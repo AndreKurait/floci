@@ -194,6 +194,64 @@ class ElbClassicServiceTest {
     }
 
     @Test
+    void creatingTwoSubnetsInOneZoneIsRejected() {
+        AwsException failure = assertThrows(AwsException.class, () ->
+                service.createLoadBalancer(REGION, "duplicate-zone", List.of(httpListener()),
+                        List.of(), List.of("subnet-a", "subnet-other-a"), List.of("sg-1"), null, Map.of()));
+        assertEquals("InvalidConfigurationRequest", failure.getErrorCode());
+        assertEquals(409, failure.getHttpStatus());
+        verify(healthChecker, never()).startMonitoring(any());
+    }
+
+    @Test
+    void attachingASecondSubnetInTheSameZoneLeavesTheExistingSelectionUntouched() {
+        ClassicLoadBalancer lb = create("same-zone");
+        assertThrows(AwsException.class, () ->
+                service.attachToSubnets(REGION, "same-zone", List.of("subnet-other-a")));
+        assertEquals(List.of("subnet-a"), lb.getSubnets());
+        assertEquals(List.of(REGION + "a"), lb.getAvailabilityZones());
+    }
+
+    @Test
+    void attachingASubnetFromAnotherVpcDoesNotChangeTheExistingVpcOrSubnets() {
+        ClassicLoadBalancer lb = create("other-vpc");
+        when(ec2Service.describeSubnets(anyString(), anyList(), any())).thenAnswer(invocation -> {
+            List<String> ids = invocation.getArgument(1);
+            return ids.stream().map(id -> {
+                Subnet subnet = new Subnet();
+                subnet.setSubnetId(id);
+                subnet.setVpcId("subnet-a".equals(id) ? "vpc-1" : "vpc-2");
+                subnet.setAvailabilityZone(REGION + id.charAt(id.length() - 1));
+                return subnet;
+            }).toList();
+        });
+        assertThrows(AwsException.class, () -> service.attachToSubnets(REGION, "other-vpc", List.of("subnet-b")));
+        assertEquals("vpc-1", lb.getVpcId());
+        assertEquals(List.of("subnet-a"), lb.getSubnets());
+        assertEquals(List.of(REGION + "a"), lb.getAvailabilityZones());
+    }
+
+    @Test
+    void detachingTheLastSubnetLeavesTheExistingSelectionUntouched() {
+        ClassicLoadBalancer lb = create("last-subnet");
+        assertThrows(AwsException.class, () ->
+                service.detachFromSubnets(REGION, "last-subnet", List.of("subnet-a")));
+        assertEquals(List.of("subnet-a"), lb.getSubnets());
+        assertEquals(List.of(REGION + "a"), lb.getAvailabilityZones());
+    }
+
+    @Test
+    void subnetChangesKeepOneSubnetPerEnabledZone() {
+        ClassicLoadBalancer lb = create("three-zones");
+        assertEquals(List.of("subnet-a", "subnet-b", "subnet-c"),
+                service.attachToSubnets(REGION, "three-zones", List.of("subnet-b", "subnet-c", "subnet-a")));
+        assertEquals(List.of(REGION + "a", REGION + "b", REGION + "c"), lb.getAvailabilityZones());
+        assertEquals(List.of("subnet-a", "subnet-c"),
+                service.detachFromSubnets(REGION, "three-zones", List.of("subnet-b")));
+        assertEquals(List.of(REGION + "a", REGION + "c"), lb.getAvailabilityZones());
+    }
+
+    @Test
     void createRejectsADuplicateName() {
         create("my-elb");
         AwsException e = assertThrows(AwsException.class, () -> create("my-elb"));

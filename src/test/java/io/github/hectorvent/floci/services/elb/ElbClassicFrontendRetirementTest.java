@@ -41,7 +41,7 @@ class ElbClassicFrontendRetirementTest {
     private final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
     private final Ec2Service ec2 = mock(Ec2Service.class);
     private final ElbClassicFrontendManager manager;
-    private final Map<String, ElbClassicFrontendManager.Frontend> frontends;
+    private final Map<String, ElbClassicFrontendManager.Frontends> frontends;
 
     @SuppressWarnings("unchecked")
     ElbClassicFrontendRetirementTest() throws Exception {
@@ -56,7 +56,7 @@ class ElbClassicFrontendRetirementTest {
                 mock(AcmService.class), mock(VpcRoutingManager.class));
         Field field = ElbClassicFrontendManager.class.getDeclaredField("frontends");
         field.setAccessible(true);
-        frontends = (Map<String, ElbClassicFrontendManager.Frontend>) field.get(manager);
+        frontends = (Map<String, ElbClassicFrontendManager.Frontends>) field.get(manager);
     }
 
     @ParameterizedTest
@@ -141,12 +141,35 @@ class ElbClassicFrontendRetirementTest {
         verify(lifecycle, never()).stopAndRemoveStrict(anyString(), any(), anyInt());
     }
 
+    @Test
+    void aFailedNodeDoesNotPreventOtherNodesFromRetiringAndCleanupCanBeRetried() {
+        ClassicLoadBalancer lb = loadBalancer("multi-node");
+        ElbClassicFrontendManager.Frontend first = new ElbClassicFrontendManager.Frontend(
+                ACCOUNT, REGION, "", "eni-a", "10.0.1.11",
+                new NetworkNamespaceLease("helper-a", "helper-a"), "proxy-a", Map.of(), Map.of());
+        ElbClassicFrontendManager.Frontend second = new ElbClassicFrontendManager.Frontend(
+                ACCOUNT, REGION, "", "eni-b", "10.0.2.11",
+                new NetworkNamespaceLease("helper-b", "helper-b"), "proxy-b", Map.of(), Map.of());
+        String key = ACCOUNT + "/" + REGION + "/" + lb.getLoadBalancerName();
+        frontends.put(key, new ElbClassicFrontendManager.Frontends("", List.of(first, second)));
+        doThrow(new IllegalStateException("first node still owned")).doNothing()
+                .when(lifecycle).stopAndRemoveStrict("proxy-a", null, 1);
+        assertThrows(IllegalStateException.class, () -> manager.remove(lb));
+        verify(ec2, never()).deleteNetworkInterface(REGION, "eni-a");
+        verify(ec2).deleteNetworkInterface(REGION, "eni-b");
+        assertTrue(frontends.containsKey(key));
+        manager.remove(lb);
+        assertFalse(frontends.containsKey(key));
+        verify(ec2).deleteNetworkInterface(REGION, "eni-a");
+    }
+
     private ElbClassicFrontendManager.Frontend install(ClassicLoadBalancer loadBalancer) {
         ElbClassicFrontendManager.Frontend frontend = new ElbClassicFrontendManager.Frontend(
                 ACCOUNT, REGION, "", "eni", "10.0.1.11",
                 new NetworkNamespaceLease("helper", "helper-name"), "proxy",
                 Map.of("instance", List.of("backend/server")), Map.of("instance", "10.0.1.10"));
-        frontends.put(ACCOUNT + "/" + REGION + "/" + loadBalancer.getLoadBalancerName(), frontend);
+        frontends.put(ACCOUNT + "/" + REGION + "/" + loadBalancer.getLoadBalancerName(),
+                new ElbClassicFrontendManager.Frontends("", List.of(frontend)));
         return frontend;
     }
 

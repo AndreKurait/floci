@@ -588,12 +588,14 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     public List<String> attachToSubnets(String region, String name, List<String> subnets) {
         try (RuntimeWrite ignored = runtimeWrite(region, name)) {
             ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
-            resolveSubnets(region, subnets);
+            List<String> proposed = new ArrayList<>(lb.getSubnets());
             for (String subnet : subnets) {
-                if (!lb.getSubnets().contains(subnet)) {
-                    lb.getSubnets().add(subnet);
+                if (!proposed.contains(subnet)) {
+                    proposed.add(subnet);
                 }
             }
+            singleVpcId(resolveSubnets(region, proposed).values());
+            lb.setSubnets(proposed);
             refreshZonesFromSubnets(region, lb);
             persist(region, lb);
             return List.copyOf(lb.getSubnets());
@@ -603,7 +605,13 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     public List<String> detachFromSubnets(String region, String name, List<String> subnets) {
         try (RuntimeWrite ignored = runtimeWrite(region, name)) {
             ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
-            lb.getSubnets().removeAll(subnets);
+            List<String> proposed = new ArrayList<>(lb.getSubnets());
+            proposed.removeAll(subnets);
+            if (proposed.isEmpty()) {
+                throw new AwsException("InvalidConfigurationRequest",
+                        "A VPC load balancer must retain at least one subnet.", 409);
+            }
+            lb.setSubnets(proposed);
             refreshZonesFromSubnets(region, lb);
             persist(region, lb);
             return List.copyOf(lb.getSubnets());
@@ -734,6 +742,13 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             if (!byId.containsKey(subnetId)) {
                 throw new AwsException("SubnetNotFound",
                         "The subnet ID '" + subnetId + "' does not exist", 400);
+            }
+        }
+        Set<String> zones = new LinkedHashSet<>();
+        for (Subnet subnet : byId.values()) {
+            if (!zones.add(subnet.getAvailabilityZone())) {
+                throw new AwsException("InvalidConfigurationRequest",
+                        "A load balancer can attach at most one subnet per Availability Zone.", 409);
             }
         }
         return byId;

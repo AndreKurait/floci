@@ -25,11 +25,15 @@ import java.security.GeneralSecurityException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * Health checking for Classic (2012-06-01) load balancers.
@@ -79,7 +83,7 @@ public class ElbClassicHealthChecker implements Resettable {
     private final Map<String, ArmedCheck> timers = new ConcurrentHashMap<>();
 
     /** A periodic check: its Vert.x timer and the tick that timer runs. */
-    private record ArmedCheck(long id, Runnable tick) {}
+    private record ArmedCheck(long id, Runnable tick, ClassicLoadBalancer loadBalancer) {}
 
     public ElbClassicHealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
         this(vertx, config, ec2Service, null);
@@ -112,7 +116,7 @@ public class ElbClassicHealthChecker implements Resettable {
         int interval = lb.getHealthCheck() != null && lb.getHealthCheck().getInterval() != null
                 ? lb.getHealthCheck().getInterval() : 30;
         Runnable tick = () -> probeAll(lb);
-        timers.put(k, new ArmedCheck(vertx.setPeriodic(interval * 1000L, id -> tick.run()), tick));
+        timers.put(k, new ArmedCheck(vertx.setPeriodic(interval * 1000L, id -> tick.run()), tick, lb));
     }
 
     /**
@@ -169,7 +173,24 @@ public class ElbClassicHealthChecker implements Resettable {
         if (s == null) {
             return InstanceHealth.registering();
         }
-        InstanceHealth health = frontends != null && frontends.enabled() ? s.publishedHealth : s.health;
+        if (frontends != null && frontends.enabled()) {
+            List<ElbClassicFrontendManager.Probe> probes = frontends.probesFor(lb, instanceId);
+            if (probes.isEmpty()) {
+                return InstanceHealth.registering();
+            }
+            boolean allFailed = true;
+            for (ElbClassicFrontendManager.Probe probe : probes) {
+                ProbeState node = s.nodes.get(probe.frontend().eni());
+                InstanceHealth health = node != null && node.probe.frontend() == probe.frontend()
+                        ? node.publishedHealth : null;
+                if (health != null && "InService".equals(health.state())) {
+                    return health;
+                }
+                allFailed &= InstanceHealth.failedChecks().equals(health);
+            }
+            return allFailed ? InstanceHealth.failedChecks() : InstanceHealth.registering();
+        }
+        InstanceHealth health = s.direct.health;
         return health == null ? InstanceHealth.registering() : health;
     }
 
@@ -198,6 +219,11 @@ public class ElbClassicHealthChecker implements Resettable {
         if (lbStates == null || lbStates.isEmpty()) {
             return;
         }
+        boolean protectedFrontend = frontends != null && frontends.enabled();
+        ArmedCheck monitoring = timers.get(key(lb));
+        if (protectedFrontend && (monitoring == null || monitoring.loadBalancer() != lb)) {
+            return;
+        }
         ClassicHealthCheck hc = lb.getHealthCheck() != null ? lb.getHealthCheck() : ClassicHealthCheck.defaults();
         Target target = Target.parse(hc.getTarget());
         if (target == null) {
@@ -210,63 +236,101 @@ public class ElbClassicHealthChecker implements Resettable {
         for (Map.Entry<String, InstanceState> entry : lbStates.entrySet()) {
             String instanceId = entry.getKey();
             InstanceState state = entry.getValue();
-            String host = resolveHost(lb.getAccountId(), instanceId);
-            boolean protectedFrontend = frontends != null && frontends.enabled();
-            ElbClassicFrontendManager.Probe namespace = protectedFrontend ? frontends.probeFor(lb, instanceId) : null;
-            vertx.executeBlocking(() -> protectedFrontend
-                    ? frontends.probe(namespace, target, timeout) : probe(host, target, timeout))
-                    .onSuccess(ok -> {
-                        if (protectedFrontend && !frontends.current(lb, namespace)) {
-                            return;
-                        }
-                        if (Boolean.TRUE.equals(ok)) {
-                            state.consecutiveFailures = 0;
-                            state.consecutiveSuccesses++;
-                            if (state.consecutiveSuccesses >= healthyThreshold) {
-                                state.health = InstanceHealth.inService();
-                            }
-                        } else {
-                            recordFailure(state, unhealthyThreshold);
-                        }
-                        if (protectedFrontend) {
-                            publishProtectedHealth(lb, namespace, state);
-                        }
-                    })
-                    .onFailure(err -> {
-                        if (protectedFrontend && !frontends.current(lb, namespace)) {
-                            return;
-                        }
-                        recordFailure(state, unhealthyThreshold);
-                        if (protectedFrontend) {
-                            publishProtectedHealth(lb, namespace, state);
-                        }
-                        LOG.debugv("Classic ELB health check failed for {0} ({1}): {2}",
-                                instanceId, host, err.getMessage());
-                    });
+            if (protectedFrontend) {
+                List<ElbClassicFrontendManager.Probe> probes = frontends.probesFor(lb, instanceId);
+                Set<String> currentNodes = probes.stream().map(probe -> probe.frontend().eni()).collect(Collectors.toSet());
+                state.nodes.keySet().retainAll(currentNodes);
+                for (ElbClassicFrontendManager.Probe probe : probes) {
+                    ProbeState node = state.nodes.compute(probe.frontend().eni(), (ignored, previous) ->
+                            previous != null && previous.probe.frontend() == probe.frontend()
+                                    ? previous : new ProbeState(probe));
+                    probeOne(lb, instanceId, node, target, timeout, healthyThreshold, unhealthyThreshold);
+                }
+            } else {
+                probeOne(lb, instanceId, state.direct, target, timeout, healthyThreshold, unhealthyThreshold);
+            }
         }
     }
 
+    private void probeOne(ClassicLoadBalancer lb, String instanceId, ProbeState state, Target target,
+                          int timeout, int healthyThreshold, int unhealthyThreshold) {
+        String host = resolveHost(lb.getAccountId(), instanceId);
+        ElbClassicFrontendManager.Probe namespace = state.probe;
+        vertx.executeBlocking(() -> namespace != null
+                ? frontends.probe(namespace, target, timeout) : probe(host, target, timeout), false)
+                .onSuccess(ok -> {
+                    if (namespace != null && !frontends.current(lb, namespace)) {
+                        return;
+                    }
+                    if (Boolean.TRUE.equals(ok)) {
+                        recordSuccess(state, healthyThreshold);
+                    } else {
+                        recordFailure(state, unhealthyThreshold);
+                    }
+                    if (namespace != null) {
+                        publishProtectedHealth(lb, namespace, state);
+                    }
+                })
+                .onFailure(err -> {
+                    if (namespace != null && !frontends.current(lb, namespace)) {
+                        return;
+                    }
+                    recordFailure(state, unhealthyThreshold);
+                    if (namespace != null) {
+                        publishProtectedHealth(lb, namespace, state);
+                    }
+                    LOG.debugv("Classic ELB health check failed for {0} ({1}): {2}",
+                            instanceId, host, err.getMessage());
+                });
+    }
+
     private void publishProtectedHealth(ClassicLoadBalancer loadBalancer,
-                                        ElbClassicFrontendManager.Probe probe, InstanceState state) {
-        InstanceHealth health = state.health == null ? InstanceHealth.registering() : state.health;
+                                        ElbClassicFrontendManager.Probe probe, ProbeState state) {
+        if (!state.publishing.compareAndSet(false, true)) {
+            return;
+        }
         vertx.executeBlocking(() -> {
-            frontends.healthChanged(loadBalancer, probe, health);
+            while (frontends.current(loadBalancer, probe)) {
+                InstanceHealth desired = state.health == null ? InstanceHealth.registering() : state.health;
+                if (Objects.equals(desired, state.publishedHealth)) {
+                    break;
+                }
+                frontends.healthChanged(loadBalancer, probe, desired);
+                if (frontends.current(loadBalancer, probe)) {
+                    state.publishedHealth = desired;
+                }
+            }
             return null;
-        }).onSuccess(ignored -> {
-            if (frontends.current(loadBalancer, probe)) {
-                state.publishedHealth = health;
+        }, false).onSuccess(ignored -> {
+            state.publishing.set(false);
+            InstanceHealth desired = state.health == null ? InstanceHealth.registering() : state.health;
+            if (frontends.current(loadBalancer, probe) && !Objects.equals(desired, state.publishedHealth)) {
+                publishProtectedHealth(loadBalancer, probe, state);
             }
         }).onFailure(failure -> {
             state.publishedHealth = InstanceHealth.registering();
+            state.publishing.set(false);
             LOG.warnv(failure, "Could not apply protected Classic health for {0}", probe.instanceId());
         });
     }
 
-    private static void recordFailure(InstanceState state, int unhealthyThreshold) {
-        state.consecutiveSuccesses = 0;
-        state.consecutiveFailures++;
-        if (state.consecutiveFailures >= unhealthyThreshold) {
-            state.health = InstanceHealth.failedChecks();
+    private static void recordSuccess(ProbeState state, int healthyThreshold) {
+        synchronized (state) {
+            state.consecutiveFailures = 0;
+            state.consecutiveSuccesses++;
+            if (state.consecutiveSuccesses >= healthyThreshold) {
+                state.health = InstanceHealth.inService();
+            }
+        }
+    }
+
+    private static void recordFailure(ProbeState state, int unhealthyThreshold) {
+        synchronized (state) {
+            state.consecutiveSuccesses = 0;
+            state.consecutiveFailures++;
+            if (state.consecutiveFailures >= unhealthyThreshold) {
+                state.health = InstanceHealth.failedChecks();
+            }
         }
     }
 
@@ -389,9 +453,20 @@ public class ElbClassicHealthChecker implements Resettable {
     }
 
     private static final class InstanceState {
+        final ProbeState direct = new ProbeState(null);
+        final Map<String, ProbeState> nodes = new ConcurrentHashMap<>();
+    }
+
+    private static final class ProbeState {
+        final ElbClassicFrontendManager.Probe probe;
+        final AtomicBoolean publishing = new AtomicBoolean();
         volatile InstanceHealth health;
         volatile InstanceHealth publishedHealth;
         volatile int consecutiveSuccesses;
         volatile int consecutiveFailures;
+
+        private ProbeState(ElbClassicFrontendManager.Probe probe) {
+            this.probe = probe;
+        }
     }
 }
