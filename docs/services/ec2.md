@@ -752,8 +752,8 @@ private gateway lifecycles are not modelled.
 | GetSecurityGroupsForVpc | Lists the security groups belonging to one VPC, with the same filters as the describe call. |
 | DescribeSecurityGroupRules | Lists stored security group rules. |
 | ModifySecurityGroupRules | Updates supported fields on security group rules. |
-| UpdateSecurityGroupRuleDescriptionsIngress | Updates descriptions on matching inbound security group rules. |
-| UpdateSecurityGroupRuleDescriptionsEgress | Updates descriptions on matching outbound security group rules. |
+| UpdateSecurityGroupRuleDescriptionsIngress | Updates or clears descriptions by rule ID or permission source, keeping rule IDs and tags. Updates both describe views. The selected group, direction, account and region must match. Supports default-VPC group names and `DryRun`. |
+| UpdateSecurityGroupRuleDescriptionsEgress | Updates outbound rule descriptions with the same selectors and validation as the inbound call. |
 
 ### Key Pairs
 
