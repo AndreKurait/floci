@@ -13,6 +13,9 @@
     <description>Fast, free, open-source local AWS emulator supporting SSM, SQS, SNS, SES, S3, DynamoDB, Lambda, API Gateway, Cognito, KMS, Kinesis, Secrets Manager, CloudFormation, Step Functions, IAM, STS, ElastiCache, RDS, EventBridge, and CloudWatch</description>
 
     <properties>
+        <!-- Maven user properties reach the test JVM: keep this build setting
+             outside the strictly validated floci.* application namespace. -->
+        <test.jvm.heap>6g</test.jvm.heap>
         <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <quarkus.platform.version>3.40.1</quarkus.platform.version>
@@ -21,9 +24,6 @@
         <everit.json.schema.version>1.14.6</everit.json.schema.version>
         <wire.version>7.0.1</wire.version>
         <aws.sdk.version>2.55.14</aws.sdk.version>
-        <!-- Maven user properties reach the test JVM: keep this build setting
-             outside the strictly validated floci.* application namespace. -->
-        <test.jvm.heap>6g</test.jvm.heap>
     </properties>
 
     <dependencyManagement>
