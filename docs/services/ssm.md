@@ -92,6 +92,11 @@ approval policies or registering an AWS-owned baseline ARN is not implemented.
 | `AcknowledgeMessage` | Agent acknowledges receipt of a command message |
 | `SendReply` | Agent reports command output and status |
 
+## Document descriptions
+
+`DescribeDocument` returns `CreatedDate` as numeric epoch seconds, so AWS SDK
+clients can decode descriptions of current and retained document versions.
+
 ## State Manager associations
 
 Association create, describe, list, update and delete operations store and return the
