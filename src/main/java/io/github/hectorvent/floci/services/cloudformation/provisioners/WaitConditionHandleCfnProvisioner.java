@@ -16,7 +16,7 @@ import java.util.UUID;
 
 /**
  * A wait handle is a presigned S3 PUT URL. Creating the handle itself never waits for a signal.
- * The separate {@code AWS::CloudFormation::WaitCondition} resource is not implemented here.
+ * {@link WaitConditionCfnProvisioner} consumes the separate resource's success/failure signals.
  */
 @ApplicationScoped
 public class WaitConditionHandleCfnProvisioner implements CfnResourceProvisioner {
@@ -56,7 +56,7 @@ public class WaitConditionHandleCfnProvisioner implements CfnResourceProvisioner
         String bucket = S3Service.INTERNAL_BUCKET_PREFIX + "cfn-wait-" + UUID.randomUUID();
         s3.createServiceOwnedBucket(bucket, context.region());
         try {
-            // Each PUT remains an independent signal for a future WaitCondition consumer.
+            // Each PUT remains an independent signal for the WaitCondition consumer.
             s3.putBucketVersioning(bucket, "Enabled");
             String url = presigner.generatePresignedUrl(endpoint.baseUrl(false), bucket, SIGNAL_KEY,
                     "PUT", URL_EXPIRY_SECONDS, context.region(), context.accountId());

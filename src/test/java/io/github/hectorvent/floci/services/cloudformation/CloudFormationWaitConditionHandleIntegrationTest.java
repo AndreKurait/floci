@@ -141,7 +141,7 @@ class CloudFormationWaitConditionHandleIntegrationTest {
     }
 
     @Test
-    void unsupportedWaitConditionFailsAndRollsBackItsRealHandle() throws Exception {
+    void unsignaledWaitConditionTimesOutAndRollsBackItsRealHandle() throws Exception {
         ObjectNode template = template();
         ObjectNode wait = template.withObject("/Resources").putObject("Wait");
         wait.put("Type", "AWS::CloudFormation::WaitCondition").put("DependsOn", "Handle");
@@ -154,7 +154,7 @@ class CloudFormationWaitConditionHandleIntegrationTest {
                 .map(StackEvent::physicalResourceId).findFirst().orElseThrow());
         assertTrue(events.stream().anyMatch(event -> "Wait".equals(event.logicalResourceId())
                 && "CREATE_FAILED".equals(event.resourceStatusAsString())
-                && event.resourceStatusReason().contains("not supported")));
+                && event.resourceStatusReason().contains("timed out")));
         assertEquals(404, signal(handle, "after-rollback"));
     }
 
