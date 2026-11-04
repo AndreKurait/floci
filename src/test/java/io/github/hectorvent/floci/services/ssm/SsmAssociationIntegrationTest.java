@@ -100,7 +100,8 @@ class SsmAssociationIntegrationTest {
             .statusCode(200)
             .body("AssociationDescription.Name", equalTo("assoc-test-doc"))
             .body("AssociationDescription.AssociationName", equalTo("my-assoc"))
-            .body("AssociationDescription.Status.Name", equalTo("Success"))
+            .body("AssociationDescription.Status.Name", equalTo("Pending"))
+            .body("AssociationDescription.LastExecutionDate", nullValue())
             .extract().path("AssociationDescription.AssociationId");
 
         // List associations

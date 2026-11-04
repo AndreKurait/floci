@@ -1164,7 +1164,7 @@ class SsmServiceTest {
     }
 
     @Test
-    void testCreateAssociation_Success() {
+    void createAssociationStartsPending() {
         String region = "us-east-1";
         ssmService.createDocument("AWS-RunShellScript", "{}", "Command", region);
 
@@ -1191,11 +1191,12 @@ class SsmServiceTest {
         assertEquals(parameters, assoc.getParameters());
         assertEquals("rate(30 minutes)", assoc.getScheduleExpression());
         assertNotNull(assoc.getStatus());
-        assertEquals("Success", assoc.getStatus().getName());
+        assertEquals("Pending", assoc.getStatus().getName());
         assertNotNull(assoc.getOverview());
-        assertEquals("Success", assoc.getOverview().getStatus());
-        assertEquals("Success", assoc.getOverview().getDetailedStatus());
+        assertEquals("Pending", assoc.getOverview().getStatus());
+        assertEquals("Creating", assoc.getOverview().getDetailedStatus());
         assertNotNull(assoc.getCreatedDate());
+        assertNull(assoc.getLastExecutionDate());
     }
 
     @Test
@@ -1467,6 +1468,31 @@ class SsmServiceTest {
 
         SsmAssociation found = ssmService.describeAssociation(created.getAssociationId(), null, null, region);
         assertEquals("rate(1 hour)", found.getScheduleExpression());
+    }
+
+    @Test
+    void associationUpdateWaitsForExecutionAndPreservesHistory() {
+        String region = "us-east-1";
+        ssmService.createDocument("Configuration", "{}", "Command", region);
+        SsmAssociation created = ssmService.createAssociation(
+                "Configuration", "configuration", null, "i-12345", null, null, null, region);
+        Instant previousExecution = Instant.parse("2025-01-01T00:00:00Z");
+        created.setStatus(new SsmAssociation.AssociationStatus("Success", "Completed", previousExecution, null));
+        created.setOverview(new SsmAssociation.AssociationOverview("Success", "Success"));
+        created.setLastExecutionDate(previousExecution);
+
+        SsmAssociation updated = ssmService.updateAssociation(created.getAssociationId(), null, null,
+                null, null, "rate(6 hours)", null, null, null, region);
+
+        assertEquals("2", updated.getAssociationVersion());
+        assertEquals("Pending", updated.getStatus().getName());
+        assertEquals("Pending", updated.getOverview().getStatus());
+        assertTrue(updated.getStatus().getDate().isAfter(previousExecution));
+        assertEquals(previousExecution, updated.getLastExecutionDate());
+        assertEquals(created.getCreatedDate(), updated.getCreatedDate());
+        SsmAssociation stored = ssmService.describeAssociation(created.getAssociationId(), null, null, region);
+        assertEquals("Pending", stored.getOverview().getStatus());
+        assertEquals(previousExecution, stored.getLastExecutionDate());
     }
 
     @Test

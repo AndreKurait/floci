@@ -64,6 +64,15 @@ without a label filter continue to return the latest version of each parameter.
 | `AcknowledgeMessage` | Agent acknowledges receipt of a command message |
 | `SendReply` | Agent reports command output and status |
 
+## State Manager associations
+
+Association create, describe, list, update and delete operations store and return the
+configuration. Floci does not yet schedule or execute associations. New associations
+therefore remain `Pending` and have no `LastExecutionDate`. An update marks the new
+association version pending while preserving any previously stored execution timestamp.
+Association creation is not evidence that a document ran, inventory was collected or
+a target became compliant. The Run Command execution paths below are separate.
+
 ## Run Command Execution
 
 `SendCommand` supports the `AWS-RunShellScript` document. For EC2 instances launched by Floci in real Docker mode, Floci creates the command invocation, returns the command response, and then runs the script asynchronously inside the target instance container. Callers observe completion through `GetCommandInvocation`. `stdout`, `stderr`, response code, start time, and end time are recorded on the invocation.

@@ -1559,13 +1559,11 @@ public class SsmService implements ResourceProvider {
         association.setMaxConcurrency(maxConcurrency);
         association.setComplianceSeverity(complianceSeverity);
         association.setAssociationVersion("1");
-        // Real SSM starts an association at "Pending" and transitions it to "Success"/"Failed" once
-        // its execution engine runs it. This emulator has no execution engine, so it reports
-        // "Success" immediately rather than modeling a state that would never change on its own.
-        association.setStatus(new SsmAssociation.AssociationStatus("Success", "Success", now, null));
-        association.setOverview(new SsmAssociation.AssociationOverview("Success", "Success"));
+        // Storing a configuration does not execute it. State Manager execution is not implemented.
+        association.setStatus(new SsmAssociation.AssociationStatus(
+                "Pending", "Awaiting association execution", now, null));
+        association.setOverview(new SsmAssociation.AssociationOverview("Pending", "Creating"));
         association.setCreatedDate(now);
-        association.setLastExecutionDate(now);
 
         associationStore.put(regionKey(region, associationId), association);
         LOG.infov("Created association {0} ({1}) for document {2} in region {3}",
@@ -1604,6 +1602,9 @@ public class SsmService implements ResourceProvider {
 
         long currentVersion = parseAssociationVersion(association.getAssociationVersion());
         association.setAssociationVersion(String.valueOf(currentVersion + 1));
+        association.setStatus(new SsmAssociation.AssociationStatus(
+                "Pending", "Awaiting association execution", Instant.now(), null));
+        association.setOverview(new SsmAssociation.AssociationOverview("Pending", "Updating"));
 
         associationStore.put(storageKey, association);
         LOG.infov("Updated association {0} in region {1}", associationId, region);
