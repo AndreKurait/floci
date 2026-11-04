@@ -1,10 +1,12 @@
 package io.github.hectorvent.floci.services.ssm;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
@@ -18,7 +20,11 @@ import io.github.hectorvent.floci.services.ssm.model.SsmAssociation;
 import io.github.hectorvent.floci.services.ssm.model.SsmDocument;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -817,6 +823,62 @@ class SsmServiceTest {
         SsmDocument updated = ssmService.updateDocument("Doc", "{\"a\":2}", region);
         assertEquals(2, updated.getDocumentVersion());
         assertEquals("{\"a\":2}", ssmService.getDocument("Doc", region).getContent());
+    }
+
+    @Test
+    void documentDefaultAndRetainedContentSurviveStorageReload(@TempDir Path directory) {
+        Path path = directory.resolve("documents.json");
+        SsmService service = serviceWithPersistentDocuments(path);
+        service.createDocument("Doc", "first", "Command", "us-east-1");
+        service.updateDocument("Doc", "second", "us-east-1");
+        service.updateDocumentDefaultVersion("Doc", "2", "us-east-1");
+        service.updateDocument("Doc", "third", "us-east-1");
+
+        SsmService reloaded = serviceWithPersistentDocuments(path);
+        SsmDocument document = reloaded.getDocument("Doc", "us-east-1");
+        assertEquals(2, document.getDefaultVersion());
+        assertEquals(3, document.getDocumentVersion());
+        assertEquals(Map.of("1", "first", "2", "second", "3", "third"), document.getVersions());
+        reloaded.updateDocument("Doc", "fourth", "us-east-1");
+        assertEquals(2, serviceWithPersistentDocuments(path).getDocument("Doc", "us-east-1").getDefaultVersion());
+
+        reloaded.deleteDocument("Doc", "us-east-1");
+        SsmService afterDelete = serviceWithPersistentDocuments(path);
+        AwsException deleted = assertThrows(AwsException.class,
+                () -> afterDelete.updateDocumentDefaultVersion("Doc", "1", "us-east-1"));
+        assertEquals("InvalidDocument", deleted.getErrorCode());
+    }
+
+    @Test
+    void legacyDocumentKeepsItsDefaultAndAvailableContentOnUpdate(@TempDir Path directory) throws IOException {
+        Path path = directory.resolve("legacy-documents.json");
+        Files.writeString(path, """
+                {"us-east-1::LegacyDoc":{"Name":"LegacyDoc","DocumentType":"Command",
+                  "Content":"third","DocumentVersion":3}}
+                """);
+        SsmService service = serviceWithPersistentDocuments(path);
+        assertEquals(3, service.getDocument("LegacyDoc", "us-east-1").getDefaultVersion());
+        service.updateDocument("LegacyDoc", "fourth", "us-east-1");
+
+        SsmService reloaded = serviceWithPersistentDocuments(path);
+        SsmDocument document = reloaded.getDocument("LegacyDoc", "us-east-1");
+        assertEquals(3, document.getDefaultVersion());
+        assertEquals(4, document.getDocumentVersion());
+        assertEquals(Map.of("3", "third", "4", "fourth"), document.getVersions());
+        reloaded.updateDocumentDefaultVersion("LegacyDoc", "1", "us-east-1");
+        SsmDocument legacySelection = serviceWithPersistentDocuments(path).getDocument("LegacyDoc", "us-east-1");
+        assertEquals(1, legacySelection.getDefaultVersion());
+        assertFalse(legacySelection.hasRetainedContent("1"));
+        assertNull(legacySelection.getContentForVersion("1"));
+        assertEquals(Map.of("3", "third", "4", "fourth"), legacySelection.getVersions());
+    }
+
+    private static SsmService serviceWithPersistentDocuments(Path path) {
+        PersistentStorage<String, SsmDocument> documents =
+                new PersistentStorage<>(path, new TypeReference<Map<String, SsmDocument>>() {});
+        documents.load();
+        return new SsmService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                documents, new InMemoryStorage<>(), 5, new RegionResolver("us-east-1", "000000000000"));
     }
 
     @Test

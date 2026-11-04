@@ -64,10 +64,22 @@ without a label filter continue to return the latest version of each parameter.
 | `AcknowledgeMessage` | Agent acknowledges receipt of a command message |
 | `SendReply` | Agent reports command output and status |
 
-## Document descriptions
+## Document versions
 
 `DescribeDocument` returns `CreatedDate` as numeric epoch seconds, so AWS SDK
 clients can decode descriptions of current and retained document versions.
+
+New documents default to version 1. `UpdateDocument` publishes a new latest version
+without changing the default. `UpdateDocumentDefaultVersion` selects an existing
+numeric version; `GetDocument` and `DescribeDocument` resolve an omitted selector
+or `$DEFAULT` to that selection, `$LATEST` to the newest version, and a number to
+that retained version. Descriptions report the default and latest separately.
+
+The selection survives storage reloads. Older stored documents without a default
+field retain their previous effective default, the latest version at migration.
+Content missing from legacy history is not recreated: a reference can exist while
+`GetDocument` and `DescribeDocument` cannot return that version's content.
+Changing the default does not schedule State Manager execution.
 
 ## State Manager associations
 

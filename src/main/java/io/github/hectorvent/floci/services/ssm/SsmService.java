@@ -1352,7 +1352,7 @@ public class SsmService implements ResourceProvider {
         return document;
     }
 
-    public SsmDocument updateDocument(String name, String content, String region) {
+    public synchronized SsmDocument updateDocument(String name, String content, String region) {
         String storageKey = regionKey(region, name);
         SsmDocument document = documentStore.get(storageKey)
                 .orElseThrow(() -> new AwsException("InvalidDocument",
@@ -1363,10 +1363,30 @@ public class SsmService implements ResourceProvider {
                             + "Change the content of the document and try again.", 400);
         }
         long newVersion = document.getDocumentVersion() + 1;
+        document.getVersions();
+        document.setDefaultVersion(document.getDefaultVersion());
         document.setContent(content);
         document.setDocumentVersion(newVersion);
         document.getVersions().put(String.valueOf(newVersion), content);
         documentStore.put(storageKey, document);
+        return document;
+    }
+
+    public synchronized SsmDocument updateDocumentDefaultVersion(String name, String version, String region) {
+        SsmDocument document = getDocument(name, region);
+        long selectedVersion;
+        try {
+            selectedVersion = Long.parseLong(version);
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidDocumentVersion",
+                    "The document version is not valid or does not exist.", 400);
+        }
+        if (selectedVersion < 1 || !Long.toString(selectedVersion).equals(version) || !document.hasVersion(version)) {
+            throw new AwsException("InvalidDocumentVersion",
+                    "The document version is not valid or does not exist.", 400);
+        }
+        document.setDefaultVersion(selectedVersion);
+        documentStore.put(regionKey(region, name), document);
         return document;
     }
 
@@ -1480,7 +1500,7 @@ public class SsmService implements ResourceProvider {
      * Rejects a {@code DocumentVersion} that cannot resolve on the target document.
      * Stored document versions are retained across updates, so numeric versions are accepted
      * when they exist in the document's version history; {@code $LATEST}/{@code $DEFAULT}
-     * always resolve to the current version. {@link SsmDocument#hasVersion} also accepts a
+     * reference the latest or selected default version. {@link SsmDocument#hasVersion} also accepts a
      * numeric version that predates the retained history (see its javadoc) rather than rejecting
      * a version that legitimately existed just because its content was never captured.
      * Non-existent versions or malformed inputs throw {@code InvalidDocumentVersion}, matching
