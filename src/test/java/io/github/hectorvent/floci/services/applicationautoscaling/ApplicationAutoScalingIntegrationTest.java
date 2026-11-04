@@ -36,8 +36,8 @@ class ApplicationAutoScalingIntegrationTest {
     private static final String TARGET_PREFIX = "AnyScaleFrontendService.";
     private static final String RESOURCE_ID = "service/aas-it-cluster/aas-it-service";
     private static final String PAGED_RESOURCE_ID = "service/aas-it-cluster/aas-it-service-paged";
-    private static final String EXCLUDED_RESOURCE_ID = "service/aas-it-cluster/aas-it-service-excluded";
     private static final String DIMENSION = "ecs:service:DesiredCount";
+    private static final String EXCLUDED_RESOURCE_ID = "service/aas-it-cluster/aas-it-service-excluded";
 
     private static String scalableTargetArn;
 
