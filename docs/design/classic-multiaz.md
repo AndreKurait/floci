@@ -49,9 +49,10 @@ waits for the configured health thresholds, then verifies every frontend can
 reach each remaining eligible instance. Short sequences of HTTPS requests do
 not establish a target-distribution guarantee.
 
-This step does not implement connection draining, ALB, network ACLs or automatic
-DNS withdrawal for an Availability Zone without healthy targets. Those are
-separate capabilities; accepting a subnet list does not establish their parity.
+ALB, network ACLs and automatic DNS withdrawal for an Availability Zone without
+healthy targets remain separate capabilities. Backend membership and
+[connection draining](classic-connection-draining.md) use each existing node's
+runtime; accepting a subnet list does not establish those behaviors by itself.
 The existing proxy uses round robin; AWS Classic HTTP and HTTPS use least
 outstanding requests. Exact scheduling parity remains separate work.
 Native application startup and a complete regional deployment remain separate

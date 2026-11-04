@@ -70,7 +70,11 @@ final class ElbClassicProxyConfig {
                         + (certificate.certificateChain() == null ? "" : certificate.certificateChain().strip() + "\n")
                         + certificate.privateKey().strip() + "\n";
                 files.put(file, pem.getBytes(StandardCharsets.UTF_8));
-                text.append(" ssl crt ").append(DIRECTORY).append("/").append(file);
+                text.append(" ssl crt ").append(DIRECTORY).append("/").append(file).append(" no-alpn");
+            }
+            if (http) {
+                // Classic terminates HTTP/1.x; HAProxy otherwise advertises HTTP/2 on TLS by default.
+                text.append(" proto h1");
             }
             text.append("\n    mode ").append(http ? "http" : "tcp")
                     .append("\n    balance roundrobin\n");

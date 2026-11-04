@@ -30,6 +30,7 @@ import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
+import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancerAttributes;
 import io.github.hectorvent.floci.services.iam.IamService;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -44,6 +45,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -66,6 +70,8 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
     private final ObjectMapper mapper;
     private final CertificateReferenceResolver certificates;
     private final Map<String, Frontends> frontends = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService drainWorker = Executors.newSingleThreadScheduledExecutor(
+            Thread.ofPlatform().daemon().name("floci-classic-drain").factory());
     private boolean recovered;
 
     public ElbClassicFrontendManager(EmulatorConfig config, Ec2Service ec2,
@@ -106,6 +112,21 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
             frontends.compute(key, (ignored, previous) -> {
                 if (previous != null && state.equals(previous.state())
                         && previous.nodes().stream().allMatch(this::running)) {
+                    for (Frontend frontend : previous.nodes()) {
+                        if (frontend.backendRuntime() != null) {
+                            NetworkInterface eni = ec2.describeNetworkInterfaces(loadBalancer.getRegion(),
+                                    List.of(frontend.eni()), Map.of()).networkInterfaces().getFirst();
+                            try {
+                                changed.set(frontend.backendRuntime().reconcile(
+                                        backendAddresses(loadBalancer, eni), loadBalancer.getAttributes())
+                                        || changed.get());
+                            } catch (RuntimeException failure) {
+                                quarantine(frontend, failure);
+                                throw failure;
+                            }
+                        }
+                    }
+                    scheduleDrainRefresh(key, previous);
                     return previous;
                 }
                 Frontends next = create(loadBalancer, state);
@@ -144,18 +165,21 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         if (loadBalancer.getSecurityGroups().isEmpty()) {
             throw new AwsException("InvalidConfigurationRequest", "A protected frontend needs security groups.", 400);
         }
-        if (loadBalancer.getAttributes().isAccessLogEnabled()
-                || loadBalancer.getAttributes().isConnectionDrainingEnabled()) {
+        if (loadBalancer.getAttributes().isAccessLogEnabled()) {
             throw new AwsException("UnsupportedOperation",
-                    "Protected Classic frontend access logging and connection draining are not implemented.", 400);
+                    "Protected Classic frontend access logging is not implemented.", 400);
         }
     }
 
     private String state(ClassicLoadBalancer loadBalancer) {
         try {
+            ClassicLoadBalancerAttributes attributes = mapper.convertValue(
+                    loadBalancer.getAttributes(), ClassicLoadBalancerAttributes.class);
+            attributes.setConnectionDrainingEnabled(false);
+            attributes.setConnectionDrainingTimeout(300);
             return mapper.writeValueAsString(List.of(loadBalancer.getSubnets(), loadBalancer.getSecurityGroups(),
-                    loadBalancer.getListeners(), loadBalancer.getHealthCheck(), loadBalancer.getAttributes(),
-                    loadBalancer.getInstanceIds()));
+                    loadBalancer.getListeners(), loadBalancer.getHealthCheck(), attributes,
+                    loadBalancer.getListeners().isEmpty() ? loadBalancer.getInstanceIds() : List.of()));
         } catch (JsonProcessingException failure) {
             throw new IllegalStateException("Cannot snapshot Classic frontend settings", failure);
         }
@@ -218,23 +242,14 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
                     eni.getNetworkInterfaceId(), eni.getPrivateIpAddress(), namespace.transportAddress(),
                     Set.copyOf(loadBalancer.getSecurityGroups()), groups, List.of(), false,
                     Set.of(eni.getPrivateIpAddress())), namespace.helperId(), prefixLists);
-            List<ElbClassicProxyConfig.Backend> backends = new ArrayList<>();
-            Subnet subnet = ec2.describeSubnets(region, List.of(subnetId), Map.of()).getFirst();
-            for (String id : loadBalancer.getInstanceIds()) {
-                Instance instance = ec2.getInstance(region, id).orElse(null);
-                if (instance != null && eni.getVpcId().equals(instance.getVpcId())
-                        && instance.getPrivateIpAddress() != null
-                        && eligibleZone(loadBalancer, subnet.getAvailabilityZone(), instance)) {
-                    backends.add(new ElbClassicProxyConfig.Backend(id, instance.getPrivateIpAddress()));
-                }
-            }
+            Map<String, String> addresses = backendAddresses(loadBalancer, eni);
+            List<ElbClassicProxyConfig.Backend> backends = addresses.entrySet().stream()
+                    .map(entry -> new ElbClassicProxyConfig.Backend(entry.getKey(), entry.getValue())).toList();
             String owner = AwsArnUtils.Arn.of("elasticloadbalancing", region, account,
                     "loadbalancer/" + loadBalancer.getLoadBalancerName()).toString();
             ElbClassicProxyConfig.Rendered rendered = ElbClassicProxyConfig.render(loadBalancer,
                     eni.getPrivateIpAddress(), backends,
                     reference -> certificates.publishedMaterial(owner, region, reference));
-            Map<String, String> addresses = backends.stream().collect(Collectors.toUnmodifiableMap(
-                    ElbClassicProxyConfig.Backend::instanceId, ElbClassicProxyConfig.Backend::address));
             if (loadBalancer.getListeners().isEmpty()) {
                 return pending.withConfiguration(rendered.servers(), addresses);
             }
@@ -254,7 +269,12 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
                     ElbClassicProxyConfig.DIRECTORY, name, content, 0600));
             lifecycle.startCreated(proxy, spec);
             awaitReady(pending);
-            return pending.withConfiguration(rendered.servers(), addresses);
+            Frontend configured = pending.withConfiguration(rendered.servers(), addresses);
+            ElbClassicBackendRuntime runtime = new ElbClassicBackendRuntime(
+                    loadBalancer.getListeners(), rendered.servers(), addresses,
+                    commands -> command(configured, commands), System::nanoTime);
+            runtime.reconcile(addresses, loadBalancer.getAttributes());
+            return configured.withRuntime(runtime);
         } catch (RuntimeException failure) {
             try {
                 release(pending);
@@ -271,25 +291,88 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
                 && (loadBalancer.getAttributes().isCrossZoneLoadBalancingEnabled() || nodeZone.equals(instanceZone));
     }
 
+    private Map<String, String> backendAddresses(ClassicLoadBalancer loadBalancer, NetworkInterface eni) {
+        Map<String, String> addresses = new LinkedHashMap<>();
+        Subnet subnet = ec2.describeSubnets(loadBalancer.getRegion(), List.of(eni.getSubnetId()), Map.of()).getFirst();
+        for (String id : loadBalancer.getInstanceIds()) {
+            Instance instance = ec2.getInstance(loadBalancer.getRegion(), id).orElse(null);
+            if (instance != null && eni.getVpcId().equals(instance.getVpcId())
+                    && instance.getPrivateIpAddress() != null
+                    && eligibleZone(loadBalancer, subnet.getAvailabilityZone(), instance)) {
+                addresses.put(id, instance.getPrivateIpAddress());
+            }
+        }
+        return addresses;
+    }
+
+    Set<String> drainingInstances(ClassicLoadBalancer loadBalancer) {
+        Frontends current = frontends.get(key(loadBalancer));
+        return current == null ? Set.of() : current.nodes().stream()
+                .filter(frontend -> frontend.backendRuntime() != null)
+                .flatMap(frontend -> frontend.backendRuntime().draining().stream()).collect(Collectors.toSet());
+    }
+
+    private void scheduleDrainRefresh(String key, Frontends current) {
+        if (!current.pollScheduled && current.nodes().stream().anyMatch(frontend ->
+                frontend.backendRuntime() != null && frontend.backendRuntime().hasPendingWork())) {
+            current.pollScheduled = true;
+            drainWorker.schedule(() -> refreshDrains(key, current), 100, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void refreshDrains(String key, Frontends expected) {
+        frontends.computeIfPresent(key, (ignored, current) -> {
+            if (current != expected) {
+                return current;
+            }
+            current.pollScheduled = false;
+            try {
+                for (Frontend frontend : current.nodes()) {
+                    if (frontend.backendRuntime() != null) {
+                        frontend.backendRuntime().refresh();
+                    }
+                }
+                current.refreshFailed = false;
+            } catch (RuntimeException failure) {
+                if (!current.refreshFailed) {
+                    LOG.warnv(failure, "Classic frontend {0} could not complete backend draining; retaining it for retry",
+                            key);
+                }
+                current.refreshFailed = true;
+            }
+            scheduleDrainRefresh(key, current);
+            return current;
+        });
+    }
+
     List<String> addresses(ClassicLoadBalancer loadBalancer) {
         Frontends current = frontends.get(key(loadBalancer));
         return current == null ? List.of() : current.nodes().stream().map(frontend -> routing.publicAddress(
                 frontend.account(), frontend.region(), frontend.eni()).orElse(frontend.address())).toList();
     }
 
-    record Probe(Frontend frontend, String instanceId, String address) {}
+    record Probe(Frontend frontend, String instanceId, String address, long generation) {
+        Probe(Frontend frontend, String instanceId, String address) {
+            this(frontend, instanceId, address, 0);
+        }
+    }
 
     List<Probe> probesFor(ClassicLoadBalancer loadBalancer, String instanceId) {
         Frontends current = frontends.get(key(loadBalancer));
         return current == null ? List.of() : current.nodes().stream()
                 .filter(frontend -> frontend.backends().containsKey(instanceId))
-                .map(frontend -> new Probe(frontend, instanceId, frontend.backends().get(instanceId))).toList();
+                .map(frontend -> new Probe(frontend, instanceId, frontend.backends().get(instanceId),
+                        frontend.backendRuntime() == null ? 0 : frontend.backendRuntime().generation(instanceId)))
+                .toList();
     }
 
     boolean current(ClassicLoadBalancer loadBalancer, Probe probe) {
         Frontends current = frontends.get(key(loadBalancer));
-        return probe != null && current != null
-                && current.nodes().stream().anyMatch(frontend -> frontend == probe.frontend());
+        return probe != null && probe.address() != null && current != null
+                && current.nodes().stream().anyMatch(frontend -> frontend == probe.frontend()
+                && probe.address().equals(frontend.backends().get(probe.instanceId()))
+                && (frontend.backendRuntime() == null
+                    || probe.generation() == frontend.backendRuntime().generation(probe.instanceId())));
     }
 
     boolean probe(Probe probe, ElbClassicHealthChecker.Target target, int timeoutSeconds) {
@@ -333,7 +416,7 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         }
         frontends.computeIfPresent(key(loadBalancer), (ignored, current) -> {
             Frontend frontend = probe.frontend();
-            if (current.nodes().stream().anyMatch(node -> node == frontend) && frontend.proxy() != null) {
+            if (current(loadBalancer, probe) && frontend.proxy() != null) {
                 publishHealth(frontend, probe.instanceId(), health);
             }
             return current;
@@ -341,23 +424,31 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
     }
 
     private void publishHealth(Frontend frontend, String instanceId, ElbClassicHealthChecker.InstanceHealth health) {
-        String state = "InService".equals(health.state()) ? "ready" : "maint";
-        String commands = frontend.servers().getOrDefault(instanceId, List.of()).stream()
-                .map(server -> "set server " + server + " state " + state + "\n").collect(Collectors.joining());
-        if (!commands.isEmpty()) {
-            try {
+        try {
+            if (frontend.backendRuntime() != null) {
+                frontend.backendRuntime().healthChanged(instanceId, "InService".equals(health.state()));
+                return;
+            }
+            String state = "InService".equals(health.state()) ? "ready" : "maint";
+            String commands = frontend.servers().getOrDefault(instanceId, List.of()).stream()
+                    .map(server -> "set server " + server + " state " + state + "\n").collect(Collectors.joining());
+            if (!commands.isEmpty()) {
                 String response = command(frontend, commands);
                 if (!response.isBlank()) {
                     throw new IllegalStateException("Classic frontend rejected its health update: " + response);
                 }
-            } catch (RuntimeException failure) {
-                try {
-                    lifecycle.stopAndRemoveStrict(frontend.proxy(), null, 1);
-                } catch (RuntimeException cleanupFailure) {
-                    failure.addSuppressed(cleanupFailure);
-                }
-                throw failure;
             }
+        } catch (RuntimeException failure) {
+            quarantine(frontend, failure);
+            throw failure;
+        }
+    }
+
+    private void quarantine(Frontend frontend, RuntimeException failure) {
+        try {
+            lifecycle.stopAndRemoveStrict(frontend.proxy(), null, 1);
+        } catch (RuntimeException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
         }
     }
 
@@ -487,6 +578,7 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
 
     @PreDestroy
     void close() {
+        drainWorker.shutdownNow();
         stopManagedContainers();
     }
 
@@ -509,25 +601,62 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         return account(loadBalancer) + "/" + loadBalancer.getRegion() + "/" + loadBalancer.getLoadBalancerName();
     }
 
-    record Frontends(String state, List<Frontend> nodes) {}
+    static final class Frontends {
+        private final String state;
+        private final List<Frontend> nodes;
+        private boolean pollScheduled;
+        private boolean refreshFailed;
+
+        Frontends(String state, List<Frontend> nodes) {
+            this.state = state;
+            this.nodes = List.copyOf(nodes);
+        }
+
+        String state() {
+            return state;
+        }
+
+        List<Frontend> nodes() {
+            return nodes;
+        }
+    }
 
     record Frontend(String account, String region, String state, String eni, String address,
                     NetworkNamespaceLease namespace, String proxy,
-                    Map<String, List<String>> servers, Map<String, String> backends) {
+                    Map<String, List<String>> servers, Map<String, String> backends,
+                    ElbClassicBackendRuntime backendRuntime) {
+        Frontend(String account, String region, String state, String eni, String address,
+                 NetworkNamespaceLease namespace, String proxy,
+                 Map<String, List<String>> servers, Map<String, String> backends) {
+            this(account, region, state, eni, address, namespace, proxy, servers, backends, null);
+        }
+
+        public Map<String, List<String>> servers() {
+            return backendRuntime == null ? servers : backendRuntime.servers();
+        }
+
+        public Map<String, String> backends() {
+            return backendRuntime == null ? backends : backendRuntime.addresses();
+        }
+
         String helper() {
             return namespace == null ? null : namespace.id();
         }
 
         Frontend withNamespace(NetworkNamespaceLease value) {
-            return new Frontend(account, region, state, eni, address, value, proxy, servers, backends);
+            return new Frontend(account, region, state, eni, address, value, proxy, servers, backends, backendRuntime);
         }
 
         Frontend withProxy(String proxyId) {
-            return new Frontend(account, region, state, eni, address, namespace, proxyId, servers, backends);
+            return new Frontend(account, region, state, eni, address, namespace, proxyId, servers, backends, backendRuntime);
         }
 
         Frontend withConfiguration(Map<String, List<String>> servers, Map<String, String> backends) {
-            return new Frontend(account, region, state, eni, address, namespace, proxy, servers, backends);
+            return new Frontend(account, region, state, eni, address, namespace, proxy, servers, backends, backendRuntime);
+        }
+
+        Frontend withRuntime(ElbClassicBackendRuntime runtime) {
+            return new Frontend(account, region, state, eni, address, namespace, proxy, servers, backends, runtime);
         }
     }
 }
