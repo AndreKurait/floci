@@ -32,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -59,6 +60,7 @@ public class EcrRegistryManager {
     private static final int CONTAINER_INTERNAL_PORT = 5000;
     private static final int REPOSITORY_DELETION_TIMEOUT_SECONDS = 10;
     private static final int REPOSITORY_DELETION_KILL_GRACE_SECONDS = 1;
+    private static final Duration REGISTRY_STARTUP_TIMEOUT = Duration.ofSeconds(10);
     private static final String NAMED_VOLUME = "ecr-registry-data";
     private static final String REPOSITORIES_PATH = "/var/lib/registry/docker/registry/v2/repositories/";
 
@@ -329,7 +331,7 @@ public class EcrRegistryManager {
 
     /**
      * Lazily starts (or reuses) the {@code registry:2} container. Idempotent and
-     * thread-safe. Throws if Docker is unreachable.
+     * thread-safe. Throws if Docker is unreachable or the registry does not become ready.
      */
     public synchronized void ensureStarted() {
         if (!config.services().ecr().enabled()) {
@@ -386,11 +388,10 @@ public class EcrRegistryManager {
                         rememberRegistryAddress(info);
                         return port;
                     });
+            attachLogStream(false);
+            awaitRegistryReady();
             this.started = true;
             LOG.infov("Started ECR backing registry {0} on host port {1}", name, String.valueOf(hostPort));
-
-            // Attach log streaming (new feature)
-            attachLogStream(false);
         } catch (Exception e) {
             throw new RuntimeException("Failed to start ECR backing registry container: " + e.getMessage(), e);
         }
@@ -500,23 +501,36 @@ public class EcrRegistryManager {
             return;
         }
         try {
-            // Give the registry a moment to be ready on first start
-            for (int i = 0; i < 10; i++) {
-                if (httpClient().ping()) {
-                    break;
-                }
-                try {
-                    Thread.sleep(200);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
             List<String> repos = httpClient().catalog();
             reconcileHook.accept(repos);
             reconciled = true;
         } catch (Exception e) {
             LOG.warnv("ECR reconcile-on-startup failed: {0}", e.getMessage());
+        }
+    }
+
+    private void awaitRegistryReady() {
+        RegistryHttpClient registry = httpClient();
+        long deadline = System.nanoTime() + REGISTRY_STARTUP_TIMEOUT.toNanos();
+        while (true) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("Interrupted while waiting for the ECR backing registry");
+            }
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                throw new IllegalStateException("ECR backing registry did not become ready within "
+                        + REGISTRY_STARTUP_TIMEOUT.toSeconds() + " seconds");
+            }
+            if (registry.ping(Duration.ofNanos(Math.min(remaining, TimeUnit.SECONDS.toNanos(1))))) {
+                return;
+            }
+            try {
+                TimeUnit.NANOSECONDS.sleep(Math.min(TimeUnit.MILLISECONDS.toNanos(200),
+                        Math.max(0, deadline - System.nanoTime())));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while waiting for the ECR backing registry", e);
+            }
         }
     }
 
@@ -654,7 +668,7 @@ public class EcrRegistryManager {
     }
 
     private void stopRegistry() {
-        if (!started || containerId == null) {
+        if (containerId == null) {
             return;
         }
         lifecycleManager.stopAndRemove(containerId, logStream);
@@ -702,16 +716,13 @@ public class EcrRegistryManager {
                 LOG.warnv("Adopted ECR registry container {0} has no published binding for port {1}; keeping configured port {2}",
                         containerId, String.valueOf(CONTAINER_INTERNAL_PORT), String.valueOf(hostPort));
             }
+            attachLogStream(true);
+            awaitRegistryReady();
             this.started = true;
             LOG.infov("Adopted existing ECR registry container {0} on host port {1}",
                     containerId, String.valueOf(hostPort));
-
-            // Attach log streaming to adopted container
-            attachLogStream(true);
         } catch (Exception e) {
-            LOG.warnv("Failed to adopt existing ECR registry container: {0}", e.getMessage());
-            this.containerId = null;
-            this.registryAddress = null;
+            throw new RuntimeException("Failed to adopt existing ECR registry container: " + e.getMessage(), e);
         }
     }
 
