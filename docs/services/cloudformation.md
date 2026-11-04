@@ -919,9 +919,14 @@ resource-policy evaluation limitation still applies. This support does not estab
 ## Conditions
 
 Template `Conditions` are evaluated before provisioning. A resource whose `Condition` evaluates to
-**false is skipped** — it is never provisioned, does not appear in `DescribeStackResources`, and its
+**false is skipped**: it is never provisioned, does not appear in `DescribeStackResources`, and its
 `Ref` / `Fn::GetAtt` are not required to resolve. This matches CloudFormation and is required for the
 condition-heavy templates CDK and LZA emit.
+
+Named conditions are evaluated after their dependencies, regardless of declaration order.
+Create, update and change-set evaluation use the same ordering. A template with a missing
+condition reference or a condition cycle is rejected before creating resources, including a
+cycle inside an otherwise short-circuited `Fn::And` or `Fn::Or` branch.
 
 The operands of `Fn::Equals` are resolved as resource property values are, so `Ref` to a parameter
 or a pseudo parameter (`AWS::StackName` and `AWS::StackId` included) and `Fn::FindInMap`, the
