@@ -84,6 +84,8 @@ class Ec2KeyPairCfnProvisionerForkRegressionTest {
         assertEquals("key", resource.getPhysicalId());
         assertEquals("key-new", resource.getAttributes().get("KeyPairId"));
         assertEquals("true", resource.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+        when(ec2.describeKeyPairs("us-east-1", List.of("key"), List.of()))
+                .thenReturn(List.of(key("key", "key-new", "private")));
         owner.delete(resource, "us-east-1");
 
         verify(ec2, times(2)).deleteKeyPair("us-east-1", null, "key-new");
@@ -93,8 +95,9 @@ class Ec2KeyPairCfnProvisionerForkRegressionTest {
     @Test
     void failedParameterCleanupKeepsTheKeyAndParameterAddressableForRetry() {
         when(ec2.createKeyPair("us-east-1", "key", null, null)).thenReturn(key("key", "key-new", "private"));
-        AwsException original = new AwsException("InternalError", "tagging failed", 500);
-        doThrow(original).when(ec2).createTags(anyString(), anyList(), anyList());
+        AwsException original = new AwsException("InternalError", "parameter write response failed", 500);
+        when(ssm.putParameter(eq("/ec2/keypair/key-new"), anyString(), anyString(), any(),
+                anyBoolean(), anyString())).thenThrow(original);
         doThrow(new AwsException("AccessDeniedException", "cleanup denied", 403))
                 .doNothing().when(ssm).deleteParameter("/ec2/keypair/key-new", "us-east-1");
         StackResource resource = resource();
@@ -138,6 +141,8 @@ class Ec2KeyPairCfnProvisionerForkRegressionTest {
                 () -> owner.provision(attempted, props("{\"KeyName\":\"next\"}"), context("old"))));
         ReplacementCleanup.mergeDisplaced(previous, attempted);
         owner.mergeFailedUpdateResourceTracking(previous, attempted);
+        when(ec2.describeKeyPairs("us-east-1", List.of("next"), List.of()))
+                .thenReturn(List.of(key("next", "key-next", "private")));
         assertTrue(owner.completeUpdate(previous).complete());
 
         assertEquals("old", previous.getPhysicalId());
@@ -145,7 +150,8 @@ class Ec2KeyPairCfnProvisionerForkRegressionTest {
         verify(ec2, times(2)).deleteKeyPair("us-east-1", null, "key-next");
         verify(ec2, never()).deleteKeyPair("us-east-1", null, "key-old");
         verify(ssm, never()).deleteParameter(anyString(), anyString());
-        verify(ec2, never()).describeKeyPairs(anyString(), anyList(), anyList());
+        verify(ec2).describeKeyPairs("us-east-1", List.of("next"), List.of());
+        verify(ec2, never()).describeKeyPairs("us-east-1", List.of("old"), List.of());
     }
 
     @Test

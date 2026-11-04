@@ -95,6 +95,11 @@ public class Instance {
      * registered so metadata answers either way.
      */
     private String imdsSourceIp;
+    /**
+     * The instance's address on Floci's own Docker network, recorded at launch, start and
+     * restore when {@code publicIpFromServiceNetwork} is on, so reporting it needs no Docker call.
+     */
+    private String serviceNetworkIp;
     private String userData;
     private String encodedUserData;
     private int sshHostPort;
@@ -260,6 +265,9 @@ public class Instance {
     public String getContainerPublicIp() { return containerPublicIp; }
     public void setContainerPublicIp(String containerPublicIp) { this.containerPublicIp = containerPublicIp; }
     public void setContainerBridgeIp(String containerBridgeIp) { this.containerBridgeIp = containerBridgeIp; }
+
+    public String getServiceNetworkIp() { return serviceNetworkIp; }
+    public void setServiceNetworkIp(String serviceNetworkIp) { this.serviceNetworkIp = serviceNetworkIp; }
 
     public String getImdsSourceIp() { return imdsSourceIp; }
     public void setImdsSourceIp(String imdsSourceIp) { this.imdsSourceIp = imdsSourceIp; }

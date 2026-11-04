@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.eks.EksService;
@@ -204,13 +205,16 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
-        // The token names the authorization resource, which the request-resource table cannot resolve.
+        // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",
                 "states:SendTaskFailure", "states:SendTaskHeartbeat").contains(operation)) {
             JsonNode body = readJsonBody(ctx);
             String resource = body == null || stepFunctionsService == null || stepFunctionsService.isUnsatisfied()
                     ? null : stepFunctionsService.get().callbackResourceArn(body.path("taskToken").asText(null), accountId);
             return List.of(resource == null ? "*" : resource);
+        }
+        if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
+            return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
         String path = "s3".equals(credentialScope) ? ctx.getUriInfo().getPath()
                 : IamActionRegistry.decodedPath(ctx);
@@ -253,7 +257,8 @@ public class ResourceArnBuilder {
     private List<String> namedResources(String credentialScope, String operation, ContainerRequestContext ctx,
                                         String region, String accountId, String partition) {
         List<String> named = operation == null || !operation.startsWith(credentialScope + ":") ? List.of()
-                : RequestResources.of(operation, ctx, partition, region, accountId, storedResourceArns(credentialScope));
+                : RequestResources.of(operation, ctx, partition, region, accountId, storedResourceArns(credentialScope),
+                        IamActionRegistry.pathLabels(credentialScope, ctx));
         return named.isEmpty() ? List.of("*") : named;
     }
 
@@ -315,6 +320,10 @@ public class ResourceArnBuilder {
     /** Uses the serving operation and the same raw names as the handler. */
     public List<String> buildLogResources(String action, ContainerRequestContext ctx,
                                           String region, String accountId, String partition) {
+        // Operations the vendored table reads (the vended-log delivery family) take their resources from it.
+        if (RequestResources.reads(action)) {
+            return namedResources("logs", action, ctx, region, accountId, partition);
+        }
         boolean stream = "logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action);
         boolean group = switch (action) {
             case "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy",
@@ -329,7 +338,12 @@ public class ResourceArnBuilder {
             return List.of("*");
         }
         if (LogGroupTagTarget.supports(action)) {
-            return List.of(LogGroupTagTarget.resolve(body.path("resourceArn").asText(), region, accountId, partition).arn());
+            String resourceArn = body.path("resourceArn").asText();
+            // A delivery source, destination or delivery is tagged through the same operations.
+            if (CloudWatchLogsDeliveryService.isDeliveryResourceArn(resourceArn)) {
+                return List.of(resourceArn);
+            }
+            return List.of(LogGroupTagTarget.resolve(resourceArn, region, accountId, partition).arn());
         }
         String name = body.path("logGroupName").asText();
         String resource = "log-group:" + name + (stream

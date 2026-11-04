@@ -26,7 +26,7 @@ class GuardedMessageQueue {
 
     private final ReentrantLock lock = new ReentrantLock();
     private final VersionedSignal changes = new VersionedSignal();
-    private final List<Message> messages;
+    private MessageList messages;
     private final StorageBackend<String, List<Message>> messageStore;
     private final String storageKey;
     private final String receiptHandleSecret;
@@ -58,7 +58,7 @@ class GuardedMessageQueue {
         this.detachedSnapshots = messageStore != null
                 && !(messageStore instanceof InMemoryStorage<?, ?>
                 || messageStore instanceof AccountAwareStorageBackend<?> aware && aware.isInMemory());
-        this.messages = snapshot(initial);
+        this.messages = MessageList.copyOf(snapshot(initial));
         this.messageStore = messageStore;
         this.storageKey = storageKey;
         this.receiptHandleSecret = receiptHandleSecret;
@@ -69,17 +69,13 @@ class GuardedMessageQueue {
 
     void addMessage(Message message) {
         try (Guard _ = hold()) {
-            List<Message> candidate = new ArrayList<>(messages);
-            candidate.add(message);
-            commit(candidate);
+            commit(messages.plus(message));
         }
     }
 
     void addAll(List<Message> toAdd) {
         try (Guard _ = hold()) {
-            List<Message> candidate = new ArrayList<>(messages);
-            candidate.addAll(toAdd);
-            commit(candidate);
+            commit(messages.plusAll(toAdd));
         }
     }
 
@@ -103,9 +99,7 @@ class GuardedMessageQueue {
                             claimed, dlqCandidates, previous);
                 }
                 if (!dlqCandidates.isEmpty()) {
-                    List<Message> candidate = new ArrayList<>(messages);
-                    candidate.removeAll(dlqCandidates);
-                    commit(candidate, false);
+                    commit(messages.withoutAll(dlqCandidates::contains), false);
                 } else if (!claimed.isEmpty()) {
                     persist(messages);
                 }
@@ -202,9 +196,7 @@ class GuardedMessageQueue {
             if (result != HandleResult.APPLIED) {
                 return new Removal(result, null);
             }
-            List<Message> candidate = new ArrayList<>(messages);
-            candidate.remove(msg);
-            commit(candidate);
+            commit(messages.without(msg));
             return new Removal(HandleResult.APPLIED, msg);
         }
     }
@@ -253,8 +245,8 @@ class GuardedMessageQueue {
 
     void removeExpired(Instant cutoff) {
         try (Guard _ = hold()) {
-            List<Message> candidate = new ArrayList<>(messages);
-            if (candidate.removeIf(msg -> msg.isExpired(cutoff))) {
+            MessageList candidate = messages.withoutAll(msg -> msg.isExpired(cutoff));
+            if (candidate != messages) {
                 commit(candidate);
             }
         }
@@ -262,14 +254,14 @@ class GuardedMessageQueue {
 
     void purge() {
         try (Guard _ = hold()) {
-            commit(List.of());
+            commit(MessageList.EMPTY);
         }
     }
 
     List<Message> drainAll() {
         try (Guard _ = hold()) {
             List<Message> drained = new ArrayList<>(messages);
-            commit(List.of());
+            commit(MessageList.EMPTY);
             return drained;
         }
     }
@@ -283,9 +275,8 @@ class GuardedMessageQueue {
             if (messages.isEmpty() || !eligible.test(messages.getFirst())) {
                 return null;
             }
-            List<Message> candidate = new ArrayList<>(messages);
-            Message head = candidate.removeFirst();
-            commit(candidate);
+            Message head = messages.getFirst();
+            commit(messages.withoutFirst());
             return head;
         }
     }
@@ -293,9 +284,7 @@ class GuardedMessageQueue {
     /** Put a message that could not be delivered back at the head, preserving queue order. */
     void restoreFirst(Message message) {
         try (Guard _ = hold()) {
-            List<Message> candidate = new ArrayList<>(messages);
-            candidate.addFirst(message);
-            commit(candidate);
+            commit(messages.withFirst(message));
         }
     }
 
@@ -415,14 +404,13 @@ class GuardedMessageQueue {
         changes.awaitChange(observed, pause);
     }
 
-    private void commit(List<Message> candidate) {
+    private void commit(MessageList candidate) {
         commit(candidate, true);
     }
 
-    private void commit(List<Message> candidate, boolean notifyReceivers) {
+    private void commit(MessageList candidate, boolean notifyReceivers) {
         persist(candidate);
-        messages.clear();
-        messages.addAll(candidate);
+        messages = candidate;
         if (notifyReceivers) {
             changes.signal();
         }
@@ -430,7 +418,7 @@ class GuardedMessageQueue {
 
     private List<Message> snapshot(List<Message> source) {
         if (!detachedSnapshots) {
-            return new ArrayList<>(source);
+            return source;
         }
         return source.stream().map(Message::copy).collect(Collectors.toCollection(ArrayList::new));
     }

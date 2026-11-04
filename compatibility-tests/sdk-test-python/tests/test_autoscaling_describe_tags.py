@@ -1,6 +1,5 @@
 """Auto Scaling tag Query/XML, filtering, pagination and ownership through boto3."""
 
-import uuid
 from contextlib import ExitStack, closing
 
 import boto3
@@ -195,53 +194,45 @@ def test_describe_tags_malformed_record_counts(aws_config):
             assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
-def test_describe_tags_filter_validation(ec2_client, aws_config, client_config):
-    name = "tag-validation-" + uuid.uuid4().hex[:12]
-    with closing(boto3.client("autoscaling", config=client_config, **aws_config)) as autoscaling:
-        with ExitStack() as cleanup:
-            image = ec2_client.register_image(
-                Name=name, Architecture="x86_64", RootDeviceName="/dev/sda1"
-            )["ImageId"]
-            cleanup.callback(ec2_client.deregister_image, ImageId=image)
-            template = ec2_client.create_launch_template(
-                LaunchTemplateName=name,
-                LaunchTemplateData={"ImageId": image, "InstanceType": "t3.micro"},
-            )["LaunchTemplate"]["LaunchTemplateId"]
-            cleanup.callback(ec2_client.delete_launch_template, LaunchTemplateId=template)
-            autoscaling.create_auto_scaling_group(
-                AutoScalingGroupName=name, MinSize=0, MaxSize=0, DesiredCapacity=0,
-                AvailabilityZones=[aws_config["region_name"] + "a"],
-                LaunchTemplate={"LaunchTemplateId": template},
-                Tags=[
-                    {"Key": "propagated", "Value": "Yes", "PropagateAtLaunch": True},
-                    {"Key": "not-propagated", "Value": "No", "PropagateAtLaunch": False},
-                ],
-            )
-            cleanup.callback(autoscaling.delete_auto_scaling_group,
-                             AutoScalingGroupName=name, ForceDelete=True)
-            group_filter = {"Name": "auto-scaling-group", "Values": [name]}
-            for filter_name, values, expected in [
-                ("KEY", ["propagated"], ["propagated"]),
-                ("\u212Aey", ["propagated"], ["propagated"]),
-                ("key", ["PROPAGATED"], []),
-                ("propagate-at-launch", ["TrUe"], ["propagated"]),
-                ("propagate-at-launch", [" false "], ["not-propagated"]),
-                ("propagate-at-launch", ["\tTRUE\n"], ["propagated"]),
-                ("propagate-at-launch", [], ["not-propagated", "propagated"]),
-            ]:
-                tags = autoscaling.describe_tags(Filters=[
-                    group_filter, {"Name": filter_name, "Values": values},
-                ])["Tags"]
-                assert sorted(tag["Key"] for tag in tags) == expected
-            for filter_value in [
-                {"Name": "key"}, {"Values": ["propagated"]},
-                {"Name": "unknown", "Values": []},
-                {"Name": "propagate-at-launch", "Values": ["1"]},
-                {"Name": "propagate-at-launch", "Values": ["tru e"]},
-            ]:
-                with pytest.raises(ClientError) as failure:
-                    autoscaling.describe_tags(Filters=[group_filter, filter_value])
-                assert failure.value.response["Error"]["Code"] == "ValidationError"
+def test_describe_tags_filter_validation(
+    autoscaling_client, test_launch_template, aws_config, unique_name
+):
+    name = unique_name
+    with ExitStack() as cleanup:
+        autoscaling_client.create_auto_scaling_group(
+            AutoScalingGroupName=name, MinSize=0, MaxSize=0, DesiredCapacity=0,
+            AvailabilityZones=[aws_config["region_name"] + "a"],
+            LaunchTemplate={"LaunchTemplateId": test_launch_template},
+            Tags=[
+                {"Key": "propagated", "Value": "Yes", "PropagateAtLaunch": True},
+                {"Key": "not-propagated", "Value": "No", "PropagateAtLaunch": False},
+            ],
+        )
+        cleanup.callback(autoscaling_client.delete_auto_scaling_group,
+                         AutoScalingGroupName=name, ForceDelete=True)
+        group_filter = {"Name": "auto-scaling-group", "Values": [name]}
+        for filter_name, values, expected in [
+            ("KEY", ["propagated"], ["propagated"]),
+            ("\u212Aey", ["propagated"], ["propagated"]),
+            ("key", ["PROPAGATED"], []),
+            ("propagate-at-launch", ["TrUe"], ["propagated"]),
+            ("propagate-at-launch", [" false "], ["not-propagated"]),
+            ("propagate-at-launch", ["\tTRUE\n"], ["propagated"]),
+            ("propagate-at-launch", [], ["not-propagated", "propagated"]),
+        ]:
+            tags = autoscaling_client.describe_tags(Filters=[
+                group_filter, {"Name": filter_name, "Values": values},
+            ])["Tags"]
+            assert sorted(tag["Key"] for tag in tags) == expected
+        for filter_value in [
+            {"Name": "key"}, {"Values": ["propagated"]},
+            {"Name": "unknown", "Values": []},
+            {"Name": "propagate-at-launch", "Values": ["1"]},
+            {"Name": "propagate-at-launch", "Values": ["tru e"]},
+        ]:
+            with pytest.raises(ClientError) as failure:
+                autoscaling_client.describe_tags(Filters=[group_filter, filter_value])
+            assert failure.value.response["Error"]["Code"] == "ValidationError"
 
 
 def test_describe_tags_pagination_validation(aws_config):

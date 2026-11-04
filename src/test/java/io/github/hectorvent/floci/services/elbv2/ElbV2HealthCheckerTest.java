@@ -5,9 +5,9 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
-import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
+import io.vertx.core.VertxOptions;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerResponse;
 import org.junit.jupiter.api.AfterEach;
@@ -19,7 +19,6 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
@@ -27,6 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -49,6 +49,48 @@ class ElbV2HealthCheckerTest {
     void closeVertx() {
         checkers.forEach(ElbV2HealthChecker::shutdown);
         vertx.close().toCompletionStage().toCompletableFuture().join();
+    }
+
+    @Test
+    void slowProbeDoesNotOccupyTheSharedVertxWorker() throws Exception {
+        Vertx isolated = Vertx.vertx(new VertxOptions().setWorkerPoolSize(1));
+        HttpServer server = null;
+        ElbV2HealthChecker checker = null;
+        CompletableFuture<HttpServerResponse> response = new CompletableFuture<>();
+        try {
+            server = isolated.createHttpServer().requestHandler(request -> response.complete(request.response()))
+                    .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+            when(config.services().elbv2().mock()).thenReturn(false);
+            checker = new ElbV2HealthChecker(isolated, config, mock(Ec2Service.class));
+            TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
+            group.setHealthCheckTimeoutSeconds(10);
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            HttpServerResponse pendingResponse = response.get(2, TimeUnit.SECONDS);
+
+            assertEquals("unrelated", assertDoesNotThrow(() -> isolated.executeBlocking(() -> "unrelated", false)
+                    .toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS)),
+                    "A probe awaiting its response must not occupy the shared worker");
+            pendingResponse.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            ElbV2HealthChecker observed = checker;
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    observed.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+        } finally {
+            try {
+                if (checker != null) {
+                    checker.shutdown();
+                }
+                if (response.isDone() && !response.join().ended()) {
+                    response.join().end();
+                }
+                if (server != null) {
+                    server.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+                }
+            } finally {
+                isolated.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            }
+        }
     }
 
     @Test
@@ -654,6 +696,55 @@ class ElbV2HealthCheckerTest {
             assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
         } finally {
             checker.stopMonitoring(group.getTargetGroupArn());
+            close(server);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false", "true"})
+    void inFlightProbeRetainsItsProtocolAndIgnoresChangedSettings(boolean changeProtocol) throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer server = vertx.createHttpServer().requestHandler(request -> {
+            requests.incrementAndGet();
+            request.response().end();
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        CompletableFuture<Void> lookupStarted = new CompletableFuture<>();
+        CompletableFuture<Void> releaseLookup = new CompletableFuture<>();
+        Ec2Service ec2 = mock(Ec2Service.class);
+        Instance instance = new Instance();
+        instance.setContainerBridgeIp("127.0.0.1");
+        when(ec2.findInstanceById(eq("000000000000"), any())).thenAnswer(invocation -> {
+            lookupStarted.complete(null);
+            releaseLookup.join();
+            return instance;
+        });
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, ec2);
+        checkers.add(checker);
+        TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
+        group.setTargetType("instance");
+        group.setHealthCheckProtocol("HTTP");
+        TargetDescription target = target("i-protocol", server.actualPort());
+        try {
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            lookupStarted.get(2, TimeUnit.SECONDS);
+            if (changeProtocol) {
+                group.setHealthCheckProtocol("HTTPS");
+            }
+            releaseLookup.complete(null);
+            await().atMost(Duration.ofSeconds(2)).until(() -> requests.get() == 1);
+            if (changeProtocol) {
+                await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
+                        assertEquals("initial", checker.getState(
+                                group.getTargetGroupArn(), target.getId(), target.getPort()),
+                                "A result for the previous settings must not change current health"));
+            } else {
+                await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
+                        assertEquals("healthy", checker.getState(
+                                group.getTargetGroupArn(), target.getId(), target.getPort())));
+            }
+        } finally {
+            releaseLookup.complete(null);
             close(server);
         }
     }

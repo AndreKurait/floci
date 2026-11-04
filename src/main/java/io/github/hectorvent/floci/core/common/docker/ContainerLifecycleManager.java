@@ -629,6 +629,8 @@ public class ContainerLifecycleManager {
      * {@link #stopAndRemove(String, Closeable)}. Resource-deletion paths that must retain their
      * persisted record for a retry use this stricter variant instead. The log stream is closed
      * only once the container is gone; when removal fails it is left open for the retry.
+     * A concurrent Docker removal is given up to five seconds to finish, followed by an
+     * independent absence check before cleanup succeeds.
      */
     public void stopAndRemoveStrict(String containerId, Closeable logStream) {
         stopAndRemoveStrict(containerId, logStream, 5);

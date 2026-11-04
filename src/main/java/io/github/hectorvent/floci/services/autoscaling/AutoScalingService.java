@@ -573,12 +573,17 @@ public class AutoScalingService implements PassedRoleLookup {
 
     private List<String> resolveAvailabilityZones(String region, List<String> availabilityZones, List<String> subnetIds) {
         if ((availabilityZones == null || availabilityZones.isEmpty()) && subnetIds != null && !subnetIds.isEmpty()) {
-            return ec2Service.describeSubnets(region, subnetIds, null).stream()
-                    .map(Subnet::getAvailabilityZone).distinct().toList();
+            List<Subnet> subnets = ec2Service.describeSubnets(region, subnetIds, null);
+            Set<String> foundIds = subnets.stream().map(Subnet::getSubnetId).collect(Collectors.toSet());
+            for (String subnetId : subnetIds) {
+                if (!foundIds.contains(subnetId)) {
+                    throw new AwsException("ValidationError", "The subnet ID '" + subnetId + "' does not exist", 400);
+                }
+            }
+            return subnets.stream().map(Subnet::getAvailabilityZone).distinct().toList();
         }
         return availabilityZones != null ? availabilityZones : List.of();
     }
-
 
     /**
      * EnableMetricsCollection: {@code Granularity} is required and 1Minute is its only valid value.

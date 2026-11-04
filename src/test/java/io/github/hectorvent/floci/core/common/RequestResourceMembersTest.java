@@ -7,6 +7,9 @@ import io.github.hectorvent.floci.core.common.RequestResourceMembers.Member;
 import io.github.hectorvent.floci.core.common.RequestResourceMembers.Resource;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedHashMap;
+import jakarta.ws.rs.core.MultivaluedMap;
+import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
@@ -14,6 +17,7 @@ import org.junit.jupiter.api.TestFactory;
 import java.io.ByteArrayInputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,7 +46,19 @@ class RequestResourceMembersTest {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
         assertTrue(table.namespaces().containsAll(List.of("cognito-idp", "ecr", "elasticloadbalancing", "states")));
         assertTrue(table.handBuilt().contains("lambda"));
-        assertTrue(table.namespaces().stream().noneMatch(table.handBuilt()::contains));
+        assertEquals(Set.of("dynamodb", "logs"), table.namespaces().stream().filter(table.handBuilt()::contains)
+                .collect(Collectors.toSet()));
+        Set<String> logsDelivery = Stream.of("PutDeliverySource", "GetDeliverySource", "DeleteDeliverySource",
+                "DescribeDeliverySources", "PutDeliveryDestination", "GetDeliveryDestination",
+                "DeleteDeliveryDestination", "DescribeDeliveryDestinations", "CreateDelivery", "GetDelivery",
+                "UpdateDeliveryConfiguration", "DeleteDelivery", "DescribeDeliveries")
+                .map(operation -> "logs:" + operation).collect(Collectors.toSet());
+        Set<String> expected = new HashSet<>(logsDelivery);
+        expected.add("dynamodb:ListTables");
+        assertEquals(expected, table.operations().keySet().stream()
+                .filter(operation -> table.handBuilt().contains(operation.substring(0, operation.indexOf(':'))))
+                .collect(Collectors.toSet()),
+                "only explicit corrections and the operations listed to read override hand-built operations");
         assertTrue(table.namespaces().stream().noneMatch(table.notCovered()::contains));
         assertTrue(table.otherNamespaces().stream().noneMatch(table.notCovered()::contains));
         table.operations().forEach((operation, resources) -> {
@@ -124,10 +140,17 @@ class RequestResourceMembersTest {
         assertEquals(new Member("SessionId", false), parseUnchecked(document(formats,
                 "{\"types\":[\"cluster\",\"group\"],\"through\":\"SessionId\",\"endpoint\":\"a\"}"))
                 .operations().get("a:Op").getFirst().through());
-        // No types, a type with no format, no member of one value, or beside members reading it otherwise.
+        // A list's structures' field names one through each of its values, when another member is absent.
+        Resource each = parseUnchecked(document(formats, "{\"types\":[\"group\"],\"through\":\"Parts[].PartId\","
+                + "\"when\":{\"GroupId\":[null]}}")).operations().get("a:Op").getFirst();
+        assertEquals(new Member("Parts", true, new Member("PartId", false)), each.through());
+        assertEquals(Map.of("GroupId", List.of("")), each.when());
+        // No types, a type with no format, no member, or beside members reading it otherwise.
         for (String bad : List.of("\"types\":[],\"through\":\"SessionId\"",
-                "\"types\":[\"pool\"],\"through\":\"SessionId\"", "\"types\":[\"group\"],\"through\":\"Ids[]\"",
-                "\"types\":[\"group\"],\"through\":\"Session.Id\"",
+                "\"types\":[\"pool\"],\"through\":\"SessionId\"", "\"types\":[\"group\"],\"through\":\"Ids[][]\"",
+                "\"types\":[\"group\"],\"through\":\"Session.Id.Part\"",
+                "\"types\":[\"group\"],\"through\":\"SessionId\",\"unless\":{\"GroupId\":[null]}",
+                "\"types\":[\"group\"],\"through\":\"SessionId\",\"when\":{\"Ids[]\":[\"a\"]}",
                 "\"types\":[\"group\"],\"through\":\"SessionId\",\"arn\":\"GroupArn\"",
                 "\"types\":[\"group\"],\"through\":\"SessionId\",\"before\":\"#\"",
                 "\"type\":\"group\",\"fill\":{},\"through\":\"SessionId\"")) {
@@ -256,9 +279,11 @@ class RequestResourceMembersTest {
 
     /**
      * Each resource alone, from a request naming it and nothing else, gives exactly its ARN, in the account its
-     * account member names when it has one, with those sharing its explicit member selector and those the operation
-     * always names, such as a create's new resource (Cloud Map's {@code CreateService}); one named through another
-     * resource of its service's own, the ARN its service gives for that.
+     * account member names when it has one, with those sharing its explicit member selector, those the operation
+     * always names, such as a create's new resource (Cloud Map's {@code CreateService}), and those filled from the ARN
+     * it is read from (a permission set made in an instance); one named through another resource of its service's
+     * own, the ARN its service gives for that. A member the table locates in a REST request's path or query is given
+     * there, a body giving it naming nothing, and such a request is not checked as a form.
      */
     @TestFactory
     Stream<DynamicTest> everyResourceOfTheTableIsReadFromAJsonBodyAndAForm() {
@@ -287,12 +312,24 @@ class RequestResourceMembersTest {
                             given.put(new Member(member, false), allowed.getFirst());
                         }
                     });
+                    // A member the table locates in a REST request's path or query goes there, where the reader takes it
+                    // from; a REST request has no form, so the form is checked for an operation locating none.
+                    Map<String, String> located = table.located().getOrDefault(operation.getKey(), Map.of());
+                    Map<String, String> labels = new LinkedHashMap<>();
+                    MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
                     given.forEach((member, value) -> {
-                        put(body, member, value);
+                        String where = member.field() == null && !member.list() ? located.get(member.name()) : null;
+                        if (where == null) {
+                            put(body, member, value);
+                        } else if (where.startsWith("{")) {
+                            labels.put(where.substring(1, where.length() - 1), value);
+                        } else {
+                            query.add(where.substring(1), value);
+                        }
                         form.append('&').append(parameter(member)).append('=').append(encoded(value));
                     });
                     List<String> named = operation.getValue().stream()
-                            .filter(other -> (other == resource || named(other)
+                            .filter(other -> (other == resource || named(other) || fillsFromTheArn(other, resource)
                                     || !other.find().isEmpty() && other.find().equals(resource.find())
                                     && other.when().equals(resource.when()) && other.unless().equals(resource.unless()))
                                     && (other.endpoint() == null || resource.endpoint() == null
@@ -302,12 +339,17 @@ class RequestResourceMembersTest {
                                     "000000000000"))
                             .distinct().toList();
                     StoredResourceArns stored = runningOn(namespace, arn);
-                    assertEquals(named, RequestResources.of(operation.getKey(),
-                            servedBy(json(body.toString()), resource.endpoint()), "aws", "us-east-1", "000000000000",
-                            stored), body.toString());
-                    assertEquals(named, RequestResources.of(operation.getKey(),
-                            servedBy(form(form.toString()), resource.endpoint()), "aws", "us-east-1", "000000000000",
-                            stored), form.toString());
+                    ContainerRequestContext request = servedBy(json(body.toString()), resource.endpoint());
+                    UriInfo uriInfo = mock(UriInfo.class);
+                    when(uriInfo.getQueryParameters()).thenReturn(query);
+                    when(request.getUriInfo()).thenReturn(uriInfo);
+                    assertEquals(named, RequestResources.of(operation.getKey(), request, "aws", "us-east-1",
+                            "000000000000", stored, labels), body + " " + labels + " " + query);
+                    if (given.keySet().stream().noneMatch(member -> located.containsKey(member.name()))) {
+                        assertEquals(named, RequestResources.of(operation.getKey(),
+                                servedBy(form(form.toString()), resource.endpoint()), "aws", "us-east-1",
+                                "000000000000", stored), form.toString());
+                    }
                 })));
     }
 
@@ -337,6 +379,17 @@ class RequestResourceMembersTest {
                 })));
     }
 
+    /**
+     * Whether a resource fills its variables from the ARN the other's member holds, as that ARN's type's variable alone
+     * (a permission set made in the instance an {@code InstanceArn} names), so a request naming the other by an ARN of
+     * its first type, which the test gives, names it too.
+     */
+    private static boolean fillsFromTheArn(Resource resource, Resource other) {
+        return other.arn() != null && !resource.fill().isEmpty()
+                && resource.fill().values().stream().allMatch(other.arn()::equals)
+                && other.types().getFirst().equals(resource.arnOf().get(other.arn().path()));
+    }
+
     /** Whether every request of its operation names the resource: no member names it and no member's value selects it. */
     private static boolean named(Resource resource) {
         return resource.arn() == null && resource.fill().isEmpty() && resource.find().isEmpty()
@@ -357,8 +410,8 @@ class RequestResourceMembersTest {
             }
 
             @Override
-            public Optional<String> through(String member, String value, String region) {
-                return Optional.of(arn);
+            public List<String> through(String member, String value, String region) {
+                return List.of(arn);
             }
         };
     }

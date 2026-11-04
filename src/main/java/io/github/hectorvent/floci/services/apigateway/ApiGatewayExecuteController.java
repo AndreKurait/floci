@@ -201,7 +201,12 @@ public class ApiGatewayExecuteController {
     static final Pattern ELB_LISTENER_ARN = Pattern.compile(
             "^arn:" + AwsArnUtils.PARTITION_REGEX + ":elasticloadbalancing:([^:]+):[^:]*:listener/(?:app|net)/.+$");
 
-    private record AuthorizerResult(Response errorResponse, String principalId, Map<String, Object> context) {}
+    private record AuthorizerResult(Response errorResponse, String principalId, Map<String, Object> context,
+                                    String usageIdentifierKey) {
+        AuthorizerResult(Response errorResponse, String principalId, Map<String, Object> context) {
+            this(errorResponse, principalId, context, null);
+        }
+    }
 
     /**
      * What a gateway-generated error needs in order to render the REST API's gateway response for
@@ -528,8 +533,11 @@ public class ApiGatewayExecuteController {
         }
         scope = scope.withResource(matched);
 
-        // 1. Authorizer
-        ResolvedApiKey resolvedApiKey = resolveApiKeyForRequest(region, apiId, stageName, headers);
+        // 1. Authorizer. With apiKeySource AUTHORIZER the x-api-key header is not read: the key is
+        // the usageIdentifierKey the Lambda authorizer returns, resolved once it has run.
+        boolean keyFromAuthorizer = apiGatewayService.getRestApi(region, apiId).readsApiKeyFromAuthorizer();
+        ResolvedApiKey resolvedApiKey = keyFromAuthorizer ? null
+                : resolveApiKey(region, apiId, stageName, headers.getHeaderString("x-api-key"));
 
         // AWS_IAM is verified before the CUSTOM authorizer path because it gates the request on the
         // caller's signature rather than on a Lambda's verdict, and a method carries one
@@ -565,6 +573,10 @@ public class ApiGatewayExecuteController {
         scope = scope.withIdentity(resolvedApiKey, iamIdentity);
         AuthorizerResult authorizerResult = invokeAuthorizer(scope, region, apiId, stageName, httpMethod, path, matched.getPath(), matched.getId(), stage, method, headers, uriInfo, resolvedApiKey);
         if (authorizerResult.errorResponse() != null) return authorizerResult.errorResponse();
+        if (keyFromAuthorizer) {
+            resolvedApiKey = resolveApiKey(region, apiId, stageName, authorizerResult.usageIdentifierKey());
+            scope = scope.withIdentity(resolvedApiKey, iamIdentity);
+        }
 
         String authorizationType = method.getAuthorizationType();
         if (authorizationType == null || "NONE".equalsIgnoreCase(authorizationType)
@@ -578,7 +590,7 @@ public class ApiGatewayExecuteController {
         }
 
         // API Gateway checks the API key requirement after authorization but before request
-        // validation and throttling. resolvedApiKey is null when the header is missing or matches
+        // validation and throttling. resolvedApiKey is null when the key is missing or matches
         // no enabled key linked to this (apiId, stage) through a usage plan.
         if (method.isApiKeyRequired() && resolvedApiKey == null) {
             return gatewayResponse(scope, GatewayResponseType.INVALID_API_KEY, 403, "Forbidden");
@@ -794,8 +806,13 @@ public class ApiGatewayExecuteController {
         pathMap.putAll(extractPathParams(resource.getPath(), path));
         pathMap.putAll(greedyPathParam(resource.getPath(), path));
 
+        String rawPath = rawStagelessPath(path, uriInfo.getRequestUri().getRawPath());
+        Map<String, String> rawPathMap = new LinkedHashMap<>();
+        rawPathMap.putAll(extractPathParams(resource.getPath(), rawPath));
+        rawPathMap.putAll(greedyPathParam(resource.getPath(), rawPath));
+
         HttpRequestParameters mapped = mapHttpRequestParameters(scope, integration, mappingContext,
-                pathMap, multiValueHeaders, multiValueQuery);
+                pathMap, rawPathMap, multiValueHeaders, multiValueQuery);
         Map<String, String> outHeaders = joinedParameterValues(mapped.headers());
         Map<String, String> outQuery = joinedParameterValues(mapped.query());
         Map<String, String> outPath = mapped.path();
@@ -819,7 +836,7 @@ public class ApiGatewayExecuteController {
                         routeContext.sourceIp(),
                         outHeaders, outQuery, outPath, body,
                         Map.of(), Map.of(),
-                        multiValueHeaders, multiValueQuery);
+                        multiValueHeaders, multiValueQuery, mapped.rawPath());
 
         LOG.debugv("execute-api: {0} {1}/{2}{3} → HTTP_PROXY {4}",
                 httpMethod, apiId, stageName, path, uri);
@@ -1098,6 +1115,13 @@ public class ApiGatewayExecuteController {
         if (proxy != null && !proxy.isEmpty()) pathMap.put("proxy", proxy);
         pathMap.putAll(extractPathParams(resource.getPath(), path));
 
+        String rawPath = rawStagelessPath(path, uriInfo.getRequestUri().getRawPath());
+        Map<String, String> rawPathMap = new HashMap<>();
+        if (rawPath != null && pathMap.containsKey("proxy")) {
+            rawPathMap.put("proxy", rawPath.substring(1));
+        }
+        rawPathMap.putAll(extractPathParams(resource.getPath(), rawPath));
+
         String incomingContentType = headerMap.getOrDefault("Content-Type",
                 headerMap.getOrDefault("content-type", "application/json"));
 
@@ -1112,7 +1136,7 @@ public class ApiGatewayExecuteController {
         // Only explicitly mapped parameters reach the backend — the defining difference from
         // HTTP_PROXY, which seeds the outgoing request with every inbound header and query param.
         HttpRequestParameters mapped = mapHttpRequestParameters(scope, integration, mappingContext,
-                pathMap, Map.of(), Map.of());
+                pathMap, rawPathMap, Map.of(), Map.of());
         Map<String, String> outHeaders = joinedParameterValues(mapped.headers());
         Map<String, String> outQuery = joinedParameterValues(mapped.query());
         Map<String, String> outPath = mapped.path();
@@ -1146,7 +1170,7 @@ public class ApiGatewayExecuteController {
                         outPath.getOrDefault("proxy", ""), resource.getPath(),
                         requestId, routeContext.sourceIp(),
                         outHeaders, outQuery, outPath, payload,
-                        Map.of(), Map.of(), mapped.headers(), mapped.query());
+                        Map.of(), Map.of(), mapped.headers(), mapped.query(), mapped.rawPath());
 
         LOG.debugv("execute-api: {0} {1}/{2}{3} → HTTP {4}", httpMethod, apiId, stageName, path, uri);
 
@@ -1280,7 +1304,8 @@ public class ApiGatewayExecuteController {
             if (!restLambdaAuthorizer.permits(verified, methodArn, conditions, resourceDecision)) {
                 return authorizerError(scope, GatewayResponseType.ACCESS_DENIED, 403);
             }
-            return new AuthorizerResult(null, verified.principalId(), verified.context());
+            return new AuthorizerResult(null, verified.principalId(), verified.context(),
+                    verified.usageIdentifierKey());
         } catch (Exception exception) {
             LOG.warnv("Authorizer failure: {0}", exception.getMessage());
             return authorizerError(scope, GatewayResponseType.AUTHORIZER_FAILURE, 500);
@@ -1540,15 +1565,15 @@ public class ApiGatewayExecuteController {
     }
 
     /**
-     * Resolves the API key id and value for a request by matching the {@code x-api-key} header
-     * against usage plan keys linked to this (apiId, stageName) pair.
+     * Resolves the API key id and value for a request by matching the key value it carries (the
+     * {@code x-api-key} header, or a Lambda authorizer's {@code usageIdentifierKey}) against usage
+     * plan keys linked to this (apiId, stageName) pair.
      *
-     * <p>Returns {@code null} when the header is missing or does not match any enabled key linked
+     * <p>Returns {@code null} when the value is missing or does not match any enabled key linked
      * to this (apiId, stage) through a usage plan.
      */
-    private ResolvedApiKey resolveApiKeyForRequest(String region, String apiId, String stageName, HttpHeaders headers) {
-        String keyHeader = headers.getHeaderString("x-api-key");
-        if (keyHeader == null || keyHeader.isBlank()) {
+    private ResolvedApiKey resolveApiKey(String region, String apiId, String stageName, String keyValue) {
+        if (keyValue == null || keyValue.isBlank()) {
             return null;
         }
         // Find all usage plans that include this (apiId, stage) pair
@@ -1559,7 +1584,7 @@ public class ApiGatewayExecuteController {
             // Check if any key in this plan matches the header value. The usage plan key holds a copy
             // of the value, so the key itself must still exist and be enabled for the match to count.
             for (UsagePlanKey planKey : apiGatewayService.getUsagePlanKeys(region, plan.getId())) {
-                if (!keyHeader.equals(planKey.getValue())) {
+                if (!keyValue.equals(planKey.getValue())) {
                     continue;
                 }
                 if (apiGatewayService.findApiKey(region, planKey.getId())
@@ -2470,18 +2495,20 @@ public class ApiGatewayExecuteController {
     }
 
     private record HttpRequestParameters(Map<String, List<String>> headers, Map<String, List<String>> query,
-                                         Map<String, String> path) { }
+                                         Map<String, String> path, Map<String, String> rawPath) { }
 
     private HttpRequestParameters mapHttpRequestParameters(GatewayResponseScope scope, Integration integration,
                                                             Map<String, Object> context, Map<String, String> path,
+                                                            Map<String, String> rawPath,
                                                             Map<String, List<String>> headers,
                                                             Map<String, List<String>> query) {
         Map<String, List<String>> outHeaders = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         outHeaders.putAll(headers);
         Map<String, List<String>> outQuery = new LinkedHashMap<>(query);
         Map<String, String> outPath = new LinkedHashMap<>(path);
+        Map<String, String> outRawPath = new LinkedHashMap<>(rawPath);
         if (integration.getRequestParameters() == null) {
-            return new HttpRequestParameters(outHeaders, outQuery, outPath);
+            return new HttpRequestParameters(outHeaders, outQuery, outPath, outRawPath);
         }
         for (Map.Entry<String, String> mapping : integration.getRequestParameters().entrySet()) {
             String destination = mapping.getKey();
@@ -2499,10 +2526,19 @@ public class ApiGatewayExecuteController {
             } else if (values != null && destination.startsWith("integration.request.querystring.")) {
                 outQuery.put(destination.substring("integration.request.querystring.".length()), values);
             } else if (values != null && destination.startsWith("integration.request.path.")) {
-                outPath.put(destination.substring("integration.request.path.".length()), String.join(",", values));
+                String name = destination.substring("integration.request.path.".length());
+                outPath.put(name, String.join(",", values));
+                // Only a value copied from the request path has a caller's encoding to keep.
+                String rawValue = source.startsWith("method.request.path.")
+                        ? rawPath.get(source.substring("method.request.path.".length())) : null;
+                if (rawValue != null) {
+                    outRawPath.put(name, rawValue);
+                } else {
+                    outRawPath.remove(name);
+                }
             }
         }
-        return new HttpRequestParameters(outHeaders, outQuery, outPath);
+        return new HttpRequestParameters(outHeaders, outQuery, outPath, outRawPath);
     }
 
     private static Map<String, String> joinedParameterValues(Map<String, List<String>> parameters) {
@@ -3204,6 +3240,8 @@ public class ApiGatewayExecuteController {
             queryParams.put(e.getKey(), String.join(",", e.getValue()));
         }
         Map<String, String> pathParams = extractV2PathParams(route.getRouteKey(), path);
+        String rawPath = rawStagelessPath(path, uriInfo.getRequestUri().getRawPath());
+        Map<String, String> rawPathParams = rawPath == null ? Map.of() : extractV2PathParams(route.getRouteKey(), rawPath);
 
         // Reuses the claims dispatchV2 already verified via enforceJwtAuthorizer, rather than
         // independently re-extracting a token and re-parsing it here: extractBearerToken only
@@ -3226,7 +3264,7 @@ public class ApiGatewayExecuteController {
                         pathParams.getOrDefault("proxy", ""), route.getRouteKey(),
                         UUID.randomUUID().toString(), sourceIp,
                         requestHeaders, queryParams, pathParams, body,
-                        claims, authorizerContext, backendHeaders, multiValueQueryParams);
+                        claims, authorizerContext, backendHeaders, multiValueQueryParams, rawPathParams);
 
         LOG.debugv("execute-api v2: {0} {1}/{2}{3} → HTTP_PROXY {4}",
                 httpMethod, apiId, stageName, path, effective.getIntegrationUri());
@@ -4603,6 +4641,33 @@ public class ApiGatewayExecuteController {
 
     private static String proxyTargetPath(String normalizedPath, UriInfo uriInfo, String stageName) {
         return rawTargetPath(normalizedPath, uriInfo.getRequestUri().getRawPath(), stageName);
+    }
+
+    /**
+     * The request path after the stage, as the caller encoded it, for reading path parameters off.
+     * A trailing slash goes only when {@code normalizedPath} lost it too, so the segments line up with
+     * the path the route was matched on. Null for a raw path in no known execute-api URL form, whose
+     * parameters are then encoded from their decoded values.
+     */
+    static String rawStagelessPath(String normalizedPath, String rawRequestPath) {
+        if (rawRequestPath == null) {
+            return null;
+        }
+        int prefixSegments;
+        if (rawRequestPath.startsWith("/execute-api/")) {
+            prefixSegments = 3;
+        } else if (rawRequestPath.startsWith("/_aws/execute-api/") || rawRequestPath.startsWith("/restapis/")) {
+            prefixSegments = 4;
+        } else {
+            return null;
+        }
+        int start = 0;
+        for (int segment = 0; segment < prefixSegments && start >= 0; segment++) {
+            start = rawRequestPath.indexOf('/', start + 1);
+        }
+        String stageless = start >= 0 ? rawRequestPath.substring(start) : "/";
+        boolean slashLost = stageless.length() > 1 && stageless.endsWith("/") && !normalizedPath.endsWith("/");
+        return slashLost ? stageless.substring(0, stageless.length() - 1) : stageless;
     }
 
     /**

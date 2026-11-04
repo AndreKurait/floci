@@ -107,7 +107,8 @@ class LambdaVpcResourceValidationIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"missing-subnet", "missing-group", "missing-second-subnet", "missing-second-group",
-            "mixed-subnets", "mixed-groups", "only-subnets", "only-groups"})
+            "mixed-subnets", "mixed-groups", "only-subnets", "only-groups",
+            "unknown-with-mixed-subnets", "unknown-with-mixed-groups"})
     void invalidVpcResourcesCannotCreateAFunction(String kind) {
         VpcConfig config = switch (kind) {
             case "missing-subnet" -> VpcConfig.builder().subnetIds("subnet-fffffffffffffffff")
@@ -122,6 +123,12 @@ class LambdaVpcResourceValidationIntegrationTest {
                     .securityGroupIds(first.group()).build();
             case "mixed-groups" -> VpcConfig.builder().subnetIds(first.subnet())
                     .securityGroupIds(first.group(), second.group()).build();
+            case "unknown-with-mixed-subnets" -> VpcConfig.builder()
+                    .subnetIds(first.subnet(), "subnet-fffffffffffffffff", second.subnet())
+                    .securityGroupIds(first.group()).build();
+            case "unknown-with-mixed-groups" -> VpcConfig.builder()
+                    .subnetIds("subnet-fffffffffffffffff")
+                    .securityGroupIds(first.group(), "sg-fffffffffffffffff", second.group()).build();
             case "only-subnets" -> VpcConfig.builder().subnetIds(first.subnet()).build();
             case "only-groups" -> VpcConfig.builder().securityGroupIds(first.group()).build();
             default -> throw new IllegalArgumentException(kind);

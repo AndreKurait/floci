@@ -65,6 +65,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.Semaphore;
@@ -101,6 +102,9 @@ public class Ec2ContainerManager {
     private static final int LAUNCH_QUEUE_CAPACITY = 64;
     // ponytail: a fixed cap on concurrent post-start IMDS setups; a start beyond it skips the setup.
     private static final int METADATA_SETUP_CONCURRENCY = 16;
+    /** Real host public keys, one line per type, come to well under a kilobyte together. */
+    static final int SSH_HOST_KEYS_MAX_BYTES = 16 * 1024;
+    private static final int SSH_HOST_KEYS_STDERR_BYTES = 1024;
     private static final long USER_DATA_EXECUTION_TIMEOUT_MINUTES = 30;
     private static final Pattern ENVIRONMENT_KEY = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
     private static final Pattern PROCESS_LIMIT = Pattern.compile("([a-z][a-z0-9]*)=(-1|[0-9]+)(?::(-1|[0-9]+))?");
@@ -186,6 +190,11 @@ public class Ec2ContainerManager {
     private final AtomicBoolean terminationRetriesStarted = new AtomicBoolean();
     private final SweepWorker terminationRetries = new SweepWorker(
             "ec2-termination-retry", true, 1, false, this::retryPendingTerminations);
+    /** Instances whose service-network lookup failed and is retried on the next address read. */
+    private final Set<String> serviceNetworkRetries = ConcurrentHashMap.newKeySet();
+    private final Set<String> serviceNetworkRetriesRunning = ConcurrentHashMap.newKeySet();
+    /** Runs service-network lookup retries; see {@link #createServiceNetworkRetryExecutor}. */
+    private final ExecutorService serviceNetworkRetryExecutor;
     private final Duration userDataExecutionTimeout;
     private final Set<ResultCallback<Frame>> activeUserDataCallbacks = ConcurrentHashMap.newKeySet();
 
@@ -224,11 +233,10 @@ public class Ec2ContainerManager {
             return null;
         }
         InspectContainerResponse worker = dockerClient.inspectContainerCmd(containerId).exec();
-        String mode = worker.getHostConfig() == null ? null : worker.getHostConfig().getNetworkMode();
-        if (mode == null || !mode.startsWith("container:")) {
+        String helperId = namespaceOwnerId(worker);
+        if (helperId == null) {
             return null;
         }
-        String helperId = mode.substring("container:".length());
         InspectContainerResponse helper = dockerClient.inspectContainerCmd(helperId).exec();
         Map<String, String> labels = helper.getConfig().getLabels();
         boolean securityGroupsEnforced = ALIASES.matches(labels, ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true");
@@ -247,6 +255,15 @@ public class Ec2ContainerManager {
 
     private record ProtectedNamespace(String helperId, String transportAddress, String privateAddress,
                                       boolean securityGroupsEnforced) {}
+
+    /**
+     * The container whose network namespace this one joined through a {@code container:} network
+     * mode, as a security-group protected guest joins its firewall helper's; null when it has its own.
+     */
+    private static String namespaceOwnerId(InspectContainerResponse container) {
+        String mode = container.getHostConfig() == null ? null : container.getHostConfig().getNetworkMode();
+        return mode != null && mode.startsWith("container:") ? mode.substring("container:".length()) : null;
+    }
 
     public void restoreSecurityGroups(Instance instance, String region, List<SecurityGroup> groups,
                                       Map<String, List<String>> prefixLists) {
@@ -332,7 +349,8 @@ public class Ec2ContainerManager {
         this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver, dockerClient,
                 portAllocator, config, metadataServer, portForwardManager, regionResolver,
                 containerNetworkReachability, vpcNetworkManager, reachableEndpoint, instanceTypeCatalog,
-                createLaunchExecutor(), Duration.ofMinutes(USER_DATA_EXECUTION_TIMEOUT_MINUTES));
+                createLaunchExecutor(), createServiceNetworkRetryExecutor(),
+                Duration.ofMinutes(USER_DATA_EXECUTION_TIMEOUT_MINUTES));
     }
 
     public Ec2ContainerManager(ContainerBuilder containerBuilder,
@@ -370,6 +388,7 @@ public class Ec2ContainerManager {
                         ContainerReachableEndpoint reachableEndpoint,
                         Ec2InstanceTypeCatalog instanceTypeCatalog,
                         ExecutorService executor,
+                        ExecutorService serviceNetworkRetryExecutor,
                         Duration userDataExecutionTimeout) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -388,6 +407,7 @@ public class Ec2ContainerManager {
         this.instanceTypeCatalog = instanceTypeCatalog != null ? instanceTypeCatalog : new Ec2InstanceTypeCatalog();
         this.metadataNamespaces = new Ec2MetadataNamespace(dockerClient, containerBuilder, lifecycleManager, config);
         this.executor = executor;
+        this.serviceNetworkRetryExecutor = serviceNetworkRetryExecutor;
         this.userDataExecutionTimeout = userDataExecutionTimeout;
     }
 
@@ -410,7 +430,15 @@ public class Ec2ContainerManager {
         this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver, dockerClient,
                 portAllocator, config, metadataServer, portForwardManager, regionResolver,
                 containerNetworkReachability, vpcNetworkManager, reachableEndpoint, new Ec2InstanceTypeCatalog(),
-                executor, userDataExecutionTimeout);
+                executor, createServiceNetworkRetryExecutor(), userDataExecutionTimeout);
+    }
+
+    /**
+     * Its own virtual threads, never {@link #createLaunchExecutor}'s: that pool blocks a full queue's
+     * submitters, and a launch worker waiting on it for a retry could stall them all.
+     */
+    private static ExecutorService createServiceNetworkRetryExecutor() {
+        return Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("ec2-service-network-retry-", 0).factory());
     }
 
     private static ExecutorService createLaunchExecutor() {
@@ -433,6 +461,7 @@ public class Ec2ContainerManager {
         closeActiveUserDataCallbacks();
         executor.shutdownNow();
         terminationRetries.stop();
+        serviceNetworkRetryExecutor.shutdownNow();
         closeActiveUserDataCallbacks();
         try {
             if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
@@ -559,6 +588,7 @@ public class Ec2ContainerManager {
                     return;
                 }
 
+                refreshServiceNetworkIp(instance);
 
                 // Set public-facing addresses only for instances due one, by the rule mock instances
                 // follow too, or holding an Elastic IP their interface carries, which RunInstances
@@ -952,6 +982,8 @@ public class Ec2ContainerManager {
                 instance.setDockerContainerId(null);
                 instance.setSshHostPort(0);
                 instance.setContainerBridgeIp(null);
+                instance.setServiceNetworkIp(null);
+                serviceNetworkRetries.remove(instance.getInstanceId());
             }
         }
         synchronized (cleanup) {
@@ -1262,6 +1294,7 @@ public class Ec2ContainerManager {
                         : namespace.privateAddress();
                 if (containerIp != null && !containerIp.isBlank()) {
                     instance.setContainerBridgeIp(containerIp);
+                    refreshServiceNetworkIp(instance);
                     if (namespace == null) {
                         exposeReachablePrivateAddress(instance, containerIp,
                                 config.services().ec2().awsFaithfulPrivateIp());
@@ -1466,6 +1499,7 @@ public class Ec2ContainerManager {
             metadataServer.unregisterContainer(previousContainerIp, instance);
         }
         instance.setContainerBridgeIp(containerIp);
+        refreshServiceNetworkIp(instance);
         if (firewallManager == null || !firewallManager.enabled()) {
             exposeReachablePrivateAddress(instance, containerIp, config.services().ec2().awsFaithfulPrivateIp());
         }
@@ -1574,6 +1608,13 @@ public class Ec2ContainerManager {
         if (instance == null) {
             return null;
         }
+        if (config.services().ec2().publicIpFromServiceNetwork()) {
+            retryServiceNetworkIp(instance);
+            String serviceNetworkIp = instance.getServiceNetworkIp();
+            if (serviceNetworkIp != null && !serviceNetworkIp.isBlank()) {
+                return serviceNetworkIp;
+            }
+        }
         String containerIp = instance.getContainerPublicIp() != null
                 ? instance.getContainerPublicIp() : instance.getContainerBridgeIp();
         if (containerIp == null || containerIp.isBlank()) {
@@ -1594,6 +1635,94 @@ public class Ec2ContainerManager {
             }
         }
         instance.setContainerPublicIp(primary);
+    }
+
+    /**
+     * Records the instance's address on Floci's own Docker network, when
+     * {@code publicIpFromServiceNetwork} is on and Floci runs as a container, so
+     * {@link #reachablePublicAddress} reports it without asking Docker. Called where the container's
+     * addresses are (re)learned: launch, start and restore.
+     */
+    void refreshServiceNetworkIp(Instance instance) {
+        String instanceId = instance.getInstanceId();
+        // The container is the lookup's generation: a result is published only while the instance
+        // still runs that container, so a lookup that outlives a replacement or a teardown cannot
+        // overwrite what came after it. Docker is asked outside the instance lock.
+        String containerId;
+        synchronized (instance) {
+            containerId = instance.getDockerContainerId();
+        }
+        String address;
+        try {
+            address = resolveServiceNetworkIp(instanceId, containerId);
+        } catch (RuntimeException e) {
+            synchronized (instance) {
+                if (containerId != null && containerId.equals(instance.getDockerContainerId())) {
+                    // A Docker hiccup is not an answer: keep what was recorded and let the next
+                    // address read retry the lookup in the background.
+                    serviceNetworkRetries.add(instanceId);
+                }
+            }
+            LOG.debugv("Could not read the service-network address of {0}, will retry: {1}",
+                    instanceId, e.getMessage());
+            return;
+        }
+        synchronized (instance) {
+            if (!Objects.equals(containerId, instance.getDockerContainerId())) {
+                return;
+            }
+            instance.setServiceNetworkIp(address);
+            serviceNetworkRetries.remove(instanceId);
+        }
+    }
+
+    /**
+     * Retries a failed {@link #refreshServiceNetworkIp} in the background, at most one attempt per
+     * instance at a time, so the address read that notices it never waits on Docker.
+     */
+    private void retryServiceNetworkIp(Instance instance) {
+        String instanceId = instance.getInstanceId();
+        if (!serviceNetworkRetries.contains(instanceId) || !serviceNetworkRetriesRunning.add(instanceId)) {
+            return;
+        }
+        try {
+            serviceNetworkRetryExecutor.execute(() -> {
+                try {
+                    refreshServiceNetworkIp(instance);
+                } finally {
+                    serviceNetworkRetriesRunning.remove(instanceId);
+                }
+            });
+        } catch (RuntimeException e) {
+            // Only a shutting-down executor refuses; the next address read tries again.
+            serviceNetworkRetriesRunning.remove(instanceId);
+            LOG.warnv("Could not schedule the service-network lookup retry for {0}: {1}",
+                    instanceId, e.getMessage());
+        }
+    }
+
+    private String resolveServiceNetworkIp(String instanceId, String containerId) {
+        if (!config.services().ec2().publicIpFromServiceNetwork() || !containerDetector.isRunningInContainer()
+                || containerId == null) {
+            return null;
+        }
+        Optional<String> network = containerBuilder.resolveDockerNetwork(Optional.empty());
+        if (network.isEmpty()) {
+            return null;
+        }
+        InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
+        // A security-group protected guest joins its firewall helper's network namespace and has
+        // no attachment of its own: the helper's address on the network is the guest's.
+        String helperId = namespaceOwnerId(inspect);
+        if (helperId != null) {
+            inspect = dockerClient.inspectContainerCmd(helperId).exec();
+        }
+        if (inspect.getNetworkSettings() == null || inspect.getNetworkSettings().getNetworks() == null) {
+            return null;
+        }
+        ContainerNetwork attached = inspect.getNetworkSettings().getNetworks().get(network.get());
+        return attached == null || attached.getIpAddress() == null || attached.getIpAddress().isBlank()
+                ? null : attached.getIpAddress();
     }
 
     /**
@@ -2217,4 +2346,27 @@ public class Ec2ContainerManager {
     static Optional<String> preferredMetadataSourceIp(Map<String, ContainerNetwork> networks) {
         return Ec2MetadataProxy.preferredMetadataSourceIp(networks);
     }
+
+    /**
+     * The instance's SSH host public keys, read from its running container. AWS prints these to
+     * the console log at first boot (cloud-init's "SSH HOST KEY KEYS" block), which is how a
+     * client verifies the host it connects to.
+     */
+    public String readSshHostKeys(String containerId) {
+        String[] cmd = {"sh", "-c", "for f in /etc/ssh/ssh_host_*_key.pub; do [ -f \"$f\" ] && cat \"$f\"; done"};
+        // The files are the guest's to write, so capture no more than real host keys can take.
+        UserDataPipeline.BoundedOutput stdout = new UserDataPipeline.BoundedOutput(SSH_HOST_KEYS_MAX_BYTES);
+        UserDataPipeline.BoundedOutput stderr = new UserDataPipeline.BoundedOutput(SSH_HOST_KEYS_STDERR_BYTES);
+        ContainerExec.Result result = ContainerExec.run(dockerClient, containerId, cmd, 15, stdout, stderr);
+        if (result.exitCode() != 0) {
+            return "";
+        }
+        if (stdout.truncated()) {
+            LOG.warnv("Ignoring SSH host keys of container {0}: {1} bytes exceed the {2}-byte limit",
+                    containerId, stdout.totalBytes(), SSH_HOST_KEYS_MAX_BYTES);
+            return "";
+        }
+        return new String(stdout.toByteArray(), StandardCharsets.UTF_8);
+    }
+
 }

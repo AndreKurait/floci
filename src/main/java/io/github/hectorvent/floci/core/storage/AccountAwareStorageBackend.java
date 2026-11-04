@@ -77,10 +77,7 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
 
     @Override
     public void putAll(Map<String, V> entries) {
-        String prefix = prefix() + "/";
-        Map<String, V> prefixedEntries = new LinkedHashMap<>();
-        entries.forEach((key, value) -> prefixedEntries.put(prefix + key, value));
-        delegate.putAll(prefixedEntries);
+        putAllForAccount(prefix(), entries);
     }
 
     @Override
@@ -201,6 +198,11 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     /** Scans all values across every account, without any account prefix filtering. */
     public List<V> scanAllAccounts() {
         return delegate.scan(k -> true);
+    }
+
+    /** Whether no account holds a value. */
+    public boolean isEmptyInAllAccounts() {
+        return delegate.isEmpty();
     }
 
     /** Removes matching values using their actual stored keys, including unprefixed legacy keys. */
@@ -469,6 +471,7 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         Map<String, V> prefixedEntries = new LinkedHashMap<>();
         entries.forEach((key, value) -> prefixedEntries.put(prefix + key, value));
         delegate.putAll(prefixedEntries);
+        trackOwner(accountId);
     }
 
     public void deleteForAccount(String accountId, String key) {
@@ -531,6 +534,19 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     public List<V> scanForAccount(String accountId, Predicate<String> keyFilter) {
         String prefix = accountId + "/";
         return delegate.scan(k -> k.startsWith(prefix) && keyFilter.test(k.substring(prefix.length())));
+    }
+
+    /**
+     * Scans with a filter that sees the stored key, {@code accountId + "/" + relativeKey}, so a prefix
+     * test can run without building the relative key. The filter must check the {@code accountId + "/"}
+     * prefix itself to keep the result to one account.
+     */
+    public List<V> scanRaw(Predicate<String> rawKeyFilter) {
+        return delegate.scan(rawKeyFilter);
+    }
+
+    public static String rawKey(String accountId, String key) {
+        return accountId + "/" + key;
     }
 
     /** Returns unprefixed pre-account values that satisfy an ownership predicate. */

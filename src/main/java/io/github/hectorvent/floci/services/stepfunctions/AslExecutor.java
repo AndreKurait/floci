@@ -43,6 +43,8 @@ import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler;
+import io.github.hectorvent.floci.services.eventbridge.EventBridgeInvoker;
+import io.github.hectorvent.floci.services.eventbridge.EventBridgeInvoker.ConnectionHttpParameters;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
@@ -134,6 +136,7 @@ import java.util.function.Consumer;
 import java.util.function.IntFunction;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
@@ -266,6 +269,7 @@ public class AslExecutor {
     private final EcsService ecsService;
     private final EcsJsonHandler ecsJsonHandler;
     private final EventBridgeHandler eventBridgeHandler;
+    private final EventBridgeInvoker eventBridgeInvoker;
     private final SchedulerService schedulerService;
     private final SchedulerController schedulerController;
     private final RdsDataService rdsDataService;
@@ -316,7 +320,7 @@ public class AslExecutor {
                        ServiceRegistry serviceRegistry, NestedTaskCredentials nestedTaskCredentials,
                        LambdaTaskAuthorizer lambdaTaskAuthorizer, ApiGatewayTaskInvoker apiGatewayTaskInvoker,
                        EmrTaskInvoker emrTaskInvoker, EmrServerlessTaskInvoker emrServerlessTaskInvoker,
-                       SdkManagementTaskInvoker sdkManagementTaskInvoker) {
+                       SdkManagementTaskInvoker sdkManagementTaskInvoker, EventBridgeInvoker eventBridgeInvoker) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
@@ -324,7 +328,7 @@ public class AslExecutor {
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
                 nestedTaskCredentials, lambdaTaskAuthorizer, null, null, apiGatewayTaskInvoker, emrTaskInvoker,
-                emrServerlessTaskInvoker, sdkManagementTaskInvoker, null);
+                emrServerlessTaskInvoker, sdkManagementTaskInvoker, null, eventBridgeInvoker);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -344,7 +348,7 @@ public class AslExecutor {
                 Duration expressMaxExecutionTimeOverride, LongSupplier nanoTimeOverride,
                 ApiGatewayTaskInvoker apiGatewayTaskInvoker, EmrTaskInvoker emrTaskInvoker,
                 EmrServerlessTaskInvoker emrServerlessTaskInvoker, SdkManagementTaskInvoker sdkManagementTaskInvoker,
-                NestedWaiter nestedWaiter) {
+                NestedWaiter nestedWaiter, EventBridgeInvoker eventBridgeInvoker) {
         this.apiGatewayTaskInvoker = apiGatewayTaskInvoker;
         this.emrTaskInvoker = emrTaskInvoker;
         this.emrServerlessTaskInvoker = emrServerlessTaskInvoker;
@@ -366,6 +370,7 @@ public class AslExecutor {
         this.ecsService = ecsService;
         this.ecsJsonHandler = ecsJsonHandler;
         this.eventBridgeHandler = eventBridgeHandler;
+        this.eventBridgeInvoker = eventBridgeInvoker;
         this.schedulerService = schedulerService;
         this.schedulerController = schedulerController;
         this.rdsDataService = rdsDataService;
@@ -413,7 +418,7 @@ public class AslExecutor {
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null, null, null, null,
-                null, null, null);
+                null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -435,7 +440,7 @@ public class AslExecutor {
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null, null, null, null, null, null,
-                null);
+                null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -726,6 +731,27 @@ public class AslExecutor {
                                         JsonNode stateDef, JsonNode input, StateMachine sm,
                                         String topLevelQueryLanguage, JsonNode context, ObjectNode variables,
                                         long executionDeadlineNanos) throws Exception {
+        // JSONPath states read and Assign workflow variables through JSONPATH_SCOPE (see there).
+        JsonPathScope previousScope = JSONPATH_SCOPE.get();
+        JsonPathScope scope = isJsonata(stateDef, topLevelQueryLanguage) ? null
+                : new JsonPathScope(variables, context, objectMapper.createObjectNode());
+        JSONPATH_SCOPE.set(scope);
+        try {
+            StateResult result = runEnteredStateBody(chain, name, enteredEventId, type, stateDef, input, sm,
+                    topLevelQueryLanguage, context, variables, executionDeadlineNanos);
+            if (scope != null) {
+                variables.setAll(scope.pendingAssignments());
+            }
+            return result;
+        } finally {
+            restoreJsonPathScope(previousScope);
+        }
+    }
+
+    private StateResult runEnteredStateBody(HistoryChain chain, String name, long enteredEventId, String type,
+                                            JsonNode stateDef, JsonNode input, StateMachine sm,
+                                            String topLevelQueryLanguage, JsonNode context, ObjectNode variables,
+                                            long executionDeadlineNanos) throws Exception {
         updateStateContext(context, name);
         boolean jsonata = isJsonata(stateDef, topLevelQueryLanguage);
         StateResult result;
@@ -808,6 +834,10 @@ public class AslExecutor {
                 return executeState(name, type, stateDef, input, chain, sm, jsonata,
                         topLevelQueryLanguage, context, variables, executionDeadlineNanos);
             } catch (FailStateException raised) {
+                JsonPathScope scope = JSONPATH_SCOPE.get();
+                if (scope != null) {
+                    scope.pendingAssignments().removeAll();
+                }
                 FailStateException e = raised.attributedTo(name, enteredEventId);
                 if (!raised.hasFinalCause()) {
                     publishEvaluationFailedEvent(chain, name, e);
@@ -918,6 +948,7 @@ public class AslExecutor {
             result = stateDef.get("Result");
         }
 
+        applyJsonPathAssign(stateDef, result);
         JsonNode output = mergeResult(stateDef, input, result);
         output = applyOutputPath(stateDef, output, context);
         return new StateResult(output, stateDef.path("Next").asText(null));
@@ -1049,7 +1080,8 @@ public class AslExecutor {
             JsonNode output = applyJsonataOutput(stateDef, input, taskResult, context, variables);
             return new StateResult(output, stateDef.path("Next").asText(null));
         } else {
-            // ResultSelector transforms the raw result before ResultPath merges it into the state input.
+            // Assign reads the raw task result; ResultSelector transforms it before ResultPath merges it.
+            applyJsonPathAssign(stateDef, taskResult);
             if (stateDef.has("ResultSelector")) {
                 taskResult = resolveParameters(stateDef.get("ResultSelector"), taskResult, context);
             }
@@ -2873,6 +2905,8 @@ public class AslExecutor {
         JsonNode choices = stateDef.path("Choices");
         for (JsonNode choice : choices) {
             if (evaluateCondition(choice, effectiveInput, context)) {
+                // A matched rule carries its own Assign; the state-level one applies on the Default path.
+                applyJsonPathAssign(choice, effectiveInput);
                 JsonNode output = applyOutputPath(stateDef, effectiveInput, context);
                 return new StateResult(output, choice.path("Next").asText());
             }
@@ -2880,6 +2914,7 @@ public class AslExecutor {
         // Default branch
         String defaultState = stateDef.path("Default").asText(null);
         if (defaultState != null) {
+            applyJsonPathAssign(stateDef, effectiveInput);
             JsonNode output = applyOutputPath(stateDef, effectiveInput, context);
             return new StateResult(output, defaultState);
         }
@@ -2900,7 +2935,7 @@ public class AslExecutor {
 
     private StateResult executeWaitState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context,
                                          ObjectNode variables, long executionDeadlineNanos)
-            throws InterruptedException {
+            throws Exception {
         long waitNanos = 0;
         JsonNode effectiveInput = input;
         if (jsonata) {
@@ -2946,6 +2981,7 @@ public class AslExecutor {
             JsonNode output = applyJsonataOutput(stateDef, input, null, context, variables);
             return new StateResult(output, stateDef.path("Next").asText(null));
         }
+        applyJsonPathAssign(stateDef, effectiveInput);
         JsonNode output = applyOutputPath(stateDef, effectiveInput, context);
         return new StateResult(output, stateDef.path("Next").asText(null));
     }
@@ -3178,7 +3214,8 @@ public class AslExecutor {
             return new StateResult(output, stateDef.path("Next").asText(null));
         }
 
-        // ResultSelector transforms the raw branch results before ResultPath merges them in.
+        // Assign reads the raw branch results; ResultSelector transforms them before ResultPath merges them in.
+        applyJsonPathAssign(stateDef, results);
         JsonNode selected = stateDef.has("ResultSelector")
                 ? resolveParameters(stateDef.get("ResultSelector"), results, context)
                 : results;
@@ -3326,7 +3363,7 @@ public class AslExecutor {
                     iterInput = jsonata
                             ? jsonataEvaluator.resolveTemplate(itemTransform, "ItemSelector",
                                     buildStatesVar(mapInput, null, iterContext), variables)
-                            : resolveParameters(itemTransform, mapInput, iterContext);
+                            : resolveMapItemParameters(itemTransform, mapInput, iterContext, variables);
                 }
                 if (!distributed) {
                     iterationChain.publishIterationStart("MapIterationStarted", Map.of("name", name, "index", i));
@@ -3470,7 +3507,8 @@ public class AslExecutor {
             return new StateResult(output, stateDef.path("Next").asText(null));
         }
 
-        // ResultSelector transforms the raw iteration results before ResultPath merges them in.
+        // Assign reads the raw iteration results; ResultSelector transforms them before ResultPath merges them in.
+        applyJsonPathAssign(stateDef, mapResult);
         JsonNode selected = stateDef.has("ResultSelector")
                 ? resolveParameters(stateDef.get("ResultSelector"), mapResult, context)
                 : mapResult;
@@ -4459,6 +4497,79 @@ public class AslExecutor {
         return resolvePath(path, input, context);
     }
 
+    /**
+     * Workflow variables of the JSONPath state running on this thread. AWS lets JSONPath states read
+     * variables through {@code $name} / {@code $name.path} references and write them with
+     * {@code Assign}; the JSONPath resolvers have no {@code variables} parameter, so
+     * {@link #runEnteredState} exposes the state's scope here for the duration of the state
+     * (Map iterations and Parallel branches run their own states, so each sees its own scope).
+     * Not set for JSONata states, which use {@code variables} directly.
+     */
+    private static final ThreadLocal<JsonPathScope> JSONPATH_SCOPE = new ThreadLocal<>();
+
+    private record JsonPathScope(ObjectNode variables, JsonNode context, ObjectNode pendingAssignments) {
+    }
+
+    private static void restoreJsonPathScope(JsonPathScope previousScope) {
+        if (previousScope == null) {
+            JSONPATH_SCOPE.remove();
+        } else {
+            JSONPATH_SCOPE.set(previousScope);
+        }
+    }
+
+    private JsonNode resolveMapItemParameters(JsonNode template, JsonNode input, JsonNode context,
+                                               ObjectNode variables) throws Exception {
+        JsonPathScope previousScope = JSONPATH_SCOPE.get();
+        JSONPATH_SCOPE.set(new JsonPathScope(variables, context, objectMapper.createObjectNode()));
+        try {
+            return resolveParameters(template, input, context);
+        } finally {
+            restoreJsonPathScope(previousScope);
+        }
+    }
+
+    /**
+     * Resolves a JSONPath workflow-variable reference ({@code $name}, {@code $name.field},
+     * {@code $name[0]}), or returns {@code null} when {@code path} is not one ({@code $}, {@code $.},
+     * {@code $[}, {@code $$}). An unknown variable fails the state with States.Runtime, as on AWS.
+     */
+    private JsonNode resolveVariableReference(String path) {
+        if (path == null || path.startsWith("$$") || path.startsWith("$.") || path.startsWith("$[")) {
+            return null;
+        }
+        Matcher m = ChoiceOperators.variableReferenceMatcher(path);
+        if (!m.matches()) {
+            return null;
+        }
+        JsonPathScope scope = JSONPATH_SCOPE.get();
+        JsonNode value = scope == null ? null : scope.variables().get(m.group(1));
+        if (value == null) {
+            throw new FailStateException("States.Runtime",
+                    "The JSONPath variable reference '" + path + "' refers to an undefined variable '" + m.group(1) + "'");
+        }
+        String rest = m.group(2);
+        return rest.isEmpty() ? value : resolvePathNode("$" + rest, value, null);
+    }
+
+    /**
+     * JSONPath {@code Assign}: evaluated against the state result (Pass: after Parameters/Result; Task,
+     * Map, Parallel: the raw result, before ResultSelector; Choice: the effective input; Catch: the error
+     * output; Wait: the effective input) with the variables as they were on state entry. Values stay
+     * pending until the state finishes successfully, so output processing cannot see its assignments.
+     */
+    private void applyJsonPathAssign(JsonNode holder, JsonNode result) throws Exception {
+        JsonPathScope scope = JSONPATH_SCOPE.get();
+        if (scope == null || holder == null || !holder.has("Assign")) {
+            return;
+        }
+        JsonNode assigned = resolveParameters(holder.get("Assign"), result, scope.context());
+        if (assigned == null || !assigned.isObject()) {
+            throw new FailStateException("States.Runtime", "Assign must evaluate to an object");
+        }
+        scope.pendingAssignments().setAll((ObjectNode) assigned);
+    }
+
     private JsonNode mergeResult(JsonNode stateDef, JsonNode input, JsonNode result) throws Exception {
         if (!stateDef.has("ResultPath")) {
             return result;
@@ -4566,6 +4677,10 @@ public class AslExecutor {
         if (path.startsWith("States.")) {
             return evaluateIntrinsic(path, root, context);
         }
+        JsonNode variable = resolveVariableReference(path);
+        if (variable != null) {
+            return variable;
+        }
         if ("$$".equals(path)) {
             return context == null ? MissingNode.getInstance() : context;
         }
@@ -4613,6 +4728,15 @@ public class AslExecutor {
         if (path.startsWith("States.")) {
             return evaluateIntrinsic(path, searchRoot, context);
         }
+        String referencePath = path;
+        Matcher variable = ChoiceOperators.variableReferenceMatcher(path);
+        if (variable.matches()) {
+            searchRoot = resolveVariableReference("$" + variable.group(1));
+            path = "$" + variable.group(2);
+            if ("$".equals(path)) {
+                return searchRoot;
+            }
+        }
         if (!path.startsWith("$.") && !path.startsWith("$[")) {
             return NullNode.getInstance();
         }
@@ -4621,7 +4745,7 @@ public class AslExecutor {
             if (!value.isMissingNode()) {
                 return value;
             }
-            throw unresolvedPayloadTemplateReference(path, fieldKey, reportedInput);
+            throw unresolvedPayloadTemplateReference(referencePath, fieldKey, reportedInput);
         }
         String[] parts = splitPathSegments(path);
         if (containsWildcard(parts)) {
@@ -4635,7 +4759,7 @@ public class AslExecutor {
         if (lookup.outOfRangeArrayIndex) {
             return NullNode.getInstance();
         }
-        throw unresolvedPayloadTemplateReference(path, fieldKey, reportedInput);
+        throw unresolvedPayloadTemplateReference(referencePath, fieldKey, reportedInput);
     }
 
     private static boolean isAdvancedJsonPath(String path) {
@@ -4997,12 +5121,10 @@ public class AslExecutor {
     }
 
     /**
-     * Implements the Step Functions HTTP Task request flow for direct task-provided
-     * fields. EventBridge connection lookup and connection-level header, query
-     * parameter, and body merging are intentionally not implemented yet.
-     *
-     * TODO: Resolve Authentication/InvocationConfig ConnectionArn through the
-     * EventBridge connection store and merge connection credentials/parameters.
+     * Implements the Step Functions HTTP Task request flow. The EventBridge connection's
+     * authorization, headers, query parameters and body parameters are merged over the
+     * task's, the connection's value winning on a conflict, as
+     * <a href="https://docs.aws.amazon.com/step-functions/latest/dg/call-https-apis.html#http-task-data-merge">documented</a>.
      *
      * TODO: Add HTTP retry support. This can be done via Mutiny's retry mechanism
      * but most likely better to be done at a higher level to support other tasks.
@@ -5030,17 +5152,27 @@ public class AslExecutor {
         }
 
         validateHttpMethod(method);
-        validateConnectionArn(input);
+        String connectionArn = connectionArn(input);
         validateHttpHeaders(headers);
+        // The connection's OAuth token exchange spends the same TimeoutSeconds as the request.
+        long deadlineNanos = nanoTime.getAsLong() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        ConnectionHttpParameters connection = connectionHttpParameters(connectionArn, region);
+        long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nanoTime.getAsLong());
+        if (remainingMillis <= 0) {
+            throw new FailStateException("States.Http.Socket", "The timeout period of " + timeoutMillis
+                    + "ms has been exceeded while authorizing with the connection");
+        }
 
-        HttpRequestPayload requestPayload = requestPayload(requestBody, requestBodyEncoding,
+        HttpRequestPayload requestPayload = requestPayload(
+                mergeConnectionBody(requestBody, connection.bodyParameters()), requestBodyEncoding,
                 input.path("Transform").path("RequestEncodingOptions"));
         MultiMap requestHeaders = requestHeaders(headers, requestPayload.contentType());
-        MultiMap requestQueryParameters = queryParameters(queryParameters);
+        connection.headers().forEach(requestHeaders::set);
+        MultiMap requestQueryParameters = queryParameters(queryParameters, connection.queryStringParameters());
 
         try {
             HttpRequest<Buffer> request = webClient.requestAbs(HttpMethod.valueOf(method), rawUri)
-                .timeout(timeoutMillis)
+                .timeout(remainingMillis)
                 .putHeaders(requestHeaders)
                 .putHeader("User-Agent", "Amazon|StepFunctions|HttpInvoke|" + region);
             request.queryParams().addAll(requestQueryParameters);
@@ -5205,7 +5337,7 @@ public class AslExecutor {
         }
     }
 
-    private void validateConnectionArn(JsonNode input) {
+    private String connectionArn(JsonNode input) {
         String connectionArn = input.path("InvocationConfig").path("ConnectionArn").asText(null);
         if (connectionArn == null || connectionArn.isBlank()) {
             connectionArn = input.path("Authentication").path("ConnectionArn").asText(null);
@@ -5214,6 +5346,36 @@ public class AslExecutor {
             throw new FailStateException("States.Runtime",
                     "ConnectionArn is required for HTTP task Authentication or InvocationConfig");
         }
+        return connectionArn;
+    }
+
+    private ConnectionHttpParameters connectionHttpParameters(String connectionArn, String region) {
+        try {
+            return eventBridgeInvoker.connectionHttpParameters(connectionArn, region);
+        } catch (AwsException e) {
+            String error = "ResourceNotFoundException".equals(e.getErrorCode())
+                    ? "Events.ConnectionResource.ResourceNotFound"
+                    : "Events.ConnectionResource.InternalError";
+            throw new FailStateException(error, e.getMessage());
+        }
+    }
+
+    // A string body cannot take the connection's body parameters; AWS fails the task rather than drop them
+    private JsonNode mergeConnectionBody(JsonNode requestBody, Map<String, String> bodyParameters) {
+        if (bodyParameters.isEmpty()) {
+            return requestBody;
+        }
+        ObjectNode merged;
+        if (requestBody.isMissingNode() || requestBody.isNull()) {
+            merged = objectMapper.createObjectNode();
+        } else if (requestBody instanceof ObjectNode objectBody) {
+            merged = objectBody.deepCopy();
+        } else {
+            throw new FailStateException("States.Runtime",
+                    "The RequestBody cannot be merged with the connection's body parameters: it is not a JSON object");
+        }
+        bodyParameters.forEach(merged::put);
+        return merged;
     }
 
     /**
@@ -5241,16 +5403,21 @@ public class AslExecutor {
         }
     }
 
-    private MultiMap queryParameters(JsonNode queryParameters) {
+    /**
+     * The task's query parameters with the connection's merged over them. Query names are
+     * case-sensitive, so a connection parameter replaces only a task parameter of the same name.
+     */
+    private MultiMap queryParameters(JsonNode queryParameters, Map<String, String> connectionParameters) {
         MultiMap params = MultiMap.caseInsensitiveMultiMap();
-        if (queryParameters.isMissingNode() || queryParameters.isNull()) {
-            return params;
+        if (!queryParameters.isMissingNode() && !queryParameters.isNull()) {
+            if (!queryParameters.isObject()) {
+                throw new FailStateException("States.Runtime", "QueryParameters must be a JSON object for HTTP task");
+            }
+            queryParameters.properties().stream()
+                    .filter(entry -> !connectionParameters.containsKey(entry.getKey()))
+                    .forEach(entry -> addQueryParameterValues(params, entry.getKey(), entry.getValue()));
         }
-        if (!queryParameters.isObject()) {
-            throw new FailStateException("States.Runtime", "QueryParameters must be a JSON object for HTTP task");
-        }
-
-        queryParameters.properties().forEach(entry -> addQueryParameterValues(params, entry.getKey(), entry.getValue()));
+        connectionParameters.forEach(params::add);
         return params;
     }
 
@@ -5826,7 +5993,8 @@ public class AslExecutor {
         if (context != null && "$$".equals(arg)) {
             return context;
         }
-        if (arg.startsWith("$.") || arg.startsWith("$[") || "$".equals(arg)) {
+        if (ChoiceOperators.variableReferenceMatcher(arg).matches()
+                || arg.startsWith("$.") || arg.startsWith("$[") || "$".equals(arg)) {
             return resolveIntrinsicReference(arg, root, context, root);
         }
         if (arg.startsWith("States.")) {
@@ -6208,6 +6376,7 @@ public class AslExecutor {
                         catcher, "Catch[" + i + "]/", statesVar, errorOutput, variables);
                 return new StateResult(output, next);
             }
+            applyJsonPathAssign(catcher, errorOutput);
             return new StateResult(mergeResult(catcher, input, errorOutput), next);
         }
         return null;

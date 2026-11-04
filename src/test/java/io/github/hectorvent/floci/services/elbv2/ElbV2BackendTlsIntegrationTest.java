@@ -1,7 +1,10 @@
 package io.github.hectorvent.floci.services.elbv2;
 
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
+import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -25,8 +28,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
@@ -66,6 +67,8 @@ import static org.junit.jupiter.api.Assertions.*;
 @TestProfile(RealElbV2DataPlaneProfile.class)
 class ElbV2BackendTlsIntegrationTest {
 
+    private static final String ACCOUNT = "321321321323";
+
     private final String name = "alb-tls-" + UUID.randomUUID().toString().substring(0, 8);
     private final List<Executable> cleanup = new ArrayList<>();
     private final AtomicInteger healthStatus = new AtomicInteger(200);
@@ -82,18 +85,20 @@ class ElbV2BackendTlsIntegrationTest {
     @Inject
     Vertx vertx;
 
+    @Inject
+    ElbV2HealthChecker healthChecker;
+
+    @Inject
+    ElbV2Service elbService;
+
     @TestHTTPResource("/")
     URI endpoint;
 
     @BeforeEach
     void createSdkNetwork() {
-        StaticCredentialsProvider credentials = StaticCredentialsProvider.create(
-                AwsBasicCredentials.create("321321321323", "secret"));
-        ec2 = Ec2Client.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
-                .credentialsProvider(credentials).build();
+        ec2 = AwsTestClients.create(Ec2Client.builder(), ACCOUNT, Region.EU_WEST_1, endpoint);
         cleanup.add(ec2::close);
-        elb = ElasticLoadBalancingV2Client.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
-                .credentialsProvider(credentials).build();
+        elb = AwsTestClients.create(ElasticLoadBalancingV2Client.builder(), ACCOUNT, Region.EU_WEST_1, endpoint);
         cleanup.add(elb::close);
         vpc = ec2.createVpc(r -> r.cidrBlock("10.83.0.0/16")).vpc().vpcId();
         cleanup.add(() -> ec2.deleteVpc(r -> r.vpcId(vpc)));
@@ -230,16 +235,16 @@ class ElbV2BackendTlsIntegrationTest {
     void httpsHealthPreservesCustomMatchersAndRecovers() throws Exception {
         HttpServer tls = backend(true);
         healthStatus.set(302);
-        createTarget("HTTPS", tls.actualPort(), "HTTPS", tls.actualPort(), "200,302");
-        awaitHealth("healthy", null);
+        createTarget("HTTPS", tls.actualPort(), "HTTPS", tls.actualPort(), "302");
+        awaitHealth("healthy", null, true);
 
         healthStatus.set(503);
-        awaitHealth("unhealthy", "Target.ResponseCodeMismatch");
+        awaitHealth("unhealthy", "Target.ResponseCodeMismatch", true);
 
         elb.modifyTargetGroup(r -> r.targetGroupArn(groupArn)
                 .matcher(Matcher.builder().httpCode("200-299").build()));
         healthStatus.set(204);
-        awaitHealth("healthy", null);
+        awaitHealth("healthy", null, true);
     }
 
     @Test
@@ -247,13 +252,13 @@ class ElbV2BackendTlsIntegrationTest {
         HttpServer plain = backend(false);
         HttpServer tls = backend(true);
         createTarget("HTTP", plain.actualPort(), "HTTP", plain.actualPort(), "200");
-        awaitHealth("healthy", null);
+        awaitHealth("healthy", null, true);
 
         elb.modifyTargetGroup(r -> r.targetGroupArn(groupArn).healthCheckProtocol("HTTPS"));
-        awaitHealth("unhealthy", "Target.FailedHealthChecks");
+        awaitHealth("unhealthy", "Target.FailedHealthChecks", true);
 
         elb.modifyTargetGroup(r -> r.targetGroupArn(groupArn).healthCheckPort(String.valueOf(tls.actualPort())));
-        awaitHealth("healthy", null);
+        awaitHealth("healthy", null, true);
     }
 
     @Test
@@ -439,7 +444,18 @@ class ElbV2BackendTlsIntegrationTest {
     }
 
     private void awaitHealth(String state, String reason) {
+        awaitHealth(state, reason, false);
+    }
+
+    private void awaitHealth(String state, String reason, boolean triggerProbe) {
         await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+            if (triggerProbe) {
+                RequestScopes.runAs(ACCOUNT, Region.EU_WEST_1.id(), () -> {
+                    TargetGroup group = elbService.getTargetGroup(Region.EU_WEST_1.id(), groupArn);
+                    assertNotNull(group);
+                    healthChecker.probeAll(groupArn, group);
+                });
+            }
             List<TargetHealthDescription> targets = elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
                     .targetHealthDescriptions();
             assertEquals(1, targets.size());

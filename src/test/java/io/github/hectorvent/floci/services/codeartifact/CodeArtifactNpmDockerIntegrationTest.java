@@ -30,10 +30,15 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.github.hectorvent.floci.testing.CodeArtifactRequests.npmPublishEnvelope;
+import static io.github.hectorvent.floci.testing.CodeArtifactRequests.putPackageOriginConfiguration;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.anyOf;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -871,6 +876,50 @@ class CodeArtifactNpmDockerIntegrationTest {
                 .then().statusCode(200)
                 .extract().asByteArray();
         assertArrayEquals(tarball, fetchedAfterUnarchive);
+    }
+
+    /**
+     * Issue #7439, against the real Verdaccio: a scoped publish sent with a literal slash ({@code
+     * PUT /@scope/name}) is accepted by Verdaccio as is, so it must take the guarded publish route.
+     * Its bytes are counted, a publish:BLOCK origin configuration refuses the next version, and
+     * lifting the block lets that version through.
+     */
+    @Test
+    @Order(23)
+    void aLiteralSlashScopedPublishIsCountedAndRespectsAPublishBlock() {
+        String scope = "flociscope";
+        String packageName = "literal-slash-pkg";
+        String npmName = "@" + scope + "/" + packageName;
+        String literalPath = "/codeartifact/npm/" + DOMAIN + "/" + REPO + "/" + npmName;
+        byte[] firstTarball = "literal slash throwaway tarball 1".getBytes(StandardCharsets.UTF_8);
+        long assetSizeBytesBefore = describeDomainAssetSizeBytes();
+
+        given().urlEncodingEnabled(false).header("Authorization", "Bearer " + bearerToken)
+                .contentType("application/json")
+                .body(npmPublishEnvelope(npmName, "1.0.0", packageName + "-1.0.0.tgz", firstTarball))
+                .put(literalPath)
+                .then().statusCode(anyOf201Or200());
+        assertEquals(assetSizeBytesBefore + firstTarball.length, describeDomainAssetSizeBytes());
+
+        putPackageOriginConfiguration(AUTH, DOMAIN, REPO, "npm", scope, packageName, "BLOCK", "BLOCK");
+        String secondVersion = npmPublishEnvelope(npmName, "2.0.0", packageName + "-2.0.0.tgz",
+                "literal slash throwaway tarball 2".getBytes(StandardCharsets.UTF_8));
+        given().urlEncodingEnabled(false).header("Authorization", "Bearer " + bearerToken)
+                .contentType("application/json").body(secondVersion)
+                .put(literalPath)
+                .then().statusCode(409)
+                .body(containsString("blocks direct publish"));
+        given().urlEncodingEnabled(false).header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/npm/" + DOMAIN + "/" + REPO + "/@" + scope + "%2F" + packageName)
+                .then().statusCode(200)
+                .body("versions", hasKey("1.0.0"))
+                .body("versions", not(hasKey("2.0.0")));
+
+        putPackageOriginConfiguration(AUTH, DOMAIN, REPO, "npm", scope, packageName, "ALLOW", "BLOCK");
+        given().urlEncodingEnabled(false).header("Authorization", "Bearer " + bearerToken)
+                .contentType("application/json").body(secondVersion)
+                .put(literalPath)
+                .then().statusCode(anyOf201Or200());
     }
 
     /**

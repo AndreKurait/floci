@@ -116,7 +116,7 @@ class Route53CfnProvisionerTest {
         when(service.createHostedZone(eq("ssm.us-east-1.amazonaws.com"), eq("dns-stack/Zone"),
                 eq("central endpoint zone"), argThat(sameVpc(vpc)))).thenReturn(
                         new Route53Service.CreateZoneResult(zone, null));
-        when(service.getNameServers()).thenReturn(List.of("ns-1.example", "ns-2.example"));
+        when(service.getAssignedNameServers("Z123456789")).thenReturn(List.of("ns-1.example", "ns-2.example"));
 
         ObjectMapper mapper = new ObjectMapper();
         JsonNode props = mapper.createObjectNode()
@@ -140,6 +140,7 @@ class Route53CfnProvisionerTest {
         assertEquals("Z123456789", resource.getPhysicalId());
         assertEquals(Set.of("Id", "NameServers"), resource.getAttributes().keySet());
         assertEquals("Z123456789", resource.getAttributes().get("Id"));
+        assertEquals("ns-1.example,ns-2.example", resource.getAttributes().get("NameServers"));
         verify(service).createHostedZone(eq("ssm.us-east-1.amazonaws.com"), eq("dns-stack/Zone"),
                 eq("central endpoint zone"), argThat(sameVpc(vpc)));
         verify(service, never()).associateVpcWithHostedZone(any(), any(), any());
@@ -157,7 +158,7 @@ class Route53CfnProvisionerTest {
         when(service.createHostedZone(eq("ssm.us-east-1.amazonaws.com"), eq("dns-stack/Zone"),
                 eq(null), argThat(sameVpc(firstVpc)))).thenReturn(
                         new Route53Service.CreateZoneResult(zone, null));
-        when(service.getNameServers()).thenReturn(List.of("ns-1.example", "ns-2.example"));
+        when(service.getAssignedNameServers("Z123456789")).thenReturn(List.of("ns-1.example", "ns-2.example"));
 
         ObjectMapper mapper = new ObjectMapper();
         JsonNode props = mapper.createObjectNode().put("Name", "ssm.us-east-1.amazonaws.com");
@@ -231,7 +232,7 @@ class Route53CfnProvisionerTest {
         HostedZone zone = new HostedZone("Z68119D97-4AB", "ssm.us-east-1.amazonaws.com.",
                 "dns-stack/Zone", null, (VpcAssociation) null);
         when(service.getHostedZone("Z68119D97-4AB")).thenReturn(zone);
-        when(service.getNameServers()).thenReturn(List.of("ns-1.example", "ns-2.example"));
+        when(service.getAssignedNameServers("Z68119D97-4AB")).thenReturn(List.of("ns-1.example", "ns-2.example"));
         ObjectMapper mapper = new ObjectMapper();
         JsonNode props = mapper.createObjectNode().put("Name", "ssm.us-east-1.amazonaws.com");
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
@@ -264,7 +265,7 @@ class Route53CfnProvisionerTest {
                 "dns-stack/Zone", null, vpc);
         when(service.createHostedZone(eq("ssm.us-east-1.amazonaws.com"), eq("dns-stack/Zone"),
                 eq(null), argThat(sameVpc(vpc)))).thenReturn(new Route53Service.CreateZoneResult(zone, null));
-        when(service.getNameServers()).thenReturn(List.of("ns-1.example", "ns-2.example"));
+        when(service.getAssignedNameServers("Z987654321")).thenReturn(List.of("ns-1.example", "ns-2.example"));
 
         ObjectMapper mapper = new ObjectMapper();
         JsonNode props = mapper.createObjectNode().put("Name", "ssm.us-east-1.amazonaws.com");
@@ -337,7 +338,7 @@ class Route53CfnProvisionerTest {
                 "caller", null, vpc);
         when(service.createHostedZone(eq("ssm.us-east-1.amazonaws.com"), eq("dns-stack/Zone"),
                 eq(null), argThat(sameVpc(vpc)))).thenReturn(new Route53Service.CreateZoneResult(zone, null));
-        when(service.getNameServers()).thenReturn(List.of("ns-1.example", "ns-2.example"));
+        when(service.getAssignedNameServers("Z123456789")).thenReturn(List.of("ns-1.example", "ns-2.example"));
 
         ObjectMapper mapper = new ObjectMapper();
         JsonNode props = mapper.createObjectNode().put("Name", "ssm.us-east-1.amazonaws.com");
@@ -419,7 +420,7 @@ class Route53CfnProvisionerTest {
                 "dns-stack/Zone", null, (VpcAssociation) null);
         when(service.createHostedZone(eq("ssm.us-east-1.amazonaws.com"), eq("dns-stack/Zone"),
                 eq(null), eq(null))).thenReturn(new Route53Service.CreateZoneResult(zone, null));
-        when(service.getNameServers()).thenReturn(List.of("ns-1.example", "ns-2.example"));
+        when(service.getAssignedNameServers("Z987654321")).thenReturn(List.of("ns-1.example", "ns-2.example"));
         RuntimeException tagFailure = new AwsException("ServiceUnavailable", "throttled", 503);
         Mockito.doThrow(tagFailure).when(service)
                 .changeTagsForResource(eq("hostedzone"), eq("Z987654321"), any(), any());

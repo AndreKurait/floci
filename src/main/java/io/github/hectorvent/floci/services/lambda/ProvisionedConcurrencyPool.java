@@ -71,8 +71,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private final Set<ContainerHandle> pendingTeardown = new HashSet<>();
     private final Map<ContainerHandle, CountDownLatch> stopping = new HashMap<>();
     private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
-            Thread.ofPlatform().daemon().name("lambda-provisioned-concurrency").factory());
+    private final ScheduledExecutorService scheduler;
     private final KeyedWorkQueue<String> reconciliation = new KeyedWorkQueue<>(
             "lambda-capacity-work", 1, 1, ignored -> reconcileSafely());
     private boolean stopped;
@@ -139,6 +138,23 @@ public class ProvisionedConcurrencyPool implements Resettable {
                               LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
                               Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
                               LambdaConcurrencyLimiter concurrencyLimiter) {
+        this(launcher, functions, aliases, storage, clock, maxPerFunction, maxTotal, ephemeral,
+                drainSeconds, concurrencyLimiter, Executors.newSingleThreadScheduledExecutor(
+                        Thread.ofPlatform().daemon().name("lambda-provisioned-concurrency").factory()));
+    }
+
+    ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                              LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
+                              Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
+                              ScheduledExecutorService scheduler) {
+        this(launcher, functions, aliases, storage, clock, maxPerFunction, maxTotal, ephemeral,
+                drainSeconds, new LambdaConcurrencyLimiter(), scheduler);
+    }
+
+    ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                              LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
+                              Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
+                              LambdaConcurrencyLimiter concurrencyLimiter, ScheduledExecutorService scheduler) {
         this.launcher = launcher;
         this.functions = functions;
         this.aliases = aliases;
@@ -149,6 +165,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
         this.maxTotal = maxTotal;
         this.ephemeral = ephemeral;
         this.drainTimeoutNanos = TimeUnit.SECONDS.toNanos(drainSeconds);
+        this.scheduler = scheduler;
     }
 
     @PostConstruct

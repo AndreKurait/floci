@@ -648,9 +648,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String groupResource = resources.getFirst();
             String taggingResource = groupResource.substring(0, groupResource.length() - 2);
             Map<String, List<String>> taggingContext = withRequestContext(
-                    conditionContext, taggingResource, region, accountId, accountId);
+                    conditionContext, taggingResource, region, accountId, accountId, "logs:TagResource");
             Map<String, List<String>> groupContext = withRequestContext(
-                    conditionContext, groupResource, region, accountId, accountId);
+                    conditionContext, groupResource, region, accountId, accountId, "logs:TagLogGroup");
             if (evaluator.evaluate(caller, null, "logs:TagResource", taggingResource, taggingContext) == Decision.DENY
                     && evaluator.evaluate(caller, null, "logs:TagLogGroup", groupResource, groupContext) == Decision.DENY) {
                 LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}",
@@ -1118,7 +1118,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 callerArns.putPrincipalKeys(context);
             }
             Map<String, List<String>> effectiveContext = withRequestContext(
-                    context, connector, region, accountId, accountId);
+                    context, connector, region, accountId, accountId, action);
             if (evaluator.evaluate(caller, null, action, connector, effectiveContext) != Decision.DENY) {
                 continue;
             }
@@ -1169,7 +1169,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                              String region, String accountId, String akid) {
         // A create tags the resource it makes, not the parent it makes it in (see RequestResources.created).
         List<String> created = RequestResources.created(operation, ctx, AwsRegions.partitionFor(region), region,
-                accountId);
+                accountId, IamActionRegistry.pathLabels(credentialScope, ctx));
         List<String> made = created.isEmpty() ? resources : created;
         for (TagOnCreate.TagSet set : tagging.checked()) {
             Map<String, List<String>> context = TagOnCreate.conditionContext(tagging, set, operation);
@@ -1290,9 +1290,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     private Map<String, List<String>> withRequestContext(Map<String, List<String>> serviceContext,
                                                         String resourceArn, String region,
-                                                        String accountId, String resourceOwnerAccountId) {
+                                                        String accountId, String resourceOwnerAccountId, String action) {
         Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
-                serviceContext, resourceArn, region, accountId, resourceOwnerAccountId);
+                serviceContext, resourceArn, region, accountId, resourceOwnerAccountId, action);
         RoutingContext routingContext = currentVertxRequest.getCurrent();
         if (routingContext != null && routingContext.request() != null) {
             context.put("aws:SecureTransport", List.of(Boolean.toString(routingContext.request().isSSL())));
@@ -1355,7 +1355,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
             for (Map<String, List<String>> targetContext : resourceContexts) {
                 Map<String, List<String>> effectiveContext = withRequestContext(
-                        targetContext, resource, region, accountId, resourceOwnerAccountId);
+                        targetContext, resource, region, accountId, resourceOwnerAccountId, action);
                 ResourcePolicyDecision resourcePolicyDecision = evaluator.evaluateResourcePolicyFor(
                         effectiveResourcePolicies, principal, action, resource, effectiveContext);
                 Decision decision = evaluator.evaluateResolvedResourcePolicy(
@@ -1637,7 +1637,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String region = requestContext.getRegion() == null
                     ? config.defaultRegion() : requestContext.getRegion();
             Map<String, List<String>> effectiveContext = withRequestContext(
-                    conditionContext, resource, region, accountId, effectiveOwnerAccountId);
+                    conditionContext, resource, region, accountId, effectiveOwnerAccountId, action);
             if (effectiveDecision == null) {
                 effectiveDecision = evaluator.evaluateResourcePolicyFor(
                         policyDocs.isEmpty() ? null : policyDocs,

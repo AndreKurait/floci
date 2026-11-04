@@ -44,30 +44,103 @@ class CloudFormationTemplateEngineTest {
         CloudFormationTemplateEngine e = new CloudFormationTemplateEngine("000000000000", "us-east-1", "my-stack",
                 "stack/id", Map.of(), Map.of(), Map.of(), Map.of("UseMapping", true),
                 Map.of("Values", json("""
-                        {"Example":{"List":["first,with-comma","","last"],"Scalar":"unchanged","Empty":[]}}
+                        {
+                          "Example": {
+                            "List": [
+                              "first,with-comma",
+                              "",
+                              "last"
+                            ],
+                            "Scalar": "unchanged",
+                            "Empty": []
+                          }
+                        }
                         """)), mapper, (Function<String, String>) name -> null);
         JsonNode list = json("{\"Fn::FindInMap\":[\"Values\",\"Example\",\"List\"]}");
         assertEquals(json("[\"first,with-comma\",\"\",\"last\"]"), e.resolveNode(list));
         assertEquals(List.of("first,with-comma", "last"), e.resolveStringList(list));
         assertEquals(List.of("first,with-comma", "", "last"), e.resolveLiteralList(mapper.createArrayNode().add(list)));
         assertEquals("first,with-comma", e.resolve(json("""
-                {"Fn::Select":[0,{"Fn::FindInMap":["Values","Example","List"]}]}
+                {
+                  "Fn::Select": [
+                    0,
+                    {
+                      "Fn::FindInMap": [
+                        "Values",
+                        "Example",
+                        "List"
+                      ]
+                    }
+                  ]
+                }
                 """)));
         assertEquals("", e.resolve(json("""
-                {"Fn::Select":[1,{"Fn::FindInMap":["Values","Example","List"]}]}
+                {
+                  "Fn::Select": [
+                    1,
+                    {
+                      "Fn::FindInMap": [
+                        "Values",
+                        "Example",
+                        "List"
+                      ]
+                    }
+                  ]
+                }
                 """)));
         assertEquals("last", e.resolve(json("""
-                {"Fn::Select":[2,{"Fn::If":["UseMapping",
-                  {"Fn::FindInMap":["Values","Example","List"]},["unused"]]}]}
+                {
+                  "Fn::Select": [
+                    2,
+                    {
+                      "Fn::If": [
+                        "UseMapping",
+                        {
+                          "Fn::FindInMap": [
+                            "Values",
+                            "Example",
+                            "List"
+                          ]
+                        },
+                        [
+                          "unused"
+                        ]
+                      ]
+                    }
+                  ]
+                }
                 """)));
         assertEquals("first,with-comma||last", e.resolve(json("""
-                {"Fn::Join":["|",{"Fn::FindInMap":["Values","Example","List"]}]}
+                {
+                  "Fn::Join": [
+                    "|",
+                    {
+                      "Fn::FindInMap": [
+                        "Values",
+                        "Example",
+                        "List"
+                      ]
+                    }
+                  ]
+                }
                 """)));
         assertEquals(json("[]"), e.resolveNode(json("""
-                {"Fn::FindInMap":["Values","Example","Empty"]}
+                {
+                  "Fn::FindInMap": [
+                    "Values",
+                    "Example",
+                    "Empty"
+                  ]
+                }
                 """)));
         assertEquals("unchanged", e.resolve(json("""
-                {"Fn::FindInMap":["Values","Example","Scalar"]}
+                {
+                  "Fn::FindInMap": [
+                    "Values",
+                    "Example",
+                    "Scalar"
+                  ]
+                }
                 """)));
     }
 

@@ -464,6 +464,32 @@ class CodeDeployServiceTest {
         return (List<Map<String, Object>>) lambdaTarget.get("lifecycleEvents");
     }
 
+    @Test
+    void listDeploymentGroupsWithoutApplicationNameThrowsApplicationNameRequired() {
+        AwsException missing = assertThrows(AwsException.class,
+                () -> service.listDeploymentGroups("us-east-1", null));
+        assertEquals("ApplicationNameRequiredException", missing.getErrorCode());
+        assertEquals(400, missing.getHttpStatus());
+        AwsException empty = assertThrows(AwsException.class,
+                () -> service.listDeploymentGroups("us-east-1", ""));
+        assertEquals("ApplicationNameRequiredException", empty.getErrorCode());
+    }
+
+    @Test
+    void listDeploymentGroupsWithWhitespaceApplicationNameThrowsInvalidApplicationName() {
+        AwsException blank = assertThrows(AwsException.class,
+                () -> service.listDeploymentGroups("us-east-1", " "));
+        assertEquals("InvalidApplicationNameException", blank.getErrorCode());
+        assertEquals(400, blank.getHttpStatus());
+    }
+
+    @Test
+    void listDeploymentGroupsForUnknownApplicationStillThrowsDoesNotExist() {
+        AwsException unknown = assertThrows(AwsException.class,
+                () -> service.listDeploymentGroups("us-east-1", "nope"));
+        assertEquals("ApplicationDoesNotExistException", unknown.getErrorCode());
+    }
+
     @SuppressWarnings("unchecked")
     private Map<String, String> diagnosticsOf(Map<String, Object> event) {
         return (Map<String, String>) event.get("diagnostics");

@@ -46,6 +46,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatc
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchDashboardCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CodeDeployCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoIdentityProviderCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoResourceServerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoUserPoolGroupCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoUserPoolUserCfnProvisioner;
@@ -76,6 +77,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.ElbClassi
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElbV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsArchiveCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.FirehoseCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.GuardDutyMalwareProtectionPlanCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamAccessKeyCfnProvisioner;
@@ -149,6 +151,7 @@ import io.github.hectorvent.floci.services.elasticache.ElastiCacheService;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
+import io.github.hectorvent.floci.services.eventbridgev2.EventBridgeV2Service;
 import io.github.hectorvent.floci.services.firehose.FirehoseService;
 import io.github.hectorvent.floci.services.guardduty.GuardDutyService;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -284,6 +287,7 @@ final class CfnProvisionerFixture {
         private RedshiftService redshiftService;
         private RedshiftServerlessService redshiftServerlessService;
         private CloudMapService cloudMapService;
+        private EventBridgeV2Service eventBridgeV2Service;
         private GuardDutyService guardDutyService;
         private BedrockAgentCoreControlService bedrockAgentCoreControlService;
         private BedrockAgentCoreMemoryService bedrockAgentCoreMemoryService;
@@ -365,7 +369,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new SesReceiptRuleCfnProvisioner(sesReceiptRuleService, sesIdentityService));
             }
             if (dynamoDbService != null) {
-                NativeDynamoDbBackend backend = new NativeDynamoDbBackend(null, null, dynamoDbService, null, null, objectMapper);
+                NativeDynamoDbBackend backend = new NativeDynamoDbBackend(null, null, null, dynamoDbService, null, null, objectMapper);
                 discovered.add(new DynamoDbCfnProvisioner(new DynamoDbFacade(backend, backend,
                         new RegionResolver("us-east-1", "000000000000")), call -> {
                             if (!"DeleteTable".equals(call.action())) {
@@ -389,6 +393,7 @@ final class CfnProvisionerFixture {
             }
             if (cognitoService != null) {
                 discovered.add(new CognitoCfnProvisioner(cognitoService));
+                discovered.add(new CognitoIdentityProviderCfnProvisioner(cognitoService));
                 discovered.add(new CognitoResourceServerCfnProvisioner(cognitoService));
                 discovered.add(new CognitoUserPoolGroupCfnProvisioner(cognitoService));
                 discovered.add(new CognitoUserPoolUserCfnProvisioner(cognitoService));
@@ -471,7 +476,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new LambdaEventSourceMappingCfnProvisioner(lambdaService));
             }
             if (flowLogService != null) {
-                discovered.add(new Ec2FlowLogCfnProvisioner(flowLogService));
+                discovered.add(new Ec2FlowLogCfnProvisioner(flowLogService, ec2Service));
             }
             if (iotAuthorizerService != null) {
                 discovered.add(new IotAuthorizerCfnProvisioner(iotAuthorizerService));
@@ -564,6 +569,9 @@ final class CfnProvisionerFixture {
             }
             if (cloudMapService != null) {
                 discovered.add(new CloudMapCfnProvisioner(cloudMapService));
+            }
+            if (eventBridgeV2Service != null) {
+                discovered.add(new EventsV2CfnProvisioner(eventBridgeV2Service));
             }
             if (guardDutyService != null) {
                 discovered.add(new GuardDutyMalwareProtectionPlanCfnProvisioner(guardDutyService));
@@ -912,6 +920,11 @@ final class CfnProvisionerFixture {
 
         public Builder cloudMap(CloudMapService v) {
             this.cloudMapService = v;
+            return this;
+        }
+
+        public Builder eventBridgeV2(EventBridgeV2Service v) {
+            this.eventBridgeV2Service = v;
             return this;
         }
 

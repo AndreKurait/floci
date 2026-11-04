@@ -98,11 +98,11 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - HTTP and HTTPS health checks use their own configured protocol and port, independently
   of the target's application protocol. HTTPS health checks require a TLS handshake,
   preserve the configured success-code matcher, and do not follow redirects.
-- Health probes connect directly to targets without using the JVM proxy configuration.
-  A lookup that outlives its deadline retains its target and worker slot until it exits;
-  subsequent probes cannot accumulate behind the timed-out work.
 - One health-check deadline covers connection, TLS handshake and response headers.
   Partial bytes do not renew it. Expiry closes the probe and counts toward `Target.Timeout`.
+- Health probes connect directly without JVM proxy settings. A timed-out lookup keeps
+  its target and shared worker slot until the underlying work actually exits. This bounds
+  background work even when name resolution ignores interruption.
 - Backend TLS uses the runtime's supported protocols and ciphers. Floci does not reproduce
   AWS ALB's backend security-policy selection from the frontend listener policy.
 - ALB listeners share the emulator's network address. Stored subnet and security-group

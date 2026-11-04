@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.testing.AwsTestClients;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -12,6 +13,7 @@ import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 import software.amazon.awssdk.services.cloudformation.model.CloudFormationException;
 import software.amazon.awssdk.services.cloudformation.model.Output;
 import software.amazon.awssdk.services.cloudformation.model.Parameter;
+import software.amazon.awssdk.services.cloudformation.model.StackResource;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.Subnet;
 
@@ -25,6 +27,7 @@ import java.util.stream.Collectors;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -45,14 +48,21 @@ class CloudFormationMappingListIntegrationTest {
     @AfterEach
     void cleanup() {
         try {
+            List<String> subnetIds = cfn.describeStackResources(request -> request.stackName(name))
+                    .stackResources().stream()
+                    .filter(resource -> "AWS::EC2::Subnet".equals(resource.resourceType()))
+                    .map(StackResource::physicalResourceId).toList();
             cfn.deleteStack(request -> request.stackName(name));
+            assertEquals(3, subnetIds.size(), "Capture every created subnet before deleting the stack");
             await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
                 CloudFormationException absent = assertThrows(CloudFormationException.class,
                         () -> cfn.describeStacks(request -> request.stackName(name)));
                 assertEquals("ValidationError", absent.awsErrorDetails().errorCode());
                 assertTrue(absent.getMessage().contains("does not exist"));
-                assertTrue(ec2.describeSubnets(request -> request.filters(filter -> filter
-                        .name("tag:aws:cloudformation:stack-name").values(name))).subnets().isEmpty());
+                List<String> remaining = ec2.describeSubnets().subnets().stream().map(Subnet::subnetId).toList();
+                for (String subnetId : subnetIds) {
+                    assertFalse(remaining.contains(subnetId), "Subnet remains after stack deletion: " + subnetId);
+                }
             });
         } finally {
             ec2.close();
@@ -65,7 +75,7 @@ class CloudFormationMappingListIntegrationTest {
     void conditionalMappedListsPlaceEachSubnetInTheSelectedZone(String mode) {
         cfn.createStack(request -> request.stackName(name).templateBody(template())
                 .parameters(mode(mode)));
-        awaitStatus("CREATE_COMPLETE");
+        CfnStackWaits.awaitStatus(cfn, name, "CREATE_COMPLETE");
         assertPlacement(mode);
     }
 
@@ -73,7 +83,7 @@ class CloudFormationMappingListIntegrationTest {
     void changingTheSelectedMappingReplacesSubnetsInTheNewZones() {
         cfn.createStack(request -> request.stackName(name).templateBody(template())
                 .parameters(mode("Discover")));
-        awaitStatus("CREATE_COMPLETE");
+        CfnStackWaits.awaitStatus(cfn, name, "CREATE_COMPLETE");
         assertPlacement("Discover");
         Map<String, String> previous = outputs();
 
@@ -81,7 +91,7 @@ class CloudFormationMappingListIntegrationTest {
                 .replace("10.88.2.0/24", "10.88.4.0/24");
         cfn.updateStack(request -> request.stackName(name).templateBody(updated)
                 .parameters(mode("Mapped")));
-        awaitStatus("UPDATE_COMPLETE");
+        CfnStackWaits.awaitStatus(cfn, name, "UPDATE_COMPLETE");
         assertPlacement("Mapped");
         List<String> remaining = ec2.describeSubnets().subnets().stream().map(Subnet::subnetId).toList();
         assertTrue(!remaining.contains(previous.get("Subnet0")) && !remaining.contains(previous.get("Subnet2")),
@@ -108,12 +118,6 @@ class CloudFormationMappingListIntegrationTest {
                 .collect(Collectors.toMap(Output::outputKey, Output::outputValue));
     }
 
-    private void awaitStatus(String expected) {
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                assertEquals(expected, cfn.describeStacks(request -> request.stackName(name))
-                        .stacks().getFirst().stackStatusAsString()));
-    }
-
     private static Parameter mode(String value) {
         return Parameter.builder().parameterKey("ZoneMode").parameterValue(value).build();
     }
@@ -121,42 +125,203 @@ class CloudFormationMappingListIntegrationTest {
     private static String template() {
         return """
                 {
-                  "Parameters":{"ZoneMode":{"Type":"String"}},
-                  "Mappings":{
-                    "Zones":{
-                      "Discover":{"Values":["automatic"]},
-                      "Mapped":{"Values":["us-east-1c","us-east-1b","us-east-1a"]}
+                  "Parameters": {
+                    "ZoneMode": {
+                      "Type": "String"
+                    }
+                  },
+                  "Mappings": {
+                    "Zones": {
+                      "Discover": {
+                        "Values": [
+                          "automatic"
+                        ]
+                      },
+                      "Mapped": {
+                        "Values": [
+                          "us-east-1c",
+                          "us-east-1b",
+                          "us-east-1a"
+                        ]
+                      }
                     },
-                    "Text":{"Example":{"Values":["first,with-comma","","last"]}}
+                    "Text": {
+                      "Example": {
+                        "Values": [
+                          "first,with-comma",
+                          "",
+                          "last"
+                        ]
+                      }
+                    }
                   },
-                  "Conditions":{
-                    "UseDiscovery":{"Fn::Equals":["automatic",{"Fn::Select":[0,
-                      {"Fn::FindInMap":["Zones",{"Ref":"ZoneMode"},"Values"]}]}]}
+                  "Conditions": {
+                    "UseDiscovery": {
+                      "Fn::Equals": [
+                        "automatic",
+                        {
+                          "Fn::Select": [
+                            0,
+                            {
+                              "Fn::FindInMap": [
+                                "Zones",
+                                {
+                                  "Ref": "ZoneMode"
+                                },
+                                "Values"
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
                   },
-                  "Resources":{
-                    "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.88.0.0/16"}},
-                    "Subnet0":{"Type":"AWS::EC2::Subnet","Properties":{
-                      "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.88.0.0/24",
-                      "AvailabilityZone":{"Fn::Select":[0,{"Fn::If":["UseDiscovery",
-                        {"Fn::GetAZs":{"Ref":"AWS::Region"}},
-                        {"Fn::FindInMap":["Zones",{"Ref":"ZoneMode"},"Values"]}]}]}}},
-                    "Subnet1":{"Type":"AWS::EC2::Subnet","Properties":{
-                      "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.88.1.0/24",
-                      "AvailabilityZone":{"Fn::Select":[1,{"Fn::If":["UseDiscovery",
-                        {"Fn::GetAZs":{"Ref":"AWS::Region"}},
-                        {"Fn::FindInMap":["Zones",{"Ref":"ZoneMode"},"Values"]}]}]}}},
-                    "Subnet2":{"Type":"AWS::EC2::Subnet","Properties":{
-                      "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.88.2.0/24",
-                      "AvailabilityZone":{"Fn::Select":[2,{"Fn::If":["UseDiscovery",
-                        {"Fn::GetAZs":{"Ref":"AWS::Region"}},
-                        {"Fn::FindInMap":["Zones",{"Ref":"ZoneMode"},"Values"]}]}]}}}
+                  "Resources": {
+                    "Vpc": {
+                      "Type": "AWS::EC2::VPC",
+                      "Properties": {
+                        "CidrBlock": "10.88.0.0/16"
+                      }
+                    },
+                    "Subnet0": {
+                      "Type": "AWS::EC2::Subnet",
+                      "Properties": {
+                        "VpcId": {
+                          "Ref": "Vpc"
+                        },
+                        "CidrBlock": "10.88.0.0/24",
+                        "AvailabilityZone": {
+                          "Fn::Select": [
+                            0,
+                            {
+                              "Fn::If": [
+                                "UseDiscovery",
+                                {
+                                  "Fn::GetAZs": {
+                                    "Ref": "AWS::Region"
+                                  }
+                                },
+                                {
+                                  "Fn::FindInMap": [
+                                    "Zones",
+                                    {
+                                      "Ref": "ZoneMode"
+                                    },
+                                    "Values"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "Subnet1": {
+                      "Type": "AWS::EC2::Subnet",
+                      "Properties": {
+                        "VpcId": {
+                          "Ref": "Vpc"
+                        },
+                        "CidrBlock": "10.88.1.0/24",
+                        "AvailabilityZone": {
+                          "Fn::Select": [
+                            1,
+                            {
+                              "Fn::If": [
+                                "UseDiscovery",
+                                {
+                                  "Fn::GetAZs": {
+                                    "Ref": "AWS::Region"
+                                  }
+                                },
+                                {
+                                  "Fn::FindInMap": [
+                                    "Zones",
+                                    {
+                                      "Ref": "ZoneMode"
+                                    },
+                                    "Values"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "Subnet2": {
+                      "Type": "AWS::EC2::Subnet",
+                      "Properties": {
+                        "VpcId": {
+                          "Ref": "Vpc"
+                        },
+                        "CidrBlock": "10.88.2.0/24",
+                        "AvailabilityZone": {
+                          "Fn::Select": [
+                            2,
+                            {
+                              "Fn::If": [
+                                "UseDiscovery",
+                                {
+                                  "Fn::GetAZs": {
+                                    "Ref": "AWS::Region"
+                                  }
+                                },
+                                {
+                                  "Fn::FindInMap": [
+                                    "Zones",
+                                    {
+                                      "Ref": "ZoneMode"
+                                    },
+                                    "Values"
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    }
                   },
-                  "Outputs":{
-                    "Subnet0":{"Value":{"Ref":"Subnet0"}},
-                    "Subnet1":{"Value":{"Ref":"Subnet1"}},
-                    "Subnet2":{"Value":{"Ref":"Subnet2"}},
-                    "UsesDiscovery":{"Value":{"Fn::If":["UseDiscovery","true","false"]}},
-                    "Joined":{"Value":{"Fn::Join":["|",{"Fn::FindInMap":["Text","Example","Values"]}]}}
+                  "Outputs": {
+                    "Subnet0": {
+                      "Value": {
+                        "Ref": "Subnet0"
+                      }
+                    },
+                    "Subnet1": {
+                      "Value": {
+                        "Ref": "Subnet1"
+                      }
+                    },
+                    "Subnet2": {
+                      "Value": {
+                        "Ref": "Subnet2"
+                      }
+                    },
+                    "UsesDiscovery": {
+                      "Value": {
+                        "Fn::If": [
+                          "UseDiscovery",
+                          "true",
+                          "false"
+                        ]
+                      }
+                    },
+                    "Joined": {
+                      "Value": {
+                        "Fn::Join": [
+                          "|",
+                          {
+                            "Fn::FindInMap": [
+                              "Text",
+                              "Example",
+                              "Values"
+                            ]
+                          }
+                        ]
+                      }
+                    }
                   }
                 }
                 """;

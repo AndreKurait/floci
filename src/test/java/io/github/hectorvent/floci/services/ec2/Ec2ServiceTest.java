@@ -3224,6 +3224,65 @@ class Ec2ServiceTest {
                 .getFirst().getAssociationId(), "a failed gateway must not claim the allocation");
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void deletingAnInterfaceSerializesWithAddressAssociation(boolean associateFirst) throws Exception {
+        ParkingStore<NetworkInterface> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<NetworkInterface> interfaceStore =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", interfaceStore)));
+        String region = "us-east-1";
+        String subnetId = service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId();
+        String interfaceId = service.createNetworkInterface(region, subnetId, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        String allocationId = service.allocateAddress(region).getAllocationId();
+        Runnable associate = () -> service.associateAddress(region, allocationId, null, interfaceId, null);
+        Runnable delete = () -> service.deleteNetworkInterface(region, interfaceId);
+        AtomicReference<Thread> firstWorker = new AtomicReference<>();
+        AtomicReference<Thread> secondWorker = new AtomicReference<>();
+        parking.parkNextRead();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> first = workers.submit(() -> {
+                firstWorker.set(Thread.currentThread());
+                (associateFirst ? associate : delete).run();
+            });
+            assertTrue(parking.awaitParked(), "the first request never read the interface");
+            Future<?> second = workers.submit(() -> {
+                secondWorker.set(Thread.currentThread());
+                (associateFirst ? delete : associate).run();
+            });
+            String secondMethod = associateFirst ? "deleteNetworkInterface" : "associateAddress";
+            Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> second.isDone()
+                    || isBlockedIn(secondWorker.get(), secondMethod, firstWorker.get()));
+            parking.release();
+            first.get(10, TimeUnit.SECONDS);
+            if (associateFirst) {
+                second.get(10, TimeUnit.SECONDS);
+            } else {
+                ExecutionException refusal = assertThrows(ExecutionException.class,
+                        () -> second.get(10, TimeUnit.SECONDS));
+                AwsException missing = assertInstanceOf(AwsException.class, refusal.getCause());
+                assertEquals("InvalidNetworkInterfaceID.NotFound", missing.getErrorCode());
+                assertEquals(400, missing.getHttpStatus());
+            }
+            AwsException missing = assertThrows(AwsException.class,
+                    () -> service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of()));
+            assertEquals("InvalidNetworkInterfaceID.NotFound", missing.getErrorCode());
+            Address address = service.describeAddresses(region, List.of(allocationId), Map.of()).getFirst();
+            assertNull(address.getAssociationId(), "the allocation must not remain associated with a deleted interface");
+            assertNull(address.getNetworkInterfaceId());
+            assertNull(address.getPrivateIpAddress());
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
     /** AssociateAddress refuses an allocation a NAT gateway holds; the gateway keeps it. */
     @Test
     void associateAddressRefusesANatGatewaysElasticIp() {
@@ -3245,6 +3304,154 @@ class Ec2ServiceTest {
         service.deleteNatGateway("us-east-1", nat.getNatGatewayId());
         assertNull(service.describeAddresses("us-east-1", List.of(allocationId), Map.of())
                 .getFirst().getAssociationId(), "delete must still release the gateway's Elastic IP");
+    }
+
+    /**
+     * A secondary-address update that read the gateway before a delete finished must not write it
+     * back: the delete runs while the update waits for the allocation lock, and another gateway
+     * takes the released primary Elastic IP meanwhile.
+     */
+    @Test
+    void aSecondaryAddressUpdateDoesNotBringBackAGatewayDeletedUnderIt() throws Exception {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnetId = service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId();
+        String primary = service.allocateAddress(region).getAllocationId();
+        String secondary = service.allocateAddress(region).getAllocationId();
+        String added = service.allocateAddress(region).getAllocationId();
+        String natId = service.createNatGateway(region, subnetId, primary, "public", null, List.of(secondary),
+                List.of(), null, List.of()).getNatGatewayId();
+        Field lockField = Ec2Service.class.getDeclaredField("privateIpAllocationLock");
+        lockField.setAccessible(true);
+        Object lock = lockField.get(service);
+        AtomicReference<Thread> updater = new AtomicReference<>();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> updating;
+            String other;
+            synchronized (lock) {
+                updating = worker.submit(() -> {
+                    updater.set(Thread.currentThread());
+                    service.updateNatGatewaySecondaryAddresses(region, natId, List.of(added), List.of(), null);
+                });
+                awaitBlockedOrDone(updater, updating);
+                assertFalse(updating.isDone(), "the update must wait for the allocation lock");
+                service.deleteNatGateway(region, natId);
+                other = service.createNatGateway(region, subnetId, primary, "public", List.of()).getNatGatewayId();
+            }
+            ExecutionException e = assertThrows(ExecutionException.class, () -> updating.get(5, TimeUnit.SECONDS));
+            assertEquals("NatGatewayNotFound", ((AwsException) e.getCause()).getErrorCode());
+
+            assertTrue(service.describeNatGateways(region, List.of(), Map.of()).stream()
+                    .noneMatch(g -> natId.equals(g.getNatGatewayId())), "the deleted gateway stays deleted");
+            NatGateway taker = service.describeNatGateways(region, List.of(other), Map.of()).getFirst();
+            assertEquals(taker.getNatGatewayAddresses().getFirst().getAssociationId(),
+                    service.describeAddresses(region, List.of(primary), Map.of()).getFirst().getAssociationId(),
+                    "the primary Elastic IP stays with the gateway that took it");
+            for (String free : List.of(secondary, added)) {
+                assertNull(service.describeAddresses(region, List.of(free), Map.of()).getFirst().getAssociationId(),
+                        free + " is not held again");
+            }
+        } finally {
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    /**
+     * A NAT gateway whose addresses run out part way gives back the lease it took on the VPC
+     * network. The subnet is a /28, eleven assignable addresses, and 31 more are asked for.
+     */
+    @Test
+    void aNatGatewayCreateThatRunsOutOfAddressesGivesBackTheLeaseItTook() {
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(vpcNetworks);
+        String subnetId = privateSubnet(service, "us-east-1", "10.60.0.0/28");
+        when(vpcNetworks.allocatePrivateIp("us-east-1", subnetId))
+                .thenReturn(Optional.of("10.60.0.5"), Optional.empty());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.createNatGateway("us-east-1", subnetId,
+                null, "private", null, List.of(), List.of(), "31", List.of()));
+        assertEquals("InsufficientFreeAddressesInSubnet", e.getErrorCode());
+        verify(vpcNetworks).releasePrivateIp("us-east-1", subnetId, "10.60.0.5");
+        assertTrue(service.describeNatGateways("us-east-1", List.of(), Map.of()).isEmpty());
+    }
+
+    /** The same on a secondary-address update, which also leaves the gateway as it was. */
+    @Test
+    void aNatGatewayUpdateThatRunsOutOfAddressesGivesBackTheLeaseItTook() {
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(vpcNetworks);
+        String subnetId = privateSubnet(service, "us-east-1", "10.60.0.0/28");
+        when(vpcNetworks.allocatePrivateIp("us-east-1", subnetId))
+                .thenReturn(Optional.of("10.60.0.6"), Optional.of("10.60.0.7"), Optional.empty());
+        NatGateway nat = service.createNatGateway("us-east-1", subnetId, null, "private", List.of());
+        assertEquals("10.60.0.6", nat.getNatGatewayAddresses().getFirst().getPrivateIp());
+
+        AwsException e = assertThrows(AwsException.class, () -> service.updateNatGatewaySecondaryAddresses(
+                "us-east-1", nat.getNatGatewayId(), List.of(), List.of(), "31"));
+        assertEquals("InsufficientFreeAddressesInSubnet", e.getErrorCode());
+        verify(vpcNetworks).releasePrivateIp("us-east-1", subnetId, "10.60.0.7");
+        assertEquals(List.of("10.60.0.6"), service.describeNatGateways("us-east-1", List.of(nat.getNatGatewayId()),
+                Map.of()).getFirst().getNatGatewayAddresses().stream().map(NatGatewayAddress::getPrivateIp).toList(),
+                "the gateway keeps only its primary address");
+    }
+
+    /**
+     * CreateTags writes a NAT gateway back under the gateway's tag lock, which DeleteNatGateway
+     * does not take, so a tag write that read the gateway before a delete stores the record the
+     * delete marked deleted. A secondary-address update must refuse that record rather than hold
+     * Elastic IPs for it.
+     */
+    @Test
+    void aSecondaryAddressUpdateRefusesAGatewayStoredAsDeleted() throws Exception {
+        CountDownLatch putReached = new CountDownLatch(1);
+        CountDownLatch deleteDone = new CountDownLatch(1);
+        AtomicReference<Boolean> pausePut = new AtomicReference<>(false);
+        InMemoryStorage<String, NatGateway> rawGateways = new InMemoryStorage<>() {
+            @Override
+            public void put(String key, NatGateway value) {
+                if (pausePut.getAndSet(false)) {
+                    putReached.countDown();
+                    try {
+                        assertTrue(deleteDone.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                super.put(key, value);
+            }
+        };
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-nat-gateways.json",
+                        new AccountAwareStorageBackend<>(rawGateways, null, "000000000000"))));
+        String region = "us-east-1";
+        String subnetId = service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId();
+        String primary = service.allocateAddress(region).getAllocationId();
+        String added = service.allocateAddress(region).getAllocationId();
+        String natId = service.createNatGateway(region, subnetId, primary, "public", List.of()).getNatGatewayId();
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            pausePut.set(true);
+            Future<?> tagging = worker.submit(() -> service.createTags(region, List.of(natId),
+                    List.of(new Tag("k", "v"))));
+            assertTrue(putReached.await(5, TimeUnit.SECONDS), "the tag write reaches its put");
+            service.deleteNatGateway(region, natId);
+            deleteDone.countDown();
+            tagging.get(5, TimeUnit.SECONDS);
+            assertEquals("deleted", rawGateways.scan(k -> true).getFirst().getState(),
+                    "the tag write stored the deleted gateway");
+
+            AwsException e = assertThrows(AwsException.class, () -> service.updateNatGatewaySecondaryAddresses(
+                    region, natId, List.of(added), List.of(), null));
+            assertEquals("NatGatewayNotFound", e.getErrorCode());
+            assertNull(service.describeAddresses(region, List.of(added), Map.of()).getFirst().getAssociationId(),
+                    "the requested Elastic IP is not held for the deleted gateway");
+        } finally {
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
+        }
     }
 
     /**
@@ -5612,6 +5819,47 @@ class Ec2ServiceTest {
         return service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro", count, count, null,
                 List.of(), subnetId, null, List.of(), null, null, null, null, 0, null, null, null, null,
                 false, null, null, null, false, privateIp);
+    }
+
+    @Test
+    void anInstanceConnectEndpointInterfaceNamesItsGroupsForTheAccountItIsReadFor() {
+        // The explicit-account DescribeNetworkInterfaces overload runs under whatever account the
+        // ambient request carries; the group names must come from the account named, not that one.
+        RequestContext context = new RequestContext();
+        Ec2Service service = mockedVpcNetworkService(context, Map.of(), null);
+        context.setAccountId("111122223333");
+        String vpcId = service.createVpc("us-east-1", "10.82.0.0/16", false).getVpcId();
+        String subnetId = service.createSubnet("us-east-1", vpcId, "10.82.1.0/24", "us-east-1a").getSubnetId();
+        String group = service.createSecurityGroup("us-east-1", "eice-sg", "x", vpcId).getGroupId();
+        String eniId = service.createInstanceConnectEndpoint("us-east-1", subnetId, List.of(group), null, null,
+                List.of(), null).getNetworkInterfaceIds().getFirst();
+
+        context.setAccountId("000000000000");
+        NetworkInterface ni = service.describeNetworkInterfaces("111122223333", "us-east-1", List.of(eniId),
+                Map.of()).networkInterfaces().getFirst();
+        assertEquals(List.of(Map.entry(group, "eice-sg")), ni.getGroups().stream()
+                .map(g -> Map.entry(g.getGroupId(), String.valueOf(g.getGroupName()))).toList());
+    }
+
+    @Test
+    void anotherAccountDoesNotSeeAnInstanceConnectEndpointsInterface() {
+        RequestContext context = new RequestContext();
+        Ec2Service service = mockedVpcNetworkService(context, Map.of(), null);
+        context.setAccountId("111122223333");
+        String vpcId = service.createVpc("us-east-1", "10.83.0.0/16", false).getVpcId();
+        String subnetId = service.createSubnet("us-east-1", vpcId, "10.83.1.0/24", "us-east-1a").getSubnetId();
+        String eniId = service.createInstanceConnectEndpoint("us-east-1", subnetId, List.of(), null, null,
+                List.of(), null).getNetworkInterfaceIds().getFirst();
+
+        context.setAccountId("444455556666");
+        assertEquals("InvalidNetworkInterfaceID.NotFound", assertThrows(AwsException.class, () -> service
+                .describeNetworkInterfaces("us-east-1", List.of(eniId), Map.of())).getErrorCode());
+        assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(), Map.of()).networkInterfaces().stream()
+                .noneMatch(ni -> eniId.equals(ni.getNetworkInterfaceId())));
+
+        context.setAccountId("111122223333");
+        assertEquals(eniId, service.describeNetworkInterfaces("us-east-1", List.of(eniId), Map.of())
+                .networkInterfaces().getFirst().getNetworkInterfaceId());
     }
 
     private static Ec2Service realVpcNetworkService(RequestContext context) {
