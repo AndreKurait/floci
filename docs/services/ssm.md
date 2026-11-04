@@ -19,14 +19,12 @@
 | `DescribeParameters` | List parameters with optional filters |
 | `LabelParameterVersion` | Attach a label to a specific version |
 | `UnlabelParameterVersion` | Remove labels from a specific version |
-| `AddTagsToResource` | Tag a parameter |
-| `ListTagsForResource` | List tags on a parameter |
-| `RemoveTagsFromResource` | Remove tags from a parameter |
+| `AddTagsToResource` | Tag a parameter or customer patch baseline |
+| `ListTagsForResource` | List tags on a parameter or customer patch baseline |
+| `RemoveTagsFromResource` | Remove tags from a parameter or customer patch baseline |
 | `PutResourcePolicy` | Attach or update the resource policy of an Advanced-tier parameter |
 | `GetResourcePolicies` | List the resource policy attached to a parameter |
 | `DeleteResourcePolicy` | Remove a parameter's resource policy |
-| `DescribePatchBaselines` | List AWS-owned predefined patch baselines (filter by `OWNER`, `OPERATING_SYSTEM`, `NAME_PREFIX`) |
-| `GetDefaultPatchBaseline` | Get the default patch baseline id for an operating system |
 
 `DescribeParameters` includes the stored parameter's `ARN` in each metadata entry, matching
 `GetParameter`. This applies to filtered and paginated results as well.
@@ -43,6 +41,36 @@ labels appears only once. Type and KeyId filters match the labeled version's met
 Public AMI parameters have no stored labels and are excluded from label queries.
 `MaxResults` and `NextToken` paginate the matching versions in name/version order; queries
 without a label filter continue to return the latest version of each parameter.
+
+### Patch baseline configuration
+
+| Action | Description |
+|---|---|
+| `CreatePatchBaseline` | Store a customer baseline's approval rules, patch lists, repository sources and tags |
+| `GetPatchBaseline` | Read customer configuration and patch-group bindings |
+| `UpdatePatchBaseline` | Change supplied fields, or replace optional configuration with `Replace=true` |
+| `DeletePatchBaseline` | Delete an unused customer baseline; registered patch groups must first be removed |
+| `DescribePatchBaselines` | Page through predefined and customer identities with `OWNER`, `OPERATING_SYSTEM` and `NAME_PREFIX` filters |
+| `GetDefaultPatchBaseline` | Return the account's default for an operating system, falling back to the predefined baseline |
+| `RegisterDefaultPatchBaseline` | Select a customer baseline as the account's default for its operating system |
+| `RegisterPatchBaselineForPatchGroup` | Bind a patch group to one customer baseline per operating system |
+| `DeregisterPatchBaselineForPatchGroup` | Remove a patch-group binding |
+| `GetPatchBaselineForPatchGroup` | Resolve a group's baseline or the operating-system default |
+| `DescribePatchGroups` | Page through bindings with `NAME_PREFIX` and `OPERATING_SYSTEM` filters |
+
+Customer baselines, defaults, tags and idempotency tokens use the existing SSM
+storage mode and are isolated by account and region. `CreatePatchBaseline`
+replays an identical client token and rejects a token used with different input.
+Updates preserve the operating system and creation time. An ordinary update
+preserves omitted fields; `Replace=true` requires a name and resets omitted
+optional configuration. JSON timestamps use epoch seconds for strict SDK clients.
+Debian and Ubuntu rules accept filters without date-based auto approval; supplying
+`ApproveAfterDays` or `ApproveUntilDate` for those operating systems is rejected.
+
+This implements configuration storage. It does not install or scan patches,
+resolve repository package versions, or report managed-node patch compliance.
+Predefined baselines retain the existing identity catalog; reading their full
+approval policies or registering an AWS-owned baseline ARN is not implemented.
 
 ### Run Command
 
