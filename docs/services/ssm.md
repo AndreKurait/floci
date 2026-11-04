@@ -64,6 +64,11 @@ without a label filter continue to return the latest version of each parameter.
 | `AcknowledgeMessage` | Agent acknowledges receipt of a command message |
 | `SendReply` | Agent reports command output and status |
 
+## Document descriptions
+
+`DescribeDocument` returns `CreatedDate` as numeric epoch seconds, so AWS SDK
+clients can decode descriptions of current and retained document versions.
+
 ## State Manager associations
 
 Association create, describe, list, update and delete operations store and return the

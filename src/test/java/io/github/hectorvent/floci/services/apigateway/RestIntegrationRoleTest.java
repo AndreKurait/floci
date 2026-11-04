@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.Integration;
 import io.github.hectorvent.floci.services.apigateway.model.MethodConfig;
 import io.github.hectorvent.floci.services.apigateway.model.MethodSetting;
+import io.github.hectorvent.floci.services.apigateway.model.RestApi;
 import io.github.hectorvent.floci.services.apigateway.model.Stage;
 import io.github.hectorvent.floci.services.iam.AssumeRolePolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
@@ -109,6 +110,7 @@ class RestIntegrationRoleTest {
         resource.setPath("/");
         resource.setResourceMethods(Map.of("POST", method));
         when(gateway.resolveRestApiRegion("us-east-1", "api")).thenReturn("us-east-1");
+        when(gateway.getRestApi("us-east-1", "api")).thenReturn(new RestApi());
         stage = new Stage();
         when(gateway.getStage("us-east-1", "api", "prod")).thenReturn(stage);
         when(gateway.getResources("us-east-1", "api")).thenReturn(List.of(resource));
