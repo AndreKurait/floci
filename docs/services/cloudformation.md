@@ -1,8 +1,8 @@
 # CloudFormation
 
-`CreateStack` and `UpdateStack` return the accepted stack ID after at most one second of waiting for initial execution progress.
-Longer operations continue in the existing background executor; use stack status and events to observe completion or failure.
-The initial wait does not cancel or resubmit an accepted operation. Existing synchronous request validation and concurrent-operation refusals are retained.
+`CreateStack` and `UpdateStack` return the accepted stack ID without waiting for resource provisioning to complete.
+Provisioning runs in the existing background executor. Use stack status and events to observe completion or failure.
+Request validation and concurrent-operation checks still run before the operation is accepted.
 
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 **Endpoint:** `POST http://localhost:4566/`
