@@ -16,6 +16,7 @@ import jakarta.inject.Inject;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -59,17 +60,29 @@ public class Ec2SecurityGroupRuleCfnProvisioner implements CfnResourceProvisione
         String groupId = resolveGroupId(props, ctx);
         IpPermission perm = toIpPermission(props, ctx.engine());
 
-        // UpdateStack re-executes every resource with the physical id it got at create time, and the
-        // authorize APIs are append-only, so the rule the previous execution created has to go:
-        // otherwise an unchanged rule doubles up on the group, and a changed one leaves its old
-        // permission behind. These resources are immutable in CloudFormation — every property change
-        // is a replacement — so the update semantics are authorize-then-revoke.
-        //
-        // Authorize first, revoke second. The other order leaves the group with neither rule when
-        // the new authorization fails, and rollback keeps the old physical id without recreating
-        // its permission, so the stack settles as UPDATE_ROLLBACK_COMPLETE minus a valid rule.
-        String previousRuleId = r.getPhysicalId();
+        String previousRuleId = ctx.priorPhysicalId();
+        if (ctx.isUpdate() && groupId != null && !groupId.isBlank()) {
+            SecurityGroupRule current = ec2Service.describeSecurityGroupRules(
+                            ctx.region(), List.of(groupId), List.of(previousRuleId)).stream()
+                    .filter(rule -> rule.isEgress() != ingress && matchesPermission(rule, perm, ctx, groupId))
+                    .findFirst().orElse(null);
+            if (current != null) {
+                if ((props.has("Description") || ctx.previouslyDeclared("Description"))
+                        && !Objects.equals(current.getDescription(), ctx.resolveOptional(props, "Description"))) {
+                    if (ingress) {
+                        ec2Service.updateSecurityGroupRuleDescriptionsIngress(ctx.region(), groupId, List.of(perm));
+                    } else {
+                        ec2Service.updateSecurityGroupRuleDescriptionsEgress(ctx.region(), groupId, List.of(perm));
+                    }
+                }
+                r.setPhysicalId(previousRuleId);
+                r.getAttributes().put("Id", previousRuleId);
+                return;
+            }
+        }
 
+        // Access changes replace the rule. Authorize first so a rejected replacement leaves the
+        // original permission available for rollback; description updates above retain its identity.
         List<SecurityGroupRule> rules = ingress
                 ? ec2Service.authorizeSecurityGroupIngress(ctx.region(), groupId, List.of(perm))
                 : ec2Service.authorizeSecurityGroupEgress(ctx.region(), groupId, List.of(perm));
@@ -85,6 +98,38 @@ public class Ec2SecurityGroupRuleCfnProvisioner implements CfnResourceProvisione
                 : r.getLogicalId();
         r.setPhysicalId(ruleId);
         r.getAttributes().put("Id", ruleId);
+    }
+
+    private boolean matchesPermission(SecurityGroupRule rule, IpPermission permission,
+                                      ProvisionContext ctx, String groupId) {
+        if (!Objects.equals(rule.getIpProtocol(), permission.getIpProtocol())
+                || !Objects.equals(rule.getFromPort(), permission.getFromPort())
+                || !Objects.equals(rule.getToPort(), permission.getToPort())) {
+            return false;
+        }
+        if (permission.getIpRanges().size() == 1) {
+            return Objects.equals(rule.getCidrIpv4(), permission.getIpRanges().getFirst().getCidrIp());
+        }
+        if (permission.getIpv6Ranges().size() == 1) {
+            return Objects.equals(rule.getCidrIpv6(), permission.getIpv6Ranges().getFirst().getCidrIpv6());
+        }
+        if (permission.getPrefixListIds().size() == 1) {
+            return Objects.equals(rule.getPrefixListId(), permission.getPrefixListIds().getFirst().getPrefixListId());
+        }
+        if (permission.getUserIdGroupPairs().size() != 1 || rule.getReferencedGroupInfo() == null) {
+            return false;
+        }
+        UserIdGroupPair peer = permission.getUserIdGroupPairs().getFirst();
+        String peerId = peer.getGroupId();
+        if (peerId == null && peer.getGroupName() != null) {
+            String vpcId = ec2Service.describeSecurityGroups(ctx.region(), List.of(groupId), List.of(), Map.of())
+                    .getFirst().getVpcId();
+            peerId = ec2Service.describeSecurityGroups(ctx.region(), List.of(), List.of(peer.getGroupName()),
+                            Map.of("vpc-id", List.of(vpcId))).stream()
+                    .map(SecurityGroup::getGroupId).findFirst().orElse(null);
+        }
+        return peerId != null && peerId.equals(rule.getReferencedGroupInfo().getGroupId())
+                && (peer.getUserId() == null || peer.getUserId().equals(rule.getReferencedGroupInfo().getUserId()));
     }
 
     @Override

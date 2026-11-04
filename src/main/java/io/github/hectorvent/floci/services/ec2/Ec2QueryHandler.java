@@ -3716,15 +3716,32 @@ public class Ec2QueryHandler {
     }
 
     private Response handleUpdateSgRuleDescriptionsIngress(MultivaluedMap<String, String> p, String region) {
-        String groupId = p.getFirst("GroupId");
-        service.updateSecurityGroupRuleDescriptionsIngress(region, groupId, Collections.emptyList());
-        return booleanResponse("UpdateSecurityGroupRuleDescriptionsIngress");
+        return updateSgRuleDescriptions(p, region, false);
     }
 
     private Response handleUpdateSgRuleDescriptionsEgress(MultivaluedMap<String, String> p, String region) {
-        String groupId = p.getFirst("GroupId");
-        service.updateSecurityGroupRuleDescriptionsEgress(region, groupId, Collections.emptyList());
-        return booleanResponse("UpdateSecurityGroupRuleDescriptionsEgress");
+        return updateSgRuleDescriptions(p, region, true);
+    }
+
+    private Response updateSgRuleDescriptions(MultivaluedMap<String, String> p, String region, boolean egress) {
+        List<SecurityGroupRule> descriptions = new ArrayList<>();
+        for (int index = 1; ; index++) {
+            String prefix = "SecurityGroupRuleDescription." + index + ".";
+            String id = p.getFirst(prefix + "SecurityGroupRuleId");
+            String description = p.getFirst(prefix + "Description");
+            if (id == null && description == null) {
+                break;
+            }
+            SecurityGroupRule value = new SecurityGroupRule();
+            value.setSecurityGroupRuleId(id);
+            value.setDescription(description);
+            descriptions.add(value);
+        }
+        service.updateSecurityGroupRuleDescriptions(region, p.getFirst("GroupId"), p.getFirst("GroupName"),
+                parseIpPermissions(p, "IpPermissions"), descriptions, egress,
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse(egress ? "UpdateSecurityGroupRuleDescriptionsEgress"
+                : "UpdateSecurityGroupRuleDescriptionsIngress");
     }
 
     // ─── Key Pair handlers ────────────────────────────────────────────────────

@@ -155,6 +155,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -8558,6 +8559,31 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public String deleteSecurityGroup(String region, String groupId, String groupName, boolean dryRun) {
+        String selectedId = resolveSecurityGroupSelection(region, groupId, groupName);
+        synchronized (attachmentTopologyLock(region)) {
+            synchronized (lockFor(key(region, selectedId))) {
+                SecurityGroup selected = getRequiredSecurityGroup(region, selectedId);
+                if ("default".equals(selected.getGroupName())) {
+                    throw new AwsException("Client.CannotDelete", "The default security group cannot be deleted", 400);
+                }
+                if (hasSecurityGroupDependencies(region, selected)) {
+                    throw new AwsException("DependencyViolation",
+                            "The security group '" + selectedId + "' has a dependent object", 400);
+                }
+                if (dryRun) {
+                    throw new AwsException("DryRunOperation",
+                            "Request would have succeeded, but DryRun flag is set.", 412);
+                }
+                securityGroups.delete(key(region, selectedId));
+                securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
+                        .filter(rule -> selected.getGroupId().equals(rule.getGroupId()))
+                        .forEach(rule -> securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId())));
+            }
+        }
+        return selectedId;
+    }
+
+    private String resolveSecurityGroupSelection(String region, String groupId, String groupName) {
         if ((groupId == null || groupId.isBlank()) && (groupName == null || groupName.isBlank())) {
             throw new AwsException("MissingParameter", "The request must contain GroupId or GroupName", 400);
         }
@@ -8573,26 +8599,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     .map(SecurityGroup::getGroupId).findFirst().orElseThrow(() ->
                             new AwsException("InvalidGroup.NotFound",
                                     "The security group '" + groupName + "' does not exist in the default VPC", 400));
-        }
-        synchronized (attachmentTopologyLock(region)) {
-            synchronized (lockFor(key(region, selectedId))) {
-                SecurityGroup selected = getRequiredSecurityGroup(region, selectedId);
-                if ("default".equals(selected.getGroupName())) {
-                    throw new AwsException("Client.CannotDelete", "The default security group cannot be deleted", 400);
-                }
-                if (hasSecurityGroupDependencies(region, selected)) {
-                    throw new AwsException("DependencyViolation",
-                            "The security group '" + selectedId + "' has a dependent object", 400);
-                }
-                if (dryRun) {
-                    throw new AwsException("DryRunOperation",
-                            "Request would have succeeded, but DryRun flag is set.", 412);
-        }
-                securityGroups.delete(key(region, selectedId));
-                securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
-                        .filter(rule -> selected.getGroupId().equals(rule.getGroupId()))
-                        .forEach(rule -> securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId())));
-            }
         }
         return selectedId;
     }
@@ -9063,13 +9069,119 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public void updateSecurityGroupRuleDescriptionsIngress(String region, String groupId, List<IpPermission> permissions) {
-        ensureDefaultResources(region);
-        // no-op for mock
+        updateSecurityGroupRuleDescriptions(region, groupId, null, permissions, List.of(), false, false);
     }
 
     public void updateSecurityGroupRuleDescriptionsEgress(String region, String groupId, List<IpPermission> permissions) {
-        ensureDefaultResources(region);
-        // no-op for mock
+        updateSecurityGroupRuleDescriptions(region, groupId, null, permissions, List.of(), true, false);
+    }
+
+    public void updateSecurityGroupRuleDescriptions(String region, String groupId, String groupName,
+                                                    List<IpPermission> permissions,
+                                                    List<SecurityGroupRule> descriptions,
+                                                    boolean egress, boolean dryRun) {
+        String selectedId = resolveSecurityGroupSelection(region, groupId, groupName);
+        if (permissions.isEmpty() == descriptions.isEmpty()) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Specify either IpPermissions or SecurityGroupRuleDescriptions", 400);
+        }
+        synchronized (lockFor(key(region, selectedId))) {
+            SecurityGroup group = getRequiredSecurityGroup(region, selectedId);
+            List<SecurityGroupRule> rules = describeSecurityGroupRules(region, List.of(selectedId), List.of())
+                    .stream().filter(rule -> rule.isEgress() == egress).toList();
+            Map<SecurityGroupRule, String> changes = new LinkedHashMap<>();
+            for (SecurityGroupRule description : descriptions) {
+                SecurityGroupRule selected = rules.stream().filter(rule ->
+                        rule.getSecurityGroupRuleId().equals(description.getSecurityGroupRuleId()))
+                        .findFirst().orElseThrow(() -> new AwsException("InvalidSecurityGroupRuleId.NotFound",
+                                "The security group rule does not exist in the selected group and direction", 400));
+                changes.put(selected, description.getDescription());
+            }
+            for (IpPermission permission : permissions) {
+                resolveGroupReferences(region, group.getVpcId(), permission);
+                List<PermissionDescription> sources = permissionDescriptions(permission);
+                if (sources.isEmpty()) {
+                    throw new AwsException("InvalidPermission.NotFound", "No security group rule source specified", 400);
+                }
+                for (PermissionDescription source : sources) {
+                    List<SecurityGroupRule> matches = rules.stream()
+                            .filter(rule -> sameRuleProtocolAndPorts(permission, rule) && source.matches().test(rule))
+                            .toList();
+                    if (matches.isEmpty()) {
+                        throw new AwsException("InvalidPermission.NotFound",
+                                "The specified rule does not exist in this security group", 400);
+                    }
+                    matches.forEach(rule -> changes.put(rule, source.description()));
+                }
+            }
+            List<IpPermission> stored = egress ? group.getIpPermissionsEgress() : group.getIpPermissions();
+            List<Runnable> updates = new ArrayList<>();
+            for (Map.Entry<SecurityGroupRule, String> change : changes.entrySet()) {
+                SecurityGroupRule rule = change.getKey();
+                String description = change.getValue();
+                boolean cidr = rule.getCidrIpv4() != null || rule.getCidrIpv6() != null;
+                if (description != null && (description.length() > 255 || !description.chars().allMatch(character ->
+                        character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z'
+                                || character >= '0' && character <= '9' || "._-:/()#,@[]+=;{}!$* ".indexOf(character) >= 0
+                                || character == '&' && cidr))) {
+                    throw new AwsException("InvalidParameterValue", "Invalid security group rule description", 400);
+                }
+                List<PermissionDescription> peers = stored.stream()
+                        .filter(permission -> sameRuleProtocolAndPorts(permission, rule))
+                        .flatMap(permission -> permissionDescriptions(permission).stream())
+                        .filter(peer -> peer.matches().test(rule)).toList();
+                if (peers.isEmpty()) {
+                    throw new AwsException("InvalidPermission.NotFound", "The security group permission is missing", 400);
+                }
+                updates.add(() -> {
+                    rule.setDescription(description);
+                    securityGroupRules.put(key(region, rule.getSecurityGroupRuleId()), rule);
+                    peers.forEach(peer -> peer.update().accept(description));
+                });
+            }
+            if (dryRun) {
+                throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+            updates.forEach(Runnable::run);
+            securityGroups.put(key(region, selectedId), group);
+        }
+    }
+
+    private boolean sameRuleProtocolAndPorts(IpPermission permission, SecurityGroupRule rule) {
+        IpPermission recorded = new IpPermission();
+        recorded.setIpProtocol(rule.getIpProtocol());
+        recorded.setFromPort(rule.getFromPort());
+        recorded.setToPort(rule.getToPort());
+        return sameProtocolAndPorts(permission, recorded);
+    }
+
+    private record PermissionDescription(Predicate<SecurityGroupRule> matches, String description,
+                                         Consumer<String> update) {}
+
+    private List<PermissionDescription> permissionDescriptions(IpPermission permission) {
+        List<PermissionDescription> result = new ArrayList<>();
+        for (IpRange range : permission.getIpRanges()) {
+            result.add(new PermissionDescription(rule ->
+                    range.getCidrIp() != null && range.getCidrIp().equals(rule.getCidrIpv4()),
+                    range.getDescription(), range::setDescription));
+        }
+        for (Ipv6Range range : permission.getIpv6Ranges()) {
+            result.add(new PermissionDescription(rule ->
+                    range.getCidrIpv6() != null && range.getCidrIpv6().equals(rule.getCidrIpv6()),
+                    range.getDescription(), range::setDescription));
+        }
+        for (PrefixListId prefix : permission.getPrefixListIds()) {
+            result.add(new PermissionDescription(rule ->
+                    prefix.getPrefixListId() != null && prefix.getPrefixListId().equals(rule.getPrefixListId()),
+                    prefix.getDescription(), prefix::setDescription));
+        }
+        for (UserIdGroupPair peer : permission.getUserIdGroupPairs()) {
+            result.add(new PermissionDescription(rule -> rule.getReferencedGroupInfo() != null
+                    && peer.getGroupId() != null && peer.getGroupId().equals(rule.getReferencedGroupInfo().getGroupId())
+                    && Objects.equals(peer.getUserId(), rule.getReferencedGroupInfo().getUserId()),
+                    peer.getDescription(), peer::setDescription));
+        }
+        return result;
     }
 
     // ─── Key Pairs ─────────────────────────────────────────────────────────────

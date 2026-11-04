@@ -26,6 +26,14 @@ interfaces with an instance-level `SubnetId` is rejected. Existing ENI attachmen
 secondary-interface provisioning and replacement for other interface settings
 remain outside this implementation.
 
+## EC2 security group rule updates
+
+Standalone `AWS::EC2::SecurityGroupIngress` and `AWS::EC2::SecurityGroupEgress`
+resources update or remove `Description` without replacing the permission, rule
+ID or tags. `Ref` and `Fn::GetAtt Id` retain that ID. Changes to the resolved
+access properties replace the rule; the new permission is authorized before
+the previous one is revoked.
+
 ## EC2 key pairs
 
 `AWS::EC2::KeyPair` provisions real EC2 backing keys. Generated RSA PEM keys store their
