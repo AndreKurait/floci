@@ -117,7 +117,7 @@ receiving new work but keeps existing connections without the deregistration
 deadline when draining is enabled. Re-registration cancels a pending retirement
 and requires fresh health admission; other healthy instances retain their state.
 See [connection draining](../design/classic-connection-draining.md) for the API
-states, tests and Auto Scaling limitation.
+states, tests and Auto Scaling integration.
 
 This mode reconstructs the runtime on listener, health-check, subnet,
 group-attachment, cross-zone or idle-timeout changes; the private address can change, and clients
