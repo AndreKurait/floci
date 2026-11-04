@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.NatGateway;
@@ -29,7 +30,8 @@ class VpcRoutingRetirementTest {
     private final VpcNetworkManager vpcs = mock(VpcNetworkManager.class);
     private final DockerClient docker = mock(DockerClient.class);
     private final VpcRoutingManager manager = new VpcRoutingManager(config, ec2, vpcs, docker,
-            mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), new ObjectMapper());
+            mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), new ObjectMapper(),
+            mock(ContainerReachableEndpoint.class));
 
     VpcRoutingRetirementTest() {
         when(config.network().vpcRouting().enabled()).thenReturn(true);

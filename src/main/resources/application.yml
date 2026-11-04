@@ -182,6 +182,7 @@ floci:
   network:
     vpc-routing:
       enabled: false
+      public-aws-api: false
     security-group-enforcement:
       enabled: false
       helper-image: floci/network-helper:local

@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.LocallyBuiltHelperImage;
@@ -30,6 +31,7 @@ import io.github.hectorvent.floci.services.ec2.model.Route;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
@@ -56,15 +58,18 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private final ContainerBuilder containers;
     private final ContainerLifecycleManager lifecycle;
     private final ObjectMapper mapper;
+    private final VpcAwsApiBridge awsApi;
     private final Map<String, Endpoint> endpoints = new LinkedHashMap<>();
     private final Map<String, PublicAddress> publicAddresses = new LinkedHashMap<>();
     private final Map<String, NatRuntime> nats = new LinkedHashMap<>();
     private String publicNetwork;
     private boolean draining;
 
+    @Inject
     public VpcRoutingManager(EmulatorConfig config, Ec2Service ec2, VpcNetworkManager vpcs,
                              DockerClient docker, ContainerBuilder containers,
-                             ContainerLifecycleManager lifecycle, ObjectMapper mapper) {
+                             ContainerLifecycleManager lifecycle, ObjectMapper mapper,
+                             ContainerReachableEndpoint endpoint) {
         this.config = config;
         this.ec2 = ec2;
         this.vpcs = vpcs;
@@ -72,6 +77,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         this.containers = containers;
         this.lifecycle = lifecycle;
         this.mapper = mapper;
+        this.awsApi = new VpcAwsApiBridge(config, docker, containers, lifecycle, mapper, endpoint);
     }
 
     public boolean enabled() {
@@ -264,6 +270,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                     }
                 });
             }
+            configureAwsApi();
             for (NatRuntime nat : List.copyOf(nats.values())) {
                 if (!nat.retiring && nat.namespace != null) {
                     RequestScopes.runAs(nat.account, nat.region, () -> configureNat(nat, topology(nat.region)));
@@ -291,6 +298,10 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private void configureNat(NatRuntime nat, Topology topology) {
         List<VpcRouteSelection.Entry> routes = routes(nat.region, nat.vpc, nat.subnet, topology);
         List<VpcRoutingCommands.Hop> destinations = new ArrayList<>();
+        String apiAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+        if (awsApi.transport() != null && internet(apiAddress, routes, nat.vpc, topology)) {
+            destinations.add(new VpcRoutingCommands.Hop(apiAddress, awsApi.transport(), nat.publicDevice, false));
+        }
         for (PublicAddress address : publicAddresses.values()) {
             if (address.transport != null && internet(address.address, routes, nat.vpc, topology)) {
                 destinations.add(new VpcRoutingCommands.Hop(address.address, address.transport,
@@ -319,15 +330,11 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             if (destination.transport == null || destination == own) {
                 continue;
             }
-            Route route = VpcRouteSelection.to(destination.address, routes).orElse(null);
-            Optional<NatGateway> gateway = VpcRouteSelection.nat(route, vpc, topology.nats);
-            NatRuntime nat = gateway.map(value -> nats.get(key(account, region, value.getNatGatewayId()))).orElse(null);
-            if (nat != null && !nat.retiring && nat.namespace != null
-                    && internet(destination.address, routes(region, nat.vpc, nat.subnet, topology), nat.vpc, topology)) {
-                hops.add(new VpcRoutingCommands.Hop(destination.address, nat.privateIp, endpoint.privateDevice, false));
-            } else if (own != null && VpcRouteSelection.internet(route, vpc, topology.gateways)) {
-                hops.add(new VpcRoutingCommands.Hop(destination.address, destination.transport, own.device, false));
-            }
+            addDestination(endpoint, topology, routes, own, destination.address, destination.transport, hops);
+        }
+        if (awsApi.transport() != null) {
+            addDestination(endpoint, topology, routes, null, EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS,
+                    awsApi.transport(), hops);
         }
         List<String> inbound = new ArrayList<>();
         if (own != null) {
@@ -351,6 +358,46 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             run(endpoint.helper, script);
             endpoint.applied = script;
         }
+    }
+
+    private void addDestination(Endpoint endpoint, Topology topology, List<VpcRouteSelection.Entry> routes,
+                                PublicAddress own, String address, String transport,
+                                List<VpcRoutingCommands.Hop> hops) {
+        SecurityGroupNftCompiler.Endpoint identity = endpoint.identity;
+        Route route = VpcRouteSelection.to(address, routes).orElse(null);
+        Optional<NatGateway> gateway = VpcRouteSelection.nat(route, identity.vpcId(), topology.nats);
+        NatRuntime nat = gateway.map(value -> nats.get(key(identity.accountId(), identity.region(),
+                value.getNatGatewayId()))).orElse(null);
+        if (nat != null && !nat.retiring && nat.namespace != null
+                && internet(address, routes(nat.region, nat.vpc, nat.subnet, topology), nat.vpc, topology)) {
+            hops.add(new VpcRoutingCommands.Hop(address, nat.privateIp, endpoint.privateDevice, false));
+        } else if (own != null && VpcRouteSelection.internet(route, identity.vpcId(), topology.gateways)) {
+            hops.add(new VpcRoutingCommands.Hop(address, transport, own.device, false));
+        }
+    }
+
+    private void configureAwsApi() {
+        if (!awsApi.enabled()) {
+            return;
+        }
+        if (nats.isEmpty()) {
+            awsApi.retire();
+            return;
+        }
+        awsApi.ensure(publicNetwork());
+        List<VpcRoutingCommands.Hop> callers = new ArrayList<>();
+        for (NatRuntime nat : nats.values()) {
+            if (!nat.retiring && nat.transport != null) {
+                RequestScopes.runAs(nat.account, nat.region, () -> {
+                    Topology topology = topology(nat.region);
+                    if (internet(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS,
+                            routes(nat.region, nat.vpc, nat.subnet, topology), nat.vpc, topology)) {
+                        callers.add(new VpcRoutingCommands.Hop(nat.publicIp, nat.transport, awsApi.device(), true));
+                    }
+                });
+            }
+        }
+        awsApi.configure(callers);
     }
 
     private List<VpcRouteSelection.Entry> routes(String region, String vpc, String subnet, Topology topology) {
@@ -505,6 +552,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (publicNetwork == null || !nats.isEmpty() || !publicAddresses.isEmpty()) {
             return;
         }
+        awsApi.retire();
         try {
             Network network = docker.inspectNetworkCmd().withNetworkId(publicNetwork).exec();
             if (network.getContainers() != null && !network.getContainers().isEmpty()) {
@@ -532,6 +580,11 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             } catch (RuntimeException failure) {
                 LOG.errorv(failure, "NAT namespace remains reserved during shutdown: {0}", entry.getKey());
             }
+        }
+        try {
+            awsApi.retire();
+        } catch (RuntimeException failure) {
+            LOG.errorv(failure, "Public AWS API bridge remains reserved during shutdown");
         }
         removeEmptyPublicNetwork();
     }
