@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.elb;
 
+import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
@@ -13,7 +14,9 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
 import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.Instance;
 import software.amazon.awssdk.services.ec2.model.NatGateway;
 import software.amazon.awssdk.services.elasticloadbalancing.model.InstanceState;
 import software.amazon.awssdk.services.elasticloadbalancing.model.Listener;
@@ -38,6 +41,70 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestProfile(ElbClassicDrainingPacketIntegrationTest.DrainingRouting.class)
 class ElbClassicDrainingPacketIntegrationTest extends ElbClassicPublicNatPacketIntegrationTest {
     public static class DrainingRouting extends PublicRouting {}
+
+    @ParameterizedTest
+    @ValueSource(strings = {"scale-in", "refresh", "explicit"})
+    void autoScalingKeepsTheGuestAliveUntilItsInflightRequestFinishes(String operation) throws Exception {
+        Topology topology = topology(20);
+        try (Held request = new Held(topology)) {
+            addSecondBackend(topology, request);
+            AutoScalingClient scaling = scalingGroup(topology);
+            if ("scale-in".equals(operation)) {
+                scaling.setDesiredCapacity(change -> change.autoScalingGroupName(topology.name()).desiredCapacity(0));
+            } else if ("refresh".equals(operation)) {
+                scaling.startInstanceRefresh(change -> change.autoScalingGroupName(topology.name())
+                        .preferences(preferences -> preferences.minHealthyPercentage(0).instanceWarmup(0)));
+            } else {
+                scaling.terminateInstanceInAutoScalingGroup(change -> change.instanceId(topology.first())
+                        .shouldDecrementDesiredCapacity(true));
+            }
+            await().atMost(Duration.ofSeconds(5)).until(() -> scaling.describeAutoScalingGroups(
+                    query -> query.autoScalingGroupNames(topology.name())).autoScalingGroups().getFirst()
+                    .instances().stream().anyMatch(instance -> topology.first().equals(instance.instanceId())
+                            && "Terminating".equals(instance.lifecycleStateAsString())));
+            assertEquals("running", ec2Instance(topology.first()).state().nameAsString());
+            assertFalse(request.future.isDone(), "Auto Scaling must not stop a guest that is still draining");
+            assertSecondBackend(topology);
+
+            request.release();
+            assertEquals(0, request.result().exitCode());
+            assertEquals("first", request.result().stdout().trim());
+            await().atMost(Duration.ofSeconds(30)).until(() ->
+                    "terminated".equals(ec2Instance(topology.first()).state().nameAsString()));
+            if ("refresh".equals(operation)) {
+                await().atMost(Duration.ofSeconds(45)).until(() -> scaling.describeInstanceRefreshes(
+                        query -> query.autoScalingGroupName(topology.name())).instanceRefreshes().getFirst()
+                        .statusAsString().equals("Successful"));
+            } else {
+                assertTrue(scaling.describeAutoScalingGroups(query -> query.autoScalingGroupNames(topology.name()))
+                        .autoScalingGroups().getFirst().instances().isEmpty());
+            }
+            assertFrontendUnchanged(topology);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void autoScalingHonorsTheDrainDeadlineAndDisabledDraining(boolean enabled) throws Exception {
+        Topology topology = topology(3);
+        try (Held request = new Held(topology)) {
+            addSecondBackend(topology, request);
+            AutoScalingClient scaling = scalingGroup(topology);
+            draining(topology.name(), enabled, 3);
+            long started = System.nanoTime();
+            scaling.setDesiredCapacity(change -> change.autoScalingGroupName(topology.name()).desiredCapacity(0));
+
+            ContainerExec.Result result = request.result();
+            assertNotEquals(0, result.exitCode());
+            assertNotEquals(28, result.exitCode(), "The load balancer must close before curl's timeout");
+            if (enabled) {
+                assertTrue(Duration.ofNanos(System.nanoTime() - started).toMillis() >= 2500);
+            }
+            await().atMost(Duration.ofSeconds(30)).until(() ->
+                    "terminated".equals(ec2Instance(topology.first()).state().nameAsString()));
+            assertSecondBackend(topology);
+        }
+    }
 
     @Test
     void newBackendsAndDeregistrationPreserveInflightWorkAndExistingHealthyMembers() throws Exception {
@@ -186,6 +253,34 @@ class ElbClassicDrainingPacketIntegrationTest extends ElbClassicPublicNatPacketI
         return topology;
     }
 
+    private Instance ec2Instance(String id) {
+        return ec2.describeInstances(query -> query.instanceIds(id)).reservations().getFirst().instances().getFirst();
+    }
+
+    private AutoScalingClient scalingGroup(Topology topology) {
+        AutoScalingClient scaling = AutoScalingClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .httpClientBuilder(UrlConnectionHttpClient.builder()).credentialsProvider(
+                        StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"))).build();
+        cleanup.addFirst(scaling::close);
+        Instance first = ec2Instance(topology.first());
+        scaling.createLaunchConfiguration(change -> change.launchConfigurationName(topology.name())
+                .imageId(first.imageId()).instanceType(first.instanceTypeAsString())
+                .securityGroups(first.securityGroups().stream().map(group -> group.groupId()).toList())
+                .userData(application("replacement")));
+        cleanup.addFirst(() -> scaling.deleteLaunchConfiguration(
+                change -> change.launchConfigurationName(topology.name())));
+        scaling.createAutoScalingGroup(change -> change.autoScalingGroupName(topology.name())
+                .launchConfigurationName(topology.name()).minSize(0).maxSize(2).desiredCapacity(0)
+                .vpcZoneIdentifier(first.subnetId()).loadBalancerNames(topology.name()));
+        cleanup.addFirst(() -> scaling.deleteAutoScalingGroup(
+                change -> change.autoScalingGroupName(topology.name()).forceDelete(true)));
+        scaling.attachInstances(change -> change.autoScalingGroupName(topology.name())
+                .instanceIds(topology.first()));
+        assertEquals(1, scaling.describeAutoScalingGroups(query -> query.autoScalingGroupNames(topology.name()))
+                .autoScalingGroups().getFirst().desiredCapacity());
+        return scaling;
+    }
+
     private void addSecondBackend(Topology topology, Held request) {
         elb.registerInstancesWithLoadBalancer(change -> change.loadBalancerName(topology.name())
                 .instances(instance -> instance.instanceId(topology.second())));
@@ -281,6 +376,16 @@ class ElbClassicDrainingPacketIntegrationTest extends ElbClassicPublicNatPacketI
                 return;
             }
             released = true;
+            try {
+                if (!Boolean.TRUE.equals(docker.inspectContainerCmd(topology.firstGuest()).exec()
+                        .getState().getRunning())) {
+                    assertTrue(future.isDone(), "An exited guest must not leave its request hanging");
+                    return;
+                }
+            } catch (NotFoundException removed) {
+                assertTrue(future.isDone(), "A retired guest must not leave its request hanging");
+                return;
+            }
             ContainerExec.Result result = exec(topology.firstGuest(), "sh", "-c",
                     "if test -f /tmp/holding; then printf 'continue\\n' > /tmp/release; fi");
             assertEquals(0, result.exitCode(), result.summary());

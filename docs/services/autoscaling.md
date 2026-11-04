@@ -140,7 +140,7 @@ described below.
 | `DescribeAutoScalingInstances` | Returns all ASG-tracked instances with their group name, lifecycle state and health status. Health is in capitals here: `HEALTHY`, as the AWS samples show, and `UNHEALTHY` by the same rule. `DescribeAutoScalingGroups` reports `Healthy` or `Unhealthy` |
 | `SetInstanceHealth` | Updates an instance's health status immediately; accepts but does not enforce the grace-period flag |
 | `SetInstanceProtection` | Enables or disables scale-in protection for named instances in a group |
-| `SetDesiredCapacity` | Updates desired count; reconciler handles scale-out / scale-in within 10 s |
+| `SetDesiredCapacity` | Queues capacity reconciliation; Classic draining can postpone termination |
 | `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
 | `EnterStandby` | Preserves membership while removing traffic and excluding the instances from active capacity; optionally decrements desired capacity within the group's minimum |
@@ -207,8 +207,8 @@ As in AWS, suspending `Terminate` protects `InService` instances, not instances
 that fail to resume from standby. See the AWS
 [suspension considerations](https://docs.aws.amazon.com/autoscaling/ec2/userguide/suspend-resume-considerations.html).
 
-Floci removes target registrations immediately. It does not simulate AWS's
-connection-draining delay. See the AWS
+Standby transitions remove target registrations immediately and do not wait for
+connection draining before reporting `Standby`. See the AWS
 [standby guide](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-enter-exit-standby.html)
 for the lifecycle and capacity rules.
 
@@ -229,8 +229,8 @@ Each move's activity carries the description and cause AWS writes and completes 
 instance refresh on its way back to service, or when the group is deleted. `DetachInstances` refuses
 an instance whose move is still in progress, such as one in `EnteringStandby` or `Pending` on its way
 back, with `The instance <id> is not in InService or Standby.`, AWS's answer for a state it does not
-detach; Floci does not refuse the other such states yet. Floci does not wait for connection draining and
-does not write the activity's `Details` member.
+detach; Floci does not refuse the other such states yet. Standby completion does not wait for connection
+draining and does not write the activity's `Details` member.
 
 ### Instance Refresh
 
@@ -348,13 +348,28 @@ and omit the optional reason. Floci does not invent a date for those existing
 suspensions. A repeated suspension leaves an unknown time unknown until the
 process is resumed and suspended again.
 
-## Capacity Reconciler (Phase 2)
+## Capacity reconciliation
 
-Floci runs a background reconciler (10 s fixed rate) that keeps each group's InService instance count aligned with `DesiredCapacity`:
+Group changes enqueue reconciliation; a 10-second repair sweep catches pending transitions.
+The reconciler keeps active capacity aligned with `DesiredCapacity`:
 
 - **Scale-out**: calls `RunInstances` with the group's launch configuration; new instances are tracked as `Pending` until the EC2 state transitions to `running`, at which point they move to `InService` and are registered with all attached ELB v2 target groups.
-- **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
+- **Scale-in**: selects unprotected `InService` instances, persists them as `Terminating`, and deregisters them from target groups and Classic load balancers before terminating EC2.
 - Activity records are written on each scale-out and scale-in event.
+
+For protected Classic frontends, scale-in, instance refresh and explicit
+`TerminateInstanceInAutoScalingGroup` requests wait for actual proxy sessions to
+finish or reach the configured drain deadline. Draining-disabled frontends close
+existing sessions immediately. An instance waits for every attached Classic
+balancer; an already drained peer can terminate independently.
+
+Deregistration, drain-observation and EC2 termination failures retain membership
+for retry. Selected scale-in members no longer count as active capacity and
+cannot return to service when desired capacity increases. Selection survives
+group storage reloads. Successful termination activities are recorded after
+EC2 accepts termination. Standby completion, forced group deletion, ELB v2
+deregistration delays and proxy-session recovery across process restarts remain
+separate limitations.
 
 `SuspendProcesses` pauses desired-capacity scale-out for `Launch` and scale-in for
 `Terminate`. The desired count remains stored, and `ResumeProcesses` allows the

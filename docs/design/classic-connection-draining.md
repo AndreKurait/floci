@@ -47,9 +47,17 @@ they verify new work reaches a remaining healthy instance while the held
 request completes or the frontend closes it. The application's FIFO supplies
 an explicit release signal, not a simulated network timeout.
 
-Auto Scaling scale-in and instance refresh still need to wait for this drain
-before terminating a guest. Native application rollout and scale are therefore
-not qualified by the direct deregistration tests. Listener, health-check,
+Auto Scaling scale-in, instance refresh and explicit instance termination
+deregister before terminating EC2 and wait until every attached Classic
+balancer finishes draining that instance. Selected members stay `Terminating`;
+errors preserve membership for retry. Packet tests exercise these operations
+through the SDK while an actual guest holds a request, including completion,
+deadline expiry and disabled draining. Unit and storage tests cover partial
+batch completion, failed observations and persisted scale-in intent.
+
+These are fixture applications; native application rollout and scale still
+need separate qualification. Standby completion, forced group deletion and ELB
+v2 deregistration delays remain separate work. Listener, health-check,
 subnet, group-attachment, cross-zone and idle-timeout changes still reconstruct
 the frontend and can interrupt connections. Process restart recovery, ALB,
 stickiness and exact Classic HTTP scheduling remain separate work.

@@ -520,6 +520,12 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         }
     }
 
+    /** Instances still serving requests after deregistration, across every frontend node. */
+    public Set<String> deregisteringInstances(String region, String name) {
+        ClassicLoadBalancer loadBalancer = requireLoadBalancer(region, name);
+        return frontends == null ? Set.of() : frontends.drainingInstances(loadBalancer);
+    }
+
     /** The health of each requested instance, or of every registered instance when none is named. */
     public Map<String, ElbClassicHealthChecker.InstanceHealth> describeInstanceHealth(
             String region, String name, List<String> instanceIds) {

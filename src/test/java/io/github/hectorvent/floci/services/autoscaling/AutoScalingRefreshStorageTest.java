@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
@@ -34,6 +35,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -55,6 +57,35 @@ class AutoScalingRefreshStorageTest {
     private Ec2Service ec2;
     private AutoScalingReconciler reconciler;
     private AutoScalingGroup group;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid"})
+    void pendingClassicDrainPreservesScaleInIntentAcrossStorageRestart(String mode) throws IOException {
+        setUp(mode);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        group.setLoadBalancerNames(List.of("classic"));
+        group.setDesiredCapacity(0);
+        service.saveAutoScalingGroupIfPresent(group);
+        when(classic.deregisteringInstances(REGION, "classic")).thenReturn(Set.of("i-original"));
+        reconciler = new AutoScalingReconciler(service, ec2, mock(ElbV2Service.class), classic, null);
+        reconciler.reconcile(group);
+        assertEquals("Terminating", group.getInstances().getFirst().getLifecycleState());
+        assertTrue(group.getInstances().getFirst().isScaleInTermination());
+        verify(ec2, never()).terminateInstances(anyString(), anyList());
+
+        restart(mode);
+        assertEquals("Terminating", group.getInstances().getFirst().getLifecycleState());
+        assertTrue(group.getInstances().getFirst().isScaleInTermination());
+        when(classic.deregisteringInstances(REGION, "classic")).thenReturn(Set.of());
+        reconciler = new AutoScalingReconciler(service, ec2, mock(ElbV2Service.class), classic, null);
+        reconciler.reconcile(group);
+
+        assertTrue(group.getInstances().isEmpty());
+        verify(ec2).terminateInstances(REGION, List.of("i-original"));
+        assertTrue(service.describeScalingActivities(REGION, group.getAutoScalingGroupName()).stream()
+                .anyMatch(activity -> "Successful".equals(activity.getStatusCode())
+                        && "Terminating EC2 instance(s): [i-original]".equals(activity.getDescription())));
+    }
 
     private void setUp(String mode) {
         service = storedService(mode);
