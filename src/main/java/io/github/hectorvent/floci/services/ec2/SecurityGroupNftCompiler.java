@@ -20,15 +20,43 @@ public final class SecurityGroupNftCompiler {
     public record Endpoint(String accountId, String region, String vpcId, String eniId,
                            String logicalAddress, String transportAddress, Set<String> groupIds,
                            List<SecurityGroup> groups, List<ControlConnection> controlConnections,
-                           boolean instanceMetadataAllowed) {
+                           boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses) {
         public Endpoint {
             controlConnections = List.copyOf(controlConnections);
+            additionalTransportAddresses = Set.copyOf(additionalTransportAddresses);
+            if (additionalTransportAddresses.stream().anyMatch(address -> !literal(address))) {
+                throw new IllegalArgumentException("Transport addresses must be literal IP addresses");
+            }
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                        boolean instanceMetadataAllowed) {
+            this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups,
+                    controlConnections, instanceMetadataAllowed, Set.of());
         }
 
         public Endpoint(String accountId, String region, String vpcId, String eniId,
                         String logicalAddress, String transportAddress, Set<String> groupIds,
                         List<SecurityGroup> groups) {
             this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups, List.of(), true);
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, Set<String> additionalTransportAddresses) {
+            this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups,
+                    List.of(), true, additionalTransportAddresses);
+        }
+
+        List<String> transportAddresses() {
+            Set<String> addresses = new LinkedHashSet<>();
+            if (literal(transportAddress)) {
+                addresses.add(transportAddress);
+            }
+            additionalTransportAddresses.stream().sorted().forEach(addresses::add);
+            return List.copyOf(addresses);
         }
 
         SecurityGroupPolicy.Peer peer() {
@@ -127,7 +155,9 @@ public final class SecurityGroupNftCompiler {
                                 && target.region().equals(peer.region())
                                 && target.vpcId().equals(peer.vpcId())
                                 && SecurityGroupPolicy.matchesPeer(group, permission, peer.peer(), prefixLists)) {
-                            appendRule(rules, chain, addressField, peer.transportAddress(), protocol);
+                            for (String address : peer.transportAddresses()) {
+                                appendRule(rules, chain, addressField, address, protocol);
+                            }
                         }
                     }
                 }
@@ -135,7 +165,9 @@ public final class SecurityGroupNftCompiler {
             // A managed peer must never fall through to a broad external CIDR rule
             // evaluated against its Docker bridge IP instead of its logical ENI address.
             for (Endpoint peer : managed) {
-                appendRule(rules, chain, addressField, peer.transportAddress(), "drop");
+                for (String address : peer.transportAddresses()) {
+                    appendRule(rules, chain, addressField, address, "drop");
+                }
             }
             for (SecurityGroup group : target.groups()) {
                 List<IpPermission> permissions = egress
