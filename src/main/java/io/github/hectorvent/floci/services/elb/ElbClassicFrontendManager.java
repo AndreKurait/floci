@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
@@ -40,12 +41,13 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /** Owns a Classic load balancer's private interface, firewall namespace and listener process. */
 @ApplicationScoped
-public class ElbClassicFrontendManager {
+public class ElbClassicFrontendManager implements ContainerTeardown {
     private static final Logger LOG = Logger.getLogger(ElbClassicFrontendManager.class);
     private static final String SERVICE = "elb-classic";
     private static final String ENI_LABEL = "io.floci.elb-classic.network-interface";
@@ -95,25 +97,28 @@ public class ElbClassicFrontendManager {
         return RequestScopes.callAs(account(loadBalancer), loadBalancer.getRegion(), () -> {
             String key = key(loadBalancer);
             String state = state(loadBalancer);
-            Frontend previous = frontends.get(key);
-            if (previous != null && state.equals(previous.state()) && running(previous)) {
-                return false;
-            }
-            Frontend next = create(loadBalancer, state);
-            try {
-                if (previous != null) {
-                    release(previous);
+            AtomicBoolean changed = new AtomicBoolean();
+            frontends.compute(key, (ignored, previous) -> {
+                if (previous != null && state.equals(previous.state()) && running(previous)) {
+                    return previous;
                 }
-            } catch (RuntimeException failure) {
+                Frontend next = create(loadBalancer, state);
                 try {
-                    release(next);
-                } catch (RuntimeException cleanupFailure) {
-                    failure.addSuppressed(cleanupFailure);
+                    if (previous != null) {
+                        release(previous);
+                    }
+                } catch (RuntimeException failure) {
+                    try {
+                        release(next);
+                    } catch (RuntimeException cleanupFailure) {
+                        failure.addSuppressed(cleanupFailure);
+                    }
+                    throw failure;
                 }
-                throw failure;
-            }
-            frontends.put(key, next);
-            return true;
+                changed.set(true);
+                return next;
+            });
+            return changed.get();
         });
     }
 
@@ -273,21 +278,30 @@ public class ElbClassicFrontendManager {
 
     void healthChanged(ClassicLoadBalancer loadBalancer, Probe probe,
                        ElbClassicHealthChecker.InstanceHealth health) {
-        if (!current(loadBalancer, probe) || probe.frontend().proxy() == null) {
+        if (probe == null) {
             return;
         }
+        frontends.computeIfPresent(key(loadBalancer), (ignored, frontend) -> {
+            if (frontend == probe.frontend() && frontend.proxy() != null) {
+                publishHealth(frontend, probe.instanceId(), health);
+            }
+            return frontend;
+        });
+    }
+
+    private void publishHealth(Frontend frontend, String instanceId, ElbClassicHealthChecker.InstanceHealth health) {
         String state = "InService".equals(health.state()) ? "ready" : "maint";
-        String commands = probe.frontend().servers().getOrDefault(probe.instanceId(), List.of()).stream()
+        String commands = frontend.servers().getOrDefault(instanceId, List.of()).stream()
                 .map(server -> "set server " + server + " state " + state + "\n").collect(Collectors.joining());
         if (!commands.isEmpty()) {
             try {
-                String response = command(probe.frontend(), commands);
+                String response = command(frontend, commands);
                 if (!response.isBlank()) {
                     throw new IllegalStateException("Classic frontend rejected its health update: " + response);
                 }
             } catch (RuntimeException failure) {
                 try {
-                    lifecycle.stopAndRemoveStrict(probe.frontend().proxy(), null, 1);
+                    lifecycle.stopAndRemoveStrict(frontend.proxy(), null, 1);
                 } catch (RuntimeException cleanupFailure) {
                     failure.addSuppressed(cleanupFailure);
                 }
@@ -297,14 +311,15 @@ public class ElbClassicFrontendManager {
     }
 
     void remove(ClassicLoadBalancer loadBalancer) {
-        Frontend frontend = frontends.get(key(loadBalancer));
-        if (frontend != null) {
+        remove(key(loadBalancer));
+    }
+
+    private void remove(String key) {
+        frontends.computeIfPresent(key, (ignored, frontend) ->
             RequestScopes.callAs(frontend.account(), frontend.region(), () -> {
                 release(frontend);
-                frontends.remove(key(loadBalancer), frontend);
                 return null;
-            });
-        }
+            }));
     }
 
     private void release(Frontend frontend) {
@@ -419,16 +434,16 @@ public class ElbClassicFrontendManager {
 
     @PreDestroy
     void close() {
-        for (Map.Entry<String, Frontend> entry : frontends.entrySet()) {
-            Frontend frontend = entry.getValue();
+        stopManagedContainers();
+    }
+
+    @Override
+    public void stopManagedContainers() {
+        for (String key : frontends.keySet()) {
             try {
-                RequestScopes.callAs(frontend.account(), frontend.region(), () -> {
-                    release(frontend);
-                    frontends.remove(entry.getKey(), frontend);
-                    return null;
-                });
+                remove(key);
             } catch (RuntimeException failure) {
-                LOG.errorv(failure, "Could not retire Classic frontend {0}; its interface remains reserved", entry.getKey());
+                LOG.errorv(failure, "Could not retire Classic frontend {0}; its interface remains reserved", key);
             }
         }
     }
