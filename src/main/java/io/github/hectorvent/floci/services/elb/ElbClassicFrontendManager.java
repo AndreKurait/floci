@@ -178,7 +178,8 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
             attributes.setConnectionDrainingEnabled(false);
             attributes.setConnectionDrainingTimeout(300);
             return mapper.writeValueAsString(List.of(loadBalancer.getSubnets(), loadBalancer.getSecurityGroups(),
-                    loadBalancer.getListeners(), loadBalancer.getHealthCheck(), attributes,
+                    loadBalancer.getListeners(), ClassicSslPolicies.listenerSettings(loadBalancer),
+                    loadBalancer.getHealthCheck(), attributes,
                     loadBalancer.getListeners().isEmpty() ? loadBalancer.getInstanceIds() : List.of()));
         } catch (JsonProcessingException failure) {
             throw new IllegalStateException("Cannot snapshot Classic frontend settings", failure);

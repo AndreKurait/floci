@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
 import io.github.hectorvent.floci.services.elb.model.ClassicListener;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancerAttributes;
+import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancerPolicy;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
 import jakarta.annotation.PostConstruct;
@@ -254,6 +255,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             lb.setScheme(scheme != null && !scheme.isBlank() ? scheme : "internet-facing");
             lb.setCreatedTime(Instant.now());
             lb.setListeners(new ArrayList<>(listeners));
+            attachDefaultPolicies(lb, listeners);
             lb.setSecurityGroups(securityGroups != null ? new ArrayList<>(securityGroups) : new ArrayList<>());
             lb.setHealthCheck(ClassicHealthCheck.defaults());
             if (tags != null && !tags.isEmpty()) {
@@ -456,6 +458,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                             continue;
                         }
                         lb.getListeners().add(listener);
+                        attachDefaultPolicies(lb, List.of(listener));
                     }
                     persist(region, lb);
                 }
@@ -472,9 +475,114 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             // this runs reads a snapshot of it.
             synchronized (listenerLock) {
                 lb.getListeners().removeIf(l -> loadBalancerPorts.contains(l.getLoadBalancerPort()));
+                Map<Integer, List<String>> bindings = new LinkedHashMap<>(lb.getListenerPolicies());
+                loadBalancerPorts.forEach(bindings::remove);
+                lb.setListenerPolicies(bindings);
                 persist(region, lb);
             }
         }
+    }
+
+    public void createLoadBalancerPolicy(String region, String name, String policyName,
+                                         String policyType, Map<String, String> attributes) {
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            synchronized (listenerLock) {
+                ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+                ClassicLoadBalancerPolicy policy = ClassicSslPolicies.create(policyName, policyType, attributes);
+                Map<String, ClassicLoadBalancerPolicy> policies = new LinkedHashMap<>(lb.getPolicies());
+                if (policies.putIfAbsent(policyName, policy) != null) {
+                    throw new AwsException("DuplicatePolicyName", "Policy " + policyName + " already exists.", 400);
+                }
+                lb.setPolicies(policies);
+                persist(region, lb);
+            }
+        }
+    }
+
+    public List<ClassicLoadBalancerPolicy> describeLoadBalancerPolicies(String region, String name,
+                                                                       List<String> policyNames) {
+        Map<String, ClassicLoadBalancerPolicy> policies = name == null
+                ? ClassicSslPolicies.predefined() : requireLoadBalancer(region, name).getPolicies();
+        if (policyNames.isEmpty()) {
+            return List.copyOf(policies.values());
+        }
+        List<ClassicLoadBalancerPolicy> result = new ArrayList<>();
+        for (String policyName : policyNames) {
+            ClassicLoadBalancerPolicy policy = policies.get(policyName);
+            if (policy == null) {
+                throw new AwsException("PolicyNotFound", "Policy " + policyName + " does not exist.", 400);
+            }
+            result.add(policy);
+        }
+        return List.copyOf(result);
+    }
+
+    public void deleteLoadBalancerPolicy(String region, String name, String policyName) {
+        ClassicSslPolicies.requireValue(policyName, "PolicyName");
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            synchronized (listenerLock) {
+                ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+                if (lb.getListenerPolicies().values().stream().anyMatch(names -> names.contains(policyName))) {
+                    throw new AwsException("InvalidConfigurationRequest",
+                            "Policy " + policyName + " is enabled on a listener.", 409);
+                }
+                Map<String, ClassicLoadBalancerPolicy> policies = new LinkedHashMap<>(lb.getPolicies());
+                policies.remove(policyName);
+                lb.setPolicies(policies);
+                persist(region, lb);
+            }
+        }
+    }
+
+    public void setLoadBalancerPoliciesOfListener(String region, String name, Integer port, List<String> names) {
+        if (port == null || port < 1 || port > 65535) {
+            throw new AwsException("ValidationError", "LoadBalancerPort must be between 1 and 65535.", 400);
+        }
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            synchronized (listenerLock) {
+                ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+                ClassicListener listener = lb.getListeners().stream()
+                        .filter(value -> port.equals(value.getLoadBalancerPort())).findFirst()
+                        .orElseThrow(() -> new AwsException("ListenerNotFound",
+                                "There is no listener on port " + port + ".", 400));
+                for (String policyName : names) {
+                    if (!lb.getPolicies().containsKey(policyName)) {
+                        throw new AwsException("PolicyNotFound", "Policy " + policyName + " does not exist.", 400);
+                    }
+                }
+                boolean tls = ClassicSslPolicies.tls(listener);
+                if (!names.isEmpty() && (!tls || names.size() != 1)) {
+                    throw new AwsException("InvalidConfigurationRequest",
+                            "An SSL negotiation policy requires one HTTPS or SSL listener policy.", 409);
+                }
+                boolean protectedFrontend = frontends != null && frontends.enabled();
+                if (tls && protectedFrontend && names.isEmpty()) {
+                    throw new AwsException("UnsupportedOperation",
+                            "Clearing all protected Classic TLS policies is not supported by Floci.", 400);
+                }
+                if (tls && !names.isEmpty() && !protectedFrontend && !config.services().elb().mock()) {
+                    throw new AwsException("UnsupportedOperation",
+                            "Per-listener TLS policy enforcement requires protected Classic VPC frontends.", 400);
+                }
+                Map<Integer, List<String>> bindings = new LinkedHashMap<>(lb.getListenerPolicies());
+                bindings.put(port, List.copyOf(names));
+                lb.setListenerPolicies(bindings);
+                persist(region, lb);
+            }
+        }
+    }
+
+    private static void attachDefaultPolicies(ClassicLoadBalancer lb, List<ClassicListener> listeners) {
+        Map<Integer, List<String>> bindings = new LinkedHashMap<>(lb.getListenerPolicies());
+        Map<String, ClassicLoadBalancerPolicy> policies = new LinkedHashMap<>(lb.getPolicies());
+        for (ClassicListener listener : listeners) {
+            if (ClassicSslPolicies.tls(listener) && !bindings.containsKey(listener.getLoadBalancerPort())) {
+                policies.putIfAbsent(ClassicSslPolicies.DEFAULT, ClassicSslPolicies.predefined().get(ClassicSslPolicies.DEFAULT));
+                bindings.put(listener.getLoadBalancerPort(), List.of(ClassicSslPolicies.DEFAULT));
+            }
+        }
+        lb.setPolicies(policies);
+        lb.setListenerPolicies(bindings);
     }
 
     // ── Health ────────────────────────────────────────────────────────────────

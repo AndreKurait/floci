@@ -54,10 +54,38 @@ selects Classic. With neither present the request goes to ELB v2.
 These Classic operations return `UnsupportedOperation` in the 2012-06-01 namespace rather than a
 fabricated result:
 
-`CreateAppCookieStickinessPolicy`, `CreateLBCookieStickinessPolicy`, `CreateLoadBalancerPolicy`,
-`DeleteLoadBalancerPolicy`, `DescribeLoadBalancerPolicies`, `DescribeLoadBalancerPolicyTypes`,
-`SetLoadBalancerPoliciesForBackendServer`, `SetLoadBalancerPoliciesOfListener`,
+`CreateAppCookieStickinessPolicy`, `CreateLBCookieStickinessPolicy`, `DescribeLoadBalancerPolicyTypes`,
+`SetLoadBalancerPoliciesForBackendServer`,
 `SetLoadBalancerListenerSSLCertificate`.
+
+## TLS negotiation policies
+
+`CreateLoadBalancerPolicy`, `DescribeLoadBalancerPolicies`, `DeleteLoadBalancerPolicy`
+and `SetLoadBalancerPoliciesOfListener` manage named `SSLNegotiationPolicyType` policies.
+Listener descriptions return their actual policy bindings. Creating a policy does
+not enable it; setting a listener's policy list replaces its previous list. An
+attached policy cannot be deleted.
+
+The bundled catalog contains `ELBSecurityPolicy-2016-08` and
+`ELBSecurityPolicy-TLS-1-2-2017-01`, captured with the public AWS
+`describe-load-balancer-policies` operation on 2026-11-04. It includes enabled and
+disabled attributes. A `Reference-Security-Policy` creates a named copy. Custom
+policies can select supported protocols and ciphers and set
+`Server-Defined-Cipher-Order`. Unsupported policy types, references and enabled
+legacy ciphers fail explicitly.
+
+Protected VPC listeners enforce the selected TLS versions, cipher allowlist and
+cipher preference. New HTTPS/SSL listeners use the AWS default
+`ELBSecurityPolicy-2016-08`; TLS 1.3 is not enabled by either bundled policy.
+The shared HTTP edge rejects explicit per-listener policy attachment because its
+common TLS endpoint cannot enforce those settings.
+
+Policy updates currently use the existing protected-node replacement mechanism
+and can interrupt established connections. Graceful live policy updates remain
+unimplemented. Clearing every policy is supported by the API record model, but
+fails explicitly on a protected TLS listener until its resulting packet behavior
+is implemented. These limits do not require removing policy properties from a
+new deployment.
 
 ## CloudFormation
 
@@ -71,8 +99,8 @@ resource's identity unless replacement is required. Replacement cleanup and
 failed-update restoration preserve the previous resource; an existing
 same-name load balancer is never adopted by an ordinary stack create.
 
-Policy properties and listener `PolicyNames` currently fail explicitly before
-allocation because their Classic APIs are not implemented. Removing
+CloudFormation policy properties and listener `PolicyNames` currently fail explicitly
+before allocation; CloudFormation binding to the Classic policy APIs remains unimplemented. Removing
 `SecurityGroups` from an existing template also fails explicitly; specifying
 the desired groups remains supported. Access-log attributes are retained as
 configuration and do not imply that log delivery is implemented.
@@ -94,7 +122,7 @@ failed health checks, record changes and load-balancer deletion take effect with
 This serves HTTP and HTTPS backends for HTTP listeners and HTTPS listeners behind Floci's existing
 TLS edge. `InstanceProtocol=HTTPS` opens a TLS connection to `InstancePort`; it never falls back to
 plaintext. Backend certificates are not authenticated, matching Classic ELB without its optional
-backend authentication policy. The policy APIs remain unsupported. Backend TLS uses the runtime's
+backend authentication policy. Backend policy APIs remain unsupported. Backend TLS uses the runtime's
 enabled protocols and ciphers rather than reproducing Classic ELB's legacy cipher list.
 
 It does not install the listener's ACM certificate on that edge. TCP/SSL forwarding,
