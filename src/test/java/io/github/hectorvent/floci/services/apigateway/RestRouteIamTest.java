@@ -95,6 +95,7 @@ class RestRouteIamTest {
         resource.setPath("/");
         resource.setResourceMethods(Map.of("POST", method));
         when(gateway.resolveRestApiRegion("us-east-1", "api")).thenReturn("us-east-1");
+        when(gateway.getRestApi("us-east-1", "api")).thenReturn(new RestApi());
         stage = new Stage();
         when(gateway.getStage("us-east-1", "api", "prod")).thenReturn(stage);
         when(gateway.getResources("us-east-1", "api")).thenReturn(List.of(resource));
