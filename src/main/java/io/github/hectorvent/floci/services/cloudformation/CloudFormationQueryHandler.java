@@ -25,10 +25,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 /**
  * Handles CloudFormation Query-protocol API calls (form-encoded POST, XML response).
@@ -129,20 +125,23 @@ public class CloudFormationQueryHandler {
         List<String> capabilities = extractList(params, "Capabilities.member.");
         Map<String, String> tags = extractTags(params);
 
-        cfnService.createChangeSetForStackOperation(stackName, "initial-create", "CREATE",
-                templateBody, templateUrl, parameters, capabilities, tags, region, params.getFirst("RoleARN"));
-        awaitExecution(cfnService.executeCreateChangeSet(stackName, "initial-create", region, disableRollback));
-
-        if (Boolean.parseBoolean(params.getFirst("EnableTerminationProtection"))) {
-            // CreateStackInput carries the same member; honor it so the stack is created protected.
-            cfnService.updateTerminationProtection(stackName, true, region);
+        boolean terminationProtection = Boolean.parseBoolean(params.getFirst("EnableTerminationProtection"));
+        ChangeSet initial = cfnService.createChangeSetForCreateStack(stackName, "initial-create",
+                templateBody, templateUrl, parameters, capabilities, tags, region,
+                params.getFirst("RoleARN"), terminationProtection);
+        try {
+            cfnService.executeCreateChangeSet(initial.getStackId(), initial.getChangeSetId(), region, disableRollback);
+        } catch (AwsException e) {
+            if (terminationProtection) {
+                cfnService.clearProtectionAfterRejectedCreate(stackName, initial, region);
+            }
+            throw e;
         }
 
-        Stack stack = cfnService.describeStacks(stackName, region).get(0);
         String xml = new XmlBuilder()
                 .start("CreateStackResponse", CF_NS)
                 .start("CreateStackResult")
-                .elem("StackId", stack.getStackId())
+                .elem("StackId", initial.getStackId())
                 .end("CreateStackResult")
                 .raw(AwsQueryResponse.responseMetadata())
                 .end("CreateStackResponse")
@@ -182,13 +181,12 @@ public class CloudFormationQueryHandler {
             cfnService.deleteChangeSet(stackName, cs.getChangeSetName(), region);
             return xmlError("ValidationError", "No updates are to be performed.", 400);
         }
-        awaitExecution(cfnService.executeChangeSet(stackName, cs.getChangeSetName(), region));
+        cfnService.executeChangeSet(cs.getStackId(), cs.getChangeSetId(), region);
 
-        Stack stack = cfnService.describeStacks(stackName, region).get(0);
         String xml = new XmlBuilder()
                 .start("UpdateStackResponse", CF_NS)
                 .start("UpdateStackResult")
-                .elem("StackId", stack.getStackId())
+                .elem("StackId", cs.getStackId())
                 .end("UpdateStackResult")
                 .raw(AwsQueryResponse.responseMetadata())
                 .end("UpdateStackResponse")
@@ -1195,19 +1193,6 @@ public class CloudFormationQueryHandler {
                .end("member");
         }
         xml.end("Parameters");
-    }
-
-    private void awaitExecution(Future<?> future) {
-        try {
-            future.get(1, TimeUnit.SECONDS);
-        } catch (TimeoutException expected) {
-            LOG.debug("Accepted stack operation continues asynchronously");
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            LOG.warn("Interrupted while awaiting initial stack progress; accepted operation continues");
-        } catch (ExecutionException error) {
-            LOG.warnv("Stack execution failed: {0}", error.getMessage());
-        }
     }
 
     private Response xmlError(String code, String message, int status) {
