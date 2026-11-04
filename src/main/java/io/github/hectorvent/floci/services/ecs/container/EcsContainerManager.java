@@ -38,6 +38,7 @@ import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
+import io.github.hectorvent.floci.services.ecs.EcsAgentLabels;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.Container;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
@@ -425,13 +426,15 @@ public class EcsContainerManager {
                 dockerFlags.applyTo(specBuilder, "ECS");
                 specBuilder.withEmbeddedDns()
                         .withJavaTrustStore();
-                // The definition's own dockerLabels, as ECS applies them, then Floci's ownership
+                // The definition's own dockerLabels, as ECS applies them; then the labels the ECS
+                // agent sets, which override a duplicate there as on ECS; then Floci's ownership
                 // labels, which win on a key conflict: reconciliation and teardown find their
                 // containers by those, and a task must not be able to hide from or adopt them.
                 if (def.getDockerLabels() != null) {
                     specBuilder.withLabels(def.getDockerLabels());
                 }
                 specBuilder
+                        .withLabels(EcsAgentLabels.forDocker(task, taskDef, def.getName()))
                         .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                                 "ecs", taskId, regionResolver.getAccountId(), region))
                         .withLabels(ownerLabels());
