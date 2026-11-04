@@ -35,8 +35,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Held HTTP requests traverse a real NAT, TLS frontend and protected backend. */
 @QuarkusTest
-@TestProfile(ElbClassicPublicNatPacketIntegrationTest.PublicRouting.class)
+@TestProfile(ElbClassicDrainingPacketIntegrationTest.DrainingRouting.class)
 class ElbClassicDrainingPacketIntegrationTest extends ElbClassicPublicNatPacketIntegrationTest {
+    public static class DrainingRouting extends PublicRouting {}
+
     @Test
     void newBackendsAndDeregistrationPreserveInflightWorkAndExistingHealthyMembers() throws Exception {
         Topology topology = topology(20);
