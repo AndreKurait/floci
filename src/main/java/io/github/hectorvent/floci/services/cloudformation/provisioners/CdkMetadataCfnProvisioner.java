@@ -22,6 +22,7 @@ public class CdkMetadataCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
-        r.setPhysicalId("cdk-metadata-" + UUID.randomUUID().toString().substring(0, 8));
+        r.setPhysicalId(ctx.isUpdate() ? ctx.priorPhysicalId()
+                : "cdk-metadata-" + UUID.randomUUID().toString().substring(0, 8));
     }
 }
