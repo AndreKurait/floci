@@ -134,6 +134,20 @@ class LambdaVpcFirewallDockerIntegrationTest {
         IpPermission ingress = reference(callerGroup);
         ec2.authorizeSecurityGroupIngress(request -> request.groupId(listenerGroup).ipPermissions(ingress));
         Listener listener = listener(ec2, subnet, listenerGroup, suffix);
+        CommandResult resets = execute(listener.containerId(), "/var/lang/bin/node", "-e", """
+                const net = require('net');
+                (async () => {
+                  for (let i = 0; i < 20; i++) {
+                    await new Promise((resolve, reject) => {
+                      const socket = net.createConnection(8080, '127.0.0.1');
+                      socket.once('error', reject);
+                      socket.once('connect', () => { socket.resetAndDestroy(); resolve(); });
+                    });
+                  }
+                })().catch(error => { console.error(error); process.exitCode = 1; });
+                """);
+        assertEquals(0, resets.code(), () -> resets.output() + "\nListener state: "
+                + docker.inspectContainerCmd(listener.containerId()).exec().getState());
 
         String function = "vpc-packets-" + suffix;
         lambda.createFunction(request -> request.functionName(function).role(role).runtime(Runtime.NODEJS20_X)
@@ -274,8 +288,12 @@ class LambdaVpcFirewallDockerIntegrationTest {
                         const fs = require('fs');
                         fs.writeFileSync('/tmp/accepted', '');
                         require('net').createServer(socket => {
+                          socket.on('error', error => {
+                            if (error.code !== 'ECONNRESET' && error.code !== 'EPIPE') throw error;
+                          });
                           fs.appendFileSync('/tmp/accepted', 'x');
-                          fs.writeFileSync('/tmp/source', socket.remoteAddress);
+                          const source = socket.remoteAddress;
+                          if (source) fs.writeFileSync('/tmp/source', source);
                           socket.end('ok');
                         }).listen(8080, '0.0.0.0');
                         """)).build()).containerId();
