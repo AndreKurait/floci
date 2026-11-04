@@ -238,6 +238,65 @@ class Ec2ContainerManagerTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void cancelledLaunchRetainsCleanupOwnershipUntilFirewallRetirementSucceeds(boolean transientFailure) {
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        PortAllocator ports = mock(PortAllocator.class);
+        VpcNetworkManager network = mock(VpcNetworkManager.class);
+        Ec2MetadataServer metadata = mock(Ec2MetadataServer.class);
+        when(firewall.enabled()).thenReturn(true);
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                mock(ContainerBuilder.class), lifecycle, mock(ContainerLogStreamer.class),
+                mock(ContainerDetector.class), mock(DockerHostResolver.class), mock(DockerClient.class),
+                ports, mock(EmulatorConfig.class), metadata, mock(Ec2PortForwardManager.class),
+                mock(RegionResolver.class), mock(ContainerNetworkReachability.class), network,
+                mock(ContainerReachableEndpoint.class), firewall);
+        Instance instance = instance("i-failed-launch-retirement");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setSshHostPort(2201);
+        instance.setContainerBridgeIp("172.18.0.12");
+        instance.setPrivateIpAddress("10.0.0.12");
+        instance.setRegion("us-east-1");
+        instance.setVpcId("vpc-original");
+        instance.setSubnetId("subnet-original");
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-original");
+        instance.setNetworkInterfaces(new ArrayList<>(List.of(eni)));
+        AtomicInteger attempts = new AtomicInteger();
+        doAnswer(invocation -> {
+            if (attempts.incrementAndGet() == 1 && transientFailure) {
+                throw new IllegalStateException("peer retirement failed");
+            }
+            return null;
+        }).when(firewall).unregister("eni-original");
+        try {
+            if (transientFailure) {
+                assertThrows(IllegalStateException.class, () -> manager.cancelLaunch(instance));
+                assertEquals("terminated", instance.getState().getName());
+                verify(ports, never()).release(anyInt());
+                verify(network, never()).releasePrivateIp(any(), any(), any());
+                verify(network, never()).detach(any(), any(), any());
+                verify(lifecycle, never()).removeIfExistsStrict(any());
+                instance.getNetworkInterfaces().clear();
+                instance.setPrivateIpAddress(null);
+                instance.setSubnetId(null);
+            }
+            assertTrue(manager.cancelLaunch(instance));
+            assertTrue(manager.cancelLaunch(instance));
+            verify(firewall, times(transientFailure ? 2 : 1)).unregister("eni-original");
+            verify(ports, times(1)).release(2201);
+            verify(network, times(1)).detach("us-east-1", "vpc-original", TEST_CONTAINER_ID);
+            verify(network, times(1)).releasePrivateIp("us-east-1", "subnet-original", "10.0.0.12");
+            verify(metadata, times(1)).unregisterContainer("172.18.0.12", instance);
+            assertNull(instance.getDockerContainerId());
+            assertEquals(0, instance.getSshHostPort());
+        } finally {
+            manager.stop();
+        }
+    }
+
     private static final String TEST_USER_DATA_OUTPUT = "test-output";
     private static final String TEST_CONTAINER_ID = "container-1";
     private static final String TEST_HELPER_ID = "metadata-helper-1";
