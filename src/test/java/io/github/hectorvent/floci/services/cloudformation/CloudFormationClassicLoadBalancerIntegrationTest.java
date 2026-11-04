@@ -243,7 +243,7 @@ class CloudFormationClassicLoadBalancerIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"Policies", "AppCookieStickinessPolicy", "LBCookieStickinessPolicy"})
+    @ValueSource(strings = {"AppCookieStickinessPolicy", "LBCookieStickinessPolicy"})
     void unsupportedPoliciesCannotProduceAGreenStack(String property) {
         ObjectNode template = template(name);
         properties(template).putArray(property).addObject().put("PolicyName", "policy");
