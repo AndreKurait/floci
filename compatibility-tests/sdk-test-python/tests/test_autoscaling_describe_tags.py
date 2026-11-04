@@ -1,6 +1,7 @@
 """Auto Scaling tag Query/XML, filtering, pagination and ownership through boto3."""
 
 from contextlib import ExitStack, closing
+import uuid
 
 import boto3
 import pytest
