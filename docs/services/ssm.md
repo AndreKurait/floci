@@ -109,6 +109,19 @@ Content missing from legacy history is not recreated: a reference can exist whil
 `GetDocument` and `DescribeDocument` cannot return that version's content.
 Changing the default does not schedule State Manager execution.
 
+## CloudFormation patch baselines
+
+`AWS::SSM::PatchBaseline` creates backing SSM configuration. `Ref` and `Fn::GetAtt Id`
+return its baseline ID. Updates keep that ID unless `OperatingSystem` changes;
+omitted optional policy fields reset through `UpdatePatchBaseline` with `Replace=true`.
+Patch groups and template-owned tags are reconciled, and deletion deregisters the
+baseline's groups before deleting it. Replacement honors `UpdateReplacePolicy`.
+
+`DefaultBaseline: true` registers the baseline on creation or a false-to-true update.
+As in AWS's resource handler, false does not unregister it, and an unchanged true does
+not overwrite a default selected outside the stack. This resource configures patching;
+it does not run Patch Manager or prove that managed nodes installed patches.
+
 ## State Manager associations
 
 Association create, describe, list, update and delete operations store and return the

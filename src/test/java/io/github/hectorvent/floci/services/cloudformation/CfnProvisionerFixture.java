@@ -121,6 +121,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.SignerCfn
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SnsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SqsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmPatchBaselineCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.StepFunctionsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.TransferCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.WafV2CfnProvisioner;
@@ -184,6 +185,7 @@ import io.github.hectorvent.floci.services.ses.SesReceiptRuleService;
 import io.github.hectorvent.floci.services.ses.SesService;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
+import io.github.hectorvent.floci.services.ssm.SsmPatchBaselineService;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
 import io.github.hectorvent.floci.services.transfer.TransferService;
@@ -236,6 +238,7 @@ final class CfnProvisionerFixture {
         private CodeDeployService codeDeployService;
         private IamService iamService;
         private SsmService ssmService;
+        private SsmPatchBaselineService ssmPatchBaselines;
         private KmsService kmsService;
         private SecretsManagerService secretsManagerService;
         private EventBridgeService eventBridgeService;
@@ -387,6 +390,9 @@ final class CfnProvisionerFixture {
             }
             if (ssmService != null) {
                 discovered.add(new SsmCfnProvisioner(ssmService));
+            }
+            if (ssmPatchBaselines != null) {
+                discovered.add(new SsmPatchBaselineCfnProvisioner(ssmPatchBaselines));
             }
             if (kmsService != null) {
                 discovered.add(new KmsCfnProvisioner(kmsService));
@@ -665,6 +671,11 @@ final class CfnProvisionerFixture {
 
         public Builder ssm(SsmService v) {
             this.ssmService = v;
+            return this;
+        }
+
+        public Builder ssmPatchBaselines(SsmPatchBaselineService value) {
+            this.ssmPatchBaselines = value;
             return this;
         }
 
