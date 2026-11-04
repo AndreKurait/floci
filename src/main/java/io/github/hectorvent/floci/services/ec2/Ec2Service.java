@@ -6847,6 +6847,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public void associateDhcpOptions(String region, String dhcpOptionsId, String vpcId) {
+        associateDhcpOptionsAndGetPrevious(region, dhcpOptionsId, vpcId);
+    }
+
+    /** Returns the replaced association while holding the same lock used to change it. */
+    public String associateDhcpOptionsAndGetPrevious(String region, String dhcpOptionsId, String vpcId) {
         if (dhcpOptionsId == null || dhcpOptionsId.isBlank()) {
             throw new AwsException("MissingParameter", "DhcpOptionsId is required", 400);
         }
@@ -6858,8 +6863,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (!"default".equals(dhcpOptionsId)) {
                 getRequiredDhcpOptions(region, dhcpOptionsId);
             }
+            String previous = vpc.getDhcpOptionsId();
             vpc.setDhcpOptionsId(dhcpOptionsId);
             vpcs.put(key(region, vpcId), vpc);
+            return previous;
         }
     }
 
@@ -6876,6 +6883,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             dhcpOptions.delete(key(region, dhcpOptionsId));
             removeTags(region, dhcpOptionsId);
+        }
+    }
+
+    /** Replaces only the association a lifecycle owner still holds, under the normal EC2 topology lock. */
+    public boolean associateDhcpOptionsIfCurrent(String region, String dhcpOptionsId, String vpcId,
+                                                 String expectedOptionsId) {
+        synchronized (attachmentTopologyLock(region)) {
+            Vpc vpc = getRequiredVpc(region, vpcId);
+            if (!Objects.equals(vpc.getDhcpOptionsId(), expectedOptionsId)) {
+                return false;
+            }
+            associateDhcpOptions(region, dhcpOptionsId, vpcId);
+            return true;
         }
     }
 
