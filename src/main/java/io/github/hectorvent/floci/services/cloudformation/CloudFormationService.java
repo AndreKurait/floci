@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudformation.GetStackOutputRoleAuthorizer.ExecutionIdentity;
 import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
+import io.github.hectorvent.floci.services.cloudformation.model.ResourceToImport;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -30,6 +31,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDynamicReferences;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.ProvisionContext;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCleanupResult;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
@@ -124,6 +126,7 @@ public class CloudFormationService implements ResourceProvider {
     private final ConcurrentHashMap<String, String> exports = new ConcurrentHashMap<>();
     private final ExecutorService executor = newOperationExecutor();
     private final CfnResourceSignals resourceSignals = new CfnResourceSignals();
+    private final Object importOwnershipLock = new Object();
 
     static ThreadPoolExecutor newOperationExecutor() {
         return new ThreadPoolExecutor(
@@ -303,7 +306,7 @@ public class CloudFormationService implements ResourceProvider {
     static boolean refusesUpdate(String status) {
         return status != null
                 && (status.endsWith("_IN_PROGRESS") || "ROLLBACK_COMPLETE".equals(status)
-                        || "UPDATE_ROLLBACK_FAILED".equals(status));
+                        || "UPDATE_ROLLBACK_FAILED".equals(status) || "IMPORT_ROLLBACK_FAILED".equals(status));
     }
 
     /**
@@ -342,6 +345,15 @@ public class CloudFormationService implements ResourceProvider {
                                                          Map<String, String> parameters,
                                                          List<String> capabilities,
                                                          Map<String, String> tags, String region, String roleArn) {
+        return createChangeSetFromPreviousTemplate(stackName, changeSetName, parameters, capabilities, tags,
+                region, roleArn, "UPDATE", List.of());
+    }
+
+    public ChangeSet createChangeSetFromPreviousTemplate(String stackName, String changeSetName,
+                                                         Map<String, String> parameters,
+                                                         List<String> capabilities,
+                                                         Map<String, String> tags, String region, String roleArn,
+                                                         String changeSetType, List<ResourceToImport> resourcesToImport) {
         ChangeSet created = null;
         while (created == null) {
             Stack stack = resolveStack(stackName, region);
@@ -350,8 +362,8 @@ public class CloudFormationService implements ResourceProvider {
                         "Stack with id " + stackName + " does not exist", 400);
             }
             String previousTemplate = previousTemplateOf(stack);
-            created = createChangeSet(stackName, changeSetName, "UPDATE", previousTemplate, null,
-                    parameters, capabilities, tags, region, currentAccount(), false, true, roleArn);
+            created = createChangeSet(stackName, changeSetName, changeSetType, previousTemplate, null,
+                    parameters, capabilities, tags, region, currentAccount(), false, true, roleArn, resourcesToImport);
         }
         return created;
     }
@@ -413,6 +425,15 @@ public class CloudFormationService implements ResourceProvider {
                 parameters, capabilities, tags, region, regionResolver.getAccountId(), true, false, roleArn);
     }
 
+    public ChangeSet createChangeSetForRequest(String stackName, String changeSetName, String changeSetType,
+                                               String templateBody, String templateUrl,
+                                               Map<String, String> parameters, List<String> capabilities,
+                                               Map<String, String> tags, String region, String roleArn,
+                                               List<ResourceToImport> resourcesToImport) {
+        return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
+                parameters, capabilities, tags, region, currentAccount(), true, false, roleArn, resourcesToImport);
+    }
+
     /**
      * Creates a change set whose condition-dependency preflight is evaluated in {@code accountId}'s
      * context. This matters for StackSet deployments: {@code createChangeSet} runs in the
@@ -437,12 +458,31 @@ public class CloudFormationService implements ResourceProvider {
                                       Map<String, String> tags, String region, String accountId,
                                       boolean attachToReviewInProgressStack, boolean fromPreviousTemplate,
                                       String roleArn) {
+        return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
+                parameters, capabilities, tags, region, accountId, attachToReviewInProgressStack,
+                fromPreviousTemplate, roleArn, List.of());
+    }
+
+    private ChangeSet createChangeSet(String stackName, String changeSetName, String changeSetType,
+                                      String templateBody, String templateUrl,
+                                      Map<String, String> parameters, List<String> capabilities,
+                                      Map<String, String> tags, String region, String accountId,
+                                      boolean attachToReviewInProgressStack, boolean fromPreviousTemplate,
+                                      String roleArn, List<ResourceToImport> resourcesToImport) {
         String resolvedTemplate = resolveTemplate(templateBody, templateUrl);
         requireValidTemplate(resolvedTemplate);
         boolean isCreateType = "CREATE".equalsIgnoreCase(changeSetType);
+        boolean isImportType = "IMPORT".equalsIgnoreCase(changeSetType);
+        if (isImportType && resourcesToImport.isEmpty()) {
+            throw importValidation("ResourcesToImport is required for an IMPORT change set");
+        }
+        if (!isImportType && !resourcesToImport.isEmpty()) {
+            throw importValidation("ResourcesToImport is valid only for an IMPORT change set");
+        }
         // An update names its stack by name or stack ID; the map is keyed by name. One that names no
         // live stack is keyed as given, so it lands in the missing-stack branch below.
         Stack live = isCreateType ? null : resolveStack(stackName, region, accountId);
+        boolean needsPlaceholder = isCreateType || isImportType && live == null;
 
         // Ahead of the transform and the preflight below, which both read the parameter values. A
         // request the claim below refuses for its stack alone (an update of a stack that is missing
@@ -451,7 +491,10 @@ public class CloudFormationService implements ResourceProvider {
         Stack named = isCreateType ? stacks.get(stackKey(accountId, stackName, region)) : live;
         boolean refusedForItsStack = isCreateType
                 ? named != null && !(attachToReviewInProgressStack && "REVIEW_IN_PROGRESS".equals(named.getStatus()))
-                : named == null || "DELETE_COMPLETE".equals(named.getStatus()) || refusesUpdate(named.getStatus());
+                : named == null ? !isImportType
+                : "DELETE_COMPLETE".equals(named.getStatus())
+                        || refusesUpdate(named.getStatus())
+                        && !(isImportType && "REVIEW_IN_PROGRESS".equals(named.getStatus()));
         if (!refusedForItsStack) {
             requireParameterValues(resolvedTemplate, parameters);
         }
@@ -461,8 +504,8 @@ public class CloudFormationService implements ResourceProvider {
         // id it is given below, allocated now. A create over a name in use is checked as that new
         // stack, never as the stack holding the name; an update of a missing stack, refused below,
         // with the name it gave and an empty id.
-        boolean attaches = isCreateType && named != null && !refusedForItsStack;
-        String createdStackId = isCreateType && !attaches ? newStackId(stackName, region, accountId) : null;
+        boolean attaches = (isCreateType || isImportType) && named != null && !refusedForItsStack;
+        String createdStackId = needsPlaceholder && !attaches ? newStackId(stackName, region, accountId) : null;
         Stack identity = isCreateType ? (attaches ? named : null) : live;
         String preflightStackName = identity != null ? identity.getStackName() : stackName;
         String preflightStackId = identity != null ? identity.getStackId()
@@ -521,7 +564,7 @@ public class CloudFormationService implements ResourceProvider {
         // AWS::Include fragments from S3, runs the SAM transform and resolves SSM parameters. Inside,
         // the verdict stands only if the stack still holds what it was reached against.
         DeployedState checked = isCreateType || live == null ? null : DeployedState.of(live);
-        boolean unchangedWhenChecked = checked != null
+        boolean unchangedWhenChecked = !isImportType && checked != null
                 && (roleArn == null || roleArn.equals(live.getRoleArn()))
                 && submitsWhatTheStackHas(live, resolvedTemplate, parameters, tags, region);
         ChangeSet[] created = new ChangeSet[1];
@@ -529,7 +572,7 @@ public class CloudFormationService implements ResourceProvider {
         Stack stack = stacks.compute(stackKey(accountId, canonicalStackName, region), (k, existing) -> {
             Stack target;
             if (existing == null) {
-                if (!isCreateType) {
+                if (!isCreateType && !isImportType) {
                     throw noStackToUpdate(stackName, region, accountId);
                 }
                 // The id the preflight saw; a placeholder that left the map since then has none.
@@ -541,7 +584,7 @@ public class CloudFormationService implements ResourceProvider {
                 // matching stack-level event (as AWS and LocalStack do) so DescribeStackEvents is
                 // non-empty straight after change-set creation — tooling such as the AWS SAM CLI
                 // reads StackEvents[0] there and otherwise fails with an IndexError.
-                if (isCreateType) {
+                if (isCreateType || isImportType) {
                     addEvent(target, target.getStackName(), target.getStackId(),
                             "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS", "User Initiated");
                 }
@@ -562,7 +605,8 @@ public class CloudFormationService implements ResourceProvider {
                 // The message is the one real CloudFormation emits, down to its own "can not"
                 // spelling and the stack id carried as "Stack:<arn>" with no space: clients match
                 // on this string.
-                if (!isCreateType && (refusesUpdate(status) || "DELETE_COMPLETE".equals(status))) {
+                if (!isCreateType && !(isImportType && reusableReviewPlaceholder)
+                        && (refusesUpdate(status) || "DELETE_COMPLETE".equals(status))) {
                     throw cannotBeUpdated(existing.getStackId(), status);
                 }
                 if (fromPreviousTemplate && !Objects.equals(templateBody, previousTemplateOf(existing))) {
@@ -579,6 +623,7 @@ public class CloudFormationService implements ResourceProvider {
             cs.setStackName(canonicalStackName);
             cs.setStackId(target.getStackId());
             cs.setChangeSetType(changeSetType != null ? changeSetType : "UPDATE");
+            cs.setResourcesToImport(resourcesToImport);
             cs.setTemplateBody(resolvedTemplate);
             cs.setRoleArn(roleArn);
             cs.setParameters(parameters);
@@ -592,6 +637,9 @@ public class CloudFormationService implements ResourceProvider {
                 cs.setStatus("FAILED");
                 cs.setExecutionStatus("UNAVAILABLE");
                 cs.setStatusReason(NO_CHANGES_REASON);
+            } else if (isImportType) {
+                cs.setStatus("CREATE_IN_PROGRESS");
+                cs.setExecutionStatus("UNAVAILABLE");
             } else {
                 cs.setStatus("CREATE_COMPLETE");
                 cs.setExecutionStatus("AVAILABLE");
@@ -602,6 +650,19 @@ public class CloudFormationService implements ResourceProvider {
         });
 
         if (created[0] != null) {
+            if (isImportType && !"FAILED".equals(created[0].getStatus())) {
+                try {
+                    PreparedImport prepared = prepareImport(stack, created[0], region, accountId,
+                            importExecutionIdentity(stack, created[0], region, accountId));
+                    created[0].setImportPhysicalIds(prepared.physicalIds());
+                    created[0].setStatus("CREATE_COMPLETE");
+                    created[0].setExecutionStatus("AVAILABLE");
+                } catch (AwsException failure) {
+                    created[0].setStatus("FAILED");
+                    created[0].setExecutionStatus("UNAVAILABLE");
+                    created[0].setStatusReason(failure.getMessage());
+                }
+            }
             persistStack(stack);
         }
         return created[0];
@@ -844,6 +905,15 @@ public class CloudFormationService implements ResourceProvider {
      * executed a template) report every resource with a truthy {@code Condition} as an Add.
      */
     public List<ResourceChange> computeChangeSetChanges(ChangeSet cs, String region) {
+        if ("IMPORT".equalsIgnoreCase(cs.getChangeSetType()) && !"FAILED".equals(cs.getStatus())) {
+            return cs.getResourcesToImport().stream().map(resource -> new ResourceChange(
+                    "Import", resource.logicalResourceId(), cs.getImportPhysicalIds().get(resource.logicalResourceId()),
+                    resource.resourceType(), null)).toList();
+        }
+        return computeTemplateChanges(cs, region);
+    }
+
+    private List<ResourceChange> computeTemplateChanges(ChangeSet cs, String region) {
         if ("FAILED".equals(cs.getStatus())) {
             // A SAM transform failure already recorded by createChangeSet (see
             // samTransformFailureReason): the change set carries 0 changes, matching real
@@ -1293,10 +1363,12 @@ public class CloudFormationService implements ResourceProvider {
                 }
             }
             existing.setRoleArn(roleArn);
-            existing.setStatus(isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS");
+            String status = "IMPORT".equalsIgnoreCase(cs.getChangeSetType()) ? "IMPORT_IN_PROGRESS"
+                    : isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS";
+            existing.setStatus(status);
             existing.setLastUpdatedTime(now());
             addEvent(existing, existing.getStackName(), existing.getStackId(),
-                    "AWS::CloudFormation::Stack", isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS", null);
+                    "AWS::CloudFormation::Stack", status, null);
             claimed[0] = new ClaimedExecution(cs, isCreate, identity);
             return existing;
         });
@@ -1329,7 +1401,13 @@ public class CloudFormationService implements ResourceProvider {
         Map<String, String> params = cs.getParameters() != null ? cs.getParameters() : Map.of();
 
         return submitOperation(() -> RequestScopes.runAs(accountId, region, () -> {
-            executeTemplate(stack, templateBody, params, cs.getTags(), isCreate, region, accountId, identity);
+            if ("IMPORT".equalsIgnoreCase(cs.getChangeSetType())) {
+                synchronized (importOwnershipLock) {
+                    executeImport(stack, cs, region, accountId, identity);
+                }
+            } else {
+                executeTemplate(stack, templateBody, params, cs.getTags(), isCreate, region, accountId, identity);
+            }
             String status = stack.getStatus();
             cs.setExecutionStatus(status != null && (status.contains("ROLLBACK") || status.endsWith("_FAILED"))
                 ? "EXECUTE_FAILED" : "EXECUTE_COMPLETE");
@@ -1744,18 +1822,23 @@ public class CloudFormationService implements ResourceProvider {
         }
 
         LinkedHashSet<String> resourceTypes = new LinkedHashSet<>();
+        Map<String, List<String>> importableLogicalIds = new LinkedHashMap<>();
         boolean hasNamedIamResource = false;
         JsonNode resourcesNode = template.path("Resources");
         if (resourcesNode.isObject()) {
             Iterator<Map.Entry<String, JsonNode>> resourceEntries = resourcesNode.fields();
             while (resourceEntries.hasNext()) {
-                JsonNode resource = resourceEntries.next().getValue();
+                Map.Entry<String, JsonNode> entry = resourceEntries.next();
+                JsonNode resource = entry.getValue();
                 JsonNode typeNode = resource.path("Type");
                 if (!typeNode.isTextual()) {
                     continue;
                 }
                 String type = typeNode.asText();
                 resourceTypes.add(type);
+                if (!dispatcher.importIdentifiers(type).isEmpty()) {
+                    importableLogicalIds.computeIfAbsent(type, ignored -> new ArrayList<>()).add(entry.getKey());
+                }
                 String nameProperty = IAM_RESOURCE_NAME_PROPERTY.get(type);
                 // Presence alone counts as named, even when the value is an intrinsic function
                 // (Ref, Fn::Sub, Fn::Join, ...) that only resolves at deploy time - CloudFormation
@@ -1796,8 +1879,12 @@ public class CloudFormationService implements ResourceProvider {
 
         String metadata = template.hasNonNull("Metadata") ? template.get("Metadata").toString() : null;
 
+        List<TemplateSummary.ResourceIdentifierSummary> identifiers = importableLogicalIds.entrySet().stream()
+                .map(entry -> new TemplateSummary.ResourceIdentifierSummary(entry.getKey(),
+                        dispatcher.importIdentifiers(entry.getKey()).stream().sorted().toList(), entry.getValue()))
+                .toList();
         return new TemplateSummary(description, parameters, new ArrayList<>(resourceTypes), version,
-                declaredTransforms, capabilities, capabilitiesReason, metadata);
+                declaredTransforms, capabilities, capabilitiesReason, metadata, identifiers);
     }
 
     // ── DescribeStackEvents ───────────────────────────────────────────────────
@@ -2058,6 +2145,228 @@ public class CloudFormationService implements ResourceProvider {
                             + "] from parameter store for this account", 400);
         }
         return resolved;
+    }
+
+    private ExecutionIdentity importExecutionIdentity(Stack stack, ChangeSet changeSet, String region, String accountId) {
+        String partition = AwsRegions.partitionFor(region);
+        return stackOutputRoles.executionIdentity(
+                changeSet.getRoleArn() != null ? changeSet.getRoleArn() : stack.getRoleArn(),
+                accountId, stack.getStackId(), partition, stackOutputRoles.captureCaller(accountId, partition));
+    }
+
+    private record PreparedImport(JsonNode template, Map<String, String> parameters,
+                                  Map<String, String> resolvedParameters, Map<String, Boolean> conditions,
+                                  Map<String, StackResource> resources, Map<String, String> physicalIds,
+                                  Map<String, String> outputs, Map<String, String> exports,
+                                  Map<String, String> outputExportNames) {
+    }
+
+    private PreparedImport prepareImport(Stack stack, ChangeSet changeSet, String region, String accountId,
+                                         ExecutionIdentity identity) {
+        Map<String, ResourceToImport> requested = new LinkedHashMap<>();
+        for (ResourceToImport resource : changeSet.getResourcesToImport()) {
+            if (requested.putIfAbsent(resource.logicalResourceId(), resource) != null) {
+                throw importValidation("ResourcesToImport contains duplicate logical ID " + resource.logicalResourceId());
+            }
+            Set<String> identifiers = dispatcher.importIdentifiers(resource.resourceType());
+            if (identifiers.isEmpty()) {
+                throw importValidation("Resource type does not support import: " + resource.resourceType());
+            }
+            if (!identifiers.equals(resource.resourceIdentifier().keySet())
+                    || resource.resourceIdentifier().values().stream().anyMatch(String::isBlank)) {
+                throw importValidation("ResourceIdentifier for " + resource.logicalResourceId()
+                        + " must specify " + identifiers);
+            }
+        }
+        Set<String> additions = new LinkedHashSet<>();
+        for (ResourceChange change : computeTemplateChanges(changeSet, region)) {
+            if (!"Add".equals(change.action()) || !requested.containsKey(change.logicalResourceId())) {
+                throw importValidation("An IMPORT change set cannot create, update or delete other resources: "
+                        + change.logicalResourceId());
+            }
+            additions.add(change.logicalResourceId());
+        }
+        if (!additions.equals(requested.keySet())) {
+            throw importValidation("ResourcesToImport must match the new resources in the template");
+        }
+        if (changeSet.getTags() != null && !changeSet.getTags().equals(stack.tagsSnapshot())) {
+            throw importValidation("An IMPORT change set cannot change the existing stack tags");
+        }
+
+        JsonNode template = awsIncludeProcessor.mergeIncludes(readTemplate(changeSet.getTemplateBody()));
+        Map<String, String> supplied = changeSet.getParameters() == null ? Map.of() : changeSet.getParameters();
+        if (samTransformProcessor.hasSamTransform(template)) {
+            template = samTransformProcessor.expandSamTemplate(template, samTransformParameters(template, supplied, region));
+        }
+        requireValidConditionsIn(template);
+        Map<String, String> parameters = resolveDefaultParameters(template, supplied);
+        Map<String, String> resolvedParameters = resolveSsmParameters(template, parameters, region);
+        Map<String, Boolean> conditions = resolveConditions(template, resolvedParameters, stack, region, accountId);
+        Map<String, JsonNode> mappings = new LinkedHashMap<>();
+        template.path("Mappings").properties().forEach(entry -> mappings.put(entry.getKey(), entry.getValue()));
+        JsonNode definitions = template.path("Resources");
+        Map<String, StackResource> resources = copyResources(stack.resourcesSnapshot());
+        Map<String, String> physicalIds = new LinkedHashMap<>();
+        Map<String, Map<String, String>> attributes = new LinkedHashMap<>();
+        resources.forEach((logicalId, resource) -> {
+            if (resource.getPhysicalId() != null) {
+                physicalIds.put(logicalId, resource.getPhysicalId());
+                attributes.put(logicalId, resource.getAttributes());
+            }
+        });
+        CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine(
+                accountId, region, stack.getStackName(), stack.getStackId(), resolvedParameters,
+                physicalIds, attributes, conditions, mappings, objectMapper,
+                name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
+                value -> dynamicReferences.resolveDynamicReferences(value, region, false),
+                (name, output, outputRegion, roleArn) ->
+                        resolveStackOutput(accountId, name, output, outputRegion, roleArn, identity),
+                parameterTypes(template),
+                (id, attribute, value) -> dispatcher.attributeValue(
+                        definitions.path(id).path("Type").asText(), attribute, value));
+        Set<String> claimedPhysicalIds = new HashSet<>();
+        for (String logicalId : topologicalSort(definitions, conditions)) {
+            ResourceToImport request = requested.get(logicalId);
+            if (request == null) {
+                continue;
+            }
+            JsonNode definition = definitions.path(logicalId);
+            if (!request.resourceType().equals(definition.path("Type").asText())) {
+                throw importValidation("ResourceType does not match the template for " + logicalId);
+            }
+            String deletionPolicy = definition.path("DeletionPolicy").asText("");
+            if (!Set.of("Delete", "Retain", "Snapshot", "RetainExceptOnCreate").contains(deletionPolicy)) {
+                throw importValidation("Resource " + logicalId + " requires a valid DeletionPolicy for import");
+            }
+            StackResource resource = new StackResource();
+            resource.setLogicalId(logicalId);
+            resource.setResourceType(request.resourceType());
+            resource.setDeletionPolicy(deletionPolicy);
+            resource.setUpdateReplacePolicy(definition.path("UpdateReplacePolicy").asText(null));
+            dispatcher.importResource(resource, engine.omitNoValue(definition.path("Properties")),
+                    request.resourceIdentifier(), new ProvisionContext(engine, region, accountId, stack.getStackName()));
+            if (resource.getPhysicalId() == null || resource.getPhysicalId().isBlank()) {
+                throw importValidation("Import did not identify resource " + logicalId);
+            }
+            requireUnownedImport(resource, region, accountId);
+            if (!claimedPhysicalIds.add(resource.getPhysicalId())) {
+                throw importValidation("A resource cannot be imported under more than one logical ID");
+            }
+            resource.setStatus("IMPORT_COMPLETE");
+            resource.setTimestamp(now());
+            resources.put(logicalId, resource);
+            physicalIds.put(logicalId, resource.getPhysicalId());
+            attributes.put(logicalId, resource.getAttributes());
+        }
+        Map<String, String> outputs = new LinkedHashMap<>();
+        Map<String, String> newExports = new LinkedHashMap<>();
+        Map<String, String> outputExportNames = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonNode> output : template.path("Outputs").properties()) {
+            JsonNode definition = output.getValue();
+            String condition = definition.path("Condition").asText(null);
+            if (condition != null && !conditions.getOrDefault(condition, false)) {
+                continue;
+            }
+            String value = engine.resolveString(definition.path("Value"),
+                    "Template format error: Every Value member must be a string.");
+            outputs.put(output.getKey(), value);
+            JsonNode export = definition.path("Export").path("Name");
+            if (!export.isMissingNode()) {
+                String name = engine.resolve(export);
+                validateExportNameAvailable(region, name, stack.exportsSnapshot(), newExports);
+                newExports.put(name, value);
+                outputExportNames.put(output.getKey(), name);
+            }
+        }
+        return new PreparedImport(template, parameters, resolvedParameters, conditions, resources, physicalIds,
+                outputs, newExports, outputExportNames);
+    }
+
+    private void requireUnownedImport(StackResource resource, String region, String accountId) {
+        for (Stack owner : stacks.values()) {
+            if (!accountId.equals(ownerAccount(owner)) || !region.equals(owner.getRegion())
+                    || "DELETE_COMPLETE".equals(owner.getStatus())) {
+                continue;
+            }
+            for (StackResource existing : owner.resourcesSnapshot().values()) {
+                if (resource.getResourceType().equals(existing.getResourceType())
+                        && resource.getPhysicalId().equals(existing.getPhysicalId())) {
+                    throw importValidation("Resource " + resource.getPhysicalId()
+                            + " already belongs to stack " + owner.getStackId());
+                }
+            }
+        }
+    }
+
+    private static AwsException importValidation(String reason) {
+        return new AwsException("ValidationError", reason, 400);
+    }
+
+    private void executeImport(Stack stack, ChangeSet changeSet, String region, String accountId,
+                               ExecutionIdentity identity) {
+        StackUpdateSnapshot previous = snapshotForUpdate(stack);
+        try {
+            // Import providers only read existing resources. Validate the complete set before
+            // committing ownership, and never send preexisting resources through create rollback.
+            PreparedImport prepared = prepareImport(stack, changeSet, region, accountId, identity);
+            stack.setOriginalTemplateBody(changeSet.getTemplateBody());
+            stack.setTemplateBody(prepared.template().toString());
+            stack.replaceParameters(prepared.parameters());
+            stack.replaceResolvedParameters(prepared.resolvedParameters());
+            synchronized (stack.getResources()) {
+                stack.getResources().clear();
+                stack.getResources().putAll(prepared.resources());
+            }
+            refreshTemplateUses(stack, prepared.template().path("Resources"),
+                    prepared.conditions(), prepared.physicalIds());
+            removeStackExports(stack, region);
+            stack.replaceOutputs(prepared.outputs());
+            stack.replaceExports(prepared.exports());
+            stack.replaceOutputExportNames(prepared.outputExportNames());
+            prepared.exports().forEach((name, value) -> {
+                String key = exportKey(region, name);
+                exports.put(accountExportKey(accountId, key), value);
+                exportBackend.putForAccount(accountId, key, value);
+            });
+            recordDynamicReferenceDigests(stack, prepared.template(), region);
+            for (ResourceToImport request : changeSet.getResourcesToImport()) {
+                String physicalId = prepared.physicalIds().get(request.logicalResourceId());
+                addEvent(stack, request.logicalResourceId(), physicalId, request.resourceType(), "IMPORT_IN_PROGRESS", null);
+                addEvent(stack, request.logicalResourceId(), physicalId, request.resourceType(), "IMPORT_COMPLETE", null);
+            }
+            stack.setStatus("IMPORT_COMPLETE");
+            stack.setStatusReason(null);
+            stack.setLastUpdatedTime(now());
+            addEvent(stack, stack.getStackName(), stack.getStackId(), "AWS::CloudFormation::Stack",
+                    "IMPORT_COMPLETE", null);
+            persistStack(stack);
+        } catch (RuntimeException failure) {
+            LOG.warnv("Import into stack {0} failed: {1}", stack.getStackName(), failure.getMessage());
+            stack.setStatus("IMPORT_ROLLBACK_IN_PROGRESS");
+            addEvent(stack, stack.getStackName(), stack.getStackId(), "AWS::CloudFormation::Stack",
+                    "IMPORT_ROLLBACK_IN_PROGRESS", failure.getMessage());
+            stack.setOriginalTemplateBody(previous.originalTemplateBody());
+            stack.setTemplateBody(previous.templateBody());
+            stack.replaceParameters(previous.parameters());
+            stack.replaceResolvedParameters(previous.resolvedParameters());
+            synchronized (stack.getResources()) {
+                stack.getResources().clear();
+                stack.getResources().putAll(previous.resources());
+            }
+            try {
+                restoreOutputAndExportState(stack, region, previous);
+                stack.setStatus("IMPORT_ROLLBACK_COMPLETE");
+            } catch (RuntimeException restoreFailure) {
+                failure.addSuppressed(restoreFailure);
+                stack.setStatus("IMPORT_ROLLBACK_FAILED");
+                LOG.errorv("Import metadata rollback failed for stack {0}: {1}",
+                        stack.getStackName(), restoreFailure.getMessage());
+            }
+            stack.setStatusReason(failure.getMessage());
+            stack.setLastUpdatedTime(now());
+            addEvent(stack, stack.getStackName(), stack.getStackId(), "AWS::CloudFormation::Stack",
+                    stack.getStatus(), failure.getMessage());
+        }
     }
 
     private void executeTemplate(Stack stack, String templateBody, Map<String, String> params,
@@ -3858,7 +4167,7 @@ public class CloudFormationService implements ResourceProvider {
      */
     private static boolean isDeletableOnStackDelete(StackResource resource) {
         return switch (resource.getStatus() == null ? "" : resource.getStatus()) {
-            case "CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_FAILED", "DELETE_FAILED" -> true;
+            case "CREATE_COMPLETE", "IMPORT_COMPLETE", "UPDATE_COMPLETE", "UPDATE_FAILED", "DELETE_FAILED" -> true;
             case "CREATE_FAILED" -> "true".equals(resource.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
             default -> false;
         };
