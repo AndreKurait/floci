@@ -20,7 +20,6 @@ import io.github.hectorvent.floci.services.ssm.model.Parameter;
 import io.github.hectorvent.floci.services.ssm.model.ParameterHistory;
 import io.github.hectorvent.floci.services.ssm.model.ParameterResourcePolicy;
 import io.github.hectorvent.floci.services.ssm.model.ParameterStringFilter;
-import io.github.hectorvent.floci.services.ssm.model.PatchBaselineIdentity;
 import io.github.hectorvent.floci.services.ssm.model.ServiceSetting;
 import io.github.hectorvent.floci.services.ssm.model.SsmAssociation;
 import io.github.hectorvent.floci.services.ssm.model.SsmDocument;
@@ -50,14 +49,16 @@ public class SsmJsonHandler {
     private final SsmCommandService commandService;
     private final ObjectMapper objectMapper;
     private final IamEnforcementFilter iamEnforcementFilter;
+    private final SsmPatchBaselineService patchBaselines;
 
     @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
-                          IamEnforcementFilter iamEnforcementFilter) {
+                          IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines) {
         this.ssmService = ssmService;
         this.commandService = commandService;
         this.objectMapper = objectMapper;
         this.iamEnforcementFilter = iamEnforcementFilter;
+        this.patchBaselines = patchBaselines;
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
@@ -90,9 +91,18 @@ public class SsmJsonHandler {
             case "GetServiceSetting" -> handleGetServiceSetting(request, region);
             case "UpdateServiceSetting" -> handleUpdateServiceSetting(request, region);
             case "ResetServiceSetting" -> handleResetServiceSetting(request, region);
-            // Patch Manager (read-only: AWS-owned predefined baselines)
-            case "DescribePatchBaselines" -> handleDescribePatchBaselines(request, region);
-            case "GetDefaultPatchBaseline" -> handleGetDefaultPatchBaseline(request, region);
+            // Patch Manager configuration
+            case "CreatePatchBaseline" -> Response.ok(patchBaselines.create(request, region)).build();
+            case "GetPatchBaseline" -> Response.ok(patchBaselines.get(request, region)).build();
+            case "UpdatePatchBaseline" -> Response.ok(patchBaselines.update(request, region)).build();
+            case "DeletePatchBaseline" -> Response.ok(patchBaselines.delete(request, region)).build();
+            case "DescribePatchBaselines" -> Response.ok(patchBaselines.describe(request, region)).build();
+            case "GetDefaultPatchBaseline" -> Response.ok(patchBaselines.getDefault(request, region)).build();
+            case "RegisterDefaultPatchBaseline" -> Response.ok(patchBaselines.registerDefault(request, region)).build();
+            case "RegisterPatchBaselineForPatchGroup" -> Response.ok(patchBaselines.registerGroup(request, region)).build();
+            case "DeregisterPatchBaselineForPatchGroup" -> Response.ok(patchBaselines.deregisterGroup(request, region)).build();
+            case "GetPatchBaselineForPatchGroup" -> Response.ok(patchBaselines.getForGroup(request, region)).build();
+            case "DescribePatchGroups" -> Response.ok(patchBaselines.describeGroups(request, region)).build();
             // Documents
             case "GetDocument" -> handleGetDocument(request, region);
             case "DescribeDocument" -> handleDescribeDocument(request, region);
@@ -453,47 +463,6 @@ public class SsmJsonHandler {
         List<String> result = new ArrayList<>();
         values.forEach(v -> result.add(v.asText()));
         return result;
-    }
-
-    private Response handleDescribePatchBaselines(JsonNode request, String region) {
-        Map<String, List<String>> filters = new HashMap<>();
-        JsonNode filtersNode = request.path("Filters");
-        if (filtersNode.isArray()) {
-            for (JsonNode f : filtersNode) {
-                String key = f.path("Key").asText("");
-                List<String> values = new ArrayList<>();
-                f.path("Values").forEach(v -> values.add(v.asText()));
-                if (!key.isEmpty()) {
-                    filters.put(key, values);
-                }
-            }
-        }
-
-        List<PatchBaselineIdentity> baselines = ssmService.describePatchBaselines(filters);
-
-        ObjectNode response = objectMapper.createObjectNode();
-        ArrayNode identities = objectMapper.createArrayNode();
-        for (PatchBaselineIdentity b : baselines) {
-            ObjectNode node = objectMapper.createObjectNode();
-            node.put("BaselineId", b.baselineId());
-            node.put("BaselineName", b.baselineName());
-            node.put("OperatingSystem", b.operatingSystem());
-            node.put("BaselineDescription", b.baselineDescription());
-            node.put("DefaultBaseline", b.defaultBaseline());
-            identities.add(node);
-        }
-        response.set("BaselineIdentities", identities);
-        return Response.ok(response).build();
-    }
-
-    private Response handleGetDefaultPatchBaseline(JsonNode request, String region) {
-        String operatingSystem = request.has("OperatingSystem") ? request.path("OperatingSystem").asText() : null;
-        String baselineId = ssmService.getDefaultPatchBaseline(operatingSystem);
-
-        ObjectNode response = objectMapper.createObjectNode();
-        response.put("BaselineId", baselineId);
-        response.put("OperatingSystem", (operatingSystem == null || operatingSystem.isBlank()) ? "WINDOWS" : operatingSystem);
-        return Response.ok(response).build();
     }
 
     /**
@@ -1200,6 +1169,9 @@ public class SsmJsonHandler {
     }
 
     private Response handleAddTagsToResource(JsonNode request, String region) {
+        if (request.path("ResourceType").asText().equals("PatchBaseline")) {
+            return Response.ok(patchBaselines.resourceTags("AddTagsToResource", request, region)).build();
+        }
         String resourceId = request.path("ResourceId").asText();
         Map<String, String> tags = new LinkedHashMap<>();
         request.path("Tags").forEach(t ->
@@ -1210,6 +1182,9 @@ public class SsmJsonHandler {
     }
 
     private Response handleListTagsForResource(JsonNode request, String region) {
+        if (request.path("ResourceType").asText().equals("PatchBaseline")) {
+            return Response.ok(patchBaselines.resourceTags("ListTagsForResource", request, region)).build();
+        }
         String resourceId = request.path("ResourceId").asText();
         Map<String, String> tags = ssmService.listTagsForResource(resourceId, region);
 
@@ -1226,6 +1201,9 @@ public class SsmJsonHandler {
     }
 
     private Response handleRemoveTagsFromResource(JsonNode request, String region) {
+        if (request.path("ResourceType").asText().equals("PatchBaseline")) {
+            return Response.ok(patchBaselines.resourceTags("RemoveTagsFromResource", request, region)).build();
+        }
         String resourceId = request.path("ResourceId").asText();
         List<String> tagKeys = new ArrayList<>();
         request.path("TagKeys").forEach(k -> tagKeys.add(k.asText()));
