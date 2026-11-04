@@ -122,6 +122,7 @@ public class CloudFormationService implements ResourceProvider {
     // Account-scoped exports registry: account:region:exportName -> exportValue
     private final ConcurrentHashMap<String, String> exports = new ConcurrentHashMap<>();
     private final ExecutorService executor = newOperationExecutor();
+    private final CfnResourceSignals resourceSignals = new CfnResourceSignals();
 
     static ThreadPoolExecutor newOperationExecutor() {
         return new ThreadPoolExecutor(
@@ -1141,6 +1142,19 @@ public class CloudFormationService implements ResourceProvider {
         return resource != null ? resource.getPhysicalId() : null;
     }
 
+    public void signalResource(String stackName, String logicalId, String uniqueId, String status, String region) {
+        if (stackName == null || stackName.isBlank()) {
+            throw new AwsException("ValidationError", "StackName is required.", 400);
+        }
+        Stack stack = getStackOrThrow(stackName, region);
+        resourceSignals.signal(stack.getStackId(), logicalId, uniqueId, status, event -> {
+            StackResource resource = stack.getResources().get(logicalId);
+            addEvent(stack, logicalId, resource.getPhysicalId(), resource.getResourceType(),
+                    "UPDATE_IN_PROGRESS".equals(stack.getStatus()) ? "UPDATE_IN_PROGRESS" : "CREATE_IN_PROGRESS",
+                    event);
+        });
+    }
+
     // ── ExecuteChangeSet ──────────────────────────────────────────────────────
 
     public Future<?> executeChangeSet(String stackName, String changeSetName, String region) {
@@ -2122,6 +2136,20 @@ public class CloudFormationService implements ResourceProvider {
                             inProgressStatus,
                             null);
                     attemptedResourceIds.add(logicalId);
+                    CfnResourceSignals.Pending signals;
+                    try {
+                        JsonNode creationPolicy = resDef.has("CreationPolicy")
+                                ? engine.resolveNode(resDef.get("CreationPolicy")) : null;
+                        signals = resourceSignals.begin(stack.getStackId(), logicalId, type, creationPolicy,
+                                creationPolicy == null ? null : engine.resolveNode(props));
+                    } catch (AwsException invalidPolicy) {
+                        resource.setStatus(creating ? "CREATE_FAILED" : "UPDATE_FAILED");
+                        resource.setStatusReason(invalidPolicy.getMessage());
+                        addEvent(stack, logicalId, resource.getPhysicalId(), type,
+                                resource.getStatus(), resource.getStatusReason());
+                        failedResource = resource;
+                        break;
+                    }
                     if ("AWS::CloudFormation::Stack".equals(type)) {
                         resource = executeNestedStack(stack, logicalId,
                                 props.isMissingNode() ? null : props,
@@ -2134,8 +2162,13 @@ public class CloudFormationService implements ResourceProvider {
                         resource = dispatcher.provision(logicalId, type, props.isMissingNode() ? null : props,
                                 engine, region, accountId, stack.getStackName(),
                                 resource.getPhysicalId(), resource.getAttributes(),
-                                event -> addEvent(stack, logicalId, event.getPhysicalResourceId(), type,
-                                        event.getResourceStatus(), event.getResourceStatusReason()),
+                                event -> {
+                                    if (signals == null || !"CREATE_COMPLETE".equals(event.getResourceStatus())
+                                            && !"UPDATE_COMPLETE".equals(event.getResourceStatus())) {
+                                        addEvent(stack, logicalId, event.getPhysicalResourceId(), type,
+                                                event.getResourceStatus(), event.getResourceStatusReason());
+                                    }
+                                },
                                 priorProps);
                     }
                     resource.setUpdateReplacePolicy(
@@ -2155,6 +2188,24 @@ public class CloudFormationService implements ResourceProvider {
                                 physicalIds);
                     }
                     stack.getResources().put(logicalId, resource);
+
+                    boolean creationSignalFailed = false;
+                    if (signals != null && ("CREATE_COMPLETE".equals(resource.getStatus())
+                            || "UPDATE_COMPLETE".equals(resource.getStatus()))
+                            && (creating || !Objects.equals(priorId, resource.getPhysicalId())
+                            || dispatcher.hasReplacementUpdate(resource))) {
+                        resource.setStatus(inProgressStatus);
+                        persistStack(stack);
+                        String failure = signals.await();
+                        String operation = creating ? "CREATE" : "UPDATE";
+                        resource.setStatus(operation + (failure == null ? "_COMPLETE" : "_FAILED"));
+                        resource.setStatusReason(failure);
+                        creationSignalFailed = failure != null;
+                        if (creationSignalFailed && creating) {
+                            resource.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
+                        }
+                    }
+                    resourceSignals.finish(stack.getStackId(), logicalId, signals);
 
                     physicalIds.put(logicalId, resource.getPhysicalId());
                     resourceAttrs.put(logicalId, resource.getAttributes());
@@ -2211,6 +2262,7 @@ public class CloudFormationService implements ResourceProvider {
                         // A provisioner that keeps the failed attempt's identity and tracking for
                         // its own rollback is not restored here; the rollback walker owns it.
                         if (!isCreate && previousResource != null
+                                && !creationSignalFailed
                                 && !dispatcher.retainsFailedUpdateState(resource)) {
                             // Provisioners work on a copy of the stored resource metadata. Keep the
                             // last known-good identity and status when an update attempt fails so a
@@ -2386,6 +2438,8 @@ public class CloudFormationService implements ResourceProvider {
                 rollbackFailedUpdate(
                         stack, region, previousState, attemptedResourceIds, e.getMessage());
             }
+        } finally {
+            resourceSignals.finishStack(stack.getStackId());
         }
     }
 

@@ -315,7 +315,7 @@ class AutoScalingGroupCfnProvisionerTest {
 
         ArgumentCaptor<AsgOptionalFields> captor = ArgumentCaptor.forClass(AsgOptionalFields.class);
         verify(autoScaling).updateAutoScalingGroup(eq(REGION), eq("my-asg"), any(), any(), any(), any(),
-                any(), eq(2), eq(6), anyInt(), anyInt(), anyList(), anyList(), any(), anyInt(), anyList(),
+                any(), eq(2), eq(6), isNull(), anyInt(), anyList(), anyList(), any(), anyInt(), anyList(),
                 captor.capture());
         assertEquals("units", captor.getValue().desiredCapacityType());
         verify(autoScaling, never()).createAutoScalingGroup(anyString(), anyString(), any(), any(), any(),

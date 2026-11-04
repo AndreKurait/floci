@@ -269,7 +269,8 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
         MixedInstancesPolicy mixedInstancesPolicy = resolveMixedInstancesPolicy(props, engine);
         int minSize = parseIntProp(props, "MinSize", ctx, 0);
         int maxSize = parseIntProp(props, "MaxSize", ctx, 0);
-        int desiredCapacity = parseIntProp(props, "DesiredCapacity", ctx, 0);
+        Integer desiredCapacity = props != null && props.has("DesiredCapacity")
+                ? parseIntProp(props, "DesiredCapacity", ctx, 0) : null;
         int cooldown = parseIntProp(props, "Cooldown", ctx, 0);
         List<String> availabilityZones = ctx.resolveStringList(props, "AvailabilityZones");
         List<String> subnetIds = ctx.resolveStringList(props, "VPCZoneIdentifier");
@@ -334,7 +335,7 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
             asg = autoScalingService.createAutoScalingGroup(region, name,
                     blankToNull(launchConfigName),
                     blankToNull(launchTemplateId), blankToNull(launchTemplateName), blankToNull(launchTemplateVersion),
-                    mixedInstancesPolicy, minSize, maxSize, desiredCapacity, cooldown,
+                    mixedInstancesPolicy, minSize, maxSize, desiredCapacity != null ? desiredCapacity : minSize, cooldown,
                     availabilityZones, subnetIds,
                     ctx.resolveStringList(props, "TargetGroupARNs"),
                     ctx.resolveStringList(props, "LoadBalancerNames"),
