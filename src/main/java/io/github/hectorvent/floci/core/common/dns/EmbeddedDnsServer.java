@@ -170,18 +170,8 @@ public class EmbeddedDnsServer {
                 }
             }
 
-            DatagramSocket socket = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
-            socket.listen(DNS_PORT, "0.0.0.0", ar -> {
-                if (ar.succeeded()) {
-                    serverIp = myIp;
-                    LOG.infov("Embedded DNS server started on {0}:53, resolving {1} → {0}", myIp, suffixes);
-                    socket.handler(packet -> handleQuery(
-                            vertx, socket, packet.data().getBytes(),
-                            packet.sender().host(), packet.sender().port(), myIp));
-                } else {
-                    LOG.warnv("Embedded DNS server failed to bind on port 53: {0}", ar.cause().getMessage());
-                }
-            });
+            listen(vertx, myIp, DNS_PORT).onFailure(error ->
+                    LOG.warnv("Embedded DNS server failed to bind on {0}:53: {1}", myIp, error.getMessage()));
         } catch (Exception e) {
             LOG.warnv("Failed to initialize embedded DNS server: {0}", e.getMessage());
         }
@@ -189,6 +179,19 @@ public class EmbeddedDnsServer {
 
     public Optional<String> getServerIp() {
         return Optional.ofNullable(serverIp);
+    }
+
+    Future<DatagramSocket> listen(Vertx vertx, String address, int port) {
+        DatagramSocket socket = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
+        // Binding the advertised address keeps replies on the address the client queried,
+        // including when the route back to that client uses a different local interface.
+        return socket.listen(port, address).onSuccess(bound -> {
+            bound.handler(packet -> handleQuery(vertx, bound, packet.data().getBytes(),
+                    packet.sender().host(), packet.sender().port(), address));
+            serverIp = address;
+            LOG.infov("Embedded DNS server started on {0}:{1}, resolving {2} to {0}",
+                    address, bound.localAddress().port(), suffixes);
+        }).onFailure(error -> socket.close());
     }
 
     static String resolveServerIp(EmulatorConfig config, CurrentContainerNetworkResolver networkResolver)
