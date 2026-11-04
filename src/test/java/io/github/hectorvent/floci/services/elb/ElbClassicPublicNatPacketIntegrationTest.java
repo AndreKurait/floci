@@ -20,6 +20,10 @@ import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.IpPermission;
 import software.amazon.awssdk.services.ec2.model.NatGateway;
 import software.amazon.awssdk.services.elasticloadbalancing.model.Listener;
+import software.amazon.awssdk.services.route53.Route53Client;
+import software.amazon.awssdk.services.route53.model.AliasTarget;
+import software.amazon.awssdk.services.route53.model.ChangeAction;
+import software.amazon.awssdk.services.route53.model.ResourceRecordSet;
 
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
@@ -27,8 +31,11 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -56,6 +63,7 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
     @Test
     void nativeRoutesAndFrontendRulesControlTheActualNatSourceAddress() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String frontendHost = "nat-app-" + suffix + ".example.test";
         Ec2Client callerAccount = Ec2Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                 .httpClientBuilder(UrlConnectionHttpClient.builder()).credentialsProvider(
                         StaticCredentialsProvider.create(AwsBasicCredentials.create("111111111111", "test"))).build();
@@ -99,7 +107,7 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
                         """.getBytes(StandardCharsets.UTF_8)));
         String backendGuest = localInstance(backend).getDockerContainerId();
         CertificateGenerator.GeneratedCertificate certificate = new CertificateGenerator().generateSelfSignedCertificate(
-                "nat-app.example.test", List.of(), KeyAlgorithm.EC_prime256v1);
+                frontendHost, List.of(), KeyAlgorithm.EC_prime256v1);
         String certificateName = "classic-nat-" + suffix;
         String arn = iam.uploadServerCertificate(request -> request.serverCertificateName(certificateName)
                 .certificateBody(certificate.certificatePem()).privateKey(certificate.privateKeyPem()))
@@ -119,43 +127,74 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
                 .instances(instance -> instance.instanceId(backend)));
         await().atMost(Duration.ofSeconds(30)).until(() -> healthy(name, backend));
         String address = dns.resolveIpv4(hostname).orElseThrow().addresses().getFirst();
+        Route53Client route53 = Route53Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .httpClientBuilder(UrlConnectionHttpClient.builder()).credentialsProvider(
+                        StaticCredentialsProvider.create(AwsBasicCredentials.create("222222222222", "test"))).build();
+        cleanup.addFirst(route53::close);
+        String zone = route53.createHostedZone(request -> request.name(frontendHost).callerReference(suffix))
+                .hostedZone().id();
+        cleanup.addFirst(() -> route53.deleteHostedZone(request -> request.id(zone)));
+        String targetZone = elb.describeLoadBalancers(request -> request.loadBalancerNames(name))
+                .loadBalancerDescriptions().getFirst().canonicalHostedZoneNameID();
+        ResourceRecordSet alias = ResourceRecordSet.builder().name(frontendHost).type("A")
+                .aliasTarget(AliasTarget.builder().dnsName(hostname).hostedZoneId(targetZone)
+                        .evaluateTargetHealth(false).build()).build();
+        changeAlias(route53, zone, ChangeAction.CREATE, alias);
+        cleanup.addFirst(() -> {
+            for (ResourceRecordSet current : route53.listResourceRecordSets(request -> request.hostedZoneId(zone))
+                    .resourceRecordSets()) {
+                if ("A".equals(current.typeAsString())) {
+                    changeAlias(route53, zone, ChangeAction.DELETE, current);
+                }
+            }
+        });
+        assertAlias(callerHelper, frontendHost, Set.of(address));
+        changeAlias(route53, zone, ChangeAction.UPSERT, alias.toBuilder().aliasTarget(alias.aliasTarget().toBuilder()
+                .hostedZoneId("ZWRONGTARGET").build()).build());
+        assertNotEquals(0, exec(callerHelper, "getent", "ahostsv4", frontendHost).exitCode());
+        changeAlias(route53, zone, ChangeAction.UPSERT, alias);
+        assertAlias(callerHelper, frontendHost, Set.of(address));
         String frontendPrivate = ec2.describeNetworkInterfaces(request -> request.filters(filter ->
                 filter.name("description").values("Classic ELB " + name)))
                 .networkInterfaces().getFirst().privateIpAddress();
         assertNotEquals(frontendPrivate, address);
 
-        assertBlocked(callerHelper, address, backendGuest, 0, "The frontend sees the NAT EIP, not the caller private IP");
+        assertBlocked(callerHelper, frontendHost, backendGuest, 0, "The frontend sees the NAT EIP, not the caller private IP");
         IpPermission publicCaller = fromAddress(443, publicIp);
         ec2.authorizeSecurityGroupIngress(request -> request.groupId(backendGroup).ipPermissions(publicCaller));
-        assertBlocked(callerHelper, address, backendGuest, 0, "Backend ingress cannot grant frontend access");
+        assertBlocked(callerHelper, frontendHost, backendGuest, 0, "Backend ingress cannot grant frontend access");
         assertTrue(healthy(name, backend), "Frontend denial must leave the backend and health checks healthy");
         ec2.authorizeSecurityGroupIngress(request -> request.groupId(frontendGroup).ipPermissions(publicCaller));
-        assertResponse(callerHelper, address, frontendPrivate, publicIp, 1);
+        assertResponse(callerHelper, frontendHost, frontendPrivate, publicIp, 1);
 
         callerAccount.deleteRoute(request -> request.routeTableId(callerRoutes).destinationCidrBlock("0.0.0.0/0"));
-        assertBlocked(callerHelper, address, backendGuest, 1, "A private subnet needs its NAT route");
+        assertBlocked(callerHelper, frontendHost, backendGuest, 1, "A private subnet needs its NAT route");
         callerAccount.createRoute(request -> request.routeTableId(callerRoutes).destinationCidrBlock("0.0.0.0/0")
                 .natGatewayId(nat.natGatewayId()));
-        assertResponse(callerHelper, address, frontendPrivate, publicIp, 2);
+        assertResponse(callerHelper, frontendHost, frontendPrivate, publicIp, 2);
         callerAccount.deleteRoute(request -> request.routeTableId(callerVpc.publicRoutes())
                 .destinationCidrBlock("0.0.0.0/0"));
-        assertBlocked(callerHelper, address, backendGuest, 2, "A public NAT subnet needs its internet gateway route");
+        assertBlocked(callerHelper, frontendHost, backendGuest, 2, "A public NAT subnet needs its internet gateway route");
         internetRoute(callerAccount, callerVpc);
-        assertResponse(callerHelper, address, frontendPrivate, publicIp, 3);
+        assertResponse(callerHelper, frontendHost, frontendPrivate, publicIp, 3);
         ec2.deleteRoute(request -> request.routeTableId(serverVpc.publicRoutes()).destinationCidrBlock("0.0.0.0/0"));
-        assertBlocked(callerHelper, address, backendGuest, 3, "A public frontend needs its internet gateway route");
+        assertBlocked(callerHelper, frontendHost, backendGuest, 3, "A public frontend needs its internet gateway route");
         internetRoute(ec2, serverVpc);
-        assertResponse(callerHelper, address, frontendPrivate, publicIp, 4);
+        assertResponse(callerHelper, frontendHost, frontendPrivate, publicIp, 4);
 
         NatGateway replacement = nat(callerAccount, callerVpc.publicSubnet());
         String replacementIp = replacement.natGatewayAddresses().getFirst().publicIp();
         assertNotEquals(publicIp, replacementIp);
         callerAccount.replaceRoute(request -> request.routeTableId(callerRoutes).destinationCidrBlock("0.0.0.0/0")
                 .natGatewayId(replacement.natGatewayId()));
-        assertBlocked(callerHelper, address, backendGuest, 4, "A replaced NAT EIP needs a matching frontend rule");
+        assertBlocked(callerHelper, frontendHost, backendGuest, 4, "A replaced NAT EIP needs a matching frontend rule");
         ec2.authorizeSecurityGroupIngress(request -> request.groupId(frontendGroup)
                 .ipPermissions(fromAddress(443, replacementIp)));
-        assertResponse(callerHelper, address, frontendPrivate, replacementIp, 5);
+        assertResponse(callerHelper, frontendHost, frontendPrivate, replacementIp, 5);
+        changeAlias(route53, zone, ChangeAction.UPSERT, alias.toBuilder().aliasTarget(alias.aliasTarget().toBuilder()
+                .dnsName("DUALSTACK." + hostname.toUpperCase(Locale.ROOT) + ".").build()).build());
+        assertAlias(callerHelper, frontendHost, Set.of(address));
+        changeAlias(route53, zone, ChangeAction.UPSERT, alias);
 
         assertNotEquals(0, exec(callerHelper, "curl", "--silent", "--show-error", "--max-time", "2",
                 "http://10.86.1.10:8080/cgi-bin/request").exitCode(),
@@ -182,7 +221,7 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
         assertTrue(docker.inspectContainerCmd(natHelper).exec().getState().getRunning());
         removeContainer(consumer);
         callerAccount.deleteNatGateway(request -> request.natGatewayId(replacement.natGatewayId()));
-        assertBlocked(callerHelper, address, backendGuest, 5, "Deleting a NAT gateway must stop new connections");
+        assertBlocked(callerHelper, frontendHost, backendGuest, 5, "Deleting a NAT gateway must stop new connections");
         assertEquals("blackhole", callerAccount.describeRouteTables(request -> request.routeTableIds(callerRoutes))
                 .routeTables().getFirst().routes().stream().filter(route ->
                         "0.0.0.0/0".equals(route.destinationCidrBlock())).findFirst().orElseThrow().stateAsString());
@@ -191,6 +230,9 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
         assertNull(callerAccount.describeAddresses(request -> request.allocationIds(
                 nat.natGatewayAddresses().getFirst().allocationId())).addresses().getFirst().associationId(),
                 "Deleting a NAT whose worker has stopped must release its native EIP reservation");
+        elb.deleteLoadBalancer(request -> request.loadBalancerName(name));
+        assertNotEquals(0, exec(callerHelper, "getent", "ahostsv4", frontendHost).exitCode(),
+                "An alias cannot retain a retired frontend address");
         cleanup.addLast(() -> assertTrue(docker.listContainersCmd().withShowAll(true).withLabelFilter(Map.of(
                 ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config),
                 ContainerStorageHelper.SERVICE_LABEL, "vpc-nat")).exec().isEmpty()));
@@ -262,10 +304,20 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
                 .ipRanges(range -> range.cidrIp(address + "/32")).build();
     }
 
-    private ContainerExec.Result request(String helper, String address) {
+    private ContainerExec.Result request(String helper, String hostname) {
         return exec(helper, "curl", "--silent", "--show-error", "--fail", "--max-time", "2",
-                "--cacert", "/tmp/frontend-ca.pem", "--resolve", "nat-app.example.test:443:" + address,
-                "https://nat-app.example.test/cgi-bin/request");
+                "--cacert", "/tmp/frontend-ca.pem", "https://" + hostname + "/cgi-bin/request");
+    }
+
+    private void assertAlias(String helper, String hostname, Set<String> expected) {
+        ContainerExec.Result result = exec(helper, "getent", "ahostsv4", hostname);
+        assertEquals(0, result.exitCode(), result.summary());
+        assertEquals(expected, result.stdout().lines().map(line -> line.split("\\s+")[0]).collect(Collectors.toSet()));
+    }
+
+    private static void changeAlias(Route53Client route53, String zone, ChangeAction action, ResourceRecordSet alias) {
+        route53.changeResourceRecordSets(request -> request.hostedZoneId(zone).changeBatch(batch ->
+                batch.changes(change -> change.action(action).resourceRecordSet(alias))));
     }
 
     private void assertBlocked(String helper, String address, String backend, int count, String reason) {
