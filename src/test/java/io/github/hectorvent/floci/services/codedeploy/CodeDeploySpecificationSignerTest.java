@@ -4,9 +4,12 @@ import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.cms.CMSSignedData;
 import org.bouncycastle.cms.SignerInformation;
 import org.bouncycastle.cms.jcajce.JcaSimpleSignerInfoVerifierBuilder;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
 import org.bouncycastle.util.io.pem.PemReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -37,6 +40,18 @@ class CodeDeploySpecificationSignerTest {
                 .generateSelfSignedCertificate("floci.test", List.of(), KeyAlgorithm.EC_prime256v1);
         CertificateGenerator.Issuer issuer = new CertificateGenerator.Issuer(
                 Pem.parseCertificate(generated.certificatePem()), Pem.parsePrivateKey(generated.privateKeyPem()));
+        verify(new CodeDeploySpecificationSigner(issuer), issuer.certificate());
+    }
+
+    @Test
+    void aProviderSpecificEllipticCurveKeyProducesAVerifiableSignature() throws Exception {
+        CertificateGenerator.GeneratedCertificate generated = new CertificateGenerator()
+                .generateSelfSignedCertificate("floci.test", List.of(), KeyAlgorithm.EC_prime256v1);
+        CertificateGenerator.Issuer issuer = new CertificateGenerator.Issuer(
+                Pem.parseCertificate(generated.certificatePem()), new JcaPEMKeyConverter()
+                        .setProvider(new BouncyCastleProvider()).getPrivateKey(PrivateKeyInfo.getInstance(
+                                Pem.parsePrivateKey(generated.privateKeyPem()).getEncoded())));
+        assertEquals("ECDSA", issuer.key().getAlgorithm());
         verify(new CodeDeploySpecificationSigner(issuer), issuer.certificate());
     }
 

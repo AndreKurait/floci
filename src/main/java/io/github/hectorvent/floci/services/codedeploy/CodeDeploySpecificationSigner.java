@@ -12,6 +12,10 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
 
 import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.interfaces.ECKey;
+import java.security.spec.PKCS8EncodedKeySpec;
 import java.util.Base64;
 import java.util.List;
 
@@ -32,15 +36,20 @@ public class CodeDeploySpecificationSigner {
 
     public String sign(String specification) {
         try {
-            String algorithm = switch (issuer.key().getAlgorithm()) {
+            PrivateKey signingKey = issuer.key();
+            boolean ecKey = signingKey instanceof ECKey;
+            if (ecKey && !"EC".equals(signingKey.getAlgorithm())) {
+                signingKey = KeyFactory.getInstance("EC")
+                        .generatePrivate(new PKCS8EncodedKeySpec(signingKey.getEncoded()));
+            }
+            String algorithm = ecKey ? "SHA256withECDSA" : switch (signingKey.getAlgorithm()) {
                 case "RSA" -> "SHA256withRSA";
-                case "EC" -> "SHA256withECDSA";
                 default -> throw new IllegalStateException("Unsupported CodeDeploy signing key algorithm");
             };
             CMSSignedDataGenerator generator = new CMSSignedDataGenerator();
             generator.addSignerInfoGenerator(new JcaSignerInfoGeneratorBuilder(
                     new JcaDigestCalculatorProviderBuilder().build()).build(
-                    new JcaContentSignerBuilder(algorithm).build(issuer.key()),
+                    new JcaContentSignerBuilder(algorithm).build(signingKey),
                     issuer.certificate()));
             generator.addCertificates(new JcaCertStore(List.of(issuer.certificate())));
             byte[] signed = generator.generate(new CMSProcessableByteArray(
