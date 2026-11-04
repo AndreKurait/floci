@@ -160,6 +160,12 @@ described below.
 Standby transitions complete asynchronously through the reconciler. Entering standby
 preserves the EC2 instance and its group tags. See the lifecycle and capacity rules below.
 
+`CreateAutoScalingGroup` defaults an omitted tag `PropagateAtLaunch` to `true`;
+an explicit `false` keeps that tag on the group. `CreateOrUpdateTags` requires the
+flag on every tag, including existing tags. If any flag is omitted, the request
+returns `ValidationError` before changing any tags in that batch. `DeleteTags`
+allows the flag to be omitted.
+
 Member instances carry the tags the
 [EC2 instance tagging lifecycle](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-tagging.html#tag-lifecycle)
 describes. An instance the group launches gets its launch template's instance tags, then the

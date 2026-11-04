@@ -47,6 +47,8 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
     // standalone SecurityGroupIngress/Egress resource owns.
     static final String INGRESS_RULES_ATTR = "__FlociSgIngressRules";
     static final String EGRESS_RULES_ATTR = "__FlociSgEgressRules";
+    /** The tag keys the last deployment wrote, as {@link Ec2Tags#recordKeys} records them. */
+    static final String TAG_KEYS_ATTR = "__FlociSgTagKeys";
 
     private final Ec2Service ec2Service;
 
@@ -112,7 +114,9 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
                     EGRESS_RULES_ATTR,
                     perms -> ec2Service.authorizeSecurityGroupEgress(region, sg.getGroupId(), perms),
                     perms -> ec2Service.revokeSecurityGroupEgress(region, sg.getGroupId(), perms));
-            Ec2Tags.reconcile(ec2Service, region, sg.getGroupId(), desiredTags);
+            Set<String> ownedTags = reconciled != null ? Ec2Tags.ownedKeys(r, TAG_KEYS_ATTR, ctx) : Set.of();
+            Ec2Tags.reconcileOwned(ec2Service, region, sg.getGroupId(), ownedTags, desiredTags);
+            Ec2Tags.recordKeys(r, TAG_KEYS_ATTR, desiredTags);
         };
         if (reconciled == null) {
             CfnRollback.guarded(r, ctx, true, () -> delete(SECURITY_GROUP, sg.getGroupId(), region),
@@ -212,11 +216,6 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
         return new LinkedHashSet<>(Arrays.asList(stored.split("\n", -1)));
     }
 
-    /**
-     * Reconciles the group's tags to the template on create and update: adds or overwrites the
-     * declared tags and removes any the template dropped. AWS treats SecurityGroup Tags as an
-     * in-place (no interruption) update.
-     */
     /**
      * Resolves a peer group's name to its id, the same lookup {@code Ec2Service} performs when it
      * stores an authorized rule. Group names are unique per VPC rather than per region, so the

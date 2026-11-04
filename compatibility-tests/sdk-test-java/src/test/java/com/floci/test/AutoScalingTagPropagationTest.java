@@ -1,8 +1,7 @@
 package com.floci.test;
 
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
 import software.amazon.awssdk.services.autoscaling.model.Instance;
 import software.amazon.awssdk.services.autoscaling.model.Tag;
@@ -19,13 +18,12 @@ import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Verifies Floci's inferred default for an omitted flag, not a live AWS comparison. */
 @DisplayName("Auto Scaling omitted tag propagation")
 class AutoScalingTagPropagationTest {
 
-    @ParameterizedTest(name = "omitted flags propagate on launch and attach, update={0}")
-    @ValueSource(booleans = {false, true})
-    void omittedFlagsPropagateOnLaunchAndAttach(boolean update) throws InterruptedException {
+    @Test
+    @DisplayName("Group creation defaults omitted flags to true on launch and attach")
+    void omittedFlagsPropagateOnLaunchAndAttach() throws InterruptedException {
         String name = TestFixtures.uniqueName("tag-propagation");
         String zone = TestFixtures.availabilityZone();
         List<Tag> tags = List.of(
@@ -48,18 +46,10 @@ class AutoScalingTagPropagationTest {
                                 .tags(tag -> tag.key("Owner").value("standalone"))))
                         .instances().get(0).instanceId();
                 standalone = attachedId;
-                List<Tag> initialTags = update
-                        ? List.of(Tag.builder().key("stack").value("old").propagateAtLaunch(false).build())
-                        : tags;
                 autoScaling.createAutoScalingGroup(request -> request.autoScalingGroupName(name)
                         .launchConfigurationName(name).minSize(0).maxSize(2).desiredCapacity(0)
-                        .availabilityZones(zone).tags(initialTags));
+                        .availabilityZones(zone).tags(tags));
                 groupCreated = true;
-                if (update) {
-                    autoScaling.createOrUpdateTags(request -> request.tags(tags.stream()
-                            .map(tag -> tag.toBuilder().resourceId(name).resourceType("auto-scaling-group").build())
-                            .toList()));
-                }
                 autoScaling.setDesiredCapacity(request -> request.autoScalingGroupName(name).desiredCapacity(1));
                 AtomicReference<String> launched = new AtomicReference<>();
                 TestFixtures.await(() -> {
@@ -85,6 +75,9 @@ class AutoScalingTagPropagationTest {
 
                 assertThat(userTags(ec2, attachedId)).containsExactlyInAnyOrderEntriesOf(
                         Map.of("Owner", "standalone"));
+                // Keep scale-in from racing the attachment tag assertions.
+                autoScaling.suspendProcesses(request -> request.autoScalingGroupName(name)
+                        .scalingProcesses("Terminate"));
                 autoScaling.attachInstances(request -> request.autoScalingGroupName(name).instanceIds(attachedId));
                 assertThat(userTags(ec2, attachedId)).containsExactlyInAnyOrderEntriesOf(
                         Map.of("Owner", "standalone", "es", name, "stack", "test"));

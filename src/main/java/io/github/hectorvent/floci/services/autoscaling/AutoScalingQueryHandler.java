@@ -517,7 +517,14 @@ public class AutoScalingQueryHandler {
     }
 
     private Response handleCreateOrUpdateTags(MultivaluedMap<String, String> p, String region) {
-        for (TagRequest tag : parseTagRequests(p)) {
+        List<TagRequest> tags = parseTagRequests(p);
+        for (int i = 0; i < tags.size(); i++) {
+            if (tags.get(i).propagateAtLaunch() == null) {
+                throw new AwsException("ValidationError",
+                        "Tags.member." + (i + 1) + ".PropagateAtLaunch is required", 400);
+            }
+        }
+        for (TagRequest tag : tags) {
             service.createOrUpdateTags(
                     region,
                     tag.resourceId(),
@@ -1749,7 +1756,8 @@ public class AutoScalingQueryHandler {
             if (key == null) { break; }
             String value = p.getFirst("Tags.member." + i + ".Value");
             tags.put(key, value != null ? value : "");
-            propagateAtLaunch.put(key, tagPropagateAtLaunch(p, i));
+            String flag = p.getFirst("Tags.member." + i + ".PropagateAtLaunch");
+            propagateAtLaunch.put(key, flag == null || Boolean.parseBoolean(flag));
         }
         return new ParsedTags(tags, propagateAtLaunch);
     }
@@ -1762,18 +1770,14 @@ public class AutoScalingQueryHandler {
             String resourceId = p.getFirst("Tags.member." + i + ".ResourceId");
             String resourceType = p.getFirst("Tags.member." + i + ".ResourceType");
             String value = p.getFirst("Tags.member." + i + ".Value");
-            boolean propagateAtLaunch = tagPropagateAtLaunch(p, i);
+            String flag = p.getFirst("Tags.member." + i + ".PropagateAtLaunch");
+            Boolean propagateAtLaunch = flag == null ? null : Boolean.parseBoolean(flag);
             result.add(new TagRequest(resourceId, resourceType, key, value != null ? value : "", propagateAtLaunch));
         }
         return result;
     }
 
-    private static boolean tagPropagateAtLaunch(MultivaluedMap<String, String> params, int index) {
-        String propagate = params.getFirst("Tags.member." + index + ".PropagateAtLaunch");
-        return propagate == null || Boolean.parseBoolean(propagate);
-    }
-
-    private record TagRequest(String resourceId, String resourceType, String key, String value, boolean propagateAtLaunch) {}
+    private record TagRequest(String resourceId, String resourceType, String key, String value, Boolean propagateAtLaunch) {}
 
     private record ParsedTags(Map<String, String> tags, Map<String, Boolean> propagateAtLaunch) {}
 
