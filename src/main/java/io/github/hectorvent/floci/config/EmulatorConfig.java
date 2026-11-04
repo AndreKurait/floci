@@ -184,6 +184,15 @@ public interface EmulatorConfig {
 
     interface DnsConfig {
         /**
+         * A local IPv4 address to bind and advertise for UDP/TCP DNS on port 53.
+         * Enables the resolver for a host process as well as a container. When unset,
+         * DNS starts automatically only inside a container, on its selected network.
+         * Workload containers must be able to reach this address.
+         * Env: {@code FLOCI_DNS_LISTEN_ADDRESS}.
+         */
+        Optional<String> listenAddress();
+
+        /**
          * Additional hostname suffixes the embedded DNS server will resolve to Floci's
          * container IP, alongside the primary {@code floci.hostname}.
          *
