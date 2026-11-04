@@ -117,6 +117,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmCfnPro
 import io.github.hectorvent.floci.services.cloudformation.provisioners.StepFunctionsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.TransferCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.WafV2CfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.WaitConditionHandleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontService;
 import io.github.hectorvent.floci.services.cloudmap.CloudMapService;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
@@ -160,6 +161,7 @@ import io.github.hectorvent.floci.services.rds.RdsService;
 import io.github.hectorvent.floci.services.redshift.RedshiftService;
 import io.github.hectorvent.floci.services.redshiftserverless.RedshiftServerlessService;
 import io.github.hectorvent.floci.services.route53.Route53Service;
+import io.github.hectorvent.floci.services.s3.PreSignedUrlGenerator;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3vectors.S3VectorsService;
 import io.github.hectorvent.floci.services.scheduler.SchedulerService;
@@ -206,6 +208,7 @@ final class CfnProvisionerFixture {
     static final class Builder {
 
         private S3Service s3Service;
+        private PreSignedUrlGenerator presigner;
         private S3VectorsService s3VectorsService;
         private SnsService snsService;
         private SesService sesService;
@@ -332,6 +335,9 @@ final class CfnProvisionerFixture {
             }
             if (s3Service != null) {
                 discovered.add(new S3CfnProvisioner(s3Service));
+            }
+            if (s3Service != null && presigner != null && reachableEndpoint != null) {
+                discovered.add(new WaitConditionHandleCfnProvisioner(s3Service, presigner, reachableEndpoint));
             }
             if (snsService != null) {
                 discovered.add(new SnsCfnProvisioner(snsService));
@@ -550,6 +556,11 @@ final class CfnProvisionerFixture {
 
         public Builder s3(S3Service v) {
             this.s3Service = v;
+            return this;
+        }
+
+        public Builder presignedUrls(PreSignedUrlGenerator v) {
+            this.presigner = v;
             return this;
         }
 

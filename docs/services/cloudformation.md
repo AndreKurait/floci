@@ -271,7 +271,7 @@ cross-resource references.
 | WAFv2 | `IPSet`, `LoggingConfiguration`, `WebACL`, `WebACLAssociation` |
 | Config | `ConfigRule` |
 | Bedrock AgentCore | `Runtime` (Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored), `RuntimeEndpoint` (Ref returns the endpoint ARN; Tags are accepted and not stored), `Memory` (Ref returns the memory ARN; MemoryStrategies, IndexedKeys, NamespaceKeys and StreamDeliveryResources are accepted and not stored) |
-| CloudFormation | `CustomResource`, `Custom::DynamoDBReplica` (applied natively against DynamoDB, not via a provider Lambda), `Stack` (nested stacks), `Custom::*` (Lambda-backed) |
+| CloudFormation | `CustomResource`, `WaitConditionHandle`, `Custom::DynamoDBReplica` (applied natively against DynamoDB, not via a provider Lambda), `Stack` (nested stacks), `Custom::*` (Lambda-backed) |
 | CloudTrail | `Trail` |
 | CDK | `CDK::Metadata` (accepted; no-op) |
 <!-- floci:cfn-types:end -->
@@ -938,6 +938,22 @@ Floci keeps no notification ARNs. `Fn::ImportValue` is not allowed in a conditio
 use Fn::ImportValue in Conditions.` A SAM template's change set fails with that reason instead, and
 so does the stack when CreateStack or UpdateStack executes it; an `AWS::Include` template fails when
 it is executed.
+
+## Wait condition handles
+
+`AWS::CloudFormation::WaitConditionHandle` takes no properties. `Ref` and `Fn::GetAtt Id`
+return the same presigned S3 PUT URL. Scripts can send JSON signals without separate AWS
+credentials. Floci uses its S3 SigV4 validation and scopes the URL to that handle's object.
+The URL expires after seven days.
+
+Each handle has versioned, account-scoped service storage that does not appear in
+`ListBuckets`. Unchanged handles keep their URL and signals across stack updates.
+Deleting a handle removes its signal versions and backing bucket; unrelated objects
+cause deletion to fail, and a bucket recreated by a customer is preserved.
+
+Creating a handle does not wait for signals. The separate
+`AWS::CloudFormation::WaitCondition` resource remains unsupported, so a template using it
+fails when unsupported-resource stubbing is disabled.
 
 ## Custom Resources and the CDK Provider Framework
 
