@@ -286,6 +286,12 @@ public final class CfnRollback {
      */
     public static final String SQS_UPDATE_SNAPSHOT_ATTR = "__FlociSqsUpdateSnapshot";
 
+    /** Prior CodeDeploy configuration and tags, retained until an in-place update commits or restores. */
+    public static final String CODEDEPLOY_UPDATE_SNAPSHOT_ATTR = "__FlociCodeDeployUpdateSnapshot";
+
+    /** Application identities for live and displaced CodeDeploy group names awaiting cleanup. */
+    public static final String CODEDEPLOY_GROUP_APPLICATIONS_ATTR = "__FlociCodeDeployGroupApplications";
+
     /**
      * Holds the value, settings and managed tags an SSM parameter carried before an in-place
      * update changed them, with the resource's attributes from before, so a failed stack update
