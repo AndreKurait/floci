@@ -3849,6 +3849,13 @@ public interface EmulatorConfig {
         /** Optional local probe interval ceiling; zero preserves each target group's interval. */
         @WithDefault("0")
         long maxHealthCheckIntervalMillis();
+
+        /**
+         * Accounts (12-digit ids) whose Application Load Balancers may be in a single Availability
+         * Zone, for local setups that model single-zone deployments. AWS refuses an ALB in fewer than
+         * two zones. Unset (the default) keeps the two-zone rule for every account.
+         */
+        Optional<List<String>> singleZoneAlbAccounts();
     }
 
     interface EksServiceConfig {
