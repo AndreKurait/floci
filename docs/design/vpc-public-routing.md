@@ -1,9 +1,9 @@
 # VPC public routing milestone
 
-Status: AWS SDK lifecycle and protected EC2 packet regressions qualified on
+Status: AWS SDK lifecycle and protected EC2 and Lambda packet regressions qualified on
 Linux amd64. Full native application qualification remains incomplete.
 
-The first public routing slice connects protected IPv4 workloads to managed
+The first public routing slice connects protected IPv4 workloads in nonoverlapping VPCs to managed
 internet-facing Classic load balancers through a public NAT gateway. AWS EC2
 route tables, NAT gateways, Elastic IPs and internet-gateway attachments supply
 the topology. Security groups continue to supply admission independently.
@@ -54,12 +54,21 @@ application delay. The test also checks namespace consumers and stopped-worker
 retirement. Focused route, address, interface and teardown regressions verify
 failure reporting and ownership.
 
+`ElbClassicLambdaNatPacketIntegrationTest` repeats the EC2 cases and runs a
+pinned stock Node.js 20 Lambda runtime. It verifies the function's private ENI
+address, observed NAT EIP, blocked frontend ingress, recovery and route removal
+while the Runtime API remains reachable. Function deletion releases its ENI.
+The fixture's two-second HTTP client deadline bounds connection failures; the
+backend does not inject delays. This case passes a resolved frontend address to
+the function, so it does not qualify application DNS resolution.
+
 This milestone does not implement arbitrary internet forwarding, VPC endpoints,
 peering, transit gateways, IPv6/NAT64, regional or multi-address NAT gateways,
-network ACLs, public EC2 addresses, or Application Load Balancer frontends.
+network ACLs, overlapping VPC address spaces, public EC2 addresses, multiple
+frontend subnets, or Application Load Balancer frontends.
 Platform DNS and service-owned Runtime API connections retain their existing
-narrow exemptions. Protected Lambda callers, public AWS API routing and a
-complete application workflow need separate qualification before this is a
+narrow exemptions. Public AWS API routing and a complete application workflow
+need separate qualification before this is a
 general VPC runtime. Persisted restart recovery and Docker Desktop also need
 separate qualification.
 

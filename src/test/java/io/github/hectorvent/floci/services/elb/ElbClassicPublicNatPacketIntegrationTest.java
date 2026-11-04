@@ -206,7 +206,7 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
                 ContainerStorageHelper.RESOURCE_ID_LABEL, id)).exec().getFirst().getId();
     }
 
-    private Network network(Ec2Client client, String cidr, String publicCidr) {
+    Network network(Ec2Client client, String cidr, String publicCidr) {
         String vpc = client.createVpc(request -> request.cidrBlock(cidr)).vpc().vpcId();
         cleanup.addFirst(() -> client.deleteVpc(request -> request.vpcId(vpc)));
         String subnet = subnet(client, vpc, publicCidr);
@@ -219,13 +219,13 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
         return network;
     }
 
-    private String subnet(Ec2Client client, String vpc, String cidr) {
+    String subnet(Ec2Client client, String vpc, String cidr) {
         String id = client.createSubnet(request -> request.vpcId(vpc).cidrBlock(cidr)).subnet().subnetId();
         cleanup.addFirst(() -> client.deleteSubnet(request -> request.subnetId(id)));
         return id;
     }
 
-    private String routes(Ec2Client client, String vpc, String subnet) {
+    String routes(Ec2Client client, String vpc, String subnet) {
         String id = client.createRouteTable(request -> request.vpcId(vpc)).routeTable().routeTableId();
         cleanup.addFirst(() -> client.deleteRouteTable(request -> request.routeTableId(id)));
         String association = client.associateRouteTable(request -> request.routeTableId(id).subnetId(subnet))
@@ -234,7 +234,7 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
         return id;
     }
 
-    private NatGateway nat(Ec2Client client, String subnet) {
+    NatGateway nat(Ec2Client client, String subnet) {
         String allocation = client.allocateAddress(request -> request.domain("vpc")).allocationId();
         cleanup.addFirst(() -> client.releaseAddress(request -> request.allocationId(allocation)));
         NatGateway gateway = client.createNatGateway(request -> request.subnetId(subnet).allocationId(allocation))
@@ -257,7 +257,7 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
                 .gatewayId(network.gateway()));
     }
 
-    private static IpPermission fromAddress(int port, String address) {
+    static IpPermission fromAddress(int port, String address) {
         return IpPermission.builder().ipProtocol("tcp").fromPort(port).toPort(port)
                 .ipRanges(range -> range.cidrIp(address + "/32")).build();
     }
@@ -308,5 +308,5 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
         return evidence.toString();
     }
 
-    private record Network(String vpc, String publicSubnet, String gateway, String publicRoutes) {}
+    record Network(String vpc, String publicSubnet, String gateway, String publicRoutes) {}
 }
