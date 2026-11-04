@@ -21,6 +21,8 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -175,6 +177,58 @@ class Ec2SecurityGroupCfnProvisionerTest {
                 """), ctx(null)));
 
         verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void failedRuleAuthorizationRetiresTheGroupAllocatedByThisCreate() throws Exception {
+        when(ec2.createSecurityGroup("us-east-1", "web", "web tier", "vpc-1"))
+                .thenReturn(group("sg-new", "web", "web tier", "vpc-1"));
+        AwsException failure = new AwsException("InvalidPermission.Malformed", "invalid rule", 400);
+        doThrow(failure).when(ec2).authorizeSecurityGroupIngress(eq("us-east-1"), eq("sg-new"), anyList());
+        StackResource r = resource("WebSg");
+
+        assertSame(failure, assertThrows(AwsException.class,
+                () -> provisioner.provision(r, inlineIngress(), ctx(null))));
+
+        verify(ec2).deleteSecurityGroup("us-east-1", "sg-new");
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ROLLBACK_OWNED_ATTR));
+    }
+
+    @Test
+    void failedReplacementCleanupRemainsOwnedAndTrackedForRetry() throws Exception {
+        when(ec2.describeSecurityGroups("us-east-1", List.of("sg-old"), List.of(), Map.of()))
+                .thenReturn(List.of(group("sg-old", "old", "web tier", "vpc-1")));
+        when(ec2.createSecurityGroup("us-east-1", "web", "web tier", "vpc-1"))
+                .thenReturn(group("sg-new", "web", "web tier", "vpc-1"));
+        AwsException failure = new AwsException("InvalidPermission.Malformed", "invalid rule", 400);
+        AwsException cleanupFailure = new AwsException("DependencyViolation", "still in use", 400);
+        doThrow(failure).when(ec2).authorizeSecurityGroupIngress(eq("us-east-1"), eq("sg-new"), anyList());
+        doThrow(cleanupFailure).when(ec2).deleteSecurityGroup("us-east-1", "sg-new");
+        StackResource r = resource("WebSg");
+        r.setPhysicalId("sg-old");
+
+        assertSame(failure, assertThrows(AwsException.class,
+                () -> provisioner.provision(r, inlineIngress(), ctx("sg-old"))));
+
+        assertEquals(List.of(cleanupFailure), List.of(failure.getSuppressed()));
+        assertEquals("true", r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+        assertTrue(r.getAttributes().get(CfnRollback.REPLACEMENT_CLEANUP_ATTR).contains("sg-new"));
+        assertTrue(r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR).contains("still in use"));
+        verify(ec2, never()).deleteSecurityGroup("us-east-1", "sg-old");
+    }
+
+    @Test
+    void failedInPlaceRuleAuthorizationNeverDeletesTheExistingGroup() throws Exception {
+        when(ec2.describeSecurityGroups("us-east-1", List.of("sg-old"), List.of(), Map.of()))
+                .thenReturn(List.of(group("sg-old", "web", "web tier", "vpc-1")));
+        AwsException failure = new AwsException("InvalidPermission.Malformed", "invalid rule", 400);
+        doThrow(failure).when(ec2).authorizeSecurityGroupIngress(eq("us-east-1"), eq("sg-old"), anyList());
+
+        assertSame(failure, assertThrows(AwsException.class,
+                () -> provisioner.provision(resource("WebSg"), inlineIngress(), ctx("sg-old"))));
+
+        verify(ec2, never()).deleteSecurityGroup(anyString(), anyString());
+        verify(ec2, never()).createSecurityGroup(anyString(), anyString(), anyString(), any());
     }
 
     @Test
@@ -334,6 +388,15 @@ class Ec2SecurityGroupCfnProvisionerTest {
 
     private JsonNode props(String json) throws Exception {
         return mapper.readTree(json);
+    }
+
+    private JsonNode inlineIngress() throws Exception {
+        return props("""
+                {"GroupName":"web","GroupDescription":"web tier","VpcId":"vpc-1",
+                 "SecurityGroupIngress":[
+                   {"IpProtocol":"tcp","FromPort":443,"ToPort":443,"CidrIp":"192.0.2.1/32"}
+                 ]}
+                """);
     }
 
     private static StackResource resource(String logicalId) {
