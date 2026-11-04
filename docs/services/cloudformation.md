@@ -7,6 +7,14 @@ The initial wait does not cancel or resubmit an accepted operation. Existing syn
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 **Endpoint:** `POST http://localhost:4566/`
 
+## Mapping values
+
+`Fn::FindInMap` preserves both string and list values from `Mappings`. A mapped
+list can feed `Fn::Select`, `Fn::Join`, list properties, or a conditional `Fn::If`
+branch without losing member commas or empty positions. This includes templates
+that choose between mapped Availability Zones and `Fn::GetAZs`. AWS documents
+both value types in the [Mappings syntax](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/mappings-section-structure.html).
+
 ## EC2 instance network placement
 
 `AWS::EC2::Instance` uses the resolved `NetworkInterfaces` entry with `DeviceIndex`
