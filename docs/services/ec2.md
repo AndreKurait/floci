@@ -546,6 +546,10 @@ instance identity when the guest's default route uses a different Docker
 bridge. Conflicting metadata host routes and Floci-owned DNAT rules are refused.
 No listener or local address is installed on port 80, so applications may
 continue to use that port.
+On Linux, metadata and EC2 interface routing accept Docker transport addresses
+in `240.0.0.0/4`. Metadata still requires a remote unicast route and rejects
+guest-local destinations. Both paths reject loopback, link-local, multicast
+and limited-broadcast addresses.
 
 `iam/info` returns the ARN and ID that IAM holds for the attached profile, and 404 when that
 profile is missing, has no role or does not match the attached ARN. An EKS cluster node, whose
