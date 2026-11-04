@@ -44,6 +44,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudTrai
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchCompositeAlarmCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchDashboardCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CodeDeployCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoResourceServerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoUserPoolGroupCfnProvisioner;
@@ -127,6 +128,7 @@ import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashb
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsMetricFilterService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
+import io.github.hectorvent.floci.services.codedeploy.CodeDeployService;
 import io.github.hectorvent.floci.services.cognito.CognitoService;
 import io.github.hectorvent.floci.services.configservice.AwsConfigService;
 import io.github.hectorvent.floci.services.docdb.DocDbService;
@@ -220,6 +222,7 @@ final class CfnProvisionerFixture {
         private LambdaService lambdaService;
         private AppSyncService appSyncService;
         private AppConfigService appConfigService;
+        private CodeDeployService codeDeployService;
         private IamService iamService;
         private SsmService ssmService;
         private KmsService kmsService;
@@ -321,6 +324,9 @@ final class CfnProvisionerFixture {
             discovered.add(new CdkMetadataCfnProvisioner());
             if (appConfigService != null) {
                 discovered.add(new AppConfigCfnProvisioner(appConfigService));
+            }
+            if (codeDeployService != null) {
+                discovered.add(new CodeDeployCfnProvisioner(codeDeployService));
             }
             if (stepFunctionsService != null) {
                 discovered.add(new StepFunctionsCfnProvisioner(stepFunctionsService, s3Service, objectMapper));
@@ -607,6 +613,11 @@ final class CfnProvisionerFixture {
 
         public Builder appConfig(AppConfigService v) {
             this.appConfigService = v;
+            return this;
+        }
+
+        public Builder codeDeploy(CodeDeployService value) {
+            this.codeDeployService = value;
             return this;
         }
 
