@@ -592,6 +592,15 @@ Dynamic-reference expansion is currently scoped to these RDS credential properti
 - On `UpdateStack` (no interruption, as in AWS), a cluster's list is checked first, then the roles the template gained are added, and the roles the previous template declared and the new one drops are removed. A role associated outside the stack is kept while the template leaves it out; declaring it fails the update with `DBClusterRoleAlreadyExists`, as in AWS. If any step of an update is refused, the roles it already added are removed and the ones it removed are put back, so the database matches what the stack still records and a retry starts from there. A rolled-back cluster replacement restores the record of which roles the stack declared.
 - An Aurora cluster member (`AWS::RDS::DBInstance` with `DBClusterIdentifier`) cannot carry `AssociatedRoles`: the schema documents the property as not applicable there, since the cluster manages its roles. The resource fails with a `ValidationError` pointing at the cluster's `AssociatedRoles`.
 
+## S3 access logging configuration
+
+`AWS::S3::Bucket.LoggingConfiguration` reaches the S3 bucket logging API, including the
+destination, log prefix and simple or date-partitioned object key format. An omitted
+destination means the source bucket. Updates preserve the bucket, removing a previously
+declared configuration disables logging, and failed updates restore the previous setting.
+Configurations set outside a template remain intact while that property is undeclared.
+This covers configuration state; it does not add S3 server access log delivery.
+
 ## S3 ownership controls
 
 `AWS::S3::Bucket` applies `OwnershipControls` through the same S3 call as
