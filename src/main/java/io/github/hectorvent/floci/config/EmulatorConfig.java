@@ -3689,6 +3689,15 @@ public interface EmulatorConfig {
         boolean enabled();
 
         /**
+         * Preserve native IPv4 ranges in independent protected VPC namespaces, including
+         * overlapping ranges. Requires Docker Engine 28+, native private IPs and security-group
+         * enforcement, with non-internal Docker transport bridges.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES}.
+         */
+        @WithDefault("false")
+        boolean isolateAddressSpaces();
+
+        /**
          * Private range that substituted CIDRs are allocated from, used when a declared VPC CIDR
          * is absent, malformed, outside RFC 1918, or already claimed on the Docker daemon. Must
          * itself be RFC 1918. The default sits high in 10/8, away from both Docker's default

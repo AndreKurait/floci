@@ -56,6 +56,16 @@ class ElbClassicLambdaNatPacketIntegrationTest extends ElbClassicPublicNatPacket
         }
     }
 
+    record ServerNetwork(String vpcCidr, String subnetCidr, String backendAddress) {}
+
+    ServerNetwork serverNetwork() {
+        return new ServerNetwork("10.90.0.0/16", "10.90.1.0/24", "10.90.1.10");
+    }
+
+    void verifyConnectedAddresses(String callerAddress, String backendAddress) {
+        assertTrue(callerAddress.startsWith("10.89.1."), callerAddress);
+    }
+
     @Test
     void protectedLambdaKeepsItsRuntimeWhileNativeNatAndFrontendRulesChange() throws Exception {
         StaticCredentialsProvider credentials = StaticCredentialsProvider.create(
@@ -80,14 +90,15 @@ class ElbClassicLambdaNatPacketIntegrationTest extends ElbClassicPublicNatPacket
                 .natGatewayId(nat.natGatewayId()));
         String callerGroup = group(callerAccount, callerVpc.vpc(), "lambda-" + suffix);
 
-        Network serverVpc = network(ec2, "10.90.0.0/16", "10.90.1.0/24");
+        ServerNetwork server = serverNetwork();
+        Network serverVpc = network(ec2, server.vpcCidr(), server.subnetCidr());
         String frontendGroup = group(serverVpc.vpc(), "frontend-" + suffix);
         String backendGroup = group(serverVpc.vpc(), "backend-" + suffix);
         ec2.authorizeSecurityGroupIngress(request -> request.groupId(backendGroup)
                 .ipPermissions(fromGroup(8080, frontendGroup)));
         IpPermission publicCaller = fromAddress(443, publicIp);
         ec2.authorizeSecurityGroupIngress(request -> request.groupId(frontendGroup).ipPermissions(publicCaller));
-        String backend = launch(serverVpc.publicSubnet(), backendGroup, "10.90.1.10",
+        String backend = launch(serverVpc.publicSubnet(), backendGroup, server.backendAddress(),
                 Base64.getEncoder().encodeToString("""
                         #!/bin/sh
                         set -eu
@@ -145,6 +156,8 @@ class ElbClassicLambdaNatPacketIntegrationTest extends ElbClassicPublicNatPacket
         JsonNode connected = invoke(lambda, name, request);
         assertEquals("connected", connected.path("status").asText(), connected.toString());
         assertTrue(connected.path("body").asText().trim().endsWith(" 1 " + publicIp), connected.toString());
+        assertEquals(server.backendAddress(), localInstance(backend).getPrivateIpAddress());
+        verifyConnectedAddresses(connected.path("sourceAddress").asText(), server.backendAddress());
         assertTrue(callerAccount.describeNetworkInterfaces(query -> query.filters(filter ->
                 filter.name("group-id").values(callerGroup))).networkInterfaces().stream()
                 .anyMatch(eni -> eni.privateIpAddress().equals(connected.path("sourceAddress").asText())));

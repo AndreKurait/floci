@@ -1,12 +1,15 @@
 package io.github.hectorvent.floci.services.ec2.net;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.CreateNetworkCmd;
+import com.github.dockerjava.api.command.CreateNetworkResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.DockerObjectAccessor;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import jakarta.annotation.PreDestroy;
@@ -29,63 +32,24 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiPredicate;
+import java.util.function.Predicate;
 
 /**
- * Gives every VPC a real Docker network, so an EC2 instance's private address is an address
- * something can actually connect to rather than a number invented to look plausible.
+ * Owns per-VPC Docker bridges and subnet IPv4 leases.
  *
- * <h2>One network per VPC, not per subnet</h2>
+ * <p>The default backend reserves the VPC range in Docker's global IPv4 IPAM. It logs and
+ * substitutes a fallback when the declaration is unusable or overlaps another Docker network.
  *
- * <p>A Docker network is an isolation domain: containers on one can reach each other, and
- * cannot reach containers on another. That is exactly a VPC. It is <em>not</em> a subnet:
- * subnets inside a VPC route to each other by default in AWS, so giving each subnet its own
- * Docker network would manufacture a partition that AWS does not have, and would break the
- * very common two-tier "app subnet talks to database subnet" topology in this corpus.
+ * <p>With address-space isolation enabled, each account and VPC gets a bridge with a unique
+ * Docker transport pool. Protected namespaces replace the transport address with their native
+ * subnet address and a local VPC route, so independent VPCs can reuse identical ranges without
+ * registering them in Docker IPAM. The emulator stays on its control network. This backend
+ * requires native private IPs, security-group enforcement and Linux Docker Engine 28+.
+ * A helper's VPC range must not overlap its Docker transport.
  *
- * <p>The per-subnet addressing that AWS gets from separate subnets is preserved anyway: the
- * network is created with the whole VPC CIDR as its IPAM pool, and each subnet allocates
- * static addresses from its own slice of that pool. A subnet CIDR is by definition inside its
- * VPC CIDR, so every such address is valid on the network. The result is one bridge per VPC
- * instead of one per subnet: the correct semantics and, incidentally, a third of the Linux
- * bridges.
- *
- * <h2>Declared CIDRs are used where they can be, substituted loudly where they cannot</h2>
- *
- * <p>The declared CIDR is used verbatim whenever it is usable, which for this corpus is
- * almost always. It is not usable when it is absent, malformed, outside RFC 1918, or already
- * claimed by another Docker network, including one of Floci's own, which is what a second
- * VPC declaring the same CIDR looks like (legal in AWS, impossible on one Docker daemon).
- * Then, and only then, an equivalent block is allocated out of a configured private pool and
- * the substitution is logged at WARN. It is never silent: a reported private IP that does not
- * mean what the caller declared is exactly the class of quiet lie this whole change exists to
- * remove, so it is either true or it is in the log.
- *
- * <h2>What this does not do</h2>
- *
- * <p>Security groups and network ACLs are untouched. Docker networks isolate between
- * networks; within one, every container can reach every other on every port. Nothing here
- * makes an assertion that traffic is <em>blocked</em> meaningful.
- *
- * <p>Between-VPC isolation is likewise only as good as the daemon underneath. It comes from
- * Docker's own {@code DOCKER-ISOLATION-STAGE} rules, which drop forwarded traffic between
- * bridge networks: Floci asks for separate networks and gets whatever the daemon does with
- * them. <strong>OrbStack does not do that.</strong> Measured on OrbStack 29.4.0, 2026-08-22:
- * two containers each attached to exactly one Docker network, on different subnets, created
- * with nothing but {@code docker network create} and {@code docker run --network}, reach each
- * other's ports in both directions. Marking the networks {@code --internal} does not change
- * it. That is a property of the host's Docker implementation and there is nothing this class
- * can do about it, so on such a host the VPC boundary is an addressing boundary only. Do not
- * read a passing "different VPCs cannot reach each other" test as evidence without checking
- * which daemon it ran on.
- *
- * <h2>Hosts where container IPs are not routable</h2>
- *
- * <p>On Docker Desktop for macOS and Windows the containers live behind a VM and none of their
- * addresses answer from the host. The private address stays correct and reachable
- * container-to-container, and the guest really holds it, but a host-side client (Terratest,
- * a shell) cannot dial it. That is the same constraint {@code ContainerNetworkReachability}
- * detects for the public address on the ec2-public-address-reachability branch, and it is why
- * SSH keeps its published host port here.
+ * <p>Subnets share their VPC bridge. Security-group and routing managers supply packet
+ * admission; this class does not implement network ACLs. Packet isolation depends on the
+ * Docker implementation and needs separate qualification on Docker Desktop and OrbStack.
  */
 @ApplicationScoped
 public class VpcNetworkManager {
@@ -103,6 +67,9 @@ public class VpcNetworkManager {
     public static final String SERVICE_VALUE = "ec2";
     private static final ContainerStorageHelper.LabelAliases ALIASES = ContainerStorageHelper.NETWORK_LABEL_ALIASES;
     private static final String NAMESPACE_LABEL = "floci_namespace";
+    static final String ADDRESS_SPACE_LABEL = "io.floci.vpc.address-space";
+    static final String CIDR_LABEL = "io.floci.vpc.cidr";
+    private static final String NATIVE_IPV4 = "native-ipv4";
 
     /**
      * Instance addresses start here inside each subnet slice. AWS reserves the first four
@@ -131,8 +98,9 @@ public class VpcNetworkManager {
     private final EmulatorConfig config;
     private final DockerClient dockerClient;
     private final CurrentContainerNetworkResolver currentContainerNetworkResolver;
+    private final RegionResolver regionResolver;
 
-    /** region::vpcId -> binding. Rebuilt from persisted VPCs at startup. */
+    /** Native address spaces include the account in their key. Rebuilt from persisted VPCs at startup. */
     private final Map<String, VpcBinding> bindings = new ConcurrentHashMap<>();
     /** region::subnetId -> region::vpcId, so subnet-keyed calls need no VPC lookup. */
     private final Map<String, String> subnetOwner = new ConcurrentHashMap<>();
@@ -151,10 +119,17 @@ public class VpcNetworkManager {
 
     @Inject
     public VpcNetworkManager(EmulatorConfig config, DockerClient dockerClient,
-                             CurrentContainerNetworkResolver currentContainerNetworkResolver) {
+                             CurrentContainerNetworkResolver currentContainerNetworkResolver,
+                             RegionResolver regionResolver) {
         this.config = config;
         this.dockerClient = dockerClient;
         this.currentContainerNetworkResolver = currentContainerNetworkResolver;
+        this.regionResolver = regionResolver;
+    }
+
+    public VpcNetworkManager(EmulatorConfig config, DockerClient dockerClient,
+                             CurrentContainerNetworkResolver currentContainerNetworkResolver) {
+        this(config, dockerClient, currentContainerNetworkResolver, null);
     }
 
     VpcNetworkManager(EmulatorConfig config, DockerClient dockerClient) {
@@ -170,6 +145,20 @@ public class VpcNetworkManager {
         return config.services().ec2().vpcNetworks().enabled() && !config.services().ec2().mock();
     }
 
+    public boolean isolatesAddressSpaces() {
+        return config.services().ec2().vpcNetworks().isolateAddressSpaces();
+    }
+
+    private void validateAddressSpaceConfiguration() {
+        if (!config.services().ec2().awsFaithfulPrivateIp()
+                || !config.network().securityGroupEnforcement().enabled()
+                || config.services().ec2().vpcNetworks().internal()
+                || !"bridge".equals(config.services().ec2().vpcNetworks().driver())) {
+            throw new IllegalStateException("Isolated VPC address spaces require native private IPs, "
+                    + "security-group enforcement and a non-internal bridge network");
+        }
+    }
+
     // ─── Declaration: CreateVpc / CreateSubnet ────────────────────────────────
 
     /**
@@ -181,8 +170,9 @@ public class VpcNetworkManager {
         if (!enabled() || region == null || vpcId == null) {
             return;
         }
-        bindings.putIfAbsent(key(region, vpcId),
-                new VpcBinding(region, vpcId, declaredCidr, networkName(region, vpcId)));
+        String account = isolatesAddressSpaces() ? accountId() : null;
+        bindings.putIfAbsent(identityKey(account, region, vpcId),
+                new VpcBinding(account, region, vpcId, declaredCidr, networkName(region, vpcId)));
     }
 
     /** Records a subnet declaration inside an already-declared VPC. */
@@ -206,7 +196,10 @@ public class VpcNetworkManager {
     }
 
     private VpcBinding plannedVpc(String region, String vpcId) {
-        VpcBinding vpc = bindings.get(key(region, vpcId));
+        return plannedVpc(bindings.get(key(region, vpcId)));
+    }
+
+    private VpcBinding plannedVpc(VpcBinding vpc) {
         if (vpc == null || vpc.planned) {
             return vpc;
         }
@@ -228,6 +221,13 @@ public class VpcNetworkManager {
         String vpcId = vpc.vpcId;
         String declaredCidr = vpc.declaredCidr;
         Optional<Cidr4> declared = Cidr4.parse(declaredCidr);
+        if (isolatesAddressSpaces()) {
+            validateAddressSpaceConfiguration();
+            vpc.effective = declared.orElseThrow(() ->
+                    new IllegalStateException("Native VPC " + vpcId + " requires a valid IPv4 CIDR"));
+            vpc.substituted = false;
+            return;
+        }
         String rejection = rejectionReason(region, vpcId, declared, declaredCidr, List.of());
         Cidr4 effective;
         if (rejection == null) {
@@ -304,6 +304,10 @@ public class VpcNetworkManager {
                 && vpc.effective.contains(declared.get())
                 && siblings.stream().noneMatch(s -> s.overlaps(declared.get()))) {
             return bindSubnet(vpc, subnetId, declared.get(), declared.get(), false);
+        }
+        if (isolatesAddressSpaces()) {
+            throw new IllegalStateException("Native subnet " + subnetId + " must be inside VPC "
+                    + vpc.vpcId + " without overlapping another subnet");
         }
 
         int desiredPrefix = declared.map(Cidr4::prefix).orElse(24);
@@ -571,20 +575,49 @@ public class VpcNetworkManager {
             return Optional.empty();
         }
         try {
-            dockerClient.connectToNetworkCmd()
-                    .withContainerId(containerId)
-                    .withNetworkId(networkName)
-                    .withContainerNetwork(new ContainerNetwork()
-                            .withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address)))
-                    .exec();
+            if (isolatesAddressSpaces()) {
+                NativeVpcAddressSpace.attach(dockerClient, config, vpc.accountId, vpc.region,
+                        networkName, vpc.effective, subnet.effective, containerId, address);
+            } else {
+                dockerClient.connectToNetworkCmd()
+                        .withContainerId(containerId)
+                        .withNetworkId(networkName)
+                        .withContainerNetwork(new ContainerNetwork()
+                                .withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address)))
+                        .exec();
+            }
             LOG.infov("Attached container {0} to VPC network {1} at {2}", containerId, networkName, address);
             return Optional.of(networkName);
         } catch (Exception e) {
+            if (isolatesAddressSpaces()) {
+                throw new IllegalStateException("Cannot attach the protected namespace to native VPC "
+                        + vpc.vpcId + " at " + address + ": " + e.getMessage(), e);
+            }
             LOG.warnv("Could not attach container {0} to VPC network {1} at {2}: {3}. The instance keeps "
                             + "its bridge address and its reported private IP will not be reachable.",
                     containerId, networkName, address, e.getMessage());
             return Optional.empty();
         }
+    }
+
+    /** Revalidates the account, VPC attachment and actual interface before routing or restoration. */
+    public String requireNativePrivateAddress(String region, String vpcId, String subnetId,
+                                               String helper, String address) {
+        if (!enabled() || !isolatesAddressSpaces()) {
+            throw new IllegalStateException("Native VPC address spaces are not enabled");
+        }
+        VpcBinding vpc = plannedVpc(region, vpcId);
+        SubnetBinding subnet = subnetBinding(region, subnetId);
+        Optional<Cidr4> host = Cidr4.parse(address + "/32");
+        if (vpc == null || vpc.effective == null || subnet == null || subnet.effective == null
+                || !vpc.key.equals(subnetOwner.get(key(region, subnetId)))
+                || host.isEmpty() || !subnet.effective.contains(host.get())) {
+            throw new IllegalStateException("The recorded private address is outside its declared native subnet");
+        }
+        validateNativeNetwork(vpc, dockerClient.inspectNetworkCmd().withNetworkId(vpc.networkName).exec());
+        NativeVpcAddressSpace.verify(dockerClient, config, vpc.accountId, region,
+                vpc.networkName, helper, address, subnet.effective.prefix());
+        return address;
     }
 
     /**
@@ -596,6 +629,10 @@ public class VpcNetworkManager {
     public boolean attachContainer(String region, String vpcId, String containerId) {
         if (!enabled() || containerId == null || vpcId == null) {
             return false;
+        }
+        if (isolatesAddressSpaces()) {
+            throw new IllegalStateException("Isolated VPC address spaces require a protected namespace "
+                    + "and a declared native private address");
         }
         VpcBinding vpc = plannedVpc(region, vpcId);
         if (vpc == null || vpc.effective == null) {
@@ -661,7 +698,7 @@ public class VpcNetworkManager {
     /** @return the network name, or null when creation failed */
     private String materialise(VpcBinding vpc) {
         synchronized (vpc) {
-            if (bindings.get(key(vpc.region, vpc.vpcId)) != vpc) {
+            if (bindings.get(vpc.key) != vpc) {
                 return null;
             }
             if (vpc.created) {
@@ -681,6 +718,12 @@ public class VpcNetworkManager {
                         != config.services().ec2().vpcNetworks().internal()) {
                     throw new IllegalStateException("Existing VPC network " + vpc.networkName
                             + " has a different internal setting; preserve it and select a fresh deployment");
+                }
+                if (isolatesAddressSpaces()) {
+                    validateNativeNetwork(vpc, existing);
+                    vpc.createdNetworkId = existing.getId();
+                    vpc.created = true;
+                    return vpc.networkName;
                 }
                 List<Cidr4> actual = ipamSubnets(existing);
                 if (actual.contains(vpc.effective)) {
@@ -711,14 +754,26 @@ public class VpcNetworkManager {
                 }
             }
             try {
-                dockerClient.createNetworkCmd()
+                CreateNetworkCmd create = dockerClient.createNetworkCmd()
                         .withName(vpc.networkName)
                         .withDriver(config.services().ec2().vpcNetworks().driver())
                         .withInternal(config.services().ec2().vpcNetworks().internal())
-                        .withIpam(new Network.Ipam().withConfig(
-                                new Network.Ipam.Config().withSubnet(vpc.effective.toString())))
-                        .withLabels(networkLabels(vpc))
-                        .exec();
+                        .withLabels(networkLabels(vpc));
+                if (isolatesAddressSpaces()) {
+                    create.withEnableIpv6(false).withOptions(Map.of(
+                            "com.docker.network.enable_ipv4", "true",
+                            "com.docker.network.bridge.enable_icc", "true",
+                            "com.docker.network.bridge.enable_ip_masquerade", "false"));
+                } else {
+                    create.withIpam(new Network.Ipam().withConfig(
+                            new Network.Ipam.Config().withSubnet(vpc.effective.toString())));
+                }
+                CreateNetworkResponse response = create.exec();
+                if (isolatesAddressSpaces()) {
+                    vpc.createdNetworkId = response == null ? null : response.getId();
+                    validateNativeNetwork(vpc,
+                            dockerClient.inspectNetworkCmd().withNetworkId(vpc.networkName).exec());
+                }
                 vpc.created = true;
                 attachCurrentContainer(vpc, null);
                 LOG.infov("Created Docker network {0} for VPC {1} ({2}){3}",
@@ -726,6 +781,10 @@ public class VpcNetworkManager {
                         vpc.substituted ? " [substituted; declared " + vpc.declared + "]" : "");
                 return vpc.networkName;
             } catch (Exception e) {
+                if (isolatesAddressSpaces()) {
+                    throw new IllegalStateException("Cannot materialise native VPC " + vpc.vpcId
+                            + "; no substituted network will be used: " + e.getMessage(), e);
+                }
                 LOG.warnv("Could not create Docker network {0} for VPC {1} ({2}): {3}. Instances in this VPC "
                                 + "stay on the shared bridge and are neither isolated nor addressed from the "
                                 + "declared CIDR.",
@@ -736,7 +795,7 @@ public class VpcNetworkManager {
     }
 
     private void attachCurrentContainer(VpcBinding vpc, Network network) {
-        if (currentContainerNetworkResolver == null) {
+        if (isolatesAddressSpaces() || currentContainerNetworkResolver == null) {
             return;
         }
         Optional<String> currentContainerId = currentContainerNetworkResolver.resolveContainerId();
@@ -826,10 +885,37 @@ public class VpcNetworkManager {
 
     private Map<String, String> networkLabels(VpcBinding vpc) {
         Map<String, String> labels = new LinkedHashMap<>(ContainerStorageHelper.defaultLabels(config));
-        labels.putAll(ContainerStorageHelper.resourceIdentityLabels(SERVICE_VALUE, vpc.vpcId, null, vpc.region));
+        labels.putAll(ContainerStorageHelper.resourceIdentityLabels(
+                SERVICE_VALUE, vpc.vpcId, vpc.accountId, vpc.region));
         labels.put(ContainerStorageHelper.COMPONENT_LABEL, COMPONENT_VALUE);
         labels.put(ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config));
+        if (vpc.accountId != null) {
+            labels.put(ADDRESS_SPACE_LABEL, NATIVE_IPV4);
+            labels.put(CIDR_LABEL, vpc.effective.toString());
+        }
         return ALIASES.withLegacyAliases(labels);
+    }
+
+    private void validateNativeNetwork(VpcBinding vpc, Network network) {
+        List<Cidr4> transport = ipamSubnets(network);
+        Map<String, String> options = network.getOptions() == null ? Map.of() : network.getOptions();
+        if (!"bridge".equals(network.getDriver())
+                || !nativeOwnershipMatches(vpc, network)
+                || Boolean.TRUE.equals(network.getEnableIPv6()) || Boolean.TRUE.equals(network.getInternal())
+                || transport.size() != 1
+                || transport.stream().anyMatch(vpc.effective::overlaps)
+                || !"true".equals(options.get("com.docker.network.bridge.enable_icc"))
+                || !"false".equals(options.get("com.docker.network.bridge.enable_ip_masquerade"))) {
+            throw new IllegalStateException("Native VPC network " + vpc.networkName
+                    + " must have matching ownership and a nonoverlapping IPv4 transport pool "
+                    + "with bridge forwarding enabled and masquerading disabled");
+        }
+    }
+
+    private boolean nativeOwnershipMatches(VpcBinding vpc, Network network) {
+        Map<String, String> labels = network.getLabels() == null ? Map.of() : network.getLabels();
+        return networkLabels(vpc).entrySet().stream()
+                .allMatch(entry -> entry.getValue().equals(labels.get(entry.getKey())));
     }
 
     // ─── Teardown ────────────────────────────────────────────────────────────
@@ -855,13 +941,27 @@ public class VpcNetworkManager {
             return;
         }
         synchronized (vpc.declarationLock) {
-            vpc.subnetDeclarations.keySet().forEach(subnetId -> subnetOwner.remove(key(region, subnetId)));
+            vpc.subnetDeclarations.keySet().forEach(subnetId ->
+                    subnetOwner.remove(identityKey(vpc.accountId, region, subnetId)));
         }
-        Set<String> previousRunNetworks = networksFromPreviousRun.remove(key(region, vpcId));
+        Set<String> previousRunNetworks = networksFromPreviousRun.remove(vpc.key);
         Set<String> networkNames = new LinkedHashSet<>();
         synchronized (vpc) {
             // Wait for any admitted Docker create before selecting networks to remove.
-            if (vpc.created) {
+            if (isolatesAddressSpaces() && vpc.createdNetworkId != null) {
+                networkNames.add(vpc.createdNetworkId);
+            } else if (isolatesAddressSpaces() && vpc.effective != null) {
+                // A create may have succeeded before its response was lost. Match its complete
+                // ownership before retiring it, including when its IPv4 mode was rejected.
+                try {
+                    Network existing = dockerClient.inspectNetworkCmd().withNetworkId(vpc.networkName).exec();
+                    if (nativeOwnershipMatches(vpc, existing)) {
+                        networkNames.add(existing.getId());
+                    }
+                } catch (NotFoundException absent) {
+                    // No network was materialised for this VPC.
+                }
+            } else if (vpc.created) {
                 networkNames.add(vpc.networkName);
             }
         }
@@ -872,7 +972,7 @@ public class VpcNetworkManager {
             return;
         }
         String flociContainerId = vpc.flociContainerId;
-        if (flociContainerId == null && currentContainerNetworkResolver != null) {
+        if (!isolatesAddressSpaces() && flociContainerId == null && currentContainerNetworkResolver != null) {
             flociContainerId = currentContainerNetworkResolver.resolveContainerId().orElse(null);
         }
         for (String networkName : networkNames) {
@@ -925,6 +1025,12 @@ public class VpcNetworkManager {
      * @param stillDeclared answers whether (region, vpcId) exists in the restored state
      */
     public void reconcileOrphans(BiPredicate<String, String> stillDeclared) {
+        reconcileOwnedOrphans(owner -> stillDeclared.test(owner.region(), owner.vpcId()));
+    }
+
+    public record VpcOwner(String accountId, String region, String vpcId) {}
+
+    public void reconcileOwnedOrphans(Predicate<VpcOwner> stillDeclared) {
         if (!enabled()) {
             return;
         }
@@ -947,9 +1053,17 @@ public class VpcNetworkManager {
                 }
                 String vpcId = ALIASES.labelValue(labels, ContainerStorageHelper.RESOURCE_ID_LABEL);
                 String region = ALIASES.labelValue(labels, ContainerStorageHelper.REGION_LABEL);
-                if (vpcId != null && region != null && stillDeclared.test(region, vpcId)) {
-                    networksFromPreviousRun.computeIfAbsent(key(region, vpcId), k -> ConcurrentHashMap.newKeySet())
-                            .add(network.getName());
+                String account = labels.get(ContainerStorageHelper.ACCOUNT_LABEL);
+                boolean nativeNetwork = NATIVE_IPV4.equals(labels.get(ADDRESS_SPACE_LABEL));
+                if (isolatesAddressSpaces() != nativeNetwork || nativeNetwork && account == null) {
+                    continue;
+                }
+                if (vpcId != null && region != null
+                        && stillDeclared.test(new VpcOwner(nativeNetwork ? account : null, region, vpcId))) {
+                    networksFromPreviousRun.computeIfAbsent(
+                                    identityKey(nativeNetwork ? account : null, region, vpcId),
+                                    k -> ConcurrentHashMap.newKeySet())
+                            .add(nativeNetwork ? network.getId() : network.getName());
                     continue;
                 }
                 if (!reap) {
@@ -1021,8 +1135,16 @@ public class VpcNetworkManager {
     }
 
     String networkName(String region, String vpcId) {
+        if (isolatesAddressSpaces()) {
+            return nativeNetworkName(config, accountId(), region, vpcId);
+        }
         return ContainerStorageHelper.dockerName(config,
                 "vpc-" + config.port() + "-" + region + "-" + vpcId);
+    }
+
+    public static String nativeNetworkName(EmulatorConfig config, String account, String region, String vpcId) {
+        return ContainerStorageHelper.dockerName(config,
+                "vpc-" + config.port() + "-" + account + "-" + region + "-" + vpcId);
     }
 
     private SubnetBinding subnetBinding(String region, String subnetId) {
@@ -1032,7 +1154,7 @@ public class VpcNetworkManager {
         }
         VpcBinding vpc = bindings.get(vpcKey);
         if (vpc != null) {
-            vpc = plannedVpc(vpc.region, vpc.vpcId);
+            vpc = plannedVpc(vpc);
         }
         return vpc == null ? null : vpc.subnets.get(subnetId);
     }
@@ -1072,11 +1194,25 @@ public class VpcNetworkManager {
         return taken;
     }
 
-    private static String key(String region, String id) {
-        return region + "::" + id;
+    private String key(String region, String id) {
+        return identityKey(isolatesAddressSpaces() ? accountId() : null, region, id);
+    }
+
+    private String accountId() {
+        String account = regionResolver == null ? config.defaultAccountId() : regionResolver.getAccountId();
+        if (account == null || !account.matches("\\d{12}")) {
+            throw new IllegalStateException("Native VPC address spaces require a complete account ID");
+        }
+        return account;
+    }
+
+    private static String identityKey(String account, String region, String id) {
+        return (account == null ? "" : account + "::") + region + "::" + id;
     }
 
     private static final class VpcBinding {
+        final String accountId;
+        final String key;
         final String region;
         final String vpcId;
         final String declaredCidr;
@@ -1089,9 +1225,12 @@ public class VpcNetworkManager {
         final Map<String, SubnetBinding> subnets = new ConcurrentHashMap<>();
         volatile boolean planned;
         volatile boolean created;
+        volatile String createdNetworkId;
         volatile String flociContainerId;
 
-        VpcBinding(String region, String vpcId, String declaredCidr, String networkName) {
+        VpcBinding(String accountId, String region, String vpcId, String declaredCidr, String networkName) {
+            this.accountId = accountId;
+            this.key = identityKey(accountId, region, vpcId);
             this.region = region;
             this.vpcId = vpcId;
             this.declaredCidr = declaredCidr;

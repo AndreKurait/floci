@@ -51,6 +51,9 @@ class ResolverRuleDnsPacketTest {
     @Inject
     Vertx vertx;
 
+    @Inject
+    EmulatorConfig config;
+
     @Test
     void aForwardedQueryIsAnsweredByTheRulesTarget() throws Exception {
         byte[] request = buildQuery("db.corp.internal");
@@ -70,7 +73,7 @@ class ResolverRuleDnsPacketTest {
     @Test
     void protectedNamespaceRegistrationControlsWhichDnsPacketsUseTheVpcRule() throws Exception {
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(mock(DockerClient.class),
-                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class),
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config,
                 mock(EmbeddedDnsServer.class)));
         // This test exercises UDP DNS and registry ownership; the Docker suite owns nftables enforcement.
         doNothing().when(manager).reconcileAll();

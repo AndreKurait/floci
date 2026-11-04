@@ -50,6 +50,7 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Base64;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -72,13 +73,18 @@ class ElbClassicVpcPacketIntegrationTest {
 
         @Override
         public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.elb.mock", "false",
+            Map<String, String> overrides = new HashMap<>(Map.of("floci.services.elb.mock", "false",
                     "floci.services.elb.vpc-frontends", "true",
                     "floci.services.ec2.mock", "false",
                     "floci.services.ec2.vpc-networks.enabled", "true",
                     "floci.services.ec2.aws-faithful-private-ip", "true",
                     "floci.network.security-group-enforcement.enabled", "true",
-                    "floci.docker.resource-namespace", NAMESPACE);
+                    "floci.docker.resource-namespace", NAMESPACE));
+            String hostDnsAddress = System.getenv("FLOCI_TEST_HOST_DNS_ADDRESS");
+            if (hostDnsAddress != null && !hostDnsAddress.isBlank()) {
+                overrides.put("floci.dns.listen-address", hostDnsAddress);
+            }
+            return overrides;
         }
     }
 

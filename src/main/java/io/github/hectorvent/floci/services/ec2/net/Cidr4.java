@@ -23,7 +23,7 @@ public final class Cidr4 {
     private static final Pattern CIDR = Pattern.compile(
             "^\\s*(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})\\s*$");
 
-    /** The three RFC 1918 private ranges, the only space Floci will put a VPC network in. */
+    /** Private ranges accepted by the legacy Docker bridge planner. */
     private static final Cidr4[] RFC_1918 = {
             new Cidr4(toLong(10, 0, 0, 0), 8),
             new Cidr4(toLong(172, 16, 0, 0), 12),
@@ -40,8 +40,8 @@ public final class Cidr4 {
 
     /**
      * @return the block, or empty when {@code text} is null, malformed, or has an octet or
-     *         prefix length out of range. Callers treat empty as "the declaration is unusable",
-     *         which is a fallback trigger, never a failure.
+     *         prefix length out of range. The caller decides whether to refuse the declaration
+     *         or select a fallback.
      */
     public static Optional<Cidr4> parse(String text) {
         if (text == null) {

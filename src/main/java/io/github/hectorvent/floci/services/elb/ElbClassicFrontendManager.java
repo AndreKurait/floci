@@ -266,8 +266,8 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
             return false;
         }
         Frontend frontend = probe.frontend();
-        Instance instance = RequestScopes.callAs(frontend.account(), frontend.region(),
-                () -> ec2.getInstance(frontend.region(), probe.instanceId()).orElse(null));
+        Instance instance = ec2.findInstanceForAccount(frontend.account(), frontend.region(), probe.instanceId())
+                .orElse(null);
         if (instance == null || instance.getState() == null || !"running".equals(instance.getState().getName())
                 || !probe.address().equals(instance.getPrivateIpAddress())) {
             return false;

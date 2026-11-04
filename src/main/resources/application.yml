@@ -787,6 +787,7 @@ floci:
       # container actually holds and instances in different VPCs are on different bridges.
       vpc-networks:
         enabled: true                             # FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED
+        isolate-address-spaces: false              # FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES
         # Used only when a declared VPC CIDR cannot be honoured: absent, malformed, outside
         # RFC 1918, or already claimed on this Docker daemon. Substitutions are logged at WARN;
         # a reported private IP that does not match the declared CIDR is never silent.

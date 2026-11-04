@@ -1254,7 +1254,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (vpcNetworkManager == null || !vpcNetworkManager.enabled()) {
             return;
         }
-        vpcNetworkManager.reconcileOrphans((region, vpcId) -> findAnyVpcEntry(region, vpcId).isPresent());
+        vpcNetworkManager.reconcileOwnedOrphans(this::declaresVpcOwner);
         // declareVpc is first-wins on overlapping CIDRs, so declare in a stable order, default account first.
         List<AccountAwareStorageBackend.AccountEntry<Vpc>> restoredVpcs = new ArrayList<>(entriesOfEveryAccount(vpcs));
         restoredVpcs.sort(Comparator
@@ -1263,14 +1263,26 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .thenComparing(AccountAwareStorageBackend.AccountEntry::key));
         for (AccountAwareStorageBackend.AccountEntry<Vpc> entry : restoredVpcs) {
             Vpc vpc = entry.value();
-            vpcNetworkManager.declareVpc(vpc.getRegion(), vpc.getVpcId(), vpc.getCidrBlock());
+            RequestScopes.runAs(entry.accountId(), vpc.getRegion(), () ->
+                    vpcNetworkManager.declareVpc(vpc.getRegion(), vpc.getVpcId(), vpc.getCidrBlock()));
         }
         for (AccountAwareStorageBackend.AccountEntry<Subnet> entry : entriesOfEveryAccount(subnets)) {
             Subnet subnet = entry.value();
-            vpcNetworkManager.declareSubnet(
-                    subnet.getRegion(), subnet.getVpcId(), subnet.getSubnetId(), subnet.getCidrBlock());
+            RequestScopes.runAs(entry.accountId(), subnet.getRegion(), () -> vpcNetworkManager.declareSubnet(
+                    subnet.getRegion(), subnet.getVpcId(), subnet.getSubnetId(), subnet.getCidrBlock()));
         }
         reserveRestoredPrivateIps();
+    }
+
+    private boolean declaresVpcOwner(VpcNetworkManager.VpcOwner owner) {
+        if (owner.accountId() == null) {
+            return findAnyVpcEntry(owner.region(), owner.vpcId()).isPresent();
+        }
+        String storageKey = key(owner.region(), owner.vpcId());
+        if (vpcs instanceof AccountAwareStorageBackend<?> accountAware) {
+            return accountAware.getForAccount(owner.accountId(), storageKey).isPresent();
+        }
+        return defaultAccountId.equals(owner.accountId()) && vpcs.get(storageKey).isPresent();
     }
 
     /**
@@ -1296,8 +1308,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     || "terminated".equals(instance.getState().getName())) {
                 continue;
             }
-            if (vpcNetworkManager.reservePrivateIp(instance.getRegion(), instance.getSubnetId(),
-                    instance.getPrivateIpAddress())) {
+            if (RequestScopes.callAs(entry.accountId(), instance.getRegion(), () ->
+                    vpcNetworkManager.reservePrivateIp(instance.getRegion(), instance.getSubnetId(),
+                            instance.getPrivateIpAddress()))) {
                 reserved++;
             }
             else {
@@ -5218,7 +5231,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * <p>The caller's stored resources decide whether the address is in use. A Docker-backed
      * subnet also leases it, so the network's own allocator never hands it to a later launch.
      *
-     * <p>Inside a Docker-backed range, what every account holds counts as well. Default VPC and
+     * <p>Without isolated address spaces, what every account holds counts as well. Default VPC and
      * subnet ids are the same in every account, so their Docker network is shared, and another
      * account's instance, network interface or NAT gateway there may hold the address with no
      * lease to show for it: an interface created with its own address never takes one, and a
@@ -5260,7 +5273,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (!leasable) {
             return false;
         }
-        if (privateIpsInUseInEveryAccount(region, subnetId).contains(address)) {
+        if (!vpcNetworkManager.isolatesAddressSpaces()
+                && privateIpsInUseInEveryAccount(region, subnetId).contains(address)) {
             throw new AwsException("InvalidIPAddress.InUse", "Address " + address + " is in use.", 400);
         }
         return true;
@@ -5277,12 +5291,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * Every address a stored resource holds in the subnet: {@link #privateIpsTaken}, plus what the
-     * instances, network interfaces and NAT gateways of every account hold there. Default subnet
-     * ids are the same in every account, so their Docker network, and its lease table, is shared.
+     * instances, network interfaces and NAT gateways of every account hold there when address spaces
+     * are shared. Isolated address spaces keep default subnet leases separate for each account.
      */
     private Set<String> privateIpsHeldOnVpcNetwork(String region, String subnetId) {
         Set<String> held = privateIpsTaken(region, subnetId);
-        held.addAll(privateIpsInUseInEveryAccount(region, subnetId));
+        if (!vpcNetworkManager.isolatesAddressSpaces()) {
+            held.addAll(privateIpsInUseInEveryAccount(region, subnetId));
+        }
         return held;
     }
 

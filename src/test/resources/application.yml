@@ -383,6 +383,7 @@ floci:
       # reconcile Docker networks on whatever daemon CI happens to have.
       vpc-networks:
         enabled: false
+        isolate-address-spaces: false
     ecs:
       enabled: true
       mock: true
