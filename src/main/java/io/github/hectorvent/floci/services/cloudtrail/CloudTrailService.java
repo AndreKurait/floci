@@ -238,6 +238,16 @@ public class CloudTrailService {
         return results;
     }
 
+    /** Public GetTrail lookup; the log writer retains its nullable home-region lookup. */
+    public Trail getTrailDetails(String region, String nameOrArn) {
+        if (AwsArnUtils.looksLikeArn(nameOrArn)) {
+            validateTrailArn(nameOrArn);
+        } else {
+            validateTrailName(nameOrArn);
+        }
+        return findTrailOrThrow(region, nameOrArn);
+    }
+
     public List<EventSelector> putEventSelectors(String region, String trailNameOrArn, List<EventSelector> selectors) {
         Trail trail = findTrailOrThrow(region, trailNameOrArn);
         List<EventSelector> normalized = selectors == null ? List.of() : List.copyOf(selectors);
@@ -360,6 +370,18 @@ public class CloudTrailService {
      *  reading the entry itself. Callers that go on to mutate the entry must re-read it inside
      *  {@link #withTrailLock} rather than reuse a value read here. */
     private String findKeyByArnOrThrow(String resourceId) {
+        validateTrailArn(resourceId);
+        for (String k : store.keys()) {
+            CloudTrailEntry entry = store.get(k).orElse(null);
+            if (entry != null && resourceId.equals(entry.trail().trailArn())) {
+                return k;
+            }
+        }
+        throw new AwsException("ResourceNotFoundException",
+                "Resource not found: " + resourceId, 400);
+    }
+
+    private static void validateTrailArn(String resourceId) {
         AwsArnUtils.Arn arn;
         try {
             arn = AwsArnUtils.parse(resourceId);
@@ -371,14 +393,6 @@ public class CloudTrailService {
             throw new AwsException("CloudTrailARNInvalidException",
                     resourceId + " is not a valid trail ARN.", 400);
         }
-        for (String k : store.keys()) {
-            CloudTrailEntry entry = store.get(k).orElse(null);
-            if (entry != null && resourceId.equals(entry.trail().trailArn())) {
-                return k;
-            }
-        }
-        throw new AwsException("ResourceNotFoundException",
-                "Resource not found: " + resourceId, 400);
     }
 
     /**
