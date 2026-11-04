@@ -443,7 +443,7 @@ When the image lacks `sshd` or `scp`, Floci first installs OpenSSH with the imag
 
 ## Security Group Port Publishing
 
-With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. This filters packets but does not emulate VPC routing, NACLs, NAT gateways, or peering. Rootless Docker and Windows containers are unsupported.
+With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. Security-group enforcement alone does not implement VPC routes or NAT; see [NAT Gateways](#nat-gateways) for the optional public routing path. NACLs, peering, rootless Docker and Windows containers are unsupported.
 
 With VPC Docker networks enabled, the protected EC2 namespace also joins its VPC
 at the instance's allocated private IP. Guests can bind and reach that address;
@@ -1183,6 +1183,23 @@ an instance, network interface, NAT gateway or interface endpoint already holds 
 parameters (`SecondaryAllocationIds`, `SecondaryPrivateIpAddresses` and
 `SecondaryPrivateIpAddressCount`) fail with `UnsupportedOperation` before anything is created.
 
+`FLOCI_NETWORK_VPC_ROUTING_ENABLED=true` additionally enables an experimental IPv4
+packet path from protected workloads through public NAT gateways to managed
+internet-facing [Classic frontends](elb-classic.md#protected-frontends).
+It requires EC2 VPC networks, native private addresses and security-group enforcement.
+The frontend observes the allocated NAT Elastic IP. The workload's NAT route and
+both the NAT and frontend subnets' internet-gateway routes must exist; missing or
+unsupported routes drop traffic. Frontend security-group ingress remains a
+separate requirement.
+
+In this mode, public NAT creation without an attached internet gateway returns a
+failed gateway with failure code `Gateway.NotAttached`. Runtime programming errors fail route API calls.
+Deleting a NAT removes forwarding before releasing its addresses; a remaining
+namespace consumer prevents retirement and keeps the reservation for a retry.
+This is limited to managed public destinations, with no general internet,
+private NAT, multi-address NAT, IPv6/NAT64, peering or NACL forwarding.
+See the [routing design and qualification limits](../design/vpc-public-routing.md).
+
 ### Capacity Reservations
 
 | Action | Description |
@@ -1809,6 +1826,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP` | `true` | Remove VPC networks left behind by a previous run of this same emulator. Whatever its value, the network a previous run created for a VPC that still exists is kept, and goes when that VPC is deleted |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER` | `bridge` | Docker network driver used for VPC networks |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL` | `false` | Create internal Docker VPC networks without external connectivity through that network |
+| `FLOCI_NETWORK_VPC_ROUTING_ENABLED` | `false` | Enforce native IPv4 routes and public NAT for protected workloads reaching managed Classic frontends |
 
 ## VPC Docker networks
 

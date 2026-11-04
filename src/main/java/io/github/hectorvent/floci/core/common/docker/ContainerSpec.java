@@ -138,6 +138,10 @@ public record ContainerSpec(
         if (linuxOptions == null) {
             linuxOptions = LinuxOptions.NONE;
         }
+        if (!linuxOptions.networkSysctls().isEmpty()
+                && ("host".equals(networkMode) || networkMode != null && networkMode.startsWith("container:"))) {
+            throw new IllegalArgumentException("Network sysctls require a container-owned network namespace");
+        }
         if (linkLocalIps != null && !linkLocalIps.isEmpty()) {
             requireUserDefinedNetwork(networkMode);
             linkLocalIps.forEach(ContainerSpec::requireLinkLocalIpv4);

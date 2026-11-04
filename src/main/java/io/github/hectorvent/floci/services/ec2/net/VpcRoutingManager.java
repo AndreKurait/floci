@@ -1,0 +1,626 @@
+package io.github.hectorvent.floci.services.ec2.net;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.Network;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerExec;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.LocallyBuiltHelperImage;
+import io.github.hectorvent.floci.core.common.docker.NetworkNamespaceLease;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
+import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
+import io.github.hectorvent.floci.services.ec2.model.NatGateway;
+import io.github.hectorvent.floci.services.ec2.model.NatGatewayAddress;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
+import io.github.hectorvent.floci.services.ec2.model.Route;
+import io.github.hectorvent.floci.services.ec2.model.RouteTable;
+import jakarta.annotation.PreDestroy;
+import jakarta.enterprise.context.ApplicationScoped;
+import org.jboss.logging.Logger;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+/** Materializes native IPv4 NAT and internet routes between isolated, managed public endpoints. */
+@ApplicationScoped
+public class VpcRoutingManager implements ContainerTeardown, Resettable {
+    private static final Logger LOG = Logger.getLogger(VpcRoutingManager.class);
+    private static final String COMPONENT = "vpc-public-transport";
+    private static final String NAT_SERVICE = "vpc-nat";
+
+    private final EmulatorConfig config;
+    private final Ec2Service ec2;
+    private final VpcNetworkManager vpcs;
+    private final DockerClient docker;
+    private final ContainerBuilder containers;
+    private final ContainerLifecycleManager lifecycle;
+    private final ObjectMapper mapper;
+    private final Map<String, Endpoint> endpoints = new LinkedHashMap<>();
+    private final Map<String, PublicAddress> publicAddresses = new LinkedHashMap<>();
+    private final Map<String, NatRuntime> nats = new LinkedHashMap<>();
+    private String publicNetwork;
+    private boolean draining;
+
+    public VpcRoutingManager(EmulatorConfig config, Ec2Service ec2, VpcNetworkManager vpcs,
+                             DockerClient docker, ContainerBuilder containers,
+                             ContainerLifecycleManager lifecycle, ObjectMapper mapper) {
+        this.config = config;
+        this.ec2 = ec2;
+        this.vpcs = vpcs;
+        this.docker = docker;
+        this.containers = containers;
+        this.lifecycle = lifecycle;
+        this.mapper = mapper;
+    }
+
+    public boolean enabled() {
+        return config.network().vpcRouting().enabled();
+    }
+
+    public void validateConfiguration() {
+        if (!vpcs.enabled() || !config.services().ec2().awsFaithfulPrivateIp()
+                || !config.network().securityGroupEnforcement().enabled()) {
+            throw new AwsException("UnsupportedOperation",
+                    "VPC packet routing requires real VPC networks, native private IPs and security-group enforcement.",
+                    400);
+        }
+    }
+
+    public boolean hasInternetGateway(String region, String vpc) {
+        return ec2.describeInternetGateways(region, List.of(), Map.of()).stream()
+                .anyMatch(gateway -> gateway.getAttachments().stream().anyMatch(attachment ->
+                        vpc.equals(attachment.getVpcId()) && "available".equals(attachment.getState())));
+    }
+
+    /** Called while the namespace still has its initial security-group deny policy. */
+    public synchronized void register(SecurityGroupNftCompiler.Endpoint identity, String helper,
+                                      List<String> resolvers) {
+        if (!enabled()) {
+            return;
+        }
+        requireActive();
+        validateConfiguration();
+        RequestScopes.runAs(identity.accountId(), identity.region(), () -> {
+            NetworkInterface eni = ec2.describeNetworkInterfaces(identity.accountId(), identity.region(),
+                    List.of(identity.eniId()), Map.of()).networkInterfaces().getFirst();
+            if (!identity.vpcId().equals(eni.getVpcId())
+                    || !identity.logicalAddress().equals(eni.getPrivateIpAddress())) {
+                throw new IllegalStateException("Protected namespace does not match its native network interface");
+            }
+            String device = deviceFor(helper, identity.logicalAddress());
+            Endpoint endpoint = new Endpoint(identity, eni.getSubnetId(), helper, device, List.copyOf(resolvers));
+            endpoints.put(key(identity.accountId(), identity.region(), identity.eniId()), endpoint);
+            run(helper, VpcRoutingCommands.endpointGuard());
+            reconcile();
+        });
+    }
+
+    /** The owning service removes the namespace before releasing its native interface. */
+    public synchronized void unregister(String account, String region, String eni) {
+        if (!enabled()) {
+            return;
+        }
+        String key = key(account, region, eni);
+        Endpoint endpoint = endpoints.get(key);
+        PublicAddress address = publicAddresses.get(key);
+        if (address != null) {
+            address.namespace.requireUnused(docker);
+            if (exists(address.namespace.id())) {
+                throw new IllegalStateException("Public namespace must retire before its address is released");
+            }
+        }
+        endpoints.remove(key, endpoint);
+        publicAddresses.remove(key, address);
+        reconcile();
+        removeEmptyPublicNetwork();
+    }
+
+    public synchronized void unregister(String eni) {
+        for (Endpoint endpoint : List.copyOf(endpoints.values())) {
+            if (eni.equals(endpoint.identity.eniId())) {
+                unregister(endpoint.identity.accountId(), endpoint.identity.region(), eni);
+            }
+        }
+    }
+
+    public synchronized String attachPublicFrontend(String account, String region, NetworkInterface eni,
+                                                   String helper) {
+        if (!enabled()) {
+            throw new AwsException("UnsupportedOperation", "Public protected frontends require VPC packet routing.", 400);
+        }
+        requireActive();
+        validateConfiguration();
+        String key = key(account, region, eni.getNetworkInterfaceId());
+        if (publicAddresses.containsKey(key)) {
+            throw new IllegalStateException("This interface already owns a public address");
+        }
+        String publicIp = allocateFrontendAddress();
+        NetworkNamespaceLease namespace = namespace(helper);
+        PublicAddress address = new PublicAddress(publicIp, namespace);
+        publicAddresses.put(key, address);
+        String network = publicNetwork();
+        docker.connectToNetworkCmd().withNetworkId(network).withContainerId(helper).exec();
+        address.transport = networkAddress(helper, network);
+        address.device = deviceFor(helper, address.transport);
+        run(helper, VpcRoutingCommands.publicAddress(publicIp, eni.getPrivateIpAddress(), address.device));
+        return publicIp;
+    }
+
+    public synchronized Optional<String> publicAddress(String account, String region, String eni) {
+        PublicAddress address = publicAddresses.get(key(account, region, eni));
+        return address == null ? Optional.empty() : Optional.of(address.address);
+    }
+
+    /** Create holds the native EIP and private address before attaching the runtime. */
+    public synchronized void createNat(String account, String region, NatGateway gateway) {
+        if (!enabled()) {
+            return;
+        }
+        requireActive();
+        validateConfiguration();
+        String key = key(account, region, gateway.getNatGatewayId());
+        if (nats.containsKey(key)) {
+            return;
+        }
+        if (!"public".equals(gateway.getConnectivityType()) || gateway.getNatGatewayAddresses().size() != 1) {
+            throw new AwsException("UnsupportedOperation", "Packet routing supports single-address public NAT gateways.",
+                    400);
+        }
+        NatGatewayAddress address = gateway.getNatGatewayAddresses().getFirst();
+        String privateIp = VpcRouteSelection.ipv4(address.getPrivateIp());
+        String publicIp = VpcRouteSelection.ipv4(address.getPublicIp());
+        // Ec2Service already reserves this address through its native NAT declaration
+        // and, for automatically assigned addresses, its VPC allocation lease.
+        NatRuntime runtime = new NatRuntime(account, region, gateway.getVpcId(),
+                gateway.getSubnetId(), privateIp, publicIp);
+        nats.put(key, runtime);
+        try {
+            LocallyBuiltHelperImage.ensureBuilt(docker, containers,
+                    config.network().securityGroupEnforcement().helperImage(), "floci/network-helper:local",
+                    "/docker/network-helper.Dockerfile");
+            String network = publicNetwork();
+            ContainerSpec spec = containers.newContainer(config.network().securityGroupEnforcement().helperImage())
+                    .withName(ContainerStorageHelper.resourceName(config, NAT_SERVICE, null,
+                            gateway.getNatGatewayId() + "-" + UUID.randomUUID()))
+                    .withDockerNetwork(Optional.of(network)).withCapAdd("NET_ADMIN")
+                    .withNetworkSysctl("net.ipv4.ip_forward", "1")
+                    .withNetworkSysctl("net.ipv4.conf.all.rp_filter", "0")
+                    .withNetworkSysctl("net.ipv4.conf.default.rp_filter", "0")
+                    .withEntrypoint(List.of("sh", "-c")).withCmd(List.of("exec sleep 2147483647"))
+                    .withLabels(ContainerStorageHelper.resourceIdentityLabels(
+                            NAT_SERVICE, gateway.getNatGatewayId(), account, region))
+                    .withLabels(Map.of(ContainerStorageHelper.OWNER_LABEL, owner()))
+                    .build();
+            runtime.namespace = namespace(lifecycle.createAndStart(spec).containerId());
+            run(runtime.namespace.id(), VpcRoutingCommands.natGuard());
+            if (vpcs.attach(region, gateway.getVpcId(), gateway.getSubnetId(),
+                    runtime.namespace.id(), privateIp).isEmpty()) {
+                throw new IllegalStateException("Cannot attach the NAT gateway at its native private address");
+            }
+            runtime.transport = networkAddress(runtime.namespace.id(), network);
+            runtime.privateDevice = deviceFor(runtime.namespace.id(), privateIp);
+            runtime.publicDevice = deviceFor(runtime.namespace.id(), runtime.transport);
+        } catch (RuntimeException failure) {
+            try {
+                retireNat(runtime);
+                nats.remove(key, runtime);
+            } catch (RuntimeException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    /** A failed retirement keeps the runtime record and the native allocation for a later retry. */
+    public synchronized void prepareNatDeletion(String account, String region, String id) {
+        NatRuntime runtime = nats.get(key(account, region, id));
+        if (runtime != null) {
+            runtime.retiring = true;
+            retireNat(runtime);
+        }
+    }
+
+    public synchronized void natDeleted(String account, String region, String id) {
+        nats.remove(key(account, region, id));
+        reconcile();
+        removeEmptyPublicNetwork();
+    }
+
+    /** Also called for internet-gateway attachment and NAT lifecycle changes. */
+    public synchronized void reconcile() {
+        if (!enabled() || draining) {
+            return;
+        }
+        try {
+            for (Endpoint endpoint : List.copyOf(endpoints.values())) {
+                RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(), () -> {
+                    Topology topology = topology(endpoint.identity.region());
+                    for (NatGateway gateway : topology.nats) {
+                        if ("available".equals(gateway.getState()) && "public".equals(gateway.getConnectivityType())
+                                && endpoint.identity.vpcId().equals(gateway.getVpcId())) {
+                            createNat(endpoint.identity.accountId(), endpoint.identity.region(), gateway);
+                        }
+                    }
+                });
+            }
+            for (NatRuntime nat : List.copyOf(nats.values())) {
+                if (!nat.retiring && nat.namespace != null) {
+                    RequestScopes.runAs(nat.account, nat.region, () -> configureNat(nat, topology(nat.region)));
+                }
+            }
+            for (Endpoint endpoint : List.copyOf(endpoints.values())) {
+                RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(),
+                        () -> configureEndpoint(endpoint, topology(endpoint.identity.region())));
+            }
+        } catch (RuntimeException failure) {
+            for (Endpoint endpoint : endpoints.values()) {
+                endpoint.applied = null;
+                quarantine(endpoint.helper, false, failure);
+            }
+            for (NatRuntime nat : nats.values()) {
+                nat.applied = null;
+                if (nat.namespace != null) {
+                    quarantine(nat.namespace.id(), true, failure);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private void configureNat(NatRuntime nat, Topology topology) {
+        List<VpcRouteSelection.Entry> routes = routes(nat.region, nat.vpc, nat.subnet, topology);
+        List<VpcRoutingCommands.Hop> destinations = new ArrayList<>();
+        for (PublicAddress address : publicAddresses.values()) {
+            if (address.transport != null && internet(address.address, routes, nat.vpc, topology)) {
+                destinations.add(new VpcRoutingCommands.Hop(address.address, address.transport,
+                        nat.publicDevice, false));
+            }
+        }
+        String script = VpcRoutingCommands.nat(nat.publicIp, vpcCidr(nat.region, nat.vpc), nat.privateDevice,
+                nat.publicDevice, destinations);
+        if (!script.equals(nat.applied)) {
+            run(nat.namespace.id(), VpcRoutingCommands.natGuard());
+            nat.applied = null;
+            run(nat.namespace.id(), script);
+            nat.applied = script;
+        }
+    }
+
+    private void configureEndpoint(Endpoint endpoint, Topology topology) {
+        SecurityGroupNftCompiler.Endpoint identity = endpoint.identity;
+        String account = identity.accountId();
+        String region = identity.region();
+        String vpc = identity.vpcId();
+        List<VpcRouteSelection.Entry> routes = routes(region, vpc, endpoint.subnet, topology);
+        PublicAddress own = publicAddresses.get(key(account, region, identity.eniId()));
+        List<VpcRoutingCommands.Hop> hops = new ArrayList<>();
+        for (PublicAddress destination : publicAddresses.values()) {
+            if (destination.transport == null || destination == own) {
+                continue;
+            }
+            Route route = VpcRouteSelection.to(destination.address, routes).orElse(null);
+            Optional<NatGateway> gateway = VpcRouteSelection.nat(route, vpc, topology.nats);
+            NatRuntime nat = gateway.map(value -> nats.get(key(account, region, value.getNatGatewayId()))).orElse(null);
+            if (nat != null && !nat.retiring && nat.namespace != null
+                    && internet(destination.address, routes(region, nat.vpc, nat.subnet, topology), nat.vpc, topology)) {
+                hops.add(new VpcRoutingCommands.Hop(destination.address, nat.privateIp, endpoint.privateDevice, false));
+            } else if (own != null && VpcRouteSelection.internet(route, vpc, topology.gateways)) {
+                hops.add(new VpcRoutingCommands.Hop(destination.address, destination.transport, own.device, false));
+            }
+        }
+        List<String> inbound = new ArrayList<>();
+        if (own != null) {
+            for (NatRuntime nat : nats.values()) {
+                if (!nat.retiring && nat.transport != null && internet(nat.publicIp, routes, vpc, topology)) {
+                    hops.add(new VpcRoutingCommands.Hop(nat.publicIp, nat.transport, own.device, true));
+                    inbound.add(nat.publicIp);
+                }
+            }
+        }
+        Cidr4 vpcCidr = vpcCidr(region, vpc);
+        List<VpcRoutingCommands.LocalRoute> local = routes.stream().map(route -> new VpcRoutingCommands.LocalRoute(
+                route.destination(), VpcRouteSelection.local(route.route()) && vpcCidr.contains(route.destination())))
+                .toList();
+        String script = VpcRoutingCommands.endpoint(identity.logicalAddress(), local, hops, endpoint.resolvers,
+                identity.controlConnections(), identity.instanceMetadataAllowed(), own == null ? null : own.device,
+                inbound);
+        if (!script.equals(endpoint.applied)) {
+            run(endpoint.helper, VpcRoutingCommands.endpointGuard());
+            endpoint.applied = null;
+            run(endpoint.helper, script);
+            endpoint.applied = script;
+        }
+    }
+
+    private List<VpcRouteSelection.Entry> routes(String region, String vpc, String subnet, Topology topology) {
+        return VpcRouteSelection.entries(vpc, subnet, topology.tables, prefix ->
+                ec2.getManagedPrefixListEntries(region, prefix, null).stream().map(PrefixListEntry::getCidr).toList());
+    }
+
+    private boolean internet(String destination, List<VpcRouteSelection.Entry> routes, String vpc, Topology topology) {
+        return VpcRouteSelection.internet(VpcRouteSelection.to(destination, routes).orElse(null), vpc, topology.gateways);
+    }
+
+    private Topology topology(String region) {
+        return new Topology(ec2.describeRouteTables(region, List.of(), Map.of()),
+                ec2.describeNatGateways(region, List.of(), Map.of()),
+                ec2.describeInternetGateways(region, List.of(), Map.of()));
+    }
+
+    private Cidr4 vpcCidr(String region, String vpc) {
+        return VpcRouteSelection.cidr(vpcs.effectiveVpcCidr(region, vpc)
+                .orElseThrow(() -> new IllegalStateException("Native VPC has no packet network")));
+    }
+
+    private String publicNetwork() {
+        if (publicNetwork != null) {
+            return publicNetwork;
+        }
+        String name = ContainerStorageHelper.resourceName(config, COMPONENT, null, "network");
+        try {
+            Network existing = docker.inspectNetworkCmd().withNetworkId(name).exec();
+            if (!owner().equals(existing.getLabels().get(ContainerStorageHelper.OWNER_LABEL))
+                    || !COMPONENT.equals(existing.getLabels().get(ContainerStorageHelper.COMPONENT_LABEL))
+                    || Boolean.TRUE.equals(existing.getInternal())
+                    || existing.getOptions() == null
+                    || !"false".equals(existing.getOptions().get("com.docker.network.bridge.enable_ip_masquerade"))) {
+                throw new IllegalStateException("Public transport name belongs to a different network");
+            }
+            publicNetwork = existing.getId();
+        } catch (NotFoundException absent) {
+            // Docker's internal bridge drops packets whose native public source or destination
+            // is outside its transport subnet. Namespace filters and explicit routes own isolation.
+            publicNetwork = docker.createNetworkCmd().withName(name).withInternal(false)
+                    .withOptions(Map.of("com.docker.network.bridge.enable_ip_masquerade", "false"))
+                    .withLabels(Map.of(ContainerStorageHelper.OWNER_LABEL, owner(),
+                            ContainerStorageHelper.COMPONENT_LABEL, COMPONENT))
+                    .exec().getId();
+        }
+        return publicNetwork;
+    }
+
+    private String allocateFrontendAddress() {
+        Set<String> allocated = publicAddresses.values().stream().map(address -> address.address)
+                .collect(Collectors.toSet());
+        for (int host = 1; host <= 254; host++) {
+            String candidate = "198.51.100." + host;
+            if (!allocated.contains(candidate)) {
+                return candidate;
+            }
+        }
+        throw new AwsException("TooManyLoadBalancers", "The managed public IPv4 address pool is exhausted.", 400);
+    }
+
+    private String networkAddress(String helper, String network) {
+        return docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks().values().stream()
+                .filter(value -> network.equals(value.getNetworkID())).map(ContainerNetwork::getIpAddress)
+                .filter(value -> value != null && !value.isBlank()).findFirst()
+                .orElseThrow(() -> new IllegalStateException("Public transport attachment has no address"));
+    }
+
+    private String deviceFor(String helper, String address) {
+        String literal = VpcRouteSelection.ipv4(address);
+        ContainerExec.Result result = ContainerExec.run(docker, helper, new String[]{"ip", "-j", "-4", "address"}, 10)
+                .throwIfTimedOut(helper);
+        if (result.exitCode() != 0) {
+            throw new IllegalStateException("Cannot inspect namespace addresses: " + result.summary());
+        }
+        try {
+            List<String> matches = new ArrayList<>();
+            for (JsonNode device : mapper.readTree(result.stdout())) {
+                for (JsonNode value : device.path("addr_info")) {
+                    if (literal.equals(value.path("local").asText())) {
+                        matches.add(VpcRoutingCommands.device(device.path("ifname").asText()));
+                    }
+                }
+            }
+            if (matches.size() != 1) {
+                throw new IllegalStateException("Native address is absent or ambiguous inside its namespace: " + literal);
+            }
+            return matches.getFirst();
+        } catch (IOException failure) {
+            throw new IllegalStateException("Cannot decode namespace addresses", failure);
+        }
+    }
+
+    private NetworkNamespaceLease namespace(String helper) {
+        InspectContainerResponse inspection = docker.inspectContainerCmd(helper).exec();
+        return new NetworkNamespaceLease(helper, inspection.getName());
+    }
+
+    private void retireNat(NatRuntime runtime) {
+        runtime.retiring = true;
+        if (runtime.namespace != null) {
+            if (running(runtime.namespace.id())) {
+                run(runtime.namespace.id(), VpcRoutingCommands.natGuard());
+            }
+            runtime.applied = null;
+            runtime.namespace.requireUnused(docker);
+            lifecycle.removeIfExistsStrict(runtime.namespace.id());
+        }
+        // The native owner releases the address only after this retirement succeeds.
+    }
+
+    private boolean exists(String id) {
+        try {
+            docker.inspectContainerCmd(id).exec();
+            return true;
+        } catch (NotFoundException absent) {
+            return false;
+        }
+    }
+
+    private boolean running(String id) {
+        try {
+            return Boolean.TRUE.equals(docker.inspectContainerCmd(id).exec().getState().getRunning());
+        } catch (NotFoundException absent) {
+            return false;
+        }
+    }
+
+    private void quarantine(String helper, boolean nat, RuntimeException failure) {
+        try {
+            run(helper, nat ? VpcRoutingCommands.natGuard() : VpcRoutingCommands.endpointGuard());
+        } catch (RuntimeException guardFailure) {
+            failure.addSuppressed(guardFailure);
+            try {
+                docker.stopContainerCmd(helper).withTimeout(0).exec();
+            } catch (RuntimeException stopFailure) {
+                failure.addSuppressed(stopFailure);
+                LOG.errorv(stopFailure, "Could not quarantine VPC namespace {0}", helper);
+            }
+        }
+    }
+
+    private void run(String helper, String script) {
+        ContainerExec.Result result = ContainerExec.run(docker, helper, new String[]{"sh", "-c", script}, 20)
+                .throwIfTimedOut(helper);
+        if (result.exitCode() != 0) {
+            throw new IllegalStateException("Cannot reconcile native VPC routing: " + result.summary());
+        }
+    }
+
+    private void removeEmptyPublicNetwork() {
+        if (publicNetwork == null || !nats.isEmpty() || !publicAddresses.isEmpty()) {
+            return;
+        }
+        try {
+            Network network = docker.inspectNetworkCmd().withNetworkId(publicNetwork).exec();
+            if (network.getContainers() != null && !network.getContainers().isEmpty()) {
+                return;
+            }
+            docker.removeNetworkCmd(publicNetwork).exec();
+            publicNetwork = null;
+        } catch (NotFoundException absent) {
+            publicNetwork = null;
+        }
+    }
+
+    @PreDestroy
+    void close() {
+        stopManagedContainers();
+    }
+
+    @Override
+    public synchronized void stopManagedContainers() {
+        draining = true;
+        for (Map.Entry<String, NatRuntime> entry : List.copyOf(nats.entrySet())) {
+            try {
+                retireNat(entry.getValue());
+                nats.remove(entry.getKey(), entry.getValue());
+            } catch (RuntimeException failure) {
+                LOG.errorv(failure, "NAT namespace remains reserved during shutdown: {0}", entry.getKey());
+            }
+        }
+        removeEmptyPublicNetwork();
+    }
+
+    @Override
+    public synchronized void beforeReset() {
+        draining = true;
+    }
+
+    @Override
+    public synchronized void clear() {
+        removeEmptyPublicNetwork();
+        if (!endpoints.isEmpty() || !nats.isEmpty() || !publicAddresses.isEmpty() || publicNetwork != null) {
+            throw new IllegalStateException("VPC packet resources have not finished retirement");
+        }
+    }
+
+    @Override
+    public synchronized void afterReset() {
+        draining = false;
+    }
+
+    private void requireActive() {
+        if (draining) {
+            throw new IllegalStateException("VPC packet routing is shutting down or resetting");
+        }
+    }
+
+    private String owner() {
+        return ContainerStorageHelper.ownerIdentity(config);
+    }
+
+    private String key(String account, String region, String id) {
+        return account + "/" + region + "/" + id;
+    }
+
+    private record Topology(List<RouteTable> tables, List<NatGateway> nats, List<InternetGateway> gateways) {}
+
+    private static final class Endpoint {
+        final SecurityGroupNftCompiler.Endpoint identity;
+        final String subnet;
+        final String helper;
+        final String privateDevice;
+        final List<String> resolvers;
+        String applied;
+
+        Endpoint(SecurityGroupNftCompiler.Endpoint identity, String subnet, String helper,
+                 String privateDevice, List<String> resolvers) {
+            this.identity = identity;
+            this.subnet = subnet;
+            this.helper = helper;
+            this.privateDevice = privateDevice;
+            this.resolvers = resolvers;
+        }
+    }
+
+    private static final class PublicAddress {
+        final String address;
+        final NetworkNamespaceLease namespace;
+        String transport;
+        String device;
+
+        PublicAddress(String address, NetworkNamespaceLease namespace) {
+            this.address = address;
+            this.namespace = namespace;
+        }
+    }
+
+    private static final class NatRuntime {
+        final String account;
+        final String region;
+        final String vpc;
+        final String subnet;
+        final String privateIp;
+        final String publicIp;
+        NetworkNamespaceLease namespace;
+        String transport;
+        String privateDevice;
+        String publicDevice;
+        String applied;
+        boolean retiring;
+
+        NatRuntime(String account, String region, String vpc, String subnet, String privateIp, String publicIp) {
+            this.account = account;
+            this.region = region;
+            this.vpc = vpc;
+            this.subnet = subnet;
+            this.privateIp = privateIp;
+            this.publicIp = publicIp;
+        }
+    }
+}

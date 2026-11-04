@@ -18,6 +18,8 @@ quarkus:
 floci:
   base-url: "http://localhost:4566"
   network:
+    vpc-routing:
+      enabled: false
     security-group-enforcement:
       enabled: true
       helper-image: floci/network-helper:local

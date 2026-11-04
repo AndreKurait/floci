@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.NetworkNamespaceLease;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -26,6 +27,7 @@ import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
+import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
 import io.github.hectorvent.floci.services.iam.IamService;
 import jakarta.annotation.PreDestroy;
@@ -56,6 +58,7 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
     private final Ec2Service ec2;
     private final SecurityGroupFirewallManager firewall;
     private final VpcNetworkManager vpcNetworks;
+    private final VpcRoutingManager routing;
     private final ContainerBuilder containers;
     private final ContainerLifecycleManager lifecycle;
     private final DockerClient docker;
@@ -67,11 +70,12 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
     public ElbClassicFrontendManager(EmulatorConfig config, Ec2Service ec2,
                                     SecurityGroupFirewallManager firewall, VpcNetworkManager vpcNetworks,
                                     ContainerBuilder containers, ContainerLifecycleManager lifecycle,
-                                    ObjectMapper mapper, IamService iam, AcmService acm) {
+                                    ObjectMapper mapper, IamService iam, AcmService acm, VpcRoutingManager routing) {
         this.config = config;
         this.ec2 = ec2;
         this.firewall = firewall;
         this.vpcNetworks = vpcNetworks;
+        this.routing = routing;
         this.containers = containers;
         this.lifecycle = lifecycle;
         this.docker = lifecycle.getDockerClient();
@@ -129,9 +133,11 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
                     "Protected Classic frontends require real ELB, VPC networks, native private IPs "
                             + "and security-group enforcement.", 400);
         }
-        if (!"internal".equals(loadBalancer.getScheme()) || loadBalancer.getSubnets().size() != 1) {
+        if (loadBalancer.getSubnets().size() != 1
+                || !"internal".equals(loadBalancer.getScheme())
+                && !("internet-facing".equals(loadBalancer.getScheme()) && routing.enabled())) {
             throw new AwsException("UnsupportedOperation",
-                    "Protected Classic frontends currently support one IPv4 subnet and the internal scheme.", 400);
+                    "Protected Classic frontends support one IPv4 subnet; public frontends also need VPC routing.", 400);
         }
         if (loadBalancer.getSecurityGroups().isEmpty()) {
             throw new AwsException("InvalidConfigurationRequest", "A protected frontend needs security groups.", 400);
@@ -166,12 +172,15 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
             ec2.holdNetworkInterfaceForService(region, eni.getNetworkInterfaceId());
             SecurityGroupFirewallManager.Namespace namespace = firewall.createNamespace(SERVICE, resource,
                     account, region, Optional.empty(), Map.of(), Map.of(ENI_LABEL, eni.getNetworkInterfaceId()));
-            pending = pending.withNamespace(new NetworkNamespace(namespace.helperId(), null));
-            pending = pending.withNamespace(new NetworkNamespace(namespace.helperId(),
+            pending = pending.withNamespace(new NetworkNamespaceLease(namespace.helperId(), null));
+            pending = pending.withNamespace(new NetworkNamespaceLease(namespace.helperId(),
                     docker.inspectContainerCmd(namespace.helperId()).exec().getName()));
             if (vpcNetworks.attach(region, eni.getVpcId(), eni.getSubnetId(),
                     namespace.helperId(), eni.getPrivateIpAddress()).isEmpty()) {
                 throw new IllegalStateException("Classic frontend could not attach to its VPC");
+            }
+            if ("internet-facing".equals(loadBalancer.getScheme())) {
+                routing.attachPublicFrontend(account, region, eni, namespace.helperId());
             }
             List<SecurityGroup> groups = ec2.describeSecurityGroups(region,
                     loadBalancer.getSecurityGroups(), List.of(), Map.of());
@@ -237,7 +246,8 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
 
     Optional<String> address(ClassicLoadBalancer loadBalancer) {
         Frontend frontend = frontends.get(key(loadBalancer));
-        return frontend == null ? Optional.empty() : Optional.of(frontend.address());
+        return frontend == null ? Optional.empty() : Optional.of(routing.publicAddress(
+                frontend.account(), frontend.region(), frontend.eni()).orElse(frontend.address()));
     }
 
     record Probe(Frontend frontend, String instanceId, String address) {}
@@ -327,9 +337,10 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
             lifecycle.stopAndRemoveStrict(frontend.proxy(), null, 1);
         }
         if (frontend.helper() != null) {
-            requireUnusedNamespace(frontend.namespace());
+            frontend.namespace().requireUnused(docker);
             lifecycle.removeIfExistsStrict(frontend.helper());
             firewall.unregister(frontend.eni());
+            routing.unregister(frontend.account(), frontend.region(), frontend.eni());
         }
         ec2.releaseNetworkInterfaceFromService(frontend.region(), frontend.eni());
         try {
@@ -337,23 +348,6 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         } catch (AwsException failure) {
             if (!"InvalidNetworkInterfaceID.NotFound".equals(failure.getErrorCode())) {
                 throw failure;
-            }
-        }
-    }
-
-    private void requireUnusedNamespace(NetworkNamespace namespace) {
-        for (Container container : docker.listContainersCmd().withShowAll(true).exec()) {
-            try {
-                String mode = docker.inspectContainerCmd(container.getId()).exec().getHostConfig().getNetworkMode();
-                if (mode != null && mode.startsWith("container:")) {
-                    String reference = mode.substring("container:".length());
-                    if (namespace.id().equals(reference) || reference.equals(namespace.name())
-                            || namespace.id().equals(docker.inspectContainerCmd(reference).exec().getId())) {
-                        throw new IllegalStateException("Classic namespace still has a consumer: " + container.getId());
-                    }
-                }
-            } catch (NotFoundException ignored) {
-                // Removed containers can disappear during this inspection.
             }
         }
     }
@@ -425,7 +419,7 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
             }
             RequestScopes.callAs(account, region, () -> {
                 release(new Frontend(account, region, "", eni, null,
-                        new NetworkNamespace(container.getId(), container.getNames()[0]), null, Map.of(), Map.of()));
+                        new NetworkNamespaceLease(container.getId(), container.getNames()[0]), null, Map.of(), Map.of()));
                 return null;
             });
         }
@@ -456,22 +450,14 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         return account(loadBalancer) + "/" + loadBalancer.getRegion() + "/" + loadBalancer.getLoadBalancerName();
     }
 
-    record NetworkNamespace(String id, String name) {
-        NetworkNamespace {
-            if (name != null && name.startsWith("/")) {
-                name = name.substring(1);
-            }
-        }
-    }
-
     record Frontend(String account, String region, String state, String eni, String address,
-                    NetworkNamespace namespace, String proxy,
+                    NetworkNamespaceLease namespace, String proxy,
                     Map<String, List<String>> servers, Map<String, String> backends) {
         String helper() {
             return namespace == null ? null : namespace.id();
         }
 
-        Frontend withNamespace(NetworkNamespace value) {
+        Frontend withNamespace(NetworkNamespaceLease value) {
             return new Frontend(account, region, state, eni, address, value, proxy, servers, backends);
         }
 

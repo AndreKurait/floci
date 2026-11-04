@@ -1429,6 +1429,9 @@ public class ContainerLifecycleManager {
             hostConfig.withPrivileged(true);
         }
         LinuxOptions linux = spec.linuxOptions();
+        if (!linux.networkSysctls().isEmpty()) {
+            hostConfig.withSysctls(linux.networkSysctls());
+        }
         List<Capability> capDrop = new ArrayList<>();
         List<Capability> capAdd = capabilities(linux.capAdd());
         if ("true".equals(ContainerStorageHelper.labelValue(

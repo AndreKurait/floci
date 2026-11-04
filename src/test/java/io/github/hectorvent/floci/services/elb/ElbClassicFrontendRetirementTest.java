@@ -6,10 +6,12 @@ import com.github.dockerjava.api.command.ListContainersCmd;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.NetworkNamespaceLease;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
+import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
 import io.github.hectorvent.floci.services.iam.IamService;
 import org.junit.jupiter.api.Test;
@@ -50,7 +52,8 @@ class ElbClassicFrontendRetirementTest {
         when(listContainers.exec()).thenReturn(List.of());
         manager = new ElbClassicFrontendManager(mock(EmulatorConfig.class), ec2,
                 mock(SecurityGroupFirewallManager.class), mock(VpcNetworkManager.class),
-                mock(ContainerBuilder.class), lifecycle, new ObjectMapper(), mock(IamService.class), mock(AcmService.class));
+                mock(ContainerBuilder.class), lifecycle, new ObjectMapper(), mock(IamService.class),
+                mock(AcmService.class), mock(VpcRoutingManager.class));
         Field field = ElbClassicFrontendManager.class.getDeclaredField("frontends");
         field.setAccessible(true);
         frontends = (Map<String, ElbClassicFrontendManager.Frontend>) field.get(manager);
@@ -141,7 +144,7 @@ class ElbClassicFrontendRetirementTest {
     private ElbClassicFrontendManager.Frontend install(ClassicLoadBalancer loadBalancer) {
         ElbClassicFrontendManager.Frontend frontend = new ElbClassicFrontendManager.Frontend(
                 ACCOUNT, REGION, "", "eni", "10.0.1.11",
-                new ElbClassicFrontendManager.NetworkNamespace("helper", "helper-name"), "proxy",
+                new NetworkNamespaceLease("helper", "helper-name"), "proxy",
                 Map.of("instance", List.of("backend/server")), Map.of("instance", "10.0.1.10"));
         frontends.put(ACCOUNT + "/" + REGION + "/" + loadBalancer.getLoadBalancerName(), frontend);
         return frontend;
