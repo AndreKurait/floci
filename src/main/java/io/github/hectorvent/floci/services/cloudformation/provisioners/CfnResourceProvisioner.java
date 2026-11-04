@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.LongNode;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 
@@ -52,6 +53,18 @@ public interface CfnResourceProvisioner {
     }
 
     void provision(StackResource resource, JsonNode properties, ProvisionContext ctx);
+
+    /** Read-only identifier properties accepted when importing an existing resource. */
+    default Set<String> importIdentifiers(String resourceType) {
+        return Set.of();
+    }
+
+    /** Reads an existing entity and sets its reference attributes without changing the entity. */
+    default void importResource(StackResource resource, JsonNode properties, Map<String, String> identifiers,
+                                ProvisionContext ctx) {
+        throw new AwsException("ValidationError",
+                "Resource import is not supported for " + resource.getResourceType(), 400);
+    }
 
     /**
      * True when the service this provisioner wraps is turned off. {@link CloudFormationResourceRegistry}

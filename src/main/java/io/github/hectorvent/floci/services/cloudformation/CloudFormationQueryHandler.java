@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
+import io.github.hectorvent.floci.services.cloudformation.model.ResourceToImport;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackInstance;
@@ -279,9 +280,11 @@ public class CloudFormationQueryHandler {
         // internally, may attach a CREATE change set to a stack still in REVIEW_IN_PROGRESS.
         ChangeSet cs = usePreviousTemplate
                 ? cfnService.createChangeSetFromPreviousTemplate(stackName, changeSetName,
-                        parameters, capabilities, tags, region, params.getFirst("RoleARN"))
+                        parameters, capabilities, tags, region, params.getFirst("RoleARN"),
+                        changeSetType, extractResourcesToImport(params))
                 : cfnService.createChangeSetForRequest(stackName, changeSetName, changeSetType,
-                        templateBody, templateUrl, parameters, capabilities, tags, region, params.getFirst("RoleARN"));
+                        templateBody, templateUrl, parameters, capabilities, tags, region, params.getFirst("RoleARN"),
+                        extractResourcesToImport(params));
 
         String xml = new XmlBuilder()
                 .start("CreateChangeSetResponse", CF_NS)
@@ -583,7 +586,15 @@ public class CloudFormationQueryHandler {
             }
             xml.end("DeclaredTransforms");
 
-            xml.start("ResourceIdentifierSummaries").end("ResourceIdentifierSummaries");
+            xml.start("ResourceIdentifierSummaries");
+            for (TemplateSummary.ResourceIdentifierSummary identifiers : summary.resourceIdentifierSummaries()) {
+                xml.start("member").elem("ResourceType", identifiers.resourceType()).start("ResourceIdentifiers");
+                identifiers.resourceIdentifiers().forEach(identifier -> xml.elem("member", identifier));
+                xml.end("ResourceIdentifiers").start("LogicalResourceIds");
+                identifiers.logicalResourceIds().forEach(logicalId -> xml.elem("member", logicalId));
+                xml.end("LogicalResourceIds").end("member");
+            }
+            xml.end("ResourceIdentifierSummaries");
             xml.elem("Metadata", summary.metadata());
 
             xml.end("GetTemplateSummaryResult")
@@ -740,6 +751,38 @@ public class CloudFormationQueryHandler {
            .raw(AwsQueryResponse.responseMetadata())
            .end("DescribeStackResourcesResponse");
         return Response.ok(xml.build()).type("text/xml").build();
+    }
+
+    private List<ResourceToImport> extractResourcesToImport(MultivaluedMap<String, String> params) {
+        List<ResourceToImport> resources = new ArrayList<>();
+        for (int index = 1; ; index++) {
+            String prefix = "ResourcesToImport.member." + index + ".";
+            if (params.keySet().stream().noneMatch(key -> key.startsWith(prefix))) {
+                break;
+            }
+            String type = params.getFirst(prefix + "ResourceType");
+            String logicalId = params.getFirst(prefix + "LogicalResourceId");
+            if (type == null || type.isBlank() || logicalId == null || logicalId.isBlank()) {
+                throw new AwsException("ValidationError",
+                        "Each ResourcesToImport member requires ResourceType and LogicalResourceId", 400);
+            }
+            Map<String, String> identifiers = new HashMap<>();
+            for (int entry = 1; ; entry++) {
+                String identifierPrefix = prefix + "ResourceIdentifier.entry." + entry + ".";
+                if (params.keySet().stream().noneMatch(key -> key.startsWith(identifierPrefix))) {
+                    break;
+                }
+                String key = params.getFirst(identifierPrefix + "key");
+                String value = params.getFirst(identifierPrefix + "value");
+                if (key == null || key.isBlank() || value == null || value.isBlank()
+                        || identifiers.putIfAbsent(key, value) != null) {
+                    throw new AwsException("ValidationError",
+                            "ResourceIdentifier must contain unique, nonempty keys and values", 400);
+                }
+            }
+            resources.add(new ResourceToImport(type, logicalId, identifiers));
+        }
+        return resources;
     }
 
     private Map<String, String> extractParameters(MultivaluedMap<String, String> params) {

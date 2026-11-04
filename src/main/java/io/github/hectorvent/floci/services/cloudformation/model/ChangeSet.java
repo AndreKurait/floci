@@ -24,7 +24,9 @@ public class ChangeSet {
     private Map<String, String> parameters;
     private List<String> capabilities;
     private Map<String, String> tags;
-    private String changeSetType; // CREATE or UPDATE
+    private String changeSetType; // CREATE, UPDATE or IMPORT
+    private List<ResourceToImport> resourcesToImport = List.of();
+    private Map<String, String> importPhysicalIds = Map.of();
     private Instant creationTime = Instant.now();
 
     public String getChangeSetId() { return changeSetId; }
@@ -53,6 +55,14 @@ public class ChangeSet {
     public void setTags(Map<String, String> tags) { this.tags = tags == null ? null : new LinkedHashMap<>(tags); }
     public String getChangeSetType() { return changeSetType; }
     public void setChangeSetType(String changeSetType) { this.changeSetType = changeSetType; }
+    public List<ResourceToImport> getResourcesToImport() { return resourcesToImport; }
+    public Map<String, String> getImportPhysicalIds() { return importPhysicalIds; }
+    public void setImportPhysicalIds(Map<String, String> importPhysicalIds) {
+        this.importPhysicalIds = Map.copyOf(importPhysicalIds);
+    }
+    public void setResourcesToImport(List<ResourceToImport> resourcesToImport) {
+        this.resourcesToImport = List.copyOf(resourcesToImport);
+    }
     public Instant getCreationTime() { return creationTime; }
     public void setCreationTime(Instant creationTime) { this.creationTime = creationTime; }
 }

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
+import io.github.hectorvent.floci.services.cloudformation.model.ResourceToImport;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -30,6 +32,36 @@ class CloudFormationStackPersistenceTest {
     Path tempDir;
 
     private static final String KEY = "000000000000/my-stack:us-east-1";
+
+    @Test
+    void pendingImportIdentifiersSurviveAStorageReload() {
+        Path filePath = tempDir.resolve("pending-import.json");
+        ResourceToImport rule = new ResourceToImport("AWS::EC2::SecurityGroupIngress", "Rule",
+                Map.of("Id", "sgr-12345678"));
+        ChangeSet changeSet = new ChangeSet();
+        changeSet.setChangeSetName("adopt");
+        changeSet.setChangeSetType("IMPORT");
+        changeSet.setStatus("CREATE_COMPLETE");
+        changeSet.setExecutionStatus("AVAILABLE");
+        changeSet.setResourcesToImport(List.of(rule));
+        changeSet.setImportPhysicalIds(Map.of("Rule", "sgr-12345678"));
+        Stack stack = new Stack();
+        stack.setStackName("my-stack");
+        stack.setStatus("REVIEW_IN_PROGRESS");
+        stack.getChangeSets().put("adopt", changeSet);
+        PersistentStorage<String, Stack> writer = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, Stack>>() {});
+        writer.put(KEY, stack);
+
+        PersistentStorage<String, Stack> reader = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, Stack>>() {});
+        reader.load();
+        ChangeSet restored = reader.get(KEY).orElseThrow().getChangeSets().get("adopt");
+        assertEquals("IMPORT", restored.getChangeSetType());
+        assertEquals("AVAILABLE", restored.getExecutionStatus());
+        assertEquals(List.of(rule), restored.getResourcesToImport());
+        assertEquals(Map.of("Rule", "sgr-12345678"), restored.getImportPhysicalIds());
+    }
 
     @Test
     void stackGraphPersistsAcrossInstances() {

@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -35,6 +37,13 @@ public class Ec2SecurityGroupRuleCfnProvisioner implements CfnResourceProvisione
 
     private static final String INGRESS = "AWS::EC2::SecurityGroupIngress";
     private static final String EGRESS = "AWS::EC2::SecurityGroupEgress";
+    private static final Set<String> COMMON_PROPERTIES =
+            Set.of("CidrIp", "CidrIpv6", "Description", "FromPort", "GroupId", "IpProtocol", "ToPort");
+    private static final Set<String> INGRESS_PROPERTIES =
+            Set.of("GroupName", "SourcePrefixListId", "SourceSecurityGroupId",
+                    "SourceSecurityGroupName", "SourceSecurityGroupOwnerId");
+    private static final Set<String> EGRESS_PROPERTIES =
+            Set.of("DestinationPrefixListId", "DestinationSecurityGroupId");
 
     private final Ec2Service ec2Service;
 
@@ -46,6 +55,48 @@ public class Ec2SecurityGroupRuleCfnProvisioner implements CfnResourceProvisione
     @Override
     public Set<String> resourceTypes() {
         return Set.of(INGRESS, EGRESS);
+    }
+
+    @Override
+    public Set<String> importIdentifiers(String resourceType) {
+        return Set.of("Id");
+    }
+
+    @Override
+    public void importResource(StackResource resource, JsonNode properties, Map<String, String> identifiers,
+                               ProvisionContext ctx) {
+        boolean egress = EGRESS.equals(resource.getResourceType());
+        properties = importProperties(properties, egress, ctx.engine());
+        if (!properties.hasNonNull("IpProtocol")
+                || (!properties.hasNonNull("GroupId") && (egress || !properties.hasNonNull("GroupName")))) {
+            throw new AwsException("ValidationError", "A security group rule requires IpProtocol and a group", 400);
+        }
+        toIpPermission(properties, ctx.engine());
+        String id = identifiers.get("Id");
+        SecurityGroupRule rule = ec2Service.describeSecurityGroupRules(ctx.region(), List.of(), List.of(id)).stream()
+                .filter(candidate -> candidate.isEgress() == egress).findFirst().orElseThrow(() ->
+                        new AwsException("ValidationError", "Security group rule " + id + " does not exist", 400));
+        resource.setPhysicalId(rule.getSecurityGroupRuleId());
+        resource.getAttributes().put("Id", rule.getSecurityGroupRuleId());
+    }
+
+    private JsonNode importProperties(JsonNode properties, boolean egress, CloudFormationTemplateEngine engine) {
+        Set<String> directionProperties = egress ? EGRESS_PROPERTIES : INGRESS_PROPERTIES;
+        CfnPropertyTypes.Reader reader = new CfnPropertyTypes.Reader(engine);
+        ObjectNode resolved = JsonNodeFactory.instance.objectNode();
+        for (Map.Entry<String, JsonNode> property : properties.properties()) {
+            String key = property.getKey();
+            if (!COMMON_PROPERTIES.contains(key) && !directionProperties.contains(key)) {
+                throw new AwsException("ValidationError", "Unsupported security group rule property " + key, 400);
+            }
+            String shape = "FromPort".equals(key) || "ToPort".equals(key) ? "Integer" : "String";
+            JsonNode value = reader.read("/" + key, property.getValue(), shape);
+            if (value != null) {
+                resolved.set(key, value);
+            }
+        }
+        reader.finish();
+        return resolved;
     }
 
     @Override

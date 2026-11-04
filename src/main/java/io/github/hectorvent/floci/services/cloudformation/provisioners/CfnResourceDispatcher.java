@@ -14,6 +14,7 @@ import org.jboss.logging.Logger;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -63,6 +64,18 @@ public class CfnResourceDispatcher {
         return registry.forType(resourceType)
                 .map(owner -> owner.attributeValue(resourceType, attributeName, value))
                 .orElseGet(() -> objectMapper.getNodeFactory().textNode(value));
+    }
+
+    public Set<String> importIdentifiers(String resourceType) {
+        return registry.forType(resourceType).map(owner -> owner.importIdentifiers(resourceType)).orElse(Set.of());
+    }
+
+    public void importResource(StackResource resource, JsonNode properties, Map<String, String> identifiers,
+                               ProvisionContext ctx) {
+        CfnResourceProvisioner owner = registry.forType(resource.getResourceType()).orElseThrow(() ->
+                new AwsException("ValidationError",
+                        "Resource import is not supported for " + resource.getResourceType(), 400));
+        owner.importResource(resource, properties, identifiers, ctx);
     }
 
     /**

@@ -82,7 +82,7 @@ preserving changes to other attributes.
 | `ContinueUpdateRollback` | Retry the rollback of a stack in `UPDATE_ROLLBACK_FAILED`, optionally skipping resources or forcing past every failed one (see [Failed update rollbacks](#failed-update-rollbacks)) |
 | `UpdateTerminationProtection` | - |
 | `CreateChangeSet` | Create a change set |
-| `DescribeChangeSet` | Get change set details with a computed Add/Modify/Remove resource diff |
+| `DescribeChangeSet` | Get change set details with a computed Add/Modify/Remove or Import resource diff |
 | `ExecuteChangeSet` | Apply a change set |
 | `DeleteChangeSet` | Delete a change set |
 | `ListChangeSets` | List change sets for a stack |
@@ -455,6 +455,30 @@ the same validation the Auto Scaling API applies. The resource schema requires
 `MetricsCollection` entry. `MetricsCollection` enables the listed metrics (an entry naming none
 enables all of them), and on `UpdateStack` the group's enabled metrics are
 set to exactly what the template lists. Removing the property leaves collection as it was.
+
+## Import Existing Security-Group Rules
+
+`CreateChangeSet` with `ChangeSetType=IMPORT` and `ResourcesToImport` adopts existing
+`AWS::EC2::SecurityGroupIngress` and `AWS::EC2::SecurityGroupEgress` resources into a new
+or existing stack. `GetTemplateSummary` advertises the identifier `Id`, the EC2 `sgr-...`
+rule ID. Both `Ref` and `Fn::GetAtt Id` keep that identity. Other resource types do not
+yet support import.
+
+Each imported resource requires a valid `DeletionPolicy`. The template must include
+the existing stack resources and cannot create, delete or change other resources during
+import. Floci validates the import's identifiers, property shapes, resource existence,
+account, Region and exclusive stack ownership. Execution repeats those checks, so a rule
+removed or claimed after change-set creation cannot be silently adopted.
+
+Import reads the existing permissions without authorizing or revoking them. A failure
+rolls back ownership and template metadata; it never deletes the preexisting rules.
+Success reports `IMPORT_COMPLETE`, and subsequent stack deletion follows each rule's
+`DeletionPolicy`. Concurrent imports cannot claim the same rule.
+
+As with AWS resource import, adoption does not establish that every template property
+matches the live permission. Verify the intended group, direction, protocol, ports and
+source before adopting a rule, and compare the live permission with the template before
+later updates. AWS does not support automatic drift detection for these two rule types.
 
 ## Updates With Nothing to Change
 
