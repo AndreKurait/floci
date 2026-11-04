@@ -16,7 +16,7 @@ import java.util.Map;
 import java.util.Set;
 
 /** The supported Classic negotiation policies, captured from the public ELB API. */
-final class ClassicSslPolicies {
+public final class ClassicSslPolicies {
     static final String TYPE = "SSLNegotiationPolicyType";
     static final String DEFAULT = "ELBSecurityPolicy-2016-08";
     private static final String REFERENCE = "Reference-Security-Policy";
@@ -42,7 +42,7 @@ final class ClassicSslPolicies {
         return PREDEFINED;
     }
 
-    static ClassicLoadBalancerPolicy create(String name, String type, Map<String, String> supplied) {
+    public static ClassicLoadBalancerPolicy create(String name, String type, Map<String, String> supplied) {
         requireValue(name, "PolicyName");
         requireValue(type, "PolicyTypeName");
         if (name.startsWith("ELBSecurityPolicy-") || name.startsWith("ELBSample-")) {

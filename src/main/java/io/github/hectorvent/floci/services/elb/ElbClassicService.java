@@ -686,6 +686,9 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             ClassicLoadBalancer current = mutableLoadBalancer(region, name);
             for (ClassicListener listener : previous.getListeners()) {
                 validateListener(listener);
+                if (ClassicSslPolicies.tls(listener)) {
+                    ClassicSslPolicies.options(ClassicSslPolicies.effective(previous, listener));
+                }
             }
             requireCertificates(region, previous.getListeners());
             validateHealthCheck(previous.getHealthCheck());
@@ -702,6 +705,8 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                 current.setHealthCheck(previous.getHealthCheck());
                 current.setAttributes(previous.getAttributes());
                 current.setTags(new LinkedHashMap<>(previous.getTags()));
+                current.setPolicies(previous.getPolicies());
+                current.setListenerPolicies(previous.getListenerPolicies());
                 populateSourceSecurityGroup(region, current);
                 persist(region, current);
             });

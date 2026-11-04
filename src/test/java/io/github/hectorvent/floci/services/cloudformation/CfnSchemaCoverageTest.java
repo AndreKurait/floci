@@ -121,8 +121,10 @@ class CfnSchemaCoverageTest {
      * Properties read by a helper class outside the provisioner source, credited to every type whose
      * reachable code calls the helper. Explicit on purpose: a row must never say "read elsewhere".
      * {@code OpenApiDocuments.resolve} reads {@code Body} and {@code BodyS3Location}.
+     * {@code ElbClassicCfnPolicies.prepare} reads and validates {@code Policies}.
      */
     private static final Map<String, Set<String>> HELPER_READS = Map.of(
+            "ElbClassicCfnPolicies.prepare(", Set.of("Policies"),
             "OpenApiDocuments.resolve(", Set.of("Body", "BodyS3Location"));
     /**
      * Calls that hand the whole resolved property object to the service request, so every writable

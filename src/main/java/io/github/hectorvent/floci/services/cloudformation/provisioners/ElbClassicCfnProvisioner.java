@@ -54,6 +54,7 @@ public class ElbClassicCfnProvisioner implements CfnResourceProvisioner {
         }
         rejectUnsupportedPolicies(props);
         List<ClassicListener> listeners = listeners(props);
+        ElbClassicCfnPolicies.Plan policies = ElbClassicCfnPolicies.prepare(props, listeners);
         String explicitName = ctx.resolveOptional(props, "LoadBalancerName");
         String name = ctx.stablePhysicalName(explicitName, resource.getLogicalId(), 32, false);
         String scheme = ctx.resolveOrDefault(props, "Scheme", "internet-facing");
@@ -77,13 +78,15 @@ public class ElbClassicCfnProvisioner implements CfnResourceProvisioner {
                     ctx.resolveStringList(props, "SecurityGroups"), scheme, ctx.resolveTags(props, "Tags"));
             resource.setPhysicalId(loadBalancer.getLoadBalancerName());
         } else {
-            resource.getAttributes().put(SNAPSHOT, snapshot(prior, ctx.region()).toString());
+            resource.getAttributes().put(SNAPSHOT, snapshot(prior, ctx.region(),
+                    resource.getAttributes().get(ElbClassicCfnPolicies.MANAGED)).toString());
         }
         CfnRollback.guarded(resource, ctx, created,
                 () -> service.deleteLoadBalancer(ctx.region(), physicalName),
                 () -> restore(resource),
                 () -> {
                     apply(physicalName, props, listeners, ctx, created);
+                    ElbClassicCfnPolicies.apply(service, ctx.region(), physicalName, policies, resource);
                     attributes(resource, service.requireLoadBalancer(ctx.region(), physicalName));
                 });
         ReplacementCleanup.record(resource, ctx, before);
@@ -106,16 +109,10 @@ public class ElbClassicCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private static void rejectUnsupportedPolicies(JsonNode props) {
-        for (String property : List.of("Policies", "AppCookieStickinessPolicy", "LBCookieStickinessPolicy")) {
+        for (String property : List.of("AppCookieStickinessPolicy", "LBCookieStickinessPolicy")) {
             if (props.hasNonNull(property) && !props.path(property).isEmpty()) {
                 throw new AwsException("UnsupportedOperation",
                         "Classic load-balancer property " + property + " is not supported by Floci.", 400);
-            }
-        }
-        for (JsonNode listener : props.path("Listeners")) {
-            if (listener.hasNonNull("PolicyNames") && !listener.path("PolicyNames").isEmpty()) {
-                throw new AwsException("UnsupportedOperation",
-                        "Classic listener PolicyNames are not supported by Floci.", 400);
             }
         }
     }
@@ -244,8 +241,9 @@ public class ElbClassicCfnProvisioner implements CfnResourceProvisioner {
         return first.stream().filter(value -> !second.contains(value)).toList();
     }
 
-    private static ObjectNode snapshot(ClassicLoadBalancer value, String region) {
+    private static ObjectNode snapshot(ClassicLoadBalancer value, String region, String managedPolicies) {
         ObjectNode result = MAPPER.createObjectNode().put("region", region).put("name", value.getLoadBalancerName());
+        result.put("managedPolicies", managedPolicies);
         ObjectNode configuration = result.putObject("configuration");
         configuration.set("listeners", MAPPER.valueToTree(value.getListeners()));
         configuration.set("subnets", MAPPER.valueToTree(value.getSubnets()));
@@ -255,6 +253,8 @@ public class ElbClassicCfnProvisioner implements CfnResourceProvisioner {
         configuration.set("healthCheck", MAPPER.valueToTree(value.getHealthCheck()));
         configuration.set("attributes", MAPPER.valueToTree(value.getAttributes()));
         configuration.set("tags", MAPPER.valueToTree(value.getTags()));
+        configuration.set("policies", MAPPER.valueToTree(value.getPolicies()));
+        configuration.set("listenerPolicies", MAPPER.valueToTree(value.getListenerPolicies()));
         return result;
     }
 
@@ -266,6 +266,11 @@ public class ElbClassicCfnProvisioner implements CfnResourceProvisioner {
         service.restoreLoadBalancerConfiguration(snapshot.path("region").asText(), snapshot.path("name").asText(),
                 MAPPER.convertValue(snapshot.path("configuration"), ClassicLoadBalancer.class));
         attributes(resource, service.requireLoadBalancer(snapshot.path("region").asText(), snapshot.path("name").asText()));
+        if (snapshot.hasNonNull("managedPolicies")) {
+            resource.getAttributes().put(ElbClassicCfnPolicies.MANAGED, snapshot.path("managedPolicies").asText());
+        } else {
+            resource.getAttributes().remove(ElbClassicCfnPolicies.MANAGED);
+        }
         resource.getAttributes().remove(SNAPSHOT);
         return true;
     }
