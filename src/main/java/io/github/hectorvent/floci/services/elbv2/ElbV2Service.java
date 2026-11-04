@@ -89,9 +89,47 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
 
+    /** The accounts of {@code floci.services.elbv2.single-zone-alb-accounts}; see {@link #minimumAlbZones}. */
+    private Set<String> singleZoneAlbAccounts = Set.of();
+
+    /**
+     * Reads {@code floci.services.elbv2.single-zone-alb-accounts} and refuses, at startup, a value that
+     * is not a 12-digit account id, so a typo cannot silently leave the exception off.
+     */
+    void readSingleZoneAlbAccounts() {
+        if (config == null) {
+            singleZoneAlbAccounts = Set.of();
+            return;
+        }
+        // Entries are trimmed, and a blank one (an empty value or a trailing comma) lists nothing, so
+        // "111111111111, 222222222222" lists both and blanking the setting turns it off.
+        List<String> accounts = config.services().elbv2().singleZoneAlbAccounts().orElse(List.of()).stream()
+                .filter(account -> account != null && !account.isBlank())
+                .map(String::trim)
+                .toList();
+        for (String account : accounts) {
+            if (!account.matches("[0-9]{12}")) {
+                throw new IllegalStateException("floci.services.elbv2.single-zone-alb-accounts must list 12-digit"
+                        + " account ids, not '" + account + "'");
+            }
+        }
+        singleZoneAlbAccounts = Set.copyOf(accounts);
+    }
+
+    /**
+     * The fewest Availability Zones an Application Load Balancer of the calling account takes. AWS
+     * requires two; Floci lowers that to one for the accounts
+     * {@code floci.services.elbv2.single-zone-alb-accounts} lists. Nothing is listed by default.
+     */
+    private int minimumAlbZones() {
+        return !singleZoneAlbAccounts.isEmpty() && singleZoneAlbAccounts.contains(regionResolver.getAccountId())
+                ? 1 : 2;
+    }
+
     @PostConstruct
     void initializeStorage()
     {
+        readSingleZoneAlbAccounts();
         if (storageFactory == null) {
             return;
         }
@@ -302,11 +340,12 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * a SetSubnets that names none, and {@link #setSubnets} on a list that names some, once it has the
      * balancer's type; whether the subnets span two Availability Zones is checked after they are looked
      * up. No public report shows what AWS answers a SetSubnets with one subnet, so it gets the create
-     * message and order.
+     * message and order. For an account granted single-zone ALBs ({@link #minimumAlbZones}) one subnet
+     * is enough, and none still gets the Application Load Balancer message.
      */
-    private static void requireSubnets(String lbType, List<String> subnets) {
+    private void requireSubnets(String lbType, List<String> subnets) {
         int count = subnets == null ? 0 : subnets.size();
-        if ("application".equals(lbType) && count < 2) {
+        if ("application".equals(lbType) && count < minimumAlbZones()) {
             throw new AwsException("ValidationError",
                     "At least two subnets in two different Availability Zones must be specified", 400);
         }
@@ -1603,7 +1642,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     .map(Subnet::getAvailabilityZone)
                     .distinct()
                     .count();
-            if (distinctAvailabilityZones < 2) {
+            if (distinctAvailabilityZones < minimumAlbZones()) {
                 throw new AwsException("InvalidConfigurationRequest",
                         "Application Load Balancers must be attached to subnets in at least two Availability Zones.", 400);
             }
