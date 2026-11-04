@@ -127,10 +127,27 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                 })) {
                     continue;
                 }
-                if (record.getSetIdentifier() != null || record.getAliasTarget() != null
+                if (record.getSetIdentifier() != null
                         || record.getWeight() != null || record.getRegion() != null
-                        || record.getFailover() != null || record.getHealthCheckId() != null
-                        || record.getRecords() == null) {
+                        || record.getFailover() != null || record.getHealthCheckId() != null) {
+                    return Optional.of(DnsAnswer.refused());
+                }
+                AliasTarget alias = record.getAliasTarget();
+                if (alias != null) {
+                    if (dnsServer == null || alias.isEvaluateTargetHealth() || record.getTtl() != null
+                            || record.getRecords() != null && !record.getRecords().isEmpty()) {
+                        return Optional.of(DnsAnswer.refused());
+                    }
+                    DnsAnswer target = dnsServer.resolveAliasTarget(alias.getDnsName(), alias.getHostedZoneId(), type)
+                            .orElseGet(DnsAnswer::refused);
+                    if (target.responseCode() != 0) {
+                        return Optional.of(DnsAnswer.refused());
+                    }
+                    answers.addAll(target.records());
+                    ttl = Math.min(ttl, target.ttlSeconds());
+                    continue;
+                }
+                if (record.getRecords() == null) {
                     return Optional.of(DnsAnswer.refused());
                 }
                 for (ResourceRecord value : record.getRecords()) {

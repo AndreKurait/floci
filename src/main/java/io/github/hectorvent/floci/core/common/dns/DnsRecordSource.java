@@ -24,6 +24,14 @@ public interface DnsRecordSource {
     }
 
     /**
+     * Resolves an alias target from an owned resource and its canonical hosted-zone ID.
+     * This lookup must not query DNS, follow aliases, or substitute an emulator suffix.
+     */
+    default Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        return Optional.empty();
+    }
+
+    /**
      * Resolves a query name to IPv4 addresses and their TTL. An empty optional means this
      * source does not own the name. The name arrives without a trailing dot and in the case the client sent.
      */

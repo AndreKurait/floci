@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
 import jakarta.enterprise.context.ApplicationScoped;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 
 /** Native Classic DNS names resolve to the owned listener before an HTTP authority is available. */
@@ -38,5 +39,26 @@ public class ElbClassicDnsRecordSource implements DnsRecordSource {
     @Override
     public Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
         return resolve(name, type);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        if (!frontends.enabled() || name == null || hostedZoneId == null) {
+            return Optional.empty();
+        }
+        String target = name.toLowerCase(Locale.ROOT);
+        if (target.startsWith("dualstack.")) {
+            target = target.substring("dualstack.".length());
+        }
+        List<ClassicLoadBalancer> matches = service.findByDnsName(target);
+        if (matches.isEmpty()) {
+            return Optional.empty();
+        }
+        if (matches.size() != 1 || type != 1
+                || !hostedZoneId.equals(matches.getFirst().getCanonicalHostedZoneNameId())) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        List<String> addresses = frontends.addresses(matches.getFirst());
+        return Optional.of(addresses.isEmpty() ? DnsAnswer.noData() : DnsAnswer.records(addresses, 60));
     }
 }
