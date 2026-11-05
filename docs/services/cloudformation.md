@@ -261,7 +261,7 @@ cross-resource references.
 | AppConfig | `Application`, `Environment` (`Tags` and `DeletionProtectionCheck` are accepted and not stored), `ConfigurationProfile` (`Tags`, `KmsKeyIdentifier`, `RetrievalRoleArn`, `Validators` and `DeletionProtectionCheck` are accepted and not stored), `DeploymentStrategy` (`Tags` are accepted and not stored; `ReplicateTo: SSM_DOCUMENT` writes no SSM document). `Ref` returns the AppConfig ID of each. See [AppConfig](appconfig.md#cloudformation) for updates and replacement. |
 | S3 | `Bucket`, `BucketPolicy` (document stored on the bucket; S3 does not evaluate it) |
 | S3 Vectors | `VectorBucket`, `Index` |
-| SQS | `Queue`, `QueuePolicy` (accepted; policy not enforced) |
+| SQS | `Queue`, `QueuePolicy` (applies policies to queues; reconciles targets on update, restores policies on rollback, and detaches on delete) |
 | SNS | `Topic`, `Subscription`, `TopicPolicy` |
 | SES | `EmailIdentity` (BYODKIM is not supported by this resource; Easy DKIM DNS attributes use the shared emulator signing zone `dkim.amazonses.com` rather than AWS's region- and identity-specific zone assignment), `ReceiptRule` (stored in an existing SES receipt rule set; Ref and RuleName return the rule name; management plane only, with no inbound mail delivery) |
 | DynamoDB | `Table` (`TimeToLiveSpecification`, `DeletionProtectionEnabled` and `KinesisStreamSpecification` applied on create and update; failed updates restore prior settings; deletion fails while protection is enabled; rename an enabled TTL attribute by disabling it in one update and enabling the new attribute in a later one; with the DynamoDB Local backend, `StreamArn` is checked as on AWS but nothing is forwarded), `GlobalTable` |

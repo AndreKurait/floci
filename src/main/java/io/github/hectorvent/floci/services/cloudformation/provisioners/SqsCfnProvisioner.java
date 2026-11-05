@@ -14,6 +14,8 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -21,13 +23,14 @@ import java.util.UUID;
 
 /**
  * CloudFormation provisioning for SQS: {@code AWS::SQS::Queue} and {@code AWS::SQS::QueuePolicy}.
- * Extracted verbatim from the former CloudFormation monolith (item 15 decomposition).
  */
 @ApplicationScoped
 public class SqsCfnProvisioner implements CfnResourceProvisioner {
 
     private static final Logger LOG = Logger.getLogger(SqsCfnProvisioner.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String POLICY_QUEUES = "__FlociQueuePolicyQueues";
+    private static final String POLICY_SNAPSHOT = "__FlociQueuePolicySnapshot";
     /** The schema's mutable properties that map one to one onto a queue attribute of the same name. */
     private static final List<String> SCALAR_ATTRIBUTES = List.of(
             "ContentBasedDeduplication", "DeduplicationScope", "DelaySeconds", "FifoThroughputLimit",
@@ -68,7 +71,7 @@ public class SqsCfnProvisioner implements CfnResourceProvisioner {
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
         switch (r.getResourceType()) {
             case "AWS::SQS::Queue" -> provisionQueue(r, props, ctx);
-            case "AWS::SQS::QueuePolicy" -> provisionQueuePolicy(r, ctx);
+            case "AWS::SQS::QueuePolicy" -> provisionQueuePolicy(r, props, ctx);
             default -> throw new IllegalStateException("SqsCfnProvisioner cannot handle " + r.getResourceType());
         }
     }
@@ -78,7 +81,29 @@ public class SqsCfnProvisioner implements CfnResourceProvisioner {
         if ("AWS::SQS::Queue".equals(resourceType)) {
             sqsService.deleteQueue(physicalId, region);
         }
-        // AWS::SQS::QueuePolicy has no backing resource to delete (matches prior behavior).
+        // A QueuePolicy needs its recorded target URLs; the StackResource overload removes it.
+    }
+
+    @Override
+    public void delete(StackResource resource, String region) {
+        if (!"AWS::SQS::QueuePolicy".equals(resource.getResourceType())) {
+            delete(resource.getResourceType(), resource.getPhysicalId(), region);
+            return;
+        }
+        if (resource.getAttributes().containsKey(POLICY_SNAPSHOT)) {
+            restoreQueuePolicies(resource, true);
+            if ("true".equals(resource.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR))) {
+                return;
+            }
+        }
+        for (String queue : policyQueues(resource)) {
+            removeQueuePolicy(queue, region);
+        }
+    }
+
+    @Override
+    public boolean retainsFailedUpdateState(StackResource resource) {
+        return resource.getAttributes().containsKey(POLICY_SNAPSHOT);
     }
 
     @Override
@@ -98,12 +123,24 @@ public class SqsCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(POLICY_SNAPSHOT);
         resource.getAttributes().remove(CfnRollback.SQS_UPDATE_SNAPSHOT_ATTR);
         ReplacementCleanup.clear(resource);
     }
 
     @Override
+    public void clearDeleteCleanup(StackResource resource) {
+        if (!"AWS::SQS::QueuePolicy".equals(resource.getResourceType())) {
+            clearUpdate(resource);
+        }
+    }
+
+    @Override
     public boolean rollbackUpdate(StackResource resource) {
+        if (resource.getAttributes().containsKey(POLICY_SNAPSHOT)) {
+            restoreQueuePolicies(resource, false);
+            return true;
+        }
         if (ReplacementCleanup.rollback(resource, this::delete)) {
             return true;
         }
@@ -275,10 +312,94 @@ public class SqsCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
-    private void provisionQueuePolicy(StackResource r, ProvisionContext ctx) {
-        // A policy has no backing entity, so its id only has to stay put across updates.
-        r.setPhysicalId(ctx.isUpdate()
-                ? ctx.priorPhysicalId()
-                : "queue-policy-" + UUID.randomUUID().toString().substring(0, 8));
+    private void provisionQueuePolicy(StackResource resource, JsonNode props, ProvisionContext ctx) {
+        List<String> queues = ctx.resolveStringList(props, "Queues").stream().distinct().toList();
+        if (queues.isEmpty()) {
+            throw new AwsException("ValidationError", "AWS::SQS::QueuePolicy requires at least one queue URL.", 400);
+        }
+        if (props == null || !props.hasNonNull("PolicyDocument")) {
+            throw new AwsException("ValidationError", "AWS::SQS::QueuePolicy requires a PolicyDocument.", 400);
+        }
+        String policy = ctx.engine().resolveJsonAttribute(props.path("PolicyDocument"));
+        try {
+            JsonNode document = policy == null ? null : MAPPER.readTree(policy);
+            if (document == null || !document.isObject()) {
+                throw new AwsException("ValidationError", "PolicyDocument must be a JSON object.", 400);
+            }
+        } catch (JsonProcessingException e) {
+            throw new AwsException("ValidationError", "PolicyDocument must be a JSON object.", 400);
+        }
+
+        List<String> previousQueues = policyQueues(resource);
+        Set<String> affected = new LinkedHashSet<>(queues);
+        affected.addAll(previousQueues);
+        Map<String, String> previousPolicies = new LinkedHashMap<>();
+        for (String queue : affected) {
+            try {
+                previousPolicies.put(queue,
+                        sqsService.getQueueAttributes(queue, List.of("Policy"), ctx.region()).getOrDefault("Policy", ""));
+            } catch (AwsException e) {
+                if (queues.contains(queue) || !"AWS.SimpleQueueService.NonExistentQueue".equals(e.getErrorCode())) {
+                    throw e;
+                }
+                LOG.debugv("Removed QueuePolicy target is already gone: {0}", queue);
+            }
+        }
+        // Read every destination before the first write. Keep the actual policies, including a
+        // newly added queue's existing policy, for a failed write or a later stack rollback.
+        ObjectNode snapshot = MAPPER.createObjectNode().put("region", ctx.region());
+        snapshot.set("queues", MAPPER.valueToTree(previousQueues));
+        snapshot.set("policies", MAPPER.valueToTree(previousPolicies));
+        resource.getAttributes().put(POLICY_SNAPSHOT, snapshot.toString());
+        String id = ctx.isUpdate() ? ctx.priorPhysicalId() : "queue-policy-" + UUID.randomUUID();
+        resource.setPhysicalId(id);
+        resource.getAttributes().put("Id", id);
+
+        CfnRollback.guarded(resource, ctx, !ctx.isUpdate(),
+                () -> restoreQueuePolicies(resource, false), () -> restoreQueuePolicies(resource, false), () -> {
+                    for (String queue : queues) {
+                        sqsService.setQueueAttributes(queue, Map.of("Policy", policy), ctx.region());
+                    }
+                    for (String queue : previousQueues) {
+                        if (!queues.contains(queue)) {
+                            removeQueuePolicy(queue, ctx.region());
+                        }
+                    }
+                    resource.getAttributes().put(POLICY_QUEUES, MAPPER.valueToTree(queues).toString());
+                });
+        if (!ctx.isUpdate()) {
+            resource.getAttributes().remove(POLICY_SNAPSHOT);
+        }
+    }
+
+    private static List<String> policyQueues(StackResource resource) {
+        JsonNode queues = CfnRollback.updateSnapshot(resource, POLICY_QUEUES);
+        if (queues == null) {
+            return List.of();
+        }
+        return MAPPER.convertValue(queues, MAPPER.getTypeFactory().constructCollectionType(List.class, String.class));
+    }
+
+    private void restoreQueuePolicies(StackResource resource, boolean deleting) {
+        JsonNode snapshot = CfnRollback.updateSnapshot(resource, POLICY_SNAPSHOT);
+        String region = snapshot.path("region").asText();
+        snapshot.path("policies").fields().forEachRemaining(entry -> {
+            Runnable restore = () ->
+                    sqsService.setQueueAttributes(entry.getKey(), Map.of("Policy", entry.getValue().asText()), region);
+            if (deleting) {
+                CfnDeletes.safeDelete("queue policy rollback", entry.getKey(), restore,
+                        "AWS.SimpleQueueService.NonExistentQueue");
+            } else {
+                restore.run();
+            }
+        });
+        resource.getAttributes().put(POLICY_QUEUES, snapshot.path("queues").toString());
+        resource.getAttributes().remove(POLICY_SNAPSHOT);
+    }
+
+    private void removeQueuePolicy(String queue, String region) {
+        CfnDeletes.safeDelete("queue policy", queue,
+                () -> sqsService.setQueueAttributes(queue, Map.of("Policy", ""), region),
+                "AWS.SimpleQueueService.NonExistentQueue");
     }
 }
