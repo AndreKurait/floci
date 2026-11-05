@@ -905,7 +905,8 @@ public class S3Controller {
             }
             if (params.has("acl")) {
                 checkVersionId(bucket, versionId);
-                s3Service.authorizeObjectWrite(bucket, key, versionId, "s3:PutObjectAcl", authorization, null);
+                s3Service.authorizeObjectWrite(bucket, key, versionId, "s3:PutObjectAcl", authorization,
+                        S3ObjectActions.cannedAclConditions(httpHeaders::getHeaderString));
                 s3Service.putObjectAcl(bucket, key, versionId,
                         new String(readWholeBody(body), StandardCharsets.UTF_8),
                         httpHeaders.getHeaderString("x-amz-acl"),

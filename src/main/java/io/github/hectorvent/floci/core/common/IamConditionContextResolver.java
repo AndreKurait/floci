@@ -429,11 +429,14 @@ public class IamConditionContextResolver {
             // actions, and the versionId picks whose tags are read.
             case "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging",
                  "s3:GetObjectVersionTagging", "s3:GetObjectAcl", "s3:GetObjectVersionAcl",
-                 "s3:PutObjectAcl", "s3:PutObjectVersionAcl", "s3:DeleteObjectTagging",
+                 "s3:DeleteObjectTagging",
                  "s3:DeleteObjectVersionTagging", "s3:GetObjectAnnotation", "s3:GetObjectVersionAnnotation",
                  "s3:ListObjectAnnotations", "s3:ListObjectVersionAnnotations", "s3:PutObjectAnnotation",
                  "s3:PutObjectVersionAnnotation", "s3:DeleteObjectAnnotation",
                  "s3:DeleteObjectVersionAnnotation" -> s3ExistingObjectTagConditionContext(ctx);
+            case "s3:PutObjectAcl", "s3:PutObjectVersionAcl" -> merge(
+                    s3ExistingObjectTagConditionContext(ctx),
+                    S3ObjectActions.cannedAclConditions(ctx::getHeaderString));
             // The Object Lock keys come from what the request sets: an object creation's headers, the
             // retention and legal-hold bodies. A part or a completion creates nothing from its own
             // headers, and is judged by the encryption its upload recorded.
