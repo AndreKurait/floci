@@ -114,6 +114,12 @@ aws sqs set-queue-attributes \
 
 `SqsManagedSseEnabled` is `true` for a queue with no `KmsMasterKeyId`, matching AWS, and `false` once a KMS key is set. It is derived on read rather than stored, so clearing `KmsMasterKeyId` returns the queue to `true`, unless you set `SqsManagedSseEnabled` yourself, in which case your value stands. AWS does not document the cleared-key case crisply, so that behaviour is Floci's choice rather than a copied one. `CreateQueue` on an existing name compares requested attributes against these reported values, so asking for `SqsManagedSseEnabled=false` on a queue that reports `true` fails with `QueueAlreadyExists` (`QueueNameExists` over JSON).
 
+`AWS::SQS::QueuePolicy` installs its resolved `PolicyDocument` on every URL in `Queues`.
+Updates keep the resource's `Ref` and `Fn::GetAtt Id`, apply the new document, and remove the policy
+from targets dropped from the list. A failed write or later stack-update failure restores the
+previous policies and target list. Deleting the policy resource detaches its policies without
+deleting the queues; an already-deleted queue is tolerated, while other cleanup errors fail deletion.
+
 ## Message Retention
 
 A message older than the queue's `MessageRetentionPeriod` is no longer returned or counted, including a message in flight. A shorter period applies to messages already in the queue. A message moved to a FIFO dead-letter queue, or moved by `StartMessageMoveTask`, starts its retention period over. A message moved to a standard dead-letter queue keeps its original enqueue time. Expired messages are freed from memory and storage every 60 seconds.

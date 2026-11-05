@@ -24,6 +24,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -31,10 +33,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
-/**
- * The SQS CFN provisioner in isolation — the payoff of item 15's decomposition: one mocked
- * service instead of the ~30 the monolithic provisioner needed.
- */
+/** The SQS CFN provisioner with isolated service failures and literal template inputs. */
 class SqsCfnProvisionerTest {
 
     private final SqsService sqs = mock(SqsService.class);
@@ -42,8 +41,6 @@ class SqsCfnProvisionerTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
-        // The engine is a collaborator; for scalar properties it just returns the node's text,
-        // which is all these SQS cases exercise. Mocking keeps this a true isolated unit test.
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
         when(engine.resolve(any())).thenAnswer(inv -> {
             JsonNode node = inv.getArgument(0);
@@ -70,6 +67,8 @@ class SqsCfnProvisionerTest {
             JsonNode resolved = engine.resolveNode(inv.getArgument(0));
             return resolved != null && resolved.isTextual() ? resolved.asText() : resolved.toString();
         });
+        when(engine.resolveStringList(any())).thenAnswer(inv ->
+                List.of(mapper.convertValue(inv.getArgument(0), String[].class)));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
     }
 
@@ -404,18 +403,29 @@ class SqsCfnProvisionerTest {
     @Test
     void aQueuePolicyKeepsItsIdAcrossUpdates() {
         StackResource r = resource("AWS::SQS::QueuePolicy", "MyPolicy");
-        provisioner.provision(r, mapper.createObjectNode(), updateCtx("queue-policy-1a2b3c4d"));
+        ObjectNode props = queuePolicy("http://q/one");
+        provisioner.provision(r, props, updateCtx("queue-policy-1a2b3c4d"));
         assertEquals("queue-policy-1a2b3c4d", r.getPhysicalId());
-        verifyNoInteractions(sqs);
+        assertEquals(r.getPhysicalId(), r.getAttributes().get("Id"));
+        verify(sqs).setQueueAttributes("http://q/one",
+                Map.of("Policy", props.path("PolicyDocument").toString()), "us-east-1");
     }
 
     @Test
     void queuePolicyGetsAPhysicalId() {
         StackResource r = resource("AWS::SQS::QueuePolicy", "MyPolicy");
-        provisioner.provision(r, mapper.createObjectNode(), ctx());
+        ObjectNode props = queuePolicy("http://q/one", "http://q/two");
+        provisioner.provision(r, props, ctx());
         assertNotNull(r.getPhysicalId());
         assertTrue(r.getPhysicalId().startsWith("queue-policy-"));
-        verifyNoInteractions(sqs);
+        assertEquals(r.getPhysicalId(), r.getAttributes().get("Id"));
+        verify(sqs).setQueueAttributes("http://q/one",
+                Map.of("Policy", props.path("PolicyDocument").toString()), "us-east-1");
+        verify(sqs).setQueueAttributes("http://q/two",
+                Map.of("Policy", props.path("PolicyDocument").toString()), "us-east-1");
+        provisioner.delete(r, "us-east-1");
+        verify(sqs).setQueueAttributes("http://q/one", Map.of("Policy", ""), "us-east-1");
+        verify(sqs).setQueueAttributes("http://q/two", Map.of("Policy", ""), "us-east-1");
     }
 
     @Test
@@ -425,9 +435,106 @@ class SqsCfnProvisionerTest {
     }
 
     @Test
-    void deleteQueuePolicyIsNoOp() {
-        provisioner.delete("AWS::SQS::QueuePolicy", "queue-policy-abc", "us-east-1");
+    void aLegacyQueuePolicyWithoutRecordedTargetsDoesNotModifyQueues() {
+        StackResource r = resource("AWS::SQS::QueuePolicy", "LegacyPolicy");
+        r.setPhysicalId("queue-policy-abc");
+        provisioner.delete(r, "us-east-1");
         verifyNoInteractions(sqs);
+    }
+
+    @Test
+    void aMissingDestinationIsRejectedBeforeAnyPolicyChanges() {
+        ObjectNode props = queuePolicy("http://q/one", "http://q/missing");
+        when(sqs.getQueueAttributes("http://q/one", List.of("Policy"), "us-east-1"))
+                .thenReturn(Map.of("Policy", "previous"));
+        when(sqs.getQueueAttributes("http://q/missing", List.of("Policy"), "us-east-1"))
+                .thenThrow(new AwsException("AWS.SimpleQueueService.NonExistentQueue", "Missing", 400));
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> provisioner.provision(resource("AWS::SQS::QueuePolicy", "Policy"), props, ctx()));
+        assertEquals("AWS.SimpleQueueService.NonExistentQueue", failure.getErrorCode());
+        verify(sqs, never()).setQueueAttributes(anyString(), any(), anyString());
+    }
+
+    @Test
+    void aFailedPolicyWriteRestoresTheOtherQueuesPreviousPolicy() {
+        ObjectNode props = queuePolicy("http://q/one", "http://q/two");
+        String policy = props.path("PolicyDocument").toString();
+        when(sqs.getQueueAttributes(anyString(), eq(List.of("Policy")), eq("us-east-1")))
+                .thenReturn(Map.of("Policy", "previous"));
+        doThrow(new AwsException("AccessDenied", "Denied", 403)).when(sqs)
+                .setQueueAttributes("http://q/two", Map.of("Policy", policy), "us-east-1");
+        StackResource r = resource("AWS::SQS::QueuePolicy", "Policy");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+        verify(sqs).setQueueAttributes("http://q/one", Map.of("Policy", "previous"), "us-east-1");
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ROLLBACK_OWNED_ATTR));
+        assertFalse(provisioner.retainsFailedUpdateState(r));
+    }
+
+    @Test
+    void aFailedPolicyRestoreRemainsAvailableToDeleteCleanup() {
+        ObjectNode props = queuePolicy("http://q/one", "http://q/two");
+        String policy = props.path("PolicyDocument").toString();
+        when(sqs.getQueueAttributes(anyString(), eq(List.of("Policy")), eq("us-east-1")))
+                .thenReturn(Map.of("Policy", "previous"));
+        doThrow(new AwsException("AccessDenied", "Write denied", 403)).when(sqs)
+                .setQueueAttributes("http://q/two", Map.of("Policy", policy), "us-east-1");
+        doThrow(new AwsException("AccessDenied", "Restore denied", 403)).when(sqs)
+                .setQueueAttributes("http://q/one", Map.of("Policy", "previous"), "us-east-1");
+        StackResource r = resource("AWS::SQS::QueuePolicy", "Policy");
+
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+        assertEquals(1, failure.getSuppressed().length);
+        assertEquals("true", r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+        provisioner.clearDeleteCleanup(r);
+        assertTrue(provisioner.retainsFailedUpdateState(r));
+
+        doNothing().when(sqs).setQueueAttributes("http://q/one", Map.of("Policy", "previous"), "us-east-1");
+        provisioner.delete(r, "us-east-1");
+        assertFalse(provisioner.retainsFailedUpdateState(r));
+        verify(sqs).setQueueAttributes("http://q/two", Map.of("Policy", "previous"), "us-east-1");
+        verify(sqs, never()).setQueueAttributes(anyString(), eq(Map.of("Policy", "")), anyString());
+    }
+
+    @Test
+    void deletingAQueuePolicyToleratesOnlyAnAlreadyDeletedQueue() {
+        StackResource r = resource("AWS::SQS::QueuePolicy", "Policy");
+        provisioner.provision(r, queuePolicy("http://q/one", "http://q/two"), ctx());
+        doThrow(new AwsException("AWS.SimpleQueueService.NonExistentQueue", "Missing", 400)).when(sqs)
+                .setQueueAttributes("http://q/one", Map.of("Policy", ""), "us-east-1");
+        doThrow(new AwsException("AccessDenied", "Denied", 403)).when(sqs)
+                .setQueueAttributes("http://q/two", Map.of("Policy", ""), "us-east-1");
+
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.delete(r, "us-east-1"));
+        assertEquals("AccessDenied", failure.getErrorCode());
+    }
+
+    @Test
+    void queuePolicyRequiresDestinationsAndAnObjectDocument() {
+        StackResource r = resource("AWS::SQS::QueuePolicy", "Policy");
+        AwsException missingQueues = assertThrows(AwsException.class,
+                () -> provisioner.provision(r, queuePolicy(), ctx()));
+        assertEquals("AWS::SQS::QueuePolicy requires at least one queue URL.", missingQueues.getMessage());
+        ObjectNode props = queuePolicy("http://q/one");
+        props.remove("PolicyDocument");
+        AwsException missingDocument = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+        assertEquals("AWS::SQS::QueuePolicy requires a PolicyDocument.", missingDocument.getMessage());
+        for (String invalid : List.of("", "not-json", "null", "[]")) {
+            props.put("PolicyDocument", invalid);
+            AwsException invalidDocument = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+            assertEquals("PolicyDocument must be a JSON object.", invalidDocument.getMessage());
+        }
+        verifyNoInteractions(sqs);
+    }
+
+    private ObjectNode queuePolicy(String... queues) {
+        ObjectNode props = mapper.createObjectNode();
+        props.set("Queues", mapper.valueToTree(queues));
+        ObjectNode policy = props.putObject("PolicyDocument").put("Version", "2012-10-17");
+        policy.putArray("Statement").addObject().put("Effect", "Allow")
+                .put("Principal", "*").put("Action", "SQS:SendMessage").put("Resource", "*");
+        return props;
     }
 
     @Test
