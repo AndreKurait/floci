@@ -62,9 +62,46 @@ jobs:
             bash .github/scripts/smoke-network-helper.sh "$IMAGE" "$HELPER_IMAGE" "$architecture"
           done
 
+  stock-agent:
+    name: Stock SSM agent (amd64)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.source-sha }}
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Run the published image with the stock SSM agent
+        env:
+          IMAGE: ${{ needs.build.outputs.image-digest-ref }}
+          HELPER_IMAGE: ${{ needs.build.outputs.network-helper-digest-ref }}
+        run: |
+          python3 .github/scripts/smoke-ssm-agent.py "$IMAGE" "$HELPER_IMAGE" \
+            --output "$RUNNER_TEMP/stock-agent-smoke"
+
+      - name: Upload agent, runtime and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stock-agent-smoke-amd64
+          path: ${{ runner.temp }}/stock-agent-smoke/
+          if-no-files-found: error
+          retention-days: 14
+
   promote:
     name: Update dev tag
-    needs: [build, smoke]
+    needs: [build, smoke, stock-agent]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
