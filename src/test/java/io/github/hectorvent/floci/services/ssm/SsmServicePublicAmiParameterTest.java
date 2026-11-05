@@ -99,11 +99,52 @@ class SsmServicePublicAmiParameterTest {
         assertEquals("unknown", value.path("ecs_agent_version").asText());
         assertEquals("unknown", value.path("ecs_runtime_version").asText());
         assertEquals("arn:aws:ssm:eu-west-1::parameter" + ECS_AL2023_RECOMMENDED, metadata.getArn());
-        assertEquals(List.of(ECS_AL2023_RECOMMENDED, ECS_AL2023_RECOMMENDED + "/image_id"),
-                ssmService.getParametersByPath("/aws/service/ecs/optimized-ami/amazon-linux-2023", true, REGION)
-                        .stream().map(Parameter::getName).toList());
+        List<String> names = ssmService.getParametersByPath(
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023", true, REGION)
+                .stream().map(Parameter::getName).toList();
+        assertEquals(14, names.size());
+        assertTrue(names.contains(ECS_AL2023_RECOMMENDED));
+        assertTrue(names.contains(ECS_AL2023_RECOMMENDED + "/image_id"));
         assertEquals(2, ssmService.getParameters(
                 List.of(ECS_AL2023_RECOMMENDED, ECS_AL2023_RECOMMENDED + "/image_id"), false, REGION).size());
+    }
+
+    @Test
+    void resolvesEcsOptimizedAl2023SubparametersForBothArchitectures() throws Exception {
+        String arm64Recommended =
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended";
+        for (String recommended : List.of(ECS_AL2023_RECOMMENDED, arm64Recommended)) {
+            JsonNode metadata = new ObjectMapper().readTree(ssmService.getParameter(recommended, REGION).getValue());
+            for (String field : List.of("schema_version", "image_name", "image_id", "os",
+                    "ecs_agent_version", "ecs_runtime_version")) {
+                Parameter subparameter = ssmService.getParameter(recommended + "/" + field, REGION);
+                assertEquals(metadata.path(field).asText(), subparameter.getValue(), subparameter.getName());
+            }
+            assertEquals(6, ssmService.getParametersByPath(recommended, false, REGION).size());
+        }
+    }
+
+    @Test
+    void resolvesCanonicalUbuntuServerParametersByVersionAndCodename() {
+        String base = "/aws/service/canonical/ubuntu/server/";
+        for (String release : List.of("24.04", "noble")) {
+            assertEquals("ami-ubuntu2404-amd64", ssmService.getParameter(
+                    base + release + "/stable/current/amd64/hvm/ebs-gp3/ami-id", REGION).getValue(), release);
+            assertEquals("ami-ubuntu2404-arm64", ssmService.getParameter(
+                    base + release + "/stable/current/arm64/hvm/ebs-gp3/ami-id", REGION).getValue(), release);
+        }
+        for (String release : List.of("22.04", "jammy")) {
+            assertEquals("ami-ubuntu2204", ssmService.getParameter(
+                    base + release + "/stable/current/amd64/hvm/ebs-gp2/ami-id", REGION).getValue(), release);
+        }
+        for (String release : List.of("20.04", "focal")) {
+            assertEquals("ami-0abcdef1234567892", ssmService.getParameter(
+                    base + release + "/stable/current/amd64/hvm/ebs-gp2/ami-id", REGION).getValue(), release);
+        }
+        assertEquals(2, ssmService.getParametersByPath(base + "24.04/stable/current", true, REGION).size());
+        // Canonical publishes 24.04 on gp3 only; the gp2 name stays absent rather than aliased.
+        assertThrows(AwsException.class, () -> ssmService.getParameter(
+                base + "24.04/stable/current/amd64/hvm/ebs-gp2/ami-id", REGION));
     }
 
     @Test
@@ -134,12 +175,12 @@ class SsmServicePublicAmiParameterTest {
         assertTrue(names.contains(AMZN2_DEFAULT), names.toString());
         assertEquals(9, names.size());
         assertTrue(ssmService.getParametersByPath("/aws/service", false, REGION).isEmpty());
-        assertEquals(34, ssmService.getParametersByPath("/aws/service", true, REGION).size());
+        assertEquals(54, ssmService.getParametersByPath("/aws/service", true, REGION).size());
     }
 
     @Test
     void appliesPathTypeFiltersToPublicParameters() {
-        assertEquals(34, ssmService.getParametersByPath("/aws/service", true,
+        assertEquals(54, ssmService.getParametersByPath("/aws/service", true,
                 List.of(new ParameterStringFilter("Type", null, List.of("String"))), REGION).size());
         assertTrue(ssmService.getParametersByPath("/aws/service", true,
                 List.of(new ParameterStringFilter("Type", null, List.of("StringList"))), REGION).isEmpty());

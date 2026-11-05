@@ -1402,6 +1402,47 @@ class SsmIntegrationTest {
             .statusCode(200)
             .body("Parameters.Name", hasItems(ecsRecommended, ecsRecommended + "/image_id"));
 
+        String ecsArm64Recommended =
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended";
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Name": "%s" }
+                """.formatted(ecsArm64Recommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameter.Value", containsString("\"image_id\":\"ami-amazonlinux2023-arm64\""));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameters")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Names": ["%s/image_name", "%s/image_id"] }
+                """.formatted(ecsRecommended, ecsArm64Recommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("InvalidParameters", empty())
+            .body("Parameters.Value", hasItems(
+                    "al2023-ami-2023.0.20230315.0-kernel-6.1-x86_64", "ami-amazonlinux2023-arm64"));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Path": "%s" }
+                """.formatted(ecsArm64Recommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameters.Name", hasItems(ecsArm64Recommended + "/image_name",
+                    ecsArm64Recommended + "/os", ecsArm64Recommended + "/schema_version"));
+
         given()
             .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")
             .contentType(SSM_CONTENT_TYPE)
@@ -2077,7 +2118,7 @@ class SsmIntegrationTest {
             .header("X-Amz-Target", "AmazonSSM.GetParameters")
             .contentType(SSM_CONTENT_TYPE)
             .body("""
-                { "Names": ["/selector/param:1", "/selector/param:9"] }
+                { "Names": ["/selector/param:1", "/selector/param:9"], "WithDecryption": true }
                 """)
         .when()
             .post("/")
@@ -2132,7 +2173,7 @@ class SsmIntegrationTest {
             .body("message", equalTo("NUMBER_VALUE can not be converted to a String"));
     }
 
-    private io.restassured.response.ValidatableResponse labelParameterVersion(String body) {
+    private ValidatableResponse labelParameterVersion(String body) {
         return given()
             .header("X-Amz-Target", "AmazonSSM.LabelParameterVersion")
             .contentType(SSM_CONTENT_TYPE)
@@ -2338,7 +2379,7 @@ class SsmIntegrationTest {
         }
     }
 
-    private io.restassured.response.ValidatableResponse unlabel(String body) {
+    private ValidatableResponse unlabel(String body) {
         return given()
             .header("X-Amz-Target", "AmazonSSM.UnlabelParameterVersion")
             .contentType(SSM_CONTENT_TYPE)
@@ -2480,7 +2521,7 @@ class SsmIntegrationTest {
         return received;
     }
 
-    private io.restassured.response.ValidatableResponse describeParameters(String body) {
+    private ValidatableResponse describeParameters(String body) {
         return given()
             .header("X-Amz-Target", "AmazonSSM.DescribeParameters")
             .contentType(SSM_CONTENT_TYPE)

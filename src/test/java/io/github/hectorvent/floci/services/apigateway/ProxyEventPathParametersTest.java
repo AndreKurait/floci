@@ -51,7 +51,7 @@ class ProxyEventPathParametersTest {
         controller = new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, MAPPER, null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class));
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, mock(ServiceCallAuthorizer.class));
     }
 
     private JsonNode pathParametersFor(String path, String resourcePath) throws Exception {
@@ -112,5 +112,15 @@ class ProxyEventPathParametersTest {
 
         assertEquals(List.of("rest"), keysOf(pp));
         assertEquals("img/logo.png", pp.get("rest").asText());
+    }
+
+    @Test
+    void greedyResourceBelowAPathParameterReceivesBothParameters() throws Exception {
+        JsonNode pp = pathParametersFor("/v1/admin/catalog/scopes/teos/sur-df",
+                "/v1/admin/catalog/{kind}/{name+}");
+
+        assertEquals(List.of("kind", "name"), keysOf(pp));
+        assertEquals("scopes", pp.get("kind").asText());
+        assertEquals("teos/sur-df", pp.get("name").asText());
     }
 }

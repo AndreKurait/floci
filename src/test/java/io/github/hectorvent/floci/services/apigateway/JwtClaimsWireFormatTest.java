@@ -31,7 +31,7 @@ class JwtClaimsWireFormatTest {
                 null, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, mock(ServiceCallAuthorizer.class));
+        , null, null, null, mock(ServiceCallAuthorizer.class));
     }
 
     private static String unsignedToken(String claimsJson) {

@@ -49,14 +49,13 @@ class BuildV2AuthorizerEventTrailingSlashTest {
                 regionResolver, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, mock(ServiceCallAuthorizer.class));
+        , null, null, null, mock(ServiceCallAuthorizer.class));
     }
 
     private JsonNode buildEvent(String normalizedPath, String rawRequestUri) throws Exception {
         when(uriInfo.getRequestUri()).thenReturn(new URI(rawRequestUri));
-        String json = controller.buildRequestAuthorizerEventV1(
+        return controller.buildRequestAuthorizerEventV1(
                 "GET", normalizedPath, "abc123", "test", "us-east-1", headers, uriInfo, null);
-        return new ObjectMapper().readTree(json);
     }
 
     @Test

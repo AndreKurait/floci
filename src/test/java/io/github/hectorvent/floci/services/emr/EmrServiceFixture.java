@@ -15,8 +15,12 @@ import io.github.hectorvent.floci.testing.MutableClock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -32,7 +36,7 @@ import static org.mockito.Mockito.when;
  * recording the {@code aws.emr} events it publishes. Each event is handed to {@link #target} as it is
  * published, as EventBridge's first delivery is, and checked to be published once the service is let go,
  * and, for a wakeup's, after it, as the timer's own thread never sends them. In the {@code docker} runner
- * mode a step's thread is one the test runs, with {@link #runStepThread}.
+ * mode a step's thread, and a bootstrap's, is one the test runs, with {@link #runStepThread}.
  */
 final class EmrServiceFixture {
 
@@ -46,6 +50,77 @@ final class EmrServiceFixture {
     }
 
     private record Wakeup(Instant due, Runnable task) {}
+
+    /**
+     * A cluster's storage as what the service asked of it, each removal refused while {@link #refuse} is set, and
+     * {@link #whileCreating} run as each is made.
+     */
+    static final class RecordingStorage implements ClusterStorage {
+        // The address each cluster's HDFS answers at.
+        static final String HDFS_ADDRESS = "172.18.0.5";
+        // The Docker network of a cluster's own each cluster's HDFS is on.
+        static final String HDFS_NETWORK = "floci-aws-emr-hdfs";
+        final List<String> created = new ArrayList<>();
+        // Each HDFS started: its cluster, primary node's host name, image and Docker network.
+        final List<List<String>> hdfs = new ArrayList<>();
+        RuntimeException hdfsFailure;
+        // Runs as each HDFS starts, with what tells it the step is past starting.
+        Consumer<BooleanSupplier> whileStartingHdfs = stopped -> { };
+        final List<String> removed = new ArrayList<>();
+        final List<Set<String>> kept = new ArrayList<>();
+        boolean refuse;
+        Runnable whileCreating = () -> { };
+
+        @Override
+        public SparkJobRunner.Storage volumes(String clusterId) {
+            return new SparkJobRunner.Storage(clusterId + "-home", clusterId + "-mnt");
+        }
+
+        @Override
+        public void create(String clusterId, String accountId, String region) {
+            created.add(clusterId);
+            whileCreating.run();
+        }
+
+        @Override
+        public SparkJobRunner.Storage hdfs(String clusterId, String accountId, String region, String host,
+                                           String image, String dockerNetwork, BooleanSupplier stopped) {
+            hdfs.add(Arrays.asList(clusterId, host, image, dockerNetwork));
+            whileStartingHdfs.accept(stopped);
+            if (hdfsFailure != null) {
+                throw hdfsFailure;
+            }
+            return volumes(clusterId).withHdfs(host, HDFS_ADDRESS, HDFS_NETWORK);
+        }
+
+        @Override
+        public boolean remove(String clusterId) {
+            removed.add(clusterId);
+            return !refuse;
+        }
+
+        @Override
+        public void removeAllBut(Set<String> kept) {
+            this.kept.add(kept);
+        }
+    }
+
+    /** Makes no image: answers {@link #IMAGE} for each, or throws {@link #failure} when it is set. */
+    static final class RecordingReleaseImages implements ReleaseImages {
+        static final String IMAGE = "sha256:" + "3".repeat(64);
+        // Each image asked for: its release, then the two it is made of.
+        final List<List<String>> asked = new ArrayList<>();
+        RuntimeException failure;
+
+        @Override
+        public String image(String releaseLabel, String sparkImage, String hiveImage) {
+            asked.add(List.of(releaseLabel, sparkImage, hiveImage));
+            if (failure != null) {
+                throw failure;
+            }
+            return IMAGE;
+        }
+    }
 
     final ObjectMapper objectMapper = new ObjectMapper();
     final List<JsonNode> published = new ArrayList<>();
@@ -61,6 +136,10 @@ final class EmrServiceFixture {
     private boolean waking;
     private final InMemoryStorageFactory storage;
     private final SparkJobRunner runner;
+    private final BootstrapRunner bootstrap;
+    // The docker runner mode's; null in the immediate one.
+    final RecordingStorage clusterStorage;
+    final RecordingReleaseImages releaseImages;
     private final IamService iam;
     private final int[] durations;
 
@@ -70,20 +149,30 @@ final class EmrServiceFixture {
     }
 
     EmrServiceFixture(int startupDelaySeconds, int stepDurationSeconds, int terminationDelaySeconds) {
-        this(new InMemoryStorageFactory(ACCOUNT), new MutableClock(), null, null,
+        this(new InMemoryStorageFactory(ACCOUNT), new MutableClock(), null, null, null, null, null,
                 startupDelaySeconds, stepDurationSeconds, terminationDelaySeconds);
     }
 
     /** The service in the {@code docker} runner mode, every duration 0, its steps run by {@code runner}. */
     static EmrServiceFixture docker(SparkJobRunner runner, IamService iam) {
-        return new EmrServiceFixture(new InMemoryStorageFactory(ACCOUNT), new MutableClock(), runner, iam, 0, 0, 0);
+        return docker(runner, null, iam);
+    }
+
+    /** As {@link #docker(SparkJobRunner, IamService)}, its clusters' bootstrap actions run by {@code bootstrap}. */
+    static EmrServiceFixture docker(SparkJobRunner runner, BootstrapRunner bootstrap, IamService iam) {
+        return new EmrServiceFixture(new InMemoryStorageFactory(ACCOUNT), new MutableClock(), runner, bootstrap,
+                new RecordingStorage(), new RecordingReleaseImages(), iam, 0, 0, 0);
     }
 
     private EmrServiceFixture(InMemoryStorageFactory storage, MutableClock clock, SparkJobRunner runner,
-                              IamService iam, int... durations) {
+                              BootstrapRunner bootstrap, RecordingStorage clusterStorage,
+                              RecordingReleaseImages releaseImages, IamService iam, int... durations) {
         this.storage = storage;
         this.clock = clock;
         this.runner = runner;
+        this.bootstrap = bootstrap;
+        this.clusterStorage = clusterStorage;
+        this.releaseImages = releaseImages;
         this.iam = iam;
         this.durations = durations;
         EventBridgeService eventBridge = mock(EventBridgeService.class);
@@ -110,12 +199,12 @@ final class EmrServiceFixture {
             public void deliver(Runnable delivery) {
                 deliveries.add(delivery);
             }
-        }, runner, stepThreads::add, iam);
+        }, runner, bootstrap, clusterStorage, releaseImages, stepThreads::add, iam);
     }
 
     /** A new service on the same storage and clock, as after a restart of Floci with persistent storage. */
     EmrServiceFixture restart() {
-        return new EmrServiceFixture(storage, clock, runner, iam, durations);
+        return new EmrServiceFixture(storage, clock, runner, bootstrap, clusterStorage, releaseImages, iam, durations);
     }
 
     /**
@@ -124,7 +213,19 @@ final class EmrServiceFixture {
      */
     EmrService restartReconciling(SparkJobRunner runner, EmrService.Wakeups wakeups) {
         return new EmrService(storage, config(true), new RegionResolver(REGION, ACCOUNT), publisher, clock, wakeups,
-                runner, stepThreads::add, iam);
+                runner, bootstrap, clusterStorage, releaseImages, stepThreads::add, iam);
+    }
+
+    /**
+     * A new service on the same storage and clock, as {@link #restart} builds, whose Hive steps run in the image
+     * {@code hiveImageTemplate} names, its steps' threads this fixture's, and its events not delivered.
+     */
+    EmrService withHiveImageTemplate(String hiveImageTemplate) {
+        EmulatorConfig config = config(false);
+        when(config.services().emr().hiveImageTemplate()).thenReturn(Optional.of(hiveImageTemplate));
+        return new EmrService(storage, config, new RegionResolver(REGION, ACCOUNT), publisher, clock,
+                mock(EmrService.Wakeups.class), runner, bootstrap, clusterStorage, releaseImages, stepThreads::add,
+                iam);
     }
 
     private EmulatorConfig config(boolean reconcile) {
@@ -134,6 +235,7 @@ final class EmrServiceFixture {
         when(config.services().emr().stepDurationSeconds()).thenReturn(durations[1]);
         when(config.services().emr().clusterTerminationDelaySeconds()).thenReturn(durations[2]);
         when(config.services().emr().imageTemplate()).thenReturn(Optional.empty());
+        when(config.services().emr().hiveImageTemplate()).thenReturn(Optional.empty());
         when(config.services().emr().dockerNetwork()).thenReturn(Optional.empty());
         when(config.services().emr().reconcileContainersOnStartup()).thenReturn(reconcile);
         return config;

@@ -14,6 +14,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import java.net.URI;
 import java.util.List;
+import java.util.Locale;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -54,7 +55,7 @@ class BuildV2ProxyEventMultiValueTest {
         controller = new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class));
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, mock(ServiceCallAuthorizer.class));
     }
 
     enum Builder { INTEGRATION, AUTHORIZER }
@@ -66,7 +67,7 @@ class BuildV2ProxyEventMultiValueTest {
                     "abc123", "us-east-1", "$default", headers, uriInfo, null, "req-1");
             case AUTHORIZER -> controller.buildRequestAuthorizerEventV2(
                     "GET", "/echo", "GET /echo",
-                    "abc123", "$default", "us-east-1", headers, uriInfo, null);
+                    "abc123", "$default", "us-east-1", headers, uriInfo, null).toString();
         };
         return new ObjectMapper().readTree(json);
     }
@@ -81,6 +82,19 @@ class BuildV2ProxyEventMultiValueTest {
 
         assertEquals("1,2", qsp.get("q").asText());
         assertEquals("x", qsp.get("single").asText());
+    }
+
+    @ParameterizedTest
+    @EnumSource(Builder.class)
+    void headerNamesUseLocaleIndependentCaseFolding(Builder builder) throws Exception {
+        requestHeaders.add("X-Identity", "identity-value");
+        Locale original = Locale.getDefault();
+        try {
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"));
+            assertEquals("identity-value", buildEvent(builder).path("headers").path("x-identity").asText());
+        } finally {
+            Locale.setDefault(original);
+        }
     }
 
     @ParameterizedTest

@@ -7,6 +7,9 @@ import io.github.hectorvent.floci.core.common.RequestResourceMembers.Member;
 import io.github.hectorvent.floci.core.common.RequestResourceMembers.Resource;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedHashMap;
+import jakarta.ws.rs.core.MultivaluedMap;
+import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
@@ -14,9 +17,13 @@ import org.junit.jupiter.api.TestFactory;
 import java.io.ByteArrayInputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -40,7 +47,19 @@ class RequestResourceMembersTest {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
         assertTrue(table.namespaces().containsAll(List.of("cognito-idp", "ecr", "elasticloadbalancing", "states")));
         assertTrue(table.handBuilt().contains("lambda"));
-        assertTrue(table.namespaces().stream().noneMatch(table.handBuilt()::contains));
+        assertEquals(Set.of("dynamodb", "logs"), table.namespaces().stream().filter(table.handBuilt()::contains)
+                .collect(Collectors.toSet()));
+        Set<String> logsDelivery = Stream.of("PutDeliverySource", "GetDeliverySource", "DeleteDeliverySource",
+                "DescribeDeliverySources", "PutDeliveryDestination", "GetDeliveryDestination",
+                "DeleteDeliveryDestination", "DescribeDeliveryDestinations", "CreateDelivery", "GetDelivery",
+                "UpdateDeliveryConfiguration", "DeleteDelivery", "DescribeDeliveries")
+                .map(operation -> "logs:" + operation).collect(Collectors.toSet());
+        Set<String> expected = new HashSet<>(logsDelivery);
+        expected.add("dynamodb:ListTables");
+        assertEquals(expected, table.operations().keySet().stream()
+                .filter(operation -> table.handBuilt().contains(operation.substring(0, operation.indexOf(':'))))
+                .collect(Collectors.toSet()),
+                "only explicit corrections and the operations listed to read override hand-built operations");
         assertTrue(table.namespaces().stream().noneMatch(table.notCovered()::contains));
         assertTrue(table.otherNamespaces().stream().noneMatch(table.notCovered()::contains));
         table.operations().forEach((operation, resources) -> {
@@ -80,6 +99,67 @@ class RequestResourceMembersTest {
     }
 
     @Test
+    void aScalableTargetIsFoundByTheMembersItsServiceReadsNotFilledByItsResourceId() {
+        List<Member> triple = List.of(new Member("ServiceNamespace", false), new Member("ResourceId", false),
+                new Member("ScalableDimension", false));
+        for (String operation : List.of("RegisterScalableTarget", "DeregisterScalableTarget", "PutScalingPolicy",
+                "DeleteScalingPolicy", "PutScheduledAction", "DeleteScheduledAction")) {
+            Resource target = RequestResourceMembers.table().operations().get("application-autoscaling:" + operation)
+                    .stream().filter(resource -> resource.arn() == null).findFirst().orElseThrow();
+            assertEquals(triple, target.find(), operation);
+            assertTrue(target.fill().isEmpty(), operation);
+        }
+        String formats = "\"arnFormats\":{\"a\":{\"target\":\"arn:${Partition}:a:${Region}:${Account}:target/${Id}\"}}";
+        assertEquals(List.of(new Member("Namespace", false), new Member("Dimension", false)), parseUnchecked(document(
+                formats, "{\"type\":\"target\",\"fill\":{},\"find\":[\"Namespace\",\"Dimension\"]}"))
+                .operations().get("a:Op").getFirst().find());
+        // No members, a list, members beside one filling it, no list of them, or beside members reading it otherwise.
+        for (String bad : List.of("\"fill\":{},\"find\":[]", "\"fill\":{},\"find\":[\"Ids[]\"]",
+                "\"fill\":{\"Id\":\"Id\"},\"find\":[\"Namespace\"]", "\"fill\":{},\"find\":\"Namespace\"",
+                "\"fill\":{},\"find\":{\"a\":\"Namespace\"}",
+                "\"fill\":{},\"find\":[\"Namespace\"],\"account\":\"registryId\"",
+                "\"fill\":{},\"find\":[\"Namespace\"],\"absent\":{\"Namespace\":\"ecs\"}")) {
+            assertThrows(IllegalStateException.class,
+                    () -> parse(document(formats, "{\"type\":\"target\"," + bad + "}")), bad);
+        }
+        // Nor beside an ARN member, which names the resource itself.
+        assertThrows(IllegalStateException.class, () -> parse(document(formats,
+                "{\"types\":[\"target\"],\"arn\":\"TargetArn\",\"find\":[\"Namespace\"]}")));
+    }
+
+    @Test
+    void aDataApiSessionNamesTheClusterOrWorkgroupItRunsOnThroughItsSessionId() {
+        Resource session = new Resource(List.of("cluster", "workgroup"), null, Map.of(), Map.of(), Map.of(), Map.of(),
+                Map.of(), null, null, Map.of(), false, List.of(), null, new Member("SessionId", false));
+        for (String operation : List.of("ExecuteStatement", "BatchExecuteStatement")) {
+            assertEquals(session, RequestResourceMembers.table().operations().get("redshift-data:" + operation)
+                    .getLast(), operation);
+        }
+        assertTrue(RequestResourceMembers.table().operations().get("redshift-data:ListSessions").isEmpty());
+        String formats = "\"arnFormats\":{\"a\":{\"cluster\":\"arn:${Partition}:a:${Region}:${Account}:cluster:${Name}\","
+                + "\"group\":\"arn:${Partition}:a:${Region}:${Account}:group/${Id}\"}}";
+        assertEquals(new Member("SessionId", false), parseUnchecked(document(formats,
+                "{\"types\":[\"cluster\",\"group\"],\"through\":\"SessionId\",\"endpoint\":\"a\"}"))
+                .operations().get("a:Op").getFirst().through());
+        // A list's structures' field names one through each of its values, when another member is absent.
+        Resource each = parseUnchecked(document(formats, "{\"types\":[\"group\"],\"through\":\"Parts[].PartId\","
+                + "\"when\":{\"GroupId\":[null]}}")).operations().get("a:Op").getFirst();
+        assertEquals(new Member("Parts", true, new Member("PartId", false)), each.through());
+        assertEquals(Map.of("GroupId", List.of("")), each.when());
+        // No types, a type with no format, no member, or beside members reading it otherwise.
+        for (String bad : List.of("\"types\":[],\"through\":\"SessionId\"",
+                "\"types\":[\"pool\"],\"through\":\"SessionId\"", "\"types\":[\"group\"],\"through\":\"Ids[][]\"",
+                "\"types\":[\"group\"],\"through\":\"Session.Id.Part\"",
+                "\"types\":[\"group\"],\"through\":\"SessionId\",\"unless\":{\"GroupId\":[null]}",
+                "\"types\":[\"group\"],\"through\":\"SessionId\",\"when\":{\"Ids[]\":[\"a\"]}",
+                "\"types\":[\"group\"],\"through\":\"SessionId\",\"arn\":\"GroupArn\"",
+                "\"types\":[\"group\"],\"through\":\"SessionId\",\"before\":\"#\"",
+                "\"type\":\"group\",\"fill\":{},\"through\":\"SessionId\"")) {
+            assertThrows(IllegalStateException.class, () -> parse(document(formats, "{" + bad + "}")), bad);
+        }
+    }
+
+    @Test
     void aMalformedTableFailsToLoad() {
         assertThrows(IllegalStateException.class, () -> parse("{\"operations\":{}}"));
         // An operation of a namespace the file does not read.
@@ -100,16 +180,64 @@ class RequestResourceMembersTest {
                     + "{\"resources\":[],\"creates\":[{\"type\":\"part\",\"parent\":\"thing\",\"arn\":\"ThingArn\"}]}}}"),
                     part);
         }
-        // A member past one structure, or a structure's member filling a variable.
+        // A member past one structure, or filling a variable from a list in a list.
         assertThrows(IllegalStateException.class, () -> parse(document(formats, "{\"types\":[\"thing\"],\"arn\":\"A[].B.ThingArn\"}")));
-        assertThrows(IllegalStateException.class, () -> parse(document(formats,
-                "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"A[].Name\"}}")));
+        for (String bad : List.of("A.Names[]", "A[].Names[]", "A[].B.Name")) {
+            assertThrows(IllegalStateException.class, () -> parse(document(formats,
+                    "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"" + bad + "\"}}")), bad);
+        }
+        // A field of each of a list's structures fills a variable, read as given when absent or as an ARN, which
+        // only a member filling a variable is.
+        Member each = new Member("A", true, new Member("Name", false));
+        assertEquals(List.of(new Resource(List.of("thing"), null, Map.of("ThingName", each), Map.of(), Map.of(),
+                Map.of("A[].Name", "default"), Map.of("A[].Name", "thing"), null, null, Map.of(), false, null)),
+                parseUnchecked(document(formats, "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"A[].Name\"},"
+                        + "\"absent\":{\"A[].Name\":\"default\"},\"arnOf\":{\"A[].Name\":\"thing\"}}"))
+                        .operations().get("a:Op"));
+        assertEquals("A[].Name", each.path());
+        for (String bad : List.of("\"absent\":{\"A[].Name\":\"default\"}", "\"arnOf\":{\"A[].Name\":\"thing\"}")) {
+            assertThrows(IllegalStateException.class, () -> parse(document(formats,
+                    "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"}," + bad + "}")), bad);
+        }
+        // A field of a structure fills a variable, as one value.
+        Member field = new Member("A", false, new Member("Name", false));
+        assertEquals(List.of(new Resource(List.of("thing"), null, Map.of("ThingName", field), Map.of(), Map.of(),
+                Map.of("A.Name", "default"), Map.of(), null, null, Map.of(), false, null)),
+                parseUnchecked(document(formats, "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"A.Name\"},"
+                        + "\"absent\":{\"A.Name\":\"default\"}}")).operations().get("a:Op"));
+        assertEquals("A.Name", field.path());
+        // A variable fixed to the one value its handler uses, and one fixed that is no variable, that a member fills,
+        // or to no value.
+        String owned = "\"arnFormats\":{\"a\":{\"thing\":\"arn:${Partition}:a:${Region}:${Account}:thing/${Owner}/${ThingName}\"}}";
+        assertEquals(List.of(new Resource(List.of("thing"), null, Map.of("ThingName", new Member("Name", false)), Map.of(),
+                Map.of(), Map.of(), Map.of(), null, null, Map.of("Owner", "Custom"), false, null)),
+                parseUnchecked(document(owned, "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"},"
+                        + "\"fixed\":{\"Owner\":\"Custom\"}}")).operations().get("a:Op"));
+        for (String bad : List.of("{\"Other\":\"Custom\"}", "{\"ThingName\":\"Custom\"}", "{\"Owner\":\"\"}",
+                "{\"Owner\":1}")) {
+            assertThrows(IllegalStateException.class, () -> parse(document(owned,
+                    "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"},\"fixed\":" + bad + "}")), bad);
+        }
+        // The resource a create makes, beside others it names, marked made, and a mark that is not true.
+        assertTrue(parseUnchecked(document(formats, "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"},"
+                + "\"made\":true}")).operations().get("a:Op").getFirst().made());
+        assertTrue(parseUnchecked(document(formats, "{\"types\":[\"thing\"],\"arn\":\"ThingArn\",\"made\":true}"))
+                .operations().get("a:Op").getFirst().made());
+        for (String bad : List.of("false", "\"true\"", "1")) {
+            assertThrows(IllegalStateException.class, () -> parse(document(formats,
+                    "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"},\"made\":" + bad + "}")), bad);
+        }
         assertEquals(List.of(new Resource(List.of("thing"), new Member("A", true, new Member("ThingArns", true)), Map.of(),
-                Map.of(), Map.of(), Map.of(), Map.of(), null, null)), parseUnchecked(document(formats, "{\"types\":[\"thing\"],\"arn\":\"A[].ThingArns[]\"}"))
+                Map.of(), Map.of(), Map.of(), Map.of(), null, null, Map.of(), false, null)), parseUnchecked(document(formats, "{\"types\":[\"thing\"],\"arn\":\"A[].ThingArns[]\"}"))
                 .operations().get("a:Op"));
-        // An ARN read before more than one character.
+        // A member read before more than one character, holding an ARN or filling a variable.
         assertThrows(IllegalStateException.class, () -> parse(document(formats,
                 "{\"types\":[\"thing\"],\"arn\":\"ThingArn\",\"before\":\"##\"}")));
+        assertThrows(IllegalStateException.class, () -> parse(document(formats,
+                "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Id\"},\"before\":\"##\"}")));
+        // A member filling a variable read up to a character, as a CodeBuild build id names its project.
+        assertEquals(":", parseUnchecked(document(formats, "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Id\"},"
+                + "\"before\":\":\"}")).operations().get("a:Op").getFirst().before());
         // An account from a list, or for a type whose format has no account.
         assertThrows(IllegalStateException.class, () -> parse(document(formats,
                 "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"},\"account\":\"Ids[]\"}")));
@@ -139,19 +267,26 @@ class RequestResourceMembersTest {
                     "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"}," + bad + "}")), bad);
         }
         assertEquals(List.of(new Resource(List.of("thing"), null, Map.of("ThingName", new Member("Name", false)),
-                Map.of(), Map.of("Bus", List.of("default")), Map.of("Bus", "default"), Map.of("Bus", "thing"), null, null)),
+                Map.of(), Map.of("Bus", List.of("default")), Map.of("Bus", "default"), Map.of("Bus", "thing"), null, null,
+                Map.of(), false, null)),
                 parseUnchecked(document(formats, "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"},"
                         + "\"unless\":{\"Bus\":[\"default\"]},\"absent\":{\"Bus\":\"default\"},"
                         + "\"arnOf\":{\"Bus\":\"thing\"}}")).operations().get("a:Op"));
         assertEquals(List.of(new Resource(List.of("thing"), null, Map.of("ThingName", new Member("Names", true)), Map.of(),
-                        Map.of(), Map.of(), Map.of(), new Member("registryId", false), null)),
+                        Map.of(), Map.of(), Map.of(), new Member("registryId", false), null, Map.of(), false, null)),
                 parseUnchecked(document(formats, "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Names[]\"},"
                         + "\"account\":\"registryId\"}")).operations().get("a:Op"));
     }
 
     /**
      * Each resource alone, from a request naming it and nothing else, gives exactly its ARN, in the account its
-     * account member names when it has one.
+     * account member names when it has one, with those sharing its explicit member selector, those the operation
+     * always names, such as a create's new resource (Cloud Map's {@code CreateService}), those filled from the ARN
+     * it is read from (a permission set made in an instance), and those a member it shares fills, their other
+     * variables open (Redshift's {@code DeleteClusterSnapshot} names {@code cluster:<id>} by the
+     * {@code SnapshotClusterIdentifier} that also fills {@code snapshot:<id>/<name>}); one named through another
+     * resource of its service's own, the ARN its service gives for that. A member the table locates in a REST
+     * request's path or query is given there, and a body or a form giving it another value names nothing.
      */
     @TestFactory
     Stream<DynamicTest> everyResourceOfTheTableIsReadFromAJsonBodyAndAForm() {
@@ -163,12 +298,14 @@ class RequestResourceMembersTest {
                     ArnFormat format = table.formats().get(namespace).get(resource.types().getFirst());
                     String arn = example(format.format());
                     String account = resource.account() != null ? "111122223333" : "000000000000";
-                    String expected = resource.arn() != null ? arn
+                    String expected = resource.arn() != null || resource.through() != null ? arn
                             : expected(format.format(), resource, account) + (format.minted() ? "/*" : "");
                     ObjectNode body = MAPPER.createObjectNode();
                     StringBuilder form = new StringBuilder("Action=" + name);
                     Map<Member, String> values = resource.arn() != null ? Map.of(resource.arn(), arn)
-                            : resource.fill().values().stream().distinct().collect(Collectors.toMap(m -> m, m -> "x"));
+                            : resource.through() != null ? Map.of(resource.through(), "x")
+                            : Stream.concat(resource.fill().values().stream(), resource.find().stream()).distinct()
+                                    .collect(Collectors.toMap(m -> m, m -> "x"));
                     Map<Member, String> given = new LinkedHashMap<>(values);
                     if (resource.account() != null) {
                         given.put(resource.account(), account);
@@ -178,14 +315,40 @@ class RequestResourceMembersTest {
                             given.put(new Member(member, false), allowed.getFirst());
                         }
                     });
+                    // A member the table locates in a REST request's path or query goes there, where the reader takes it
+                    // from, and the body and the form give it another value, which names nothing.
+                    Map<String, String> located = table.located().getOrDefault(operation.getKey(), Map.of());
+                    Map<String, String> labels = new LinkedHashMap<>();
+                    MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
                     given.forEach((member, value) -> {
-                        put(body, member, value);
-                        form.append('&').append(parameter(member)).append('=').append(encoded(value));
+                        String where = member.field() == null && !member.list() ? located.get(member.name()) : null;
+                        if (where != null && where.startsWith("{")) {
+                            labels.put(where.substring(1, where.length() - 1), value);
+                        } else if (where != null) {
+                            query.add(where.substring(1), value);
+                        }
+                        String sent = where == null ? value : "other";
+                        put(body, member, sent);
+                        form.append('&').append(parameter(member)).append('=').append(encoded(sent));
                     });
-                    assertEquals(List.of(expected), RequestResources.of(operation.getKey(), json(body.toString()),
-                            "aws", "us-east-1", "000000000000"), body.toString());
-                    assertEquals(List.of(expected), RequestResources.of(operation.getKey(), form(form.toString()),
-                            "aws", "us-east-1", "000000000000"), form.toString());
+                    List<String> named = operation.getValue().stream()
+                            .filter(other -> (other == resource || named(other) || sharesAMember(other, given)
+                                    || fillsFromTheArn(other, resource)
+                                    || !other.find().isEmpty() && other.find().equals(resource.find())
+                                    && other.when().equals(resource.when()) && other.unless().equals(resource.unless()))
+                                    && (other.endpoint() == null || resource.endpoint() == null
+                                    || other.endpoint().equals(resource.endpoint())))
+                            .map(other -> other == resource ? expected : expected(
+                                    table.formats().get(namespace).get(other.types().getFirst()).format(), other,
+                                    "000000000000", given.keySet()))
+                            .distinct().toList();
+                    StoredResourceArns stored = runningOn(namespace, arn);
+                    assertEquals(named, RequestResources.of(operation.getKey(),
+                            sentWith(servedBy(json(body.toString()), resource.endpoint()), query), "aws", "us-east-1",
+                            "000000000000", stored, labels), body + " " + labels + " " + query);
+                    assertEquals(named, RequestResources.of(operation.getKey(),
+                            sentWith(servedBy(form(form.toString()), resource.endpoint()), query), "aws", "us-east-1",
+                            "000000000000", stored, labels), form + " " + labels + " " + query);
                 })));
     }
 
@@ -215,6 +378,62 @@ class RequestResourceMembersTest {
                 })));
     }
 
+    /**
+     * Whether a resource fills its variables from the ARN the other's member holds, as that ARN's type's variable alone
+     * (a permission set made in the instance an {@code InstanceArn} names), so a request naming the other by an ARN of
+     * its first type, which the test gives, names it too.
+     */
+    private static boolean fillsFromTheArn(Resource resource, Resource other) {
+        return other.arn() != null && !resource.fill().isEmpty()
+                && resource.fill().values().stream().allMatch(other.arn()::equals)
+                && other.types().getFirst().equals(resource.arnOf().get(other.arn().path()));
+    }
+
+    /** Whether every request of its operation names the resource: no member names it and no member's value selects it. */
+    private static boolean named(Resource resource) {
+        return resource.arn() == null && resource.fill().isEmpty() && resource.find().isEmpty()
+                && resource.through() == null && resource.when().isEmpty() && resource.unless().isEmpty();
+    }
+
+    /** A namespace's stored ARNs that find nothing, and give {@code arn} for whatever a request names a resource through. */
+    private static StoredResourceArns runningOn(String namespace, String arn) {
+        return new StoredResourceArns() {
+            @Override
+            public String namespace() {
+                return namespace;
+            }
+
+            @Override
+            public Optional<String> find(String type, List<String> names, String region) {
+                return Optional.empty();
+            }
+
+            @Override
+            public List<String> through(String member, String value, String region) {
+                return List.of(arn);
+            }
+        };
+    }
+
+    /**
+     * Whether a request giving these members names the resource too: it fills a variable from one of them, not from
+     * the ARN one holds ({@link #fillsFromTheArn} decides those), and no {@code when} or {@code unless} the request's
+     * values fail leaves it out (each member given is {@code x}, any other absent, which a value list holds as
+     * {@code ""}).
+     */
+    private static boolean sharesAMember(Resource resource, Map<Member, String> given) {
+        if (resource.arn() != null || resource.fill().values().stream()
+                .noneMatch(member -> given.containsKey(member) && !resource.arnOf().containsKey(member.path()))) {
+            return false;
+        }
+        Map<String, String> values = given.entrySet().stream()
+                .collect(Collectors.toMap(entry -> entry.getKey().name(), Map.Entry::getValue, (a, b) -> a));
+        return resource.when().entrySet().stream()
+                .allMatch(when -> when.getValue().contains(values.getOrDefault(when.getKey(), "")))
+                && resource.unless().entrySet().stream()
+                .noneMatch(unless -> unless.getValue().contains(values.getOrDefault(unless.getKey(), "")));
+    }
+
     /** The value at the member's path in a body: in its list's first element, and in its field's structure. */
     private static void put(ObjectNode body, Member member, String value) {
         if (member.field() == null) {
@@ -242,10 +461,20 @@ class RequestResourceMembersTest {
 
     /** The format in the account with each variable the resource fills {@code x}, and each other open. */
     private static String expected(String format, Resource resource, String account) {
+        return expected(format, resource, account, resource.fill().values());
+    }
+
+    /** The format in the account with each variable the resource fills from one of {@code given} {@code x}. */
+    private static String expected(String format, Resource resource, String account, Collection<Member> given) {
         String arn = format.replace("${Partition}", "aws").replace("${Region}", "us-east-1")
                 .replace("${Account}", account);
-        for (String variable : resource.fill().keySet()) {
-            arn = arn.replace("${" + variable + "}", "x");
+        for (Map.Entry<String, Member> variable : resource.fill().entrySet()) {
+            if (given.contains(variable.getValue())) {
+                arn = arn.replace("${" + variable.getKey() + "}", "x");
+            }
+        }
+        for (Map.Entry<String, String> variable : resource.fixed().entrySet()) {
+            arn = arn.replace("${" + variable.getKey() + "}", variable.getValue());
         }
         return arn.replaceAll("\\$\\{\\w+}", "*");
     }
@@ -272,6 +501,27 @@ class RequestResourceMembersTest {
 
     private static String encoded(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    /** The request as the service of the endpoint prefix serves it; as no known service when there is none. */
+    static ContainerRequestContext servedBy(ContainerRequestContext request, String endpoint) {
+        if (endpoint != null) {
+            ServiceDescriptor service = new ServiceDescriptor(endpoint, endpoint, true, true, null, null, 0L, null,
+                    ServiceProtocol.JSON, Set.of(ServiceProtocol.JSON), Set.of(), Set.of(), Set.of(), Set.of(),
+                    Set.of());
+            when(request.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY))
+                    .thenReturn(new ProtocolClaim(WireProtocol.AWS_JSON_1_1, service, null, null));
+        }
+        return request;
+    }
+
+    /** The request with the query it is sent with. */
+    private static ContainerRequestContext sentWith(ContainerRequestContext request,
+                                                    MultivaluedMap<String, String> query) {
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getQueryParameters()).thenReturn(query);
+        when(request.getUriInfo()).thenReturn(uriInfo);
+        return request;
     }
 
     private static ContainerRequestContext json(String body) {

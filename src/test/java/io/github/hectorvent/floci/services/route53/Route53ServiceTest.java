@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.route53.model.AliasTarget;
 import io.github.hectorvent.floci.services.route53.model.HealthCheck;
 import io.github.hectorvent.floci.services.route53.model.HealthCheckConfig;
+import io.github.hectorvent.floci.services.route53.model.HostedZone;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecordSet;
 import io.github.hectorvent.floci.services.route53.model.VpcAssociation;
@@ -24,6 +25,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.empty;
@@ -62,10 +64,10 @@ class Route53ServiceTest {
         Mockito.when(config.defaultAccountId()).thenReturn(ACCOUNT);
         Mockito.when(config.services()).thenReturn(servicesConfig);
         Mockito.when(servicesConfig.route53()).thenReturn(route53Config);
-        Mockito.when(route53Config.defaultNameserver1()).thenReturn("ns-1.awsdns-00.com" + nameserverSuffix);
-        Mockito.when(route53Config.defaultNameserver2()).thenReturn("ns-2.awsdns-00.net" + nameserverSuffix);
-        Mockito.when(route53Config.defaultNameserver3()).thenReturn("ns-3.awsdns-00.org" + nameserverSuffix);
-        Mockito.when(route53Config.defaultNameserver4()).thenReturn("ns-4.awsdns-00.co.uk" + nameserverSuffix);
+        Mockito.when(route53Config.defaultNameserver1()).thenReturn(Optional.of("ns-1.awsdns-00.com" + nameserverSuffix));
+        Mockito.when(route53Config.defaultNameserver2()).thenReturn(Optional.of("ns-2.awsdns-00.net" + nameserverSuffix));
+        Mockito.when(route53Config.defaultNameserver3()).thenReturn(Optional.of("ns-3.awsdns-00.org" + nameserverSuffix));
+        Mockito.when(route53Config.defaultNameserver4()).thenReturn(Optional.of("ns-4.awsdns-00.co.uk" + nameserverSuffix));
         Mockito.when(route53Config.vpcAssociationControlPlaneDelayMs()).thenReturn(0L);
 
         Ec2Service ec2Service = Mockito.mock(Ec2Service.class);
@@ -74,35 +76,84 @@ class Route53ServiceTest {
         return new Route53Service(storageFactory, config, regionResolver, ec2Service);
     }
 
+    @Test
+    void hostedZonesByNameUseReversedLabelsAndFilteredPageBoundary() {
+        Route53Service service = newService();
+        String firstId = service.createHostedZone("z.example.com.", "byname-first", null, null).zone().getId();
+        String lastId = service.createHostedZone("a.other.com.", "byname-last", null, null).zone().getId();
+
+        assertEquals(List.of(firstId, lastId), service.listHostedZonesByName(null, 0).stream()
+                .map(HostedZone::getId).toList());
+
+        Route53Pagination.Page<HostedZone> lastPage = service.pageHostedZonesByName("a.other.com.", null, 1);
+        assertEquals(List.of(lastId), lastPage.items().stream().map(HostedZone::getId).toList());
+        assertFalse(lastPage.isTruncated());
+    }
+
+    @Test
+    void reversedDnsNameKeepsAnEscapedDotInsideItsLabel() {
+        assertEquals("com.example.a\\.b.", Route53Service.reversedDnsName("a\\.b.example.com."));
+    }
+
+    @Test
+    void hostedZonesByNameContinueAcrossNamesAndLimitPagesToOneHundred() {
+        Route53Service service = newService();
+        for (int i = 0; i < 101; i++) {
+            service.createHostedZone("zone-" + String.format("%03d", i) + ".example.test.",
+                    "byname-cap-" + i, null, null);
+        }
+
+        assertEquals(101, service.listHostedZonesByName(null, 0).size());
+        Route53Pagination.Page<HostedZone> firstPage = service.pageHostedZonesByName(null, null, 200);
+        assertEquals(100, firstPage.items().size());
+        assertTrue(firstPage.isTruncated());
+
+        HostedZone nextZone = firstPage.nextItem();
+        Route53Pagination.Page<HostedZone> secondPage = service.pageHostedZonesByName(
+                nextZone.getName(), nextZone.getId(), 200);
+        assertEquals(List.of(nextZone.getId()), secondPage.items().stream().map(HostedZone::getId).toList());
+        assertFalse(secondPage.isTruncated());
+    }
+
     @ParameterizedTest(name = "configured names ending in {0}")
     @ValueSource(strings = {"", ".", " ", ".\t", ".\u2003"})
-    void defaultApexRecordsUseAbsoluteNamesAndTheDelegationSetDoesNot(String nameserverSuffix) {
+    void configuredApexRecordsUseAbsoluteNamesAndTheDelegationSetDoesNot(String nameserverSuffix) {
         Route53Service service = newService(nameserverSuffix);
         String zoneId = service.createHostedZone("authority.example", "authority", null, null).zone().getId();
         List<ResourceRecordSet> records = service.listResourceRecordSets(zoneId, null, null, 100);
+        List<String> assigned = service.getAssignedNameServers(zoneId);
 
         assertAll(
-                () -> assertEquals(List.of("ns-1.awsdns-00.com. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"),
+                () -> assertEquals(List.of(assigned.getFirst() + ". awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400"),
                         valuesOf(records, "SOA"), "SOA"),
-                () -> assertEquals(List.of("ns-1.awsdns-00.com.", "ns-2.awsdns-00.net.", "ns-3.awsdns-00.org.",
-                        "ns-4.awsdns-00.co.uk."), valuesOf(records, "NS"), "NS"),
+                () -> assertEquals(assigned.stream().map(name -> name + ".").toList(), valuesOf(records, "NS"), "NS"),
                 () -> assertEquals(List.of("ns-1.awsdns-00.com", "ns-2.awsdns-00.net", "ns-3.awsdns-00.org",
-                        "ns-4.awsdns-00.co.uk"), service.getNameServers(), "delegation set"));
+                        "ns-4.awsdns-00.co.uk"), assigned, "configured names"),
+                () -> assertEquals(assigned, service.getNameServers(), "configured bases"));
     }
 
     @ParameterizedTest(name = "configured names ending in {0}")
     @ValueSource(strings = {"", ".", " ", ".\t", ".\u2003"})
     void apexNsQueryIsAnswered(String nameserverSuffix) {
         Route53Service service = newService(nameserverSuffix);
-        service.createHostedZone("authority.example", "authority", null, null);
+        String zoneId = service.createHostedZone("authority.example", "authority", null, null).zone().getId();
 
         DnsAnswer answer = new Route53DnsRecordSource(service).resolveAuthoritative("authority.example", 2)
                 .orElseThrow();
 
         assertEquals(0, answer.responseCode(), "rcode");
-        assertEquals(List.of(new DnsRecord.Ns("ns-1.awsdns-00.com."), new DnsRecord.Ns("ns-2.awsdns-00.net."),
-                new DnsRecord.Ns("ns-3.awsdns-00.org."), new DnsRecord.Ns("ns-4.awsdns-00.co.uk.")),
+        assertEquals(service.getAssignedNameServers(zoneId).stream().map(name -> new DnsRecord.Ns(name + ".")).toList(),
                 answer.records(), "answers");
+    }
+
+    @Test
+    void privateZonesKeepTheirConfiguredNameServers() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("private.example", "private", null,
+                new VpcAssociation("vpc-123", "us-east-1")).zone().getId();
+        assertEquals(service.getNameServers(), service.getAssignedNameServers(zoneId));
+        assertEquals(service.getNameServers().stream().map(name -> name + ".").toList(),
+                valuesOf(service.listResourceRecordSets(zoneId, null, null, 100), "NS"));
     }
 
     @Test
@@ -266,6 +317,56 @@ class Route53ServiceTest {
         rrs.setSetIdentifier(setIdentifier);
         rrs.setWeight(weight);
         return rrs;
+    }
+
+    @Test
+    void recordOutsideTheHostedZoneIsRejected() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("datacite.org.", "ref-outside", null, null).zone().getId();
+
+        AwsException e = assertThrows(AwsException.class, () -> service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", aRecord("_lovable.strategy", 300, "1.2.3.4"))), null));
+        assertEquals("InvalidChangeBatch", e.getErrorCode());
+        assertEquals("RRSet with DNS name _lovable.strategy. is not permitted in zone datacite.org.", e.getMessage());
+        AwsException suffixOnly = assertThrows(AwsException.class, () -> service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", aRecord("notdatacite.org", 300, "1.2.3.4"))), null));
+        assertEquals("InvalidChangeBatch", suffixOnly.getErrorCode());
+    }
+
+    @Test
+    void recordInsideTheHostedZoneIsAcceptedRegardlessOfCaseDotOrWildcard() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("datacite.org.", "ref-inside", null, null).zone().getId();
+
+        service.changeResourceRecordSets(zoneId, List.of(
+                change("CREATE", aRecord("WWW.DataCite.org", 300, "1.2.3.4")),
+                change("CREATE", aRecord("*.blog.datacite.org.", 300, "1.2.3.5")),
+                change("CREATE", aRecord("datacite.org", 300, "1.2.3.6"))), null);
+
+        assertEquals(5, service.listResourceRecordSets(zoneId, null, null, 0).size());
+    }
+
+    @Test
+    void rootHostedZoneAcceptsAnyRecordName() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone(".", "ref-root", null, null).zone().getId();
+
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", aRecord("www.example.", 300, "1.2.3.4"))), null);
+
+        assertEquals(3, service.listResourceRecordSets(zoneId, null, null, 0).size());
+    }
+
+    @Test
+    void zoneCheckFoldsOnlyAsciiLettersLikeRecordIdentity() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("k.example.", "ref-kelvin", null, null).zone().getId();
+
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", aRecord("www.K.example.", 300, "1.2.3.4"))), null);
+        AwsException e = assertThrows(AwsException.class, () -> service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", aRecord("www.\u212A.example.", 300, "1.2.3.5"))), null));
+        assertEquals("InvalidChangeBatch", e.getErrorCode());
     }
 
     @Test
