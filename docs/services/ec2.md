@@ -417,8 +417,9 @@ EBS-backed `CopyImage` checks the source AMI in `SourceRegion` and the new image
 snapshots in the destination region. Image/snapshot attribute operations and
 `CreateTags`/`DeleteTags` check their named image and snapshot ARNs. This permits
 image/snapshot-scoped roles while retaining explicit denies. `DescribeImages`
-and `DescribeTags` require an unscoped grant. Other EC2 resource targets retain
-their existing unscoped evaluation; this does not qualify all EC2 IAM behavior.
+and `DescribeTags` require an unscoped grant. Security-group rule and tag
+authorization is described below; other EC2 resource targets retain their
+existing unscoped evaluation.
 Public/group/organization grants, legacy `OperationType`/`UserId.N` mutation
 forms, encrypted shared copies and KMS remain unsupported.
 
@@ -769,6 +770,15 @@ private gateway lifecycles are not modelled.
 | ModifySubnetAttribute | Updates supported subnet attributes. |
 
 ### Security Groups
+
+With IAM enforcement enabled, ingress and egress authorization and revocation
+requests carrying `GroupId` check that group's ARN, including its account,
+region and partition. Referenced peer groups and prefix lists do not replace
+the target group. `CreateTags` and `DeleteTags` also check each named group's
+ARN; a mixed request requires permission for every resource before changing
+any tags. Scoped grants and explicit denies both apply. Group-name-only
+requests, describe calls and other group operations retain their existing
+unscoped evaluation.
 
 | Action | Description |
 |--------|-------------|
