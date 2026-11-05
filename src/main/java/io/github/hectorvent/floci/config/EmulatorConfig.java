@@ -1437,6 +1437,9 @@ public interface EmulatorConfig {
 
         @WithDefault("5")
         int maxParameterHistory();
+
+        @WithDefault("1000")
+        long resourceDataSyncIntervalMs();
     }
 
     interface SqsServiceConfig {

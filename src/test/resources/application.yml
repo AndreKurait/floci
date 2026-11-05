@@ -144,6 +144,7 @@ floci:
     ssm:
       enabled: true
       max-parameter-history: 5
+      resource-data-sync-interval-ms: 100
     sqs:
       enabled: true
       default-visibility-timeout: 30
