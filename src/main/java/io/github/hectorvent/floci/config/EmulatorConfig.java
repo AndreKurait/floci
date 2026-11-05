@@ -4104,6 +4104,9 @@ public interface EmulatorConfig {
         /** Path to PEM private key file. Env: FLOCI_TLS_KEY_PATH */
         Optional<String> keyPath();
 
+        /** PEM certificates appended to workload trust bundles. Env: FLOCI_TLS_EXTRA_CA_CERTS */
+        Optional<String> extraCaCerts();
+
         /**
          * Auto-generate a server certificate when no cert-path/key-path is provided. The leaf is
          * issued by Floci's local root CA; both live under {@code {storage.persistent-path}/tls/}
