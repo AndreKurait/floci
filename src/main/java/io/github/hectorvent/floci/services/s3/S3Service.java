@@ -943,6 +943,8 @@ public class S3Service implements Resettable, ResourceProvider {
         String normalizedServerSideEncryption = normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption());
         SseCustomerKey sseCustomerKey = validateSseCustomerKey(effectiveOptions.getSseCustomerAlgorithm(), effectiveOptions.getSseCustomerKey(), effectiveOptions.getSseCustomerKeyMd5());
         rejectConflictingServerSideEncryption(normalizedServerSideEncryption, sseCustomerKey);
+        S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
+                normalizedServerSideEncryption, effectiveOptions.getSseKmsKeyId(), sseCustomerKey != null);
         checkWritePreconditions(bucketName, key, effectiveOptions.getIfMatch(), effectiveOptions.getIfNoneMatch());
 
         byte[] data = body instanceof BytesBody bytes ? bytes.data() : null;
@@ -965,10 +967,8 @@ public class S3Service implements Resettable, ResourceProvider {
         object.setContentEncoding(effectiveOptions.getContentEncoding());
         object.setContentDisposition(effectiveOptions.getContentDisposition());
         object.setCacheControl(effectiveOptions.getCacheControl());
-        object.setServerSideEncryption(normalizedServerSideEncryption);
-        object.setSseKmsKeyId("aws:kms".equals(normalizedServerSideEncryption)
-                ? effectiveOptions.getSseKmsKeyId()
-                : null);
+        object.setServerSideEncryption(encryption.algorithm());
+        object.setSseKmsKeyId(encryption.kmsKeyId());
         if (sseCustomerKey != null) {
             object.setSseCustomerAlgorithm(sseCustomerKey.algorithm());
             object.setSseCustomerKeyMd5(sseCustomerKey.keyMd5());
@@ -4743,6 +4743,8 @@ public class S3Service implements Resettable, ResourceProvider {
             String normalizedServerSideEncryption = normalizeServerSideEncryption(serverSideEncryption);
             SseCustomerKey customerKey = validateSseCustomerKey(sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
             rejectConflictingServerSideEncryption(normalizedServerSideEncryption, customerKey);
+            S3ObjectEncryption encryption = S3ObjectEncryption.resolve(destination.getEncryptionConfiguration(),
+                    normalizedServerSideEncryption, sseKmsKeyId, customerKey != null);
             MultipartUpload upload = new MultipartUpload(bucket, key, contentType);
             upload.setUploadId(orderedMultipartUploadId(upload.getInitiated(), upload.getUploadId()));
             upload.setOwnerAccountId(getBucketOwnerAccountId(bucket));
@@ -4754,8 +4756,8 @@ public class S3Service implements Resettable, ResourceProvider {
             upload.setContentDisposition(contentDisposition);
             upload.setContentEncoding(objectOptions.getContentEncoding());
             upload.setCacheControl(objectOptions.getCacheControl());
-            upload.setServerSideEncryption(normalizedServerSideEncryption);
-            upload.setSseKmsKeyId("aws:kms".equals(normalizedServerSideEncryption) ? sseKmsKeyId : null);
+            upload.setServerSideEncryption(encryption.algorithm());
+            upload.setSseKmsKeyId(encryption.kmsKeyId());
             if (customerKey != null) {
                 upload.setSseCustomerAlgorithm(customerKey.algorithm());
                 upload.setSseCustomerKeyMd5(customerKey.keyMd5());
@@ -6456,6 +6458,7 @@ public class S3Service implements Resettable, ResourceProvider {
     public void putBucketEncryption(String bucketName, String encryptionXml) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        S3ObjectEncryption.fromConfiguration(encryptionXml);
         bucket.setEncryptionConfiguration(encryptionXml);
         bucketStore.put(bucketName, bucket);
     }
@@ -8346,14 +8349,6 @@ public class S3Service implements Resettable, ResourceProvider {
         String effectiveCacheControl = replaceMetadata && effectiveOptions.getCacheControl() != null
                 ? effectiveOptions.getCacheControl()
                 : source.getCacheControl();
-        String effectiveServerSideEncryption = destinationCustomerKey != null
-                ? null
-                : (normalizedServerSideEncryption != null ? normalizedServerSideEncryption : source.getServerSideEncryption());
-        String effectiveSseKmsKeyId = "aws:kms".equals(effectiveServerSideEncryption)
-                ? (normalizedServerSideEncryption != null
-                    ? effectiveOptions.getSseKmsKeyId()
-                    : source.getSseKmsKeyId())
-                : null;
         boolean replaceTags = "REPLACE".equalsIgnoreCase(effectiveOptions.getTaggingDirective());
         Map<String, String> effectiveTags = replaceTags
                 ? effectiveOptions.getReplacementTagging()
@@ -8409,8 +8404,8 @@ public class S3Service implements Resettable, ResourceProvider {
                 }
                 result[0] = storeObjectCopy(destBucket, destKey, body, metadata,
                         effectiveContentType, effectiveStorageClass, effectiveContentEncoding,
-                        effectiveContentDisposition, effectiveCacheControl, effectiveServerSideEncryption,
-                        effectiveSseKmsKeyId, effectiveOptions, copyChecksumAlgorithm, effectiveTags);
+                        effectiveContentDisposition, effectiveCacheControl,
+                        effectiveOptions, copyChecksumAlgorithm, effectiveTags);
                 if (copyAnnotations) {
                     restoreAnnotations(sourceAnnotations, destBucket, destKey, result[0]);
                 }
@@ -8434,8 +8429,8 @@ public class S3Service implements Resettable, ResourceProvider {
                         "The specified bucket does not exist.", 404))) {
             result[0] = storeObjectCopy(destBucket, destKey, body, metadata,
                     effectiveContentType, effectiveStorageClass, effectiveContentEncoding,
-                    effectiveContentDisposition, effectiveCacheControl, effectiveServerSideEncryption,
-                    effectiveSseKmsKeyId, effectiveOptions, copyChecksumAlgorithm, effectiveTags);
+                    effectiveContentDisposition, effectiveCacheControl,
+                    effectiveOptions, copyChecksumAlgorithm, effectiveTags);
             if (copyAnnotations) {
                 restoreAnnotations(sourceAnnotations, destBucket, destKey, result[0]);
             }
@@ -8450,8 +8445,7 @@ public class S3Service implements Resettable, ResourceProvider {
                                      Map<String, String> metadata,
                                      String effectiveContentType, String effectiveStorageClass,
                                      String effectiveContentEncoding, String effectiveContentDisposition,
-                                     String effectiveCacheControl, String effectiveServerSideEncryption,
-                                     String effectiveSseKmsKeyId,
+                                      String effectiveCacheControl,
                                      CopyObjectOptions effectiveOptions, ChecksumAlgorithm copyChecksumAlgorithm,
                                      Map<String, String> effectiveTags) {
         return storeObject(destBucket, destKey, body.body(), effectiveContentType,
@@ -8461,8 +8455,8 @@ public class S3Service implements Resettable, ResourceProvider {
                         .withContentEncoding(effectiveContentEncoding)
                         .withContentDisposition(effectiveContentDisposition)
                         .withCacheControl(effectiveCacheControl)
-                        .withServerSideEncryption(effectiveServerSideEncryption)
-                        .withSseKmsKeyId(effectiveSseKmsKeyId)
+                        .withServerSideEncryption(effectiveOptions.getServerSideEncryption())
+                        .withSseKmsKeyId(effectiveOptions.getSseKmsKeyId())
                         .withSseCustomerAlgorithm(effectiveOptions.getSseCustomerAlgorithm())
                         .withSseCustomerKey(effectiveOptions.getSseCustomerKey())
                         .withSseCustomerKeyMd5(effectiveOptions.getSseCustomerKeyMd5())
