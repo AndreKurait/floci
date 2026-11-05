@@ -298,7 +298,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         specBuilder.withEmbeddedDns();
         // A container image's runtime is its own, Java as likely as any.
-        if (isJavaRuntime(fn.getRuntime()) || "Image".equals(fn.getPackageType())) {
+        if ("Image".equals(fn.getPackageType())
+                || (isJavaRuntime(fn.getRuntime()) && !mountsRuntimeJavaTrustStore(dockerFlags))) {
             specBuilder.withJavaTrustStore();
         }
 
@@ -568,6 +569,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         return configured.filter(value -> !value.isBlank())
                 .map(LambdaDockerFlags::parse)
                 .orElseGet(() -> LambdaDockerFlags.parse(null));
+    }
+
+    private static boolean mountsRuntimeJavaTrustStore(LambdaDockerFlags flags) {
+        List<Path> stores = List.of(Path.of("/var/lang/lib/security/cacerts"),
+                Path.of("/etc/pki/ca-trust/extracted/java/cacerts"));
+        return flags.volumes().stream()
+                .map(volume -> Path.of(volume.split(":", -1)[1]).normalize())
+                .anyMatch(target -> stores.stream().anyMatch(store -> store.startsWith(target)));
     }
 
     private static void applyDockerFlags(ContainerBuilder.Builder builder, LambdaDockerFlags flags) {
