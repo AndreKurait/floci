@@ -984,6 +984,36 @@ class ContainerLauncherTest {
         assertTrue(captureRealContainerSpec().javaTrustStore());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "/var/lang/lib/security/cacerts, false",
+            "/var/lang/lib/security, false",
+            "/etc/pki/ca-trust/extracted/java/cacerts, false",
+            "/etc/pki/ca-trust/extracted/java, false",
+            "/var/lang/lib/security/cacerts.backup, true",
+            "/opt/cacerts, true"
+    })
+    void launchFunction_keepsAnExplicitlyMountedRuntimeTrustStore(String destination, boolean injectStore)
+            throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("code"));
+        when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
+                "--volume /host/trust:" + destination + ":ro"));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("mounted-trust");
+        fn.setRuntime("java21");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setEnvironment(Map.of("JAVA_TOOL_OPTIONS", "-Dapplication.option=kept"));
+
+        launcher.launch(fn);
+
+        ContainerSpec spec = captureRealContainerSpec();
+        assertEquals(injectStore, spec.javaTrustStore());
+        assertTrue(spec.env().contains("JAVA_TOOL_OPTIONS=-Dapplication.option=kept"));
+        assertTrue(spec.binds().stream().anyMatch(bind -> bind.getVolume().getPath().equals(destination)
+                && bind.getAccessMode() == AccessMode.ro));
+    }
+
     @Test
     void launchFunction_createsWithoutBindMountsOrVolume_forSmallCode() throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("code"));
