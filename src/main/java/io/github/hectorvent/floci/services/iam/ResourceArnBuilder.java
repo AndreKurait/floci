@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
@@ -220,7 +221,7 @@ public class ResourceArnBuilder {
                 : IamActionRegistry.decodedPath(ctx);
         return switch (credentialScope) {
             case "s3"             -> buildS3Resources(operation, path, region);
-            case "ec2"            -> Ec2ImageResourceArns.of(operation, ctx, region, partition);
+            case "ec2"            -> Ec2ResourceArns.of(operation, ctx, region, accountId, partition);
             case "lambda"         -> List.of(buildLambdaArn(path, ctx, region, accountId));
             case "sqs"            -> List.of(buildSqsArn(ctx, region, accountId));
             case "sns"            -> List.of(buildSnsArn(ctx, region, accountId));
@@ -1593,8 +1594,7 @@ public class ResourceArnBuilder {
             }
         }
         if (queueUrl != null && !queueUrl.isEmpty()) {
-            String queueName = queueUrl.substring(queueUrl.lastIndexOf('/') + 1);
-            return AwsArnUtils.Arn.of("sqs", region, accountId, queueName).toString();
+            return SqsService.queueArn(queueUrl, AwsRegions.partitionFor(region), region, accountId);
         }
         return AwsArnUtils.Arn.of("sqs", region, accountId, "*").toString();
     }

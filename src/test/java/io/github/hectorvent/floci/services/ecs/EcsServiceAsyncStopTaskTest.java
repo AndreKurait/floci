@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
 import io.github.hectorvent.floci.services.ecs.container.EcsTaskHandle;
 import io.github.hectorvent.floci.services.ecs.exec.EcsExecSessionRegistry;
 import io.github.hectorvent.floci.services.ecs.model.Attribute;
+import io.github.hectorvent.floci.services.ecs.model.Container;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
@@ -108,9 +109,9 @@ class EcsServiceAsyncStopTaskTest {
         return manager;
     }
 
-    private static io.github.hectorvent.floci.services.ecs.model.Container container(String name) {
-        io.github.hectorvent.floci.services.ecs.model.Container container =
-                new io.github.hectorvent.floci.services.ecs.model.Container();
+    private static Container container(String name) {
+        Container container =
+                new Container();
         container.setName(name);
         container.setLastStatus("RUNNING");
         return container;

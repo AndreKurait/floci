@@ -77,6 +77,11 @@ public class LaunchedContainerAwsEnv {
         return reachableEndpoint.baseUrl(useEmbeddedDns);
     }
 
+    /** Uses the configured TLS transport for a workload receiving Floci's CA trust bundle. */
+    public String flociEndpointWithTls(boolean useEmbeddedDns) {
+        return reachableEndpoint.baseUrlWithTls(useEmbeddedDns);
+    }
+
     /**
      * Variant for launchers whose workloads reach Floci at an address other than the
      * Docker-reachable one (e.g. Kubernetes pods reaching Floci's pod IP).

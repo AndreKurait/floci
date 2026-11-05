@@ -157,11 +157,12 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
-NAMESPACES = ("acm", "application-autoscaling", "athena", "bcm-data-exports", "bcm-pricing-calculator", "budgets", "ce",
-              "cloudtrail", "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "cur", "datasync", "ecr",
-              "elasticloadbalancing", "elasticmapreduce", "es", "events", "firehose", "globalaccelerator", "kinesisanalytics",
-              "payment-cryptography", "redshift-data", "rekognition", "servicediscovery", "servicequotas", "sso",
-              "states", "swf", "textract", "timestream-influxdb", "translate")
+NAMESPACES = ("access-analyzer", "acm", "application-autoscaling", "athena", "bcm-data-exports",
+              "bcm-pricing-calculator", "budgets", "ce", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
+              "cognito-idp", "cur", "datasync", "ecr", "elasticloadbalancing", "elasticmapreduce", "es", "events",
+              "firehose", "globalaccelerator", "kinesisanalytics", "payment-cryptography", "redshift",
+              "redshift-data", "rekognition", "servicediscovery", "servicequotas", "sso", "states", "swf", "textract",
+              "timestream-influxdb", "translate")
 
 # SDK clients the reference lists for a namespace's operations whose requests Floci does not serve, and why: their
 # members are not read.
@@ -191,11 +192,11 @@ READ_IN_HAND_BUILT: dict[str, str] = {
 }
 
 _LATER = "not read yet: a later batch, with the tests that show its ARNs are the ones its handlers mint"
-_REST = "REST: its requests name their resources in the path, which RequestResources does not read yet"
+_REST = ("REST: its requests name their resources in the path, which RequestResources reads from the route a request "
+         "matched in the vendored REST routes (regen_rest_routes.MODELS), which do not have its model yet")
 
 # Namespaces Floci serves whose resources are not read yet, and why.
 NOT_COVERED: dict[str, str] = {
-    "access-analyzer": _REST,
     "account": _REST,
     "airflow": _REST,
     "app-integrations": _REST,
@@ -257,7 +258,6 @@ NOT_COVERED: dict[str, str] = {
     "ram": _REST,
     "rds": _LATER,
     "rds-data": _REST,
-    "redshift": _LATER,
     "redshift-serverless": "not read yet: its namespace, workgroup, snapshot and managed VPC endpoint ARNs end in an "
                            "id the service mints, `namespace/<id>`, while its requests name them by namespaceName, "
                            "workgroupName, snapshotName and endpointName, so reading it needs the stored ARNs those "
@@ -531,6 +531,65 @@ CORRECTIONS: dict[str, tuple[list[dict], str]] = {
         "using the option ALL_PROVISIONED_ACCOUNTS to, at most, 3,500 AWS accounts', the AWS_ACCOUNT option "
         "provisioning it 'in a single AWS account', IAM Identity Center User Guide), read through the permission set; "
         "its TargetId names the account only for AWS_ACCOUNT, the handler reading a null one as none"),
+    "redshift:GetClusterCredentials": ([
+        {"type": "dbname", "fill": {"ClusterName": "ClusterIdentifier", "DbName": "DbName"},
+         "unless": {"DbName": [None]}},
+        {"type": "dbuser", "fill": {"ClusterName": "ClusterIdentifier", "DbUser": "DbUser"}},
+    ], "the database is checked only when the request names one ('If the DbName parameter is specified, the IAM "
+       "policy must allow access to the resource dbname for the specified database name'), and the Management "
+       "Guide's policy granting the action on a dbuser alone allows it; the rule names the database by "
+       "ClusterIdentifier alone when DbName is absent"),
+    "redshift:RestoreFromClusterSnapshot": ([
+        {"type": "cluster", "fill": {"ClusterName": "ClusterIdentifier"}},
+        {"type": "snapshot", "fill": {"ClusterName": "SnapshotClusterIdentifier", "SnapshotName": "SnapshotIdentifier"}},
+        {"types": ["snapshot"], "arn": "SnapshotArn"},
+    ], "the snapshot's cluster is SnapshotClusterIdentifier ('The name of the cluster the source snapshot was created "
+       "from'), not ClusterIdentifier, the cluster 'that will be created from restoring the snapshot'; its "
+       "DefaultIamRoleArn is an IAM role's ARN and its RedshiftIdcApplicationArn an IAM Identity Center "
+       "application's, never a cluster's or a snapshot's"),
+    **{f"redshift:{operation}": ([{"types": ["cluster", "eventsubscription", "hsmclientcertificate", "hsmconfiguration",
+                                             "integration", "parametergroup", "securitygroup",
+                                             "securitygroupingress-cidr", "securitygroupingress-ec2securitygroup",
+                                             "snapshot", "snapshotcopygrant", "snapshotschedule", "subnetgroup",
+                                             "usagelimit"], "arn": "ResourceName"}],
+                                 "the request names the resource by its ARN in ResourceName ('The Amazon Resource "
+                                 "Name (ARN) to which you want to add the tag or tags'), whose name does not end in "
+                                 "Arn")
+       for operation in ("CreateTags", "DeleteTags", "DescribeTags")},
+    **{f"redshift:{operation}": ([{"type": kind, "fill": fill}], f"{why}, never a {kind}'s")
+       for operation, kind, fill, why in (
+           ("CreateCluster", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its DefaultIamRoleArn is an IAM role's ARN and its RedshiftIdcApplicationArn an IAM Identity Center "
+            "application's"),
+           ("CreateCustomDomainAssociation", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its CustomDomainCertificateArn is an ACM certificate's ARN"),
+           ("CreateEventSubscription", "eventsubscription", {"EventSubscriptionName": "SubscriptionName"},
+            "its SnsTopicArn is an SNS topic's ARN"),
+           ("CreateIntegration", "integration", {},
+            "its SourceArn is the source database's ARN and its TargetArn the target data warehouse's"),
+           ("DescribeClusterSnapshots", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its SnapshotArn is a snapshot's ARN"),
+           ("DescribeNodeConfigurationOptions", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its SnapshotArn is a snapshot's ARN"),
+           ("ListRecommendations", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its NamespaceArn is a namespace's ARN"),
+           ("ModifyClusterIamRoles", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its DefaultIamRoleArn is an IAM role's ARN"),
+           ("ModifyCustomDomainAssociation", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its CustomDomainCertificateArn is an ACM certificate's ARN"),
+           ("ModifyEventSubscription", "eventsubscription", {"EventSubscriptionName": "SubscriptionName"},
+            "its SnsTopicArn is an SNS topic's ARN"),
+           ("ModifyLakehouseConfiguration", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its LakehouseIdcApplicationArn is an IAM Identity Center application's ARN"))},
+    **{f"redshift:{operation}": ([{"types": [kind], "arn": arn}], f"{why}, never a {kind}'s")
+       for operation, kind, arn, why in (
+           ("AssociateDataShareConsumer", "datashare", "DataShareArn",
+            "its ConsumerArn is the consumer namespace's ARN"),
+           ("DisassociateDataShareConsumer", "datashare", "DataShareArn",
+            "its ConsumerArn is the consumer namespace's ARN"),
+           ("ModifyRedshiftIdcApplication", "redshiftidcapplication", "RedshiftIdcApplicationArn",
+            "its IamRoleArn is an IAM role's ARN and its AuthorizedTokenIssuerList's TrustedTokenIssuerArn a trusted "
+            "token issuer's"))},
 }
 
 # Resource types whose ARN a request may give with a qualifier, one more `:<name>` past its format, which their

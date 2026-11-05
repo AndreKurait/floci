@@ -2,6 +2,9 @@
 
 Floci supports both API Gateway v1 (REST APIs) and API Gateway v2 (HTTP APIs).
 
+HTTP integrations preserve path encoding through custom domains and `execute-api` hosts as well
+as path-based endpoints. For example, `/files/a%25b` reaches an HTTP backend with `%25` intact.
+
 ## REST Lambda integration permissions
 
 With IAM enforcement enabled, REST API `AWS` and `AWS_PROXY` Lambda integrations

@@ -56,7 +56,7 @@ class CustomResourceProvisionerTest {
         lambdaService = mock(LambdaService.class);
         store = new CustomResourceResponseStore(new ProviderFrameworkDetector(lambdaService));
         ContainerReachableEndpoint endpoint = mock(ContainerReachableEndpoint.class);
-        when(endpoint.baseUrl()).thenReturn("http://floci:4566");
+        when(endpoint.baseUrlWithTls(true)).thenReturn("https://floci:4566");
 
         provisioner = CfnProvisionerFixture.builder()
                 .lambda(lambdaService)
@@ -149,7 +149,7 @@ class CustomResourceProvisionerTest {
         assertEquals("Create", event.get("RequestType").asText());
         // The real stack id, so a handler can DescribeStacks(event.StackId).
         assertEquals(STACK_ID, event.get("StackId").asText());
-        assertTrue(event.get("ResponseURL").asText().startsWith("http://floci:4566/cfn-response/"));
+        assertTrue(event.get("ResponseURL").asText().startsWith("https://floci:4566/cfn-response/"));
         assertEquals("hi", event.get("ResourceProperties").get("Message").asText());
         // CloudFormation carries ServiceToken both at the top level and inside ResourceProperties.
         assertEquals(SERVICE_TOKEN, event.get("ServiceToken").asText());

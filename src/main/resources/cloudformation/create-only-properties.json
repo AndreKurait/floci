@@ -805,11 +805,28 @@
     "QueueName"
   ],
   "AWS::SQS::QueuePolicy": [],
+  "AWS::SSM::Association": [
+    "InstanceId"
+  ],
+  "AWS::SSM::Document": [
+    "Name",
+    "DocumentType"
+  ],
   "AWS::SSM::Parameter": [
     "Name"
   ],
   "AWS::SSM::PatchBaseline": [
     "OperatingSystem"
+  ],
+  "AWS::SSM::ResourceDataSync": [
+    "KMSKeyArn",
+    "SyncFormat",
+    "BucketPrefix",
+    "SyncName",
+    "BucketRegion",
+    "BucketName",
+    "S3Destination",
+    "SyncType"
   ],
   "AWS::StepFunctions::StateMachine": [
     "StateMachineName",

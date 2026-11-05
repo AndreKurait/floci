@@ -193,8 +193,11 @@ AWS::SNS::Topic	TopicArn	ArchivePolicy,ContentBasedDeduplication,DataProtectionP
 AWS::SNS::TopicPolicy	Id	PolicyDocument,Topics
 AWS::SQS::Queue	Arn,QueueUrl	ContentBasedDeduplication,DeduplicationScope,DelaySeconds,FifoQueue,FifoThroughputLimit,KmsDataKeyReusePeriodSeconds,KmsMasterKeyId,MaximumMessageSize,MessageRetentionPeriod,QueueName,ReceiveMessageWaitTimeSeconds,RedriveAllowPolicy,RedrivePolicy,SqsManagedSseEnabled,Tags,VisibilityTimeout
 AWS::SQS::QueuePolicy	Id	PolicyDocument,Queues
+AWS::SSM::Association	AssociationId	ApplyOnlyAtCronInterval,AssociationDispatchAssumeRole,AssociationName,AutomationTargetParameterName,CalendarNames,ComplianceSeverity,DocumentVersion,InstanceId,MaxConcurrency,MaxErrors,Name,OutputLocation,Parameters,ScheduleExpression,ScheduleOffset,SyncCompliance,Tags,Targets,WaitForSuccessTimeoutSeconds
+AWS::SSM::Document		Attachments,Content,DocumentFormat,DocumentType,Name,Requires,Tags,TargetType,UpdateMethod,VersionName
 AWS::SSM::Parameter	Arn	AllowedPattern,DataType,Description,Name,Policies,Tags,Tier,Type,Value
 AWS::SSM::PatchBaseline	Id	ApprovalRules,ApprovedPatches,ApprovedPatchesComplianceLevel,ApprovedPatchesEnableNonSecurity,AvailableSecurityUpdatesComplianceStatus,DefaultBaseline,Description,GlobalFilters,Name,OperatingSystem,PatchGroups,RejectedPatches,RejectedPatchesAction,Sources,Tags
+AWS::SSM::ResourceDataSync		BucketName,BucketPrefix,BucketRegion,KMSKeyArn,S3Destination,SyncFormat,SyncName,SyncSource,SyncType
 AWS::Scheduler::Schedule	Arn	Description,EndDate,FlexibleTimeWindow,GroupName,KmsKeyArn,Name,ScheduleExpression,ScheduleExpressionTimezone,StartDate,State,Target
 AWS::Scheduler::ScheduleGroup	Arn,CreationDate,LastModificationDate,State	Name,Tags
 AWS::SecretsManager::Secret	Id	Description,GenerateSecretString,KmsKeyId,Name,ReplicaRegions,SecretString,Tags,Type

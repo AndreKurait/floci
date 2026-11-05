@@ -114,6 +114,12 @@ aws sqs set-queue-attributes \
 
 `SqsManagedSseEnabled` is `true` for a queue with no `KmsMasterKeyId`, matching AWS, and `false` once a KMS key is set. It is derived on read rather than stored, so clearing `KmsMasterKeyId` returns the queue to `true`, unless you set `SqsManagedSseEnabled` yourself, in which case your value stands. AWS does not document the cleared-key case crisply, so that behaviour is Floci's choice rather than a copied one. `CreateQueue` on an existing name compares requested attributes against these reported values, so asking for `SqsManagedSseEnabled=false` on a queue that reports `true` fails with `QueueAlreadyExists` (`QueueNameExists` over JSON).
 
+`AWS::SQS::QueuePolicy` installs its resolved `PolicyDocument` on every URL in `Queues`.
+Updates keep the resource's `Ref` and `Fn::GetAtt Id`, apply the new document, and remove the policy
+from targets dropped from the list. A failed write or later stack-update failure restores the
+previous policies and target list. Deleting the policy resource detaches its policies without
+deleting the queues; an already-deleted queue is tolerated, while other cleanup errors fail deletion.
+
 ## Message Retention
 
 A message older than the queue's `MessageRetentionPeriod` is no longer returned or counted, including a message in flight. A shorter period applies to messages already in the queue. A message moved to a FIFO dead-letter queue, or moved by `StartMessageMoveTask`, starts its retention period over. A message moved to a standard dead-letter queue keeps its original enqueue time. Expired messages are freed from memory and storage every 60 seconds.
@@ -218,6 +224,14 @@ https://sqs.<region>.amazonaws.com/000000000000/<queue-name>
 The region is the one the request was signed for, and the host carries that region's partition DNS suffix, so a queue in `cn-north-1` is reported as `https://sqs.cn-north-1.amazonaws.com.cn/...`. Use it for tooling that parses or compares queue URLs against the AWS form. Most SDKs send requests to the endpoint you configured and take only the path from the URL. Clients that send requests to the host in the returned URL, such as the AWS SDK for Java 1.x, need the default `floci` setting or DNS that points the `sqs.<region>` host at Floci.
 
 Under either setting every form is accepted as input. That covers the AWS URL, the Floci URL, any other host whose path ends in `/<account>/<queue-name>`, and the bare queue name. A queue is stored by account and name, so a base URL with a path of its own, such as `http://localhost:4566/sqs`, keeps the same queues under either setting. Existing queues, persisted ones included, are reported in the form the current setting and base URL give.
+
+## Queue policies under IAM enforcement
+
+With `floci.services.iam.enforcement-enabled` on, a queue's `Policy` attribute, written by
+`SetQueueAttributes` or `AddPermission`, takes part in the decision as IAM's policy evaluation logic
+describes. Within one account either the policy or the caller's identity policies can allow a call,
+and an explicit `Deny` in either refuses it. A `QueueUrl` whose path names another account is a
+cross-account call: the queue's policy and the caller's identity policies both have to allow it.
 
 ## Storage write failures
 

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common.dns;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
+import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import org.junit.jupiter.api.Test;
 
@@ -22,10 +23,12 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -100,15 +103,31 @@ class EmbeddedDnsHostStartupTest {
     }
 
     @Test
-    void occupiedUdpPortFailsExplicitStartupAndReleasesTheTcpListener() throws Exception {
+    void failedUdpListenFailsExplicitStartupAndReleasesTheTcpListener() throws Exception {
         Vertx vertx = Vertx.vertx();
-        try (DatagramSocket occupied = new DatagramSocket(0, InetAddress.ofLiteral(ADDRESS))) {
-            int port = occupied.getLocalPort();
+        AtomicInteger tcpPort = new AtomicInteger(-1);
+        BindException udpFailure = new BindException("Controlled UDP bind failure");
+        try {
             IllegalStateException failure = assertThrows(IllegalStateException.class,
-                    () -> start(vertx, Optional.of(ADDRESS), port));
+                    () -> new EmbeddedDnsServer(config(Optional.of(ADDRESS)), hostDetector(), vertx,
+                            List.of(), List.of(), List.of(), mock(CurrentContainerNetworkResolver.class), 0) {
+                        @Override
+                        // The Vert.x DatagramSocket clashes with the JDK fixture socket.
+                        Future<io.vertx.core.datagram.DatagramSocket> listen(Vertx instance, String host, int port) {
+                            tcpPort.set(port);
+                            assertThrows(BindException.class, () -> {
+                                try (ServerSocket unexpected = bindTcp(port)) {
+                                    assertEquals(port, unexpected.getLocalPort());
+                                }
+                            });
+                            return Future.failedFuture(udpFailure);
+                        }
+                    });
+            assertTrue(tcpPort.get() > 0);
             assertTrue(failure.getMessage().contains("floci.dns.listen-address=" + ADDRESS));
-            try (ServerSocket tcp = bindTcp(port)) {
-                assertEquals(port, tcp.getLocalPort());
+            assertSame(udpFailure, failure.getCause().getCause());
+            try (ServerSocket tcp = bindTcp(tcpPort.get())) {
+                assertEquals(tcpPort.get(), tcp.getLocalPort());
             }
         } finally {
             vertx.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
@@ -128,13 +147,21 @@ class EmbeddedDnsHostStartupTest {
     }
 
     private EmbeddedDnsServer start(Vertx vertx, Optional<String> address, int port) {
+        return new EmbeddedDnsServer(config(address), hostDetector(), vertx, List.of(), List.of(), List.of(),
+                mock(CurrentContainerNetworkResolver.class), port);
+    }
+
+    private EmulatorConfig config(Optional<String> address) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.dns().listenAddress()).thenReturn(address);
         when(config.dns().containerFallbackServers()).thenReturn(List.of());
+        return config;
+    }
+
+    private ContainerDetector hostDetector() {
         ContainerDetector detector = mock(ContainerDetector.class);
         when(detector.isRunningInContainer()).thenReturn(false);
-        return new EmbeddedDnsServer(config, detector, vertx, List.of(), List.of(), List.of(),
-                mock(CurrentContainerNetworkResolver.class), port);
+        return detector;
     }
 
     private ServerSocket bindTcp(int port) throws Exception {

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ecs;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -137,6 +138,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     private final CloudWatchMetricsService cloudWatchMetricsService;
     private final Clock clock;
     private final boolean dockerMode;
+    private final boolean publishAwsvpcPortsToHost;
+    private final boolean dynamicAwsvpcHostPorts;
     private final boolean sweepLeftoverContainers;
     private final String baseUrl;
     // Replaced by afterReset() after a state reset, whose container teardown shuts this scheduler down.
@@ -287,6 +290,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         this.regionResolver = regionResolver;
         this.containerManager = containerManager;
         this.dockerMode = !config.services().ecs().mock();
+        this.publishAwsvpcPortsToHost = config.services().ecs().publishAwsvpcPortsToHost();
+        this.dynamicAwsvpcHostPorts = config.services().ecs().dynamicAwsvpcHostPorts();
         this.sweepLeftoverContainers = dockerMode && config.services().ecs().reconcileContainersOnStartup();
         this.leftoverTaskVolumesRemoved = !sweepLeftoverContainers;
         this.baseUrl = config.effectiveBaseUrl();
@@ -1814,7 +1819,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(e -> e.getKey().startsWith(prefix))
                 .map(Map.Entry::getValue)
                 .filter(ci -> STATUS_ACTIVE.equals(ci.getStatus()))
-                .sorted(java.util.Comparator.comparing(ContainerInstance::getContainerInstanceArn))
+                .sorted(Comparator.comparing(ContainerInstance::getContainerInstanceArn))
                 .toList();
         if (requestedArn != null) {
             return active.stream().filter(ci -> requestedArn.equals(ci.getContainerInstanceArn())
@@ -1834,7 +1839,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         return arn.substring(arn.lastIndexOf('/') + 1);
     }
 
-    private final java.util.concurrent.atomic.AtomicInteger placementCursor = new java.util.concurrent.atomic.AtomicInteger();
+    private final AtomicInteger placementCursor = new AtomicInteger();
 
     /** Where a task runs: a launch type, or the capacity provider that chose one for it. */
     private record Placement(LaunchType launchType, String capacityProviderName) {}
@@ -2114,7 +2119,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     /** Waits for the background stops in flight, for tests that check what a teardown left. */
     void awaitPendingStops() throws Exception {
         for (CompletableFuture<Void> stop : List.copyOf(taskStops.values())) {
-            stop.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            stop.get(60, TimeUnit.SECONDS);
         }
     }
 
@@ -3783,8 +3788,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      * registration names the profile, and the instance's IMDS serves that profile's role.
      */
     public static final String IAM_INSTANCE_PROFILE_ATTRIBUTE = "floci.iam-instance-profile";
-    private static final com.fasterxml.jackson.databind.ObjectMapper IDENTITY_DOCUMENT_MAPPER =
-            new com.fasterxml.jackson.databind.ObjectMapper();
+    private static final ObjectMapper IDENTITY_DOCUMENT_MAPPER =
+            new ObjectMapper();
 
     /** The fields of an EC2 instance identity document, or none for an absent or unreadable one. */
     static Map<String, Object> parseInstanceIdentityDocument(String document) {
@@ -3890,7 +3895,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             }
             String value = attribute.value();
             String account = regionResolver.getAccountId();
-            if (value == null || !value.matches("arn:aws(-[a-z]+)*:iam::" + java.util.regex.Pattern.quote(account)
+            if (value == null || !value.matches("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::" + Pattern.quote(account)
                     + ":instance-profile/([\\w+=,.@-]+/)*[\\w+=,.@-]{1,128}")) {
                 throw new AwsException("InvalidParameterException", "Attribute " + IAM_INSTANCE_PROFILE_ATTRIBUTE
                         + " must be the ARN of an instance profile in account " + account + ": " + value, 400);
@@ -5858,6 +5863,34 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             if (currentDeploymentId.equals(svc.getFailedDeploymentId())) {
                 return;
             }
+            Map<String, Object> deploymentConfiguration = svc.getDeploymentConfiguration();
+            if (dockerMode && deploymentConfiguration != null
+                    && deploymentConfiguration.get("minimumHealthyPercent") instanceof Number minimum
+                    && minimum.doubleValue() == 0) {
+                Set<Integer> replacementPorts = fixedPublishedPorts(
+                        resolveTaskDefinitionOrThrow(currentTaskDefinitionArn, region));
+                List<EcsTask> draining = tasks.values().stream()
+                        .filter(task -> ownedBy(task, svc, cluster))
+                        .filter(task -> isStaleForDeployment(task, currentDeploymentId, currentTaskDefinitionArn))
+                        .filter(task -> !TaskStatus.STOPPED.name().equals(task.getLastStatus()))
+                        .filter(task -> !Collections.disjoint(replacementPorts,
+                                fixedPublishedPorts(resolveTaskDefinitionOrThrow(task.getTaskDefinitionArn(), region))))
+                        .toList();
+                if (!draining.isEmpty()) {
+                    for (EcsTask task : draining) {
+                        try {
+                            stopServiceTaskIfUnprotected(task,
+                                    "Service deployment replaced task definition " + task.getTaskDefinitionArn(), region);
+                        } catch (Exception e) {
+                            LOG.warnv(e, "Service reconciler failed to drain task {0}: {1}",
+                                    task.getTaskArn(), e.getMessage());
+                        }
+                    }
+                    svc.setRunningCount((int) runningTasks.stream()
+                            .filter(task -> TaskStatus.RUNNING.name().equals(task.getLastStatus())).count());
+                    return;
+                }
+            }
             deployment = deploymentRecordForCurrentWorkload(svc);
             int toStart = svc.getDesiredCount() - (int) current;
             List<EcsTask> currentTasks = runningTasks.stream()
@@ -5906,6 +5939,17 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         if (settled != null) {
             settleStatus(settled);
         }
+    }
+
+    private Set<Integer> fixedPublishedPorts(TaskDefinition definition) {
+        return definition.getContainerDefinitions().stream()
+                .filter(container -> container.getPortMappings() != null)
+                .flatMap(container -> container.getPortMappings().stream())
+                // ContainerLifecycleManager currently publishes every mapping as TCP.
+                .map(port -> EcsContainerManager.publishedHostPort(port, definition.getNetworkMode(),
+                        publishAwsvpcPortsToHost, dynamicAwsvpcHostPorts))
+                .filter(hostPort -> hostPort > 0)
+                .collect(Collectors.toSet());
     }
 
     private ServiceDeployment deploymentRecordForCurrentWorkload(EcsServiceModel svc) {

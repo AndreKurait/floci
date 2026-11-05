@@ -1435,8 +1435,14 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
+        @WithDefault("false")
+        boolean directCommandExecutionEnabled();
+
         @WithDefault("5")
         int maxParameterHistory();
+
+        @WithDefault("1000")
+        long resourceDataSyncIntervalMs();
     }
 
     interface SqsServiceConfig {
@@ -2098,15 +2104,17 @@ public interface EmulatorConfig {
         /**
          * The image a {@code docker} step uses, with {@code %s} standing for the cluster's release label,
          * for example "registry.internal/emr-serverless/spark/%s:20250425". If omitted, Floci uses the
-         * release's public EMR Serverless image on Amazon ECR Public.
+         * release's public EMR Serverless image on Amazon ECR Public. Every cluster also runs its HDFS in
+         * {@link #hiveImageTemplate()}'s image, so a mirror names both.
          */
         Optional<String> imageTemplate();
 
         /**
-         * The EMR Serverless Hive image a {@code docker} cluster with Hive takes Hive from, into the image its
-         * bootstrap and steps run in, as {@link #imageTemplate()} names the image Hive is added to, for example
-         * "registry.internal/emr-serverless/hive/%s:20250425". If omitted, Floci uses the release's public EMR
-         * Serverless Hive image on Amazon ECR Public.
+         * The EMR Serverless Hive image every {@code docker} cluster runs its HDFS in, and a cluster with Hive takes
+         * Hive from, into the image its bootstrap and steps run in, as {@link #imageTemplate()} names the image Hive
+         * is added to, for example "registry.internal/emr-serverless/hive/%s:20250425". If omitted, Floci uses the
+         * release's public EMR Serverless Hive image on Amazon ECR Public. An emr-spark-* release has none, so its
+         * clusters run their HDFS in emr-7.5.0's.
          */
         Optional<String> hiveImageTemplate();
 
@@ -4118,6 +4126,9 @@ public interface EmulatorConfig {
 
         /** Path to PEM private key file. Env: FLOCI_TLS_KEY_PATH */
         Optional<String> keyPath();
+
+        /** PEM certificates appended to workload trust bundles. Env: FLOCI_TLS_EXTRA_CA_CERTS */
+        Optional<String> extraCaCerts();
 
         /**
          * Auto-generate a server certificate when no cert-path/key-path is provided. The leaf is

@@ -149,7 +149,7 @@ public class ApiGatewayTaskInvoker {
         iam.registerSession(accessKey, secret, token, roleArn, Instant.now().plusSeconds(120),
                 null, roleId.accountId(), sessionName, principalId + ":" + sessionName);
         try {
-            sign(headers, uri, payload, owner.region(), accessKey, secret, token);
+            sign(headers, uri, payload, owner.region(), "execute-api", accessKey, secret, token);
             HttpRequest.Builder request = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(60))
                     .POST(HttpRequest.BodyPublishers.ofByteArray(payload));
             headers.forEach((name, value) -> {
@@ -255,14 +255,14 @@ public class ApiGatewayTaskInvoker {
                 || lowerName.startsWith("x-amzn-") || lowerName.startsWith("x-forwarded-");
     }
 
-    private static void sign(TreeMap<String, List<String>> headers, URI uri, byte[] payload, String region,
-                             String accessKey, String secret, String token) throws Exception {
+    static void sign(TreeMap<String, List<String>> headers, URI uri, byte[] payload, String region, String service,
+                     String accessKey, String secret, String token) throws Exception {
         String stamp = AMZ_DATE.format(Instant.now());
         headers.put("host", List.of(uri.getAuthority()));
         headers.put("x-amz-date", List.of(stamp));
         headers.put("x-amz-security-token", List.of(token));
         String signed = String.join(";", headers.keySet());
-        CredentialScope scope = new CredentialScope(accessKey, stamp.substring(0, 8), region, "execute-api");
+        CredentialScope scope = new CredentialScope(accessKey, stamp.substring(0, 8), region, service);
         String canonical = "POST\n" + uri.getRawPath() + "\n\n"
                 + SigV4Canonicalization.canonicalHeaders(signed, name -> headers.get(name).stream()
                         .map(SigV4RequestValidator::normalizeHeaderValue).collect(Collectors.joining(","))) + "\n" + signed + "\n"
@@ -270,12 +270,12 @@ public class ApiGatewayTaskInvoker {
         String toSign = "AWS4-HMAC-SHA256\n" + stamp + "\n" + scope.credentialScope() + "\n"
                 + Digests.sha256Hex(canonical);
         String signature = SigV4RequestValidator.hexEncode(SigV4RequestValidator.hmacSha256(
-                SigV4RequestValidator.deriveSigningKey(secret, scope.date(), region, "execute-api"), toSign));
+                SigV4RequestValidator.deriveSigningKey(secret, scope.date(), region, service), toSign));
         headers.put("authorization", List.of("AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + scope.credentialScope()
                 + ", SignedHeaders=" + signed + ", Signature=" + signature));
     }
 
-    private static String accessKey() {
+    static String accessKey() {
         String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         StringBuilder value = new StringBuilder("ASIA");
         for (int index = 0; index < 16; index++) {
@@ -284,7 +284,7 @@ public class ApiGatewayTaskInvoker {
         return value.toString();
     }
 
-    private static String randomSecret(int size) {
+    static String randomSecret(int size) {
         byte[] bytes = new byte[size];
         RANDOM.nextBytes(bytes);
         return Base64.getEncoder().withoutPadding().encodeToString(bytes);

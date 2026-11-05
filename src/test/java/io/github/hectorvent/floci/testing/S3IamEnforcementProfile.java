@@ -9,6 +9,8 @@ import java.util.Map;
  * that need all three. {@link S3EnforceAuthProfile} covers the narrower case. Quarkus builds the
  * application once per distinct profile class, so they share this one rather than each declaring
  * their own.
+ * {@code S3CrossAccountNotificationSdkIntegrationTest} also uses this profile for signed
+ * cross-account notification delivery.
  *
  * <p>The overrides, and who relies on them:
  * <ul>

@@ -7,13 +7,14 @@ import jakarta.ws.rs.container.ContainerRequestContext;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Resource targets for EBS-backed image copies and image/snapshot attributes and tags. */
-final class Ec2ImageResourceArns {
+/** Resource targets for EBS-backed images, snapshots, security-group rules and their tags. */
+final class Ec2ResourceArns {
 
-    private Ec2ImageResourceArns() {
+    private Ec2ResourceArns() {
     }
 
-    static List<String> of(String operation, ContainerRequestContext context, String region, String partition) {
+    static List<String> of(String operation, ContainerRequestContext context, String region,
+                           String account, String partition) {
         if (operation == null) {
             return List.of("*");
         }
@@ -23,7 +24,10 @@ final class Ec2ImageResourceArns {
                     named(RequestBodyReader.formField(context, "ImageId"), "image", region, partition);
             case "ec2:DescribeSnapshotAttribute", "ec2:ModifySnapshotAttribute", "ec2:DeleteSnapshot" ->
                     named(RequestBodyReader.formField(context, "SnapshotId"), "snapshot", region, partition);
-            case "ec2:CreateTags", "ec2:DeleteTags" -> tags(context, region, partition);
+            case "ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress",
+                 "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress" ->
+                    group(context, region, account, partition);
+            case "ec2:CreateTags", "ec2:DeleteTags" -> tags(context, region, account, partition);
             default -> List.of("*");
         };
     }
@@ -43,7 +47,14 @@ final class Ec2ImageResourceArns {
         return id == null || id.isBlank() ? List.of("*") : List.of(arn(partition, region, type, id));
     }
 
-    private static List<String> tags(ContainerRequestContext context, String region, String partition) {
+    private static List<String> group(ContainerRequestContext context, String region,
+                                      String account, String partition) {
+        String id = RequestBodyReader.formField(context, "GroupId");
+        return id == null || id.isBlank() ? List.of("*") : List.of(groupArn(partition, region, account, id));
+    }
+
+    private static List<String> tags(ContainerRequestContext context, String region,
+                                     String account, String partition) {
         List<String> resources = new ArrayList<>();
         // Match the contiguous ResourceId.N list consumed by Ec2QueryHandler.
         for (int index = 1; ; index++) {
@@ -55,6 +66,8 @@ final class Ec2ImageResourceArns {
                 resources.add(arn(partition, region, "image", id));
             } else if (id.startsWith("snap-")) {
                 resources.add(arn(partition, region, "snapshot", id));
+            } else if (id.startsWith("sg-")) {
+                resources.add(groupArn(partition, region, account, id));
             } else {
                 // Other EC2 resource types retain their existing unscoped authorization.
                 resources.add("*");
@@ -66,5 +79,9 @@ final class Ec2ImageResourceArns {
     private static String arn(String partition, String region, String type, String id) {
         // EC2 image and snapshot ARNs omit the account component.
         return new AwsArnUtils.Arn(partition, "ec2", region, "", type + "/" + id).toString();
+    }
+
+    private static String groupArn(String partition, String region, String account, String id) {
+        return new AwsArnUtils.Arn(partition, "ec2", region, account, "security-group/" + id).toString();
     }
 }

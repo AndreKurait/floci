@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.ssm;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.json.JsonPath;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -12,7 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import java.time.Instant;
-import java.util.Base64;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -29,6 +31,7 @@ import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.when;
 
 @QuarkusTest
+@TestProfile(SsmDirectCommandProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class SsmSendCommandIntegrationTest {
 
@@ -192,7 +195,7 @@ class SsmSendCommandIntegrationTest {
     @Order(7)
     void agentGetsEndpoint() {
         given()
-            .header("X-Amz-Target", "AmazonSSMMessageDeliveryService.GetEndpoint")
+            .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.GetEndpoint")
             .contentType(SSM_CT)
             .body("""
                 {
@@ -212,7 +215,7 @@ class SsmSendCommandIntegrationTest {
     @Order(8)
     void agentPollsAndGetsMessage() {
         given()
-            .header("X-Amz-Target", "AmazonSSMMessageDeliveryService.GetMessages")
+            .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.GetMessages")
             .contentType(SSM_CT)
             .body("""
                 {
@@ -236,7 +239,7 @@ class SsmSendCommandIntegrationTest {
     void agentAcknowledgesMessage() {
         // First poll to get the message ID
         String msgId = given()
-            .header("X-Amz-Target", "AmazonSSMMessageDeliveryService.GetMessages")
+            .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.GetMessages")
             .contentType(SSM_CT)
             .body("""
                 {
@@ -270,7 +273,7 @@ class SsmSendCommandIntegrationTest {
             String newCmdId = JsonPath.from(resp).getString("Command.CommandId");
 
             msgId = given()
-                .header("X-Amz-Target", "AmazonSSMMessageDeliveryService.GetMessages")
+                .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.GetMessages")
                 .contentType(SSM_CT)
                 .body("""
                     {
@@ -285,7 +288,7 @@ class SsmSendCommandIntegrationTest {
 
         // Acknowledge
         given()
-            .header("X-Amz-Target", "AmazonSSMMessageDeliveryService.AcknowledgeMessage")
+            .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.AcknowledgeMessage")
             .contentType(SSM_CT)
             .body("""
                 { "MessageId": "%s" }
@@ -317,7 +320,7 @@ class SsmSendCommandIntegrationTest {
 
         // Poll
         String msgId = given()
-            .header("X-Amz-Target", "AmazonSSMMessageDeliveryService.GetMessages")
+            .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.GetMessages")
             .contentType(SSM_CT)
             .body("""
                 {
@@ -329,19 +332,13 @@ class SsmSendCommandIntegrationTest {
         .when().post("/")
         .then().statusCode(200).extract().jsonPath().getString("Messages[0].MessageId");
 
-        // Build a SendReply payload (base64 encoded agent output)
         String replyPayload = buildReplyPayload("world\n", "Success", 0);
 
         // Send reply
         given()
-            .header("X-Amz-Target", "AmazonSSMMessageDeliveryService.SendReply")
+            .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.SendReply")
             .contentType(SSM_CT)
-            .body("""
-                {
-                    "MessageId": "%s",
-                    "Payload": "%s"
-                }
-                """.formatted(msgId, replyPayload))
+            .body(Map.of("MessageId", msgId, "Payload", replyPayload))
         .when()
             .post("/")
         .then()
@@ -466,7 +463,7 @@ class SsmSendCommandIntegrationTest {
             .body("StandardOutputContent", equalTo("direct-output\n"));
 
         given()
-            .header("X-Amz-Target", "AmazonSSMMessageDeliveryService.GetMessages")
+            .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.GetMessages")
             .contentType(SSM_CT)
             .body("""
                 {
@@ -538,24 +535,10 @@ class SsmSendCommandIntegrationTest {
     }
 
     private static String buildReplyPayload(String stdout, String status, int returnCode) {
-        String json = """
-            {
-              "additionalInfo": {
-                "agent": { "name": "amazon-ssm-agent", "version": "3.2.2172.0" }
-              },
-              "documentTraceOutput": "",
-              "runtimeStatus": {
-                "runShellScript": {
-                  "status": "%s",
-                  "returnCode": %d,
-                  "standardOutput": "%s",
-                  "standardError": "",
-                  "startDateTime": "2026-01-01T00:00:00Z",
-                  "endDateTime": "2026-01-01T00:00:01Z"
-                }
-              }
-            }
-            """.formatted(status, returnCode, stdout.replace("\n", "\\n").replace("\"", "\\\""));
-        return Base64.getEncoder().encodeToString(json.getBytes());
+        return new ObjectMapper().valueToTree(Map.of(
+                "documentStatus", status, "runtimeStatus", Map.of("runShellScript", Map.of(
+                        "status", status, "code", returnCode, "standardOutput", stdout,
+                        "standardError", "", "startDateTime", "2026-01-01T00:00:00Z",
+                        "endDateTime", "2026-01-01T00:00:01Z")))).toString();
     }
 }

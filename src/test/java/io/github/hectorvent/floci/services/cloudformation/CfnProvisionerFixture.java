@@ -120,8 +120,11 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.SesReceip
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SignerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SnsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SqsCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmAssociationCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmDocumentCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmPatchBaselineCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmResourceDataSyncCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.StepFunctionsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.TransferCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.WafV2CfnProvisioner;
@@ -186,6 +189,7 @@ import io.github.hectorvent.floci.services.ses.SesService;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.ssm.SsmPatchBaselineService;
+import io.github.hectorvent.floci.services.ssm.SsmResourceDataSyncService;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
 import io.github.hectorvent.floci.services.transfer.TransferService;
@@ -239,6 +243,7 @@ final class CfnProvisionerFixture {
         private IamService iamService;
         private SsmService ssmService;
         private SsmPatchBaselineService ssmPatchBaselines;
+        private SsmResourceDataSyncService ssmResourceDataSyncs;
         private KmsService kmsService;
         private SecretsManagerService secretsManagerService;
         private EventBridgeService eventBridgeService;
@@ -390,9 +395,14 @@ final class CfnProvisionerFixture {
             }
             if (ssmService != null) {
                 discovered.add(new SsmCfnProvisioner(ssmService));
+                discovered.add(new SsmDocumentCfnProvisioner(ssmService));
+                discovered.add(new SsmAssociationCfnProvisioner(ssmService));
             }
             if (ssmPatchBaselines != null) {
                 discovered.add(new SsmPatchBaselineCfnProvisioner(ssmPatchBaselines));
+            }
+            if (ssmResourceDataSyncs != null) {
+                discovered.add(new SsmResourceDataSyncCfnProvisioner(ssmResourceDataSyncs));
             }
             if (kmsService != null) {
                 discovered.add(new KmsCfnProvisioner(kmsService));
@@ -676,6 +686,11 @@ final class CfnProvisionerFixture {
 
         public Builder ssmPatchBaselines(SsmPatchBaselineService value) {
             this.ssmPatchBaselines = value;
+            return this;
+        }
+
+        public Builder ssmResourceDataSyncs(SsmResourceDataSyncService value) {
+            this.ssmResourceDataSyncs = value;
             return this;
         }
 

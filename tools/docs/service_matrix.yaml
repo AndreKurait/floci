@@ -50,6 +50,7 @@ aliases:
   application-autoscaling: applicationautoscaling
   elasticbeanstalk: elastic-beanstalk
   ec2messages: ssm                      # SSM Messages facet, documented alongside ssm.md
+  ssmmessages: ssm                      # SSM agent control channel, documented alongside ssm.md
   codedeploy-commands: codedeploy        # Legacy host-agent command protocol
   codedeploy-commands-secure: codedeploy # IAM-authorized host-agent command protocol
   iotdata: iot                          # IoT Data row shares iot.md with IoT Core

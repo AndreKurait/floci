@@ -50,7 +50,8 @@ public class ContainerReachableEndpoint {
     }
 
     /**
-     * The Floci {@code http://host:port} base URL reachable from inside a launched Docker container.
+     * The HTTP base URL reachable from inside a launched Docker container. The public listener
+     * accepts HTTP alongside HTTPS; clients with CA trust can select {@link #baseUrlWithTls(boolean)}.
      *
      * <p>The port is the one Floci listens on, not the port in {@code floci.base-url}: base-url
      * advertises the host-facing address, which differs under a port mapping such as
@@ -65,6 +66,15 @@ public class ContainerReachableEndpoint {
 
     /** Selects the workload network before handing an address to a container with different DNS. */
     public String baseUrl(boolean useEmbeddedDns) {
+        return baseUrl(useEmbeddedDns, "http");
+    }
+
+    /** Uses HTTPS when configured, for a client that receives the Floci CA trust bundle. */
+    public String baseUrlWithTls(boolean useEmbeddedDns) {
+        return baseUrl(useEmbeddedDns, config.tls().enabled() ? "https" : "http");
+    }
+
+    private String baseUrl(boolean useEmbeddedDns, String scheme) {
         String flociHostname;
         if (useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()) {
             flociHostname = config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
@@ -84,7 +94,7 @@ public class ContainerReachableEndpoint {
         if (flociHostname.contains(":")) {
             flociHostname = "[" + flociHostname + "]";
         }
-        return "http://" + flociHostname + ":" + port();
+        return scheme + "://" + flociHostname + ":" + port();
     }
 
     /** The port of {@link #baseUrl()}: the one a launched container can reach Floci on. */

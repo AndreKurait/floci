@@ -94,8 +94,8 @@ preserving changes to other attributes.
 | `ValidateTemplate` | Refuses a body that is no template (see [Template format](#template-format)) and a template holding a `null` value (see [Null values](#null-values)); otherwise returns success without validating further |
 | `ListStacks` | List stacks by status |
 | `ListExports` | - |
-| `SetStackPolicy` | Accepted; no-op (stub — stack policies are not enforced) |
-| `GetStackPolicy` | Accepted; returns an empty policy (stub) |
+| `SetStackPolicy` | Store a stack policy given as `StackPolicyBody` or `StackPolicyURL`; only its structure is checked, and the policy is not enforced. `CreateStack` stores its policy and `UpdateStack` applies its policy once the update completes |
+| `GetStackPolicy` | Return the stored stack policy as submitted, including for a deleted stack by stack id |
 | `DescribeStackResource` | Get a specific stack resource |
 | `DescribeOrganizationsAccess` | - |
 | `ActivateOrganizationsAccess` | - |
@@ -115,7 +115,7 @@ preserving changes to other attributes.
 
 ## StackSets compatibility
 
-StackSets support both `SELF_MANAGED` and the Cloud Launchpad `SERVICE_MANAGED` workflow. `ActivateOrganizationsAccess` requires an Organizations management account with all features enabled and enables trusted access for `stacksets.cloudformation.amazonaws.com`. Service-managed organizational-unit deployment targets are resolved from the caller's actual Organizations state rather than converted into synthetic account IDs. Targeting an OU includes eligible accounts directly in that OU and in all descendant OUs, while excluding the organization management account, matching AWS StackSets targeting semantics.
+StackSets support both `SELF_MANAGED` and the Cloud Launchpad `SERVICE_MANAGED` workflow. `ActivateOrganizationsAccess` requires an Organizations management account with all features enabled and enables trusted access for `stacksets.cloudformation.amazonaws.com`. Service-managed organizational-unit deployment targets are resolved from the caller's actual Organizations state rather than converted into synthetic account IDs. Targeting an OU includes eligible accounts directly in that OU and in all descendant OUs, while excluding the organization management account, matching AWS StackSets targeting semantics. `DescribeStackSet` returns the stack set's `Tags` and, for a service-managed stack set, the root and OU ids its instances were created for as `OrganizationalUnitIds`.
 
 `CreateStackInstances` and `UpdateStackSet` execute the backing CloudFormation stacks in each target account. A failed resource can therefore drive the backing stack through rollback and leave the stack instance `INOPERABLE` with detailed status `FAILED`; the StackSet operation is reported as `FAILED` instead of being forced to success.
 
@@ -198,6 +198,28 @@ an atomic ownership check against another stack or a direct Cognito API writer r
 Failed in-place restoration preserves the original name and scopes for a `ContinueUpdateRollback`
 retry. Deleting the current server keeps this snapshot if deletion fails.
 
+## SSM documents
+
+`AWS::SSM::Document` creates a backing SSM document. `Ref` returns its name, and
+`GetDocument` returns the resolved JSON content. Object content and JSON-encoded
+strings are supported. The registry schema declares no `Fn::GetAtt` attributes.
+
+`UpdateMethod: NewVersion` keeps the document name and selects the new version
+as the default. A failed stack update restores the prior default; retained
+versions remain readable. A retry can select the version that the failed update
+already published. The default `Replace` method replaces changed content:
+an automatically named document gets a new name, while a custom-named document
+requires a different `Name`. Replacement cleanup honors `UpdateReplacePolicy`.
+Change-set previews use the selected `UpdateMethod` for content changes, including
+content that references another resource. A method resolved only during execution
+reports conditional replacement; changing `Name` still requires replacement.
+Creation never adopts a document that exists outside the stack.
+
+Non-JSON `DocumentFormat`, nonempty `Attachments`, `Requires` or `Tags`, and
+`TargetType` or `VersionName` are rejected because the backing SSM document service
+does not yet implement them. Creating a document does not run its steps or
+establish State Manager inventory collection.
+
 ## SSM parameters
 
 Like AWS's resource handler, `AWS::SSM::Parameter` is created with one `PutParameter` that carries
@@ -239,7 +261,7 @@ cross-resource references.
 | AppConfig | `Application`, `Environment` (`Tags` and `DeletionProtectionCheck` are accepted and not stored), `ConfigurationProfile` (`Tags`, `KmsKeyIdentifier`, `RetrievalRoleArn`, `Validators` and `DeletionProtectionCheck` are accepted and not stored), `DeploymentStrategy` (`Tags` are accepted and not stored; `ReplicateTo: SSM_DOCUMENT` writes no SSM document). `Ref` returns the AppConfig ID of each. See [AppConfig](appconfig.md#cloudformation) for updates and replacement. |
 | S3 | `Bucket`, `BucketPolicy` (document stored on the bucket; S3 does not evaluate it) |
 | S3 Vectors | `VectorBucket`, `Index` |
-| SQS | `Queue`, `QueuePolicy` (accepted; policy not enforced) |
+| SQS | `Queue`, `QueuePolicy` (applies policies to queues; reconciles targets on update, restores policies on rollback, and detaches on delete) |
 | SNS | `Topic`, `Subscription`, `TopicPolicy` |
 | SES | `EmailIdentity` (BYODKIM is not supported by this resource; Easy DKIM DNS attributes use the shared emulator signing zone `dkim.amazonses.com` rather than AWS's region- and identity-specific zone assignment), `ReceiptRule` (stored in an existing SES receipt rule set; Ref and RuleName return the rule name; management plane only, with no inbound mail delivery) |
 | DynamoDB | `Table` (`TimeToLiveSpecification`, `DeletionProtectionEnabled` and `KinesisStreamSpecification` applied on create and update; failed updates restore prior settings; deletion fails while protection is enabled; rename an enabled TTL attribute by disabling it in one update and enabling the new attribute in a later one; with the DynamoDB Local backend, `StreamArn` is checked as on AWS but nothing is forwarded), `GlobalTable` |
@@ -247,7 +269,7 @@ cross-resource references.
 | Signer | `SigningProfile` (identifiers only; Floci has no Signer API) |
 | IAM | `Role`, `User` (template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete), `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile` |
 | Organizations | `Organization`, `OrganizationalUnit`, `Account`, `Policy`, `ResourcePolicy` |
-| SSM | `Parameter`, `PatchBaseline` (backed by SSM configuration, tags and patch-group bindings; OperatingSystem changes replace the baseline; DefaultBaseline only registers a default; does not execute patches on managed nodes) |
+| SSM | `Association` (Backing configuration, references, updates, rollback and deletion; State Manager execution remains unsupported), `Document` (JSON content, version selection, replacement and rollback; see SSM documents for unsupported properties), `Parameter`, `PatchBaseline` (backed by SSM configuration, tags and patch-group bindings; OperatingSystem changes replace the baseline; DefaultBaseline only registers a default; does not execute patches on managed nodes), `ResourceDataSync` (owns SSM inventory delivery configuration with legacy or nested S3 destinations; destination changes require replacement; checks SSM admission status; does not collect guest inventory) |
 | KMS | `Key`, `Alias` |
 | Secrets Manager | `Secret`, `SecretTargetAttachment` |
 | ECR | `Repository` |
@@ -258,7 +280,7 @@ cross-resource references.
 | ElastiCache | `CacheCluster` (starts a real container; modifying an existing cluster in place is not supported), `SubnetGroup`, `User` (Tags are ignored), `UserGroup` (Tags are ignored), `ServerlessCache` (GetAtt uses the dotted Endpoint.* and ReaderEndpoint.* form) |
 | Redshift | `Cluster` (single-node container; Port and non-dev DBName ignored; ManageMasterPassword unsupported), `ClusterParameterGroup`, `ClusterSubnetGroup`, `ClusterSecurityGroup` (accepted; no EC2-Classic security group model), `EventSubscription` |
 | Redshift Serverless | `Namespace` (Managed admin credentials use Secrets Manager; GetAtt uses the dotted Namespace.* form), `Workgroup` (starts a real container; one workgroup per namespace; capacity, VPC and price-performance settings are stored only; snapshot restore properties are ignored; GetAtt uses the dotted Workgroup.* form) |
-| EC2 | `VPC` (`Tags` update in place, keeping tags added outside the stack; deleted on stack teardown; a VPC with dependents outside the stack, including anything still holding a network interface in its subnets (an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone interface, an interface endpoint), fails the delete with `DependencyViolation`, as on AWS), `Subnet`, `SecurityGroup` (inline `SecurityGroupIngress`/`SecurityGroupEgress` supported; `Tags` update in place, keeping tags added outside the stack), `SecurityGroupIngress`, `SecurityGroupEgress`, `InternetGateway`, `RouteTable`, `SubnetRouteTableAssociation`, `Route`, `NatGateway` (zonal; `AvailabilityMode` regional fails; a change to the `Secondary*` address properties updates the gateway in place), `EIP`, `Instance` (`Tags` update in place, keeping tags added outside the stack), `LaunchTemplate`, `VPCGatewayAttachment`, `VPCEndpoint`, `NetworkAcl`, `NetworkAclEntry`, `SubnetNetworkAclAssociation`, `FlowLog` (`Tags` are applied and updated in place, keeping tags added outside the stack; any other change fails, since it needs a replacement), `DHCPOptions`, `KeyPair` (a created key's private key is stored in the `SecureString` parameter `/ec2/keypair/<KeyPairId>`, as on AWS, and deleted with the key), `PrefixList` (updated in place; an update that changes `AddressFamily`, or `MaxEntries` together with `Entries`, fails), `VPCDHCPOptionsAssociation` |
+| EC2 | `VPC` (`Tags` update in place, keeping tags added outside the stack; deleted on stack teardown; a VPC with dependents outside the stack, including anything still holding a network interface in its subnets (an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone interface, an interface endpoint), fails the delete with `DependencyViolation`, as on AWS), `Subnet`, `SecurityGroup` (inline `SecurityGroupIngress`/`SecurityGroupEgress` supported; `Tags` update in place, keeping tags added outside the stack; a failed stack update puts the rules and tags of a group it changed in place back), `SecurityGroupIngress`, `SecurityGroupEgress`, `InternetGateway`, `RouteTable`, `SubnetRouteTableAssociation`, `Route`, `NatGateway` (zonal; `AvailabilityMode` regional fails; a change to the `Secondary*` address properties updates the gateway in place), `EIP`, `Instance` (`Tags` update in place, keeping tags added outside the stack), `LaunchTemplate`, `VPCGatewayAttachment`, `VPCEndpoint`, `NetworkAcl`, `NetworkAclEntry`, `SubnetNetworkAclAssociation`, `FlowLog` (`Tags` are applied and updated in place, keeping tags added outside the stack; any other change fails, since it needs a replacement), `DHCPOptions`, `KeyPair` (a created key's private key is stored in the `SecureString` parameter `/ec2/keypair/<KeyPairId>`, as on AWS, and deleted with the key), `PrefixList` (updated in place; an update that changes `AddressFamily`, or `MaxEntries` together with `Entries`, fails), `VPCDHCPOptionsAssociation` |
 | Elastic Load Balancing Classic | `LoadBalancer` |
 | Elastic Load Balancing v2 | `LoadBalancer`, `TargetGroup`, `Listener`, `ListenerRule` |
 | Auto Scaling | `LaunchConfiguration`, `AutoScalingGroup`, `LifecycleHook`, `ScalingPolicy` |

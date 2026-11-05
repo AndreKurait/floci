@@ -77,7 +77,7 @@ approval policies or registering an AWS-owned baseline ARN is not implemented.
 | Action | Description |
 |---|---|
 | `UpdateInstanceInformation` | Register or update an SSM agent record for an instance. Does not create an EC2 instance or register the container with IMDS (see [Run Command Execution](#run-command-execution)) |
-| `DescribeInstanceInformation` | List registered SSM managed instances |
+| `DescribeInstanceInformation` | Filter and paginate registered managed nodes in the caller's account and region |
 | `SendCommand` | Create command invocations for target instances |
 | `GetCommandInvocation` | Return a command invocation result |
 | `ListCommands` | List command records |
@@ -103,10 +103,64 @@ Values remain strings. Invalid batches leave the previous inventory intact.
 The SSM storage setting controls persistence across restarts.
 
 This implements inventory upload and entry reads. Inventory collection scheduling,
-compliance item contexts, inventory aggregators, custom-schema deletion and S3 resource
-data sync are not implemented by these actions. AWS's full attribute-schema and
+compliance item contexts, inventory aggregators and custom-schema deletion are not
+implemented by these actions. AWS's full attribute-schema and
 daily byte-quota validation are not modeled. A successful upload does not prove a
 State Manager document executed.
+
+### Inventory resource data sync
+
+| Action | Description |
+|---|---|
+| `CreateResourceDataSync` | Configure asynchronous inventory export to S3 |
+| `ListResourceDataSync` | Page through configurations and their last attempt/success statuses |
+| `DeleteResourceDataSync` | Stop future exports while preserving existing S3 objects |
+
+`SyncToDestination` creates an inventory baseline and exports subsequent uploads.
+Each type is written as JSON lines at
+`<prefix>/<type>/accountid=<account>/region=<region>/resourcetype=ManagedInstanceInventory/<instance>.json`.
+Rows include `resourceId`, `captureTime` and `schemaVersion`. Empty inventory content
+overwrites that type's object with an empty body. Hash-only refreshes export the
+retained content with the new capture time.
+
+Configurations and acknowledged inventory revisions use the SSM storage mode.
+Failed writes retain their error and the prior successful-sync time; the worker
+retries after the destination or policy is repaired. Success is recorded only
+after all pending writes complete. There are five configurations per account and
+region. Deletion, reset and shutdown wait for in-flight exports to finish.
+
+With S3 auth or IAM enforcement enabled, delivery evaluates the SSM service
+principal against the bucket policy for `s3:GetBucketAcl` and `s3:PutObject`,
+including the source account, sync ARN, SigV4 signing version and
+`bucket-owner-full-control` ACL. Service-to-service network context is redacted;
+the worker does not inherit the caller's transport or source IP.
+Cross-account destinations require the existing S3 global bucket namespace.
+The destination must be in the same partition and must not use S3 Object Lock.
+
+The worker interval defaults to 1,000 ms and is configurable with
+`FLOCI_SERVICES_SSM_RESOURCE_DATA_SYNC_INTERVAL_MS`. Explorer `SyncFromSource`,
+Organizations data sharing and `AWSKMSKeyARN` are explicitly unsupported.
+Collection and scheduling require a running SSM agent and an association. Resource
+data sync exports the inventory that managed nodes actually report.
+
+### CloudFormation inventory destinations
+
+`AWS::SSM::ResourceDataSync` owns a real SSM inventory sync. `Ref` returns `SyncName`;
+the AWS schema defines no `Fn::GetAtt` attributes. Both the legacy top-level S3
+destination fields and nested `S3Destination` are supported. Combining them fails
+before creating a sync.
+
+Creation reads the actual SSM status using the AWS provider's initial two-second
+callback and bounded ten-second retries. `Successful` and `InProgress` satisfy
+resource admission; `Failed` fails creation and removes the new sync. Admission
+does not establish that inventory was exported: inspect the sync status and S3
+objects for that result.
+
+Destination properties are create-only. A replacement requires a new `SyncName`,
+creates it before retiring the previous sync, and honors rollback and retention.
+Changing a destination while keeping its custom name fails without modifying the
+old sync. Stack deletion stops future exports and preserves existing S3 objects.
+Explorer `SyncSource` and KMS-encrypted delivery remain unsupported.
 
 ### ec2messages Agent Protocol
 
@@ -115,6 +169,17 @@ State Manager document executed.
 | `GetMessages` | Agent polls for pending command messages |
 | `AcknowledgeMessage` | Agent acknowledges receipt of a command message |
 | `SendReply` | Agent reports command output and status |
+
+### ssmmessages control channel
+
+The stock agent uses `CreateControlChannel` and a signed WebSocket
+`OpenControlChannel` at `/v1/control-channel/{managed-node-id}`. Both handshakes
+verify SigV4, session credentials and IAM authorization. A one-use token binds
+the connection to its account, region, node and caller. EC2 instance credentials
+can open only their own node's channel.
+
+The channel carries the agent's binary job, acknowledgement and result messages.
+These are Run Command control channels; Session Manager data channels are not implemented.
 
 ## Document versions
 
@@ -149,11 +214,36 @@ it does not run Patch Manager or prove that managed nodes installed patches.
 ## State Manager associations
 
 Association create, describe, list, update and delete operations store and return the
-configuration. Floci does not yet schedule or execute associations. New associations
-therefore remain `Pending` and have no `LastExecutionDate`. An update marks the new
-association version pending while preserving any previously stored execution timestamp.
-Association creation is not evidence that a document ran, inventory was collected or
-a target became compliant. The Run Command execution paths below are separate.
+configuration. A running SSM agent discovers its configuration through
+`ListInstanceAssociations`, fetches the selected version with `GetDocument`, and executes
+the document using its own plugins and schedule. Discovery supports legacy instance
+associations, `InstanceIds` targets, and live EC2 tag targets in the caller's account
+and region.
+
+New associations remain `Pending` until an agent reports execution through
+`UpdateInstanceAssociationStatus`. Reports retain each node's association version,
+status and execution date. One successful target does not complete other pending
+targets. Older reports cannot overwrite newer executions, and a delayed progress
+report cannot undo a completed execution at the same date. An updated association
+requires reports for its new version.
+
+These agent APIs do not provide centralized dispatch, concurrency/error budgets,
+resource-group target resolution, or compliance aggregation. Association creation
+alone does not prove that a document ran or inventory was collected. The Run Command
+execution paths below are separate.
+
+CloudFormation `AWS::SSM::Association` creates that backing configuration and returns
+its ID through both `Ref` and `Fn::GetAtt AssociationId`. Document references, target
+conditions, parameters, schedules and rate controls are resolved from the template.
+Updates preserve the association ID, except a changed legacy `InstanceId` replaces
+the association. Failed updates restore the previous configuration; replacement
+retention and stack deletion operate on the owned association.
+
+`ApplyOnlyAtCronInterval`, `AssociationDispatchAssumeRole`, `AutomationTargetParameterName`,
+`CalendarNames`, `OutputLocation`, `ScheduleOffset`, `SyncCompliance`, `Tags` and
+`WaitForSuccessTimeoutSeconds` are not yet supported by this CloudFormation owner.
+Nonempty declarations fail before creating or changing an association. Omit the
+execution wait only when successful configuration creation is the intended contract.
 
 `UpdateAssociation.Name` selects the new document without changing the association ID.
 The requested document version is validated against that document before any stored
@@ -173,57 +263,96 @@ cannot both overwrite the association.
 
 ## Run Command Execution
 
-`SendCommand` supports the `AWS-RunShellScript` document. For EC2 instances launched by Floci in real Docker mode, Floci creates the command invocation, returns the command response, and then runs the script asynchronously inside the target instance container. Callers observe completion through `GetCommandInvocation`. `stdout`, `stderr`, response code, start time, and end time are recorded on the invocation.
+`DescribeInstanceInformation` supports `InstanceIds`, `AgentVersion`, `PingStatus`,
+`PlatformTypes` and `ResourceType` through modern `Filters` and the deprecated
+`InstanceInformationFilterList` wire shape. Values within a filter are alternatives;
+different keys must all match. Unknown or foreign managed-node IDs fail with
+`InvalidInstanceId`. Known EC2 nodes that are stopped, shutting down or terminated
+are omitted. A registered external agent does not require a Floci EC2 record.
+Discovery does not infer lost contact from heartbeat age.
 
-Direct execution writes the commands to a private executable script and invokes its
-path through `sh -c`, matching the SSM agent's execution model. A shebang selects the
-guest's interpreter, including its arguments; scripts without one use the shell.
-The invocation keeps the requested working directory and removes its temporary
-script after completion, failure, or the in-container execution timeout.
+Listings default to 10 items and accept `MaxResults` from 5 to 50. Follow
+`NextToken` for more results; tokens are scoped to the account, region and filters.
+Mixing the two filter shapes, invalid keys or values, and foreign tokens fail.
+Activation, association, IAM role, source and tag filters are not implemented;
+they return `UnsupportedOperation` rather than ignoring the requested selection.
 
-For public `SendCommand`, set `TimeoutSeconds` to a delivery/start allowance from 30 to
-2,592,000 seconds. The default is 3,600 seconds. Floci does not automatically expire
-commands waiting for an agent, so a command that is never delivered can remain pending
-indefinitely. The document's execution allowance and internal CodeDeploy hook budgets
-are separate.
+By default, `SendCommand` requires a registered managed node. Execution requires
+a running SSM agent; commands wait for delivery while it is stopped. Floci delivers the selected Command document through the agent's `ssmmessages`
+channel. The agent executes its own plugins and reports their output and status.
+Stopping the agent prevents execution even when its EC2 container is still running.
 
-If the target is not a Floci EC2 container, or if the document is not supported for direct execution, Floci falls back to the SSM agent polling flow. In that mode, `SendCommand` queues an ec2messages payload and the invocation completes after an agent calls `SendReply`.
+Commands capture the selected document version and content at submission. Changing
+or deleting the document afterward does not change queued work. Built-in
+`AWS-RunShellScript` and `AWS-RunPowerShellScript` documents and stored JSON/YAML
+Command documents use this path. Public parameter values remain string lists in
+command metadata; delivery converts them to the document's declared `String` or
+`StringList` type. Missing required parameters, unknown parameters and malformed
+values fail before command creation. The agent performs plugin-specific validation.
 
-Background execution retains the issuing account and region. Agent queues and message correlations
-use that same account, region and instance identity; polling or completing a message from another
-account or region leaves the owner's work untouched. Pending messages remain in memory and are lost
-on restart.
+Use a document step's name as `GetCommandInvocation.PluginName` when it has multiple
+steps. Results remain separate for each step. A document completion summary may arrive
+before its final plugin replies; those replies fill in missing results without
+reopening the finished command or overwriting completed steps with older progress.
+Inline output retains the first 24,000 characters of stdout and 8,000 of stderr.
 
-!!! note "Managed instance registration is independent of EC2 and IMDS"
-    Registering a container's SSM agent with `UpdateInstanceInformation` only creates the managed instance record. It does not create an EC2 instance, does not install the link-local `169.254.169.254` proxy in the container, and does not register the container with the [EC2 IMDS server](ec2.md#imds-and-ssm-managed-instances). A container that was only registered with SSM therefore has no working IMDS endpoint and no instance profile credentials, and `SendCommand` against it uses the agent polling flow rather than direct execution.
+`TimeoutSeconds` supplies the delivery allowance, from 30 to 2,592,000 seconds and
+3,600 by default. The execution allowance contributes to `ExpiresAfter`: shell
+documents accept `Parameters.executionTimeout` from 1 to 172800 seconds, defaulting
+to 3,600. Custom documents use their declared execution-timeout parameter when
+present, otherwise the 3,600-second service default. Each plugin's execution timer
+is enforced by the agent. Internal CodeDeploy hook budgets remain separate.
 
-    To get a container that both answers IMDS and runs `SendCommand` directly, launch it with EC2 `RunInstances` first and then register that same container's SSM agent. Floci logs a warning when an agent registers from a container that is not backed by a Floci EC2 instance.
+Without an agent's terminal reply before `ExpiresAfter`, active invocations become
+`TimedOut` with `StatusDetails: Delivery Timed Out`. Execution timeout requires the
+agent's timeout result. Expired work is not delivered after reconnection. Delivery
+timeouts are counted separately from execution failures in command metadata.
 
-Direct command output follows the AWS inline output limits: first 24,000 characters of stdout and first 8,000 characters of stderr. Commands that exceed their execution budget are constrained inside the target container when the container has the `timeout` command available, and terminal timeout results are marked `TimedOut` with `StatusDetails` set to `Execution Timed Out`; commands with nonzero exit codes are marked `Failed`.
+`CancelCommand` cancels work immediately if it has never been sent. Sent work becomes
+`Cancelling` until the agent reports a terminal result; cancellation is delivered
+through the same authenticated channel. Queued commands and cancellation state use
+the selected SSM storage backend. A replacement connection recovers pending work.
+While a node has an authenticated gateway connection, its legacy polls return no
+commands. Closing an older connection cannot release a replacement connection's
+ownership; once the current connection closes, legacy polling can resume queued work.
 
-### Shell command timeout budgets
+The older `ec2messages` polling path uses `EC2WindowsMessageDeliveryService.*`
+targets and plain JSON payload strings. Its queues and message correlations remain
+in memory; visibility retries and recovery of those legacy queues are not implemented.
+Run Command concurrency/error budgets and full document-schema constraints are also
+not implemented.
 
-For public `SendCommand` requests using the exact `AWS-RunShellScript` document name,
-`TimeoutSeconds` is the delivery/start allowance. `Parameters.executionTimeout` is a separate
-execution allowance, defaulting to 3600 seconds and accepting one decimal string from 1 to
-172800. The direct worker uses this execution allowance; agent payloads retain the public
-document's 3600-second default and carry an explicit parameter unchanged.
+### Direct execution compatibility mode
 
-`Command.TimeoutSeconds` still reports the delivery allowance. `ExpiresAfter` includes both
-allowances for these shell requests. This corrects metadata and execution budgets; it does not
-add automatic delivery expiration, restart recovery, cleanup retries or late-start fencing.
-Internal CodeDeploy hook budgets and non-shell document handling keep their existing behavior.
-Missing or empty `commands`, malformed shell parameter wire shapes and invalid execution limits
-are refused before command creation
-with `InvalidParameters`/HTTP400. This is Floci's chosen mapping; exact AWS error wording and
-empty-list normalization were not observed live. Other document parameters and delivery-timeout
-coercion/upper-bound handling are not a complete document-schema implementation.
+Set `FLOCI_SERVICES_SSM_DIRECT_COMMAND_EXECUTION_ENABLED=true` to retain direct
+execution of `AWS-RunShellScript` in a Floci EC2 container. This mode bypasses the
+SSM agent and cannot establish that agent startup or network transport works.
+It writes a private executable script, preserves the requested working directory,
+and records output, exit status and timing. Unsupported targets use agent delivery.
+
+Managed-node registration is independent of EC2 and IMDS. `UpdateInstanceInformation`
+stores a managed-node record; it does not create an EC2 instance or install IMDS.
+Launch an instance with EC2 `RunInstances`, an instance profile and an image that
+starts the agent to exercise the normal credential and network paths.
+
+### Image promotion check
+
+The development image workflow runs `.github/scripts/smoke-ssm-agent.py` before
+promoting `dev`. It uses the unmodified stock agent, instance-profile credentials
+and verified TLS to collect inventory, run a versioned multi-step document, preserve
+a native script failure, cancel a running process, and recover after an agent stop.
+An undelivered command must expire without creating its side effect, including after
+restart. API and container cleanup must restore the daemon's original footprint.
+
+The check uses a generic Amazon Linux container. Native AMI boot and application
+fleet workflows require separate integration tests.
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_SSM_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_SSM_DIRECT_COMMAND_EXECUTION_ENABLED` | `false` | Enable direct container execution for compatibility; bypasses the SSM agent |
 | `FLOCI_SERVICES_SSM_MAX_PARAMETER_HISTORY` | `5` | Number of parameter versions retained per parameter |
 | `FLOCI_STORAGE_SERVICES_SSM_MODE` | *(global default)* | Storage mode override for SSM (`memory`, `persistent`, `hybrid`, `wal`) |
 | `FLOCI_STORAGE_SERVICES_SSM_FLUSH_INTERVAL_MS` | `5000` | Flush interval for `hybrid`/`wal` storage modes (milliseconds) |

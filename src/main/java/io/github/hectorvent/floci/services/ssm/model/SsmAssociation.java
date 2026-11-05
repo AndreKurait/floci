@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ssm.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -60,6 +61,9 @@ public class SsmAssociation {
 
     @JsonProperty("AssociationVersion")
     private String associationVersion;
+
+    @JsonProperty("InstanceExecutions")
+    private volatile Map<String, InstanceExecution> instanceExecutions = Map.of();
 
     public SsmAssociation() {}
 
@@ -222,6 +226,24 @@ public class SsmAssociation {
 
     public void setAssociationVersion(String associationVersion) {
         this.associationVersion = associationVersion;
+    }
+
+    public Map<String, InstanceExecution> getInstanceExecutions() {
+        return instanceExecutions == null ? Map.of() : instanceExecutions;
+    }
+
+    public void setInstanceExecutions(Map<String, InstanceExecution> executions) {
+        this.instanceExecutions = Map.copyOf(executions);
+    }
+
+    @RegisterForReflection
+    public record InstanceExecution(String associationVersion, String status, Instant executionDate,
+                                    String executionSummary, String errorCode, JsonNode outputUrl) {
+        public InstanceExecution {
+            if (outputUrl != null && outputUrl.isNull()) {
+                outputUrl = null;
+            }
+        }
     }
 
     @RegisterForReflection

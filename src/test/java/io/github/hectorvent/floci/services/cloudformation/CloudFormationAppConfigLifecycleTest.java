@@ -2,7 +2,6 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -13,17 +12,13 @@ import io.github.hectorvent.floci.services.appconfig.model.DeploymentSummary;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AppConfigCfnProvisioner;
-import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDynamicReferences;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
-import io.github.hectorvent.floci.services.s3.S3Service;
-import io.github.hectorvent.floci.services.ssm.SsmService;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -33,10 +28,8 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
@@ -64,13 +57,7 @@ class CloudFormationAppConfigLifecycleTest {
         appConfig = spy(new AppConfigService(storage, new RegionResolver("us-east-1", ACCOUNT)));
         CfnResourceDispatcher dispatcher = new CfnResourceDispatcher(MAPPER,
                 new CloudFormationResourceRegistry(List.of(new AppConfigCfnProvisioner(appConfig))), null, null);
-        RegionResolver regionResolver = mock(RegionResolver.class);
-        when(regionResolver.getAccountId()).thenReturn(ACCOUNT);
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(config.defaultAccountId()).thenReturn(ACCOUNT);
-        cfn = new CloudFormationService(dispatcher, mock(S3Service.class), mock(SsmService.class),
-                mock(GetStackOutputRoleAuthorizer.class), new CfnDynamicReferences(null, null, MAPPER), MAPPER,
-                config, regionResolver, Clock.systemUTC(), new InMemoryStorageFactory(ACCOUNT));
+        cfn = CloudFormationServiceFixture.create(dispatcher);
     }
 
     /**

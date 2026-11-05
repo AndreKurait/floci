@@ -36,7 +36,7 @@ class SsmJsonHandlerSecretReferenceTest {
         doThrow(new AwsException("AccessDenied", "denied", 403)).when(iamEnforcementFilter)
             .authorizeAdditionalResource("auth", "secretsmanager:GetSecretValue", REPLACEMENT_ARN);
         SsmJsonHandler handler = new SsmJsonHandler(ssmService, null, null, objectMapper, iamEnforcementFilter,
-                mock(SsmPatchBaselineService.class));
+                mock(SsmPatchBaselineService.class), null, null, null);
 
         ObjectNode getParameter = objectMapper.createObjectNode().put("Name", NAME).put("WithDecryption", true);
         ObjectNode getParameters = objectMapper.createObjectNode().put("WithDecryption", true);

@@ -17,6 +17,7 @@ public class Execution {
     private String stateMachineArn;
     private String stateMachineVersionArn;
     private String stateMachineAliasArn;
+    private ExecutionConfiguration stateMachineConfiguration;
     private String name;
     private String status = "RUNNING"; // RUNNING, SUCCEEDED, FAILED, TIMED_OUT, ABORTED
     private String input;
@@ -47,6 +48,11 @@ public class Execution {
     public String getStateMachineAliasArn() { return stateMachineAliasArn; }
     public void setStateMachineAliasArn(String stateMachineAliasArn) {
         this.stateMachineAliasArn = stateMachineAliasArn;
+    }
+
+    public ExecutionConfiguration getStateMachineConfiguration() { return stateMachineConfiguration; }
+    public void setStateMachineConfiguration(ExecutionConfiguration configuration) {
+        this.stateMachineConfiguration = configuration;
     }
 
     public String getName() { return name; }

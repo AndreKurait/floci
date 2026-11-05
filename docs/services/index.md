@@ -10,7 +10,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 
 | Service | Endpoint | Protocol | Supported operations |
 |---|---|---|---|
-| [SSM](ssm.md) | `POST /` + `X-Amz-Target: AmazonSSM.*` / `AmazonSSMMessageDeliveryService.*` | JSON 1.1 | 22 |
+| [SSM](ssm.md) | `POST /` + `AmazonSSM.*` / `EC2WindowsMessageDeliveryService.*`; `/v1/control-channel/{id}` | JSON 1.1 / REST XML / WebSocket | 67 |
 | [SQS](sqs.md) | `POST /` with `Action=` param | Query / JSON | 23 |
 | [SNS](sns.md) | `POST /` with `Action=` param | Query / JSON | 39 |
 | [S3](s3.md) | `/{bucket}/{key}` | REST XML | 58 |
@@ -36,7 +36,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [Managed Service for Apache Flink](kinesisanalytics.md) | `POST /` + `X-Amz-Target: KinesisAnalytics_20180523.*` | JSON 1.1 | 15 |
 | [Payment Cryptography](payment-cryptography.md) | `POST /` + `X-Amz-Target: PaymentCryptographyControlPlane.*` | JSON 1.0 | 12 |
 | [Secrets Manager](secrets-manager.md) | `POST /` + `X-Amz-Target: secretsmanager.*` | JSON 1.1 | 23 |
-| [Step Functions](step-functions.md) | `POST /` + `X-Amz-Target: AmazonStatesService.*` | JSON 1.1 | 32 |
+| [Step Functions](step-functions.md) | `POST /` + `X-Amz-Target: AmazonStatesService.*` | JSON 1.1 | 33 |
 | [SWF](swf.md) | `POST /` + `X-Amz-Target: SimpleWorkflowService.*` | JSON 1.0 | 39 |
 | [CloudFormation](cloudformation.md) | `POST /` with `Action=` param | Query | 37 |
 | [Cloud Control API](cloudcontrol.md) | `POST /` + `X-Amz-Target: CloudApiService.*` | JSON 1.1 | 5 |

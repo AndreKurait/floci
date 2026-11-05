@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import io.github.hectorvent.floci.services.s3.S3ObjectKeys;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.S3SignatureConditions;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -156,8 +157,36 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "redshift" -> redshiftConditionContext(action, ctx);
+            case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    /**
+     * These calls authorize the base state-machine ARN. A version or alias in the
+     * request is a qualifier condition, including when an alias selects a version.
+     */
+    private Map<String, List<String>> stepFunctionsConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("states:DescribeStateMachine".equals(action) || "states:StartExecution".equals(action))) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        String value = body == null ? null : body.path("stateMachineArn").asText(null);
+        if (value == null) {
+            return null;
+        }
+        try {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(value);
+            String[] resource = arn.resource().split(":", -1);
+            if ("states".equals(arn.service()) && resource.length == 3
+                    && "stateMachine".equals(resource[0]) && !resource[1].isBlank() && !resource[2].isBlank()) {
+                return Map.of("states:StateMachineQualifier", List.of(resource[2]));
+            }
+        } catch (IllegalArgumentException expected) {
+            // Leave malformed selectors to the ordinary authorization and API validation.
+        }
+        return null;
     }
 
     /** Group mutations and stream access use the handler's group and request scope. */
@@ -267,6 +296,22 @@ public class IamConditionContextResolver {
         };
     }
 
+    /** The {@code redshift:} keys a Redshift request carries in its own members, such as its DbUser. */
+    private Map<String, List<String>> redshiftConditionContext(String action, ContainerRequestContext ctx) {
+        List<String> keys = RequestConditionKeys.requestKeys(action);
+        if (keys.isEmpty()) {
+            return null;
+        }
+        Map<String, String> form = formParameters(ctx);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        for (String key : keys) {
+            for (String member : RequestConditionKeys.members(action, key)) {
+                putIfPresent(conditions, key, form.get(member));
+            }
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
     public static Map<String, List<String>> withGlobalContext(Map<String, List<String>> serviceContext,
                                                         String resourceArn, String region,
                                                         String accountId, String resourceOwnerAccountId) {
@@ -354,11 +399,11 @@ public class IamConditionContextResolver {
     /** The authType a web function endpoint request names, and the one the endpoint has before it. */
     private Map<String, List<String>> lambdaConditionContext(String action, ContainerRequestContext ctx) {
         Map<String, List<String>> conditions = new LinkedHashMap<>();
-        for (String member : LambdaWebConditionKeys.members(action, REQUEST_AUTH_TYPE)) {
+        for (String member : RequestConditionKeys.members(action, REQUEST_AUTH_TYPE)) {
             PassedRoles.values(PassedRoles.jsonBody(ctx), member.split("\\."))
                     .forEach(value -> putIfPresent(conditions, REQUEST_AUTH_TYPE, value));
         }
-        if (LambdaWebConditionKeys.takes(action, RESOURCE_AUTH_TYPE)) {
+        if (RequestConditionKeys.takes(action, RESOURCE_AUTH_TYPE)) {
             putIfPresent(conditions, RESOURCE_AUTH_TYPE, storedAuthType(ctx));
         }
         return conditions.isEmpty() ? null : conditions;
@@ -394,6 +439,11 @@ public class IamConditionContextResolver {
                     ctx.getUriInfo().getQueryParameters());
         }
         Map<String, List<String>> conditions = s3ActionConditionContext(action, ctx);
+        Map<String, List<String>> signature = S3SignatureConditions.request(ctx.getHeaderString("Authorization"),
+                ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters());
+        if (!signature.isEmpty()) {
+            conditions = merge(conditions, signature);
+        }
         // A version action is checked only for a request naming a version, and carries its id.
         if (S3ObjectActions.isVersionAction(action) && ctx.getUriInfo() != null) {
             String versionId = ctx.getUriInfo().getQueryParameters().getFirst("versionId");
@@ -423,11 +473,14 @@ public class IamConditionContextResolver {
             // actions, and the versionId picks whose tags are read.
             case "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging",
                  "s3:GetObjectVersionTagging", "s3:GetObjectAcl", "s3:GetObjectVersionAcl",
-                 "s3:PutObjectAcl", "s3:PutObjectVersionAcl", "s3:DeleteObjectTagging",
+                 "s3:DeleteObjectTagging",
                  "s3:DeleteObjectVersionTagging", "s3:GetObjectAnnotation", "s3:GetObjectVersionAnnotation",
                  "s3:ListObjectAnnotations", "s3:ListObjectVersionAnnotations", "s3:PutObjectAnnotation",
                  "s3:PutObjectVersionAnnotation", "s3:DeleteObjectAnnotation",
                  "s3:DeleteObjectVersionAnnotation" -> s3ExistingObjectTagConditionContext(ctx);
+            case "s3:PutObjectAcl", "s3:PutObjectVersionAcl" -> merge(
+                    s3ExistingObjectTagConditionContext(ctx),
+                    S3ObjectActions.cannedAclConditions(ctx::getHeaderString));
             // The Object Lock keys come from what the request sets: an object creation's headers, the
             // retention and legal-hold bodies. A part or a completion creates nothing from its own
             // headers, and is judged by the encryption its upload recorded.

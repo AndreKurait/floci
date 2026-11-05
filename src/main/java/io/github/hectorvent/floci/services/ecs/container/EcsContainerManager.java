@@ -34,7 +34,10 @@ import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
@@ -78,6 +81,7 @@ import org.jboss.logging.Logger;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -503,12 +507,12 @@ public class EcsContainerManager {
                     boolean publishToHost = !containerDetector.isRunningInContainer()
                             || publishAwsvpcPorts;
                     for (PortMapping pm : def.getPortMappings()) {
+                        int hostPort = publishedHostPort(pm, taskDef.getNetworkMode(), publishAwsvpcPorts,
+                                config.services().ecs().dynamicAwsvpcHostPorts());
                         if (awsvpc && publishToHost) {
-                            int hostPort = awsvpcHostPort(pm, publishAwsvpcPorts,
-                                    config.services().ecs().dynamicAwsvpcHostPorts());
                             specBuilder.withPortBinding(pm.containerPort(), hostPort, hostPortBindAddress());
-                        } else if (!awsvpc && pm.hostPort() > 0) {
-                            specBuilder.withPortBinding(pm.containerPort(), pm.hostPort());
+                        } else if (hostPort > 0) {
+                            specBuilder.withPortBinding(pm.containerPort(), hostPort);
                         } else if (publishToHost) {
                             specBuilder.withDynamicPort(pm.containerPort());
                         } else {
@@ -1450,18 +1454,23 @@ public class EcsContainerManager {
                 continue;
             }
             for (PortMapping port : container.getPortMappings()) {
-                bindings.put(port.containerPort(), awsvpcHostPort(port, publishAwsvpcPortsToHost,
-                        dynamicAwsvpcHostPorts));
+                bindings.put(port.containerPort(), publishedHostPort(port, NetworkMode.awsvpc,
+                        publishAwsvpcPortsToHost, dynamicAwsvpcHostPorts));
             }
         }
         return bindings;
     }
 
-    private static int awsvpcHostPort(PortMapping port, boolean publishToHost, boolean dynamicHostPorts) {
-        if (publishToHost && !dynamicHostPorts) {
-            return port.hostPort() > 0 ? port.hostPort() : port.containerPort();
+    /** Host port to publish for a mapping; zero means no fixed host-port reservation. */
+    public static int publishedHostPort(PortMapping port, NetworkMode networkMode,
+                                        boolean publishAwsvpcPortsToHost, boolean dynamicAwsvpcHostPorts) {
+        if (networkMode != NetworkMode.awsvpc) {
+            return Math.max(0, port.hostPort());
         }
-        return 0;
+        if (!publishAwsvpcPortsToHost || dynamicAwsvpcHostPorts) {
+            return 0;
+        }
+        return port.hostPort() > 0 ? port.hostPort() : port.containerPort();
     }
 
     private record PreparedNetwork(NetworkInterface eni, SecurityGroupFirewallManager.Namespace namespace) {}
@@ -1583,18 +1592,21 @@ public class EcsContainerManager {
         // A force removal terminates Docker's follow-log transport even when the preceding stop failed.
         // Preserve handles for any container that still may be running after both operations failed.
         terminatedContainerIds.forEach(dockerId -> finalizeLogStream(handle, dockerId));
-        if (handle.allContainersRemoved()) {
-            cleanupProtectedNetwork(handle);
-            removeTaskVolumes(handle);
-            // Only now: a container that survived a failed removal still holds its address.
-            releaseTaskLinkLocalAddresses(handle.getTaskArn());
+        try {
+            if (handle.allContainersRemoved()) {
+                // Confirm the helper released its host ports before unregister forgets its identity.
+                if (firewallManager != null && handle.getNetworkInterfaceId() != null) {
+                    firewallManager.removeNamespaceStrict(handle.getNetworkInterfaceId());
+                }
+                cleanupProtectedNetwork(handle);
+                removeTaskVolumes(handle);
+                // Only now: a container that survived a failed removal still holds its address.
+                releaseTaskLinkLocalAddresses(handle.getTaskArn());
+            }
+        } finally {
+            // A failed container or helper removal must not keep the stopping task's credentials usable.
+            revokeTaskRoleCredentials(handle.getTaskArn());
         }
-        // Revoked whether or not removal succeeded, unlike everything above. A task being
-        // stopped must not keep usable credentials just because Docker could not remove one of
-        // its containers: the retry that would eventually revoke them depends on the handle
-        // being retained, which only happens while a log stream is still open, so a container
-        // without one (a FireLens router, say) would strand them for the life of the process.
-        revokeTaskRoleCredentials(handle.getTaskArn());
         return exitCodes;
     }
 
@@ -2014,12 +2026,12 @@ public class EcsContainerManager {
     Ec2MetadataServer instanceMetadataServer;
 
     /** ec2InstanceId -> the instance IMDS answers for; one per container instance, shared by its tasks. */
-    private final Map<String, io.github.hectorvent.floci.services.ec2.model.Instance> metadataInstances =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Instance> metadataInstances =
+            new ConcurrentHashMap<>();
     /** taskArn -> the container addresses registered for it. */
-    private final Map<String, List<String>> metadataAddressesByTask = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, List<String>> metadataAddressesByTask = new ConcurrentHashMap<>();
     /** ec2InstanceId -> the tasks registered with IMDS as that instance, which share its credentials. */
-    private final Map<String, Set<String>> metadataTasksByInstance = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Set<String>> metadataTasksByInstance = new ConcurrentHashMap<>();
 
     /**
      * Whether a task's SDK is meant to find the container instance's instance-profile role through
@@ -2047,7 +2059,7 @@ public class EcsContainerManager {
             if (entry.getValue().remove(taskArn) && entry.getValue().isEmpty()) {
                 String instanceId = entry.getKey();
                 metadataTasksByInstance.remove(instanceId, entry.getValue());
-                io.github.hectorvent.floci.services.ec2.model.Instance instance = metadataInstances.remove(instanceId);
+                Instance instance = metadataInstances.remove(instanceId);
                 if (instance != null) {
                     instanceMetadataServer.unregisterInstance(instance);
                 }
@@ -2064,7 +2076,7 @@ public class EcsContainerManager {
         if (base == null) {
             return null;
         }
-        java.net.URI uri = java.net.URI.create(base);
+        URI uri = URI.create(base);
         return "http://" + uri.getHost() + ":" + config.services().ec2().imdsPort();
     }
 
@@ -2080,7 +2092,7 @@ public class EcsContainerManager {
         if (!servesInstanceMetadata(task)) {
             return;
         }
-        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+        Instance instance =
                 metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, null));
         metadataTasksByInstance.computeIfAbsent(task.getEc2InstanceId(), ignored -> ConcurrentHashMap.newKeySet())
                 .add(task.getTaskArn());
@@ -2098,7 +2110,7 @@ public class EcsContainerManager {
                     dockerId, task.getTaskArn());
             return;
         }
-        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+        Instance instance =
                 metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, ip));
         if (instance.getPrivateIpAddress() == null) {
             instance.setPrivateIpAddress(ip);
@@ -2107,7 +2119,7 @@ public class EcsContainerManager {
         instanceMetadataServer.forgetPendingContainer(dockerId);
         metadataTasksByInstance.computeIfAbsent(task.getEc2InstanceId(), ignored -> ConcurrentHashMap.newKeySet())
                 .add(task.getTaskArn());
-        metadataAddressesByTask.computeIfAbsent(task.getTaskArn(), ignored -> new java.util.concurrent.CopyOnWriteArrayList<>())
+        metadataAddressesByTask.computeIfAbsent(task.getTaskArn(), ignored -> new CopyOnWriteArrayList<>())
                 .add(ip);
     }
 
@@ -2125,19 +2137,19 @@ public class EcsContainerManager {
     }
 
     /** The EC2 instance a container instance stands for, as IMDS describes it. */
-    private static io.github.hectorvent.floci.services.ec2.model.Instance containerInstanceHost(
+    private static Instance containerInstanceHost(
             EcsTask task, String region, String ip) {
-        io.github.hectorvent.floci.services.ec2.model.Instance instance =
-                new io.github.hectorvent.floci.services.ec2.model.Instance();
+        Instance instance =
+                new Instance();
         instance.setInstanceId(task.getEc2InstanceId());
         instance.setImageId("ami-ecs-optimized");
         instance.setInstanceType("m5.large");
         if (task.getAvailabilityZone() != null) {
-            instance.setPlacement(new io.github.hectorvent.floci.services.ec2.model.Placement(task.getAvailabilityZone()));
+            instance.setPlacement(new Placement(task.getAvailabilityZone()));
         }
         instance.setRegion(region);
         instance.setOwnerId(accountOf(task.getTaskArn()));
-        instance.setState(io.github.hectorvent.floci.services.ec2.model.InstanceState.running());
+        instance.setState(InstanceState.running());
         instance.setPrivateIpAddress(ip);
         // The profile IMDS serves credentials for; Ec2MetadataServer checks IAM holds it per request.
         instance.setIamInstanceProfileArn(task.getIamInstanceProfileArn());
@@ -2145,8 +2157,7 @@ public class EcsContainerManager {
     }
 
     private static String accountOf(String arn) {
-        String[] parts = arn.split(":");
-        return parts.length > 4 ? parts[4] : null;
+        return AwsArnUtils.accountOrDefault(arn, null);
     }
 
     /**

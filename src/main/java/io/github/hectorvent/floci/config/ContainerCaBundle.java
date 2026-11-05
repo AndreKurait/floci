@@ -97,9 +97,18 @@ public final class ContainerCaBundle {
      *                                  public roots would cut containers off from public HTTPS
      */
     public static Path write(Path tlsDir, Path trustAnchorFile) throws IOException, GeneralSecurityException {
-        List<X509Certificate> anchors = parseCertificates(Files.readString(trustAnchorFile));
-        if (anchors.isEmpty()) {
-            throw new IllegalArgumentException(trustAnchorFile + " holds no certificate");
+        return write(tlsDir, List.of(trustAnchorFile));
+    }
+
+    /** Append every configured anchor file, preserving JVM roots and never copying private keys. */
+    public static Path write(Path tlsDir, List<Path> trustAnchorFiles) throws IOException, GeneralSecurityException {
+        List<X509Certificate> anchors = new ArrayList<>();
+        for (Path trustAnchorFile : trustAnchorFiles) {
+            List<X509Certificate> certificates = parseCertificates(Files.readString(trustAnchorFile));
+            if (certificates.isEmpty()) {
+                throw new IllegalArgumentException(trustAnchorFile + " holds no certificate");
+            }
+            anchors.addAll(certificates);
         }
         List<X509Certificate> roots = systemRoots();
         if (roots.isEmpty()) {
