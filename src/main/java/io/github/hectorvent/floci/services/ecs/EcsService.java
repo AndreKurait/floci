@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.services.ecs;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -1818,7 +1820,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(e -> e.getKey().startsWith(prefix))
                 .map(Map.Entry::getValue)
                 .filter(ci -> STATUS_ACTIVE.equals(ci.getStatus()))
-                .sorted(java.util.Comparator.comparing(ContainerInstance::getContainerInstanceArn))
+                .sorted(Comparator.comparing(ContainerInstance::getContainerInstanceArn))
                 .toList();
         if (requestedArn != null) {
             return active.stream().filter(ci -> requestedArn.equals(ci.getContainerInstanceArn())
@@ -1838,7 +1840,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         return arn.substring(arn.lastIndexOf('/') + 1);
     }
 
-    private final java.util.concurrent.atomic.AtomicInteger placementCursor = new java.util.concurrent.atomic.AtomicInteger();
+    private final AtomicInteger placementCursor = new AtomicInteger();
 
     /** Where a task runs: a launch type, or the capacity provider that chose one for it. */
     private record Placement(LaunchType launchType, String capacityProviderName) {}
@@ -2118,7 +2120,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     /** Waits for the background stops in flight, for tests that check what a teardown left. */
     void awaitPendingStops() throws Exception {
         for (CompletableFuture<Void> stop : List.copyOf(taskStops.values())) {
-            stop.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            stop.get(60, TimeUnit.SECONDS);
         }
     }
 
@@ -3787,8 +3789,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      * registration names the profile, and the instance's IMDS serves that profile's role.
      */
     public static final String IAM_INSTANCE_PROFILE_ATTRIBUTE = "floci.iam-instance-profile";
-    private static final com.fasterxml.jackson.databind.ObjectMapper IDENTITY_DOCUMENT_MAPPER =
-            new com.fasterxml.jackson.databind.ObjectMapper();
+    private static final ObjectMapper IDENTITY_DOCUMENT_MAPPER = new ObjectMapper();
 
     /** The fields of an EC2 instance identity document, or none for an absent or unreadable one. */
     static Map<String, Object> parseInstanceIdentityDocument(String document) {
@@ -3837,7 +3838,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     public ContainerInstance registerContainerInstance(RegisterContainerInstanceRequest request,
                                                         String region) {
         EcsCluster cluster = resolveClusterOrDefault(request.getCluster(), region);
-        checkInstanceProfileAttribute(request.getAttributes());
+        checkInstanceProfileAttribute(request.getAttributes(), region);
         // The agent registers with the EC2 instance identity document of the host it runs on, and
         // ECS records that instance; only a registration without one gets a made-up instance id.
         Map<String, Object> identity = parseInstanceIdentityDocument(request.getInstanceIdentityDocument());
@@ -3881,10 +3882,10 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * A {@link #IAM_INSTANCE_PROFILE_ATTRIBUTE} must name an instance profile of the registering
-     * account, as an EC2 instance can only carry one of its own account's profiles. Whether IAM
-     * holds the profile is checked when IMDS serves its credentials, so it may be created later.
+     * account and partition, as an EC2 instance can only carry one of its own account's profiles.
+     * Whether IAM holds the profile is checked when IMDS serves its credentials, so it may be created later.
      */
-    private void checkInstanceProfileAttribute(List<Attribute> attributes) {
+    private void checkInstanceProfileAttribute(List<Attribute> attributes, String region) {
         if (attributes == null) {
             return;
         }
@@ -3894,10 +3895,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             }
             String value = attribute.value();
             String account = regionResolver.getAccountId();
-            if (value == null || !value.matches("arn:aws(-[a-z]+)*:iam::" + java.util.regex.Pattern.quote(account)
-                    + ":instance-profile/([\\w+=,.@-]+/)*[\\w+=,.@-]{1,128}")) {
+            String partition = AwsRegions.partitionFor(region);
+            AwsArnUtils.Arn arn = AwsArnUtils.isArn(value) ? AwsArnUtils.parse(value) : null;
+            if (arn == null || !"iam".equals(arn.service()) || !arn.region().isEmpty()
+                    || !partition.equals(arn.partition()) || !account.equals(arn.accountId())
+                    || !arn.resource().matches("instance-profile/([\\w+=,.@-]+/)*[\\w+=,.@-]{1,128}")) {
                 throw new AwsException("InvalidParameterException", "Attribute " + IAM_INSTANCE_PROFILE_ATTRIBUTE
-                        + " must be the ARN of an instance profile in account " + account + ": " + value, 400);
+                        + " must be the ARN of an instance profile in account " + account
+                        + " and partition " + partition + ": " + value, 400);
             }
         }
     }

@@ -256,6 +256,31 @@ class TargetDispatcherTest {
     }
 
     @Test
+    void appSyncDeliveryAndRetryKeepTheCurrentGraphqlOperation() {
+        invoker = mock(EventBridgeInvoker.class);
+        dispatcher = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class), BASE_URL, clock, null);
+        doThrow(unavailable()).doNothing().when(invoker)
+                .invokeTarget(any(Target.class), eq(EVENT), eq(REGION), eq(RULE_ARN));
+        String endpoint = "arn:aws:appsync:us-east-1:000000000000:endpoints/graphql-api/orders";
+        Target original = new Target("appsync", endpoint, null, null);
+        original.setAppSyncParameters(new Target.AppSyncParameters("mutation { first }"));
+        Target updated = new Target("appsync", endpoint, null, null);
+        updated.setAppSyncParameters(new Target.AppSyncParameters("mutation { second }"));
+        AtomicReference<List<Target>> current = new AtomicReference<>(List.of(original));
+
+        dispatcher.dispatch(RULE_ARN, original, EVENT, REGION, current::get);
+        current.set(List.of(updated));
+        tickAt(T0.plusSeconds(1));
+
+        ArgumentCaptor<Target> delivered = ArgumentCaptor.forClass(Target.class);
+        verify(invoker, times(2)).invokeTarget(delivered.capture(), eq(EVENT), eq(REGION), eq(RULE_ARN));
+        assertEquals(original.getAppSyncParameters(), delivered.getAllValues().get(0).getAppSyncParameters());
+        assertEquals(updated.getAppSyncParameters(), delivered.getAllValues().get(1).getAppSyncParameters());
+        verifyNoDeadLetter();
+    }
+
+    @Test
     void loweredRetryLimitDeadLettersAQueuedRetryWithoutAnotherAttempt() {
         when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
         Target original = sqsTarget(new Target.RetryPolicy(2, 3600), DLQ_ARN);
