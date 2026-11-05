@@ -223,6 +223,7 @@ class Smoke:
         docker(
             "run", "--detach", "--name", self.cli, "--network", "container:" + self.server,
             "--label", "floci.smoke.owner=" + self.owner, "--read-only",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m",
             "--mount", f"type=bind,source={ca},target=/floci-root-ca.crt,readonly",
             "--entrypoint", "/bin/sh", AWS_CLI_IMAGE,
             "-ec", "exec sleep 2147483647",
