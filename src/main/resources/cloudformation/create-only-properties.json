@@ -805,6 +805,9 @@
     "QueueName"
   ],
   "AWS::SQS::QueuePolicy": [],
+  "AWS::SSM::Association": [
+    "InstanceId"
+  ],
   "AWS::SSM::Document": [
     "Name",
     "DocumentType"
