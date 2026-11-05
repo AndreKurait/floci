@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -206,6 +207,85 @@ class CloudTrailIntegrationTest {
         .then()
             .statusCode(200)
             .body("Events", hasSize(0));
+    }
+
+    @Test
+    void lookupEventsAcceptsOmittedAndPositiveMaxResults() {
+        invokeCloudTrail("LookupEvents", "{}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":null}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":1}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":50}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":51}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":1000}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":1001}")
+            .then().statusCode(200).body("Events", hasSize(0));
+    }
+
+    @Test
+    void lookupEventsCoercesFractionalMaxResultsLikeTheSdkParser() {
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":0.5}")
+            .then().statusCode(400)
+                .body(containsString("InvalidMaxResultsException"))
+                .body(containsString("A max results value of 0 is invalid."));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":-0.5}")
+            .then().statusCode(400)
+                .body(containsString("InvalidMaxResultsException"))
+                .body(containsString("A max results value of 0 is invalid."));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":1.5}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":50.9}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":1000.5}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":2147483648}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":-2147483649}")
+            .then().statusCode(400)
+                .body(containsString("InvalidMaxResultsException"))
+                .body(containsString("A max results value of -2147483648 is invalid."));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":1e309}")
+            .then().statusCode(200).body("Events", hasSize(0));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":-1e309}")
+            .then().statusCode(400)
+                .body(containsString("InvalidMaxResultsException"))
+                .body(containsString("A max results value of -2147483648 is invalid."));
+    }
+
+    @Test
+    void lookupEventsRejectsNonPositiveMaxResults() {
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":0}")
+            .then().statusCode(400)
+                .body(containsString("\"__type\""))
+                .body(containsString("InvalidMaxResultsException"))
+                .body(containsString("A max results value of 0 is invalid."))
+                .body(containsString("Specify max results between 1 and 1000."));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":-1}")
+            .then().statusCode(400)
+                .body(containsString("InvalidMaxResultsException"))
+                .body(containsString("A max results value of -1 is invalid."))
+                .body(containsString("Specify max results between 1 and 1000."));
+    }
+
+    @Test
+    void lookupEventsRejectsNonNumericMaxResultsAsSerializationErrors() {
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":\"ten\"}")
+            .then().statusCode(400)
+                .body(containsString("SerializationException"))
+                .body(containsString("STRING_VALUE can not be converted to an Integer"));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":[1]}")
+            .then().statusCode(400)
+                .body(containsString("SerializationException"))
+                .body(containsString("Start of list found where not expected"));
+        invokeCloudTrail("LookupEvents", "{\"MaxResults\":{\"a\":1}}")
+            .then().statusCode(400)
+                .body(containsString("SerializationException"))
+                .body(containsString("Start of structure or map found where not expected"));
     }
 
     @Test
@@ -485,7 +565,7 @@ class CloudTrailIntegrationTest {
 
     // --- Helpers ---
 
-    private static io.restassured.response.Response invokeCloudTrail(String action, String body) {
+    private static Response invokeCloudTrail(String action, String body) {
         return given()
             .header("X-Amz-Target", CT_TARGET + action)
             .contentType(JSON11)

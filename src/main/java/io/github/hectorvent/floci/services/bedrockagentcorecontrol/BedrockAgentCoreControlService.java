@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntime;
@@ -46,9 +47,11 @@ public class BedrockAgentCoreControlService {
     private static final String ID_ALPHABET =
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final int MAX_PAGE = 100;
+    private static final int RUNTIME_LOCK_STRIPES = 256;
 
     private final StorageBackend<String, AgentRuntime> storage;
     private final RegionResolver regionResolver;
+    private final StripedLocks runtimeLocks = new StripedLocks(RUNTIME_LOCK_STRIPES);
     private final BedrockAgentCoreIdentityService identityService;
     // clientToken idempotency: tokens of completed deletes, so a replayed delete succeeds
     // instead of 404ing. In-memory only (reset on restart), and each entry expires after
@@ -85,6 +88,14 @@ public class BedrockAgentCoreControlService {
                                            String roleArn, String description, Map<String, String> environmentVariables,
                                            JsonNode authorizerConfiguration, JsonNode protocolConfiguration,
                                            String clientToken, String region) {
+        return createAgentRuntime(name, artifact, networkConfiguration, roleArn, description, environmentVariables,
+                authorizerConfiguration, protocolConfiguration, null, clientToken, region);
+    }
+
+    public AgentRuntime createAgentRuntime(String name, JsonNode artifact, JsonNode networkConfiguration,
+                                           String roleArn, String description, Map<String, String> environmentVariables,
+                                           JsonNode authorizerConfiguration, JsonNode protocolConfiguration,
+                                           Map<String, String> tags, String clientToken, String region) {
         if (clientToken != null) {
             Optional<AgentRuntime> replay = storage.scan(k -> k.startsWith(keyPrefix(region))).stream()
                     .filter(r -> clientToken.equals(r.getClientToken()))
@@ -139,6 +150,9 @@ public class BedrockAgentCoreControlService {
         }
         runtime.getVersions().add(snapshot(runtime, "1", now));
         runtime.getEndpoints().add(newEndpoint("DEFAULT", "1", null, now));
+        if (tags != null) {
+            runtime.getTags().putAll(tags);
+        }
 
         storage.put(key(region, id), runtime);
         LOG.infov("Created AgentCore runtime {0} (id={1})", name, id);
@@ -170,34 +184,36 @@ public class BedrockAgentCoreControlService {
                                            String roleArn, String description, Map<String, String> environmentVariables,
                                            JsonNode authorizerConfiguration, JsonNode protocolConfiguration,
                                            String region) {
-        if (artifact == null || artifact.isNull()) {
-            throw new AwsException("ValidationException", "agentRuntimeArtifact is required", 400);
-        }
-        if (networkConfiguration == null || networkConfiguration.isNull()) {
-            throw new AwsException("ValidationException", "networkConfiguration is required", 400);
-        }
-        if (roleArn == null || roleArn.isBlank()) {
-            throw new AwsException("ValidationException", "roleArn is required", 400);
-        }
-        validateConfiguration(networkConfiguration, protocolConfiguration);
-        AgentRuntime runtime = getAgentRuntime(id, region);
-        Instant now = Instant.now();
+        synchronized (runtimeLock(region, id)) {
+            if (artifact == null || artifact.isNull()) {
+                throw new AwsException("ValidationException", "agentRuntimeArtifact is required", 400);
+            }
+            if (networkConfiguration == null || networkConfiguration.isNull()) {
+                throw new AwsException("ValidationException", "networkConfiguration is required", 400);
+            }
+            if (roleArn == null || roleArn.isBlank()) {
+                throw new AwsException("ValidationException", "roleArn is required", 400);
+            }
+            validateConfiguration(networkConfiguration, protocolConfiguration);
+            AgentRuntime runtime = getAgentRuntime(id, region);
+            Instant now = Instant.now();
 
-        int newVersion = runtime.getLatestVersion() + 1;
-        runtime.setLatestVersion(newVersion);
-        runtime.setRoleArn(roleArn);
-        runtime.setDescription(description);
-        runtime.setAgentRuntimeArtifact(artifact);
-        runtime.setNetworkConfiguration(networkConfiguration);
-        runtime.setAuthorizerConfiguration(authorizerConfiguration);
-        runtime.setProtocolConfiguration(protocolConfiguration);
-        runtime.setEnvironmentVariables(environmentVariables != null ? new HashMap<>(environmentVariables) : new HashMap<>());
-        runtime.setLastUpdatedAt(now);
-        runtime.getVersions().add(snapshot(runtime, String.valueOf(newVersion), now));
+            int newVersion = runtime.getLatestVersion() + 1;
+            runtime.setLatestVersion(newVersion);
+            runtime.setRoleArn(roleArn);
+            runtime.setDescription(description);
+            runtime.setAgentRuntimeArtifact(artifact);
+            runtime.setNetworkConfiguration(networkConfiguration);
+            runtime.setAuthorizerConfiguration(authorizerConfiguration);
+            runtime.setProtocolConfiguration(protocolConfiguration);
+            runtime.setEnvironmentVariables(environmentVariables != null ? new HashMap<>(environmentVariables) : new HashMap<>());
+            runtime.setLastUpdatedAt(now);
+            runtime.getVersions().add(snapshot(runtime, String.valueOf(newVersion), now));
 
-        storage.put(key(region, id), runtime);
-        LOG.infov("Updated AgentCore runtime {0} to version {1}", id, newVersion);
-        return runtime;
+            storage.put(key(region, id), runtime);
+            LOG.infov("Updated AgentCore runtime {0} to version {1}", id, newVersion);
+            return runtime;
+        }
     }
 
     /**
@@ -225,25 +241,27 @@ public class BedrockAgentCoreControlService {
     }
 
     public AgentRuntime deleteAgentRuntime(String id, String clientToken, String region) {
-        Optional<AgentRuntime> found = storage.get(key(region, id));
-        if (found.isEmpty()) {
-            if (clientToken != null && deletedRuntimeTokens.contains(tokenKey(region, clientToken))) {
-                AgentRuntime marker = new AgentRuntime();
-                marker.setAgentRuntimeId(id);
-                marker.setStatus(STATUS_DELETING);
-                return marker;
+        synchronized (runtimeLock(region, id)) {
+            Optional<AgentRuntime> found = storage.get(key(region, id));
+            if (found.isEmpty()) {
+                if (clientToken != null && deletedRuntimeTokens.contains(tokenKey(region, clientToken))) {
+                    AgentRuntime marker = new AgentRuntime();
+                    marker.setAgentRuntimeId(id);
+                    marker.setStatus(STATUS_DELETING);
+                    return marker;
+                }
+                throw new AwsException("ResourceNotFoundException",
+                        "AgentCore runtime not found: " + id, 404);
             }
-            throw new AwsException("ResourceNotFoundException",
-                    "AgentCore runtime not found: " + id, 404);
+            AgentRuntime runtime = found.get();
+            storage.delete(key(region, id));
+            if (clientToken != null) {
+                deletedRuntimeTokens.record(tokenKey(region, clientToken));
+            }
+            runtime.setStatus(STATUS_DELETING);
+            LOG.infov("Deleted AgentCore runtime {0}", id);
+            return runtime;
         }
-        AgentRuntime runtime = found.get();
-        storage.delete(key(region, id));
-        if (clientToken != null) {
-            deletedRuntimeTokens.record(tokenKey(region, clientToken));
-        }
-        runtime.setStatus(STATUS_DELETING);
-        LOG.infov("Deleted AgentCore runtime {0}", id);
-        return runtime;
     }
 
     private static String tokenKey(String region, String clientToken) {
@@ -280,11 +298,11 @@ public class BedrockAgentCoreControlService {
      * validated here — the data plane treats them permissively.
      */
     public boolean runtimeArnExists(String region, String arn) {
-        String[] parts = arn == null ? new String[0] : arn.split(":");
-        if (parts.length < 6 || !parts[5].startsWith("agent/")) {
+        String resource = BedrockAgentCoreArns.resource(arn);
+        if (resource == null || !resource.startsWith("agent/")) {
             return true;
         }
-        String uuid = parts[5].substring("agent/".length());
+        String uuid = resource.substring("agent/".length());
         String prefix = keyPrefix(region);
         return storage.scan(k -> k.startsWith(prefix)).stream()
                 .anyMatch(r -> uuid.equals(r.getUuid()));
@@ -325,49 +343,53 @@ public class BedrockAgentCoreControlService {
 
     private static String uuidFromArn(String arn) {
         // arn:aws:bedrock-agentcore:<region>:<account>:agent/<uuid>:<version>
-        String[] parts = arn == null ? new String[0] : arn.split(":");
-        if (parts.length < 6 || !parts[5].startsWith("agent/")) {
+        String resource = BedrockAgentCoreArns.resource(arn);
+        if (resource == null || !resource.startsWith("agent/")) {
             throw new AwsException("ValidationException", "Unsupported resource ARN: " + arn, 400);
         }
-        return parts[5].substring("agent/".length());
+        return resource.substring("agent/".length());
     }
 
     // ──────────────────────────── Endpoints (Phase 2) ────────────────────────────
 
     public AgentRuntimeEndpoint createEndpoint(String runtimeId, String name, String agentRuntimeVersion,
                                                String description, String clientToken, String region) {
-        AgentRuntime runtime = getAgentRuntime(runtimeId, region);
-        if (clientToken != null) {
-            Optional<AgentRuntimeEndpoint> replay = runtime.getEndpoints().stream()
-                    .filter(e -> clientToken.equals(e.getClientToken()))
-                    .findFirst();
-            if (replay.isPresent()) {
-                return replay.get();
+        synchronized (runtimeLock(region, runtimeId)) {
+            AgentRuntime runtime = getAgentRuntime(runtimeId, region);
+            if (clientToken != null) {
+                Optional<AgentRuntimeEndpoint> replay = runtime.getEndpoints().stream()
+                        .filter(e -> clientToken.equals(e.getClientToken()))
+                        .findFirst();
+                if (replay.isPresent()) {
+                    return replay.get();
+                }
             }
+            if (name == null || !NAME_PATTERN.matcher(name).matches()) {
+                throw new AwsException("ValidationException",
+                        "endpoint name must match [a-zA-Z][a-zA-Z0-9_]{0,47}", 400);
+            }
+            boolean exists = runtime.getEndpoints().stream().anyMatch(e -> name.equals(e.getName()));
+            if (exists) {
+                throw new AwsException("ConflictException",
+                        "AgentCore runtime endpoint already exists: " + name, 409);
+            }
+            String version = agentRuntimeVersion != null ? agentRuntimeVersion
+                    : String.valueOf(runtime.getLatestVersion());
+            requirePublishedVersion(runtime, version);
+            AgentRuntimeEndpoint endpoint = newEndpoint(name, version, description, Instant.now());
+            endpoint.setClientToken(clientToken);
+            runtime.getEndpoints().add(endpoint);
+            storage.put(key(region, runtimeId), runtime);
+            LOG.infov("Created AgentCore endpoint {0} on runtime {1}", name, runtimeId);
+            return endpoint;
         }
-        if (name == null || !NAME_PATTERN.matcher(name).matches()) {
-            throw new AwsException("ValidationException",
-                    "endpoint name must match [a-zA-Z][a-zA-Z0-9_]{0,47}", 400);
-        }
-        boolean exists = runtime.getEndpoints().stream().anyMatch(e -> name.equals(e.getName()));
-        if (exists) {
-            throw new AwsException("ConflictException",
-                    "AgentCore runtime endpoint already exists: " + name, 409);
-        }
-        String version = agentRuntimeVersion != null ? agentRuntimeVersion
-                : String.valueOf(runtime.getLatestVersion());
-        requirePublishedVersion(runtime, version);
-        AgentRuntimeEndpoint endpoint = newEndpoint(name, version, description, Instant.now());
-        endpoint.setClientToken(clientToken);
-        runtime.getEndpoints().add(endpoint);
-        storage.put(key(region, runtimeId), runtime);
-        LOG.infov("Created AgentCore endpoint {0} on runtime {1}", name, runtimeId);
-        return endpoint;
     }
 
     public AgentRuntimeEndpoint getEndpoint(String runtimeId, String name, String region) {
-        AgentRuntime runtime = getAgentRuntime(runtimeId, region);
-        return findEndpoint(runtime, name);
+        synchronized (runtimeLock(region, runtimeId)) {
+            AgentRuntime runtime = getAgentRuntime(runtimeId, region);
+            return findEndpoint(runtime, name);
+        }
     }
 
     /** UpdateAgentRuntimeEndpoint on the API: a null version or description is left as it is. */
@@ -384,19 +406,21 @@ public class BedrockAgentCoreControlService {
      */
     public AgentRuntimeEndpoint updateEndpoint(String runtimeId, String name, String agentRuntimeVersion,
                                                String description, boolean replaceOmitted, String region) {
-        AgentRuntime runtime = getAgentRuntime(runtimeId, region);
-        AgentRuntimeEndpoint endpoint = findEndpoint(runtime, name);
-        if (agentRuntimeVersion != null) {
-            requirePublishedVersion(runtime, agentRuntimeVersion);
-            endpoint.setTargetVersion(agentRuntimeVersion);
-            endpoint.setLiveVersion(agentRuntimeVersion);
+        synchronized (runtimeLock(region, runtimeId)) {
+            AgentRuntime runtime = getAgentRuntime(runtimeId, region);
+            AgentRuntimeEndpoint endpoint = findEndpoint(runtime, name);
+            if (agentRuntimeVersion != null) {
+                requirePublishedVersion(runtime, agentRuntimeVersion);
+                endpoint.setTargetVersion(agentRuntimeVersion);
+                endpoint.setLiveVersion(agentRuntimeVersion);
+            }
+            if (description != null || replaceOmitted) {
+                endpoint.setDescription(description);
+            }
+            endpoint.setLastUpdatedAt(Instant.now());
+            storage.put(key(region, runtimeId), runtime);
+            return endpoint;
         }
-        if (description != null || replaceOmitted) {
-            endpoint.setDescription(description);
-        }
-        endpoint.setLastUpdatedAt(Instant.now());
-        storage.put(key(region, runtimeId), runtime);
-        return endpoint;
     }
 
     /**
@@ -413,34 +437,38 @@ public class BedrockAgentCoreControlService {
     }
 
     public AgentRuntimeEndpoint deleteEndpoint(String runtimeId, String name, String clientToken, String region) {
-        AgentRuntime runtime = getAgentRuntime(runtimeId, region);
-        Optional<AgentRuntimeEndpoint> found = runtime.getEndpoints().stream()
-                .filter(e -> e.getName().equals(name)).findFirst();
-        if (found.isEmpty()) {
-            if (clientToken != null && deletedEndpointTokens.contains(tokenKey(region, clientToken))) {
-                AgentRuntimeEndpoint marker = new AgentRuntimeEndpoint();
-                marker.setName(name);
-                marker.setStatus(STATUS_DELETING);
-                return marker;
+        synchronized (runtimeLock(region, runtimeId)) {
+            AgentRuntime runtime = getAgentRuntime(runtimeId, region);
+            Optional<AgentRuntimeEndpoint> found = runtime.getEndpoints().stream()
+                    .filter(e -> e.getName().equals(name)).findFirst();
+            if (found.isEmpty()) {
+                if (clientToken != null && deletedEndpointTokens.contains(tokenKey(region, clientToken))) {
+                    AgentRuntimeEndpoint marker = new AgentRuntimeEndpoint();
+                    marker.setName(name);
+                    marker.setStatus(STATUS_DELETING);
+                    return marker;
+                }
+                throw new AwsException("ResourceNotFoundException",
+                        "AgentCore runtime endpoint not found: " + name, 404);
             }
-            throw new AwsException("ResourceNotFoundException",
-                    "AgentCore runtime endpoint not found: " + name, 404);
+            AgentRuntimeEndpoint endpoint = found.get();
+            runtime.getEndpoints().removeIf(e -> name.equals(e.getName()));
+            if (clientToken != null) {
+                deletedEndpointTokens.record(tokenKey(region, clientToken));
+            }
+            endpoint.setStatus(STATUS_DELETING);
+            storage.put(key(region, runtimeId), runtime);
+            return endpoint;
         }
-        AgentRuntimeEndpoint endpoint = found.get();
-        runtime.getEndpoints().removeIf(e -> name.equals(e.getName()));
-        if (clientToken != null) {
-            deletedEndpointTokens.record(tokenKey(region, clientToken));
-        }
-        endpoint.setStatus(STATUS_DELETING);
-        storage.put(key(region, runtimeId), runtime);
-        return endpoint;
     }
 
     public PaginatedResult<AgentRuntimeEndpoint> listEndpoints(String runtimeId, Integer maxResults, String nextToken,
                                                           String region) {
-        AgentRuntime runtime = getAgentRuntime(runtimeId, region);
-        return Pagination.paginate(runtime.getEndpoints(), AgentRuntimeEndpoint::getName, maxResults, nextToken,
-                MAX_PAGE, "ValidationException");
+        synchronized (runtimeLock(region, runtimeId)) {
+            AgentRuntime runtime = getAgentRuntime(runtimeId, region);
+            return Pagination.paginate(runtime.getEndpoints(), AgentRuntimeEndpoint::getName, maxResults, nextToken,
+                    MAX_PAGE, "ValidationException");
+        }
     }
 
     /** An endpoint together with the runtime that holds it. */
@@ -453,20 +481,31 @@ public class BedrockAgentCoreControlService {
      * API, so this is the only way back from the ARN CloudFormation keeps as the physical id.
      */
     public Optional<EndpointLocation> findEndpointByArn(String region, String arn) {
-        String[] parts = arn == null ? new String[0] : arn.split(":");
-        if (parts.length < 6 || !parts[5].startsWith("agentEndpoint/")) {
+        String resource = BedrockAgentCoreArns.resource(arn);
+        if (resource == null || !resource.startsWith("agentEndpoint/")) {
             return Optional.empty();
         }
-        String uuid = parts[5].substring("agentEndpoint/".length());
+        String uuid = resource.substring("agentEndpoint/".length());
         String prefix = keyPrefix(region);
         for (AgentRuntime runtime : storage.scan(k -> k.startsWith(prefix))) {
-            for (AgentRuntimeEndpoint endpoint : runtime.getEndpoints()) {
-                if (uuid.equals(endpoint.getUuid())) {
-                    return Optional.of(new EndpointLocation(runtime, endpoint));
+            synchronized (runtimeLock(region, runtime.getAgentRuntimeId())) {
+                Optional<AgentRuntime> current = storage.get(key(region, runtime.getAgentRuntimeId()));
+                if (current.isEmpty()) {
+                    continue;
+                }
+                for (AgentRuntimeEndpoint endpoint : current.get().getEndpoints()) {
+                    if (uuid.equals(endpoint.getUuid())) {
+                        return Optional.of(new EndpointLocation(current.get(), endpoint));
+                    }
                 }
             }
         }
         return Optional.empty();
+    }
+
+    private Object runtimeLock(String region, String runtimeId) {
+        String lockKey = regionResolver.getAccountId() + ":" + key(region, runtimeId);
+        return runtimeLocks.lockFor(lockKey);
     }
 
     private AgentRuntimeEndpoint findEndpoint(AgentRuntime runtime, String name) {

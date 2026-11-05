@@ -25,6 +25,10 @@ services:
     doc: docs/services/acm.md
     sources:
       - { path: services/acm/AcmJsonHandler.java, mode: switch }
+  - service: paymentcryptography
+    doc: docs/services/payment-cryptography.md
+    sources:
+      - { path: services/paymentcryptography/PaymentCryptographyJsonHandler.java, mode: switch }
   - service: applicationautoscaling
     doc: docs/services/applicationautoscaling.md
     sources:
@@ -47,6 +51,7 @@ services:
       - { path: services/bedrockagentcorecontrol/BedrockAgentCoreToolsController.java, mode: rest }
       - { path: services/bedrockagentcorecontrol/BedrockAgentCoreGatewayRuleController.java, mode: rest }
       - { path: services/bedrockagentcorecontrol/BedrockAgentCoreResourcePolicyController.java, mode: rest }
+      - { path: services/bedrockagentcorecontrol/BedrockAgentCoreHarnessController.java, mode: rest }
     rename_actions:
       CreateEndpoint: CreateAgentRuntimeEndpoint
       GetEndpoint: GetAgentRuntimeEndpoint
@@ -237,6 +242,10 @@ services:
     doc: docs/services/eventbridge.md
     sources:
       - { path: services/eventbridge/EventBridgeHandler.java, mode: switch }
+  - service: eventbridgev2
+    doc: docs/services/eventbridgev2.md
+    sources:
+      - { path: services/eventbridgev2/EventBridgeV2Handler.java, mode: switch }
   - service: firehose
     doc: docs/services/firehose.md
     sources:
@@ -322,7 +331,7 @@ services:
     # SubnetIds / VpcSecurityGroupIds / IamRoles / AddIamRoles / RemoveIamRoles / TagKeys / TagValues /
     # DbGroups / ScheduleDefinitions are labels of an inner member-name switch (memberKeyRegex), not
     # actions, same shape as the rds exclusions above.
-    exclude_actions: [SubnetIds, VpcSecurityGroupIds, IamRoles, AddIamRoles, RemoveIamRoles, TagKeys, TagValues, DbGroups, ScheduleDefinitions]
+    exclude_actions: [SubnetIds, VpcSecurityGroupIds, IamRoles, AddIamRoles, RemoveIamRoles, TagKeys, TagValues, DbGroups, ScheduleDefinitions, SourceIds, EventCategories]
   - service: redshiftdata
     doc: docs/services/redshift-data.md
     sources:
@@ -443,6 +452,7 @@ deferred_handlers:
   - { path: services/cloudmap/CloudMapHandler.java }  # non-tabular doc (grouped/inline)
   - { path: services/cloudwatch/logs/CloudWatchLogsHandler.java }  # multi-table doc (nested handler)
   - { path: services/cloudwatch/logs/CloudWatchLogsMetricFilterHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
+  - { path: services/cloudwatch/logs/CloudWatchLogsDeliveryHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsJsonHandler.java }  # multi-table doc (nested handler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsQueryHandler.java }  # multi-table doc (nested handler)
   - { path: services/codebuild/CodeBuildJsonHandler.java }  # non-tabular doc (grouped/inline)

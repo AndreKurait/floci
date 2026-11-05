@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -243,6 +245,14 @@ public class KinesisAnalyticsV2Service {
             }
         }
         return storage.scan(key -> key.startsWith(prefix));
+    }
+
+    public PaginatedResult<FlinkApplication> listApplications(String region, Integer limit, String nextToken) {
+        if (nextToken != null && !nextToken.isEmpty() && !APPLICATION_NAME.matcher(nextToken).matches()) {
+            throw new AwsException("InvalidRequestException", "Invalid NextToken.", 400);
+        }
+        return Pagination.paginateUnencoded(listApplications(region), FlinkApplication::getApplicationName,
+                limit, nextToken, 50, 50, 128, "InvalidRequestException");
     }
 
     public FlinkApplication startApplication(String applicationName) {
@@ -549,6 +559,14 @@ public class KinesisAnalyticsV2Service {
 
     public List<Snapshot> listApplicationSnapshots(String applicationName, String region) {
         return List.copyOf(describeApplication(applicationName, region).getSnapshots().values());
+    }
+
+    public PaginatedResult<Snapshot> listApplicationSnapshots(String applicationName, String region,
+                                                              Integer limit, String nextToken) {
+        // AWS: ListSnapshotsInputLimit is 1 to 50 and NextToken is 1 to 512 with no pattern, so
+        // unlike ListApplications the token is not checked against a resource name here.
+        return Pagination.paginateUnencoded(listApplicationSnapshots(applicationName, region),
+                Snapshot::getSnapshotName, limit, nextToken, 50, 50, 512, "InvalidArgumentException");
     }
 
     public void deleteApplicationSnapshot(String applicationName, String snapshotName,

@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.storage.PersistentPathValidator;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHook;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHooksRunner;
+import io.github.hectorvent.floci.services.amazonmq.container.RabbitMqManager;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbRuntime;
@@ -20,12 +21,18 @@ import io.github.hectorvent.floci.services.elasticache.ElastiCacheService;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheMemcachedContainerManager;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheProxyManager;
+import io.github.hectorvent.floci.services.elb.ElbClassicService;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.floci.ui.FlociUiManager;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.kinesisanalytics.container.FlinkContainerManager;
 import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionService;
+import io.github.hectorvent.floci.services.memorydb.MemoryDbService;
+import io.github.hectorvent.floci.services.memorydb.container.MemoryDbContainerManager;
+import io.github.hectorvent.floci.services.memorydb.proxy.MemoryDbProxyManager;
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerManager;
 import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
 import io.github.hectorvent.floci.services.pipes.PipesService;
@@ -55,9 +62,13 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.io.IOException;
 import java.text.MessageFormat;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -92,18 +103,20 @@ class EmulatorLifecycleTest {
     @Mock private ElastiCacheProxyManager elastiCacheProxyManager;
     @Mock private RdsContainerManager rdsContainerManager;
     @Mock private RdsProxyManager rdsProxyManager;
-    @Mock private io.github.hectorvent.floci.services.memorydb.container.MemoryDbContainerManager memoryDbContainerManager;
-    @Mock private io.github.hectorvent.floci.services.memorydb.proxy.MemoryDbProxyManager memoryDbProxyManager;
+    @Mock private MemoryDbContainerManager memoryDbContainerManager;
+    @Mock private MemoryDbProxyManager memoryDbProxyManager;
+    @Mock private MemoryDbService memoryDbService;
+    @Mock private EmulatorConfig.MemoryDbServiceConfig memoryDbServiceConfig;
     @Mock private DocDbContainerManager docDbContainerManager;
     @Mock private NeptuneContainerManager neptuneContainerManager;
     @Mock private NeptuneProxyManager neptuneProxyManager;
-    @Mock private io.github.hectorvent.floci.services.amazonmq.container.RabbitMqManager rabbitMqManager;
-    @Mock private io.github.hectorvent.floci.services.kinesisanalytics.container.FlinkContainerManager flinkContainerManager;
+    @Mock private RabbitMqManager rabbitMqManager;
+    @Mock private FlinkContainerManager flinkContainerManager;
     @Mock private RdsService rdsService;
     @Mock private TimestreamInfluxDbService timestreamInfluxDbService;
     @Mock private EmulatorConfig.TimestreamInfluxDbServiceConfig timestreamInfluxDbServiceConfig;
-    @Mock private io.github.hectorvent.floci.services.elbv2.ElbV2Service elbV2Service;
-    @Mock private io.github.hectorvent.floci.services.elb.ElbClassicService elbClassicService;
+    @Mock private ElbV2Service elbV2Service;
+    @Mock private ElbClassicService elbClassicService;
     @Mock private EcsService ecsService;
     @Mock private EksService eksService;
     @Mock private InitializationHooksRunner initializationHooksRunner;
@@ -131,6 +144,7 @@ class EmulatorLifecycleTest {
     @BeforeEach
     void setUp() {
         Mockito.lenient().when(config.services()).thenReturn(servicesConfig);
+        Mockito.lenient().when(servicesConfig.memorydb()).thenReturn(memoryDbServiceConfig);
         Mockito.lenient().when(servicesConfig.ec2()).thenReturn(ec2ServiceConfig);
         Mockito.lenient().when(servicesConfig.ecs()).thenReturn(ecsServiceConfig);
         Mockito.lenient().when(ecsServiceConfig.taskRoleCredentials()).thenReturn(ecsTaskRoleCredentialsConfig);
@@ -160,7 +174,7 @@ class EmulatorLifecycleTest {
                 iamService, elastiCacheService, elastiCacheMemcachedService,
                 elastiCacheContainerManager, elastiCacheMemcachedContainerManager,
                 elastiCacheProxyManager, rdsContainerManager, rdsProxyManager,
-                memoryDbContainerManager, memoryDbProxyManager,
+                memoryDbContainerManager, memoryDbProxyManager, memoryDbService,
                 docDbContainerManager, neptuneContainerManager, neptuneProxyManager,
                 rabbitMqManager, flinkContainerManager, rdsService, timestreamInfluxDbService,
                 elbV2Service, elbClassicService, ecsService,
@@ -170,7 +184,7 @@ class EmulatorLifecycleTest {
                 persistentPathValidator,
                 dynamoDbRuntime, redshiftZeroEtlConsumer, eksService);
         Mockito.lenient().when(containerTeardowns.iterator())
-                .thenReturn(java.util.Collections.emptyIterator());
+                .thenReturn(Collections.emptyIterator());
     }
 
     private void stubStorageConfig() {
@@ -754,12 +768,11 @@ class EmulatorLifecycleTest {
 
     /** Collects the messages EmulatorLifecycle logs while {@code action} runs. */
     private List<String> lifecycleLogMessages(Runnable action) {
-        java.util.logging.Logger logger =
-                java.util.logging.Logger.getLogger(EmulatorLifecycle.class.getName());
+        Logger logger = Logger.getLogger(EmulatorLifecycle.class.getName());
         List<String> messages = new CopyOnWriteArrayList<>();
-        java.util.logging.Handler handler = new java.util.logging.Handler() {
+        Handler handler = new Handler() {
             @Override
-            public void publish(java.util.logging.LogRecord logRecord) {
+            public void publish(LogRecord logRecord) {
                 Object[] parameters = logRecord.getParameters();
                 messages.add(parameters == null || parameters.length == 0
                         ? logRecord.getMessage()
