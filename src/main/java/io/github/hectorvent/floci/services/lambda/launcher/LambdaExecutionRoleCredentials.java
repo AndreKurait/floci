@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda.launcher;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.iam.model.LambdaExecutionBinding;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -53,7 +54,15 @@ public class LambdaExecutionRoleCredentials {
      * the existing container credential fallback rather than becoming an implicit deny-all caller.
      */
     public Optional<SessionCreds> forFunction(LambdaFunction function) {
-        return forRole(function.getRole(), sessionAccountId(function), function.getFunctionName());
+        Optional<SessionCreds> credentials = forRole(
+                function.getRole(), sessionAccountId(function), function.getFunctionName());
+        if (credentials.isPresent()) {
+            LambdaExecutionBinding binding = binding(function);
+            if (binding != null) {
+                iamService.bindLambdaExecution(sessionAccountId(function), credentials.get().accessKeyId(), binding);
+            }
+        }
+        return credentials;
     }
 
     /** A session for {@code roleArn} assumed on behalf of {@code functionName} in {@code functionAccountId}. */
@@ -92,6 +101,32 @@ public class LambdaExecutionRoleCredentials {
                 functionAccountId, credentials.accessKeyId(), credentials.secretAccessKey(),
                 credentials.sessionToken(), roleArn, functionName, assumedRoleId);
         return Optional.of(credentials);
+    }
+
+    /** Bind before start so init-time AssumeRole can retain provenance; verification still requires running. */
+    public void bindContainer(LambdaFunction function, String accessKey, String containerId) {
+        LambdaExecutionBinding binding = binding(function);
+        if (binding != null) {
+            iamService.bindLambdaExecution(sessionAccountId(function), accessKey, binding.withContainer(containerId));
+        }
+    }
+
+    public void bindStartedContainer(LambdaFunction function, String accessKey, String containerId, String startedAt) {
+        LambdaExecutionBinding binding = binding(function);
+        if (binding != null) {
+            iamService.bindLambdaExecution(sessionAccountId(function), accessKey,
+                    binding.withContainer(containerId).withStartedAt(startedAt));
+        }
+    }
+
+    private static LambdaExecutionBinding binding(LambdaFunction function) {
+        if (function.isHotReload() || function.getFunctionArn() == null || function.getCodeSha256() == null) {
+            return null;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(function.getFunctionArn());
+        return new LambdaExecutionBinding(sessionAccountId(function), arn.region(), function.getFunctionName(),
+                function.getFunctionArn(), function.getVersion() == null ? "$LATEST" : function.getVersion(),
+                function.getRole(), function.getCodeSha256(), function.getRevisionId(), null, null);
     }
 
     public void unregister(String accountId, String accessKeyId) {

@@ -269,8 +269,8 @@ class StsQueryHandlerTest {
         Response response = handler.handle("AssumeRole", params);
 
         assertEquals(200, response.getStatus(), (String) response.getEntity());
-        verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
-                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"));
+        verify(iamService).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
+                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(false), isNull());
     }
 
     @Test
@@ -743,8 +743,8 @@ class StsQueryHandlerTest {
         assertEquals(200, response.getStatus(), (String) response.getEntity());
         assertEquals(expected, extract(EXPIRATION, (String) response.getEntity()));
         ArgumentCaptor<Instant> sessionExpiration = ArgumentCaptor.forClass(Instant.class);
-        verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()),
-                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("s"), anyString());
+        verify(iamService).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()),
+                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("s"), anyString(), eq(false), isNull());
         assertEquals(expiration, sessionExpiration.getValue());
     }
 
