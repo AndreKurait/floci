@@ -13,6 +13,8 @@ import time
 import urllib.request
 import uuid
 
+from lambda_vpc_smoke import LAMBDA_IMAGE, exercise_lambda_vpc
+
 
 AGENT_VERSION = "3.3.5700.0"
 AGENT_SHA256 = "fd6c483dfb6f0752c09c9823a617cf5de60aecf5a18cd4d6acbbb454836342a5"
@@ -78,7 +80,8 @@ class Smoke:
             "cleanup_errors": [],
         }
 
-    def aws(self, service, operation, **parameters):
+    def aws(self, service, operation, *arguments, timeout=30, **parameters):
+        options = ("--cli-input-json", json.dumps(parameters)) if parameters else ()
         result = docker(
             "exec", "-e", "AWS_ACCESS_KEY_ID=test", "-e", "AWS_SECRET_ACCESS_KEY=test",
             "-e", "AWS_SESSION_TOKEN=", "-e", "AWS_EC2_METADATA_DISABLED=true",
@@ -86,7 +89,8 @@ class Smoke:
             "-e", "AWS_CA_BUNDLE=/app/data/tls/floci-root-ca.crt", "-e", "AWS_PAGER=",
             self.server, "aws", "--endpoint-url", "https://localhost:4566",
             "--region", REGION, "--output", "json", "--no-paginate",
-            service, operation, "--cli-input-json", json.dumps(parameters),
+            service, operation, *arguments, *options,
+            timeout=timeout,
         )
         return json.loads(result.stdout) if result.stdout.strip() else {}
 
@@ -130,6 +134,8 @@ class Smoke:
         (self.work / "catalog.json").write_text(json.dumps(catalog))
         docker("pull", "--platform", "linux/amd64", self.image, timeout=240)
         docker("pull", "--platform", "linux/amd64", self.helper, timeout=240)
+        docker("pull", "--platform", "linux/amd64", LAMBDA_IMAGE, timeout=240)
+        self.record["lambda_runtime_image"] = LAMBDA_IMAGE
         image = json.loads(docker("image", "inspect", self.image).stdout)[0]
         configured = dict(value.split("=", 1) for value in image["Config"]["Env"] if "=" in value)
         for key in ("FLOCI_SERVICES_EC2_METADATA_HELPER_IMAGE",
@@ -149,13 +155,17 @@ class Smoke:
             "FLOCI_DNS_CONTAINER_FALLBACK_ENABLED": "false",
             "FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK": self.network,
             "FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE": self.server,
+            "FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__PYTHON3_12_": LAMBDA_IMAGE,
             "FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH": "/catalog.json",
             "FLOCI_SERVICES_EC2_MOCK": "false", "FLOCI_SERVICES_EC2_PRIVILEGED": "false",
             "FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED": "true",
+            "FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL": "false",
+            "FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES": "true",
             "FLOCI_SERVICES_EC2_AWS_FAITHFUL_PRIVATE_IP": "true",
             "FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED": "true",
             "FLOCI_NETWORK_VPC_ROUTING_ENABLED": "true",
             "FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API": "true",
+            "FLOCI_SERVICES_ELB_VPC_FRONTENDS": "true",
             "FLOCI_SERVICES_EC2_VOLUME_BLOCK_DEVICES": "false",
             "FLOCI_SERVICES_EC2_PUBLISH_SECURITY_GROUP_PORTS": "false",
             "FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED": "true",
@@ -748,6 +758,7 @@ def main():
             exercise_cancellation(smoke)
             exercise_delivery_outage(smoke)
             exercise_delivery_outage(smoke, remove_route=True)
+            exercise_lambda_vpc(smoke, docker)
             smoke.record.update(status="passed", command_transport_qualified=True)
         except Exception as error:
             smoke.record.update(status="failed", error=str(error))
