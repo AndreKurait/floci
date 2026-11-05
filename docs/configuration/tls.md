@@ -44,7 +44,10 @@ Disabling verification (`--no-verify-ssl`, `verify=False`, `NODE_TLS_REJECT_UNAU
 For managed Java Lambda runtimes, an explicit Docker bind over
 `/var/lang/lib/security/cacerts` or `/etc/pki/ca-trust/extracted/java/cacerts`,
 including a parent directory, keeps that mounted runtime truststore in control.
-Floci does not inject its JVM truststore option in that case. Supply the roots
+For the default public Java runtime images, Floci does not inject its JVM
+truststore option in that case. Container paths are matched case-sensitively
+on every host OS. Custom Java runtime images retain automatic injection because
+their truststore layout is not established by those standard paths. Supply the roots
 the workload needs in the mounted store; certificate verification stays enabled.
 Container-image Lambda functions retain their existing truststore injection.
 
