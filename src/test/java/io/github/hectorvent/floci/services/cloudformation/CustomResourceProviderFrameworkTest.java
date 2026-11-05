@@ -51,7 +51,7 @@ class CustomResourceProviderFrameworkTest {
         detector = new ProviderFrameworkDetector(lambdaService);
         store = new CustomResourceResponseStore(detector);
         ContainerReachableEndpoint endpoint = mock(ContainerReachableEndpoint.class);
-        when(endpoint.baseUrl()).thenReturn("http://floci:4566");
+        when(endpoint.baseUrlWithTls(true)).thenReturn("https://floci:4566");
 
         provisioner = CfnProvisionerFixture.builder()
                 .lambda(lambdaService)

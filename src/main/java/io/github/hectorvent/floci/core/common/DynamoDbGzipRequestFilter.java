@@ -32,15 +32,20 @@ public class DynamoDbGzipRequestFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext context) {
+        if (resourceInfo.getResourceClass() != AwsJsonController.class
+                || !isGzip(context.getHeaderString(HttpHeaders.CONTENT_ENCODING))) {
+            return;
+        }
         String target = context.getHeaderString("X-Amz-Target");
         boolean dynamoDb = catalog.matchTarget(target)
                 .filter(match -> "dynamodb".equals(match.descriptor().externalKey()))
                 .filter(match -> match.prefix().startsWith("DynamoDB_"))
                 .isPresent();
+        if (!dynamoDb) {
+            return;
+        }
         MediaType type = context.getMediaType();
-        if (resourceInfo.getResourceClass() != AwsJsonController.class || !dynamoDb || type == null
-                || !type.isCompatible(MediaType.valueOf(AwsJsonController.CONTENT_TYPE_AWS_JSON_1_0))
-                || !isGzip(context.getHeaderString(HttpHeaders.CONTENT_ENCODING))) {
+        if (type == null || !type.isCompatible(MediaType.valueOf(AwsJsonController.CONTENT_TYPE_AWS_JSON_1_0))) {
             return;
         }
         context.setEntityStream(new ByteArrayInputStream(
