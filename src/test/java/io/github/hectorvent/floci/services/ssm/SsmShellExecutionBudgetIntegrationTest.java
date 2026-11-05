@@ -6,13 +6,13 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.ssm.model.Command;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 @QuarkusTest
+@TestProfile(SsmDirectCommandProfile.class)
 class SsmShellExecutionBudgetIntegrationTest extends SsmCommandIntegrationFixture {
     private static final String ACCOUNT = "222222222222";
     private static final String REGION = "us-west-2";
@@ -39,12 +40,11 @@ class SsmShellExecutionBudgetIntegrationTest extends SsmCommandIntegrationFixtur
             assertEquals(200, response.statusCode());
             String id = response.jsonPath().getString("Command.CommandId");
             assertNotNull(id);
-            Response poll = call("AmazonSSMMessageDeliveryService.GetMessages", mapper.valueToTree(
+            Response poll = call("EC2WindowsMessageDeliveryService.GetMessages", mapper.valueToTree(
                     Map.of("Destination", instance, "MessagesRequestId", "budget")));
             assertEquals(200, poll.statusCode());
             assertEquals(1, poll.jsonPath().getList("Messages").size());
-            JsonNode payload = mapper.readTree(Base64.getDecoder().decode(
-                    poll.jsonPath().getString("Messages[0].Payload")));
+            JsonNode payload = mapper.readTree(poll.jsonPath().getString("Messages[0].Payload"));
             JsonNode command = mapper.readTree(response.asByteArray()).path("Command");
             assertAll("public metadata and delivered document",
                     () -> assertEquals(30, command.path("TimeoutSeconds").asInt()),
@@ -56,7 +56,7 @@ class SsmShellExecutionBudgetIntegrationTest extends SsmCommandIntegrationFixtur
                     () -> {
                         if (supplied != 0) {
                             assertEquals(Integer.toString(supplied),
-                                    payload.at("/Parameters/executionTimeout/0").asText());
+                                    payload.at("/Parameters/executionTimeout").asText());
                         }
                     });
         } finally {

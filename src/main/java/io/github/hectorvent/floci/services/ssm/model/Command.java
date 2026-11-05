@@ -14,6 +14,7 @@ public class Command {
     private String commandId;
     private String documentName;
     private String documentVersion;
+    private String documentContent;
     private String comment;
     private Instant expiresAfter;
     private Map<String, List<String>> parameters;
@@ -25,6 +26,7 @@ public class Command {
     private int targetCount;
     private int completedCount;
     private int errorCount;
+    private int deliveryTimedOutCount;
     private String outputS3BucketName;
     private String outputS3KeyPrefix;
     private String outputS3Region;
@@ -40,6 +42,9 @@ public class Command {
 
     public String getDocumentVersion() { return documentVersion; }
     public void setDocumentVersion(String documentVersion) { this.documentVersion = documentVersion; }
+
+    public String getDocumentContent() { return documentContent; }
+    public void setDocumentContent(String documentContent) { this.documentContent = documentContent; }
 
     public String getComment() { return comment; }
     public void setComment(String comment) { this.comment = comment; }
@@ -73,6 +78,9 @@ public class Command {
 
     public int getErrorCount() { return errorCount; }
     public void setErrorCount(int errorCount) { this.errorCount = errorCount; }
+
+    public int getDeliveryTimedOutCount() { return deliveryTimedOutCount; }
+    public void setDeliveryTimedOutCount(int deliveryTimedOutCount) { this.deliveryTimedOutCount = deliveryTimedOutCount; }
 
     public String getOutputS3BucketName() { return outputS3BucketName; }
     public void setOutputS3BucketName(String outputS3BucketName) { this.outputS3BucketName = outputS3BucketName; }

@@ -3,8 +3,8 @@ package io.github.hectorvent.floci.services.ssm;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
@@ -22,8 +22,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
-import java.util.Iterator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -36,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 /**
  * Handles SSM agent registration and command execution lifecycle:
@@ -62,24 +62,38 @@ public class SsmCommandService implements Resettable {
     private final RegionResolver regionResolver;
     private final SsmDirectCommandExecutor directCommandExecutor;
     private final ExecutorService directExecutionExecutor;
+    private final SsmService documents;
+    private final boolean directCommandExecutionEnabled;
 
     // In-memory queues are owned by the issuing account, region and instance. Lost on restart.
     private final ConcurrentHashMap<MessageOwner, Queue<PendingMessage>> messageQueues = new ConcurrentHashMap<>();
     // Message correlations retain the same owner through every agent operation.
     private final ConcurrentHashMap<String, MessageCorrelation> messageIndex = new ConcurrentHashMap<>();
+    private final Map<MessageOwner, UUID> messageGatewayConnections = new HashMap<>();
 
     @Inject
     public SsmCommandService(
             StorageFactory storageFactory,
             ObjectMapper objectMapper,
             RegionResolver regionResolver,
-            SsmDirectCommandExecutor directCommandExecutor) {
+            SsmDirectCommandExecutor directCommandExecutor,
+            SsmService documents,
+            EmulatorConfig config) {
+        this(storageFactory, objectMapper, regionResolver, directCommandExecutor, documents,
+                config.services().ssm().directCommandExecutionEnabled());
+    }
+
+    SsmCommandService(StorageFactory storageFactory, ObjectMapper objectMapper, RegionResolver regionResolver,
+                      SsmDirectCommandExecutor directCommandExecutor, SsmService documents,
+                      boolean directCommandExecutionEnabled) {
         this.instanceStore = storageFactory.create("ssm", "ssm-instances.json", new TypeReference<>() {});
         this.commandStore = storageFactory.create("ssm", "ssm-commands.json", new TypeReference<>() {});
         this.invocationStore = storageFactory.create("ssm", "ssm-invocations.json", new TypeReference<>() {});
         this.objectMapper = objectMapper;
         this.regionResolver = regionResolver;
         this.directCommandExecutor = directCommandExecutor;
+        this.documents = documents;
+        this.directCommandExecutionEnabled = directCommandExecutionEnabled;
         // Each direct execution blocks for the whole container exec, up to its execution budget, so every
         // target gets its own virtual thread instead of a platform thread.
         this.directExecutionExecutor = Executors.newThreadPerTaskExecutor(
@@ -94,6 +108,9 @@ public class SsmCommandService implements Resettable {
     public void clear() {
         messageQueues.clear();
         messageIndex.clear();
+        synchronized (messageGatewayConnections) {
+            messageGatewayConnections.clear();
+        }
     }
 
     // ── Agent registration ──────────────────────────────────────────────────
@@ -131,7 +148,7 @@ public class SsmCommandService implements Resettable {
         // Registering with SSM does not create an EC2 instance record. Make it obvious when the
         // agent lives in a container Floci did not launch through RunInstances: SendCommand falls
         // back to agent polling and IMDS (169.254.169.254) has nothing to serve for that container.
-        if (firstRegistration && !directCommandExecutor.isContainerBacked(instanceId)) {
+        if (directCommandExecutionEnabled && firstRegistration && !directCommandExecutor.isContainerBacked(instanceId)) {
             LOG.warnv("SSM managed instance {0} is not backed by a running Floci EC2 container. "
                     + "SendCommand will use the agent polling flow and IMDS will not answer for it. "
                     + "To get both, launch the container with EC2 RunInstances before registering its SSM agent.",
@@ -167,16 +184,23 @@ public class SsmCommandService implements Resettable {
             throw SmithyValidationErrors.validationException(
                     "Value at 'instanceIds' failed to satisfy constraint: Member must have length less than or equal to " + MAX_INSTANCE_IDS);
         }
+        if (!directCommandExecutionEnabled) {
+            instanceIds.forEach(instanceId -> requireManagedInstance(instanceId, region));
+        }
 
-        boolean publicShell = "AWS-RunShellScript".equals(documentName);
+        boolean publicShell = "AWS-RunShellScript".equals(documentName)
+                || "AWS-RunPowerShellScript".equals(documentName);
         Map<String, List<String>> parameters = publicShell
                 ? parseShellParameters(request.path("Parameters")) : parseParameters(request.path("Parameters"));
         String comment = request.path("Comment").asText("");
         int timeoutSeconds = SsmJsonDeserialization.optionalInteger(request.path("TimeoutSeconds"), 3600);
         validateTimeoutSeconds(timeoutSeconds);
-        int executionTimeoutSeconds = publicShell ? shellExecutionTimeout(parameters) : timeoutSeconds;
-        int documentTimeoutDefault = publicShell ? DEFAULT_SHELL_EXECUTION_TIMEOUT_SECONDS : timeoutSeconds;
-        String documentVersion = request.path("DocumentVersion").asText("$DEFAULT");
+        SsmCommandDocument selected = SsmCommandDocument.resolve(documents, objectMapper, documentName,
+                request.path("DocumentVersion").asText("$DEFAULT"), region);
+        ObjectNode agentParameters = SsmCommandDocument.parametersForAgent(objectMapper, selected.content(), parameters);
+        int executionTimeoutSeconds = publicShell ? shellExecutionTimeout(parameters)
+                : SsmCommandDocument.executionAllowance(selected.content(), agentParameters);
+        String documentVersion = selected.version();
         String outputS3Bucket = request.path("OutputS3BucketName").asText("");
         String outputS3Prefix = request.path("OutputS3KeyPrefix").asText("");
 
@@ -188,6 +212,7 @@ public class SsmCommandService implements Resettable {
         command.setCommandId(commandId);
         command.setDocumentName(documentName);
         command.setDocumentVersion(documentVersion);
+        command.setDocumentContent(selected.content().toString());
         command.setComment(comment);
         command.setParameters(parameters);
         command.setInstanceIds(new ArrayList<>(instanceIds));
@@ -200,8 +225,7 @@ public class SsmCommandService implements Resettable {
         command.setOutputS3KeyPrefix(outputS3Prefix.isEmpty() ? null : outputS3Prefix);
         command.setOutputS3Region(region);
         command.setRegion(region);
-        command.setExpiresAfter(now.plusSeconds((long) timeoutSeconds
-                + (publicShell ? executionTimeoutSeconds : 0)));
+        command.setExpiresAfter(now.plusSeconds((long) timeoutSeconds + executionTimeoutSeconds));
 
         command.setStatus("InProgress");
         command.setStatusDetails(statusDetails("InProgress"));
@@ -219,9 +243,12 @@ public class SsmCommandService implements Resettable {
             inv.setStatus("Pending");
             inv.setStatusDetails(statusDetails("Pending"));
             inv.setRegion(region);
+            initializePlugins(inv, selected.content());
 
             String callerAccountId = regionResolver != null ? regionResolver.getAccountId() : null;
-            if (directCommandExecutor.supports(callerAccountId, instanceId, documentName)) {
+            if (directCommandExecutionEnabled
+                    && directCommandExecutor.supports(callerAccountId, instanceId, documentName)) {
+                inv.setDirectExecution(true);
                 inv.setStatus("InProgress");
                 inv.setStatusDetails(statusDetails("InProgress"));
                 invocationStore.put(invocationKey(region, commandId, instanceId), inv);
@@ -229,7 +256,7 @@ public class SsmCommandService implements Resettable {
             }
             else {
                 invocationStore.put(invocationKey(region, commandId, instanceId), inv);
-                queueMessage(commandId, instanceId, documentName, parameters, documentTimeoutDefault, region);
+                queueMessage(commandId, instanceId, region);
             }
         }
 
@@ -243,7 +270,6 @@ public class SsmCommandService implements Resettable {
                     directExecutionRequest.documentName(),
                     directExecutionRequest.parameters(),
                     executionTimeoutSeconds,
-                    documentTimeoutDefault,
                     region);
         }
         return response;
@@ -294,7 +320,7 @@ public class SsmCommandService implements Resettable {
 
     private static AwsException invalidShellParameters() {
         return new AwsException("InvalidParameters",
-                "AWS-RunShellScript requires at least one command and string-list parameters; "
+                "Shell documents require at least one command and string-list parameters; "
                         + "executionTimeout must contain one integer from 1 to 172800.", 400);
     }
 
@@ -310,12 +336,15 @@ public class SsmCommandService implements Resettable {
     }
 
     public CommandInvocation getCommandInvocation(String commandId, String instanceId, String region) {
-        return invocationStore.get(invocationKey(region, commandId, instanceId))
+        CommandInvocation invocation = invocationStore.get(invocationKey(region, commandId, instanceId))
                 .orElseThrow(() -> new AwsException("InvocationDoesNotExist",
                         "Command " + commandId + " on instance " + instanceId + " does not exist.", 400));
+        expireDelivery(invocation, region);
+        return invocation;
     }
 
     public List<Command> listCommands(String commandId, String instanceId, String region) {
+        listCommandInvocations(commandId, instanceId, region);
         String prefix = region + "::";
         return commandStore.scan(k -> {
             if (!k.startsWith(prefix)) return false;
@@ -330,12 +359,14 @@ public class SsmCommandService implements Resettable {
 
     public List<CommandInvocation> listCommandInvocations(String commandId, String instanceId, String region) {
         String prefix = region + "::";
-        return invocationStore.scan(k -> {
+        List<CommandInvocation> invocations = invocationStore.scan(k -> {
             if (!k.startsWith(prefix)) return false;
             if (commandId != null && !k.contains("::" + commandId + "::")) return false;
             if (instanceId != null && !k.endsWith("::" + instanceId)) return false;
             return true;
         });
+        invocations.forEach(invocation -> expireDelivery(invocation, region));
+        return invocations;
     }
 
     public void cancelCommand(String commandId, List<String> targetInstanceIds, String region) {
@@ -350,32 +381,33 @@ public class SsmCommandService implements Resettable {
         for (String instanceId : targets) {
             String invKey = invocationKey(region, commandId, instanceId);
             invocationStore.get(invKey).ifPresent(inv -> {
-                // Same lock discipline as the command-level fields: invocationStore returns the same
-                // shared CommandInvocation object on every get(), and multiple methods here (direct
-                // completion, agent SendReply/FailMessage, timeout sweeps) can race this cancellation
-                // on the same instance's invocation.
                 synchronized (inv) {
                     if ("Pending".equals(inv.getStatus()) || "InProgress".equals(inv.getStatus())) {
-                        inv.setStatus("Cancelled");
-                        inv.setStatusDetails("Cancelled");
+                        boolean delivered = inv.getDeliveryAttemptTime() != null || "InProgress".equals(inv.getStatus());
+                        String status = delivered && !inv.isDirectExecution() ? "Cancelling" : "Cancelled";
+                        inv.setStatus(status);
+                        inv.setStatusDetails(status);
+                        if ("Cancelling".equals(status)) {
+                            inv.setCancellationJobId(agentJobId(UUID.randomUUID().toString(), instanceId));
+                        } else {
+                            inv.setExecutionEndDateTime(Instant.now());
+                            terminateActivePlugins(inv, status, status);
+                        }
                         invocationStore.put(invKey, inv);
                     }
-                }
-                // Remove any queued (not-yet-polled) messages for this instance
-                Queue<PendingMessage> q = messageQueues.get(messageOwner(region, instanceId));
-                if (q != null) {
-                    q.removeIf(m -> m.commandId().equals(commandId));
+                    Queue<PendingMessage> queue = messageQueues.get(messageOwner(region, instanceId));
+                    if (queue != null) {
+                        queue.removeIf(message -> message.commandId().equals(commandId));
+                    }
+                    if ("Cancelling".equals(inv.getStatus()) && !inv.isCancellationAcknowledged()) {
+                        messageQueues.computeIfAbsent(messageOwner(region, instanceId), key -> new ConcurrentLinkedQueue<>())
+                                .add(new PendingMessage(inv.getCancellationJobId(), commandId, region, Instant.now()));
+                    }
                 }
             });
         }
 
-        // Same lock updateCommandStatus takes on this exact object, so a rollup completing this
-        // command concurrently can't have its own status+statusDetails write interleave with this one.
-        synchronized (command) {
-            command.setStatus("Cancelled");
-            command.setStatusDetails("Cancelled");
-            commandStore.put(commandKey(region, commandId), command);
-        }
+        updateCommandStatus(commandId, region);
         LOG.infov("CancelCommand: commandId={0}", commandId);
     }
 
@@ -396,14 +428,15 @@ public class SsmCommandService implements Resettable {
             if (!instanceIds.contains(invocation.getInstanceId())) {
                 continue;
             }
-            if (!isActiveInvocation(invocation.getStatus())) {
-                continue;
-            }
             synchronized (invocation) {
+                if (!isActiveInvocation(invocation.getStatus())) {
+                    continue;
+                }
                 invocation.setStatus("Failed");
                 invocation.setStatusDetails(statusDetails);
                 invocation.setResponseCode(-1);
                 invocation.setExecutionEndDateTime(now);
+                terminateActivePlugins(invocation, "Failed", statusDetails);
                 invocationStore.put(invocationKey(region, invocation.getCommandId(), invocation.getInstanceId()), invocation);
             }
             commandIds.add(invocation.getCommandId());
@@ -427,121 +460,266 @@ public class SsmCommandService implements Resettable {
 
     // ── ec2messages agent protocol ──────────────────────────────────────────
 
+    void messageGatewayOpened(String instanceId, String region, UUID connection) {
+        synchronized (messageGatewayConnections) {
+            messageGatewayConnections.put(messageOwner(region, instanceId), connection);
+        }
+    }
+
+    void messageGatewayClosed(String instanceId, String region, UUID connection) {
+        synchronized (messageGatewayConnections) {
+            messageGatewayConnections.remove(messageOwner(region, instanceId), connection);
+        }
+    }
+
     public List<Map<String, Object>> getMessages(String instanceId, String messagesRequestId, int visibilityTimeout) {
         MessageOwner owner = messageOwner(regionResolver.getRegion(), instanceId);
-        Queue<PendingMessage> queue = messageQueues.get(owner);
         List<Map<String, Object>> result = new ArrayList<>();
-        if (queue == null || queue.isEmpty()) {
-            return result;
+        synchronized (messageGatewayConnections) {
+            // An agent can keep a legacy poll alive during its gateway handoff. Keep that poll
+            // from consuming work assigned to an authenticated gateway connection.
+            Queue<PendingMessage> queue = messageQueues.get(owner);
+            if (messageGatewayConnections.containsKey(owner) || queue == null || queue.isEmpty()) {
+                return result;
+            }
+            PendingMessage msg = queue.poll();
+            if (msg == null) {
+                return result;
+            }
+
+            deliverAgentCommand(instanceId, msg.messageId(), msg.region(), current -> {
+                messageIndex.put(msg.messageId(), new MessageCorrelation(owner, msg.commandId()));
+                result.add(Map.of("MessageId", msg.messageId(), "Destination", instanceId,
+                        "CreatedDate", msg.createdDate().toString(),
+                        "Topic", current.topic() + "." + msg.region(), "Payload", current.content()));
+            });
+
+            if (!result.isEmpty()) {
+                LOG.infov("GetMessages: instanceId={0} returned messageId={1}", instanceId, msg.messageId());
+            }
         }
-
-        PendingMessage msg = queue.poll();
-        if (msg == null) {
-            return result;
-        }
-
-        // Track for AcknowledgeMessage / SendReply correlation
-        messageIndex.put(msg.messageId(), new MessageCorrelation(owner, msg.commandId()));
-
-        result.add(Map.of(
-                "MessageId", msg.messageId(),
-                "Destination", instanceId,
-                "CreatedDate", msg.createdDate().toString(),
-                "Topic", "aws.ssm.sendCommand." + msg.region(),
-                "Payload", msg.payload()
-        ));
-
-        LOG.infov("GetMessages: instanceId={0} returned messageId={1}", instanceId, msg.messageId());
         return result;
     }
 
     public void acknowledgeMessage(String messageId) {
-        // Message was already removed from queue on GetMessages. Just update invocation to InProgress.
         MessageCorrelation meta = ownedCorrelation(messageId, false);
         if (meta == null) {
             return;
         }
-        String commandId = meta.commandId();
-        String instanceId = meta.owner().instanceId();
-        String region = meta.owner().region();
-
-        String invKey = invocationKey(region, commandId, instanceId);
-        invocationStore.get(invKey).ifPresent(inv -> {
-            synchronized (inv) {
-                if ("Pending".equals(inv.getStatus())) {
-                    inv.setStatus("InProgress");
-                    inv.setStatusDetails(statusDetails("InProgress"));
-                    inv.setExecutionStartDateTime(Instant.now());
-                    invocationStore.put(invKey, inv);
-                }
-            }
-        });
-        LOG.debugv("AcknowledgeMessage: messageId={0} commandId={1}", messageId, commandId);
+        acknowledgeAgentCommand(meta.owner().instanceId(), messageId, meta.owner().region());
+        LOG.debugv("AcknowledgeMessage: messageId={0} commandId={1}", messageId, meta.commandId());
     }
 
-    public void sendReply(String messageId, String payloadBase64) {
-        MessageCorrelation meta = ownedCorrelation(messageId, true);
+    public void sendReply(String messageId, String payloadJson) {
+        MessageCorrelation meta = ownedCorrelation(messageId, false);
         if (meta == null) {
             LOG.warnv("SendReply: unknown messageId={0}", messageId);
             return;
         }
-        String commandId = meta.commandId();
-        String instanceId = meta.owner().instanceId();
-        String region = meta.owner().region();
-
         try {
-            byte[] decoded = Base64.getDecoder().decode(payloadBase64);
-            JsonNode payload = objectMapper.readTree(decoded);
-
-            String status = "Success";
-            int returnCode = 0;
-            String stdout = "";
-            String stderr = "";
-            Instant endTime = Instant.now();
-
-            // Parse runtimeStatus or pluginResults — take the first plugin entry found
-            JsonNode statusNode = payload.has("runtimeStatus") ? payload.get("runtimeStatus")
-                    : payload.get("pluginResults");
-            if (statusNode != null && statusNode.isObject()) {
-                Iterator<Map.Entry<String, JsonNode>> it = statusNode.fields();
-                if (it.hasNext()) {
-                    JsonNode plugin = it.next().getValue();
-                    status = plugin.path("status").asText("Success");
-                    returnCode = plugin.path("returnCode").asInt(plugin.path("code").asInt(0));
-                    stdout = plugin.path("standardOutput").asText(plugin.path("output").asText(""));
-                    stderr = plugin.path("standardError").asText("");
-                }
-            }
-
-            // Trim output to AWS limits
-            if (stdout.length() > MAX_STDOUT_CHARS) {
-                stdout = truncateOutput(stdout, MAX_STDOUT_CHARS);
-            }
-            if (stderr.length() > MAX_STDERR_CHARS) {
-                stderr = truncateOutput(stderr, MAX_STDERR_CHARS);
-            }
-
-            String invKey = invocationKey(region, commandId, instanceId);
-            CommandInvocation inv = invocationStore.get(invKey).orElse(null);
-            if (inv != null) {
-                synchronized (inv) {
-                    inv.setStatus(toInvocationStatus(status));
-                    inv.setStatusDetails(statusDetails(toInvocationStatus(status)));
-                    inv.setStandardOutputContent(stdout);
-                    inv.setStandardErrorContent(stderr);
-                    inv.setResponseCode(returnCode);
-                    inv.setExecutionEndDateTime(endTime);
-                    invocationStore.put(invKey, inv);
-                }
-            }
-
-            // Recalculate command status
-            updateCommandStatus(commandId, region);
-            LOG.infov("SendReply: commandId={0} instanceId={1} status={2} rc={3}", commandId, instanceId, status, returnCode);
+            agentReply(meta.owner().instanceId(), messageId, objectMapper.readTree(payloadJson), meta.owner().region());
         } catch (Exception e) {
             LOG.warnv(e, "Failed to parse SendReply payload for messageId={0}", messageId);
+            throw new AwsException("InvalidMessage", "The command reply is invalid.", 400);
         }
     }
+
+    /** Pending commands are recovered from account-aware storage when a channel reconnects. */
+    List<AgentCommand> pendingAgentCommands(String instanceId, String region) {
+        List<AgentCommand> pending = new ArrayList<>();
+        for (CommandInvocation invocation : listCommandInvocations(null, instanceId, region)) {
+            synchronized (invocation) {
+                Command command = commandStore.get(commandKey(region, invocation.getCommandId())).orElse(null);
+                if (command != null) {
+                    AgentCommand job = pendingAgentCommand(invocation, command);
+                    if (job != null) {
+                        pending.add(job);
+                    }
+                }
+            }
+        }
+        return pending;
+    }
+
+    private AgentCommand pendingAgentCommand(CommandInvocation invocation, Command command) {
+        if ("Pending".equals(invocation.getStatus())) {
+            return new AgentCommand(agentJobId(command.getCommandId(), invocation.getInstanceId()),
+                    commandPayload(command), "aws.ssm.sendCommand");
+        }
+        if ("Cancelling".equals(invocation.getStatus()) && !invocation.isCancellationAcknowledged()) {
+            return new AgentCommand(invocation.getCancellationJobId(), objectMapper.createObjectNode()
+                    .put("CancelMessageId", agentJobId(command.getCommandId(), invocation.getInstanceId())).toString(),
+                    "aws.ssm.cancelCommand");
+        }
+        return null;
+    }
+
+    /** Recheck the persisted state under the cancellation lock before accepting a wire delivery. */
+    boolean deliverAgentCommand(String instanceId, String jobId, String region, Consumer<AgentCommand> deliver) {
+        CommandInvocation invocation = agentInvocation(instanceId, jobId, region);
+        synchronized (invocation) {
+            Command command = commandStore.get(commandKey(region, invocation.getCommandId())).orElse(null);
+            AgentCommand current = command == null ? null : pendingAgentCommand(invocation, command);
+            if (current == null || !current.jobId().equals(jobId)) {
+                return false;
+            }
+            if (invocation.getDeliveryAttemptTime() == null && "aws.ssm.sendCommand".equals(current.topic())) {
+                invocation.setDeliveryAttemptTime(Instant.now());
+                invocationStore.put(invocationKey(region, invocation.getCommandId(), instanceId), invocation);
+            }
+            deliver.accept(current);
+            return true;
+        }
+    }
+
+    void acknowledgeAgentCommand(String instanceId, String jobId, String region) {
+        CommandInvocation invocation = agentInvocation(instanceId, jobId, region);
+        synchronized (invocation) {
+            if (jobId.equals(invocation.getCancellationJobId())) {
+                invocation.setCancellationAcknowledged(true);
+                invocationStore.put(invocationKey(region, invocation.getCommandId(), instanceId), invocation);
+            } else if ("Pending".equals(invocation.getStatus())) {
+                invocation.setStatus("InProgress");
+                invocation.setStatusDetails(statusDetails("InProgress"));
+                invocation.setExecutionStartDateTime(Instant.now());
+                invocationStore.put(invocationKey(region, invocation.getCommandId(), instanceId), invocation);
+            }
+        }
+        Queue<PendingMessage> queue = messageQueues.get(messageOwner(region, instanceId));
+        if (queue != null) {
+            queue.removeIf(message -> message.messageId().equals(jobId));
+        }
+        updateCommandStatus(invocation.getCommandId(), region);
+    }
+
+    void agentReply(String instanceId, String jobId, JsonNode reply, String region) {
+        CommandInvocation invocation = agentInvocation(instanceId, jobId, region);
+        if (reply == null || !reply.isObject()) {
+            throw new AwsException("InvalidMessage", "Invalid command reply.", 400);
+        }
+        String documentStatus = reply.path("documentStatus").asText("");
+        if (!Set.of("", "Pending", "InProgress", "Success", "Failed", "TimedOut",
+                "Cancelled", "Canceled", "SuccessAndReboot", "PassedAndReboot").contains(documentStatus)) {
+            throw new AwsException("InvalidMessage", "Invalid command document status.", 400);
+        }
+        synchronized (invocation) {
+            boolean finished = !isActiveInvocation(invocation.getStatus());
+            if (finished && !invocation.isAgentTerminalResponse()) {
+                return;
+            }
+            if (jobId.equals(invocation.getCancellationJobId())) {
+                invocation.setCancellationAcknowledged(true);
+                invocationStore.put(invocationKey(region, invocation.getCommandId(), instanceId), invocation);
+                return;
+            }
+            JsonNode runtime = reply.get("runtimeStatus");
+            if (runtime != null && !runtime.isNull()) {
+                if (!runtime.isObject()) {
+                    throw new AwsException("InvalidMessage", "Invalid command plugin results.", 400);
+                }
+                for (Map.Entry<String, JsonNode> entry : runtime.properties()) {
+                    if (!invocation.getPluginResults().containsKey(entry.getKey()) || !entry.getValue().isObject()) {
+                        throw new AwsException("InvalidMessage", "The reply names an unknown command plugin.", 400);
+                    }
+                }
+                runtime.properties().forEach(entry -> {
+                    JsonNode previous = invocation.getPluginResults().get(entry.getKey());
+                    if (isActiveInvocation(toInvocationStatus(previous.path("status").asText("Pending")))) {
+                        invocation.getPluginResults().put(entry.getKey(), entry.getValue().deepCopy());
+                    }
+                });
+            }
+            String status = finished ? invocation.getStatus()
+                    : documentStatus.isEmpty() ? "InProgress" : toInvocationStatus(documentStatus);
+            if ("Cancelling".equals(invocation.getStatus()) && isActiveInvocation(status)) {
+                status = "Cancelling";
+            }
+            invocation.setStatus(status);
+            invocation.setStatusDetails(statusDetails(status));
+            if (invocation.getExecutionStartDateTime() == null) {
+                invocation.setExecutionStartDateTime(Instant.now());
+            }
+            if (!invocation.getPluginResults().isEmpty()) {
+                JsonNode plugin = invocation.getPluginResults().values().iterator().next();
+                invocation.setStandardOutputContent(truncateOutput(
+                        plugin.path("standardOutput").asText(plugin.path("output").asText("")), MAX_STDOUT_CHARS));
+                invocation.setStandardErrorContent(truncateOutput(
+                        plugin.path("standardError").asText(""), MAX_STDERR_CHARS));
+                invocation.setResponseCode(plugin.path("code").asInt(plugin.path("returnCode").asInt(-1)));
+            }
+            if (!finished && !isActiveInvocation(status)) {
+                invocation.setExecutionEndDateTime(Instant.now());
+                invocation.setAgentTerminalResponse(true);
+            }
+            invocationStore.put(invocationKey(region, invocation.getCommandId(), instanceId), invocation);
+        }
+        updateCommandStatus(invocation.getCommandId(), region);
+    }
+
+    private CommandInvocation agentInvocation(String instanceId, String jobId, String region) {
+        String prefix = "aws.ssm.";
+        String suffix = "." + instanceId;
+        if (jobId == null || !jobId.startsWith(prefix) || !jobId.endsWith(suffix)
+                || jobId.length() != prefix.length() + 36 + suffix.length()) {
+            throw new AwsException("InvalidMessage", "The command job does not belong to this node.", 400);
+        }
+        String commandId = jobId.substring(prefix.length(), jobId.length() - suffix.length());
+        try {
+            UUID.fromString(commandId);
+        } catch (IllegalArgumentException invalid) {
+            throw new AwsException("InvalidMessage", "The command job identifier is invalid.", 400);
+        }
+        CommandInvocation invocation = invocationStore.get(invocationKey(region, commandId, instanceId))
+                .orElseGet(() -> invocationStore.scan(key -> key.startsWith(region + "::")
+                                && key.endsWith("::" + instanceId)).stream()
+                        .filter(candidate -> jobId.equals(candidate.getCancellationJobId())).findFirst()
+                        .orElseThrow(() -> new AwsException("InvocationDoesNotExist",
+                                "The command job does not belong to this node.", 400)));
+        expireDelivery(invocation, region);
+        return invocation;
+    }
+
+    private void expireDelivery(CommandInvocation invocation, String region) {
+        boolean expired = false;
+        synchronized (invocation) {
+            Command command = commandStore.get(commandKey(region, invocation.getCommandId())).orElse(null);
+            if (!invocation.isDirectExecution() && isActiveInvocation(invocation.getStatus())
+                    && command != null && command.getExpiresAfter() != null
+                    && !Instant.now().isBefore(command.getExpiresAfter())) {
+                invocation.setStatus("TimedOut");
+                invocation.setStatusDetails("Delivery Timed Out");
+                invocation.setExecutionEndDateTime(Instant.now());
+                terminateActivePlugins(invocation, "TimedOut", "Delivery Timed Out");
+                invocationStore.put(invocationKey(region, invocation.getCommandId(), invocation.getInstanceId()), invocation);
+                expired = true;
+            }
+        }
+        if (expired) {
+            updateCommandStatus(invocation.getCommandId(), region);
+        }
+    }
+
+    private void initializePlugins(CommandInvocation invocation, JsonNode document) {
+        Map<String, JsonNode> plugins = new LinkedHashMap<>();
+        for (JsonNode step : document.path("mainSteps")) {
+            plugins.put(step.path("name").asText(), objectMapper.createObjectNode().put("status", "Pending").put("code", -1));
+        }
+        document.path("runtimeConfig").fieldNames().forEachRemaining(name ->
+                plugins.put(name, objectMapper.createObjectNode().put("status", "Pending").put("code", -1)));
+        invocation.setPluginResults(plugins);
+    }
+
+    private void terminateActivePlugins(CommandInvocation invocation, String status, String details) {
+        invocation.getPluginResults().replaceAll((name, plugin) -> {
+            if (!isActiveInvocation(toInvocationStatus(plugin.path("status").asText("Pending")))) {
+                return plugin;
+            }
+            ObjectNode result = (ObjectNode) plugin.deepCopy();
+            return result.put("status", status).put("statusDetails", details).put("code", -1);
+        });
+    }
+
+    record AgentCommand(String jobId, String content, String topic) {}
 
     public void failMessage(String messageId, String failureType) {
         MessageCorrelation meta = ownedCorrelation(messageId, true);
@@ -555,9 +733,13 @@ public class SsmCommandService implements Resettable {
         String invKey = invocationKey(region, commandId, instanceId);
         invocationStore.get(invKey).ifPresent(inv -> {
             synchronized (inv) {
+                if (!isActiveInvocation(inv.getStatus())) {
+                    return;
+                }
                 inv.setStatus("Failed");
                 inv.setStatusDetails("Failed: " + failureType);
                 inv.setExecutionEndDateTime(Instant.now());
+                terminateActivePlugins(inv, "Failed", inv.getStatusDetails());
                 invocationStore.put(invKey, inv);
             }
         });
@@ -593,12 +775,19 @@ public class SsmCommandService implements Resettable {
                                         int timeoutSeconds, String region) {
         String commandId = UUID.randomUUID().toString();
         Instant now = Instant.now();
+        SsmCommandDocument selected = SsmCommandDocument.resolve(
+                documents, objectMapper, documentName, "$DEFAULT", region);
+        Map<String, List<String>> effectiveParameters = new LinkedHashMap<>(parameters);
+        if ("AWS-RunShellScript".equals(documentName)) {
+            effectiveParameters.putIfAbsent("executionTimeout", List.of(Integer.toString(timeoutSeconds)));
+        }
 
         Command command = new Command();
         command.setCommandId(commandId);
         command.setDocumentName(documentName);
-        command.setDocumentVersion("$DEFAULT");
-        command.setParameters(parameters);
+        command.setDocumentVersion(selected.version());
+        command.setDocumentContent(selected.content().toString());
+        command.setParameters(effectiveParameters);
         command.setInstanceIds(List.of(instanceId));
         command.setRequestedDateTime(now);
         command.setStatus("InProgress");
@@ -613,20 +802,24 @@ public class SsmCommandService implements Resettable {
         inv.setCommandId(commandId);
         inv.setInstanceId(instanceId);
         inv.setDocumentName(documentName);
-        inv.setDocumentVersion("$DEFAULT");
+        inv.setDocumentVersion(selected.version());
         inv.setRequestedDateTime(now);
         inv.setStatus("Pending");
         inv.setStatusDetails(statusDetails("Pending"));
         inv.setRegion(region);
+        initializePlugins(inv, selected.content());
         invocationStore.put(invocationKey(region, commandId, instanceId), inv);
 
-        queueMessage(commandId, instanceId, documentName, parameters, timeoutSeconds, region);
+        queueMessage(commandId, instanceId, region);
         return commandId;
     }
 
     public String getCommandInvocationStatus(String commandId, String instanceId, String region) {
         return invocationStore.get(invocationKey(region, commandId, instanceId))
-                .map(CommandInvocation::getStatus)
+                .map(invocation -> {
+                    expireDelivery(invocation, region);
+                    return invocation.getStatus();
+                })
                 .orElse("Failed");
     }
 
@@ -639,7 +832,6 @@ public class SsmCommandService implements Resettable {
             String documentName,
             Map<String, List<String>> parameters,
             int timeoutSeconds,
-            int documentTimeoutDefault,
             String region) {
         CompletableFuture.runAsync(() -> RequestScopes.runAs(accountId, region, () -> {
             String invKey = invocationKey(region, commandId, instanceId);
@@ -658,9 +850,10 @@ public class SsmCommandService implements Resettable {
                     }
                     invocation.setStatus("Pending");
                     invocation.setStatusDetails(statusDetails("Pending"));
+                    invocation.setDirectExecution(false);
                     invocationStore.put(invKey, invocation);
                 }
-                queueMessage(commandId, instanceId, documentName, parameters, documentTimeoutDefault, region);
+                queueMessage(commandId, instanceId, region);
                 updateCommandStatus(commandId, region);
                 return;
             }
@@ -685,7 +878,7 @@ public class SsmCommandService implements Resettable {
         invocation.setExecutionEndDateTime(result.executionEndDateTime());
     }
 
-    private static String truncateOutput(String output, int maxChars) {
+    static String truncateOutput(String output, int maxChars) {
         if (output == null) {
             return "";
         }
@@ -695,92 +888,39 @@ public class SsmCommandService implements Resettable {
         return output.substring(0, maxChars);
     }
 
-    private void queueMessage(String commandId, String instanceId, String documentName,
-                              Map<String, List<String>> parameters, int timeoutSeconds, String region) {
-        String messageId = UUID.randomUUID().toString();
-        String payload = buildCommandPayload(commandId, documentName, documentVersion(parameters), parameters, timeoutSeconds, region);
-        PendingMessage msg = new PendingMessage(messageId, commandId, region, Instant.now(), payload);
+    private void queueMessage(String commandId, String instanceId, String region) {
+        String messageId = agentJobId(commandId, instanceId);
+        PendingMessage msg = new PendingMessage(messageId, commandId, region, Instant.now());
         messageQueues.computeIfAbsent(messageOwner(region, instanceId), k -> new ConcurrentLinkedQueue<>()).add(msg);
     }
 
-    private String buildCommandPayload(String commandId, String documentName, String docVersion,
-                                       Map<String, List<String>> parameters, int timeoutSeconds, String region) {
+    private String commandPayload(Command command) {
         try {
             ObjectNode payload = objectMapper.createObjectNode();
-            payload.put("DocumentName", documentName);
-            payload.put("DocumentVersion", docVersion);
-            payload.put("CommandId", commandId);
-            payload.put("OutputS3BucketName", "");
-            payload.put("OutputS3KeyPrefix", "");
-            payload.put("OutputS3Region", region);
+            payload.put("DocumentName", command.getDocumentName());
+            payload.put("DocumentVersion", command.getDocumentVersion());
+            payload.put("CommandId", command.getCommandId());
+            payload.put("OutputS3BucketName", command.getOutputS3BucketName() == null ? "" : command.getOutputS3BucketName());
+            payload.put("OutputS3KeyPrefix", command.getOutputS3KeyPrefix() == null ? "" : command.getOutputS3KeyPrefix());
+            payload.put("OutputS3Region", command.getRegion());
             payload.put("CloudWatchLogGroupName", "");
-            payload.put("CloudWatchLogStreamName", "");
+            payload.put("CloudWatchOutputEnabled", "false");
 
-            ObjectNode params = objectMapper.createObjectNode();
-            if (parameters != null) {
-                for (Map.Entry<String, List<String>> e : parameters.entrySet()) {
-                    ArrayNode arr = objectMapper.createArrayNode();
-                    e.getValue().forEach(arr::add);
-                    params.set(e.getKey(), arr);
-                }
+            if (command.getDocumentContent() == null) {
+                throw new AwsException("InvalidDocument", "The command has no captured document content.", 400);
             }
-            payload.set("Parameters", params);
-            payload.set("DocumentContent", buildDocumentContent(documentName, parameters, timeoutSeconds));
+            JsonNode document = objectMapper.readTree(command.getDocumentContent());
+            payload.set("Parameters", SsmCommandDocument.parametersForAgent(objectMapper, document, command.getParameters()));
+            payload.set("DocumentContent", document);
 
-            return Base64.getEncoder().encodeToString(objectMapper.writeValueAsBytes(payload));
+            return objectMapper.writeValueAsString(payload);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to build command payload", e);
+            throw new IllegalStateException("Failed to read the command's captured document.", e);
         }
     }
 
-    private JsonNode buildDocumentContent(String documentName, Map<String, List<String>> parameters, int timeoutSeconds) {
-        ObjectNode doc = objectMapper.createObjectNode();
-        doc.put("schemaVersion", "2.2");
-        doc.put("description", documentName);
-
-        ObjectNode docParams = objectMapper.createObjectNode();
-        ObjectNode commandsParam = objectMapper.createObjectNode();
-        commandsParam.put("type", "StringList");
-        commandsParam.put("description", "Commands to run.");
-        docParams.set("commands", commandsParam);
-
-        ObjectNode wdParam = objectMapper.createObjectNode();
-        wdParam.put("type", "String");
-        wdParam.put("default", "");
-        wdParam.put("description", "Working directory.");
-        docParams.set("workingDirectory", wdParam);
-
-        ObjectNode toParam = objectMapper.createObjectNode();
-        toParam.put("type", "String");
-        toParam.put("default", String.valueOf(timeoutSeconds));
-        toParam.put("description", "Execution timeout in seconds.");
-        docParams.set("executionTimeout", toParam);
-        doc.set("parameters", docParams);
-
-        ArrayNode mainSteps = objectMapper.createArrayNode();
-        ObjectNode step = objectMapper.createObjectNode();
-        step.put("action", resolveAction(documentName));
-        step.put("name", "runShellScript");
-        ObjectNode inputs = objectMapper.createObjectNode();
-        inputs.put("runCommand", "{{ commands }}");
-        inputs.put("workingDirectory", "{{ workingDirectory }}");
-        inputs.put("timeoutSeconds", "{{ executionTimeout }}");
-        step.set("inputs", inputs);
-        mainSteps.add(step);
-        doc.set("mainSteps", mainSteps);
-
-        return doc;
-    }
-
-    private String resolveAction(String documentName) {
-        return switch (documentName) {
-            case "AWS-RunPowerShellScript" -> "aws:runPowerShellScript";
-            default -> "aws:runShellScript";
-        };
-    }
-
-    private String documentVersion(Map<String, List<String>> parameters) {
-        return "$DEFAULT";
+    static String agentJobId(String commandId, String instanceId) {
+        return "aws.ssm." + commandId + "." + instanceId;
     }
 
     private void updateCommandStatus(String commandId, String region) {
@@ -789,51 +929,57 @@ public class SsmCommandService implements Resettable {
             return;
         }
 
-        List<String> instanceIds = command.getInstanceIds();
-        int completed = 0;
-        int errors = 0;
-        int timedOut = 0;
-        boolean anyInProgress = false;
-
-        for (String iid : instanceIds) {
-            CommandInvocation inv = invocationStore.get(invocationKey(region, commandId, iid)).orElse(null);
-            if (inv == null) continue;
-            String s = inv.getStatus();
-            if ("Success".equals(s)) {
-                completed++;
-            } else if ("Failed".equals(s) || "TimedOut".equals(s) || "Cancelled".equals(s)) {
-                completed++;
-                errors++;
-                if ("TimedOut".equals(s)) {
-                    timedOut++;
-                }
-            } else if ("InProgress".equals(s) || "Pending".equals(s)) {
-                anyInProgress = true;
-            }
-        }
-
-        // Synchronized on the shared Command object itself (commandStore's get() always returns the
-        // same instance for a given key, not a defensive copy) so this status+statusDetails write
-        // can't interleave with cancelCommand's own status+statusDetails write on the same object -
-        // without this, cancelCommand's whole pair could land inside the gap between this method's
-        // two field writes, leaving status=Cancelled but statusDetails reflecting this call's stale
-        // completion status (or the reverse), even though each method's own two fields individually
-        // agree with each other when read right after being written.
         synchronized (command) {
+            List<String> instanceIds = command.getInstanceIds();
+            int completed = 0;
+            int errors = 0;
+            int executionTimedOut = 0;
+            int deliveryTimedOut = 0;
+            int cancelled = 0;
+            boolean anyInProgress = false;
+            boolean anyCancelling = false;
+            for (String instanceId : instanceIds) {
+                CommandInvocation invocation = invocationStore.get(invocationKey(region, commandId, instanceId)).orElse(null);
+                if (invocation == null) {
+                    continue;
+                }
+                synchronized (invocation) {
+                    String status = invocation.getStatus();
+                    if (!isActiveInvocation(status)) {
+                        completed++;
+                    }
+                    if ("Cancelled".equals(status)) {
+                        cancelled++;
+                    } else if ("Failed".equals(status)) {
+                        errors++;
+                    } else if ("TimedOut".equals(status)) {
+                        if ("Delivery Timed Out".equals(invocation.getStatusDetails())) {
+                            deliveryTimedOut++;
+                        } else {
+                            executionTimedOut++;
+                            errors++;
+                        }
+                    }
+                    anyCancelling |= "Cancelling".equals(status);
+                    anyInProgress |= "InProgress".equals(status) || invocation.getDeliveryAttemptTime() != null;
+                }
+            }
+            String status;
+            String details;
+            if (completed == instanceIds.size()) {
+                status = cancelled == instanceIds.size() ? "Cancelled"
+                        : deliveryTimedOut == instanceIds.size() ? "TimedOut"
+                        : commandStatus(errors, executionTimedOut, instanceIds.size());
+                details = deliveryTimedOut == instanceIds.size() ? "Delivery Timed Out" : statusDetails(status);
+            } else {
+                status = anyCancelling ? "Cancelling" : anyInProgress ? "InProgress" : "Pending";
+                details = statusDetails(status);
+            }
             command.setCompletedCount(completed);
             command.setErrorCount(errors);
-
-            if (!anyInProgress && completed == instanceIds.size()) {
-                // Use the local status, not a re-read of command.getStatus(): re-reading it here left
-                // a second, narrower window where a concurrent updateCommandStatus call for the same
-                // command (e.g. another instance's async completion racing this one) could mutate the
-                // shared object in between, so this call's own statusDetails ended up reflecting a
-                // DIFFERENT call's status than the one it had just written to status itself.
-                String status = commandStatus(errors, timedOut, instanceIds.size());
-                command.setStatus(status);
-                command.setStatusDetails(statusDetails(status));
-            }
-
+            command.setDeliveryTimedOutCount(deliveryTimedOut);
+            command.setStatus(status);
+            command.setStatusDetails(details);
             commandStore.put(commandKey(region, commandId), command);
         }
     }
@@ -851,8 +997,10 @@ public class SsmCommandService implements Resettable {
         return "Success";
     }
 
-    private static String toInvocationStatus(String agentStatus) {
+    static String toInvocationStatus(String agentStatus) {
         return switch (agentStatus) {
+            case "Pending" -> "Pending";
+            case "InProgress", "SuccessAndReboot", "PassedAndReboot" -> "InProgress";
             case "Success" -> "Success";
             case "Failed" -> "Failed";
             case "TimedOut" -> "TimedOut";
@@ -862,10 +1010,10 @@ public class SsmCommandService implements Resettable {
     }
 
     private static boolean isActiveInvocation(String status) {
-        return "Pending".equals(status) || "InProgress".equals(status);
+        return "Pending".equals(status) || "InProgress".equals(status) || "Cancelling".equals(status);
     }
 
-    private static String statusDetails(String status) {
+    static String statusDetails(String status) {
         return switch (status) {
             case "InProgress" -> "In Progress";
             case "TimedOut" -> "Execution Timed Out";
@@ -878,6 +1026,7 @@ public class SsmCommandService implements Resettable {
         copy.setCommandId(source.getCommandId());
         copy.setDocumentName(source.getDocumentName());
         copy.setDocumentVersion(source.getDocumentVersion());
+        copy.setDocumentContent(source.getDocumentContent());
         copy.setComment(source.getComment());
         copy.setExpiresAfter(source.getExpiresAfter());
         copy.setParameters(source.getParameters());
@@ -889,6 +1038,7 @@ public class SsmCommandService implements Resettable {
         copy.setTargetCount(source.getTargetCount());
         copy.setCompletedCount(source.getCompletedCount());
         copy.setErrorCount(source.getErrorCount());
+        copy.setDeliveryTimedOutCount(source.getDeliveryTimedOutCount());
         copy.setOutputS3BucketName(source.getOutputS3BucketName());
         copy.setOutputS3KeyPrefix(source.getOutputS3KeyPrefix());
         copy.setOutputS3Region(source.getOutputS3Region());
@@ -902,17 +1052,28 @@ public class SsmCommandService implements Resettable {
             String documentName,
             Map<String, List<String>> parameters) {}
 
-    @SuppressWarnings("unchecked")
     private Map<String, List<String>> parseParameters(JsonNode parametersNode) {
-        if (parametersNode == null || parametersNode.isNull() || !parametersNode.isObject()) {
+        if (parametersNode == null || parametersNode.isNull() || parametersNode.isMissingNode()) {
             return Map.of();
         }
-        try {
-            return objectMapper.convertValue(parametersNode,
-                    new TypeReference<Map<String, List<String>>>() {});
-        } catch (Exception e) {
-            return Map.of();
+        if (!parametersNode.isObject()) {
+            throw new AwsException("InvalidParameters", "Parameters must be a map of string lists.", 400);
         }
+        Map<String, List<String>> values = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonNode> entry : parametersNode.properties()) {
+            List<String> items = new ArrayList<>();
+            if (!entry.getValue().isArray()) {
+                throw new AwsException("InvalidParameters", "Parameters must be a map of string lists.", 400);
+            }
+            for (JsonNode item : entry.getValue()) {
+                if (!item.isTextual()) {
+                    throw new AwsException("InvalidParameters", "Parameters must be a map of string lists.", 400);
+                }
+                items.add(item.textValue());
+            }
+            values.put(entry.getKey(), List.copyOf(items));
+        }
+        return values;
     }
 
     private static String instanceKey(String region, String instanceId) {
@@ -930,5 +1091,5 @@ public class SsmCommandService implements Resettable {
     private record MessageOwner(String accountId, String region, String instanceId) {}
     private record MessageCorrelation(MessageOwner owner, String commandId) {}
 
-    record PendingMessage(String messageId, String commandId, String region, Instant createdDate, String payload) {}
+    record PendingMessage(String messageId, String commandId, String region, Instant createdDate) {}
 }

@@ -60,7 +60,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         String registration = """
                 {
@@ -91,7 +91,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -127,7 +127,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -156,7 +156,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -188,7 +188,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -226,7 +226,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -252,21 +252,9 @@ class SsmCommandServiceDirectExecutionTest {
     }
 
     @Test
-    void cancelAndConcurrentRollup_areMutuallyExclusiveForTheSameCommand() throws Exception {
-        // Regression: even with the self-consistency fix above, cancelCommand's own status +
-        // statusDetails write could still land entirely inside updateCommandStatus's window between
-        // ITS two field writes - leaving status=Cancelled but statusDetails reflecting the rollup's
-        // stale completion status, or the reverse. Both methods now synchronize on the shared Command
-        // object (commandStore's get() always returns the same instance for a key) before touching
-        // its status fields, so the two calls can't interleave with each other at all, closing this
-        // regardless of which field either one happens to write first.
-        //
-        // Proving this directly rather than by timing: commandStore.put() is called from inside the
-        // synchronized block in both methods and is a real interception point (unlike the two setter
-        // calls themselves), so a spy can force updateCommandStatus's finalize write to block while
-        // it still holds the lock, and assert a concurrent cancelCommand call blocks too rather than
-        // racing past it - the same style already used to prove the code-volume lock in
-        // ContainerLauncherTest's cleanupAndAConcurrentRollback... test.
+    void cancellationDuringRollupPreservesACompletedCommand() throws Exception {
+        // Hold the terminal rollup's store write while cancellation arrives. Its parent-status
+        // update must wait for the same lock and preserve the already completed invocation.
         SsmDirectCommandExecutor executor = mock(SsmDirectCommandExecutor.class);
         Instant start = Instant.parse("2026-06-07T00:00:00Z");
         Instant end = Instant.parse("2026-06-07T00:00:01Z");
@@ -292,7 +280,7 @@ class SsmCommandServiceDirectExecutionTest {
         }).when(commandStore).put(any(), any());
 
         SsmCommandService service = new SsmCommandService(
-                new SingleCommandStoreFactory(commandStore), objectMapper, regionResolver, executor);
+                new SingleCommandStoreFactory(commandStore), objectMapper, regionResolver, executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -324,8 +312,10 @@ class SsmCommandServiceDirectExecutionTest {
         assertTrue(cancelReturned.get(), "cancelCommand should complete once the rollup releases the lock");
 
         Command finalCommand = service.listCommands(command.getCommandId(), null, "us-west-2").getFirst();
-        assertEquals("Cancelled", finalCommand.getStatus());
-        assertEquals("Cancelled", finalCommand.getStatusDetails());
+        assertEquals("Success", finalCommand.getStatus());
+        assertEquals("Success", finalCommand.getStatusDetails());
+        assertEquals(1, finalCommand.getCompletedCount());
+        assertEquals("Success", service.getCommandInvocation(command.getCommandId(), "i-race", "us-west-2").getStatus());
     }
 
     @Test
@@ -366,7 +356,7 @@ class SsmCommandServiceDirectExecutionTest {
         }).when(commandStore).put(any(), any());
 
         SsmCommandService commandService = new SsmCommandService(
-                new SingleCommandStoreFactory(commandStore), objectMapper, regionResolver, executor);
+                new SingleCommandStoreFactory(commandStore), objectMapper, regionResolver, executor, null, true);
         SsmJsonHandler jsonHandler = new SsmJsonHandler(mock(SsmService.class), commandService, null, objectMapper, null,
                 mock(SsmPatchBaselineService.class), null, null);
 
@@ -448,7 +438,7 @@ class SsmCommandServiceDirectExecutionTest {
             }
 
             SsmCommandService service = new SsmCommandService(
-                    new InMemoryStorageFactory(), objectMapper, regionResolver, executor);
+                    new InMemoryStorageFactory(), objectMapper, regionResolver, executor, null, true);
 
             ObjectNode request = objectMapper.createObjectNode();
             ArrayNode instanceIdsNode = request.putArray("InstanceIds");
@@ -482,7 +472,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -528,7 +518,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -563,7 +553,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -597,7 +587,7 @@ class SsmCommandServiceDirectExecutionTest {
                 new InMemoryStorageFactory(),
                 objectMapper,
                 regionResolver,
-                executor);
+                executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -640,7 +630,7 @@ class SsmCommandServiceDirectExecutionTest {
                 });
 
         SsmCommandService service = new SsmCommandService(
-                new InMemoryStorageFactory(), objectMapper, regionResolver, executor);
+                new InMemoryStorageFactory(), objectMapper, regionResolver, executor, null, true);
 
         // SendCommand takes at most 50 InstanceIds, so the burst is split across several commands.
         List<Command> commands = new ArrayList<>();
@@ -684,7 +674,7 @@ class SsmCommandServiceDirectExecutionTest {
                 });
 
         SsmCommandService service = new SsmCommandService(
-                new InMemoryStorageFactory(), objectMapper, regionResolver, executor);
+                new InMemoryStorageFactory(), objectMapper, regionResolver, executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {
@@ -726,7 +716,7 @@ class SsmCommandServiceDirectExecutionTest {
                 });
 
         SsmCommandService service = new SsmCommandService(
-                new InMemoryStorageFactory(), objectMapper, regionResolver, executor);
+                new InMemoryStorageFactory(), objectMapper, regionResolver, executor, null, true);
 
         Command command = service.sendCommand(objectMapper.readTree("""
                 {

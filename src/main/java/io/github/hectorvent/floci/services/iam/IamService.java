@@ -4533,6 +4533,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return currentSession(accessKeyId).map(SessionCredential::getExpiration);
     }
 
+    /** The EC2 node for which IMDS issued this live credential, when it is an instance session. */
+    public Optional<String> findEc2SessionInstanceId(String accessKeyId) {
+        return currentSession(accessKeyId).map(SessionCredential::getEc2InstanceId);
+    }
+
     /** Whether an access key ID identifies Floci's documented public deployer credential. */
     public boolean isSeededDeployerAccessKey(String accessKeyId) {
         return DEFAULT_DEPLOYER_ACCESS_KEY_ID.equals(accessKeyId);

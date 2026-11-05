@@ -10,7 +10,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 
 | Service | Endpoint | Protocol | Supported operations |
 |---|---|---|---|
-| [SSM](ssm.md) | `POST /` + `X-Amz-Target: AmazonSSM.*` / `AmazonSSMMessageDeliveryService.*` | JSON 1.1 | 22 |
+| [SSM](ssm.md) | `POST /` + `AmazonSSM.*` / `EC2WindowsMessageDeliveryService.*`; `/v1/control-channel/{id}` | JSON 1.1 / REST XML / WebSocket | 67 |
 | [SQS](sqs.md) | `POST /` with `Action=` param | Query / JSON | 23 |
 | [SNS](sns.md) | `POST /` with `Action=` param | Query / JSON | 39 |
 | [S3](s3.md) | `/{bucket}/{key}` | REST XML | 58 |

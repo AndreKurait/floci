@@ -82,7 +82,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Run the published image with the stock SSM agent
+      - name: Verify stock-agent inventory, commands, cancellation and recovery
         env:
           IMAGE: ${{ needs.build.outputs.image-digest-ref }}
           HELPER_IMAGE: ${{ needs.build.outputs.network-helper-digest-ref }}

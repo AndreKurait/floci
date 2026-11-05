@@ -170,6 +170,17 @@ Explorer `SyncSource` and KMS-encrypted delivery remain unsupported.
 | `AcknowledgeMessage` | Agent acknowledges receipt of a command message |
 | `SendReply` | Agent reports command output and status |
 
+### ssmmessages control channel
+
+The stock agent uses `CreateControlChannel` and a signed WebSocket
+`OpenControlChannel` at `/v1/control-channel/{managed-node-id}`. Both handshakes
+verify SigV4, session credentials and IAM authorization. A one-use token binds
+the connection to its account, region, node and caller. EC2 instance credentials
+can open only their own node's channel.
+
+The channel carries the agent's binary job, acknowledgement and result messages.
+These are Run Command control channels; Session Manager data channels are not implemented.
+
 ## Document versions
 
 `DescribeDocument` returns `CreatedDate` as numeric epoch seconds, so AWS SDK
@@ -252,57 +263,82 @@ cannot both overwrite the association.
 
 ## Run Command Execution
 
-`SendCommand` supports the `AWS-RunShellScript` document. For EC2 instances launched by Floci in real Docker mode, Floci creates the command invocation, returns the command response, and then runs the script asynchronously inside the target instance container. Callers observe completion through `GetCommandInvocation`. `stdout`, `stderr`, response code, start time, and end time are recorded on the invocation.
+By default, `SendCommand` requires a registered managed node. Execution requires
+a running SSM agent; commands wait for delivery while it is stopped. Floci delivers the selected Command document through the agent's `ssmmessages`
+channel. The agent executes its own plugins and reports their output and status.
+Stopping the agent prevents execution even when its EC2 container is still running.
 
-Direct execution writes the commands to a private executable script and invokes its
-path through `sh -c`, matching the SSM agent's execution model. A shebang selects the
-guest's interpreter, including its arguments; scripts without one use the shell.
-The invocation keeps the requested working directory and removes its temporary
-script after completion, failure, or the in-container execution timeout.
+Commands capture the selected document version and content at submission. Changing
+or deleting the document afterward does not change queued work. Built-in
+`AWS-RunShellScript` and `AWS-RunPowerShellScript` documents and stored JSON/YAML
+Command documents use this path. Public parameter values remain string lists in
+command metadata; delivery converts them to the document's declared `String` or
+`StringList` type. Missing required parameters, unknown parameters and malformed
+values fail before command creation. The agent performs plugin-specific validation.
 
-For public `SendCommand`, set `TimeoutSeconds` to a delivery/start allowance from 30 to
-2,592,000 seconds. The default is 3,600 seconds. Floci does not automatically expire
-commands waiting for an agent, so a command that is never delivered can remain pending
-indefinitely. The document's execution allowance and internal CodeDeploy hook budgets
-are separate.
+Use a document step's name as `GetCommandInvocation.PluginName` when it has multiple
+steps. Results remain separate for each step. A document completion summary may arrive
+before its final plugin replies; those replies fill in missing results without
+reopening the finished command or overwriting completed steps with older progress.
+Inline output retains the first 24,000 characters of stdout and 8,000 of stderr.
 
-If the target is not a Floci EC2 container, or if the document is not supported for direct execution, Floci falls back to the SSM agent polling flow. In that mode, `SendCommand` queues an ec2messages payload and the invocation completes after an agent calls `SendReply`.
+`TimeoutSeconds` supplies the delivery allowance, from 30 to 2,592,000 seconds and
+3,600 by default. The execution allowance contributes to `ExpiresAfter`: shell
+documents accept `Parameters.executionTimeout` from 1 to 172800 seconds, defaulting
+to 3,600. Custom documents use their declared execution-timeout parameter when
+present, otherwise the 3,600-second service default. Each plugin's execution timer
+is enforced by the agent. Internal CodeDeploy hook budgets remain separate.
 
-Background execution retains the issuing account and region. Agent queues and message correlations
-use that same account, region and instance identity; polling or completing a message from another
-account or region leaves the owner's work untouched. Pending messages remain in memory and are lost
-on restart.
+Without an agent's terminal reply before `ExpiresAfter`, active invocations become
+`TimedOut` with `StatusDetails: Delivery Timed Out`. Execution timeout requires the
+agent's timeout result. Expired work is not delivered after reconnection. Delivery
+timeouts are counted separately from execution failures in command metadata.
 
-!!! note "Managed instance registration is independent of EC2 and IMDS"
-    Registering a container's SSM agent with `UpdateInstanceInformation` only creates the managed instance record. It does not create an EC2 instance, does not install the link-local `169.254.169.254` proxy in the container, and does not register the container with the [EC2 IMDS server](ec2.md#imds-and-ssm-managed-instances). A container that was only registered with SSM therefore has no working IMDS endpoint and no instance profile credentials, and `SendCommand` against it uses the agent polling flow rather than direct execution.
+`CancelCommand` cancels work immediately if it has never been sent. Sent work becomes
+`Cancelling` until the agent reports a terminal result; cancellation is delivered
+through the same authenticated channel. Queued commands and cancellation state use
+the selected SSM storage backend. A replacement connection recovers pending work.
+While a node has an authenticated gateway connection, its legacy polls return no
+commands. Closing an older connection cannot release a replacement connection's
+ownership; once the current connection closes, legacy polling can resume queued work.
 
-    To get a container that both answers IMDS and runs `SendCommand` directly, launch it with EC2 `RunInstances` first and then register that same container's SSM agent. Floci logs a warning when an agent registers from a container that is not backed by a Floci EC2 instance.
+The older `ec2messages` polling path uses `EC2WindowsMessageDeliveryService.*`
+targets and plain JSON payload strings. Its queues and message correlations remain
+in memory; visibility retries and recovery of those legacy queues are not implemented.
+Run Command concurrency/error budgets and full document-schema constraints are also
+not implemented.
 
-Direct command output follows the AWS inline output limits: first 24,000 characters of stdout and first 8,000 characters of stderr. Commands that exceed their execution budget are constrained inside the target container when the container has the `timeout` command available, and terminal timeout results are marked `TimedOut` with `StatusDetails` set to `Execution Timed Out`; commands with nonzero exit codes are marked `Failed`.
+### Direct execution compatibility mode
 
-### Shell command timeout budgets
+Set `FLOCI_SERVICES_SSM_DIRECT_COMMAND_EXECUTION_ENABLED=true` to retain direct
+execution of `AWS-RunShellScript` in a Floci EC2 container. This mode bypasses the
+SSM agent and cannot establish that agent startup or network transport works.
+It writes a private executable script, preserves the requested working directory,
+and records output, exit status and timing. Unsupported targets use agent delivery.
 
-For public `SendCommand` requests using the exact `AWS-RunShellScript` document name,
-`TimeoutSeconds` is the delivery/start allowance. `Parameters.executionTimeout` is a separate
-execution allowance, defaulting to 3600 seconds and accepting one decimal string from 1 to
-172800. The direct worker uses this execution allowance; agent payloads retain the public
-document's 3600-second default and carry an explicit parameter unchanged.
+Managed-node registration is independent of EC2 and IMDS. `UpdateInstanceInformation`
+stores a managed-node record; it does not create an EC2 instance or install IMDS.
+Launch an instance with EC2 `RunInstances`, an instance profile and an image that
+starts the agent to exercise the normal credential and network paths.
 
-`Command.TimeoutSeconds` still reports the delivery allowance. `ExpiresAfter` includes both
-allowances for these shell requests. This corrects metadata and execution budgets; it does not
-add automatic delivery expiration, restart recovery, cleanup retries or late-start fencing.
-Internal CodeDeploy hook budgets and non-shell document handling keep their existing behavior.
-Missing or empty `commands`, malformed shell parameter wire shapes and invalid execution limits
-are refused before command creation
-with `InvalidParameters`/HTTP400. This is Floci's chosen mapping; exact AWS error wording and
-empty-list normalization were not observed live. Other document parameters and delivery-timeout
-coercion/upper-bound handling are not a complete document-schema implementation.
+### Image promotion check
+
+The development image workflow runs `.github/scripts/smoke-ssm-agent.py` before
+promoting `dev`. It uses the unmodified stock agent, instance-profile credentials
+and verified TLS to collect inventory, run a versioned multi-step document, preserve
+a native script failure, cancel a running process, and recover after an agent stop.
+An undelivered command must expire without creating its side effect, including after
+restart. API and container cleanup must restore the daemon's original footprint.
+
+The check uses a generic Amazon Linux container. Native AMI boot and application
+fleet workflows require separate integration tests.
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_SSM_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_SSM_DIRECT_COMMAND_EXECUTION_ENABLED` | `false` | Enable direct container execution for compatibility; bypasses the SSM agent |
 | `FLOCI_SERVICES_SSM_MAX_PARAMETER_HISTORY` | `5` | Number of parameter versions retained per parameter |
 | `FLOCI_STORAGE_SERVICES_SSM_MODE` | *(global default)* | Storage mode override for SSM (`memory`, `persistent`, `hybrid`, `wal`) |
 | `FLOCI_STORAGE_SERVICES_SSM_FLUSH_INTERVAL_MS` | `5000` | Flush interval for `hybrid`/`wal` storage modes (milliseconds) |

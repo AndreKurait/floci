@@ -1435,6 +1435,9 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
+        @WithDefault("false")
+        boolean directCommandExecutionEnabled();
+
         @WithDefault("5")
         int maxParameterHistory();
 

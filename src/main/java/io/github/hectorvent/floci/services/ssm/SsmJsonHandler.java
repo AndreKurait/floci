@@ -1456,7 +1456,8 @@ public class SsmJsonHandler {
         String commandId = request.path("CommandId").asText();
         String instanceId = request.path("InstanceId").asText();
         CommandInvocation inv = commandService.getCommandInvocation(commandId, instanceId, region);
-        return Response.ok(invocationToDetailNode(inv)).build();
+        String pluginName = request.has("PluginName") ? request.path("PluginName").asText() : null;
+        return Response.ok(invocationToDetailNode(inv, pluginName)).build();
     }
 
     private Response handleListCommands(JsonNode request, String region) {
@@ -1481,7 +1482,22 @@ public class SsmJsonHandler {
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode invArray = objectMapper.createArrayNode();
         for (CommandInvocation inv : invocations) {
-            invArray.add(invocationToNode(inv));
+            ObjectNode node = invocationToNode(inv);
+            if (request.path("Details").asBoolean(false)) {
+                synchronized (inv) {
+                    ArrayNode plugins = node.putArray("CommandPlugins");
+                    inv.getPluginResults().forEach((name, plugin) -> {
+                        ObjectNode detail = plugins.addObject().put("Name", name)
+                                .put("Status", SsmCommandService.toInvocationStatus(plugin.path("status").asText("Pending")))
+                                .put("ResponseCode", plugin.path("code").asInt(plugin.path("returnCode").asInt(-1)));
+                        detail.put("StatusDetails", plugin.path("statusDetails").asText(detail.path("Status").asText()));
+                        detail.put("Output", SsmCommandService.truncateOutput(
+                                plugin.path("output").asText(plugin.path("standardOutput").asText("")),
+                                SsmCommandService.MAX_STDOUT_CHARS));
+                    });
+                }
+            }
+            invArray.add(node);
         }
         response.set("CommandInvocations", invArray);
         return Response.ok(response).build();
@@ -1528,6 +1544,7 @@ public class SsmJsonHandler {
         node.put("TargetCount", c.getTargetCount());
         node.put("CompletedCount", c.getCompletedCount());
         node.put("ErrorCount", c.getErrorCount());
+        node.put("DeliveryTimedOutCount", c.getDeliveryTimedOutCount());
         node.put("TimeoutSeconds", c.getTimeoutSeconds());
         if (c.getInstanceIds() != null) {
             ArrayNode ids = objectMapper.createArrayNode();
@@ -1563,18 +1580,54 @@ public class SsmJsonHandler {
         return node;
     }
 
-    private ObjectNode invocationToDetailNode(CommandInvocation inv) {
-        ObjectNode node = invocationToNode(inv);
-        node.put("StandardOutputContent", inv.getStandardOutputContent() != null ? inv.getStandardOutputContent() : "");
-        node.put("StandardErrorContent", inv.getStandardErrorContent() != null ? inv.getStandardErrorContent() : "");
-        node.put("ResponseCode", inv.getResponseCode());
-        if (inv.getExecutionStartDateTime() != null) {
-            node.put("ExecutionStartDateTime", inv.getExecutionStartDateTime().toString());
+    private ObjectNode invocationToDetailNode(CommandInvocation inv, String requestedPlugin) {
+        synchronized (inv) {
+            Map<String, JsonNode> plugins = inv.getPluginResults();
+            if ((requestedPlugin == null && plugins.size() > 1)
+                    || (requestedPlugin != null && !plugins.containsKey(requestedPlugin))) {
+                throw new AwsException("InvalidPluginName", "Specify a step name from the command document.", 400);
+            }
+            String selected = requestedPlugin != null ? requestedPlugin
+                    : plugins.isEmpty() ? null : plugins.keySet().iterator().next();
+            ObjectNode node = invocationToNode(inv);
+            node.put("StandardOutputContent", inv.getStandardOutputContent() != null ? inv.getStandardOutputContent() : "");
+            node.put("StandardErrorContent", inv.getStandardErrorContent() != null ? inv.getStandardErrorContent() : "");
+            node.put("ResponseCode", inv.getResponseCode());
+            if (inv.getExecutionStartDateTime() != null) {
+                node.put("ExecutionStartDateTime", inv.getExecutionStartDateTime().toString());
+            }
+            if (inv.getExecutionEndDateTime() != null) {
+                node.put("ExecutionEndDateTime", inv.getExecutionEndDateTime().toString());
+            }
+            if (selected != null) {
+                node.put("PluginName", selected);
+                JsonNode plugin = plugins.get(selected);
+                if (!inv.isDirectExecution() || !"Pending".equals(plugin.path("status").asText("Pending"))) {
+                    String status = SsmCommandService.toInvocationStatus(plugin.path("status").asText("Pending"));
+                    if ("Pending".equals(status) && plugins.size() == 1
+                            && ("InProgress".equals(inv.getStatus()) || "Cancelling".equals(inv.getStatus()))) {
+                        status = inv.getStatus();
+                    }
+                    node.put("Status", status).put("StatusDetails",
+                            plugin.path("statusDetails").asText(SsmCommandService.statusDetails(status)));
+                    node.put("StandardOutputContent", SsmCommandService.truncateOutput(
+                            plugin.path("standardOutput").asText(plugin.path("output").asText("")),
+                            SsmCommandService.MAX_STDOUT_CHARS));
+                    node.put("StandardErrorContent", SsmCommandService.truncateOutput(
+                            plugin.path("standardError").asText(""), SsmCommandService.MAX_STDERR_CHARS));
+                    node.put("ResponseCode", plugin.path("code").asInt(plugin.path("returnCode").asInt(-1)));
+                    node.remove("ExecutionStartDateTime");
+                    node.remove("ExecutionEndDateTime");
+                    if (plugin.path("startDateTime").isTextual()) {
+                        node.put("ExecutionStartDateTime", plugin.path("startDateTime").asText());
+                    }
+                    if (plugin.path("endDateTime").isTextual()) {
+                        node.put("ExecutionEndDateTime", plugin.path("endDateTime").asText());
+                    }
+                }
+            }
+            return node;
         }
-        if (inv.getExecutionEndDateTime() != null) {
-            node.put("ExecutionEndDateTime", inv.getExecutionEndDateTime().toString());
-        }
-        return node;
     }
 
     private ObjectNode instanceInfoToNode(InstanceInformation info) {

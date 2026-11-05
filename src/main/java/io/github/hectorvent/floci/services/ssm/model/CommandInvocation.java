@@ -1,9 +1,12 @@
 package io.github.hectorvent.floci.services.ssm.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -23,6 +26,12 @@ public class CommandInvocation {
     private Instant executionStartDateTime;
     private Instant executionEndDateTime;
     private String region;
+    private Map<String, JsonNode> pluginResults = new LinkedHashMap<>();
+    private Instant deliveryAttemptTime;
+    private String cancellationJobId;
+    private boolean cancellationAcknowledged;
+    private boolean directExecution;
+    private boolean agentTerminalResponse;
 
     public CommandInvocation() {}
 
@@ -67,4 +76,24 @@ public class CommandInvocation {
 
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
+
+    public Map<String, JsonNode> getPluginResults() { return pluginResults; }
+    public void setPluginResults(Map<String, JsonNode> pluginResults) { this.pluginResults = pluginResults; }
+
+    public Instant getDeliveryAttemptTime() { return deliveryAttemptTime; }
+    public void setDeliveryAttemptTime(Instant deliveryAttemptTime) { this.deliveryAttemptTime = deliveryAttemptTime; }
+
+    public String getCancellationJobId() { return cancellationJobId; }
+    public void setCancellationJobId(String cancellationJobId) { this.cancellationJobId = cancellationJobId; }
+
+    public boolean isCancellationAcknowledged() { return cancellationAcknowledged; }
+    public void setCancellationAcknowledged(boolean cancellationAcknowledged) {
+        this.cancellationAcknowledged = cancellationAcknowledged;
+    }
+
+    public boolean isDirectExecution() { return directExecution; }
+    public void setDirectExecution(boolean directExecution) { this.directExecution = directExecution; }
+
+    public boolean isAgentTerminalResponse() { return agentTerminalResponse; }
+    public void setAgentTerminalResponse(boolean agentTerminalResponse) { this.agentTerminalResponse = agentTerminalResponse; }
 }

@@ -25,7 +25,7 @@ BASE_IMAGE = (
     "957ff255a4ca9c60138ea636b8ae09e29ba146ea7bc95d0dae3923a5faeeb122"
 )
 AMI = "ami-00000000000000001"
-REGION = "us-east-1"
+REGION = "ap-southeast-7"
 POLICY = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 
 
@@ -66,6 +66,7 @@ class Smoke:
         self.network = self.owner + "-network"
         self.guest = None
         self.created = {}
+        self.command_documents = []
         self.before = footprint()
         self.daemon = docker("info", "--format", "{{.ID}}").stdout.strip()
         self.record = {
@@ -364,6 +365,256 @@ class Smoke:
         self.record["cleanup_passed"] = not self.record["cleanup_errors"]
 
 
+AGENT_PROCESSES = r"""
+for entry in /proc/[0-9]*/exe; do
+    executable=$(readlink "$entry") || continue
+    case "$executable" in
+        /usr/bin/amazon-ssm-agent|/usr/bin/ssm-agent-worker|/usr/bin/ssm-document-worker|/usr/bin/ssm-session-worker)
+            pid=${entry#/proc/}
+            pid=${pid%/exe}
+            printf '%s %s\n' "$pid" "$executable"
+            ;;
+    esac
+done
+"""
+
+
+def gateway_open_count(smoke):
+    expected = "region=" + REGION + " node=" + smoke.created["instance"]
+    result = docker("logs", smoke.server)
+    return sum("SSM control channel opened" in line and expected in line
+               for line in (result.stdout + result.stderr).splitlines())
+
+
+def wait_for_gateway(smoke, after_count=0):
+    def opened():
+        count = gateway_open_count(smoke)
+        return count if count > after_count else None
+    count = wait_for("The real agent did not authenticate a new message gateway channel", opened, seconds=45)
+    smoke.record["native_gateway_authenticated"] = True
+    smoke.record["native_gateway_connection_count"] = count
+    return count
+
+
+def gateway_execution(smoke, command_id):
+    def recorded():
+        log = docker("exec", smoke.guest, "cat", "/var/log/amazon/ssm/amazon-ssm-agent.log").stdout
+        for line in log.splitlines():
+            marker = "[DataBackend] {"
+            if marker not in line:
+                continue
+            try:
+                document = json.loads("{" + line.split(marker, 1)[1])
+            except json.JSONDecodeError:
+                # The agent may still be writing the final line of this log snapshot.
+                continue
+            if document.get("DocumentInformation", {}).get("CommandID") == command_id:
+                transport = document.get("UpstreamServiceName")
+                if transport != "MessageGatewayService":
+                    raise ValueError("The command used a fallback transport: " + str(transport))
+                return {"command_id": command_id, "upstream_service": transport}
+        return None
+
+    return wait_for("The native agent did not record the command's execution transport",
+                    recorded, seconds=30)
+
+
+def exercise_commands(smoke):
+    print("Executing a versioned custom document through the native gateway", flush=True)
+    instance = smoke.created["instance"]
+    marker = uuid.uuid4().hex
+    path = "/tmp/floci-native-command-" + marker
+    name = smoke.owner + "-command"
+    document = {
+        "schemaVersion": "2.2",
+        "parameters": {"Marker": {"type": "String"}},
+        "mainSteps": [
+            {"action": "aws:runShellScript", "name": "writeMarker", "inputs": {
+                "runCommand": ["printf 'version-one:%s\\n' '{{ Marker }}' > " + path,
+                               "printf 'first:%s\\n' '{{ Marker }}'"],
+                "timeoutSeconds": "30",
+            }},
+            {"action": "aws:runShellScript", "name": "readMarker", "inputs": {
+                "runCommand": ["cat " + path], "timeoutSeconds": "30",
+            }},
+        ],
+    }
+    smoke.aws("ssm", "create-document", Name=name, DocumentType="Command", Content=json.dumps(document))
+    smoke.command_documents.append(name)
+    second = json.loads(json.dumps(document).replace("version-one:", "version-two:"))
+    smoke.aws("ssm", "update-document", Name=name, DocumentVersion="$LATEST", Content=json.dumps(second))
+    began = time.monotonic()
+    command = smoke.aws("ssm", "send-command", InstanceIds=[instance], DocumentName=name,
+                        DocumentVersion="$DEFAULT", Parameters={"Marker": [marker]}, TimeoutSeconds=30)["Command"]
+    smoke.record["native_command_id"] = command["CommandId"]
+    smoke.aws("ssm", "update-document-default-version", Name=name, DocumentVersion="2")
+
+    def complete(plugin, command_id=command["CommandId"]):
+        result = smoke.aws("ssm", "get-command-invocation", CommandId=command_id,
+                           InstanceId=instance, PluginName=plugin)
+        return result if result["Status"] not in ("Pending", "InProgress", "Delayed") else None
+
+    first = wait_for("The agent did not finish the first custom step", lambda: complete("writeMarker"))
+    second = wait_for("The agent did not finish the second custom step", lambda: complete("readMarker"))
+    smoke.record["custom_command"] = {
+        "seconds": time.monotonic() - began, "selected_version": command["DocumentVersion"],
+        "first": first, "second": second,
+    }
+    if first["Status"] != "Success" or first["ResponseCode"] != 0:
+        raise ValueError("The real agent failed the first document step: " + json.dumps(first))
+    if second["Status"] != "Success" or second["ResponseCode"] != 0:
+        raise ValueError("The real agent failed the second document step: " + json.dumps(second))
+    if first["StandardOutputContent"].strip() != "first:" + marker:
+        raise ValueError("The first step did not execute its parameterized command")
+    if second["StandardOutputContent"].strip() != "version-one:" + marker:
+        raise ValueError("The command did not execute the selected document version")
+    smoke.record["custom_command"]["transport"] = gateway_execution(smoke, command["CommandId"])
+    if command["DocumentVersion"] != "1":
+        raise ValueError("SendCommand did not resolve the default version at submission")
+    listed = smoke.aws("ssm", "list-command-invocations", CommandId=command["CommandId"], Details=True)
+    plugins = listed["CommandInvocations"][0]["CommandPlugins"]
+    if {item["Name"] for item in plugins} != {"writeMarker", "readMarker"}:
+        raise ValueError("Command history did not retain both plugin results")
+
+    failure_name = smoke.owner + "-failure"
+    failure_document = {"schemaVersion": "2.2", "mainSteps": [{
+        "action": "aws:runShellScript", "name": "failStep",
+        "inputs": {"runCommand": ["printf 'native-failure\\n' >&2", "exit 23"], "timeoutSeconds": "30"},
+    }]}
+    smoke.aws("ssm", "create-document", Name=failure_name, DocumentType="Command",
+              Content=json.dumps(failure_document))
+    smoke.command_documents.append(failure_name)
+    began = time.monotonic()
+    failed = smoke.aws("ssm", "send-command", InstanceIds=[instance], DocumentName=failure_name,
+                       TimeoutSeconds=30)["Command"]
+    failure = wait_for("The agent did not report the failed script",
+                             lambda: complete("failStep", failed["CommandId"]))
+    smoke.record["failed_command"] = {"seconds": time.monotonic() - began, "invocation": failure}
+    if failure["Status"] != "Failed" or failure["ResponseCode"] != 23:
+        raise ValueError("The real plugin failure was not preserved: " + json.dumps(failure))
+    if "native-failure" not in failure["StandardErrorContent"]:
+        raise ValueError("The native plugin stderr was lost")
+    smoke.record["failed_command"]["transport"] = gateway_execution(smoke, failed["CommandId"])
+    smoke.record["native_custom_document_executed"] = True
+
+
+def exercise_cancellation(smoke):
+    print("Cancelling a real agent command blocked on a FIFO", flush=True)
+    prefix = "/tmp/floci-cancel-" + uuid.uuid4().hex
+    fifo, ready, escaped = prefix + ".fifo", prefix + ".ready", prefix + ".escaped"
+    instance = smoke.created["instance"]
+    command = smoke.aws("ssm", "send-command", InstanceIds=[instance],
+                        DocumentName="AWS-RunShellScript", TimeoutSeconds=30,
+                        Parameters={"commands": ["mkfifo " + fifo, "printf ready > " + ready,
+                                                 "cat " + fifo + " >/dev/null",
+                                                 "printf escaped > " + escaped],
+                                    "executionTimeout": ["120"]})["Command"]
+
+    def running():
+        return docker("exec", smoke.guest, "/bin/sh", "-ec",
+                            'test -p "$1" && test -f "$2"', "ready-check", fifo, ready,
+                            check=False).returncode == 0
+
+    wait_for("The real command did not reach its blocking operation", running, seconds=45)
+    transport = gateway_execution(smoke, command["CommandId"])
+    began = time.monotonic()
+    smoke.aws("ssm", "cancel-command", CommandId=command["CommandId"], InstanceIds=[instance])
+
+    def completed():
+        result = smoke.aws("ssm", "get-command-invocation", CommandId=command["CommandId"], InstanceId=instance)
+        return result if result["Status"] not in ("Pending", "InProgress", "Delayed", "Cancelling") else None
+
+    invocation = wait_for("The real agent did not finish cancellation", completed, seconds=30)
+    smoke.record["cancelled_command"] = {
+        "seconds": time.monotonic() - began, "invocation": invocation, "transport": transport,
+    }
+    if invocation["Status"] != "Cancelled":
+        raise ValueError("The real agent did not report cancellation: " + json.dumps(invocation))
+    writer = docker("exec", smoke.guest, "timeout", "2", "/bin/sh", "-ec",
+                          'printf release > "$1"', "reader-check", fifo, check=False)
+    smoke.record["cancelled_command"]["fifo_writer_exit_code"] = writer.returncode
+    if writer.returncode != 124:
+        raise ValueError("The cancelled command still had a process reading its FIFO")
+    docker("exec", smoke.guest, "/bin/sh", "-ec", 'test ! -e "$1"', "escape-check", escaped)
+    smoke.record["cancelled_command"]["process_stopped_and_side_effect_absent"] = True
+    smoke.record["native_cancellation_qualified"] = True
+
+
+def exercise_stopped_agent(smoke):
+    print("Stopping the real agent and observing delivery expiry and recovery", flush=True)
+    def processes():
+        return docker("exec", smoke.guest, "/bin/sh", "-ec",
+                            AGENT_PROCESSES).stdout.strip().splitlines()
+
+    before = processes()
+    smoke.record["agent_processes_before_stop"] = before
+    if not any(line.endswith(" /usr/bin/amazon-ssm-agent") for line in before):
+        raise ValueError("The real agent was not running before the negative check")
+    pids = [line.split()[0] for line in before]
+    if not all(pid.isdigit() and int(pid) > 1 for pid in pids):
+        raise ValueError("Refusing to signal an invalid process identifier")
+    docker("exec", smoke.guest, "/bin/sh", "-c",
+                 'for pid do kill -TERM "$pid" 2>/dev/null || true; done',
+                 "stop-owned-stock-agent", *pids)
+    wait_for("The real agent did not stop", lambda: not processes(), seconds=45)
+    smoke.record["agent_processes_after_stop"] = processes()
+    instance = smoke.created["instance"]
+    marker = uuid.uuid4().hex
+    path = "/tmp/floci-stopped-agent-" + marker
+    began = time.monotonic()
+    command = smoke.aws("ssm", "send-command", InstanceIds=[instance],
+                        DocumentName="AWS-RunShellScript", TimeoutSeconds=30,
+                        Parameters={"commands": ["printf '%s\\n' '" + marker + "' > " + path],
+                                    "executionTimeout": ["1"]})["Command"]
+
+    def completed(command_id):
+        invocation = smoke.aws("ssm", "get-command-invocation", CommandId=command_id,
+                               InstanceId=instance)
+        return invocation if invocation["Status"] not in ("Pending", "InProgress", "Delayed") else None
+
+    invocation = wait_for("The undelivered command did not expire",
+                                lambda: completed(command["CommandId"]), seconds=70)
+    smoke.record["stopped_agent"] = {
+        "seconds": time.monotonic() - began, "command": command, "invocation": invocation,
+        "processes_after_command": processes(),
+    }
+    if invocation["Status"] != "TimedOut" or invocation["StatusDetails"] != "Delivery Timed Out":
+        raise ValueError("A command without a live agent did not expire as undelivered")
+    if invocation["ResponseCode"] != -1 or processes():
+        raise ValueError("The stopped-agent command unexpectedly executed")
+    docker("exec", smoke.guest, "/bin/sh", "-ec", 'test ! -e "$1"', "marker-check", path)
+    smoke.record["stopped_agent"]["side_effect_absent"] = True
+    previous_connections = gateway_open_count(smoke)
+    docker("exec", smoke.guest, "/bin/sh", "-ec", """
+nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+  -u AWS_ENDPOINT_URL -u AWS_REGION -u AWS_DEFAULT_REGION -u AWS_CA_BUNDLE -u SSL_CERT_FILE \
+  /usr/bin/amazon-ssm-agent </dev/null >/var/log/amazon/ssm/restart.log 2>&1 &
+""")
+    wait_for("The unchanged agent did not restart", processes, seconds=45)
+    gateway_connections = wait_for_gateway(smoke, after_count=previous_connections)
+    began = time.monotonic()
+    recovery = smoke.aws("ssm", "send-command", InstanceIds=[instance],
+                         DocumentName="AWS-RunShellScript", TimeoutSeconds=60,
+                         Parameters={"commands": ["printf 'recovered:%s\\n' '" + marker + "'"],
+                                     "executionTimeout": ["30"]})["Command"]
+    recovered = wait_for("The restarted agent did not execute the recovery command",
+                               lambda: completed(recovery["CommandId"]), seconds=100)
+    if recovered["Status"] != "Success" or recovered["ResponseCode"] != 0:
+        raise ValueError("The recovery command failed: " + json.dumps(recovered))
+    if recovered["StandardOutputContent"].strip() != "recovered:" + marker:
+        raise ValueError("The recovered agent did not return the submitted unique output")
+    docker("exec", smoke.guest, "/bin/sh", "-ec", 'test ! -e "$1"', "marker-check", path)
+    smoke.record["recovered_agent"] = {
+        "seconds": time.monotonic() - began, "command": recovery, "invocation": recovered,
+        "expired_command_side_effect_still_absent": True,
+        "gateway_connections_before_restart": previous_connections,
+        "gateway_connections_after_restart": gateway_connections,
+        "transport": gateway_execution(smoke, recovery["CommandId"]),
+    }
+    smoke.record["stopped_agent_delivery_timeout_and_recovery"] = True
+
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
@@ -377,12 +628,21 @@ def main():
         try:
             smoke.prepare()
             smoke.exercise()
-            smoke.record["status"] = "passed"
+            wait_for_gateway(smoke)
+            exercise_commands(smoke)
+            exercise_cancellation(smoke)
+            exercise_stopped_agent(smoke)
+            smoke.record.update(status="passed", command_transport_qualified=True)
         except Exception as error:
             smoke.record.update(status="failed", error=str(error))
             if isinstance(error, subprocess.CalledProcessError):
                 smoke.record["command_error"] = error.stderr
         finally:
+            for name in reversed(smoke.command_documents):
+                try:
+                    smoke.aws("ssm", "delete-document", Name=name)
+                except Exception as error:
+                    smoke.record["cleanup_errors"].append({"resource": name, "error": str(error)})
             smoke.cleanup()
             if not smoke.record["cleanup_passed"]:
                 smoke.record["status"] = "failed"
