@@ -419,20 +419,32 @@ public class TlsConfigSource implements ConfigSource {
 
     /**
      * Containers Floci launches get this bundle copied in (Docker) or mounted (Kubernetes), and
-     * those whose workload is Java its trust store too. A failure here must not stop Floci: log it,
-     * and containers simply will not trust Floci HTTPS until a boot manages to write it.
+     * those whose workload is Java its trust store too. Explicit extra trust must load successfully;
+     * without that option, a bundle failure retains the existing warning-only behavior.
      */
     private static void writeContainerCaBundle(Path tlsDir, Path trustAnchor) {
+        String extraCaCerts = resolveProperty("floci.tls.extra-ca-certs", "");
+        List<Path> anchors = new ArrayList<>(List.of(trustAnchor));
+        if (!extraCaCerts.isBlank()) {
+            validateFileExists(extraCaCerts, "Additional TLS trust");
+            anchors.add(Path.of(extraCaCerts));
+        }
         Path bundle;
         try {
-            bundle = ContainerCaBundle.write(tlsDir, trustAnchor);
+            bundle = ContainerCaBundle.write(tlsDir, anchors);
         } catch (Exception e) {
+            if (!extraCaCerts.isBlank()) {
+                throw new IllegalStateException("Cannot build container trust with floci.tls.extra-ca-certs", e);
+            }
             LOG.warnv(e, "TLS: could not write the container CA bundle under {0}: {1}", tlsDir, e.getMessage());
             return;
         }
         try {
             ContainerCaBundle.writeJavaTrustStore(bundle);
         } catch (Exception e) {
+            if (!extraCaCerts.isBlank()) {
+                throw new IllegalStateException("Cannot build Java trust with floci.tls.extra-ca-certs", e);
+            }
             LOG.warnv(e, "TLS: could not write the containers' Java trust store under {0}: {1}", tlsDir,
                     e.getMessage());
         }
