@@ -124,6 +124,26 @@ class AutoScalingRefreshStorageTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void terminationCompletesTheSameActivityAfterStorageReload(String mode) throws IOException {
+        setUp(mode);
+        ScalingActivity accepted = service.terminateInstanceInAutoScalingGroup(REGION, "i-original", true);
+        String activityId = accepted.getActivityId();
+
+        restart(mode);
+        reconciler.reconcile(group);
+
+        assertTrue(group.getInstances().isEmpty());
+        ScalingActivity completed = service.describeScalingActivities(REGION, "suspended-group").stream()
+                .filter(activity -> activityId.equals(activity.getActivityId())).findFirst().orElseThrow();
+        assertEquals("Successful", completed.getStatusCode());
+        assertEquals(100, completed.getProgress());
+        assertNotNull(completed.getEndTime());
+        assertEquals(accepted.getStartTime(), completed.getStartTime());
+        assertEquals("InProgress", accepted.getStatusCode(), "the accepted response is a snapshot");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
     void replacementWithoutDeclaredZoneUsesTheAcceptedEc2Placement(String mode) throws IOException {
         setUp(mode);
         group.setAvailabilityZones(List.of());

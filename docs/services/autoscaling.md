@@ -104,7 +104,7 @@ EC2 instance can use a default subnet in a different zone.
 | `SetDesiredCapacity` | Updates desired count; reconciler handles scale-out / scale-in within 10 s |
 | `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
-| `TerminateInstanceInAutoScalingGroup` | Terminates a specific instance; optionally decrements desired capacity |
+| `TerminateInstanceInAutoScalingGroup` | Requests termination of a specific instance; optionally decrements desired capacity and returns its `InProgress` activity |
 | `EnterStandby` | Moves `InService` instances to `EnteringStandby` and returns one `InProgress` activity (progress 50) per instance; the reconciler deregisters them from the group's target groups and Classic Load Balancers and sets `Standby` within 10 s. `ShouldDecrementDesiredCapacity=true` lowers desired capacity by the number of instances, refused with `ValidationError` below `MinSize`; `false` keeps it, so the group launches replacements |
 | `ExitStandby` | Moves `Standby` instances to `Pending`, raises desired capacity by the number of instances (refused with `ValidationError` above `MaxSize`) and returns one `PreInService` activity (progress 30) per instance; the reconciler registers them with the group's load balancers and sets `InService` within 10 s |
 | `SuspendProcesses` | Records suspended scaling processes (empty list suspends all); reported back by `DescribeAutoScalingGroups` |
@@ -115,6 +115,13 @@ an explicit `false` keeps that tag on the group. `CreateOrUpdateTags` requires t
 flag on every tag, including existing tags. If any flag is omitted, the request
 returns `ValidationError` before changing any tags in that batch. `DeleteTags`
 allows the flag to be omitted.
+
+`TerminateInstanceInAutoScalingGroup` returns an `Activity` for its existing single-instance
+request. `DescribeScalingActivities` reports the same activity as `Successful` when the
+reconciler removes the terminated member, including after a storage reload. Failed termination
+attempts keep the activity in progress for retry; deleting the group cancels it. Repeating a
+pending termination returns its existing activity without decrementing capacity again, and
+`DetachInstances` refuses to detach a member while its termination is pending.
 
 Member instances carry the tags the
 [EC2 instance tagging lifecycle](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-tagging.html#tag-lifecycle)
