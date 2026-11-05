@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
@@ -128,7 +127,7 @@ class Ec2ServiceConcurrencyTest {
             try {
                 runRace(i -> {
                     service.createNetworkAclEntry(region, aclId, 100 + i, "6", "allow", false,
-                            "10.0." + i + ".0/24", 80, 80, false);
+                            "10.0." + i + ".0/24", null, null, null, 80, 80, false);
                     return "entry-" + i;
                 });
             } finally {

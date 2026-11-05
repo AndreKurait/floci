@@ -7,6 +7,7 @@ import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesResponse;
+import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
@@ -128,16 +129,34 @@ public class ContainerLifecycleManager {
      * @return information about the created container including resolved endpoints and published ports
      */
     public ContainerInfo createAndStart(ContainerSpec spec) {
-        String containerId = create(spec);
+        return createAndStart(spec, false);
+    }
+
+    /** Starts a disposable container, reclaiming its anonymous volumes if startup fails. */
+    public ContainerInfo createAndStartEphemeral(ContainerSpec spec) {
+        return createAndStart(spec, true);
+    }
+
+    private ContainerInfo createAndStart(ContainerSpec spec, boolean removeAnonymousVolumes) {
+        String resolvedImage = imageCacheService.ensureImageExists(spec.image());
+        String containerId = create(spec, resolvedImage, null, removeAnonymousVolumes);
         try {
-            ContainerInfo info = startCreated(containerId, spec);
-            return withPublishedHostPorts(info, spec);
-        } catch (Exception e) {
-            // A failed start (e.g. host-port conflict) must not leak the created
-            // container: retrying callers would accumulate Created containers and
-            // fixed-name callers would hit name conflicts on the next attempt.
+            return withPublishedHostPorts(startCreated(containerId, spec), spec);
+        } catch (RuntimeException failure) {
+            removeFailedContainer(containerId, failure, removeAnonymousVolumes);
+            throw failure;
+        }
+    }
+
+    private void removeFailedContainer(String containerId, RuntimeException failure, boolean removeAnonymousVolumes) {
+        if (!removeAnonymousVolumes) {
             removeIfExists(containerId);
-            throw e;
+            return;
+        }
+        try {
+            removeIfExistsStrict(containerId, true);
+        } catch (RuntimeException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
         }
     }
 
@@ -176,12 +195,16 @@ public class ContainerLifecycleManager {
     }
 
     private String create(ContainerSpec spec, String resolvedImage, String platform) {
-        String containerId = createWithCaBundle(spec, resolvedImage, platform);
+        return create(spec, resolvedImage, platform, false);
+    }
+
+    private String create(ContainerSpec spec, String resolvedImage, String platform, boolean removeAnonymousVolumes) {
+        String containerId = createWithCaBundle(spec, resolvedImage, platform, removeAnonymousVolumes);
         if (spec.hasNetworkConfiguration()) {
             try {
                 attachNetworkBeforeStart(containerId, spec);
             } catch (RuntimeException e) {
-                removeIfExists(containerId);
+                removeFailedContainer(containerId, e, removeAnonymousVolumes);
                 throw new IllegalStateException(
                         "Failed to attach pre-start network configuration for container " + containerId, e);
             }
@@ -189,7 +212,8 @@ public class ContainerLifecycleManager {
         return containerId;
     }
 
-    private String createWithCaBundle(ContainerSpec spec, String resolvedImage, String platform) {
+    private String createWithCaBundle(ContainerSpec spec, String resolvedImage, String platform,
+                                      boolean removeAnonymousVolumes) {
         LOG.debugv("Creating container from spec: image={0}, name={1}", spec.image(), spec.name());
 
         // Built once: a dynamic port binding allocates its host port here.
@@ -205,7 +229,11 @@ public class ContainerLifecycleManager {
         }
         // SSL_CERT_FILE and friends replace the image's trust store, so they must never name a
         // file that is not there. Start over without them: the container keeps its own trust.
-        dockerClient.removeContainerCmd(containerId).withForce(true).exec();
+        if (removeAnonymousVolumes) {
+            removeIfExistsStrict(containerId, true);
+        } else {
+            dockerClient.removeContainerCmd(containerId).withForce(true).exec();
+        }
         return createContainer(spec, resolvedImage, platform, hostConfig, spec.env());
     }
 
@@ -489,18 +517,7 @@ public class ContainerLifecycleManager {
     }
 
     private void stopAndRemoveAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
-        LOG.infov("Stopping container {0}", containerId);
-
-        boolean stoppedOrMissing = false;
-        try {
-            dockerClient.stopContainerCmd(containerId).withTimeout(stopTimeoutSeconds).exec();
-            stoppedOrMissing = true;
-        } catch (NotFoundException e) {
-            LOG.debugv("Container {0} not found (already removed)", containerId);
-            stoppedOrMissing = true;
-        } catch (Exception e) {
-            LOG.warnv("Error stopping container {0}: {1}", containerId, e.getMessage());
-        }
+        boolean stoppedOrMissing = stopAdmitted(containerId, stopTimeoutSeconds);
 
         // Force removal is the recovery path when Docker could not stop the container cleanly. It also
         // terminates the follow-log transport, allowing its terminal callback to drain the final tail.
@@ -518,6 +535,35 @@ public class ContainerLifecycleManager {
 
         if (logStream != null && (stoppedOrMissing || removedOrMissing)) {
             closeLogStreamAfterContainerStop(logStream);
+        }
+    }
+
+    /**
+     * Stops a container and leaves it in place, for its output to be read before it is removed: one that
+     * had already exited, or is gone, counts as stopped.
+     *
+     * @param stopTimeoutSeconds seconds to wait for the container to stop cleanly after
+     *        SIGTERM before Docker sends SIGKILL. Must be a non-negative integer.
+     */
+    public void stop(String containerId, int stopTimeoutSeconds) {
+        withTeardownSlot(() -> stopAdmitted(containerId, stopTimeoutSeconds));
+    }
+
+    private boolean stopAdmitted(String containerId, int stopTimeoutSeconds) {
+        LOG.infov("Stopping container {0}", containerId);
+        try {
+            dockerClient.stopContainerCmd(containerId).withTimeout(stopTimeoutSeconds).exec();
+            return true;
+        } catch (NotFoundException e) {
+            LOG.debugv("Container {0} not found (already removed)", containerId);
+            return true;
+        } catch (NotModifiedException e) {
+            // HTTP 304: the container had already exited, which is the outcome the stop wanted.
+            LOG.debugv("Container {0} had already stopped", containerId);
+            return true;
+        } catch (Exception e) {
+            LOG.warnv("Error stopping container {0}: {1}", containerId, e.getMessage());
+            return false;
         }
     }
 
@@ -559,6 +605,9 @@ public class ContainerLifecycleManager {
             LOG.debugv("Container {0} not found (already removed)", containerId);
             closeLogStreamIfPresent(logStream);
             return;
+        } catch (NotModifiedException e) {
+            // HTTP 304: the container had already exited, which is the outcome the stop wanted.
+            LOG.debugv("Container {0} had already stopped", containerId);
         } catch (Exception e) {
             stopFailure = e;
             LOG.warnv("Error stopping container {0}: {1}", containerId, e.getMessage());
@@ -1047,8 +1096,17 @@ public class ContainerLifecycleManager {
      * @param name the container name to remove
      */
     public void removeIfExistsStrict(String name) {
+        removeIfExistsStrict(name, false);
+    }
+
+    /** Removes a container, optionally reclaiming anonymous volumes that are no longer in use. */
+    public void removeIfExistsStrict(String name, boolean removeAnonymousVolumes) {
         try {
-            dockerClient.removeContainerCmd(name).withForce(true).exec();
+            RemoveContainerCmd remove = dockerClient.removeContainerCmd(name).withForce(true);
+            if (removeAnonymousVolumes) {
+                remove.withRemoveVolumes(true);
+            }
+            remove.exec();
             LOG.infov("Removed stale container {0}", name);
         } catch (NotFoundException e) {
             // Not found means the fixed name is available.

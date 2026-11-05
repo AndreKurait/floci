@@ -14,6 +14,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.zip.ZipEntry;
@@ -25,6 +26,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Runs a real NuGet V3 push/install round trip against a live, per-repository BaGetter container,
@@ -480,6 +482,35 @@ class CodeArtifactNuGetDockerIntegrationTest {
                 .body("versions[0].version", equalTo(VERSION))
                 .body("versions[0].status", equalTo("Published"))
                 .body("versions[0].origin.originType", equalTo("INTERNAL"));
+    }
+
+    /**
+     * Bridges to BaGetter's own NuGet V3 Search resource, confirmed live: {@code
+     * BagetterSidecarClient#listPackages} presses it into service purely for this admin listing
+     * (this class's own class-level documentation explains why the native NuGet client protocol
+     * never gets a Search endpoint of its own). A mixed-case id, confirmed back lowercased, since
+     * a live search response returns the id real-cased exactly as pushed, and {@code
+     * CodeArtifactService}'s own {@code accountingPackageName} normalizes every NuGet name to
+     * lowercase (AWS's own documented NuGet normalization).
+     */
+    @Test
+    @Order(17)
+    void listPackagesBridgesToTheRealBagetterSearchResource() {
+        String packageId = "ListPackages.Probe";
+        byte[] nupkg = buildNupkg(packageId, VERSION, "list packages description", null, null);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(pushBody("boundary123", nupkg))
+                .put("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/api/v2/package")
+                .then().statusCode(201);
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/packages?domain=" + DOMAIN + "&repository=" + REPO + "&format=nuget")
+                .then().statusCode(200)
+                .extract().jsonPath();
+        List<String> names = body.getList("packages.package", String.class);
+        assertTrue(names.contains(packageId.toLowerCase(Locale.ROOT)), "expected "
+                + packageId.toLowerCase(Locale.ROOT) + " among " + names);
     }
 
     private static long describeDomainAssetSizeBytes() {

@@ -50,8 +50,10 @@ starts() {
     grep -qE "$(IFS='|'; echo "$*")" "$SHARD_FILE"
 }
 # The image a test constant pins, or empty (and a log line) when the constant cannot be read.
+# TestImages is found by name rather than by its package path, which a package rename changes.
+TEST_IMAGES="$(find src/test/java -path '*/testing/TestImages.java' -print -quit)"
 test_image() {
-    image="$(grep -oE "$1 *= *\"[^\"]+\"" src/test/java/io/github/hectorvent/floci/testing/TestImages.java | grep -oE '"[^"]+"' | tr -d '"')"
+    image="$(grep -oE "$1 *= *\"[^\"]+\"" "${TEST_IMAGES:-/dev/null}" | grep -oE '"[^"]+"' | tr -d '"')"
     [ -n "$image" ] || echo "$(date -u +%H:%M:%S) prefetch skipped: TestImages.$1 not readable" >> "$PREFETCH_LOG"
     echo "$image"
 }
@@ -120,7 +122,7 @@ grep -q 'RdsAwsIntegrationTest' "$SHARD_FILE" && [ -n "$SQLSERVER_IMAGE" ] && pu
 # provisioner tests reach it through Redshift. It was pulled inline in all four shards.
 REDSHIFT_PG_IMAGE="$(grep -oE 'image-version: *postgres:[^ ]+' src/main/resources/application.yml | awk '{print $2}')"
 grep -qE '/redshift/|/cloudformation/' "$SHARD_FILE" && [ -n "$REDSHIFT_PG_IMAGE" ] && pull "$REDSHIFT_PG_IMAGE"
-grep -q '/rds/' "$SHARD_FILE" && pull postgres:16.3-alpine
+grep -qE '/rds/|/rdsdata/' "$SHARD_FILE" && pull postgres:16.3-alpine
 # The InfluxDB and k3s pins live in application.yml like the sidecars above.
 INFLUX_IMAGE="$(grep -oE 'default-image: *"influxdb:[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q '/timestreaminfluxdb/' "$SHARD_FILE" && [ -n "$INFLUX_IMAGE" ] && pull "$INFLUX_IMAGE"

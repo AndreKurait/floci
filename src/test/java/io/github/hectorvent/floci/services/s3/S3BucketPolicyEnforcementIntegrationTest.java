@@ -1,13 +1,19 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.AwsCanonicalUserId;
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testing.S3IamEnforcementProfile;
 import io.github.hectorvent.floci.testutil.S3RequestSigner;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.ExtractableResponse;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.net.URI;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
@@ -23,6 +29,50 @@ class S3BucketPolicyEnforcementIntegrationTest {
     private static final String ACCOUNT_A = "111122223333";
     private static final String ACCOUNT_B = "222233334444";
     private static final S3RequestSigner ROOT_SIGNER = S3RequestSigner.signedAs("test", "test");
+
+    @TestHTTPResource("/")
+    URI endpoint;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
+
+    @Test
+    void crossAccountListingRequiresAndHonorsTheOwnersBucketPolicy() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String ownerName = "list-owner-" + suffix;
+        String readerName = "list-reader-" + suffix;
+        cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(ACCOUNT_A, "iam"), ownerName));
+        Credentials owner = createAccountAdmin(ownerName, ACCOUNT_A);
+        cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(ACCOUNT_B, "iam"), readerName));
+        Credentials reader = createAccountAdmin(readerName, ACCOUNT_B);
+        String bucket = "owner-listing-" + suffix;
+        cleanup.register(() -> EnforcementFixtures.removeBucket(endpoint.getPort(), owner.signer(), bucket));
+        createBucketAs(bucket, owner.signer());
+        try {
+            given().filter(owner.signer()).body("owned-data").put("/" + bucket + "/object.txt")
+                    .then().statusCode(200);
+            for (String query : new String[]{"", "?list-type=2"}) {
+                given().filter(reader.signer()).get("/" + bucket + query)
+                        .then().statusCode(403).body(containsString("AccessDenied"));
+            }
+            given().filter(owner.signer()).body("""
+                    {"Version":"2012-10-17","Statement":[{
+                      "Effect":"Allow","Principal":{"AWS":"%s"},"Action":"s3:ListBucket",
+                      "Resource":"arn:aws:s3:::%s"}]}
+                    """.formatted(reader.userArn(), bucket))
+                    .put("/" + bucket + "?policy").then().statusCode(200);
+            for (String query : new String[]{"", "?list-type=2"}) {
+                given().filter(reader.signer()).get("/" + bucket + query)
+                        .then().statusCode(200).body(containsString("<Key>object.txt</Key>"));
+            }
+            given().filter(owner.signer()).delete("/" + bucket + "?policy").then().statusCode(204);
+            given().filter(reader.signer()).get("/" + bucket + "?list-type=2")
+                    .then().statusCode(403).body(containsString("AccessDenied"));
+        } finally {
+            given().filter(owner.signer()).delete("/" + bucket + "/object.txt");
+            given().filter(owner.signer()).delete("/" + bucket);
+        }
+    }
 
     record Credentials(String accessKeyId, String secretAccessKey, String userArn) {
         S3RequestSigner signer() {
@@ -308,8 +358,10 @@ class S3BucketPolicyEnforcementIntegrationTest {
 
     @Test
     void aBucketPolicyNamingAnAccountByItsCanonicalIdGrantsThatAccount() {
-        // A bucket policy can name an account by its S3 canonical user ID (IAM User Guide, "AWS account
-        // principals"), and Floci's canonical ID for an account is its account id.
+        // A bucket policy can name an account by its S3 canonical user ID (IAM User Guide, "AWS
+        // account principals"): the 64-hex value S3 reports as owner, which Floci derives from
+        // the account. The account ID itself still matches, for policies written when Floci
+        // reported the account as the canonical ID.
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String source = "bp-canonical-" + suffix;
         S3RequestSigner owner = sourceBucketInAccountA(source);
@@ -322,6 +374,14 @@ class S3BucketPolicyEnforcementIntegrationTest {
 
         allowGetObject(owner, source, "{\"CanonicalUser\":\"" + ACCOUNT_B + "\"}");
         assertReadAndCopy(reader, source, destination, 200);
+
+        allowGetObject(owner, source,
+                "{\"CanonicalUser\":\"" + AwsCanonicalUserId.forAccount(ACCOUNT_B) + "\"}");
+        assertReadAndCopy(reader, source, destination, 200);
+
+        allowGetObject(owner, source,
+                "{\"CanonicalUser\":\"" + AwsCanonicalUserId.forAccount(ACCOUNT_A) + "\"}");
+        assertReadAndCopy(reader, source, destination, 403);
     }
 
     /** Creates a bucket in account A holding {@code o.txt}, and returns its owner, an account-A administrator. */

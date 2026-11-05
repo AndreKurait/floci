@@ -58,7 +58,7 @@ public class ZipExtractor {
         Path staged = Files.createTempFile(absTarget.getParent(), ".floci-staging-", ".zip");
         try {
             Files.write(staged, zipBytes);
-            extract(staged, absTarget, maxEntries, beforeInstall);
+            extract(staged, absTarget, maxEntries, MAX_ENTRY_BYTES, MAX_EXPANDED_BYTES, beforeInstall);
         } finally {
             Files.deleteIfExists(staged);
         }
@@ -73,20 +73,33 @@ public class ZipExtractor {
         checkLimits(maxEntries, Files.size(zipFile));
         Path absTarget = targetDir.toAbsolutePath().normalize();
         Files.createDirectories(absTarget.getParent());
-        extract(zipFile, absTarget, maxEntries, beforeInstall);
+        extract(zipFile, absTarget, maxEntries, MAX_ENTRY_BYTES, MAX_EXPANDED_BYTES, beforeInstall);
+    }
+
+    /** For a package whose archive, files and expanded total may each reach {@code maxBytes}. */
+    public void extractTo(Path zipFile, Path targetDir, int maxEntries, long maxBytes) throws IOException {
+        checkLimits(maxEntries, Files.size(zipFile), maxBytes);
+        Path absTarget = targetDir.toAbsolutePath().normalize();
+        Files.createDirectories(absTarget.getParent());
+        extract(zipFile, absTarget, maxEntries, maxBytes, maxBytes, null);
     }
 
     static void checkLimits(int maxEntries, long compressedBytes) throws IOException {
+        checkLimits(maxEntries, compressedBytes, S3_MAX_COMPRESSED_BYTES);
+    }
+
+    private static void checkLimits(int maxEntries, long compressedBytes, long maxCompressedBytes) throws IOException {
         if (maxEntries < 1) {
             throw new IOException("ZIP archive entry limit must be at least 1: " + maxEntries);
         }
-        if (compressedBytes > S3_MAX_COMPRESSED_BYTES) {
-            throw new IOException("ZIP archive exceeds the " + S3_MAX_COMPRESSED_BYTES
+        if (compressedBytes > maxCompressedBytes) {
+            throw new IOException("ZIP archive exceeds the " + maxCompressedBytes
                     + " byte compressed limit: " + compressedBytes);
         }
     }
 
-    private void extract(Path archive, Path absTarget, int maxEntries, Runnable beforeInstall) throws IOException {
+    private void extract(Path archive, Path absTarget, int maxEntries, long maxEntryBytes, long maxExpandedBytes,
+                         Runnable beforeInstall) throws IOException {
         // Extract into a staging directory and swap it in, rather than writing over the target
         // in place. A deployment package is the complete contents of the function, so a file
         // dropped between two deploys has to disappear — writing in place only ever adds and
@@ -143,13 +156,13 @@ public class ZipExtractor {
                     }
 
                     long declaredSize = entry.getSize();
-                    if (declaredSize > MAX_ENTRY_BYTES) {
-                        throw new IOException("ZIP entry exceeds the " + MAX_ENTRY_BYTES
+                    if (declaredSize > maxEntryBytes) {
+                        throw new IOException("ZIP entry exceeds the " + maxEntryBytes
                                 + " byte limit: " + entryName);
                     }
                     long accountedSize = declaredSize >= 0 ? declaredSize : 0;
-                    if (accountedSize > MAX_EXPANDED_BYTES - expandedBytes) {
-                        throw new IOException("ZIP archive exceeds the " + MAX_EXPANDED_BYTES
+                    if (accountedSize > maxExpandedBytes - expandedBytes) {
+                        throw new IOException("ZIP archive exceeds the " + maxExpandedBytes
                                 + " byte expanded limit");
                     }
 
@@ -158,10 +171,10 @@ public class ZipExtractor {
                     } else {
                         Files.createDirectories(targetPath.getParent());
                         long copyLimit = declaredSize >= 0
-                                ? Math.min(declaredSize, MAX_EXPANDED_BYTES - expandedBytes)
-                                : MAX_EXPANDED_BYTES - expandedBytes;
+                                ? Math.min(declaredSize, maxExpandedBytes - expandedBytes)
+                                : maxExpandedBytes - expandedBytes;
                         long copiedBytes = copyVerified(zip, entry, targetPath,
-                                MAX_ENTRY_BYTES, copyLimit);
+                                maxEntryBytes, copyLimit);
                         accountedSize = declaredSize >= 0 ? declaredSize : copiedBytes;
                     }
                     expandedBytes += accountedSize;

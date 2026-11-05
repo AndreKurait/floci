@@ -101,7 +101,8 @@ public class CloudWatchLogsHandler {
         boolean deletionProtectionEnabled = request.path("deletionProtectionEnabled").asBoolean(false);
         Map<String, String> tags = extractTags(request.path("tags"));
         String kmsKeyId = request.path("kmsKeyId").asText(null);
-        logsService.createLogGroup(name, retentionInDays, tags, deletionProtectionEnabled, kmsKeyId, region);
+        logsService.createLogGroup(name, retentionInDays, tags, deletionProtectionEnabled, kmsKeyId,
+                logGroupClass(request), region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -140,13 +141,14 @@ public class CloudWatchLogsHandler {
         if (request.hasNonNull("nextToken") && !request.get("nextToken").isTextual()) {
             throw CloudWatchLogsService.invalidNextToken();
         }
-        PaginatedResult<LogGroup> page = logsService.describeLogGroups(prefix, region, limit, nextToken);
+        PaginatedResult<LogGroup> page = logsService.describeLogGroups(prefix, logGroupClass(request), region, limit, nextToken);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode groupsArray = objectMapper.createArrayNode();
         for (LogGroup g : page.items()) {
             ObjectNode node = objectMapper.createObjectNode();
             node.put("logGroupName", g.getLogGroupName());
+            node.put("logGroupClass", g.getLogGroupClass());
             node.put("creationTime", g.getCreatedTime());
             String logGroupArn = logsService.buildArn(g.getLogGroupName(), region);
             node.put("arn", logGroupArn + ":*");
@@ -167,6 +169,17 @@ public class CloudWatchLogsHandler {
             response.put("nextToken", page.nextToken());
         }
         return Response.ok(response).build();
+    }
+
+    private static String logGroupClass(JsonNode request) {
+        JsonNode value = request.get("logGroupClass");
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isTextual()) {
+            throw new AwsException("InvalidParameterException", "logGroupClass must be a string.", 400);
+        }
+        return value.textValue();
     }
 
     private Response handlePutResourcePolicy(JsonNode request, String region) {
@@ -387,6 +400,11 @@ public class CloudWatchLogsHandler {
             requireListSize(request.path("logStreamNames"), "logStreamNames", 1, 100);
         }
         request.path("logStreamNames").forEach(n -> streamNames.add(resolveLogStreamName(n.asText(null))));
+        // After the logStreamNames check, so a request that check refuses gets its message rather than this one.
+        if (groupName == null || groupName.isBlank()) {
+            throw new AwsException("InvalidParameterException",
+                    "logGroupName or logGroupIdentifier is required.", 400);
+        }
 
         CloudWatchLogsService.FilteredLogEventsResult result =
                 logsService.filterLogEvents(groupName, streamNames, startTime, endTime, filterPattern, limit,

@@ -855,6 +855,7 @@ Every `awsvpc` task receives an ENI in its subnet. With `FLOCI_NETWORK_SECURITY_
 | `FLOCI_SERVICES_ECS_DEFAULT_CPU_UNITS` | `256` | Default CPU units when the task definition omits it |
 | `FLOCI_SERVICES_ECS_HOST_VOLUME_ROOTS` | *(unset)* | Approved parent directories for host volume bind mounts (`volumes[].host.sourcePath`) and container devices (`linuxParameters.devices[].hostPath`) |
 | `FLOCI_SERVICES_ECS_ALLOW_UNSAFE_HOST_VOLUMES` | `false` | Allow any host path, bypassing the `HOST_VOLUME_ROOTS` allowlist; traversal, the bare root, and the Docker socket are still always rejected |
+| `FLOCI_SERVICES_ECS_ALLOW_PRIVILEGED_CONTAINERS` | `false` | Allow EC2 task containers requesting `privileged: true` to run with Docker privilege on the host |
 | `FLOCI_SERVICES_ECS_RECONCILE_CONTAINERS_ON_STARTUP` | `true` | On startup, in Docker mode, remove the ECS containers a previous run of this Floci left on the daemon before the scheduler starts replacement tasks (see [Restarts](#restarts)) |
 | `FLOCI_SERVICES_ECS_IMAGE_PULL_BEHAVIOR` | `default` | How task images are pulled at launch, as the ECS agent's `ECS_IMAGE_PULL_BEHAVIOR`: `default`, `always`, `once` or `prefer-cached` (see [Image pulls](#image-pulls)) |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_ENABLED` | `false` | Vend real task IAM role credentials to task containers |
@@ -984,6 +985,8 @@ Always rejected, regardless of configuration:
 
 A container device's `hostPath` (`linuxParameters.devices`) goes through the same checks and the same allowlist, since a device hands the container the host's hardware.
 
+An EC2 task definition may contain `privileged: true`, but Docker-backed tasks using it stop before launch unless the Floci operator sets `FLOCI_SERVICES_ECS_ALLOW_PRIVILEGED_CONTAINERS=true`. A privileged container has access to all host devices and can bypass the host path restrictions above, so enable this only when task definition callers are trusted.
+
 A rejected `sourcePath` or device `hostPath` fails `RegisterTaskDefinition` with `InvalidParameterException`; a rejection caught again at `RunTask` time (e.g. a task definition registered before this policy existed) stops the task with that message as its `stoppedReason`. Named Docker volumes, EFS volumes, and host volumes with no `sourcePath` (ephemeral storage shared within a task) are unaffected by these checks.
 
 ### EFS volume ownership
@@ -1046,9 +1049,31 @@ services:
 
 ### Host access to awsvpc task ports
 
-By default, Floci preserves the isolation expected from `awsvpc`: native runs use a dynamic Docker host port, while Floci-in-Docker exposes the container port only on the configured Docker network. A process running directly on the Docker host therefore has no stable port for an `awsvpc` task.
+Native runs publish `awsvpc` task ports on dynamically allocated Docker host ports.
+When Floci runs in Docker, task ports remain private to the configured Docker network
+unless `FLOCI_SERVICES_ECS_PUBLISH_AWSVPC_PORTS_TO_HOST=true` is set.
 
-Set `FLOCI_SERVICES_ECS_PUBLISH_AWSVPC_PORTS_TO_HOST=true` to opt into stable host publishing. Floci binds each `containerPort` to the same host port, or uses an explicit non-zero `hostPort` when one is present. A host-side Terraform provider can then connect to `localhost:<port>`.
+Enabling host publishing preserves stable ports by default: an explicit non-zero
+`hostPort` is used, otherwise the host port equals `containerPort`. Existing host-side
+clients can keep using `localhost:<hostPort>`. Only one task at a time can reserve each
+stable port on the shared Docker host.
+
+To run tasks with matching container ports concurrently, including rolling-deployment
+revisions, also set `FLOCI_SERVICES_ECS_DYNAMIC_AWSVPC_HOST_PORTS=true`
+(`floci.services.ecs.dynamic-awsvpc-host-ports`, default `false`). Docker then allocates
+an available host port per task, including tasks declaring an explicit `hostPort`.
+Discover the actual published address and port in `DescribeTasks`:
+
+```bash
+aws ecs describe-tasks --cluster my-cluster --tasks "$TASK_ARN" \
+  --query 'tasks[].containers[].networkBindings[]'
+```
+
+Published `awsvpc` ports bind to `127.0.0.1` by default. Set
+`floci.services.ecs.host-port-bind-address` (`FLOCI_SERVICES_ECS_HOST_PORT_BIND_ADDRESS`)
+to another Docker-host interface if clients need one. The same stable or dynamic
+allocation and interface settings apply to security-group network-namespace helpers.
+These are interfaces on the Docker daemon's host, which may differ from Floci's host.
 
 ```yaml
 services:
@@ -1058,9 +1083,15 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       FLOCI_SERVICES_ECS_PUBLISH_AWSVPC_PORTS_TO_HOST: "true"
+      FLOCI_SERVICES_ECS_DYNAMIC_AWSVPC_HOST_PORTS: "true"
+      FLOCI_SERVICES_ECS_HOST_PORT_BIND_ADDRESS: "127.0.0.1"
 ```
 
-This setting is an emulator-specific networking convenience and defaults to `false`. Docker cannot bind the same host port twice, so use it only when at most one running task publishes each port.
+Host publishing is an emulator convenience and defaults to `false` in Docker mode.
+With dynamic allocation enabled, host-side clients must use each task's reported host
+port. Load balancers inside Docker use the container's Docker-network address and
+container port; native load balancers use the published host port. Bridge/host-mode
+explicit bindings retain their existing fixed-port behavior.
 
 ## Examples
 

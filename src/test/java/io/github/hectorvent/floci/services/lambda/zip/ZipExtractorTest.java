@@ -468,6 +468,22 @@ class ZipExtractorTest {
     }
 
     @Test
+    void aPackageMayExpandToTheLimitItIsGiven(@TempDir Path codeStore) throws IOException {
+        long limit = 512L * 1024 * 1024;
+        Path archive = codeStore.resolve("code.zip");
+        Path target = codeStore.resolve("fn");
+        Files.write(archive, zipWithDeclaredSizes(300L * 1024 * 1024, 212L * 1024 * 1024));
+
+        extractor.extractTo(archive, target, ZipExtractor.DEFAULT_MAX_ENTRIES, limit);
+        assertTrue(Files.exists(target.resolve("entry0")));
+
+        Files.write(archive, zipWithDeclaredSizes(300L * 1024 * 1024, 212L * 1024 * 1024 + 1));
+        IOException thrown = assertThrows(IOException.class,
+                () -> extractor.extractTo(archive, target, ZipExtractor.DEFAULT_MAX_ENTRIES, limit));
+        assertEquals("ZIP archive exceeds the 536870912 byte expanded limit", thrown.getMessage());
+    }
+
+    @Test
     void rejectsAnEntryWhoseCompressionMethodCannotBeRead(@TempDir Path target) throws IOException {
         // A package must never be half-deployed because an entry used a codec the reader does
         // not implement — writing it out empty would leave a function whose code silently

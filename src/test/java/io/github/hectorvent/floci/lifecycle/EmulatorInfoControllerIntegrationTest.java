@@ -69,6 +69,26 @@ class EmulatorInfoControllerIntegrationTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"/_floci/info", "/_localstack/info"})
+    void info_isTheConsoleContractManifestOnBothPaths(String path) {
+        given()
+            .when().get(path)
+            .then()
+                .statusCode(200)
+                .contentType("application/json")
+                .body("manifest_version", equalTo(1))
+                .body("console_contract", equalTo(2))
+                .body("cloud", equalTo("aws"))
+                .body("health_url", equalTo("/_floci/health"))
+                .body("services.s3", equalTo("enabled"))
+                .body("defaults.region", equalTo("us-east-1"))
+                .body("defaults.account_id", equalTo("000000000000"))
+                .body("ui.port", equalTo(4500))
+                .body("version", equalTo(FlociVersion.current()))
+                .body("dynamodb_backend", notNullValue());
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"/_floci/init", "/_localstack/init"})
     void init_returnsLifecycleStateOnBothPaths(String path) {
         given()

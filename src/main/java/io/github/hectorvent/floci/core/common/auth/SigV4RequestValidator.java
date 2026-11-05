@@ -9,6 +9,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.DateTimeException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -126,9 +127,12 @@ public final class SigV4RequestValidator {
                 return false;
             }
 
-            Instant tokenTime = Instant.from(DATETIME_FMT.parse(dateTime));
-            int expirySeconds = Integer.parseInt(expires);
-            if (Instant.now().minus(expiryGrace).isAfter(tokenTime.plusSeconds(expirySeconds))) {
+            Optional<Instant> expiry = expiry(dateTime, expires);
+            if (expiry.isEmpty()) {
+                LOG.debugv("{0} has a date or expiry that does not parse", logLabel);
+                return false;
+            }
+            if (Instant.now().minus(expiryGrace).isAfter(expiry.get())) {
                 LOG.debugv("{0} expired", logLabel);
                 return false;
             }
@@ -198,6 +202,30 @@ public final class SigV4RequestValidator {
     }
 
     private record QueryParameter(String name, String value) {}
+
+    /**
+     * When a token stops being valid, before any grace its service allows: its {@code X-Amz-Date}
+     * plus {@code X-Amz-Expires} seconds, or empty when either is missing or does not parse, the
+     * seconds as an {@code int}. A caller that reports the expiry, as Aurora DSQL's hint does, reads
+     * it here, so it reports the one {@link #validate} judged.
+     */
+    public static Optional<Instant> expiry(String rawQuery) {
+        List<QueryParameter> parameters = decodeQuery(rawQuery);
+        return expiry(findParam(parameters, "X-Amz-Date"), findParam(parameters, "X-Amz-Expires"));
+    }
+
+    private static Optional<Instant> expiry(String dateTime, String expires) {
+        if (dateTime == null || expires == null) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(Instant.from(DATETIME_FMT.parse(dateTime)).plusSeconds(Integer.parseInt(expires)));
+        } catch (DateTimeException | NumberFormatException ignored) {
+            // A date or an expiry that does not parse sets no expiry, so the token it came with is
+            // refused: one of more seconds than an int holds included, as validate always refused it.
+            return Optional.empty();
+        }
+    }
 
     /**
      * The value of {@code name} in a token's query string, read as {@link #validate} reads it: the

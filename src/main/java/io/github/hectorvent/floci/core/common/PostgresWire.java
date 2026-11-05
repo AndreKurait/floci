@@ -36,6 +36,16 @@ public final class PostgresWire {
     public record CString(String value, int next) {
     }
 
+    /**
+     * A packet whose length is outside what its reader takes. Nothing after the length was read, so
+     * a server can still answer the way PostgreSQL does before it closes the connection.
+     */
+    public static final class InvalidLengthException extends IOException {
+        InvalidLengthException(String message) {
+            super(message);
+        }
+    }
+
     // ── Framing ───────────────────────────────────────────────────────────────
 
     /** Reads a startup-phase packet: its length, refused outside 8 to {@code maxLength}, code and body. */
@@ -89,14 +99,14 @@ public final class PostgresWire {
         return out.toByteArray();
     }
 
-    /** {@code length}, refused when below {@code minimum} or above {@code maximum}. */
+    /** {@code length}, refused with an {@link InvalidLengthException} when below {@code minimum} or above {@code maximum}. */
     public static int checkedLength(int length, int minimum, int maximum, String packetName) throws IOException {
         if (length < minimum) {
-            throw new IOException("PostgreSQL " + packetName + " length is below the "
+            throw new InvalidLengthException("PostgreSQL " + packetName + " length is below the "
                     + minimum + " byte minimum: " + length);
         }
         if (length > maximum) {
-            throw new IOException("PostgreSQL " + packetName + " length exceeds the "
+            throw new InvalidLengthException("PostgreSQL " + packetName + " length exceeds the "
                     + maximum + " byte limit: " + length);
         }
         return length;

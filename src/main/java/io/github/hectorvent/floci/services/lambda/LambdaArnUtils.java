@@ -56,6 +56,11 @@ public final class LambdaArnUtils {
         return arn.resource().substring(EVENT_SOURCE_MAPPING_PREFIX.length());
     }
 
+    /** {@code arn:<partition>:lambda:<region>:<account>:network-connector:<id>:<version>}. */
+    public static String networkConnectorVersionArn(String connectorArn, long version) {
+        return connectorArn + ":" + version;
+    }
+
     /**
      * The full function ARN a {@code FunctionName} reference names, the way an IAM policy's
      * {@code Resource} names it. The reference is read as {@link #resolve} reads it, so a malformed

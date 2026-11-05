@@ -44,6 +44,11 @@ guardrail and all of its versions.
 Both an id (`abc123def456`) and a full ARN are accepted wherever the API takes a
 `guardrailIdentifier` or a `resourceARN`.
 
+The three tag actions require a full ARN to match the stored guardrail ARN exactly,
+including partition, service, Region, account, and resource type. An ARN that only
+shares the guardrail ID returns `ResourceNotFoundException` (HTTP 404) without changing tags.
+The existing bare-ID form remains accepted.
+
 `kmsKeyId` on `CreateGuardrail` and `UpdateGuardrail` is a `KmsKeyId`: a key id, a key
 ARN, an alias name or an alias ARN. `kmsKeyArn` on the read shapes is a `KmsKeyArn`,
 which is only ever the full key ARN, so every accepted form is resolved through KMS to
@@ -61,6 +66,10 @@ most 50 tags, counted over the tags already on it together with the tags in the 
 request, so `CreateGuardrail` and `TagResource` both raise `TooManyTagsException` once
 the resulting total would pass 50. Replacing the value of a tag key the guardrail
 already carries does not add to that total.
+
+Guardrails are listed by the Resource Groups Tagging API (resource type `bedrock:guardrail`)
+and Resource Explorer with their own tags, and `TagResources` / `UntagResources` there change
+those tags, as `TagResource` and `UntagResource` do.
 
 ## Not implemented
 

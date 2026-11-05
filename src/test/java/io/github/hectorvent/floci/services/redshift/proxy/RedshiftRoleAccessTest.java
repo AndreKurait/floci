@@ -18,6 +18,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -65,8 +66,14 @@ class RedshiftRoleAccessTest {
             "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}""";
 
     private static IamService iamServiceWithRole(String trustPolicy) {
+        return iamServiceWithRole(trustPolicy, ROLE_ARN);
+    }
+
+    /** IAM holding {@code spectrum-role} under {@code heldArn}. */
+    private static IamService iamServiceWithRole(String trustPolicy, String heldArn) {
         IamService iamService = mock(IamService.class);
         IamRole role = mock(IamRole.class);
+        when(role.getArn()).thenReturn(heldArn);
         when(role.getAssumeRolePolicyDocument()).thenReturn(trustPolicy);
         when(iamService.findRole(ACCOUNT, "spectrum-role")).thenReturn(Optional.of(role));
         return iamService;
@@ -96,6 +103,20 @@ class RedshiftRoleAccessTest {
         IamService missing = mock(IamService.class);
         when(missing.findRole(ACCOUNT, "spectrum-role")).thenReturn(Optional.empty());
         assertRefused("does not exist", ROLE_ARN, missing, ACCOUNT, List.of(ROLE_ARN));
+    }
+
+    @Test
+    void resolveRoleSessionTakesTheRoleOnlyUnderTheArnIamHoldsItUnder() {
+        String held = "arn:aws:iam::111111111111:role/app/spectrum-role";
+        String otherPath = "arn:aws:iam::111111111111:role/sandbox/spectrum-role";
+        IamService iamService = iamServiceWithRole(TRUST_POLICY, held);
+
+        assertRefused("does not exist", otherPath, iamService, ACCOUNT, List.of(otherPath));
+        assertRefused("does not exist", ROLE_ARN, iamService, ACCOUNT, List.of(ROLE_ARN));
+        RedshiftRoleAccess.RoleSession session =
+                RedshiftRoleAccess.resolveRoleSession(held, iamService, ACCOUNT, List.of(held));
+        verify(iamService).registerSessionForAccount(eq(ACCOUNT), eq(session.accessKeyId()), anyString(),
+                eq(session.sessionToken()), eq(held), any(Instant.class), isNull());
     }
 
     @Test

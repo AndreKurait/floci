@@ -69,6 +69,8 @@ RDS Data API (`rds-data`) is documented separately because it uses REST JSON rou
 | `DescribeValidDBInstanceModifications` | Return the storage an instance can move to: its type and the sizes a modify stores as asked |
 | `DescribeOrderableDBInstanceOptions` | List the orderable engine, version and instance class combinations from the engine catalogue; see [Engine catalogue](#engine-catalogue) |
 | `DescribeEvents` | - |
+| `DescribeCertificates` | List the Region's RDS certificate authorities and the one new instances get; see [Certificate authorities](#certificate-authorities) |
+| `ModifyCertificates` | Set or remove the account's default certificate authority for new instances |
 | `CreateEventSubscription` | Create an event notification subscription (stored, nothing is published) |
 | `DescribeEventSubscriptions` | List subscriptions, or the one the request names |
 | `ModifyEventSubscription` | Update the members the request names |
@@ -201,6 +203,12 @@ checked against the instance's other window. Modifications apply immediately —
     `Copy`, `Delete` and the `restore` attribute behave as they do for instance snapshots, under
     `arn:aws:rds:<region>:<account>:cluster-snapshot:<name>`. RDS reserved instances aren't
     modeled (there's no reserved-instance API), so tagging doesn't apply to them.
+
+## Cluster parameter groups
+
+`DescribeDBClusterParameterGroups` includes `DBClusterParameterGroupArn` for managed `default.*`
+groups as well as customer-created groups, in both named and list responses. Managed default ARNs
+use the request's account, region, and partition with the `cluster-pg:<group-name>` resource form.
 
 ## Boolean parameters
 
@@ -548,6 +556,29 @@ mysql -h 127.0.0.1 -P 7002 -u root -psecret123
 Override the image per-instance with the `--engine-version` flag or globally via environment variables.
 Aurora MySQL versions such as `8.0.mysql_aurora.3.08.0` use the MySQL version in front, so that example runs `mysql:8.0`.
 
+## Parameter groups
+
+A MySQL or MariaDB database runs with its parameter group: an Aurora MySQL cluster with its DB
+cluster parameter group, with the writer instance's DB parameter group on top (so an
+instance-level value such as `max_connections` wins, as on AWS), and a standalone instance with
+its DB parameter group. Floci passes each override to the server when it starts the database
+container, so a value set in the group is the engine's value; creating a cluster's writer restarts
+the cluster's container when the writer's group changes anything. A later change to a group, or a
+new `DBClusterParameterGroupName` on `ModifyDBCluster` or `DBParameterGroupName` on
+`ModifyDBInstance`, takes effect the next time the container starts: `RebootDBInstance` on the
+writer or on a standalone instance, a stop and start, or a Floci restart. A cluster's members share
+one database, so rebooting the writer restarts it for every member, and a reader's own DB
+parameter group is not applied. `time_zone` is passed as `--default-time-zone`, and Aurora's
+`binlog_format` of `OFF` turns binary logging off. A parameter the server does not know, such as
+one only Aurora has, is skipped with a warning in the database log. A formula value such as
+`{DBInstanceClassMemory*3/4}` keeps the server's default, and so do `port`, `bind_address`,
+`socket`, `datadir` and `skip_networking`, which Floci needs to reach the database, and
+`require_secure_transport` and `skip_grant_tables`, which would lock out Floci's proxy (it talks
+to the server without TLS). When the server refuses a value and stops, the instance, or every
+member of the cluster, reports `incompatible-parameters` and Floci logs the server's error; correct
+the group and reboot to start it again. PostgreSQL and SQL Server databases do not take parameter
+group values yet.
+
 ## Option Groups
 
 Option groups are metadata: Floci stores the options you add, returns them on the wire, and
@@ -753,6 +784,14 @@ fail while release is in progress; unrelated secrets remain available.
 A failed backend password rotation retains the managed secret and stored credentials.
 If Secrets Manager support is unavailable, opt-out fails before changing cluster state.
 This does not provide a transaction across database backends and persistent storage.
+
+## PostgreSQL restore connections
+
+Snapshot and point in time restores drop the target's non-template databases with
+`DROP DATABASE ... WITH (FORCE)` before replaying the dump. This terminates connections
+on the restore target, including preloaded workers such as pg_cron; the source is unchanged.
+Custom PostgreSQL images must support this syntax (PostgreSQL 13 or later). Prepared
+transactions and active logical replication slots or subscriptions can still prevent a drop.
 
 ## Point in time restore
 
@@ -967,6 +1006,41 @@ Two limits follow from that. `SHOW CREATE USER` reports the substituted plugin r
 connecting with a token is not yet emulated for MySQL: unlike PostgreSQL, which receives the
 password in cleartext, MySQL sends a scramble, so the proxy would have to drive the
 `mysql_clear_password` auth switch that real RDS triggers before it could see a token to validate.
+
+## Certificate authorities
+
+`DescribeCertificates` lists the Region's RDS certificate authorities, `rds-ca-rsa2048-g1`,
+`rds-ca-rsa4096-g1` and `rds-ca-ecc384-g1`, with the thumbprint and validity AWS reports. They are
+vendored from the certificate bundles AWS publishes for each Region of the `aws` partition by
+`tools/aws/regen_rds_ca_certificates.py`. As the user guide says, ap-south-1, ap-southeast-4,
+ca-west-1, eu-central-2, eu-south-2 and il-central-1 offer only `rds-ca-rsa2048-g1`, though their
+bundles carry all three. A Region with no vendored entry, such as a GovCloud, China or custom one,
+reports us-east-1's certificates under its own ARN.
+
+- `CertificateIdentifier` filters, without regard to case, and an unknown one is
+  `CertificateNotFound`. `MaxRecords` (20 to 100) and `Marker` page the list. `Filters` is not taken,
+  since the API reference says it isn't supported.
+- `DefaultCertificateForNewLaunches` is `rds-ca-rsa2048-g1` until `ModifyCertificates` sets an
+  override for the account and Region. The overriding certificate then reports `CustomerOverride`
+  true and its `CustomerOverrideValidTill`. `RemoveCustomerOverride` puts RDS's default back.
+  Sending both members, or neither, is `InvalidParameterCombination`. AWS doesn't document what it does here, so
+  this behavior is a guess.
+- `CreateDBInstance`, `RestoreDBInstanceFromDBSnapshot`, `RestoreDBInstanceToPointInTime`,
+  `CreateDBInstanceReadReplica` and `ModifyDBInstance` take `CACertificateIdentifier`. An instance
+  given none gets the account's default when it is created. An unknown identifier is
+  `CertificateNotFound`. A modify changes it at once, as Floci applies every modification
+  immediately, and a blank value leaves it as it was. `CertificateRotationRestart` is accepted and
+  has no effect.
+- Instances report `CACertificateIdentifier` and `CertificateDetails` (`CAIdentifier`, with the
+  CA's `ValidTill`, as Floci keeps no per-instance server certificate). An instance stored before
+  this was recorded reports `rds-ca-rsa2048-g1`, since an override applies only to instances
+  created after it. `AWS::RDS::DBInstance` takes
+  `CACertificateIdentifier` and resolves `CertificateDetails.CAIdentifier` and
+  `CertificateDetails.ValidTill` in `Fn::GetAtt`.
+
+The identifier is metadata: the auth proxy presents a certificate from Floci's own CA whatever
+the instance names, so clients trust Floci's CA (see [TLS / SSL](#tls-ssl)), not AWS's bundle.
+Multi-AZ DB clusters do not take `CACertificateIdentifier` yet.
 
 ## TLS / SSL
 

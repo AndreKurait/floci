@@ -355,6 +355,7 @@ public class FlociUiManager {
         }
         env.put(PORT_ENV, String.valueOf(console.internalPort()));
         env.put("FLOCI_CLOUD", FLOCI_CLOUD);
+        env.put("FLOCI_INFO_URL", infoUrl(endpoint));
         if (config.services().ui().insecureSkipTlsVerify()) {
             LOG.warn("floci.services.ui.insecure-skip-tls-verify=true: the web console sidecar will "
                     + "not verify Floci's TLS certificate. Intended for Floci's self-signed "
@@ -368,6 +369,12 @@ public class FlociUiManager {
         List<String> rendered = new ArrayList<>(env.size());
         env.forEach((key, value) -> rendered.add(key + "=" + value));
         return rendered;
+    }
+
+    /** Console Contract v2's {@code FLOCI_INFO_URL}: the manifest, at the address the console reaches Floci on. */
+    static String infoUrl(String endpoint) {
+        String base = endpoint.endsWith("/") ? endpoint.substring(0, endpoint.length() - 1) : endpoint;
+        return base + "/_floci/info";
     }
 
     /**

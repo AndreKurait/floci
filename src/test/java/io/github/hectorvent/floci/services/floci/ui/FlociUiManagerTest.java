@@ -689,7 +689,14 @@ class FlociUiManagerTest {
         assertTrue(env.contains("AWS_REGION=us-east-1"), env.toString());
         assertTrue(env.contains("AWS_DEFAULT_REGION=us-east-1"), env.toString());
         assertTrue(env.contains("FLOCI_CLOUD=aws"), env.toString());
+        assertTrue(env.contains("FLOCI_INFO_URL=http://floci:4566/_floci/info"), env.toString());
         assertTrue(env.contains("PORT=4500"), env.toString());
+    }
+
+    @Test
+    void theManifestUrlNeverDoublesTheSlash() {
+        assertEquals("http://floci:4566/_floci/info", FlociUiManager.infoUrl("http://floci:4566/"));
+        assertEquals("http://floci:4566/_floci/info", FlociUiManager.infoUrl("http://floci:4566"));
     }
 
     @Test

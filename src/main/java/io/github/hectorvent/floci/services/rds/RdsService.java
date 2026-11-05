@@ -183,6 +183,8 @@ public class RdsService implements Resettable, ResourceProvider {
     private StorageBackend<String, RdsEvent> events = new InMemoryStorage<>();
     private final StorageBackend<String, EventSubscription> eventSubscriptions;
     private final StorageBackend<String, DbClusterEndpoint> clusterEndpoints;
+    /** The account's ModifyCertificates override per Region, by CA identifier. */
+    private final StorageBackend<String, String> certificateOverrides;
     private final StorageBackend<String, DbProxyEndpoint> proxyEndpoints;
     private final RdsContainerManager containerManager;
     private final RdsProxyManager proxyManager;
@@ -285,6 +287,8 @@ public class RdsService implements Resettable, ResourceProvider {
                 new TypeReference<Map<String, String>>() {});
         this.events = storageFactory.create("rds", "rds-events.json",
                 new TypeReference<Map<String, RdsEvent>>() {});
+        this.certificateOverrides = storageFactory.create("rds", "rds-certificate-overrides.json",
+                new TypeReference<Map<String, String>>() {});
     }
 
     RdsService(RdsContainerManager containerManager,
@@ -422,6 +426,7 @@ public class RdsService implements Resettable, ResourceProvider {
         this.clusterSnapshots = new InMemoryStorage<>();
         this.snapshotData = new io.github.hectorvent.floci.core.storage.InMemoryStorage<>();
         this.eventSubscriptions = new InMemoryStorage<>();
+        this.certificateOverrides = new InMemoryStorage<>();
         this.clusterEndpoints = new InMemoryStorage<>();
         this.proxyEndpoints = new InMemoryStorage<>();
     }
@@ -743,6 +748,8 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         DbInstanceSettings.validateMonitoringPairOnCreate(
                 settings.monitoringInterval(), settings.monitoringRoleArn());
+        resolvedSettings = resolvedSettings.withCaCertificateIdentifier(
+                resolveCaCertificate(settings.caCertificateIdentifier(), effectiveRegion));
         boolean mock = config.services().rds().mock();
         if (masterUsername == null || masterUsername.isBlank()) {
             masterUsername = "root";
@@ -817,14 +824,15 @@ public class RdsService implements Resettable, ResourceProvider {
                 RdsContainerHandle handle = containerManager.tryStart(
                         dbInstanceArn, id, instanceStorageResourceId,
                         instanceDockerVolumeName, engine, image,
-                        masterUsername, masterPassword, dbName);
+                        masterUsername, masterPassword, dbName,
+                        instanceEngineParameters(currentAccountId(), effectiveRegion, paramGroupName));
                 if (handle != null) {
                     backendHost = handle.getHost();
                     backendPort = handle.getPort();
                     containerId = handle.getContainerId();
                     containerHost = handle.getHost();
                     containerPort = handle.getPort();
-                } else {
+                } else if (!containerManager.refusedParameterGroup(dbInstanceArn)) {
                     LOG.warnv("DB instance {0} created without a backing database container: no "
                             + "Docker daemon is reachable. Metadata operations work; connections to "
                             + "the database do not until a daemon appears.", id);
@@ -879,6 +887,14 @@ public class RdsService implements Resettable, ResourceProvider {
                         releaseProxyPort(proxyPort);
                         throw new AwsException("InvalidDBClusterStateFault",
                                 "DB cluster is not available for member creation.", 400);
+                    }
+                    if (!mock && currentCluster.resolveWriterIdentifier() == null) {
+                        try {
+                            applyWriterParameterGroup(currentCluster, paramGroupName, effectiveRegion);
+                        } catch (RuntimeException | Error e) {
+                            releaseProxyPort(proxyPort);
+                            throw e;
+                        }
                     }
                     backendHost = currentCluster.getContainerHost();
                     backendPort = currentCluster.getContainerPort();
@@ -1238,6 +1254,17 @@ public class RdsService implements Resettable, ResourceProvider {
                                                        List<String> vpcSecurityGroupIds,
                                                        Map<String, String> tags, String region,
                                                        Integer requestedPort, Boolean iamEnabled, String storageType) {
+        return restoreDbInstanceFromDbSnapshot(instanceId, snapshotId, dbInstanceClass, availabilityZone,
+                multiAz, dbSubnetGroupName, vpcSecurityGroupIds, tags, region, requestedPort, iamEnabled,
+                storageType, null);
+    }
+
+    public DbInstance restoreDbInstanceFromDbSnapshot(String instanceId, String snapshotId, String dbInstanceClass,
+                                                       String availabilityZone, boolean multiAz, String dbSubnetGroupName,
+                                                       List<String> vpcSecurityGroupIds,
+                                                       Map<String, String> tags, String region,
+                                                       Integer requestedPort, Boolean iamEnabled, String storageType,
+                                                       String caCertificateIdentifier) {
         String effectiveRegion = effectiveRegion(region);
         DbSnapshot snapshot = Optional.ofNullable(findSnapshotForScope(currentAccountId(), effectiveRegion, snapshotId))
                 .orElseThrow(() -> new AwsException("DBSnapshotNotFound", "DBSnapshot " + snapshotId + " not found.", 404));
@@ -1252,7 +1279,8 @@ public class RdsService implements Resettable, ResourceProvider {
         // Use the parameters from the snapshot
         DbInstanceSettings restoreSettings = new DbInstanceSettings(
                 snapshot.isStorageEncrypted(), snapshot.getKmsKeyId(), null, null, null, null)
-                .withStorageType(storageType != null ? storageType : snapshot.getStorageType());
+                .withStorageType(storageType != null ? storageType : snapshot.getStorageType())
+                .withCaCertificateIdentifier(caCertificateIdentifier);
         DbInstance instance = createDbInstance(instanceId, snapshot.getEngine().name().toLowerCase(), snapshot.getEngineVersion(),
                 snapshot.getMasterUsername(), snapshot.getMasterPassword(),
                 snapshot.getDbName(), targetClass, snapshot.getAllocatedStorage(), Boolean.TRUE.equals(iamEnabled),
@@ -1354,7 +1382,8 @@ public class RdsService implements Resettable, ResourceProvider {
                 source.isStorageEncrypted() ? source.getKmsKeyId() : null,
                 request.backupRetentionPeriod(), request.preferredBackupWindow(), null,
                 request.copyTagsToSnapshot()).withStorageType(
-                        request.storageType() != null ? request.storageType() : source.getStorageType());
+                        request.storageType() != null ? request.storageType() : source.getStorageType())
+                .withCaCertificateIdentifier(request.caCertificateIdentifier());
         DbInstance instance = createDbInstance(targetId, engineParam, source.getEngineVersion(),
                 source.getMasterUsername(), source.getMasterPassword(), dbName,
                 firstNonBlank(request.dbInstanceClass(), source.getDbInstanceClass()),
@@ -1562,7 +1591,8 @@ public class RdsService implements Resettable, ResourceProvider {
                 source.isStorageEncrypted() && sameRegion ? source.getKmsKeyId() : null,
                 0, source.getPreferredBackupWindow(), source.getPreferredMaintenanceWindow(),
                 copyTagsToSnapshot).withStorageType(
-                        request.storageType() != null ? request.storageType() : source.getStorageType());
+                        request.storageType() != null ? request.storageType() : source.getStorageType())
+                .withCaCertificateIdentifier(request.caCertificateIdentifier());
         Map<String, String> tags = request.tags() != null ? request.tags() : Map.of();
 
         DbInstance replica = createDbInstance(id, engineParam, source.getEngineVersion(),
@@ -1748,7 +1778,7 @@ public class RdsService implements Resettable, ResourceProvider {
      * Region as the linking instance, an ARN names one anywhere in the account.
      */
     private DbInstance findLinkedInstance(String accountId, DbInstance from, String linkName) {
-        if (linkName.startsWith("arn:")) {
+        if (AwsArnUtils.isArn(linkName)) {
             for (DbInstance candidate : instances.scan(k -> true)) {
                 if (linkName.equalsIgnoreCase(candidate.getDbInstanceArn())
                         && accountId.equals(accountIdFromArn(candidate.getDbInstanceArn()))) {
@@ -1778,7 +1808,7 @@ public class RdsService implements Resettable, ResourceProvider {
                     .equalsIgnoreCase(replica.getReadReplicaSourceDbInstanceIdentifier())) {
                 continue;
             }
-            if (replicaName.startsWith("arn:")) {
+            if (AwsArnUtils.isArn(replicaName)) {
                 replica.setReadReplicationStatus(READ_REPLICATION_TERMINATED);
             } else {
                 replica.setReadReplicaSourceDbInstanceIdentifier(null);
@@ -2616,7 +2646,7 @@ public class RdsService implements Resettable, ResourceProvider {
     }
 
     private String resourceRegionOrDefault(String resourceName) {
-        return resourceName != null && resourceName.startsWith("arn:")
+        return AwsArnUtils.isArn(resourceName)
                 ? regionFromArn(resourceName) : regionResolver.getDefaultRegion();
     }
 
@@ -2909,7 +2939,7 @@ public class RdsService implements Resettable, ResourceProvider {
         Map<String, DbInstance> unique = new LinkedHashMap<>();
         for (DbInstance instance : instances.scan(k -> true)) {
             boolean matchesFilter = filterId == null || filterId.isBlank()
-                    || (filterId.startsWith("arn:")
+                    || (AwsArnUtils.isArn(filterId)
                     ? filterId.equalsIgnoreCase(instance.getDbInstanceArn())
                     : instance.getDbInstanceIdentifier().equalsIgnoreCase(filterId));
             if (matchesFilter
@@ -3092,10 +3122,26 @@ public class RdsService implements Resettable, ResourceProvider {
             String optionGroupName, String region, Boolean autoMinorVersionUpgrade,
             DbInstanceSettings settings, Boolean publiclyAccessible,
             DbInstanceScalingChanges scaling, Boolean deletionProtection) {
+        return modifyDbInstance(id, newPassword, iamEnabled, dbSubnetGroupName,
+                vpcSecurityGroupIds, optionGroupName, region, autoMinorVersionUpgrade,
+                settings, publiclyAccessible, scaling, deletionProtection, null);
+    }
+
+    /**
+     * Like AWS, a new {@code dbParameterGroupName} is recorded at once and the engine runs with
+     * it from its next start, such as a reboot.
+     */
+    public DbInstance modifyDbInstance(
+            String id, String newPassword, Boolean iamEnabled,
+            String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
+            String optionGroupName, String region, Boolean autoMinorVersionUpgrade,
+            DbInstanceSettings settings, Boolean publiclyAccessible,
+            DbInstanceScalingChanges scaling, Boolean deletionProtection,
+            String dbParameterGroupName) {
         return withInstancePublication(id, region, () -> doModifyDbInstance(
                 id, newPassword, iamEnabled, dbSubnetGroupName, vpcSecurityGroupIds,
                 optionGroupName, region, autoMinorVersionUpgrade,
-                settings, publiclyAccessible, scaling, deletionProtection));
+                settings, publiclyAccessible, scaling, deletionProtection, dbParameterGroupName));
     }
 
     private synchronized DbInstance doModifyDbInstance(
@@ -3103,7 +3149,8 @@ public class RdsService implements Resettable, ResourceProvider {
             String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
             String optionGroupName, String region, Boolean autoMinorVersionUpgrade,
             DbInstanceSettings settings, Boolean publiclyAccessible,
-            DbInstanceScalingChanges scaling, Boolean deletionProtection) {
+            DbInstanceScalingChanges scaling, Boolean deletionProtection,
+            String dbParameterGroupName) {
         validateInstanceSettings(settings);
         String effectiveRegion = effectiveRegion(region);
         DbInstance instance = getDbInstance(id, effectiveRegion);
@@ -3123,7 +3170,19 @@ public class RdsService implements Resettable, ResourceProvider {
             effective = effective.withStorageType(null);
         }
         validateAutoscalingMinimum(instance, effective.maxAllocatedStorage());
+        if (!isBlank(settings.caCertificateIdentifier())) {
+            effective = effective.withCaCertificateIdentifier(
+                    resolveCaCertificate(settings.caCertificateIdentifier(), effectiveRegion));
+        }
+        boolean changesParameterGroup = dbParameterGroupName != null && !dbParameterGroupName.isBlank();
+        if (changesParameterGroup) {
+            validateInstanceParameterGroup(dbParameterGroupName, engineName(instance),
+                    instance.getEngineVersion(), effectiveRegion);
+        }
         instance.setStatus(DbInstanceStatus.AVAILABLE);
+        if (changesParameterGroup) {
+            instance.setParameterGroupName(dbParameterGroupName);
+        }
         if (optionGroupName != null && !optionGroupName.isBlank()) {
             validateInstanceOptionGroup(optionGroupName,
                     instance.getEngine() == null ? null : instance.getEngine().name().toLowerCase(),
@@ -3557,7 +3616,8 @@ public class RdsService implements Resettable, ResourceProvider {
             handle = containerManager.tryStart(
                     instance.getDbInstanceArn(), id, storageResourceId,
                     dockerVolumeName, instance.getEngine(), image, instance.getMasterUsername(),
-                    instance.getMasterPassword(), instance.getDbName());
+                    instance.getMasterPassword(), instance.getDbName(),
+                    instanceEngineParameters(instance));
         } catch (RuntimeException | Error e) {
             instance.setStatus(DbInstanceStatus.FAILED);
             putInstanceForScope(currentAccountId(), effectiveRegion, id, instance);
@@ -3720,8 +3780,36 @@ public class RdsService implements Resettable, ResourceProvider {
         cluster.setContainerPort(0);
     }
 
+    /**
+     * The first member of a cluster becomes its writer, whose DB parameter group is layered over
+     * the cluster's group. A running engine is restarted with it when that changes the options
+     * the engine runs with; one not started yet picks it up when it starts.
+     */
+    private void applyWriterParameterGroup(
+            DbCluster cluster, String writerParameterGroupName, String effectiveRegion) {
+        if (cluster.getContainerId() == null || cluster.getEndpoint() == null) {
+            return;
+        }
+        Map<String, String> withWriter = clusterEngineParameters(cluster, writerParameterGroupName);
+        if (RdsContainerManager.engineParameterOptions(cluster.getEngine(), withWriter).equals(
+                RdsContainerManager.engineParameterOptions(
+                        cluster.getEngine(), clusterEngineParameters(cluster, null)))) {
+            return;
+        }
+        String id = cluster.getDbClusterIdentifier();
+        String accountId = accountIdFromArn(cluster.getDbClusterArn());
+        stopDbClusterRuntime(cluster, id, effectiveRegion, accountId);
+        startClusterBackend(cluster, id, effectiveRegion, withWriter);
+        putClusterForScope(accountId, effectiveRegion, id, cluster);
+    }
+
     /** Brings a cluster's container up on its existing volume and its proxy with it. */
     private void startClusterBackend(DbCluster cluster, String id, String effectiveRegion) {
+        startClusterBackend(cluster, id, effectiveRegion, clusterEngineParameters(cluster));
+    }
+
+    private void startClusterBackend(DbCluster cluster, String id, String effectiveRegion,
+                                     Map<String, String> engineParameters) {
         if (cluster.getEndpoint() == null) {
             try {
                 ensureClusterBackend(id, effectiveRegion, false);
@@ -3740,7 +3828,7 @@ public class RdsService implements Resettable, ResourceProvider {
             handle = containerManager.tryStart(
                     cluster.getDbClusterArn(), id, storageResourceId, dockerVolumeName,
                     cluster.getEngine(), image, cluster.getMasterUsername(), cluster.getMasterPassword(),
-                    cluster.getDatabaseName());
+                    cluster.getDatabaseName(), engineParameters);
         } catch (RuntimeException | Error e) {
             cluster.setStatus(DbInstanceStatus.FAILED);
             putClusterForScope(currentAccountId(), effectiveRegion, id, cluster);
@@ -3783,12 +3871,18 @@ public class RdsService implements Resettable, ResourceProvider {
         putInstanceForScope(currentAccountId(), effectiveRegion, id, instance);
 
         boolean mock = config.services().rds().mock();
+        DbCluster writtenCluster = mock ? null : availableClusterWrittenBy(instance, id, effectiveRegion);
+        if (writtenCluster != null) {
+            return rebootClusterWriter(instance, id, writtenCluster, effectiveRegion);
+        }
+        boolean startAttempted = false;
         if (!mock) {
             // Stop proxy during reboot
             proxyManager.stopProxy(rdsResourceRelayKey(instance.getDbInstanceArn(), id));
 
             // Restart container if it's a standalone instance
             if (instance.getDbClusterIdentifier() == null && instance.getContainerId() != null) {
+                startAttempted = true;
                 try {
                     containerManager.stop(buildHandle(instance));
                 } catch (RuntimeException | Error e) {
@@ -3806,7 +3900,8 @@ public class RdsService implements Resettable, ResourceProvider {
                 RdsContainerHandle handle = containerManager.tryStart(
                         instance.getDbInstanceArn(), id, storageResourceId,
                         dockerVolumeName, instance.getEngine(), image, instance.getMasterUsername(),
-                        instance.getMasterPassword(), instance.getDbName());
+                        instance.getMasterPassword(), instance.getDbName(),
+                        instanceEngineParameters(instance));
                 instance.setContainerStorageResourceId(storageResourceId);
                 instance.setDockerVolumeName(dockerVolumeName);
                 instance.setContainerId(handle != null ? handle.getContainerId() : null);
@@ -3837,14 +3932,71 @@ public class RdsService implements Resettable, ResourceProvider {
                         proxyBinding(instance.getEngine(), instance.getEndpoint().address(),
                                 instance.getEndpoint().port(), instanceRegion, accountId,
                                 backendIdentity.dbUserResourceId()));
-            } else {
-                // No backing container: created or last rebooted while no daemon was reachable.
+            } else if (!startAttempted) {
+                // No backing container: created or last rebooted while no daemon was reachable,
+                // or its server did not start with its parameter group.
                 instance = doEnsureInstanceBackend(id, effectiveRegion);
             }
         }
 
         LOG.infov("DB instance {0} rebooted", id);
         return instance;
+    }
+
+    /** The available cluster whose writer {@code instance} is, or null. */
+    private DbCluster availableClusterWrittenBy(DbInstance instance, String id, String effectiveRegion) {
+        String clusterId = instance.getDbClusterIdentifier();
+        if (clusterId == null || clusterId.isBlank()) {
+            return null;
+        }
+        DbCluster cluster = findClusterForScope(
+                accountIdFromArn(instance.getDbInstanceArn()), effectiveRegion, clusterId);
+        if (cluster == null || !id.equals(cluster.resolveWriterIdentifier())
+                || (cluster.getStatus() != null && cluster.getStatus() != DbInstanceStatus.AVAILABLE)) {
+            return null;
+        }
+        return cluster;
+    }
+
+    /**
+     * Rebooting an Aurora cluster's writer restarts the database the cluster's members share, which
+     * is how a changed DB cluster parameter group, or the writer's DB parameter group, reaches it.
+     */
+    private DbInstance rebootClusterWriter(
+            DbInstance writer, String id, DbCluster cluster, String effectiveRegion) {
+        String clusterId = cluster.getDbClusterIdentifier();
+        String accountId = accountIdFromArn(cluster.getDbClusterArn());
+        try {
+            stopDbClusterRuntime(cluster, clusterId, effectiveRegion, accountId);
+            startClusterBackend(cluster, clusterId, effectiveRegion);
+        } catch (RuntimeException | Error e) {
+            writer.setStatus(DbInstanceStatus.FAILED);
+            try {
+                putInstanceForScope(accountId, effectiveRegion, id, writer);
+            } catch (RuntimeException persistFailure) {
+                e.addSuppressed(persistFailure);
+            }
+            throw e;
+        }
+        putClusterForScope(accountId, effectiveRegion, clusterId, cluster);
+        restoreClusterMemberBackends(cluster, effectiveRegion, true);
+        LOG.infov("DB instance {0} rebooted with the database of DB cluster {1}", id, clusterId);
+        return getDbInstance(id, effectiveRegion);
+    }
+
+    /**
+     * Whether the database an instance runs on did not start with its parameter group's values,
+     * which AWS reports as incompatible-parameters until a reboot starts it. A cluster member
+     * shares its cluster's database.
+     */
+    public boolean databaseRefusedParameterGroup(DbInstance instance) {
+        return !config.services().rds().mock()
+                && containerManager.refusedParameterGroup(instanceBackendRuntimeId(instance));
+    }
+
+    /** Returns the runtime that owns an instance's backing container. Cluster members share their cluster runtime. */
+    public String instanceBackendRuntimeId(DbInstance instance) {
+        return instanceBackendIdentity(instance).runtimeId();
     }
 
     private InstanceBackendIdentity instanceBackendIdentity(DbInstance instance) {
@@ -3935,7 +4087,8 @@ public class RdsService implements Resettable, ResourceProvider {
             started = containerManager.tryStart(
                     instance.getDbInstanceArn(), id, resolvedInstanceStorageResourceId(instance),
                     resolvedInstanceDockerVolumeName(instance), instance.getEngine(), image,
-                    instance.getMasterUsername(), instance.getMasterPassword(), instance.getDbName());
+                    instance.getMasterUsername(), instance.getMasterPassword(), instance.getDbName(),
+                    instanceEngineParameters(instance));
             if (started == null) {
                 return instance;
             }
@@ -4040,7 +4193,8 @@ public class RdsService implements Resettable, ResourceProvider {
         RdsContainerHandle started = containerManager.tryStart(
                 cluster.getDbClusterArn(), id, storageResourceId, dockerVolumeName,
                 cluster.getEngine(), image, cluster.getMasterUsername(),
-                cluster.getMasterPassword(), cluster.getDatabaseName());
+                cluster.getMasterPassword(), cluster.getDatabaseName(),
+                clusterEngineParameters(cluster));
         if (started == null) {
             return cluster;
         }
@@ -4464,12 +4618,13 @@ public class RdsService implements Resettable, ResourceProvider {
             RdsContainerHandle handle = containerManager.tryStart(
                     clusterArn, id, clusterResourceId, clusterDockerVolumeName,
                     engine, image,
-                    masterUsername, masterPassword, databaseName);
+                    masterUsername, masterPassword, databaseName,
+                    clusterEngineParameters(currentAccountId(), effectiveRegion, paramGroupName));
             if (handle != null) {
                 cluster.setContainerId(handle.getContainerId());
                 cluster.setContainerHost(handle.getHost());
                 cluster.setContainerPort(handle.getPort());
-            } else {
+            } else if (!containerManager.refusedParameterGroup(clusterArn)) {
                 LOG.warnv("DB cluster {0} created without a backing database container: no Docker "
                         + "daemon is reachable. Metadata operations work; connections to the "
                         + "database do not until a daemon appears.", id);
@@ -4808,7 +4963,7 @@ public class RdsService implements Resettable, ResourceProvider {
         Map<String, DbCluster> unique = new LinkedHashMap<>();
         for (DbCluster cluster : clusters.scan(k -> true)) {
             boolean matchesFilter = filterId == null || filterId.isBlank()
-                    || (filterId.startsWith("arn:")
+                    || (AwsArnUtils.isArn(filterId)
                     ? filterId.equalsIgnoreCase(cluster.getDbClusterArn())
                     : cluster.getDbClusterIdentifier().equalsIgnoreCase(filterId));
             if (matchesFilter
@@ -4855,6 +5010,20 @@ public class RdsService implements Resettable, ResourceProvider {
                                      Integer serverlessV2SecondsUntilAutoPause,
                                      Boolean manageMasterUserPassword, String masterUserSecretKmsKeyId,
                                      String region) {
+        return modifyDbCluster(id, newPassword, iamEnabled, serverlessV2MinCapacity,
+                serverlessV2MaxCapacity, serverlessV2SecondsUntilAutoPause,
+                manageMasterUserPassword, masterUserSecretKmsKeyId, null, region);
+    }
+
+    /**
+     * Like AWS, a new {@code dbClusterParameterGroupName} is recorded at once and the engine runs
+     * with it from its next start, such as a reboot.
+     */
+    public DbCluster modifyDbCluster(String id, String newPassword, Boolean iamEnabled,
+                                     Double serverlessV2MinCapacity, Double serverlessV2MaxCapacity,
+                                     Integer serverlessV2SecondsUntilAutoPause,
+                                     Boolean manageMasterUserPassword, String masterUserSecretKmsKeyId,
+                                     String dbClusterParameterGroupName, String region) {
         String effectiveRegion = effectiveRegion(region);
         while (true) {
             DbCluster cluster = getDbCluster(id, effectiveRegion);
@@ -4866,7 +5035,8 @@ public class RdsService implements Resettable, ResourceProvider {
                     }
                     return doModifyDbCluster(id, newPassword, iamEnabled, serverlessV2MinCapacity,
                             serverlessV2MaxCapacity, serverlessV2SecondsUntilAutoPause,
-                            manageMasterUserPassword, masterUserSecretKmsKeyId, region);
+                            manageMasterUserPassword, masterUserSecretKmsKeyId,
+                            dbClusterParameterGroupName, region);
                 }
             }
         }
@@ -4876,9 +5046,15 @@ public class RdsService implements Resettable, ResourceProvider {
                                      Double serverlessV2MinCapacity, Double serverlessV2MaxCapacity,
                                      Integer serverlessV2SecondsUntilAutoPause,
                                      Boolean manageMasterUserPassword, String masterUserSecretKmsKeyId,
-                                     String region) {
+                                     String dbClusterParameterGroupName, String region) {
         String effectiveRegion = effectiveRegion(region);
         DbCluster cluster = getDbCluster(id, effectiveRegion);
+        boolean changesParameterGroup = dbClusterParameterGroupName != null
+                && !dbClusterParameterGroupName.isBlank();
+        if (changesParameterGroup) {
+            validateClusterParameterGroup(dbClusterParameterGroupName, engineName(cluster),
+                    cluster.getEngineVersion(), effectiveRegion);
+        }
         boolean modifiesServerlessV2Scaling = serverlessV2MinCapacity != null
                 || serverlessV2MaxCapacity != null
                 || serverlessV2SecondsUntilAutoPause != null;
@@ -4954,6 +5130,9 @@ public class RdsService implements Resettable, ResourceProvider {
                 && masterUserSecretKmsKeyId != null
                 && !masterUserSecretKmsKeyId.equals(cluster.getMasterUserSecretKmsKeyId())) {
             rekeyManagedMasterUserSecret(cluster, masterUserSecretKmsKeyId, effectiveRegion);
+        }
+        if (changesParameterGroup) {
+            cluster.setParameterGroupName(dbClusterParameterGroupName);
         }
         if (modifiesServerlessV2Scaling) {
             cluster.setServerlessV2MinCapacity(effectiveMinCapacity);
@@ -5602,7 +5781,7 @@ public class RdsService implements Resettable, ResourceProvider {
         if (reference == null || reference.isBlank()) {
             throw new AwsException("InvalidParameterValue", "DBClusterIdentifier is required.", 400);
         }
-        if (reference.startsWith("arn:")) {
+        if (AwsArnUtils.isArn(reference)) {
             DbCluster cluster = findClusterByArn(accountId, reference);
             if (cluster == null) {
                 throw new AwsException("DBClusterNotFoundFault", "DB cluster " + reference + " not found.", 404);
@@ -6387,6 +6566,104 @@ public class RdsService implements Resettable, ResourceProvider {
         LOG.infov("DB proxy {0} deleted", name);
     }
 
+    // ── Certificates ──────────────────────────────────────────────────────────
+
+    /** A certificate authority as DescribeCertificates and ModifyCertificates report it. */
+    public record Certificate(String certificateIdentifier, String thumbprint, Instant validFrom,
+                              Instant validTill, String certificateArn, boolean customerOverride,
+                              Instant customerOverrideValidTill) {}
+
+    public record CertificatePage(List<Certificate> certificates, String defaultForNewLaunches, String marker) {}
+
+    /** The CA an instance reports and the end of its validity. */
+    public record InstanceCertificate(String caIdentifier, Instant validTill) {}
+
+    /**
+     * The Region's certificate authorities in identifier order, or the one named, with the CA a new
+     * instance gets. {@code Filters} is not taken: the API reference says it isn't supported.
+     */
+    public synchronized CertificatePage describeCertificates(String region, String certificateIdentifier,
+                                                             Integer maxRecords, String marker) {
+        String effectiveRegion = effectiveRegion(region);
+        requireValidMaxRecords(maxRecords);
+        String override = certificateOverrides.get(effectiveRegion).orElse(null);
+        List<Certificate> matching = new ArrayList<>();
+        for (RdsCaCertificates.CaCertificate ca : RdsCaCertificates.forRegion(effectiveRegion)) {
+            if (isBlank(certificateIdentifier) || ca.identifier().equalsIgnoreCase(certificateIdentifier)) {
+                matching.add(certificate(ca, effectiveRegion, ca.identifier().equals(override)));
+            }
+        }
+        if (!isBlank(certificateIdentifier) && matching.isEmpty()) {
+            throw certificateNotFound(certificateIdentifier);
+        }
+        OffsetPage<Certificate> page = offsetPage(matching, maxRecords, marker);
+        return new CertificatePage(page.items(), defaultCaCertificate(effectiveRegion), page.marker());
+    }
+
+    /**
+     * Sets the CA new instances in the Region get, or with {@code removeCustomerOverride} puts back
+     * RDS's default. The answer is the CA set, or after a removal the one that was overridden.
+     */
+    public synchronized Certificate modifyCertificates(String region, String certificateIdentifier,
+                                                       Boolean removeCustomerOverride) {
+        String effectiveRegion = effectiveRegion(region);
+        boolean remove = Boolean.TRUE.equals(removeCustomerOverride);
+        if (remove == !isBlank(certificateIdentifier)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Specify either CertificateIdentifier or RemoveCustomerOverride, but not both.", 400);
+        }
+        if (remove) {
+            String previous = certificateOverrides.get(effectiveRegion)
+                    .orElse(RdsCaCertificates.DEFAULT_FOR_NEW_LAUNCHES);
+            certificateOverrides.delete(effectiveRegion);
+            return certificate(RdsCaCertificates.find(effectiveRegion, previous)
+                    .orElseThrow(() -> certificateNotFound(previous)), effectiveRegion, false);
+        }
+        RdsCaCertificates.CaCertificate ca = RdsCaCertificates.find(effectiveRegion, certificateIdentifier)
+                .orElseThrow(() -> certificateNotFound(certificateIdentifier));
+        certificateOverrides.put(effectiveRegion, ca.identifier());
+        return certificate(ca, effectiveRegion, true);
+    }
+
+    /**
+     * The CA an instance reports. One stored before CAs were recorded reports RDS's default, since an
+     * override applies only to instances created after it.
+     */
+    public InstanceCertificate instanceCertificate(DbInstance instance) {
+        String region = regionFromArn(instance.getDbInstanceArn());
+        String identifier = instance.getCaCertificateIdentifier() != null
+                ? instance.getCaCertificateIdentifier() : RdsCaCertificates.DEFAULT_FOR_NEW_LAUNCHES;
+        return RdsCaCertificates.find(region, identifier)
+                .map(ca -> new InstanceCertificate(ca.identifier(), ca.validTill()))
+                .orElse(new InstanceCertificate(identifier, null));
+    }
+
+    /** The account's override for the Region, else RDS's default. */
+    private String defaultCaCertificate(String region) {
+        return certificateOverrides.get(region).orElse(RdsCaCertificates.DEFAULT_FOR_NEW_LAUNCHES);
+    }
+
+    /** The requested CA in its canonical case, or the Region's default when none is requested. */
+    private String resolveCaCertificate(String requested, String region) {
+        if (isBlank(requested)) {
+            return defaultCaCertificate(region);
+        }
+        return RdsCaCertificates.find(region, requested)
+                .map(RdsCaCertificates.CaCertificate::identifier)
+                .orElseThrow(() -> certificateNotFound(requested));
+    }
+
+    private Certificate certificate(RdsCaCertificates.CaCertificate ca, String region, boolean override) {
+        String arn = new AwsArnUtils.Arn(regionResolver.partitionForRegion(region), "rds", region, "",
+                "cert:" + ca.identifier()).toString();
+        return new Certificate(ca.identifier(), ca.thumbprint(), ca.validFrom(), ca.validTill(), arn, override,
+                override ? ca.validTill() : null);
+    }
+
+    private static AwsException certificateNotFound(String identifier) {
+        return new AwsException("CertificateNotFound", "Certificate " + identifier + " not found.", 404);
+    }
+
     // ── DB Proxy endpoints ────────────────────────────────────────────────────
 
     /** AWS's limit on the endpoints a caller adds to one proxy, besides its default endpoint. */
@@ -6953,7 +7230,7 @@ public class RdsService implements Resettable, ResourceProvider {
         if (group == null) {
             ManagedClusterParameterGroup managed = managedClusterParameterGroup(name);
             if (managed != null) {
-                group = managed.toModel(effectiveRegion(region));
+                group = managed.toModel(effectiveRegion(region), regionResolver);
             }
         }
         if (group == null) {
@@ -6983,7 +7260,7 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         Map<String, DbClusterParameterGroup> unique = new LinkedHashMap<>();
         for (ManagedClusterParameterGroup managed : MANAGED_CLUSTER_PARAMETER_GROUPS) {
-            DbClusterParameterGroup group = managed.toModel(effectiveRegion);
+            DbClusterParameterGroup group = managed.toModel(effectiveRegion, regionResolver);
             unique.put(group.getDbClusterParameterGroupName(), group);
         }
         List<DbClusterParameterGroup> storedGroups;
@@ -7031,9 +7308,10 @@ public class RdsService implements Resettable, ResourceProvider {
     }
 
     private record ManagedClusterParameterGroup(String name, String family, String description) {
-        private DbClusterParameterGroup toModel(String region) {
+        private DbClusterParameterGroup toModel(String region, RegionResolver regionResolver) {
             DbClusterParameterGroup group = new DbClusterParameterGroup(name, family, description);
             group.setRegion(region);
+            group.setDbClusterParameterGroupArn(regionResolver.buildArn("rds", region, "cluster-pg:" + name));
             return group;
         }
     }
@@ -8366,7 +8644,8 @@ public class RdsService implements Resettable, ResourceProvider {
                 restoredHandle = containerManager.tryStart(
                         cluster.getDbClusterArn(), cluster.getDbClusterIdentifier(),
                         storageResourceId, dockerVolumeName, cluster.getEngine(), image,
-                        cluster.getMasterUsername(), cluster.getMasterPassword(), cluster.getDatabaseName());
+                        cluster.getMasterUsername(), cluster.getMasterPassword(), cluster.getDatabaseName(),
+                        clusterEngineParameters(cluster));
                 cluster.setContainerId(restoredHandle != null ? restoredHandle.getContainerId() : null);
                 cluster.setContainerHost(restoredHandle != null ? restoredHandle.getHost() : null);
                 cluster.setContainerPort(restoredHandle != null ? restoredHandle.getPort() : 0);
@@ -8508,7 +8787,8 @@ public class RdsService implements Resettable, ResourceProvider {
                             instance.getDbInstanceArn(), instance.getDbInstanceIdentifier(),
                             instance.getContainerStorageResourceId(),
                             instance.getDockerVolumeName(), instance.getEngine(), image,
-                            instance.getMasterUsername(), instance.getMasterPassword(), instance.getDbName());
+                            instance.getMasterUsername(), instance.getMasterPassword(), instance.getDbName(),
+                            instanceEngineParameters(instance));
                     backendHost = restoredHandle != null ? restoredHandle.getHost() : null;
                     backendPort = restoredHandle != null ? restoredHandle.getPort() : 0;
                     instance.setContainerId(restoredHandle != null ? restoredHandle.getContainerId() : null);
@@ -9082,6 +9362,84 @@ public class RdsService implements Resettable, ResourceProvider {
             subnetGroups.delete(groupName);
         }
         return legacy.orElse(null);
+    }
+
+    /** The overrides of a standalone instance's DB parameter group, which its engine runs with. */
+    private Map<String, String> instanceEngineParameters(DbInstance instance) {
+        return instanceEngineParameters(accountIdFromArn(instance.getDbInstanceArn()),
+                regionFromArn(instance.getDbInstanceArn()), instance.getParameterGroupName());
+    }
+
+    /**
+     * The overrides a DB parameter group sets, read in the account and region of the resource
+     * that uses it. A managed default group has none, and neither has a missing group.
+     */
+    private Map<String, String> instanceEngineParameters(
+            String accountId, String region, String groupName) {
+        if (groupName == null || groupName.isBlank()) {
+            return Map.of();
+        }
+        String effectiveRegion = effectiveRegion(region);
+        DbParameterGroup group;
+        if (parameterGroups instanceof AccountAwareStorageBackend<DbParameterGroup> aware) {
+            group = aware.getForAccountMigratingLegacyKeys(
+                    accountId, dbResourceKey(effectiveRegion, groupName), List.of(groupName),
+                    candidate -> Objects.equals(groupName, candidate.getDbParameterGroupName())
+                            && parameterGroupBelongsToRegion(candidate, effectiveRegion),
+                    Objects.equals(accountId, defaultAccountId())).orElse(null);
+        } else {
+            group = findParameterGroupForRegion(groupName, effectiveRegion);
+        }
+        return group == null || group.getParameters() == null
+                ? Map.of() : new HashMap<>(group.getParameters());
+    }
+
+    /**
+     * The overrides a cluster's engine runs with: those of its DB cluster parameter group, with
+     * those of its writer's DB parameter group on top, as an instance-level value such as
+     * {@code max_connections} overrides the cluster's on AWS.
+     */
+    private Map<String, String> clusterEngineParameters(DbCluster cluster) {
+        String writerId = cluster.resolveWriterIdentifier();
+        DbInstance writer = writerId == null ? null : findInstanceForScope(
+                accountIdFromArn(cluster.getDbClusterArn()),
+                effectiveRegion(regionFromArn(cluster.getDbClusterArn())), writerId);
+        return clusterEngineParameters(cluster, writer == null ? null : writer.getParameterGroupName());
+    }
+
+    private Map<String, String> clusterEngineParameters(
+            DbCluster cluster, String writerParameterGroupName) {
+        String accountId = accountIdFromArn(cluster.getDbClusterArn());
+        String region = regionFromArn(cluster.getDbClusterArn());
+        Map<String, String> parameters = new HashMap<>(
+                clusterEngineParameters(accountId, region, cluster.getParameterGroupName()));
+        parameters.putAll(instanceEngineParameters(accountId, region, writerParameterGroupName));
+        return parameters;
+    }
+
+    /**
+     * The overrides a DB cluster parameter group sets, read in the account and region of the
+     * cluster that uses it. A managed default group has none, and neither has a missing group.
+     */
+    private Map<String, String> clusterEngineParameters(
+            String accountId, String region, String groupName) {
+        if (groupName == null || groupName.isBlank()) {
+            return Map.of();
+        }
+        String effectiveRegion = effectiveRegion(region);
+        DbClusterParameterGroup group;
+        if (clusterParameterGroups
+                instanceof AccountAwareStorageBackend<DbClusterParameterGroup> aware) {
+            group = aware.getForAccountMigratingLegacyKeys(
+                    accountId, dbResourceKey(effectiveRegion, groupName), List.of(groupName),
+                    candidate -> Objects.equals(groupName, candidate.getDbClusterParameterGroupName())
+                            && clusterParameterGroupBelongsToRegion(candidate, effectiveRegion),
+                    Objects.equals(accountId, defaultAccountId())).orElse(null);
+        } else {
+            group = findClusterParameterGroupForRegion(groupName, effectiveRegion);
+        }
+        return group == null || group.getParameters() == null
+                ? Map.of() : new HashMap<>(group.getParameters());
     }
 
     private synchronized DbParameterGroup findParameterGroupForRegion(

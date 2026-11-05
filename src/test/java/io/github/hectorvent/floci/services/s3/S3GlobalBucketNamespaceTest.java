@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.AwsCanonicalUserId;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.s3.model.Bucket;
 import io.github.hectorvent.floci.services.s3.model.MultipartUpload;
 import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
@@ -52,6 +54,78 @@ class S3GlobalBucketNamespaceTest {
         Instance<RequestContext> inst = mock(Instance.class);
         when(inst.get()).thenReturn(rc);
         return inst;
+    }
+
+    @Test
+    void legacyGovernanceRetentionIsReadableOnlyByTheDefaultOwnerBeforeMigration() {
+        Instance<RequestContext> context = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        StorageBackend<String, S3Object> rawObjects = new InMemoryStorage<>();
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(rawObjects, context, DEFAULT_ACCT);
+        S3Service service = new S3Service(buckets, objects, Path.of("s3-legacy-retention-test"), true, false);
+        service.createBucket("legacy-retention-bucket", "us-east-1");
+        service.putBucketVersioning("legacy-retention-bucket", "Enabled");
+        service.setBucketObjectLockEnabled("legacy-retention-bucket");
+        S3Object object = service.putObject("legacy-retention-bucket", "object.txt",
+                "payload".getBytes(UTF_8), "text/plain", Map.of());
+        String version = object.getVersionId();
+        service.putObjectRetention("legacy-retention-bucket", "object.txt", version,
+                "GOVERNANCE", Instant.parse("2035-01-01T00:00:00Z"), true);
+        String currentKey = "legacy-retention-bucket/object.txt";
+        String versionKey = currentKey + "#v#" + version;
+        for (String key : List.of(currentKey, versionKey)) {
+            rawObjects.put(key, objects.getForAccount(DEFAULT_ACCT, key).orElseThrow());
+            rawObjects.delete(DEFAULT_ACCT + "/" + key);
+        }
+
+        assertTrue(service.isGovernanceRetentionActive("legacy-retention-bucket", "object.txt", version));
+        assertTrue(service.deleteOverridesGovernanceRetention("legacy-retention-bucket", "object.txt", version));
+        assertTrue(rawObjects.get(versionKey).isPresent());
+        assertTrue(objects.getForAccount(DEFAULT_ACCT, versionKey).isEmpty());
+        caller.set(ACCOUNT_A);
+        service.createBucket("legacy-retention-bucket", "us-east-1");
+        assertFalse(service.isGovernanceRetentionActive("legacy-retention-bucket", "object.txt", version));
+        assertTrue(objects.getForAccount(ACCOUNT_A, versionKey).isEmpty());
+        assertTrue(rawObjects.get(versionKey).isPresent());
+        caller.set(DEFAULT_ACCT);
+        service.deleteObject("legacy-retention-bucket", "object.txt", version, true);
+        assertTrue(objects.getForAccount(DEFAULT_ACCT, versionKey).isEmpty());
+        assertTrue(rawObjects.get(versionKey).isEmpty());
+    }
+
+    @Test
+    void crossAccountListingsReadTheOwnersObjectsAndPreservePrefixPagination() {
+        Instance<RequestContext> context = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        S3Service service = new S3Service(buckets, objects, Path.of("s3-gns-listing-test"), true, true);
+        caller.set(ACCOUNT_A);
+        service.createBucket("owner-listing-bucket", "us-east-1");
+        service.putObject("owner-listing-bucket", "one.txt", "one".getBytes(UTF_8), "text/plain", Map.of());
+        service.putObject("owner-listing-bucket", "nested/two.txt", "two".getBytes(UTF_8),
+                "text/plain", Map.of());
+        caller.set(ACCOUNT_B);
+        service.putObject("owner-listing-bucket", "three.txt", "three".getBytes(UTF_8), "text/plain", Map.of());
+        assertEquals(List.of("nested/two.txt", "one.txt", "three.txt"),
+                service.listObjects("owner-listing-bucket", null, null, 100).stream()
+                        .map(S3Object::getKey).toList());
+        S3Service.ListObjectsResult first =
+                service.listObjectsWithPrefixes("owner-listing-bucket", null, "/", 1, null, null);
+        assertEquals(List.of("nested/"), first.commonPrefixes());
+        assertTrue(first.isTruncated());
+        S3Service.ListObjectsResult next =
+                service.listObjectsWithPrefixes("owner-listing-bucket", null, "/", 100,
+                        first.nextContinuationToken(), null);
+        assertEquals(List.of("one.txt", "three.txt"), next.objects().stream().map(S3Object::getKey).toList());
+        assertEquals(List.of("nested/two.txt"),
+                service.listObjects("owner-listing-bucket", "nested/", null, 100).stream()
+                        .map(S3Object::getKey).toList());
+        assertTrue(service.listBuckets().isEmpty());
+        assertTrue(objects.scanForAccount(ACCOUNT_B, key -> true).isEmpty());
     }
 
     /**
@@ -278,15 +352,15 @@ class S3GlobalBucketNamespaceTest {
 
         String defaultAcl = globalNs.getObjectAcl(
                 "shared-metadata-bucket", "object.txt", versionId);
-        assertTrue(defaultAcl.contains(ACCOUNT_A));
-        assertFalse(defaultAcl.contains(ACCOUNT_B));
+        assertTrue(defaultAcl.contains(AwsCanonicalUserId.forAccount(ACCOUNT_A)));
+        assertFalse(defaultAcl.contains(AwsCanonicalUserId.forAccount(ACCOUNT_B)));
         globalNs.putObjectAcl(
                 "shared-metadata-bucket", "object.txt", versionId,
                 "", "public-read", null, null, null, null, null);
         String storedAcl = globalNs.getObjectAcl(
                 "shared-metadata-bucket", "object.txt", versionId);
-        assertTrue(storedAcl.contains(ACCOUNT_A));
-        assertFalse(storedAcl.contains(ACCOUNT_B));
+        assertTrue(storedAcl.contains(AwsCanonicalUserId.forAccount(ACCOUNT_A)));
+        assertFalse(storedAcl.contains(AwsCanonicalUserId.forAccount(ACCOUNT_B)));
 
         globalNs.deleteObjectTagging("shared-metadata-bucket", "object.txt");
         assertTrue(globalNs.getObjectTagging("shared-metadata-bucket", "object.txt").isEmpty());

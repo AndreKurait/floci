@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.dsql;
 
 import com.github.dockerjava.api.DockerClient;
+import io.github.hectorvent.floci.core.common.PostgresWire;
 import io.github.hectorvent.floci.services.dsql.dataplane.DsqlEndpoint;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.testing.EnforcementFixtures;
@@ -18,13 +19,21 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.PSQLWarning;
 
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -38,6 +47,7 @@ import static io.github.hectorvent.floci.services.dsql.DsqlWireClient.sync;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -109,6 +119,19 @@ class DsqlDataPlaneIntegrationTest {
         assertEquals("08P01", plain.getSQLState());
         assertTrue(plain.getServerErrorMessage().getDetail().startsWith("Session Id: "));
 
+        // Measured: a connection that names no server is refused once its password is in, whatever it is.
+        for (String password : List.of(cluster.adminToken(), "not-a-token")) {
+            PSQLException unnamed = assertThrows(PSQLException.class, () -> {
+                Properties properties = cluster.properties("admin", password);
+                properties.setProperty("sslfactory", "org.postgresql.ssl.NonValidatingFactory");
+                DriverManager.getConnection(cluster.url(), properties).close();
+            });
+            assertEquals("unable to accept connection, sni was not received",
+                    unnamed.getServerErrorMessage().getMessage());
+            assertEquals("08P01", unnamed.getSQLState());
+            assertTrue(unnamed.getServerErrorMessage().getDetail().startsWith("Session Id: "));
+        }
+
         PSQLException wrongAction = assertThrows(PSQLException.class, () ->
                 cluster.connect("admin", cluster.token("DbConnect", "test", "test", Instant.now(), 900, null)).close());
         assertEquals("unable to accept connection, access denied", wrongAction.getServerErrorMessage().getMessage());
@@ -135,6 +158,134 @@ class DsqlDataPlaneIntegrationTest {
         assertEquals("database \"other\" is not currently accepting connections",
                 otherDatabase.getServerErrorMessage().getMessage());
         assertEquals("55000", otherDatabase.getSQLState());
+    }
+
+    /**
+     * DSQL's limits (measured): a startup packet of 10,000 bytes or more, or under 8, and a client
+     * message over 10 MiB or under 4, are refused as soon as their length arrives, before signing in
+     * and after, and the connection closes.
+     */
+    @Test
+    void aPacketOutsideDsqlsLimitsIsRefusedAsItsLengthArrives() throws Exception {
+        try (DsqlWireClient client = DsqlWireClient.tls(endpoint.port(), cluster.host())) {
+            client.send(startupOfLength(9_999));
+            PostgresWire.Message password = client.next();
+            assertEquals('R', password.type());
+            assertEquals(3, PostgresWire.int32(password.body(), 0));
+        }
+        try (DsqlWireClient client = DsqlWireClient.tls(endpoint.port(), cluster.host())) {
+            client.send(startupOfLength(10_000));
+            assertRefused(client, "invalid length of startup packet");
+        }
+        try (DsqlWireClient client = DsqlWireClient.tls(endpoint.port(), cluster.host())) {
+            client.send(PostgresWire.int32(7), new byte[3]);
+            assertRefused(client, "invalid length of startup packet");
+        }
+        try (DsqlWireClient client = DsqlWireClient.tls(endpoint.port(), cluster.host())) {
+            client.send(startupOfLength(100));
+            assertEquals('R', client.next().type());
+            client.send(header('p', 10 * 1024 * 1024 + 1));
+            assertRefused(client, "invalid message length");
+        }
+        for (int length : new int[] {10 * 1024 * 1024 + 1, 3}) {
+            try (DsqlWireClient client = cluster.wireClient("admin", cluster.adminToken())) {
+                client.send(header('Q', length));
+                assertRefused(client, "invalid message length");
+            }
+        }
+    }
+
+    /**
+     * Before TLS, DSQL reads no more of a packet than its length and code (measured): a startup
+     * packet is refused as not TLS whatever length it claims, after a GSSENCRequest too, and one
+     * under 8 bytes ends the connection without a word. A length whose first byte is TLS's is read
+     * as TLS (see {@link #tlsWithNoSslRequestFirstIsTakenForTheAlpnProtocolPostgresql}).
+     */
+    @Test
+    void aPacketBeforeTlsIsRefusedAsNotTlsWhateverItsLength() throws Exception {
+        for (int length : new int[] {9_999, 10_000, 20_000}) {
+            for (boolean gssFirst : new boolean[] {false, true}) {
+                try (Socket socket = new Socket("127.0.0.1", endpoint.port())) {
+                    InputStream in = socket.getInputStream();
+                    OutputStream out = socket.getOutputStream();
+                    if (gssFirst) {
+                        out.write(PostgresWire.int32(8));
+                        out.write(PostgresWire.int32(PostgresWire.GSSENC_REQUEST));
+                        assertEquals('N', in.read());
+                    }
+                    out.write(startupOfLength(length));
+                    PostgresWire.Message error = PostgresWire.read(in, Integer.MAX_VALUE, "message");
+                    Map<Character, String> fields = PostgresWire.parseFields(error.body(), 0);
+                    assertEquals("08P01", fields.get('C'), length + (gssFirst ? " after GSSENCRequest" : ""));
+                    assertEquals("unable to accept connection, SSL is mandatory. AWS Authentication is required.",
+                            fields.get('M'));
+                }
+            }
+        }
+        try (Socket socket = new Socket("127.0.0.1", endpoint.port())) {
+            socket.getOutputStream().write(PostgresWire.int32(7));
+            assertEquals(-1, socket.getInputStream().read());
+        }
+    }
+
+    /**
+     * DSQL takes TLS started at once, with no SSLRequest, from a client offering the ALPN protocol
+     * postgresql, as libpq's and pgjdbc's direct negotiation do, and picks postgresql whenever a
+     * client offers it; a direct handshake without it completes and the connection closes without a
+     * word. A connection is told apart by its first byte alone: a startup packet claiming a length
+     * that starts with 0x16 is read as TLS, and answered with a TLS alert (measured).
+     */
+    @Test
+    void tlsWithNoSslRequestFirstIsTakenForTheAlpnProtocolPostgresql() throws Exception {
+        Properties properties = cluster.properties("admin", cluster.adminToken());
+        properties.setProperty("sslNegotiation", "direct");
+        try (Connection connection = DriverManager.getConnection(cluster.url(), properties);
+             Statement statement = connection.createStatement();
+             ResultSet row = statement.executeQuery("SELECT current_user")) {
+            assertTrue(row.next());
+            assertEquals("admin", row.getString(1));
+        }
+        try (DsqlWireClient client = DsqlWireClient.direct(endpoint.port(), cluster.host(), "http/1.1", "postgresql")) {
+            assertEquals("postgresql", client.applicationProtocol());
+            client.signIn("admin", cluster.adminToken());
+            client.send(query("SELECT 1"));
+            assertEquals(List.of("SELECT 1"), client.untilReady());
+        }
+        for (String[] alpn : new String[][] {{}, {"http/1.1"}}) {
+            try (DsqlWireClient client = DsqlWireClient.direct(endpoint.port(), cluster.host(), alpn)) {
+                assertEquals("", client.applicationProtocol(), List.of(alpn).toString());
+                // The endpoint's 30 s handshake timeout would close it too, later: only a close at once is this quick.
+                assertThrows(EOFException.class, () -> assertTimeoutPreemptively(Duration.ofSeconds(5), client::next),
+                        List.of(alpn).toString());
+            }
+        }
+        try (DsqlWireClient client = DsqlWireClient.tls(endpoint.port(), cluster.host(), "postgresql")) {
+            assertEquals("postgresql", client.applicationProtocol());
+            client.signIn("admin", cluster.adminToken());
+        }
+        try (DsqlWireClient client = DsqlWireClient.tls(endpoint.port(), cluster.host(), "http/1.1")) {
+            assertEquals("", client.applicationProtocol());
+            client.signIn("admin", cluster.adminToken());
+        }
+        try (Socket socket = new Socket("127.0.0.1", endpoint.port())) {
+            byte[] startup = startupOfLength(100);
+            System.arraycopy(PostgresWire.int32(0x16000000), 0, startup, 0, 4);
+            socket.getOutputStream().write(startup);
+            socket.setSoTimeout(5_000);
+            byte[] answer = socket.getInputStream().readAllBytes();
+            assertEquals(0x15, answer[0], "a TLS alert record, not a PostgreSQL message");
+        }
+    }
+
+    @Test
+    void aMessageOfTenMibIsTaken() throws Exception {
+        try (DsqlWireClient client = cluster.wireClient("admin", cluster.adminToken())) {
+            String padding = "x".repeat(10 * 1024 * 1024 - 4 - 1 - "SELECT 1 /**/".length());
+            client.send(query("SELECT 1 /*" + padding + "*/"));
+            assertEquals(List.of("SELECT 1"), client.untilReady());
+            client.send(query("SELECT 2"));
+            assertEquals(List.of("SELECT 1"), client.untilReady());
+        }
     }
 
     @Test
@@ -626,5 +777,35 @@ class DsqlDataPlaneIntegrationTest {
     private EnforcementFixtures.UserCredentials accessKey(String account) {
         return EnforcementFixtures.createUser(cleanup, httpPort, EnforcementFixtures.auth(account, "iam"),
                 "dsql-" + System.nanoTime());
+    }
+
+    /** A startup packet signing in as {@code admin}, its application_name padded to make {@code length} bytes. */
+    private static byte[] startupOfLength(int length) {
+        Map<String, String> parameters = new LinkedHashMap<>();
+        parameters.put("user", "admin");
+        parameters.put("database", "postgres");
+        parameters.put("application_name", "");
+        parameters.put("application_name", "a".repeat(length - PostgresWire.startupMessage(parameters).length));
+        return PostgresWire.startupMessage(parameters);
+    }
+
+    /** A message's type and the length it announces, without any of its body. */
+    private static byte[] header(char type, int length) {
+        byte[] header = new byte[5];
+        header[0] = (byte) type;
+        System.arraycopy(PostgresWire.int32(length), 0, header, 1, 4);
+        return header;
+    }
+
+    /** The endpoint answers DSQL's FATAL with {@code message} and the session's id, then closes. */
+    private static void assertRefused(DsqlWireClient client, String message) throws IOException {
+        PostgresWire.Message error = client.next();
+        assertEquals('E', error.type());
+        Map<Character, String> fields = PostgresWire.parseFields(error.body(), 0);
+        assertEquals("FATAL", fields.get('S'));
+        assertEquals("08P01", fields.get('C'));
+        assertEquals(message, fields.get('M'));
+        assertTrue(fields.get('D').startsWith("Session Id: "), fields.get('D'));
+        assertThrows(IOException.class, client::next);
     }
 }

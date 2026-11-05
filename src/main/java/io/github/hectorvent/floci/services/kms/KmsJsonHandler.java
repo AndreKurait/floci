@@ -39,7 +39,7 @@ public class KmsJsonHandler {
 
     private static final Set<String> KEY_ID_OPERATIONS = Set.of(
             "GetPublicKey", "DescribeKey", "ReplicateKey", "CreateGrant", "ListGrants", "RevokeGrant", "Encrypt", "GenerateDataKey",
-            "GenerateDataKeyWithoutPlaintext", "Sign", "Verify", "GenerateMac", "VerifyMac", "ScheduleKeyDeletion",
+            "GenerateDataKeyWithoutPlaintext", "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext", "Sign", "Verify", "GenerateMac", "VerifyMac", "ScheduleKeyDeletion",
             "CancelKeyDeletion", "TagResource", "UntagResource", "ListResourceTags", "GetKeyPolicy", "PutKeyPolicy",
             "ListKeyPolicies", "UpdateKeyDescription", "GetKeyRotationStatus", "EnableKeyRotation",
             "DisableKeyRotation", "EnableKey", "DisableKey", "RotateKeyOnDemand", "GetParametersForImport",
@@ -81,6 +81,8 @@ public class KmsJsonHandler {
             case "ReEncrypt" -> handleReEncrypt(request, region);
             case "GenerateDataKey" -> handleGenerateDataKey(request, region);
             case "GenerateDataKeyWithoutPlaintext" -> handleGenerateDataKeyWithoutPlaintext(request, region);
+            case "GenerateDataKeyPair" -> handleGenerateDataKeyPair(request, region);
+            case "GenerateDataKeyPairWithoutPlaintext" -> handleGenerateDataKeyPairWithoutPlaintext(request, region);
             case "Sign" -> handleSign(request, region);
             case "Verify" -> handleVerify(request, region);
             case "GenerateMac" -> handleGenerateMac(request, region);
@@ -174,16 +176,58 @@ public class KmsJsonHandler {
     }
 
     private Response handleListKeys(JsonNode request, String region) {
-        List<KmsKey> keys = service.listKeys(region);
+        KmsService.Page<KmsKey> page = service.listKeys(region, marker(request), limit(request));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("Keys");
-        for (KmsKey k : keys) {
+        for (KmsKey k : page.items()) {
             ObjectNode entry = array.addObject();
             entry.put("KeyId", k.getKeyId());
             entry.put("KeyArn", k.getArn());
         }
-        response.put("Truncated", false);
+        putTruncation(response, page);
         return Response.ok(response).build();
+    }
+
+    /** MarkerType has length >= 1 in the model, so a present but empty Marker is refused, not ignored. */
+    private static String marker(JsonNode request) {
+        JsonNode node = request.path("Marker");
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isTextual()) {
+            // MarkerType is a string; any other JSON value is refused rather than coerced.
+            throw new AwsException("SerializationException", jsonToken(node) + " can not be converted to a String", 400);
+        }
+        String marker = node.textValue();
+        if (marker.isEmpty()) {
+            throw SmithyValidationErrors.validationException("Value '' at 'marker' failed to satisfy constraint: "
+                    + "Member must have length greater than or equal to 1");
+        }
+        return marker;
+    }
+
+    /**
+     * The model types Limit as an integer in LimitType [1..1000], so anything else is refused
+     * rather than coerced. A Limit above an action's documented page size is clamped by the service.
+     */
+    private static Integer limit(JsonNode request) {
+        JsonNode limit = request.path("Limit");
+        if (limit.isMissingNode() || limit.isNull()) {
+            return null;
+        }
+        if (!limit.isIntegralNumber() || !limit.canConvertToInt()) {
+            throw new AwsException("SerializationException",
+                    (limit.isNumber() ? "NUMBER_VALUE" : "STRING_VALUE") + " can not be converted to an Integer", 400);
+        }
+        validateRange("limit", limit.intValue(), 1, 1000);
+        return limit.intValue();
+    }
+
+    private static void putTruncation(ObjectNode response, KmsService.Page<?> page) {
+        response.put("Truncated", page.truncated());
+        if (page.truncated()) {
+            response.put("NextMarker", page.nextMarker());
+        }
     }
 
     private Response handleListGrants(JsonNode request, String region) {
@@ -357,6 +401,37 @@ public class KmsJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleGenerateDataKeyPair(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText();
+        String spec = readDataKeyPairSpec(request);
+        Map<String, String> context = readStrictEncryptionContext(request.path("EncryptionContext"));
+
+        KmsService.DataKeyPair result = service.generateDataKeyPair(keyId, spec, context, region);
+
+        ObjectNode response = dataKeyPairResponse(result);
+        response.put("PrivateKeyPlaintext", Base64.getEncoder().encodeToString(result.privateKeyPlaintext()));
+        return Response.ok(response).build();
+    }
+
+    private Response handleGenerateDataKeyPairWithoutPlaintext(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText();
+        String spec = readDataKeyPairSpec(request);
+        Map<String, String> context = readStrictEncryptionContext(request.path("EncryptionContext"));
+
+        KmsService.DataKeyPair result = service.generateDataKeyPairWithoutPlaintext(keyId, spec, context, region);
+
+        return Response.ok(dataKeyPairResponse(result)).build();
+    }
+
+    private ObjectNode dataKeyPairResponse(KmsService.DataKeyPair result) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("PrivateKeyCiphertextBlob", Base64.getEncoder().encodeToString(result.privateKeyCiphertextBlob()));
+        response.put("PublicKey", Base64.getEncoder().encodeToString(result.publicKey()));
+        response.put("KeyId", result.keyArn());
+        response.put("KeyPairSpec", result.keyPairSpec());
+        return response;
+    }
+
     private Response handleReEncrypt(JsonNode request, String region) {
         byte[] ciphertext = requireSizedBlob(request, "CiphertextBlob", false, KmsService.MAX_CIPHERTEXT_BYTES);
         String destKeyId = request.path("DestinationKeyId").asText();
@@ -387,6 +462,37 @@ public class KmsJsonHandler {
         Map<String, String> result = new HashMap<>();
         node.fields().forEachRemaining(e -> result.put(e.getKey(), e.getValue().asText()));
         return result;
+    }
+
+    /**
+     * EncryptionContextType is a map of string to string, so any other JSON value is refused rather
+     * than read as no context: a private key encrypted without the caller's context would decrypt
+     * without it too.
+     */
+    private static Map<String, String> readStrictEncryptionContext(JsonNode node) {
+        if (node.isMissingNode() || node.isNull()) {
+            return Map.of();
+        }
+        if (!node.isObject()) {
+            throw new AwsException("SerializationException", jsonToken(node) + " can not be converted to a Map", 400);
+        }
+        Map<String, String> result = new HashMap<>();
+        node.fields().forEachRemaining(e -> {
+            if (!e.getValue().isTextual()) {
+                throw new AwsException("SerializationException",
+                        jsonToken(e.getValue()) + " can not be converted to a String", 400);
+            }
+            result.put(e.getKey(), e.getValue().textValue());
+        });
+        return result;
+    }
+
+    private static String jsonToken(JsonNode node) {
+        return node.isTextual() ? "STRING_VALUE"
+                : node.isNumber() ? "NUMBER_VALUE"
+                : node.isBoolean() ? (node.booleanValue() ? "TRUE_VALUE" : "FALSE_VALUE")
+                : node.isNull() ? "VALUE_NULL"
+                : node.isArray() ? "START_ARRAY" : "START_OBJECT";
     }
 
     private Response handleSign(JsonNode request, String region) {
@@ -467,17 +573,17 @@ public class KmsJsonHandler {
     private Response handleListAliases(JsonNode request, String region) {
         JsonNode keyIdNode = request.path("KeyId");
         String keyId = (keyIdNode.isMissingNode() || keyIdNode.isNull()) ? null : keyIdNode.asText();
-        List<KmsAlias> aliases = service.listAliases(keyId, region);
+        KmsService.Page<KmsAlias> page = service.listAliases(keyId, region, marker(request), limit(request));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("Aliases");
-        for (KmsAlias a : aliases) {
+        for (KmsAlias a : page.items()) {
             ObjectNode entry = array.addObject();
             entry.put("AliasName", a.getAliasName());
             entry.put("AliasArn", a.getAliasArn());
             entry.put("TargetKeyId", a.getTargetKeyId());
             entry.put("CreationDate", a.getCreationDate());
         }
-        response.put("Truncated", false);
+        putTruncation(response, page);
         return Response.ok(response).build();
     }
 
@@ -683,6 +789,22 @@ public class KmsJsonHandler {
         return spec;
     }
 
+    private static final List<String> DATA_KEY_PAIR_SPECS = List.of("RSA_2048", "RSA_3072", "RSA_4096",
+            "ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1", "SM2", "ECC_NIST_EDWARDS25519");
+
+    private static String readDataKeyPairSpec(JsonNode request) {
+        String spec = request.path("KeyPairSpec").asText(null);
+        if (spec == null) {
+            throw SmithyValidationErrors.validationException(SmithyValidationErrors.notNull("keyPairSpec"));
+        }
+        if (!DATA_KEY_PAIR_SPECS.contains(spec)) {
+            throw SmithyValidationErrors.validationException("Value '" + spec
+                    + "' at 'keyPairSpec' failed to satisfy constraint: Member must satisfy enum value set: "
+                    + DATA_KEY_PAIR_SPECS.toString());
+        }
+        return spec;
+    }
+
     private static Integer readNumberOfBytes(JsonNode request) {
         JsonNode numberOfBytes = request.path("NumberOfBytes");
         if (!numberOfBytes.isNumber()) {
@@ -707,8 +829,7 @@ public class KmsJsonHandler {
         String name = Character.toLowerCase(member.charAt(0)) + member.substring(1);
         JsonNode value = request.path(member);
         if (value.isMissingNode() || value.isNull()) {
-            throw SmithyValidationErrors.validationException("Value null at '" + name
-                    + "' failed to satisfy constraint: Member must not be null");
+            throw SmithyValidationErrors.validationException(SmithyValidationErrors.notNull(name));
         }
         String keyId = value.asText();
         String pattern = "Value '" + keyId + "' at '" + name

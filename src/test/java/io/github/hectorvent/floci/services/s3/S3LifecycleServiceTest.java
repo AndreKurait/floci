@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.s3;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -127,6 +128,24 @@ class S3LifecycleServiceTest {
     }
 
     @Test
+    void noncurrentExpirationDeletesAnArchivedNullVersionWithoutChangingTheCurrentVersion() {
+        put("a.txt");
+        s3Service.putBucketVersioning(BUCKET, "Enabled");
+        S3Object current = put("a.txt");
+        lifecycle(rule("Enabled", "<Filter></Filter>",
+                "<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays>"
+                        + "</NoncurrentVersionExpiration>"));
+
+        s3Service.applyLifecycleExpiration(Instant.now().plus(Duration.ofDays(3)));
+
+        assertThat(versionIds("a.txt"), contains(current.getVersionId()));
+        assertEquals("data", new String(s3Service.getObject(BUCKET, "a.txt").getData(), StandardCharsets.UTF_8));
+        AwsException missing = assertThrows(AwsException.class,
+                () -> s3Service.getObject(BUCKET, "a.txt", "null"));
+        assertEquals("NoSuchVersion", missing.getErrorCode());
+    }
+
+    @Test
     void aNoncurrentVersionUnderALegalHoldIsKept() {
         s3Service.putBucketVersioning(BUCKET, "Enabled");
         s3Service.setBucketObjectLockEnabled(BUCKET);
@@ -198,7 +217,8 @@ class S3LifecycleServiceTest {
 
         s3Service.applyLifecycleExpiration(Instant.now());
 
-        assertEquals(List.of("lifecycle"), notifications.functionNames);
+        assertEquals(List.of("arn:aws:lambda:us-east-1:000000000000:function:lifecycle"),
+                notifications.functionNames);
         JsonNode record = new ObjectMapper().readTree(notifications.payloads.getFirst()).path("Records").get(0);
         assertEquals("LifecycleExpiration:Delete", record.path("eventName").asText());
         // The user guide's example names S3 itself, not a requester.

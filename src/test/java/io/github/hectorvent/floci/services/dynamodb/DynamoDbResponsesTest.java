@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.ws.rs.core.MediaType;
@@ -112,6 +113,21 @@ class DynamoDbResponsesTest {
     @Test
     void withCrc32_nullResponse_returnsNull() {
         assertNull(DynamoDbResponses.withCrc32(null, mapper));
+    }
+
+    @Test
+    void withCrc32_serializationFailurePreservesOriginalResponse() {
+        ObjectMapper failingMapper = new ObjectMapper() {
+            @Override
+            public byte[] writeValueAsBytes(Object value) throws JsonProcessingException {
+                throw new JsonProcessingException("expected serialization failure") {};
+            }
+        };
+        Response original = Response.status(202).entity(new Object())
+                .header("x-amzn-requestid", "request-123").build();
+
+        assertSame(original, DynamoDbResponses.withCrc32(original, failingMapper));
+        assertNull(original.getHeaderString("X-Amz-Crc32"));
     }
 
     @Test

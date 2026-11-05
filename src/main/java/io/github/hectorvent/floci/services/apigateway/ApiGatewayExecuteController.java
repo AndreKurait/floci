@@ -784,25 +784,35 @@ public class ApiGatewayExecuteController {
             return null;
         }
         String connectionId = integration.getConnectionId();
+        if (connectionId != null) {
+            Matcher stageVariable = ApiGatewayService.VPC_LINK_STAGE_VARIABLE.matcher(connectionId);
+            if (stageVariable.matches()) {
+                connectionId = scope.stage().getVariables().get(stageVariable.group(1));
+            }
+        }
         if (connectionId == null || connectionId.isBlank()) {
             return gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
                     "VPC_LINK integration is missing a connectionId");
         }
+        String status;
         try {
-            io.github.hectorvent.floci.services.apigateway.model.VpcLink link =
-                    apiGatewayService.getVpcLink(region, connectionId);
-            if (!"AVAILABLE".equalsIgnoreCase(link.getStatus())) {
+            status = apiGatewayService.getVpcLink(region, connectionId).getStatus();
+        } catch (AwsException e) {
+            try {
+                status = apiGatewayV2Service.getVpcLink(region, connectionId).getVpcLinkStatus();
+            } catch (AwsException ignored) {
+                LOG.warnv("VPC_LINK integration references unknown link {0} in {1}", connectionId, region);
                 return Response.status(502)
-                        .entity(jsonMessage("VPC link is not available: " + link.getStatus()))
+                        .entity(jsonMessage("Invalid VPC link identifier specified: " + connectionId))
                         .type(MediaType.APPLICATION_JSON).build();
             }
-            return null;
-        } catch (AwsException e) {
-            LOG.warnv("VPC_LINK integration references unknown link {0} in {1}", connectionId, region);
+        }
+        if (!"AVAILABLE".equalsIgnoreCase(status)) {
             return Response.status(502)
-                    .entity(jsonMessage("Invalid VPC link identifier specified: " + connectionId))
+                    .entity(jsonMessage("VPC link is not available: " + status))
                     .type(MediaType.APPLICATION_JSON).build();
         }
+        return null;
     }
 
     // ──────────────────────────── Binary payloads ────────────────────────────
@@ -1021,10 +1031,6 @@ public class ApiGatewayExecuteController {
             if (result.failure() == CognitoUserPoolAuthorizer.Failure.UNAUTHORIZED) {
                 return new AuthorizerResult(gatewayResponse(scope, GatewayResponseType.UNAUTHORIZED, 401,
                         "Unauthorized"), null, null);
-            }
-            if (result.failure() == CognitoUserPoolAuthorizer.Failure.ACCESS_DENIED) {
-                return new AuthorizerResult(gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
-                        "User is not authorized to access this resource"), null, null);
             }
             return new AuthorizerResult(null, result.principalId(), result.context());
         }
@@ -1608,6 +1614,11 @@ public class ApiGatewayExecuteController {
         return buildProxyResponse(result, httpApiV2, httpApiV2);
     }
 
+    // The Content-Type an HTTP API answers with when the function's result carries a body and no
+    // Content-Type header of its own (measured on AWS, eu-west-1, 2026-10-19, in both payload
+    // formats). A REST API keeps answering application/json.
+    private static final String HTTP_API_DEFAULT_CONTENT_TYPE = "text/plain; charset=utf-8";
+
     // httpApi selects the HTTP API error response; payloadV2 selects the integration's format 2.0
     // response rules (inference and cookies). An HTTP API integration can still use format 1.0.
     Response buildProxyResponse(InvokeResult result, boolean httpApi, boolean payloadV2) {
@@ -1670,7 +1681,7 @@ public class ApiGatewayExecuteController {
                 byte[] bytes = base64 ? Base64.getDecoder().decode(bodyStr) : bodyStr.getBytes();
                 String ct = findHeaderIgnoreCase(multiHeaders, "Content-Type")
                         .or(() -> findHeaderIgnoreCase(respHeaders, "Content-Type"))
-                        .orElse(MediaType.APPLICATION_JSON);
+                        .orElse(httpApi ? HTTP_API_DEFAULT_CONTENT_TYPE : MediaType.APPLICATION_JSON);
                 builder.entity(bytes).type(ct);
             }
             return builder.build();
@@ -3252,43 +3263,35 @@ public class ApiGatewayExecuteController {
             return new RequestAuthorizerResult(null, null); // Not a REQUEST authorizer — skip
         }
 
-        // Validate identity sources — if any configured source is missing, return 401 without invoking Lambda
+        String payloadFormatVersion = authorizer.getAuthorizerPayloadFormatVersion();
+        boolean formatTwo = "2.0".equals(payloadFormatVersion);
+        ObjectNode event = formatTwo
+                ? buildRequestAuthorizerEventV2(httpMethod, path, route.getRouteKey(),
+                        apiId, stageName, region, headers, uriInfo, stageVariables)
+                : buildRequestAuthorizerEventV1(httpMethod, path, apiId, stageName,
+                        region, headers, uriInfo, stageVariables);
+        ((ObjectNode) event.path("requestContext")).put("routeKey", route.getRouteKey());
+        List<String> identityValues = new ArrayList<>();
         List<String> identitySources = authorizer.getIdentitySource();
-        if (identitySources != null && !identitySources.isEmpty()) {
-            MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
-            for (String expression : identitySources) {
-                if (expression.startsWith("$request.header.")) {
-                    String headerName = expression.substring("$request.header.".length());
-                    String value = headers.getHeaderString(headerName);
-                    if (value == null || value.isEmpty()) {
-                        return new RequestAuthorizerResult(Response.status(401)
-                                .entity(jsonMessage("Unauthorized"))
-                                .type(MediaType.APPLICATION_JSON).build(), null);
-                    }
-                } else if (expression.startsWith("$request.querystring.")) {
-                    String paramName = expression.substring("$request.querystring.".length());
-                    String value = queryParams.getFirst(paramName);
-                    if (value == null || value.isEmpty()) {
-                        return new RequestAuthorizerResult(Response.status(401)
-                                .entity(jsonMessage("Unauthorized"))
-                                .type(MediaType.APPLICATION_JSON).build(), null);
-                    }
+        if (identitySources != null) {
+            for (String source : identitySources) {
+                String value = httpApiAuthorizerIdentityValue(event, source);
+                if (value == null || value.isEmpty()) {
+                    return new RequestAuthorizerResult(Response.status(401)
+                            .entity(jsonMessage("Unauthorized"))
+                            .type(MediaType.APPLICATION_JSON).build(), null);
                 }
-                // $context.* identity sources are always present — no validation needed
+                identityValues.add(value);
             }
         }
-
-        // Build the authorizer event payload based on the configured payload format version
-        String payloadFormatVersion = authorizer.getAuthorizerPayloadFormatVersion();
-        String eventJson;
-        if ("2.0".equals(payloadFormatVersion)) {
-            eventJson = buildRequestAuthorizerEventV2(httpMethod, path, route.getRouteKey(),
-                    apiId, stageName, region, headers, uriInfo, stageVariables);
+        if (formatTwo) {
+            event.set("identitySource", objectMapper.valueToTree(identityValues));
         } else {
-            // Default to 1.0 format
-            eventJson = buildRequestAuthorizerEventV1(httpMethod, path, apiId, stageName,
-                    region, headers, uriInfo, stageVariables);
+            String identities = String.join(",", identityValues);
+            event.put("identitySource", identities);
+            event.put("authorizationToken", identities);
         }
+        String eventJson = event.toString();
 
         // Extract the Lambda function name from the authorizer URI
         String functionName = functionNameFromUri(authorizer.getAuthorizerUri());
@@ -3400,7 +3403,7 @@ public class ApiGatewayExecuteController {
      * <p>Package-private so the shape can be asserted directly, the way {@code buildV2ProxyEvent}
      * is.
      */
-    String buildRequestAuthorizerEventV1(String httpMethod, String path,
+    ObjectNode buildRequestAuthorizerEventV1(String httpMethod, String path,
                                          String apiId, String stageName, String region,
                                          HttpHeaders headers, UriInfo uriInfo,
                                          Map<String, String> stageVariables) {
@@ -3439,19 +3442,25 @@ public class ApiGatewayExecuteController {
         ctx.put("resourcePath", preservedPath);
         ctx.put("stage", stageName);
         ctx.put("requestId", UUID.randomUUID().toString());
-
-        try {
-            return objectMapper.writeValueAsString(event);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to serialize v1 authorizer event", e);
-        }
+        ctx.put("protocol", "HTTP/1.1");
+        Instant now = Instant.now();
+        ctx.put("requestTime", GATEWAY_REQUEST_TIME.format(now.atZone(ZoneOffset.UTC)));
+        ctx.put("requestTimeEpoch", now.toEpochMilli());
+        String arnRegion = region != null ? region : regionResolver.getDefaultRegion();
+        ctx.put("domainName", AwsEndpoints.executeApiHost(apiId, arnRegion));
+        ctx.put("domainPrefix", apiId);
+        ObjectNode identity = ctx.putObject("identity");
+        identity.put("sourceIp", "127.0.0.1");
+        identity.put("userAgent", headers.getHeaderString("User-Agent") != null
+                ? headers.getHeaderString("User-Agent") : "");
+        return event;
     }
 
     /**
      * Builds a REQUEST authorizer event in payload format version 2.0.
      * Uses the newer HTTP API-native shape with routeArn, routeKey, rawPath, and requestContext.http.
      */
-    String buildRequestAuthorizerEventV2(String httpMethod, String path, String routeKey,
+    ObjectNode buildRequestAuthorizerEventV2(String httpMethod, String path, String routeKey,
                                           String apiId, String stageName, String region,
                                           HttpHeaders headers, UriInfo uriInfo,
                                           Map<String, String> stageVariables) {
@@ -3495,11 +3504,43 @@ public class ApiGatewayExecuteController {
         http.put("userAgent", headers.getHeaderString("User-Agent") != null
                 ? headers.getHeaderString("User-Agent") : "");
 
-        try {
-            return objectMapper.writeValueAsString(event);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to serialize v2 authorizer event", e);
+        return event;
+    }
+
+    private static String httpApiAuthorizerIdentityValue(ObjectNode event, String source) {
+        boolean formatTwo = "2.0".equals(event.path("version").asText());
+        JsonNode value;
+        if (source.startsWith("$request.header.")) {
+            return findHeaderIgnoreCase(event.path("headers"), source.substring("$request.header.".length())).orElse(null);
+        } else if (source.startsWith("$request.querystring.")) {
+            value = event.path("queryStringParameters").path(source.substring("$request.querystring.".length()));
+        } else if (source.startsWith("$stageVariables.")) {
+            value = event.path("stageVariables").path(source.substring("$stageVariables.".length()));
+        } else if (source.startsWith("$context.")) {
+            String variable = source.substring("$context.".length());
+            if ("path".equals(variable)) {
+                JsonNode context = event.path("requestContext");
+                String stage = context.path("stage").asText();
+                String path = formatTwo ? context.path("http").path("path").asText() : context.path("path").asText();
+                return ("$default".equals(stage) ? "" : "/" + stage) + path;
+            }
+            String field = "extendedRequestId".equals(variable) ? "requestId" : variable;
+            if (formatTwo) {
+                field = switch (variable) {
+                    case "httpMethod" -> "http.method";
+                    case "protocol" -> "http.protocol";
+                    case "identity.sourceIp" -> "http.sourceIp";
+                    case "identity.userAgent" -> "http.userAgent";
+                    case "requestTime" -> "time";
+                    case "requestTimeEpoch" -> "timeEpoch";
+                    default -> field;
+                };
+            }
+            value = event.at("/requestContext/" + field.replace('.', '/'));
+        } else {
+            return null;
         }
+        return value.isValueNode() && !value.isNull() ? value.asText() : null;
     }
 
     private String extractToken(Authorizer authorizer, HttpHeaders headers, UriInfo uriInfo) {
@@ -3876,7 +3917,7 @@ public class ApiGatewayExecuteController {
         ObjectNode headersNode = event.putObject("headers");
         for (Map.Entry<String, List<String>> e : requestHeaders.entrySet()) {
             if (!e.getValue().isEmpty()) {
-                headersNode.put(e.getKey().toLowerCase(), String.join(",", e.getValue()));
+                headersNode.put(e.getKey().toLowerCase(Locale.ROOT), String.join(",", e.getValue()));
             }
         }
 

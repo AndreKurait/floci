@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.athena;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.athena.model.CreateWorkGroupRequest;
 import io.github.hectorvent.floci.services.athena.model.QueryExecution;
 import io.github.hectorvent.floci.services.athena.model.QueryExecutionContext;
@@ -73,7 +75,21 @@ public class AthenaJsonHandler {
                 String name = request.has("WorkGroup") ? request.get("WorkGroup").asText() : "primary";
                 yield Response.ok(Map.of("WorkGroup", athenaService.getWorkGroup(name, region))).build();
             }
-            case "ListWorkGroups" -> Response.ok(Map.of("WorkGroups", athenaService.listWorkGroups(region))).build();
+            case "ListWorkGroups" -> {
+                JsonNode maxResults = request.get("MaxResults");
+                if (maxResults != null && (!maxResults.isIntegralNumber() || !maxResults.canConvertToInt())) {
+                    throw new AwsException("InvalidRequestException", "Invalid MaxResults", 400);
+                }
+                int pageSize = maxResults == null ? 50 : maxResults.asInt();
+                String nextToken = request.hasNonNull("NextToken") ? request.get("NextToken").asText() : null;
+                PaginatedResult<Map<String, Object>> page = athenaService.listWorkGroupsPage(region, pageSize, nextToken);
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("WorkGroups", page.items());
+                if (page.nextToken() != null) {
+                    response.put("NextToken", page.nextToken());
+                }
+                yield Response.ok(response).build();
+            }
             case "CreateWorkGroup" -> {
                 CreateWorkGroupRequest createRequest = mapper.treeToValue(request, CreateWorkGroupRequest.class);
                 athenaService.createWorkGroup(createRequest, region);
@@ -84,8 +100,17 @@ public class AthenaJsonHandler {
                 athenaService.updateWorkGroup(updateRequest, region);
                 yield Response.ok(Map.of()).build();
             }
-            case "ListDataCatalogs" ->
-                    Response.ok(Map.of("DataCatalogsSummary", athenaService.listDataCatalogs(region))).build();
+            case "ListDataCatalogs" -> {
+                Integer maxResults = Pagination.parseMaxResults(request, "MaxResults", "InvalidRequestException");
+                String nextToken = Pagination.parseNextToken(request, "NextToken", "InvalidRequestException");
+                PaginatedResult<Map<String, Object>> page = athenaService.listDataCatalogsPage(region, maxResults, nextToken);
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("DataCatalogsSummary", page.items());
+                if (page.nextToken() != null) {
+                    response.put("NextToken", page.nextToken());
+                }
+                yield Response.ok(response).build();
+            }
             case "GetDataCatalog" -> {
                 String name = request.has("Name") ? request.get("Name").asText() : AthenaService.DEFAULT_CATALOG;
                 yield Response.ok(Map.of("DataCatalog", athenaService.getDataCatalog(region, name))).build();

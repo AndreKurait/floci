@@ -17,6 +17,21 @@ public class Snapshot {
     private String sqlDump;
     private String snapshotArn;
     private Instant snapshotCreateTime;
+    private Integer manualSnapshotRetentionPeriod;
+    private String snapshotType;
+    private Integer automatedSnapshotRetentionPeriod;
+    private Instant scheduledTime;
+    private String clusterGeneration;
+
+    public String getClusterGeneration() { return clusterGeneration; }
+    public void setClusterGeneration(String value) { clusterGeneration = value; }
+
+    public String getSnapshotType() { return snapshotType == null ? "manual" : snapshotType; }
+    public void setSnapshotType(String value) { snapshotType = value; }
+    public Integer getAutomatedSnapshotRetentionPeriod() { return automatedSnapshotRetentionPeriod; }
+    public void setAutomatedSnapshotRetentionPeriod(Integer value) { automatedSnapshotRetentionPeriod = value; }
+    public Instant getScheduledTime() { return scheduledTime; }
+    public void setScheduledTime(Instant value) { scheduledTime = value; }
 
     public Snapshot() {}
 
@@ -107,6 +122,14 @@ public class Snapshot {
 
     public void setSnapshotCreateTime(Instant snapshotCreateTime) {
         this.snapshotCreateTime = snapshotCreateTime;
+    }
+
+    public Integer getManualSnapshotRetentionPeriod() {
+        return manualSnapshotRetentionPeriod == null ? -1 : manualSnapshotRetentionPeriod;
+    }
+
+    public void setManualSnapshotRetentionPeriod(Integer manualSnapshotRetentionPeriod) {
+        this.manualSnapshotRetentionPeriod = manualSnapshotRetentionPeriod;
     }
 
     private Map<String, String> tags = new LinkedHashMap<>();

@@ -192,6 +192,46 @@ class DynamoDbPartiQLParserTest {
     }
 
     @Test
+    void parsesAFromFirstUpdateAsAnUpdate() {
+        Stmt stmt = DynamoDbPartiQLParser.parse(
+                "FROM \"t\" WHERE pk = 'p' AND a = 1 SET c = 1, d = 2 REMOVE b RETURNING ALL NEW *", List.of());
+
+        Stmt.Update update = assertInstanceOf(Stmt.Update.class, stmt);
+        assertEquals("t", update.table());
+        assertEquals(2, update.where().size());
+        assertEquals(2, update.sets().size());
+        assertEquals("b", update.removes().getFirst().root());
+        assertEquals(DynamoDbPartiQLParser.Returning.ALL_NEW, update.returning());
+        assertEquals("dynamodb:PartiQLUpdate", DynamoDbPartiQLParser.iamAction("FROM \"t\" WHERE pk = 'p' SET c = 1"));
+    }
+
+    @Test
+    void parsesAFromFirstUpdateWithoutAWhere() {
+        Stmt stmt = DynamoDbPartiQLParser.parse("FROM \"t\" SET c = 1", List.of());
+
+        assertTrue(assertInstanceOf(Stmt.Update.class, stmt).where().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"FROM \"t\"", "FROM \"t\" WHERE pk = 'p'", "FROM \"t\" WHERE pk = 'p' RETURNING ALL OLD *",
+            "UPDATE \"t\" WHERE pk = 'p'", "UPDATE \"t\" WHERE pk = 'p' SET c = 1"})
+    void refusesAnUpdateWhoseSetOrRemoveDoesNotFollowTheTable(String statement) {
+        AwsException e = assertThrows(AwsException.class, () -> DynamoDbPartiQLParser.parse(statement, List.of()));
+
+        assertEquals("ValidationException", e.getErrorCode());
+        assertEquals("Statement wasn't well formed, can't be processed: Expected data manipulation", e.getMessage());
+    }
+
+    @Test
+    void readsAWhereAfterTheSetOfAFromFirstUpdateAsALeftoverToken() {
+        AwsException e = assertThrows(AwsException.class,
+                () -> DynamoDbPartiQLParser.parse("FROM \"t\" SET c = 1 WHERE pk = 'p'", List.of()));
+
+        assertEquals("Statement wasn't well formed, can't be processed: Unexpected token after expression",
+                e.getMessage());
+    }
+
+    @Test
     void keepsABareAttributeNameAsARootOnlyPath() {
         Path path = assertInstanceOf(Cond.Eq.class, firstCond(SELECT + "= 'x'")).path();
 
@@ -243,6 +283,49 @@ class DynamoDbPartiQLParserTest {
                 () -> DynamoDbPartiQLParser.parse("SELECT a[1.5] FROM \"t\" WHERE pk = 'p'", List.of()));
 
         assertEquals("ValidationException", e.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            ".73e1,    .73e1",
+            "-.73e1,   -.73e1",
+            "+.73e1,   .73e1",
+            "5.,       5.",
+            "5.e1,     5.e1",
+            "7.31E+6,  7.31E+6",
+            "-7,       -7"
+    })
+    void readsANumberLiteralWithALeadingPointOrAnExponent(String literal, String value) {
+        Cond cond = firstCond(SELECT + "= " + literal);
+
+        PVal val = assertInstanceOf(Cond.Eq.class, cond).val();
+        assertEquals(value, assertInstanceOf(PVal.Num.class, val).v());
+    }
+
+    @Test
+    void keepsAPointAfterANameAsAPathStep() {
+        Cond cond = firstCond("SELECT pk FROM \"t\" WHERE a.b = 1");
+
+        Path path = assertInstanceOf(Cond.Eq.class, cond).path();
+        assertEquals(List.of(new Seg.Name("a"), new Seg.Name("b")), path.segments());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1e2147483648", "1e-2147483648", "1.5e-2147483647", "1e99999999999"})
+    void refusesAnExponentThatDoesNotFitAnInt(String literal) {
+        AwsException e = assertThrows(AwsException.class, () -> firstCond(SELECT + "= " + literal));
+
+        assertEquals("ValidationException", e.getErrorCode());
+        assertEquals("Statement wasn't well formed, can't be processed: ", e.getMessage());
+    }
+
+    @Test
+    void readsASecondPointAsALeftoverToken() {
+        AwsException e = assertThrows(AwsException.class, () -> firstCond(SELECT + "= 1.2.3"));
+
+        assertEquals("ValidationException", e.getErrorCode());
+        assertEquals("Statement wasn't well formed, can't be processed: Unexpected token after expression",
+                e.getMessage());
     }
 
     @Test

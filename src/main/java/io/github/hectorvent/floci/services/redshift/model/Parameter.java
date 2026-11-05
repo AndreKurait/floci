@@ -8,6 +8,7 @@ public class Parameter {
     private String parameterValue;
     private String description;
     private String dataType;
+    private String source;
 
     public Parameter() {}
 
@@ -53,5 +54,13 @@ public class Parameter {
 
     public void setDataType(String dataType) {
         this.dataType = dataType;
+    }
+
+    public String getSource() {
+        return source;
+    }
+
+    public void setSource(String source) {
+        this.source = source;
     }
 }

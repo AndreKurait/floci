@@ -1414,7 +1414,7 @@ public class CloudFormationService implements ResourceProvider {
     private static void validateContinueUpdateRollback(String stackNameOrArn, List<String> resourcesToSkip) {
         List<String> violations = new ArrayList<>();
         if (stackNameOrArn == null) {
-            violations.add("Value null at 'stackName' failed to satisfy constraint: Member must not be null");
+            violations.add(SmithyValidationErrors.notNull("stackName"));
         } else {
             if (stackNameOrArn.isEmpty()) {
                 violations.add("Value '' at 'stackName' failed to satisfy constraint:"
@@ -2021,7 +2021,9 @@ public class CloudFormationService implements ResourceProvider {
                             value -> dynamicReferences.resolveDynamicReferences(value, region, false),
                             (name, output, outputRegion, roleArn) ->
                                     resolveStackOutput(accountId, name, output, outputRegion, roleArn),
-                            parameterTypes);
+                            parameterTypes,
+                            (id, attribute, value) -> dispatcher.attributeValue(
+                                    resources.path(id).path("Type").asText(), attribute, value));
 
                     StackResource resource = stack.getResources().get(logicalId);
                     StackResource previousResource = resource;
@@ -2192,7 +2194,9 @@ public class CloudFormationService implements ResourceProvider {
                     value -> dynamicReferences.resolveDynamicReferences(value, region, false),
                     (name, output, outputRegion, roleArn) ->
                             resolveStackOutput(accountId, name, output, outputRegion, roleArn),
-                    parameterTypes);
+                    parameterTypes,
+                    (id, attribute, value) -> dispatcher.attributeValue(
+                            resources.path(id).path("Type").asText(), attribute, value));
 
             // Resolve outputs before mutating stack/global export state, so failed updates do not
             // leave stale or partially registered exports behind.
@@ -2212,14 +2216,9 @@ public class CloudFormationService implements ResourceProvider {
             Map<String, String> outputValues = new LinkedHashMap<>();
             for (Map.Entry<String, JsonNode> output : outputs.entrySet()) {
                 try {
-                    outputValues.put(output.getKey(), finalEngine.resolve(output.getValue().path("Value")));
+                    outputValues.put(output.getKey(), finalEngine.resolveString(output.getValue().path("Value"),
+                            "Template format error: Every Value member must be a string."));
                 } catch (AwsException e) {
-                    if (!CloudFormationTemplateEngine.containsGetStackOutput(output.getValue())) {
-                        throw e;
-                    }
-                    // An output whose Fn::GetStackOutput cannot be read fails the operation once the
-                    // resources exist, and the stack rolls back as for a resource that failed
-                    // (measured: a create deletes them and ends ROLLBACK_COMPLETE).
                     LOG.warnv("Stack {0} output {1} failed: {2}", stack.getStackName(), output.getKey(),
                             e.getMessage());
                     rollbackFailedExecution(stack, region, isCreate, e.getMessage(), previousState,
@@ -4350,7 +4349,7 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private Stack resolveDeletedStack(String stackNameOrArn, String region, String accountId) {
-        if (stackNameOrArn != null && stackNameOrArn.startsWith("arn:")) {
+        if (AwsArnUtils.isArn(stackNameOrArn)) {
             DeletedStackEntry deleted = deletedStacks.get(stackNameOrArn);
             if (deleted != null) {
                 if (deleted.isExpired(now())) {
@@ -4456,7 +4455,7 @@ public class CloudFormationService implements ResourceProvider {
                                     String region, String accountId) {
         ChangeSet changeSet = stack.getChangeSets().get(
                 resolveChangeSetName(changeSetNameOrArn, region, accountId));
-        if (changeSet == null || (changeSetNameOrArn != null && changeSetNameOrArn.startsWith("arn:")
+        if (changeSet == null || (AwsArnUtils.isArn(changeSetNameOrArn)
                 && !changeSetNameOrArn.equals(changeSet.getChangeSetId()))) {
             return null;
         }
@@ -4649,7 +4648,7 @@ public class CloudFormationService implements ResourceProvider {
         }
 
         // If input looks like an ARN, extract the stack name and retry
-        if (stackNameOrArn != null && stackNameOrArn.startsWith("arn:")) {
+        if (AwsArnUtils.isArn(stackNameOrArn)) {
             try {
                 AwsArnUtils.Arn arn = AwsArnUtils.parse(stackNameOrArn);
                 if (!accountId.equals(arn.accountId()) || !region.equals(arn.region())) {

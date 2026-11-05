@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
+import io.github.hectorvent.floci.services.autoscaling.model.CapacityReservationSpecification;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefreshLaunch;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefreshReplacement;
@@ -21,7 +22,6 @@ import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
-import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
@@ -137,7 +137,6 @@ public class AutoScalingReconciler {
         asgService.reconcileIfPresent(asg, () -> {
             removeTerminatingInstances(asg);
             removeStaleInstances(asg);
-            removeOrphanedTargetRegistrations(asg);
             promoteReadyInstances(asg);
             reconcileRefreshReplacements(asg);
 
@@ -348,39 +347,6 @@ public class AutoScalingReconciler {
         }
     }
 
-    private void removeOrphanedTargetRegistrations(AutoScalingGroup asg) {
-        if (asg.getTargetGroupARNs().isEmpty()) {
-            return;
-        }
-
-        Set<String> activeInstanceIds = asg.getInstances().stream()
-                .filter(instance -> isActiveLifecycleState(instance.getLifecycleState())
-                        || pausedRefreshOwns(asg, instance.getInstanceId()))
-                .map(AsgInstance::getInstanceId)
-                .collect(Collectors.toSet());
-
-        for (String tgArn : asg.getTargetGroupARNs()) {
-            try {
-                List<TargetDescription> orphanedTargets = elbV2Service.describeTargetHealth(
-                                asg.getRegion(), tgArn, List.of()).stream()
-                        .map(TargetHealth::getTarget)
-                        .filter(target -> target != null && target.getId() != null)
-                        .filter(target -> !activeInstanceIds.contains(target.getId()))
-                        .collect(Collectors.toList());
-                if (!orphanedTargets.isEmpty()) {
-                    elbV2Service.deregisterTargets(asg.getRegion(), tgArn, orphanedTargets);
-                    LOG.infov("ASG {0}: deregistered orphaned target(s) {1} from TG {2}",
-                            asg.getAutoScalingGroupName(),
-                            orphanedTargets.stream().map(TargetDescription::getId).collect(Collectors.toList()),
-                            tgArn);
-                }
-            } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not reconcile TG {1}: {2}",
-                        asg.getAutoScalingGroupName(), tgArn, e.getMessage());
-            }
-        }
-    }
-
     private void removeTerminatingInstances(AutoScalingGroup asg) {
         List<AsgInstance> terminatingInstances = asg.getInstances().stream()
                 .filter(instance -> "Terminating".equals(instance.getLifecycleState()))
@@ -539,6 +505,73 @@ public class AutoScalingReconciler {
         return launchedInstanceIds;
     }
 
+    private Reservation launchWithGroupCapacity(AutoScalingGroup asg, LaunchSource launchSource,
+                                                 LaunchPlacement placement, String clientToken) {
+        CapacityReservationSpecification groupSpecification = asg.getCapacityReservationSpecification();
+        AutoScalingService.validateCapacityReservationSpecification(groupSpecification);
+        String preference = groupSpecification == null ? null
+                : groupSpecification.getCapacityReservationPreference();
+        if (preference == null || "default".equals(preference)) {
+            return launchWithCapacity(asg, launchSource, placement, clientToken,
+                    launchSource.capacityReservationSpecification());
+        }
+        LaunchTemplateData.CapacityReservationSpecification specification =
+                new LaunchTemplateData.CapacityReservationSpecification();
+        if (!"none".equals(preference)) {
+            specification.setCapacityReservationTarget(capacityTarget(groupSpecification,
+                    launchSource.capacityReservationSpecification()));
+        }
+        boolean fallback = "capacity-reservations-first".equals(preference);
+        specification.setCapacityReservationPreference(fallback
+                ? specification.getCapacityReservationTarget() == null ? "open" : "capacity-reservations-only"
+                : preference);
+        try {
+            return launchWithCapacity(asg, launchSource, placement, clientToken, specification);
+        } catch (AwsException failure) {
+            if (!fallback || !Set.of("InsufficientInstanceCapacity", "ReservationCapacityExceeded")
+                    .contains(failure.getErrorCode())) {
+                throw failure;
+            }
+            specification.setCapacityReservationPreference("none");
+            specification.setCapacityReservationTarget(null);
+            return launchWithCapacity(asg, launchSource, placement, clientToken, specification);
+        }
+    }
+
+    private static LaunchTemplateData.CapacityReservationTarget capacityTarget(
+            CapacityReservationSpecification groupSpecification,
+            LaunchTemplateData.CapacityReservationSpecification templateSpecification) {
+        if (!groupSpecification.hasTarget()) {
+            return templateSpecification == null ? null : templateSpecification.getCapacityReservationTarget();
+        }
+        LaunchTemplateData.CapacityReservationTarget target = new LaunchTemplateData.CapacityReservationTarget();
+        if (!groupSpecification.getCapacityReservationIds().isEmpty()) {
+            target.setCapacityReservationId(groupSpecification.getCapacityReservationIds().getFirst());
+        } else {
+            target.setCapacityReservationResourceGroupArn(
+                    groupSpecification.getCapacityReservationResourceGroupArns().getFirst());
+        }
+        return target;
+    }
+
+    private Reservation launchWithCapacity(AutoScalingGroup asg, LaunchSource launchSource,
+                                           LaunchPlacement placement, String clientToken,
+                                           LaunchTemplateData.CapacityReservationSpecification capacitySpecification) {
+        String launchZone = Ec2Service.isModelledAvailabilityZone(asg.getRegion(), placement.availabilityZone())
+                ? placement.availabilityZone() : null;
+        return ec2Service.runInstances(
+                asg.getRegion(), launchSource.imageId(), launchSource.instanceType(), 1, 1,
+                launchSource.keyName(), launchSource.securityGroupIds(), placement.subnetId(), clientToken,
+                AutoScalingService.propagatedInstanceTags(asg, launchSource.instanceTags()), launchSource.userData(),
+                launchSource.launchConfigurationName() == null ? launchSource.iamInstanceProfile()
+                        : asgService.resolveLaunchConfigurationProfile(launchSource.iamInstanceProfile()),
+                launchSource.associatePublicIpAddress(), null, 0, launchZone, launchSource.metadataOptions(), null,
+                launchSource.encodedUserData() != null ? launchSource.encodedUserData()
+                        : encodeLegacyUserData(launchSource.userData()),
+                false, null, null, launchSource.blockDeviceMappings(), false, null,
+                capacitySpecification);
+    }
+
     private List<Instance> launchInstance(AutoScalingGroup asg, LaunchSource launchSource,
                                           LaunchPlacement placement, String clientToken,
                                           InstanceRefreshLaunch metadata, List<Instance> existing,
@@ -547,16 +580,7 @@ public class AutoScalingReconciler {
         if (instances.isEmpty()) {
             Reservation reservation;
             try {
-                reservation = ec2Service.runInstances(
-                        asg.getRegion(), launchSource.imageId(), launchSource.instanceType(), 1, 1,
-                        launchSource.keyName(), launchSource.securityGroupIds(), placement.subnetId(), clientToken,
-                        propagatedInstanceTags(asg, launchSource), launchSource.userData(),
-                        launchSource.launchConfigurationName() == null ? launchSource.iamInstanceProfile()
-                                : asgService.resolveLaunchConfigurationProfile(launchSource.iamInstanceProfile()),
-                        launchSource.associatePublicIpAddress(), null, 0, null, launchSource.metadataOptions(), null,
-                        launchSource.encodedUserData() != null ? launchSource.encodedUserData()
-                                : encodeLegacyUserData(launchSource.userData()),
-                        false, null, null, launchSource.blockDeviceMappings());
+                reservation = launchWithGroupCapacity(asg, launchSource, placement, clientToken);
             } catch (RuntimeException launchFailure) {
                 if (!refreshLaunch) {
                     throw launchFailure;
@@ -659,23 +683,6 @@ public class AutoScalingReconciler {
 
     private record LaunchPlacement(String subnetId, String availabilityZone, int availableIpAddresses,
                                    boolean requiresIpv4Address) {}
-
-    private static List<io.github.hectorvent.floci.services.ec2.model.Tag> propagatedInstanceTags(
-            AutoScalingGroup asg,
-            LaunchSource launchSource) {
-        Map<String, String> tags = new LinkedHashMap<>();
-        for (io.github.hectorvent.floci.services.ec2.model.Tag tag : launchSource.instanceTags()) {
-            tags.put(tag.getKey(), tag.getValue());
-        }
-        asg.getTags().forEach((key, value) -> {
-            if (asg.getTagPropagateAtLaunch().getOrDefault(key, false)) {
-                tags.put(key, value);
-            }
-        });
-        return tags.entrySet().stream()
-                .map(entry -> new io.github.hectorvent.floci.services.ec2.model.Tag(entry.getKey(), entry.getValue()))
-                .toList();
-    }
 
     private void scaleIn(AutoScalingGroup asg, int count) {
         List<AsgInstance> candidates = asg.getInstances().stream()
@@ -852,7 +859,7 @@ public class AutoScalingReconciler {
                     // subnet's MapPublicIpOnLaunch, and only null means
                     // "fall back to the subnet default".
                     lc.getAssociatePublicIpAddress(),
-                    launchConfigurationBlockDevices(lc), lc.getMetadataOptions());
+                    launchConfigurationBlockDevices(lc), lc.getMetadataOptions(), null);
         }
 
         LaunchTemplate launchTemplate = resolveLaunchTemplate(asg);
@@ -881,7 +888,8 @@ public class AutoScalingReconciler {
                     asg.getLaunchTemplateName(),
                     resolvedVersion,
                     version.getData().effectiveAssociatePublicIpAddress(),
-                    version.getData().getBlockDeviceMappings(), version.getData().getMetadataOptions());
+                    version.getData().getBlockDeviceMappings(), version.getData().getMetadataOptions(),
+                    version.getData().getCapacityReservationSpecification());
         }
 
         MixedInstancesPolicy.LaunchTemplateSpecification specification =
@@ -916,7 +924,8 @@ public class AutoScalingReconciler {
                         specification.getLaunchTemplateName(),
                         resolvedVersion,
                         version.getData().effectiveAssociatePublicIpAddress(),
-                        version.getData().getBlockDeviceMappings(), version.getData().getMetadataOptions());
+                        version.getData().getBlockDeviceMappings(), version.getData().getMetadataOptions(),
+                    version.getData().getCapacityReservationSpecification());
             }
         }
 
@@ -1053,7 +1062,8 @@ public class AutoScalingReconciler {
             String launchTemplateVersion,
             Boolean associatePublicIpAddress,
             List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings,
-            LaunchTemplateData.MetadataOptions metadataOptions) {}
+            LaunchTemplateData.MetadataOptions metadataOptions,
+            LaunchTemplateData.CapacityReservationSpecification capacityReservationSpecification) {}
 
     // Override for describeAutoScalingGroups with null region (all regions)
     // The service only filters by region when non-null; null means all.

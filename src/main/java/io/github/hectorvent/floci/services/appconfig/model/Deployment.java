@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.appconfig.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -17,6 +18,10 @@ public class Deployment {
     private int deploymentNumber;
     @JsonProperty("ConfigurationName")
     private String configurationName;
+    // Omitted rather than null on deployments stored before it was recorded, so they read back unchanged.
+    @JsonProperty("ConfigurationLocationUri")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String configurationLocationUri;
     @JsonProperty("ConfigurationVersion")
     private String configurationVersion;
     @JsonProperty("DeploymentStrategyId")
@@ -42,6 +47,9 @@ public class Deployment {
 
     public String getConfigurationName() { return configurationName; }
     public void setConfigurationName(String configurationName) { this.configurationName = configurationName; }
+
+    public String getConfigurationLocationUri() { return configurationLocationUri; }
+    public void setConfigurationLocationUri(String configurationLocationUri) { this.configurationLocationUri = configurationLocationUri; }
 
     public String getConfigurationVersion() { return configurationVersion; }
     public void setConfigurationVersion(String configurationVersion) { this.configurationVersion = configurationVersion; }

@@ -2,12 +2,10 @@ package io.github.hectorvent.floci.services.codebuild;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.codebuild.model.Build;
@@ -22,10 +20,8 @@ import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -40,7 +36,7 @@ import java.util.stream.Collectors;
 public class CodeBuildService {
 
     private static final int LIST_PROJECTS_PAGE_SIZE = 100;
-    private static final ObjectMapper PAGE_TOKEN_MAPPER = new ObjectMapper();
+    private static final int LIST_BUILDS_PAGE_SIZE = 100;
 
     // key: region -> name -> project
     private Map<String, Map<String, Project>> projects = new ConcurrentHashMap<>();
@@ -264,8 +260,9 @@ public class CodeBuildService {
         if (sortBy == null && sortOrder == null) {
             return listProjects(region);
         }
-        return listProjectRecords(region, sortBy, sortOrder).stream()
-                .map(Project::getName)
+        return projectSortKeys(region).stream()
+                .sorted(listComparator(sortBy, sortOrder))
+                .map(ListSortKey::name)
                 .toList();
     }
 
@@ -277,94 +274,19 @@ public class CodeBuildService {
             }
         }
 
-        List<Project> projects = listProjectRecords(region, sortBy, sortOrder);
-        int start = 0;
-        if (nextToken != null) {
-            Project anchor = decodeListProjectsToken(nextToken, region, sortBy, sortOrder);
-            Comparator<Project> comparator = projectComparator(sortBy, sortOrder);
-            while (start < projects.size() && comparator.compare(projects.get(start), anchor) <= 0) {
-                start++;
-            }
-        }
-
-        int end = Math.min(start + LIST_PROJECTS_PAGE_SIZE, projects.size());
-        List<String> names = projects.subList(start, end).stream().map(Project::getName).toList();
-        String resultToken = end < projects.size()
-                ? encodeListProjectsToken(projects.get(end - 1), region, sortBy, sortOrder)
-                : null;
-        return new ProjectPage(names, resultToken);
-    }
-
-    private Project decodeListProjectsToken(String token, String region, String sortBy, String sortOrder) {
-        if (token.isEmpty()) {
-            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
-        }
-        JsonNode cursor;
-        try {
-            cursor = PAGE_TOKEN_MAPPER.readTree(Base64.getUrlDecoder().decode(token));
-        } catch (IllegalArgumentException | IOException e) {
-            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
-        }
-        JsonNode lastName = cursor == null ? null : cursor.path("lastName");
-        JsonNode sortValue = cursor == null ? null : cursor.path("sortValue");
-        if (cursor == null || !"ListProjects".equals(cursor.path("action").asText(null))
-                || !region.equals(cursor.path("region").asText(null))
-                || !cursor.has("sortBy") || !Objects.equals(sortBy, cursor.path("sortBy").asText(null))
-                || !cursor.has("sortOrder") || !Objects.equals(sortOrder, cursor.path("sortOrder").asText(null))
-                || !lastName.isTextual() || lastName.asText().isEmpty()
-                || (sortBy == null || "NAME".equals(sortBy)) && !sortValue.isNull()
-                || !sortValue.isNull() && !sortValue.isNumber()) {
-            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
-        }
-        Double value = sortValue.isNull() ? null : sortValue.asDouble();
-        if (value != null && !Double.isFinite(value)) {
-            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
-        }
-        Project anchor = new Project();
-        anchor.setName(lastName.asText());
-        anchor.setCreated(value);
-        anchor.setLastModified(value);
-        return anchor;
-    }
-
-    private String encodeListProjectsToken(Project last, String region, String sortBy, String sortOrder) {
-        Double value = switch (sortBy == null ? "NAME" : sortBy) {
-            case "CREATED_TIME" -> last.getCreated();
-            case "LAST_MODIFIED_TIME" -> last.getLastModified();
-            default -> null;
-        };
-        ObjectNode cursor = PAGE_TOKEN_MAPPER.createObjectNode();
-        cursor.put("action", "ListProjects");
-        cursor.put("region", region);
-        cursor.put("sortBy", sortBy);
-        cursor.put("sortOrder", sortOrder);
-        cursor.put("lastName", last.getName());
-        cursor.put("sortValue", value);
-        return Base64Url.encode(cursor.toString());
+        CodeBuildPagination.Page<ListSortKey> page = paginateList(projectSortKeys(region), region, sortBy, sortOrder,
+                LIST_PROJECTS_PAGE_SIZE, nextToken, "ListProjects", null);
+        return new ProjectPage(page.items().stream().map(ListSortKey::name).toList(), page.nextToken());
     }
 
     public record ProjectPage(List<String> projects, String nextToken) {
     }
 
-    private List<Project> listProjectRecords(String region, String sortBy, String sortOrder) {
+    private List<ListSortKey> projectSortKeys(String region) {
         return projectsFor(region).values().stream()
-                .sorted(projectComparator(sortBy, sortOrder))
+                .map(project -> new ListSortKey(project.getCreated(), project.getLastModified(),
+                        project.getName(), project.getName()))
                 .toList();
-    }
-
-    private Comparator<Project> projectComparator(String sortBy, String sortOrder) {
-        Comparator<Project> comparator = switch (sortBy == null ? "NAME" : sortBy) {
-            case "NAME" -> Comparator.comparing(Project::getName);
-            case "CREATED_TIME" -> Comparator.comparing(Project::getCreated,
-                    Comparator.nullsFirst(Comparator.naturalOrder()));
-            case "LAST_MODIFIED_TIME" -> Comparator.comparing(Project::getLastModified,
-                    Comparator.nullsFirst(Comparator.naturalOrder()));
-            default -> throw new AwsException("InvalidInputException", "Invalid sortBy: " + sortBy, 400);
-        };
-        if (isDescendingSortOrder(sortOrder, false)) {
-            comparator = comparator.reversed();
-        }
-        return comparator.thenComparing(Project::getName);
     }
 
     // ---- Report Groups ----
@@ -435,6 +357,97 @@ public class CodeBuildService {
 
     public List<String> listReportGroups(String region) {
         return new ArrayList<>(reportGroupsFor(region).keySet());
+    }
+
+    public ReportGroupPage listReportGroupsPage(String region, String sortBy, String sortOrder,
+                                                int maxResults, String nextToken) {
+        if (maxResults < 1 || maxResults > 100) {
+            throw new AwsException("InvalidInputException", "maxResults must be between 1 and 100", 400);
+        }
+        String criterion = sortBy == null ? "NAME" : sortBy;
+        String order = sortOrder == null ? "ASCENDING" : sortOrder;
+        List<ListSortKey> keys = reportGroupsFor(region).values().stream()
+                .map(group -> new ListSortKey(group.getCreated(), group.getLastModified(),
+                        group.getName(), group.getArn()))
+                .toList();
+        CodeBuildPagination.Page<ListSortKey> page = paginateList(keys, region, criterion, order, maxResults, nextToken,
+                "ListReportGroups", "lastArn");
+        return new ReportGroupPage(page.items().stream().map(ListSortKey::id).toList(), page.nextToken());
+    }
+
+    private CodeBuildPagination.Page<ListSortKey> paginateList(List<ListSortKey> keys, String region, String sortBy,
+                                                                String sortOrder, int pageSize, String nextToken,
+                                                                String action, String idField) {
+        Comparator<ListSortKey> comparator = listComparator(sortBy, sortOrder);
+        List<ListSortKey> sorted = keys.stream().sorted(comparator).toList();
+        return CodeBuildPagination.page(sorted, comparator, pageSize, nextToken,
+                token -> decodeListToken(token, region, sortBy, sortOrder, action, idField),
+                last -> encodeListToken(last, region, sortBy, sortOrder, action, idField));
+    }
+
+    private Comparator<ListSortKey> listComparator(String sortBy, String sortOrder) {
+        Comparator<ListSortKey> comparator = switch (sortBy == null ? "NAME" : sortBy) {
+            case "NAME" -> Comparator.comparing(ListSortKey::name);
+            case "CREATED_TIME" -> Comparator.comparing(ListSortKey::created,
+                    Comparator.nullsFirst(Comparator.naturalOrder()));
+            case "LAST_MODIFIED_TIME" -> Comparator.comparing(ListSortKey::lastModified,
+                    Comparator.nullsFirst(Comparator.naturalOrder()));
+            default -> throw new AwsException("InvalidInputException", "Invalid sortBy: " + sortBy, 400);
+        };
+        if (isDescendingSortOrder(sortOrder, false)) {
+            comparator = comparator.reversed();
+        }
+        return comparator.thenComparing(ListSortKey::name).thenComparing(ListSortKey::id);
+    }
+
+    private ListSortKey decodeListToken(String token, String region, String sortBy,
+                                        String sortOrder, String action, String idField) {
+        JsonNode cursor = CodeBuildPagination.readToken(token);
+        JsonNode lastName = cursor == null ? null : cursor.path("lastName");
+        JsonNode sortValue = cursor == null ? null : cursor.path("sortValue");
+        JsonNode lastId = cursor == null || idField == null ? null : cursor.path(idField);
+        if (cursor == null || !action.equals(cursor.path("action").asText(null))
+                || !region.equals(cursor.path("region").asText(null))
+                || !cursor.has("sortBy") || !Objects.equals(sortBy, cursor.path("sortBy").asText(null))
+                || !cursor.has("sortOrder") || !Objects.equals(sortOrder, cursor.path("sortOrder").asText(null))
+                || !lastName.isTextual() || lastName.asText().isEmpty()
+                || idField != null && (!lastId.isTextual() || lastId.asText().isEmpty())
+                || (sortBy == null || "NAME".equals(sortBy)) && !sortValue.isNull()
+                || !sortValue.isNull() && !sortValue.isNumber()) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        Double value = sortValue.isNull() ? null : sortValue.asDouble();
+        if (value != null && !Double.isFinite(value)) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        String name = lastName.asText();
+        return new ListSortKey(value, value, name, idField == null ? name : lastId.asText());
+    }
+
+    private String encodeListToken(ListSortKey last, String region, String sortBy,
+                                    String sortOrder, String action, String idField) {
+        Double value = switch (sortBy == null ? "NAME" : sortBy) {
+            case "CREATED_TIME" -> last.created();
+            case "LAST_MODIFIED_TIME" -> last.lastModified();
+            default -> null;
+        };
+        ObjectNode cursor = CodeBuildPagination.newToken();
+        cursor.put("action", action);
+        cursor.put("region", region);
+        cursor.put("sortBy", sortBy);
+        cursor.put("sortOrder", sortOrder);
+        if (idField != null) {
+            cursor.put(idField, last.id());
+        }
+        cursor.put("lastName", last.name());
+        cursor.put("sortValue", value);
+        return CodeBuildPagination.writeToken(cursor);
+    }
+
+    public record ReportGroupPage(List<String> reportGroups, String nextToken) {
+    }
+
+    private record ListSortKey(Double created, Double lastModified, String name, String id) {
     }
 
     // ---- Source Credentials ----
@@ -637,6 +650,85 @@ public class CodeBuildService {
                 .sorted(comparator)
                 .map(Build::getId)
                 .toList();
+    }
+
+    public BuildPage listBuildsPage(String region, String account, String sortOrder, String nextToken) {
+        return paginateBuilds(region, account, null, sortOrder, nextToken, false);
+    }
+
+    public BuildPage listBuildsForProjectPage(String region, String account, String projectName,
+                                              String sortOrder, String nextToken) {
+        if (projectName == null || projectName.isEmpty()) {
+            throw new AwsException("InvalidInputException", "projectName is required", 400);
+        }
+        return paginateBuilds(region, account, projectName, sortOrder, nextToken, true);
+    }
+
+    private BuildPage paginateBuilds(String region, String account, String projectName,
+                                     String sortOrder, String nextToken, boolean forProject) {
+        Comparator<Build> comparator = forProject
+                ? Comparator.comparing(Build::getBuildNumber).thenComparing(Build::getId)
+                : Comparator.comparing(Build::getId);
+        if (isDescendingSortOrder(sortOrder, true)) {
+            comparator = comparator.reversed();
+        }
+        List<Build> sorted = buildsFor(account, region).values().stream()
+                .filter(build -> !forProject || projectName.equals(build.getProjectName()))
+                .sorted(comparator)
+                .toList();
+        if (forProject && sortOrder != null && sorted.size() > LIST_BUILDS_PAGE_SIZE) {
+            throw new AwsException("InvalidInputException",
+                    "sortOrder cannot be set when a project has more than 100 builds", 400);
+        }
+
+        String action = forProject ? "ListBuildsForProject" : "ListBuilds";
+        CodeBuildPagination.Page<Build> page = CodeBuildPagination.page(sorted, comparator, LIST_BUILDS_PAGE_SIZE,
+                nextToken,
+                token -> decodeBuildToken(token, action, region, account, projectName, sortOrder, forProject),
+                last -> encodeBuildToken(last, action, region, account, projectName, sortOrder, forProject));
+        return new BuildPage(page.items().stream().map(Build::getId).toList(), page.nextToken());
+    }
+
+    private Build decodeBuildToken(String token, String action, String region, String account,
+                                   String projectName, String sortOrder, boolean forProject) {
+        JsonNode cursor = CodeBuildPagination.readToken(token);
+        if (cursor == null || !cursor.isObject()
+                || !action.equals(cursor.path("action").asText(null))
+                || !region.equals(cursor.path("region").asText(null))
+                || !account.equals(cursor.path("account").asText(null))
+                || !cursor.has("projectName")
+                || !Objects.equals(projectName, cursor.path("projectName").asText(null))
+                || !cursor.has("sortOrder")
+                || !Objects.equals(sortOrder, cursor.path("sortOrder").asText(null))
+                || !cursor.path("lastId").isTextual() || cursor.path("lastId").asText().isEmpty()
+                || forProject && (!cursor.path("buildNumber").isIntegralNumber()
+                        || !cursor.path("buildNumber").canConvertToLong())) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        Build anchor = new Build();
+        anchor.setId(cursor.path("lastId").asText());
+        if (forProject) {
+            anchor.setBuildNumber(cursor.path("buildNumber").longValue());
+        }
+        return anchor;
+    }
+
+    private String encodeBuildToken(Build last, String action, String region, String account,
+                                    String projectName, String sortOrder, boolean forProject) {
+        ObjectNode cursor = CodeBuildPagination.newToken();
+        cursor.put("action", action);
+        cursor.put("region", region);
+        cursor.put("account", account);
+        cursor.put("projectName", projectName);
+        cursor.put("sortOrder", sortOrder);
+        cursor.put("lastId", last.getId());
+        if (forProject) {
+            cursor.put("buildNumber", last.getBuildNumber());
+        }
+        return CodeBuildPagination.writeToken(cursor);
+    }
+
+    public record BuildPage(List<String> ids, String nextToken) {
     }
 
     private boolean isDescendingSortOrder(String sortOrder, boolean defaultDescending) {

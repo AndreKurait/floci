@@ -12,6 +12,7 @@ import software.amazon.awssdk.services.appconfigdata.model.StartConfigurationSes
 import software.amazon.awssdk.services.appconfigdata.model.StartConfigurationSessionResponse;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -606,6 +607,71 @@ class AppConfigTest {
         } finally {
             try {
                 appConfig.deleteApplication(DeleteApplicationRequest.builder().applicationId(legacyAppId).build());
+            } catch (Exception ignored) {
+                // Best-effort cleanup: the application name is unique, so a leftover cannot affect other tests.
+            }
+        }
+    }
+
+    @Test
+    @Order(57)
+    @DisplayName("Environments return their monitors and deployments their profile's name and location")
+    void monitorsAndDeploymentSourceRoundTrip() {
+        String monitoredAppId = appConfig.createApplication(CreateApplicationRequest.builder()
+                .name(TestFixtures.uniqueName("monitored-app")).build()).id();
+        try {
+            Monitor withRole = Monitor.builder()
+                    .alarmArn("arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration-errors")
+                    .alarmRoleArn("arn:aws:iam::000000000000:role/appconfig-alarm-monitor")
+                    .build();
+            Monitor withoutRole = Monitor.builder()
+                    .alarmArn("arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration-latency")
+                    .build();
+            CreateEnvironmentResponse monitored = appConfig.createEnvironment(CreateEnvironmentRequest.builder()
+                    .applicationId(monitoredAppId).name("monitored").monitors(withRole, withoutRole).build());
+            assertThat(monitored.monitors()).containsExactly(withRole, withoutRole);
+            assertThat(appConfig.getEnvironment(GetEnvironmentRequest.builder()
+                    .applicationId(monitoredAppId).environmentId(monitored.id()).build()).monitors())
+                    .containsExactly(withRole, withoutRole);
+            assertThat(appConfig.createEnvironment(CreateEnvironmentRequest.builder()
+                    .applicationId(monitoredAppId).name("unmonitored").build()).hasMonitors()).isFalse();
+
+            // Qualified: the imported BadRequestException is AppConfigData's, this one is AppConfig's.
+            assertThrows(software.amazon.awssdk.services.appconfig.model.BadRequestException.class,
+                    () -> appConfig.createEnvironment(CreateEnvironmentRequest.builder()
+                            .applicationId(monitoredAppId).name("refused")
+                            .monitors(Collections.nCopies(6, withoutRole)).build()));
+
+            String profileId = appConfig.createConfigurationProfile(CreateConfigurationProfileRequest.builder()
+                    .applicationId(monitoredAppId)
+                    .name("service-settings")
+                    .locationUri("ssm-parameter://service-settings")
+                    .type("AWS.Freeform")
+                    .build()).id();
+            StartDeploymentResponse started = appConfig.startDeployment(StartDeploymentRequest.builder()
+                    .applicationId(monitoredAppId)
+                    .environmentId(monitored.id())
+                    .configurationProfileId(profileId)
+                    .configurationVersion("1")
+                    .deploymentStrategyId("AppConfig.AllAtOnce")
+                    .build());
+            assertThat(started.configurationName()).isEqualTo("service-settings");
+            assertThat(started.configurationLocationUri()).isEqualTo("ssm-parameter://service-settings");
+
+            GetDeploymentResponse deployment = appConfig.getDeployment(GetDeploymentRequest.builder()
+                    .applicationId(monitoredAppId)
+                    .environmentId(monitored.id())
+                    .deploymentNumber(started.deploymentNumber())
+                    .build());
+            assertThat(deployment.configurationName()).isEqualTo("service-settings");
+            assertThat(deployment.configurationLocationUri()).isEqualTo("ssm-parameter://service-settings");
+
+            // AWS documents no default Type: a profile created without one reports none.
+            assertThat(appConfig.createConfigurationProfile(CreateConfigurationProfileRequest.builder()
+                    .applicationId(monitoredAppId).name("untyped").locationUri("hosted").build()).type()).isNull();
+        } finally {
+            try {
+                appConfig.deleteApplication(DeleteApplicationRequest.builder().applicationId(monitoredAppId).build());
             } catch (Exception ignored) {
                 // Best-effort cleanup: the application name is unique, so a leftover cannot affect other tests.
             }

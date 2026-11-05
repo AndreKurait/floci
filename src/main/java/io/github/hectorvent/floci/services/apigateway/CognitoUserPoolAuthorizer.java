@@ -10,17 +10,18 @@ import jakarta.ws.rs.core.HttpHeaders;
 
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /** Verifies Cognito user-pool tokens for REST execute-api methods. */
 @ApplicationScoped
 public class CognitoUserPoolAuthorizer {
 
     public enum Failure {
-        UNAUTHORIZED,
-        ACCESS_DENIED
+        UNAUTHORIZED
     }
 
     public record Result(Failure failure, String principalId, Map<String, Object> context) {}
@@ -60,10 +61,11 @@ public class CognitoUserPoolAuthorizer {
             if (!providerArns.contains(verifiedPoolArn)) {
                 return new Result(Failure.UNAUTHORIZED, null, null);
             }
+            // AWS answers 401, not 403, when the token claims none of the method's scopes, ID tokens included.
             List<String> requiredScopes = method.getAuthorizationScopes();
             if (requiredScopes != null && !requiredScopes.isEmpty()) {
                 if (!"access".equals(verified.tokenUse())) {
-                    return new Result(Failure.ACCESS_DENIED, null, null);
+                    return new Result(Failure.UNAUTHORIZED, null, null);
                 }
                 Set<String> granted = new HashSet<>();
                 Object scopeClaim = verified.claims().get("scope");
@@ -71,11 +73,14 @@ public class CognitoUserPoolAuthorizer {
                     granted.addAll(Arrays.asList(value.trim().split("\\s+")));
                 }
                 if (requiredScopes.stream().noneMatch(granted::contains)) {
-                    return new Result(Failure.ACCESS_DENIED, null, null);
+                    return new Result(Failure.UNAUTHORIZED, null, null);
                 }
             }
             String principalId = String.valueOf(verified.claims().getOrDefault("sub", "unknown"));
-            return new Result(null, principalId, Map.of("claims", verified.claims()));
+            Map<String, Object> claims = new LinkedHashMap<>(verified.claims());
+            claims.replaceAll((key, value) -> value instanceof List<?> items
+                    ? items.stream().map(String::valueOf).collect(Collectors.joining(",")) : value);
+            return new Result(null, principalId, Map.of("claims", claims));
         } catch (AwsException e) {
             return new Result(Failure.UNAUTHORIZED, null, null);
         }

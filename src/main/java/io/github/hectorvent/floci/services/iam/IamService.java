@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CertificateMaterialException;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SessionAccountLookup;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
@@ -1222,6 +1223,44 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     /**
+     * Creates the account access role AWS Organizations preconfigures in a member account it
+     * just created ({@code CreateAccount}'s {@code RoleName}, default
+     * {@code OrganizationAccountAccessRole}), in that account's own namespace: the
+     * management account is the caller here, so the whole creation runs inside
+     * {@link RequestScopes#callAs(String, Supplier)} as the new account, and
+     * {@link #createRole} and {@link #attachRolePolicy} validate the name, mint the ARN
+     * and store the role the way every other IAM role goes.
+     *
+     * <p>The role matches the one AWS creates: it trusts the management account, through the
+     * account-root principal AWS's generated trust policy names, and carries the
+     * {@code AdministratorAccess} AWS-managed policy. The account is fresh, so the name
+     * cannot collide; a role that is there anyway is returned rather than failing an account
+     * creation AWS would have completed: {@link #createRole} answers
+     * {@code EntityAlreadyExists} for it, that one error is caught here, and anything
+     * else propagates.
+     */
+    public IamRole provisionAccountAccessRole(String accountId, String roleName, String managementAccountId) {
+        String trustPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Principal\":{\"AWS\":\"" + regionResolver.buildGlobalArn("iam", managementAccountId, "root")
+                + "\"},\"Action\":\"sts:AssumeRole\"}]}";
+        String administratorAccess = AwsManagedPolicies.arnPrefix(regionResolver.getPartition())
+                + "/AdministratorAccess";
+        return RequestScopes.callAs(accountId, () -> {
+            try {
+                IamRole role = createRole(roleName, "/", trustPolicy, null, 0, null);
+                attachRolePolicy(roleName, administratorAccess);
+                LOG.infov("Created account access role {0} in account {1}", roleName, accountId);
+                return role;
+            } catch (AwsException alreadyExists) {
+                if (!"EntityAlreadyExists".equals(alreadyExists.getErrorCode())) {
+                    throw alreadyExists;
+                }
+                return getRole(roleName);
+            }
+        });
+    }
+
+    /**
      * roleDescriptionType: at most 1000 characters of the set AWS publishes, which admits tab,
      * newline and carriage return and no other control character. Enforced wherever a role
      * description is taken, so {@code CreateRole}, {@code UpdateRole},
@@ -2388,6 +2427,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // Centralized root access management (org-scoped, IAM Query endpoint)
     // =========================================================================
 
+    // The toggles themselves. Who may read or move them, and which organization's record they
+    // belong to, is CentralRootAccess: it is the caller of all five and the only one that should
+    // be, these having no caller check of their own.
+
     /** Currently-enabled centralized root features, in enablement order. Empty for a fresh org. */
     public List<String> listOrganizationsFeatures() {
         return new ArrayList<>(currentRootFeatures().getEnabledFeatures());
@@ -2854,8 +2897,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private static void validatePassword(String password, String member) {
         if (password == null) {
             throw SmithyValidationErrors.validationError(
-                    "Value null at '" + member
-                            + "' failed to satisfy constraint: Member must not be null");
+                    SmithyValidationErrors.notNull(member));
         }
         if (!LOGIN_PROFILE_PASSWORD_PATTERN.matcher(password).matches()) {
             throw SmithyValidationErrors.validationError(
@@ -2928,8 +2970,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void putAccountProperties(Map<String, String> properties) {
         if (properties == null || properties.isEmpty()) {
             throw SmithyValidationErrors.validationError(
-                    "Value null at 'properties' failed to "
-                            + "satisfy constraint: Member must not be null");
+                    SmithyValidationErrors.notNull("properties"));
         }
         String namespace = null;
         for (Map.Entry<String, String> entry : properties.entrySet()) {
@@ -3048,6 +3089,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             state.setEnabled(false);
             outboundFederation.put(OUTBOUND_FEDERATION_KEY, state);
             LOG.info("Disabled outbound web identity federation");
+        }
+    }
+
+    /**
+     * The account's federation state while the feature is on, for a caller that answers its own
+     * refusal rather than IAM's: STS turns a token request down with
+     * {@code OutboundWebIdentityFederationDisabledException}, not with {@code FeatureDisabled}.
+     */
+    public Optional<OutboundWebIdentityFederation> findEnabledOutboundWebIdentityFederation() {
+        synchronized (outboundFederationLock) {
+            return outboundFederation.get(OUTBOUND_FEDERATION_KEY)
+                    .filter(OutboundWebIdentityFederation::isEnabled);
         }
     }
 
@@ -3937,19 +3990,24 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * that matches nothing gets {@code NoSuchEntity}. Different mistakes, different answers.
      *
      * <p>The API Reference publishes a length of 20 to 128 as well as the pattern, so both are
-     * checked, and both are reported when both are broken, in the order it prints them. The
-     * pattern message is the one recorded against AWS; the length wording is the form AWS uses for
-     * a member carrying both bounds, which {@link #validatePassword} spells the same
-     * way.
+     * checked, and both are reported when both are broken, in the order it prints them.
+     *
+     * <p>Each message names the one bound the value broke, rather than both at once: every
+     * recorded IAM length violation reads that way, "Member must have length less than or equal to
+     * 64" for a user name over 64 and "Member must have length greater than or equal to 20" for an
+     * ARN under 20, and a short id told about a 128-character ceiling it is nowhere near would be
+     * reporting a constraint it did not break. The pattern message is the one recorded against
+     * AWS.
      */
     private void requireCredentialIdFormat(String credentialId) {
         String id = credentialId == null ? "" : credentialId;
         List<String> violations = new ArrayList<>();
-        if (id.length() < SERVICE_CREDENTIAL_ID_MIN_LENGTH
-                || id.length() > SERVICE_CREDENTIAL_ID_MAX_LENGTH) {
-            violations.add("Member must have length less than or equal to "
-                    + SERVICE_CREDENTIAL_ID_MAX_LENGTH + " and greater than or equal to "
+        if (id.length() < SERVICE_CREDENTIAL_ID_MIN_LENGTH) {
+            violations.add("Member must have length greater than or equal to "
                     + SERVICE_CREDENTIAL_ID_MIN_LENGTH);
+        } else if (id.length() > SERVICE_CREDENTIAL_ID_MAX_LENGTH) {
+            violations.add("Member must have length less than or equal to "
+                    + SERVICE_CREDENTIAL_ID_MAX_LENGTH);
         }
         if (!SERVICE_CREDENTIAL_ID_PATTERN.matcher(id).matches()) {
             violations.add("Member must satisfy regular expression pattern: [\\w]+");
@@ -4485,6 +4543,15 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return currentSession(accessKeyId)
                 .map(SessionCredential::getSessionToken)
                 .filter(token -> !token.isBlank());
+    }
+
+    /**
+     * When the session a temporary access key belongs to expires, for callers that must not hand
+     * out something outliving it. Empty for a long-term key, which names no session, and for a
+     * session already expired, which no longer resolves.
+     */
+    public Optional<Instant> findSessionExpiration(String accessKeyId) {
+        return currentSession(accessKeyId).map(SessionCredential::getExpiration);
     }
 
     /** Whether an access key ID identifies Floci's documented public deployer credential. */
@@ -5252,6 +5319,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 }
                 return sessionTokenContext(session);
             }
+            if (isAccountRootArn(session.getRoleArn())) {
+                // A privileged session (AssumeRoot) acts as the member account's root user, which
+                // no identity policy grants and none denies: collecting role policies for a root
+                // ARN finds none, which would refuse everything. What scopes it is its task
+                // policy, and the five AWS publishes for the purpose carry Deny statements only,
+                // so it is read beside the root's own allow-all rather than as a session policy,
+                // where an intersection with nothing to allow would refuse everything too.
+                return new CallerContext(session.getSessionPolicyDocument() == null
+                        ? List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY)
+                        : List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY, session.getSessionPolicyDocument()),
+                        null, null);
+            }
             List<String> identityPolicies = collectRolePolicies(session.getRoleArn());
             String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
             return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc);
@@ -5520,6 +5599,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                             null));
                 }
                 return issuingUser(session).map(IamService::callerForUser);
+            }
+            if (isAccountRootArn(roleArn)) {
+                // A privileged session (AssumeRoot) is the member account's root user, not an
+                // assumed role: the ARN it reports is the root ARN it was minted for, and its
+                // aws:userid is the account id, as the account root's always is.
+                return Optional.of(new CallerArns(roleArn, roleArn, CallerArns.TYPE_ACCOUNT,
+                        AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId()), null));
             }
             String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
             String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());
@@ -5919,64 +6005,68 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return passwordPolicies.get(ACCOUNT_PASSWORD_POLICY_KEY);
     }
 
+    /** An identity policy as an access denied message names it: a managed one by its ARN, an inline one by none. */
+    public record HeldPolicy(String arn, String document) {}
+
+    /** The identity policies of an IAM user or role, in the order they are collected, and its permissions boundary. */
+    public record HeldPolicies(List<HeldPolicy> identity, String permissionsBoundaryArn) {}
+
+    /** What the IAM user or role behind {@code accessKeyId} holds, or nothing for any other caller. */
+    public Optional<HeldPolicies> heldPolicies(String accessKeyId) {
+        Optional<AccessKey> key = accessKeys.get(accessKeyId);
+        if (key.isPresent()) {
+            return users.get(key.get().getUserName()).map(this::heldPolicies);
+        }
+        Optional<SessionCredential> session = findSessionForCallerContext(accessKeyId)
+                .filter(found -> found.getDelegatedApproverArn() == null && !isFederatedUserSession(found));
+        if (session.isPresent() && session.get().getRoleArn() == null) {
+            // GetSessionToken credentials act with the policies of the user that minted them.
+            return session.filter(found -> found.getPresignedAction() == null)
+                    .flatMap(this::issuingUser)
+                    .map(this::heldPolicies);
+        }
+        return session.flatMap(found -> roleFromArnOrName(found.getRoleArn()))
+                .map(role -> new HeldPolicies(rolePolicies(role), role.getPermissionsBoundaryArn()));
+    }
+
+    private HeldPolicies heldPolicies(IamUser user) {
+        return new HeldPolicies(userPolicies(user), user.getPermissionsBoundaryArn());
+    }
+
     private List<String> collectUserPolicies(String userArnOrName) {
-        Optional<IamUser> userOpt = userFromArnOrName(userArnOrName);
-        if (userOpt.isEmpty()) {
-            return null;
-        }
-        IamUser user = userOpt.get();
-
-        // User inline policies
-        List<String> docs = new ArrayList<>(user.getInlinePolicies().values());
-
-        // User attached managed policies
-        for (String arn : user.getAttachedPolicyArns()) {
-            Optional<IamPolicy> p = resolvePolicy(arn);
-            if (p.isPresent() && p.get().getDefaultDocument() != null) {
-                docs.add(p.get().getDefaultDocument());
-            }
-        }
-
-        // Group policies
-        for (String groupName : user.getGroupNames()) {
-            Optional<IamGroup> groupOpt = groups.get(groupName);
-            if (groupOpt.isEmpty()) continue;
-            IamGroup group = groupOpt.get();
-            docs.addAll(group.getInlinePolicies().values());
-            for (String arn : group.getAttachedPolicyArns()) {
-                Optional<IamPolicy> p = resolvePolicy(arn);
-                if (p.isPresent() && p.get().getDefaultDocument() != null) {
-                    docs.add(p.get().getDefaultDocument());
-                }
-            }
-        }
-
-        return docs;
+        return userFromArnOrName(userArnOrName).map(user -> documents(userPolicies(user))).orElse(null);
     }
 
     private List<String> collectRolePolicies(String roleArn) {
-        if (roleArn == null) {
-            return null;
-        }
-        Optional<IamRole> roleOpt = roleFromArnOrName(roleArn);
-        if (roleOpt.isEmpty()) {
-            return null;
-        }
-        IamRole role = roleOpt.get();
-        List<String> docs = new ArrayList<>();
+        return roleFromArnOrName(roleArn).map(role -> documents(rolePolicies(role))).orElse(null);
+    }
 
-        // Role inline policies
-        docs.addAll(role.getInlinePolicies().values());
-
-        // Role attached managed policies
-        for (String arn : role.getAttachedPolicyArns()) {
-            Optional<IamPolicy> p = resolvePolicy(arn);
-            if (p.isPresent() && p.get().getDefaultDocument() != null) {
-                docs.add(p.get().getDefaultDocument());
-            }
+    /** The user's inline and managed policies, then each group's. */
+    private List<HeldPolicy> userPolicies(IamUser user) {
+        List<HeldPolicy> held = inlineThenManaged(user.getInlinePolicies(), user.getAttachedPolicyArns());
+        for (String groupName : user.getGroupNames()) {
+            groups.get(groupName).ifPresent(group ->
+                    held.addAll(inlineThenManaged(group.getInlinePolicies(), group.getAttachedPolicyArns())));
         }
+        return held;
+    }
 
-        return docs;
+    private List<HeldPolicy> rolePolicies(IamRole role) {
+        return inlineThenManaged(role.getInlinePolicies(), role.getAttachedPolicyArns());
+    }
+
+    private List<HeldPolicy> inlineThenManaged(Map<String, String> inline, List<String> attachedArns) {
+        List<HeldPolicy> held = new ArrayList<>();
+        inline.values().forEach(document -> held.add(new HeldPolicy(null, document)));
+        for (String arn : attachedArns) {
+            resolvePolicy(arn).map(IamPolicy::getDefaultDocument)
+                    .ifPresent(document -> held.add(new HeldPolicy(arn, document)));
+        }
+        return held;
+    }
+
+    private static List<String> documents(List<HeldPolicy> held) {
+        return held.stream().map(HeldPolicy::document).collect(Collectors.toCollection(ArrayList::new));
     }
 
     /**

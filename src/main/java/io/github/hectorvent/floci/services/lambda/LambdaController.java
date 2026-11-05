@@ -7,12 +7,15 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.s3.PreSignedUrlGenerator;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -27,7 +30,6 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.core.UriBuilder;
 import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
@@ -53,12 +55,15 @@ public class LambdaController {
     private final LambdaService lambdaService;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final PreSignedUrlGenerator presignGenerator;
 
     @Inject
-    public LambdaController(LambdaService lambdaService, RegionResolver regionResolver, ObjectMapper objectMapper) {
+    public LambdaController(LambdaService lambdaService, RegionResolver regionResolver, ObjectMapper objectMapper,
+                            PreSignedUrlGenerator presignGenerator) {
         this.lambdaService = lambdaService;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+        this.presignGenerator = presignGenerator;
     }
 
     // ──────────────────────────── CreateFunction ────────────────────────────
@@ -102,12 +107,14 @@ public class LambdaController {
             code.put("ImageUri", fn.getImageUri());
             code.put("ResolvedImageUri", fn.getImageUri());
         } else {
-            // Path-style URL to the package in Floci's own S3, built from the
-            // request so it targets the same endpoint the client is talking to.
-            String location = UriBuilder.fromUri(uriInfo.getBaseUri())
-                    .path(LambdaService.tasksBucketName(region))
-                    .path(LambdaService.codeObjectKey(fn))
-                    .build().toString();
+            String base = uriInfo.getBaseUri().toString();
+            if (base.endsWith("/")) {
+                base = base.substring(0, base.length() - 1);
+            }
+            String codeRegion = AwsArnUtils.regionOrDefault(fn.getFunctionArn(), region);
+            String location = presignGenerator.generatePresignedUrl(base,
+                    LambdaService.tasksBucketName(codeRegion), LambdaService.codeObjectKey(fn),
+                    "GET", 0, codeRegion, LambdaService.ownerAccount(fn));
             code.put("Location", location);
             code.put("RepositoryType", "S3");
         }
@@ -136,14 +143,19 @@ public class LambdaController {
 
     @GET
     @Path("/functions")
-    public Response listFunctions(@Context HttpHeaders headers) {
+    public Response listFunctions(@Context HttpHeaders headers,
+                                  @QueryParam("MaxItems") String maxItems,
+                                  @QueryParam("Marker") String marker) {
         String region = regionResolver.resolveRegion(headers);
-        List<LambdaFunction> functions = lambdaService.listFunctions(region);
+        PaginatedResult<LambdaFunction> page = lambdaService.listFunctions(region, maxItems, marker);
 
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("Functions");
-        for (LambdaFunction fn : functions) {
+        for (LambdaFunction fn : page.items()) {
             items.add(objectMapper.valueToTree(buildFunctionConfiguration(fn)));
+        }
+        if (page.nextToken() != null) {
+            root.put("NextMarker", page.nextToken());
         }
         return Response.ok(root).build();
     }
@@ -234,9 +246,12 @@ public class LambdaController {
     private static final int ASYNC_REQUEST_LIMIT = 1 * 1024 * 1024;
     private static final int SYNC_RESPONSE_LIMIT = 6 * 1024 * 1024;
 
+    // A synchronous invocation waits for its function to finish; on a virtual thread that wait does
+    // not hold one of the shared request workers.
     @POST
     @Path("/functions/{functionName}/invocations")
     @Consumes(MediaType.WILDCARD)
+    @RunOnVirtualThread
     public Response invoke(@Context HttpHeaders headers,
                            @Context UriInfo uriInfo,
                            @PathParam("functionName") String functionName,
@@ -741,7 +756,11 @@ public class LambdaController {
                 .format(Instant.ofEpochMilli(fn.getLastModified()).atOffset(ZoneOffset.UTC)));
         node.put("RevisionId", fn.getRevisionId());
         node.put("Version", fn.getVersion());
-        node.put("LastUpdateStatus", "Successful");
+        node.put("LastUpdateStatus", lambdaService.lastUpdateStatus(fn));
+        String lastUpdateStatusReason = lambdaService.lastUpdateStatusReason(fn);
+        if (lastUpdateStatusReason != null) {
+            node.put("LastUpdateStatusReason", lastUpdateStatusReason);
+        }
 
         // Architectures — always present; default x86_64
         ArrayNode archNode = node.putArray("Architectures");

@@ -86,8 +86,11 @@ public final class RedshiftRoleAccess {
                     "IAM Role '" + iamRoleArn
                             + "' could not be assumed: role is not associated with the Redshift cluster", null);
         }
+        // The path counts, as STS AssumeRole takes it: an ARN naming the role under another path names no role,
+        // so the iam:PassRole check on the ARN the cluster was given covers the role assumed here.
         String roleName = parsed.resource().substring(parsed.resource().lastIndexOf('/') + 1);
-        Optional<IamRole> role = iamService.findRole(parsed.accountId(), roleName);
+        Optional<IamRole> role = iamService.findRole(parsed.accountId(), roleName)
+                .filter(found -> IamService.roleArnMatches(iamRoleArn, found));
         if (role.isEmpty()) {
             throw new S3CopySimulator.S3TransferException(SQLSTATE_INSUFFICIENT_PRIVILEGE,
                     "IAM Role '" + iamRoleArn + "' could not be assumed: role does not exist", null);

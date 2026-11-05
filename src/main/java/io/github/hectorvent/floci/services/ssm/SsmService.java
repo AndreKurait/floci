@@ -50,12 +50,17 @@ public class SsmService implements ResourceProvider {
     private static final Logger LOG = Logger.getLogger(SsmService.class);
 
     private static final String PUBLIC_PARAMETER_PREFIX = "/aws/service/";
+    private static final String ECS_AL2023_RECOMMENDED =
+            "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended";
+    private static final String ECS_AL2023_ARM64_RECOMMENDED =
+            "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended";
     private static final DateTimeFormatter SOURCE_RESULT_DATE =
             DateTimeFormatter.ofPattern("MMM d, yyyy, h:mm:ss a", Locale.US).withZone(ZoneOffset.UTC);
     static final String SECRET_REFERENCE_PREFIX = "/aws/reference/secretsmanager/";
     // Label is a ParameterStringFilter key too, but only GetParametersByPath accepts it.
     private static final Set<String> DESCRIBE_PARAMETERS_FILTER_KEYS =
             Set.of("Name", "Type", "KeyId", "Path", "Tier", "DataType");
+    private static final Set<String> GET_PARAMETERS_BY_PATH_FILTER_KEYS = Set.of("Type", "KeyId", "Label");
     private static final String DEFAULT_SSM_KEY_ID = "alias/aws/ssm";
     private static final int STANDARD_TIER_MAX_VALUE_BYTES = 4096;
     private static final Set<String> PARAMETER_TIERS = Set.of("Standard", "Advanced", "Intelligent-Tiering");
@@ -302,9 +307,7 @@ public class SsmService implements ResourceProvider {
         Parameter parameter = new Parameter(name, value, type != null ? type : "String");
         parameter.setVersion(version);
         parameter.setDescription(description);
-        if ("SecureString".equals(parameter.getType())) {
-            parameter.setKeyId(keyId);
-        }
+        parameter.setKeyId(keyIdOf(parameter.getType(), keyId));
         parameter.setAllowedPattern(allowedPattern);
         // AWS keeps existing policies until new ones, or an empty list, are sent.
         if (policies == null) {
@@ -347,10 +350,11 @@ public class SsmService implements ResourceProvider {
         return getParameter(parameterName(nameOrArn, region), true, region);
     }
 
-    public Parameter getParameter(String name, boolean withDecryption, String region) {
-        if (name != null && name.startsWith(SECRET_REFERENCE_PREFIX)) {
-            return secretReference(name, withDecryption, region);
+    public Parameter getParameter(String nameOrArn, boolean withDecryption, String region) {
+        if (nameOrArn != null && nameOrArn.startsWith(SECRET_REFERENCE_PREFIX)) {
+            return secretReference(nameOrArn, withDecryption, region);
         }
+        String name = parameterReadName(nameOrArn, region);
         return findParameter(name, region).orElseThrow(() -> {
             int separator = name == null ? -1 : name.lastIndexOf(':');
             if (separator > 0 && separator < name.length() - 1
@@ -531,15 +535,23 @@ public class SsmService implements ResourceProvider {
                         : h.getLabels() != null && h.getLabels().contains(selector))
                 .max(Comparator.comparingLong(ParameterHistory::getVersion))
                 .map(h -> {
-                    Parameter parameter = new Parameter(baseName, h.getValue(), h.getType());
-                    parameter.setVersion(h.getVersion());
-                    parameter.setDescription(h.getDescription());
-                    parameter.setLastModifiedDate(h.getLastModifiedDate());
-                    parameter.setArn(current.get().getArn());
-                    parameter.setDataType(current.get().getDataType());
+                    Parameter parameter = historicalParameter(current.get(), h);
                     parameter.setSelector(":" + selector);
                     return parameter;
                 });
+    }
+
+    private static Parameter historicalParameter(Parameter current, ParameterHistory history) {
+        Parameter parameter = new Parameter(current.getName(), history.getValue(), history.getType());
+        parameter.setVersion(history.getVersion());
+        parameter.setDescription(history.getDescription());
+        parameter.setLastModifiedDate(history.getLastModifiedDate());
+        // Older stored history has no KeyId; only the current version can recover it reliably.
+        parameter.setKeyId(history.getKeyId() != null ? history.getKeyId()
+                : history.getVersion() == current.getVersion() ? current.getKeyId() : null);
+        parameter.setArn(current.getArn());
+        parameter.setDataType(current.getDataType());
+        return parameter;
     }
 
     /**
@@ -554,11 +566,47 @@ public class SsmService implements ResourceProvider {
             return Optional.empty();
         }
         return imageCatalog.findByPublicParameterName(name).map(image -> {
-            Parameter parameter = new Parameter(name, image.imageId, "String");
+            String value = image.imageId;
+            if (name.startsWith(ECS_AL2023_RECOMMENDED)
+                    || name.startsWith(ECS_AL2023_ARM64_RECOMMENDED)) {
+                ObjectNode metadata = JsonNodeFactory.instance.objectNode();
+                metadata.put("schema_version", 1);
+                metadata.put("image_name", image.name);
+                metadata.put("image_id", image.imageId);
+                metadata.put("os", "Amazon Linux 2023");
+                // The catalog image is synthetic; do not claim an installed ECS agent or runtime version.
+                metadata.put("ecs_agent_version", "unknown");
+                metadata.put("ecs_runtime_version", "unknown");
+                String recommendedName = name.startsWith(ECS_AL2023_ARM64_RECOMMENDED)
+                        ? ECS_AL2023_ARM64_RECOMMENDED : ECS_AL2023_RECOMMENDED;
+                value = name.equals(recommendedName) ? metadata.toString()
+                        : metadata.required(name.substring(recommendedName.length() + 1)).asText();
+            }
+            Parameter parameter = new Parameter(name, value, "String");
             parameter.setArn(AwsArnUtils.Arn.of("ssm", region, "", parameterResource(name)).toString());
             parameter.setLastModifiedDate(Instant.parse(image.creationDate));
             return parameter;
         });
+    }
+
+    public List<Parameter> getParametersByPath(String path, boolean recursive,
+                                              List<ParameterStringFilter> filters, String region) {
+        filters.forEach(SsmService::validateGetParametersByPathFilter);
+        List<ParameterStringFilter> matchingFilters = filters.stream().filter(filter -> !"Label".equals(filter.key())).toList();
+        List<ParameterStringFilter> labelFilters = filters.stream().filter(filter -> "Label".equals(filter.key())).toList();
+        if (labelFilters.isEmpty()) {
+            return getParametersByPath(path, recursive, region).stream()
+                    .filter(parameter -> matchingFilters.stream().allMatch(filter -> matchesParameterFilter(parameter, filter)))
+                    .toList();
+        }
+        // Labels belong to versions, so matching only the latest parameter would lose older releases.
+        return getParametersByPath(path, recursive, region).stream()
+                .flatMap(parameter -> historyStore.get(regionKey(region, parameter.getName())).orElse(List.of()).stream()
+                        .filter(history -> history.getLabels() != null && labelFilters.stream().allMatch(filter ->
+                                filter.values().stream().anyMatch(history.getLabels()::contains)))
+                        .map(history -> historicalParameter(parameter, history))
+                        .filter(history -> matchingFilters.stream().allMatch(filter -> matchesParameterFilter(history, filter))))
+                .toList();
     }
 
     public List<Parameter> getParametersByPath(String path, boolean recursive, String region) {
@@ -663,9 +711,7 @@ public class SsmService implements ResourceProvider {
                     : "Name".equals(key) ? Set.of("Equals", "BeginsWith", "Contains")
                     : Set.of("Equals", "BeginsWith");
             if (!options.contains(filter.option())) {
-                throw new AwsException("InvalidFilterOption",
-                        "The specified filter option isn't valid. Valid options are Equals and BeginsWith. "
-                                + "For Path filter, valid options are Recursive and OneLevel.", 400);
+                throw invalidFilterOption();
             }
         }
         // Every key but a tag needs at least one value, and a path value must be absolute.
@@ -675,6 +721,30 @@ public class SsmService implements ResourceProvider {
             throw new AwsException("InvalidFilterValue",
                     "The filter value isn't valid. Verify the value and try again.", 400);
         }
+    }
+
+    private static void validateGetParametersByPathFilter(ParameterStringFilter filter) {
+        String key = filter.key();
+        if (key == null || !GET_PARAMETERS_BY_PATH_FILTER_KEYS.contains(key)) {
+            throw new AwsException("InvalidFilterKey", "The specified key isn't valid.", 400);
+        }
+        if (!"Label".equals(key)) {
+            validateDescribeParametersFilter(filter);
+            return;
+        }
+        if (filter.option() != null && !"Equals".equals(filter.option())) {
+            throw invalidFilterOption();
+        }
+        if (filter.values().isEmpty()) {
+            throw new AwsException("InvalidFilterValue",
+                    "The filter value isn't valid. Verify the value and try again.", 400);
+        }
+    }
+
+    private static AwsException invalidFilterOption() {
+        return new AwsException("InvalidFilterOption",
+                "The specified filter option isn't valid. Valid options are Equals and BeginsWith. "
+                        + "For Path filter, valid options are Recursive and OneLevel.", 400);
     }
 
     private static boolean matchesParameterFilter(Parameter parameter, ParameterStringFilter filter) {
@@ -701,6 +771,11 @@ public class SsmService implements ResourceProvider {
         return actual != null && matchesAny(actual, filter);
     }
 
+    /** The account the current request acts in; parameter storage is partitioned by it. */
+    String accountId() {
+        return regionResolver.getAccountId();
+    }
+
     /** Parameters stored before Floci kept a tier are Standard, as AWS defaults them. */
     static String tierOf(Parameter parameter) {
         return parameter.getTier() != null ? parameter.getTier() : "Standard";
@@ -708,10 +783,14 @@ public class SsmService implements ResourceProvider {
 
     /** A SecureString put without a KeyId is encrypted with the AWS managed key. */
     static String keyIdOf(Parameter parameter) {
-        if (!"SecureString".equals(parameter.getType())) {
+        return keyIdOf(parameter.getType(), parameter.getKeyId());
+    }
+
+    static String keyIdOf(String type, String keyId) {
+        if (!"SecureString".equals(type)) {
             return null;
         }
-        return parameter.getKeyId() != null ? parameter.getKeyId() : DEFAULT_SSM_KEY_ID;
+        return keyId != null ? keyId : DEFAULT_SSM_KEY_ID;
     }
 
     private static boolean matchesAny(String actual, ParameterStringFilter filter) {
@@ -918,7 +997,7 @@ public class SsmService implements ResourceProvider {
      */
     static String labelListViolation(List<String> labels) {
         if (labels == null) {
-            return "Value null at 'labels' failed to satisfy constraint: Member must not be null";
+            return SmithyValidationErrors.notNull("labels");
         }
         String prefix = "Value '" + labels + "' at 'labels' failed to satisfy constraint: ";
         if (labels.isEmpty()) {
@@ -1031,10 +1110,25 @@ public class SsmService implements ResourceProvider {
      * label selector after the last colon is kept, but the fallback checks the name without it.
      */
     private String parameterName(String nameOrArn, String region) {
+        return parameterName(nameOrArn, region, false);
+    }
+
+    String parameterReadName(String nameOrArn, String region) {
+        return parameterName(nameOrArn, region, true);
+    }
+
+    private String parameterName(String nameOrArn, String region, boolean parameterRead) {
         if (nameOrArn != null && nameOrArn.startsWith("arn:")) {
             try {
                 AwsArnUtils.Arn arn = AwsArnUtils.parse(nameOrArn);
                 if ("ssm".equals(arn.service()) && arn.resource().startsWith("parameter")) {
+                    if (parameterRead && (!arn.resource().startsWith("parameter/")
+                            || arn.resource().startsWith("parameter" + SECRET_REFERENCE_PREFIX)
+                            || !arn.accountId().equals(regionResolver.getAccountId())
+                            || !arn.region().equals(region)
+                            || !arn.partition().equals(regionResolver.partitionForRegion(region)))) {
+                        return nameOrArn;
+                    }
                     String name = arn.resource().substring("parameter".length());
                     int separator = name.lastIndexOf(':');
                     String baseName = separator > 0 ? name.substring(0, separator) : name;

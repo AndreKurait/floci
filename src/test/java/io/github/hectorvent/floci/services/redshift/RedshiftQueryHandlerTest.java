@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.redshift;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
@@ -32,12 +33,279 @@ import static org.mockito.Mockito.*;
 
 class RedshiftQueryHandlerTest {
 
+    @Test
+    void nonFiniteEventTimestampsReturnAnAwsValidationError() {
+        for (String invalid : List.of("NaN", "Infinity", "-Infinity", "1e300")) {
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("StartTime", invalid);
+            AwsException error = assertThrows(AwsException.class, () -> handler.handle("DescribeEvents", params));
+            assertEquals("InvalidParameterValue", error.getErrorCode());
+        }
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void modifyClusterIamRolesParsesAndReturnsDefaultRole() {
+        String role = "arn:aws:iam::111111111111:role/default";
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "c1");
+        params.putSingle("AddIamRoles.IamRoleArn.1", role);
+        params.putSingle("DefaultIamRoleArn", role);
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("c1");
+        cluster.setDefaultIamRoleArn(role);
+        when(service.modifyClusterIamRoles("c1", List.of(role), List.of(), role)).thenReturn(cluster);
+
+        Response response = handler.handle("ModifyClusterIamRoles", params);
+
+        verify(service).modifyClusterIamRoles("c1", List.of(role), List.of(), role);
+        assertTrue(response.getEntity().toString().contains("<DefaultIamRoleArn>" + role + "</DefaultIamRoleArn>"));
+    }
+
+    @Test
+    void createClusterPassesDefaultRoleToService() {
+        String role = "arn:aws:iam::111111111111:role/default";
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "c1");
+        params.putSingle("NodeType", "dc2.large");
+        params.putSingle("MasterUsername", "admin");
+        params.putSingle("MasterUserPassword", "pw");
+        params.putSingle("IamRoles.IamRoleArn.1", role);
+        params.putSingle("DefaultIamRoleArn", role);
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("c1");
+        cluster.setDefaultIamRoleArn(role);
+        when(service.createCluster("c1", "dc2.large", "admin", "pw", null, List.of(), List.of(role), role))
+                .thenReturn(cluster);
+
+        Response response = handler.handle("CreateCluster", params);
+
+        assertTrue(response.getEntity().toString().contains("<DefaultIamRoleArn>" + role + "</DefaultIamRoleArn>"));
+        verify(service).createCluster("c1", "dc2.large", "admin", "pw", null, List.of(), List.of(role), role);
+    }
+
     private RedshiftQueryHandler handler;
     private RedshiftService service;
     private RedshiftCredentialBroker credentialBroker;
     private EmulatorConfig config;
     private RedshiftIamDbUserResolver iamDbUserResolver;
     private RegionResolver regionResolver;
+
+    @Test
+    void resetClusterParameterGroupReturnsAwsQueryResponse() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        params.putSingle("ResetAllParameters", "true");
+
+        Response response = handler.handle("ResetClusterParameterGroup", params);
+
+        assertEquals(200, response.getStatus());
+        String xml = (String) response.getEntity();
+        assertTrue(xml.contains("<ResetClusterParameterGroupResult>"));
+        assertTrue(xml.contains("<ParameterGroupName>reset-pg</ParameterGroupName>"));
+        assertTrue(xml.contains("<ParameterGroupStatus>"));
+        verify(service).resetClusterParameterGroup("reset-pg", true, List.of());
+    }
+
+    @Test
+    void resetClusterParameterGroupDefaultsToAllWithoutNames() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+
+        handler.handle("ResetClusterParameterGroup", params);
+
+        verify(service).resetClusterParameterGroup("reset-pg", true, List.of());
+    }
+
+    @Test
+    void resetClusterParameterGroupAcceptsBothQueryMemberFormatsWithoutValues() {
+        for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("ParameterGroupName", "reset-pg");
+            params.putSingle("ResetAllParameters", "false");
+            params.putSingle(prefix + ".1.ParameterName", "wlm_json_configuration");
+
+            handler.handle("ResetClusterParameterGroup", params);
+        }
+
+        verify(service, times(2)).resetClusterParameterGroup("reset-pg", false, List.of("wlm_json_configuration"));
+    }
+
+    @Test
+    void resetClusterParameterGroupDefaultsToSelectedNamesWhenNamesAreGiven() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        params.putSingle("Parameters.Parameter.1.ParameterName", "wlm_json_configuration");
+
+        handler.handle("ResetClusterParameterGroup", params);
+
+        verify(service).resetClusterParameterGroup("reset-pg", false, List.of("wlm_json_configuration"));
+    }
+
+    @Test
+    void resetClusterParameterGroupDoesNotTreatSparseNamesAsResetAll() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        params.putSingle("Parameters.Parameter.2.ParameterName", "wlm_json_configuration");
+
+        handler.handle("ResetClusterParameterGroup", params);
+
+        verify(service).resetClusterParameterGroup("reset-pg", false, List.of("wlm_json_configuration"));
+    }
+
+    @Test
+    void resetClusterParameterGroupRejectsInvalidBoolean() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        params.putSingle("ResetAllParameters", "invalid");
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> handler.handle("ResetClusterParameterGroup", params));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        verify(service, never()).resetClusterParameterGroup(any(), anyBoolean(), anyList());
+    }
+
+    @Test
+    void resetClusterParameterGroupAcceptsBotocoreEmptyListForResetAll() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        params.putSingle("Parameters", "");
+        params.putSingle("ResetAllParameters", "true");
+
+        Response response = handler.handle("ResetClusterParameterGroup", params);
+
+        assertEquals(200, response.getStatus());
+        verify(service).resetClusterParameterGroup("reset-pg", true, List.of());
+    }
+
+    @Test
+    void resetClusterParameterGroupTreatsEmptyListLikeOmittedList() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        params.putSingle("Parameters", "");
+
+        handler.handle("ResetClusterParameterGroup", params);
+
+        verify(service).resetClusterParameterGroup("reset-pg", true, List.of());
+    }
+
+    @Test
+    void resetClusterParameterGroupRejectsNonemptyBareParameters() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        params.putSingle("Parameters", "invalid");
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> handler.handle("ResetClusterParameterGroup", params));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        verify(service, never()).resetClusterParameterGroup(any(), anyBoolean(), anyList());
+    }
+
+    @Test
+    void resetClusterParameterGroupPassesAllSuppliedNamesToServiceForValidation() {
+        for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("ParameterGroupName", "reset-pg");
+            for (int index = 1; index <= 21; index++) {
+                params.putSingle(prefix + "." + index + ".ParameterName", "max_cursor_result_set_size");
+            }
+
+            handler.handle("ResetClusterParameterGroup", params);
+        }
+        ArgumentCaptor<List<String>> names = ArgumentCaptor.captor();
+        verify(service, times(2)).resetClusterParameterGroup(eq("reset-pg"), eq(false), names.capture());
+        assertTrue(names.getAllValues().stream().allMatch(value -> value.size() == 21));
+    }
+
+    @Test
+    void modifyClusterParameterGroupRejectsMembersWithoutNames() {
+        for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("ParameterGroupName", "reset-pg");
+            params.putSingle(prefix + ".1.ParameterValue", "1000");
+
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> handler.handle("ModifyClusterParameterGroup", params));
+
+            assertEquals("InvalidParameterValue", failure.getErrorCode());
+        }
+        verify(service, never()).modifyClusterParameterGroup(any(), anyList());
+    }
+
+    @Test
+    void modifyClusterParameterGroupReadsSparseMembersInNumericOrder() {
+        for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("ParameterGroupName", "reset-pg");
+            params.putSingle(prefix + ".10.ParameterName", "max_cursor_result_set_size");
+            params.putSingle(prefix + ".10.ParameterValue", "2000");
+            params.putSingle(prefix + ".2.ParameterName", "max_cursor_result_set_size");
+            params.putSingle(prefix + ".2.ParameterValue", "1000");
+
+            handler.handle("ModifyClusterParameterGroup", params);
+        }
+
+        ArgumentCaptor<List<Parameter>> updates = ArgumentCaptor.captor();
+        verify(service, times(2)).modifyClusterParameterGroup(eq("reset-pg"), updates.capture());
+        for (List<Parameter> parameters : updates.getAllValues()) {
+            assertEquals(List.of("1000", "2000"), parameters.stream().map(Parameter::getParameterValue).toList());
+        }
+    }
+
+    @Test
+    void resetClusterParameterGroupCountsMembersRatherThanFields() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        for (int index = 1; index <= 20; index++) {
+            params.putSingle("Parameters.Parameter." + index + ".ParameterName", "max_cursor_result_set_size");
+            params.putSingle("Parameters.Parameter." + index + ".ParameterValue", "ignored");
+        }
+
+        handler.handle("ResetClusterParameterGroup", params);
+
+        ArgumentCaptor<List<String>> names = ArgumentCaptor.captor();
+        verify(service).resetClusterParameterGroup(eq("reset-pg"), eq(false), names.capture());
+        assertEquals(20, names.getValue().size());
+    }
+
+    @Test
+    void resetClusterParameterGroupRejectsMembersWithoutNamesBeforeChoosingResetAll() {
+        for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("ParameterGroupName", "reset-pg");
+            params.putSingle(prefix + ".1.ParameterValue", "1000");
+
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> handler.handle("ResetClusterParameterGroup", params));
+
+            assertEquals("InvalidParameterValue", failure.getErrorCode());
+            params.putSingle(prefix + ".2.ParameterName", "wlm_json_configuration");
+            assertThrows(AwsException.class, () -> handler.handle("ResetClusterParameterGroup", params));
+            params.putSingle(prefix + ".1.ParameterName", " ");
+            assertThrows(AwsException.class, () -> handler.handle("ResetClusterParameterGroup", params));
+        }
+        verify(service, never()).resetClusterParameterGroup(any(), anyBoolean(), anyList());
+    }
+
+    @Test
+    void describeClusterParametersFiltersAndSerializesSource() {
+        Parameter overridden = new Parameter("max_cursor_result_set_size", "1000");
+        overridden.setSource("user");
+        Parameter engineDefault = new Parameter("wlm_json_configuration", "{}");
+        engineDefault.setSource("engine-default");
+        when(service.describeClusterParameters("reset-pg")).thenReturn(List.of(overridden, engineDefault));
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ParameterGroupName", "reset-pg");
+        params.putSingle("Source", "user");
+
+        Response response = handler.handle("DescribeClusterParameters", params);
+
+        String xml = (String) response.getEntity();
+        assertTrue(xml.contains("<Source>user</Source>"));
+        assertFalse(xml.contains("wlm_json_configuration"));
+    }
 
     @BeforeEach
     void setUp() {
@@ -72,7 +340,7 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("test-cluster");
         cluster.setClusterStatus("available");
-        when(service.createCluster(any(), any(), any(), any(), any(), any())).thenReturn(cluster);
+        when(service.createCluster(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(cluster);
 
         Response response = handler.handle("CreateCluster", params);
 
@@ -98,7 +366,7 @@ class RedshiftQueryHandlerTest {
         cluster.setClusterStatus("available");
         cluster.setMasterPasswordSecretArn("arn:aws:secretsmanager:us-east-1:acc:secret:redshift-managed");
         cluster.setMasterPasswordSecretKmsKeyId("arn:aws:kms:us-east-1:acc:key/key-1");
-        when(service.createClusterWithManagedMasterPassword(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(service.createClusterWithManagedMasterPassword(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(cluster);
 
         Response response = handler.handle("CreateCluster", params,
@@ -111,7 +379,7 @@ class RedshiftQueryHandlerTest {
         assertFalse(xml.contains("<MasterUserSecret>"));
         verify(service).createClusterWithManagedMasterPassword(eq("managed-cluster"), eq("dc2.large"),
                 eq("admin"), isNull(), eq(List.of()), eq(List.of()),
-                eq("arn:aws:kms:us-east-1:acc:key/key-1"), eq("us-east-1"));
+                eq("arn:aws:kms:us-east-1:acc:key/key-1"), eq("us-east-1"), isNull());
     }
 
     @Test
@@ -127,13 +395,13 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("test-cluster");
         cluster.setClusterStatus("available");
-        when(service.createCluster(any(), any(), any(), any(), any(), any(), any())).thenReturn(cluster);
+        when(service.createCluster(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(cluster);
 
         handler.handle("CreateCluster", params);
 
         verify(service).createCluster(eq("test-cluster"), eq("dc2.large"), eq("admin"), eq("password123"),
                 isNull(), eq(List.of()), eq(List.of("arn:aws:iam::000000000000:role/first",
-                        "arn:aws:iam::000000000000:role/second")));
+                        "arn:aws:iam::000000000000:role/second")), isNull());
     }
     
     @Test
@@ -176,7 +444,7 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("test-cluster");
         cluster.setClusterStatus("creating");
-        when(service.createCluster(any(), any(), any(), any(), any(), any())).thenReturn(cluster);
+        when(service.createCluster(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(cluster);
 
         Response response = handler.handle("CreateCluster", params);
         String xml = (String) response.getEntity();
@@ -206,7 +474,7 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("test-cluster");
         cluster.setClusterStatus("deleting");
-        when(service.deleteCluster(any())).thenReturn(cluster);
+        when(service.deleteCluster("test-cluster", null, null, null)).thenReturn(cluster);
 
         Response response = handler.handle("DeleteCluster", params);
         assertEquals(200, response.getStatus());
@@ -233,10 +501,27 @@ class RedshiftQueryHandlerTest {
         assertTrue(xml.contains("<Port>5439</Port>"));
         assertTrue(xml.contains("<MasterUsername>admin</MasterUsername>"));
         assertTrue(xml.contains("<RequestId>test-req-id</RequestId>"));
+        assertTrue(xml.contains("<ManualSnapshotRetentionPeriod>-1</ManualSnapshotRetentionPeriod>"));
         // A Snapshot built via this constructor carries no ARN/CreateTime; the elements
         // must be omitted rather than serialized as empty or "null".
         assertFalse(xml.contains("<SnapshotArn>"));
         assertFalse(xml.contains("<SnapshotCreateTime>"));
+    }
+
+    @Test
+    void describeLegacySnapshotsDefaultsMissingAndNullRetention() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        for (String json : List.of("{\"snapshotIdentifier\":\"legacy\"}",
+                "{\"snapshotIdentifier\":\"legacy\",\"manualSnapshotRetentionPeriod\":null}")) {
+            Snapshot snapshot = mapper.readValue(json, Snapshot.class);
+            when(service.describeSnapshots("legacy", null)).thenReturn(List.of(snapshot));
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("SnapshotIdentifier", "legacy");
+
+            String xml = handler.handle("DescribeClusterSnapshots", params).getEntity().toString();
+
+            assertTrue(xml.contains("<ManualSnapshotRetentionPeriod>-1</ManualSnapshotRetentionPeriod>"));
+        }
     }
 
     @Test
@@ -599,13 +884,13 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("c1");
         cluster.setIamRoleArns(List.of("arn:aws:iam::111111111111:role/a"));
-        when(service.modifyClusterIamRoles(eq("c1"), any(), any())).thenReturn(cluster);
+        when(service.modifyClusterIamRoles(eq("c1"), any(), any(), isNull())).thenReturn(cluster);
 
         Response response = handler.handle("ModifyClusterIamRoles", params);
 
         assertEquals(200, response.getStatus());
         verify(service).modifyClusterIamRoles("c1",
-                List.of("arn:aws:iam::111111111111:role/a"), List.of("arn:aws:iam::111111111111:role/b"));
+                List.of("arn:aws:iam::111111111111:role/a"), List.of("arn:aws:iam::111111111111:role/b"), null);
         String body = response.getEntity().toString();
         assertTrue(body.contains("<ModifyClusterIamRolesResult>"));
         assertTrue(body.contains("<IamRoleArn>arn:aws:iam::111111111111:role/a</IamRoleArn>"));

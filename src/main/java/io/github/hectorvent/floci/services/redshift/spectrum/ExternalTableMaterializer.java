@@ -720,7 +720,7 @@ public class ExternalTableMaterializer {
     private void ensureScratchBucket() {
         boolean created = true;
         try {
-            s3Service.createBucket(SCRATCH_BUCKET, config.defaultRegion());
+            s3Service.createInternalBucket(SCRATCH_BUCKET, config.defaultRegion());
         } catch (AwsException exception) {
             if (!"BucketAlreadyOwnedByYou".equals(exception.getErrorCode())) {
                 throw exception;

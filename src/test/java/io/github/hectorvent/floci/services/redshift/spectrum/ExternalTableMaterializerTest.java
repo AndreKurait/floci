@@ -100,6 +100,7 @@ class ExternalTableMaterializerTest {
         s3 = mock(S3Service.class);
         iam = mock(IamService.class);
         IamRole role = mock(IamRole.class);
+        when(role.getArn()).thenReturn("arn:aws:iam::000000000000:role/R");
         when(role.getAssumeRolePolicyDocument()).thenReturn(TRUST_POLICY);
         when(iam.findRole(ACCOUNT, "R")).thenReturn(Optional.of(role));
         EmulatorConfig config = mock(EmulatorConfig.class, Answers.RETURNS_DEEP_STUBS);
@@ -616,7 +617,7 @@ class ExternalTableMaterializerTest {
 
     @Test
     void refusesToUseAScratchBucketNameThatBelongsToAUserBucket() {
-        when(s3.createBucket(eq(ExternalTableMaterializer.SCRATCH_BUCKET), anyString()))
+        when(s3.createInternalBucket(eq(ExternalTableMaterializer.SCRATCH_BUCKET), anyString()))
                 .thenThrow(new AwsException("BucketAlreadyOwnedByYou", "owned", 409));
         when(s3.getBucketTagging(ExternalTableMaterializer.SCRATCH_BUCKET)).thenReturn(Map.of());
         when(glue.getTable("lake", "events")).thenReturn(csvTable());
@@ -626,6 +627,7 @@ class ExternalTableMaterializerTest {
 
         assertThat(exception.getMessage(), containsString("not the Spectrum scratch bucket"));
         verify(duck, never()).execute(anyString(), any(), anyString(), anyString());
+        verify(s3, never()).putBucketTagging(eq(ExternalTableMaterializer.SCRATCH_BUCKET), any());
         verify(s3, never()).deleteObject(eq(ExternalTableMaterializer.SCRATCH_BUCKET), anyString());
     }
 
@@ -636,7 +638,7 @@ class ExternalTableMaterializerTest {
         verify(s3).putBucketTagging(ExternalTableMaterializer.SCRATCH_BUCKET, Map.of(
                 S3Service.INTERNAL_BUCKET_TAG_KEY, S3Service.REDSHIFT_SPECTRUM_SCRATCH_TAG_VALUE));
 
-        when(s3.createBucket(eq(ExternalTableMaterializer.SCRATCH_BUCKET), anyString()))
+        when(s3.createInternalBucket(eq(ExternalTableMaterializer.SCRATCH_BUCKET), anyString()))
                 .thenThrow(new AwsException("BucketAlreadyOwnedByYou", "owned", 409));
         when(s3.getBucketTagging(ExternalTableMaterializer.SCRATCH_BUCKET)).thenReturn(Map.of(
                 S3Service.INTERNAL_BUCKET_TAG_KEY, S3Service.REDSHIFT_SPECTRUM_SCRATCH_TAG_VALUE));

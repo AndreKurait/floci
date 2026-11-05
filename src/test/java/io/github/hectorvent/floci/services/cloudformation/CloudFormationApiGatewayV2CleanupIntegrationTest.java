@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Route;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.mockito.InjectSpy;
@@ -67,7 +68,7 @@ class CloudFormationApiGatewayV2CleanupIntegrationTest {
         String apiName = "http-api-cleanup-" + suffix;
 
         createStack(httpApiTemplate(apiName, List.of("/before")));
-        waitForStackStatus("CREATE_COMPLETE");
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         String apiId = apiIdForName(apiName);
         String oldRouteId = apiGatewayV2Service.findRouteByKey(REGION, apiId, "GET /before").getRouteId();
 
@@ -93,7 +94,7 @@ class CloudFormationApiGatewayV2CleanupIntegrationTest {
         }).when(apiGatewayV2Service).deleteRoute(eq(REGION), eq(apiId), anyString());
 
         updateStack(httpApiTemplate(apiName, List.of("/survivor", "/fail")));
-        waitForStackStatus("UPDATE_ROLLBACK_COMPLETE");
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_ROLLBACK_COMPLETE");
 
         StackResource persisted = cloudFormationService.describeStacks(stackName, REGION)
                 .getFirst().getResources().get("HttpApi");
@@ -109,7 +110,7 @@ class CloudFormationApiGatewayV2CleanupIntegrationTest {
         String apiName = "http-api-restore-failure-" + suffix;
 
         createStack(httpApiTemplate(apiName, List.of("/before")));
-        waitForStackStatus("CREATE_COMPLETE");
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         String apiId = apiIdForName(apiName);
         String oldRouteId = apiGatewayV2Service.findRouteByKey(REGION, apiId, "GET /before").getRouteId();
 
@@ -127,7 +128,7 @@ class CloudFormationApiGatewayV2CleanupIntegrationTest {
         }).when(apiGatewayV2Service).createRoute(eq(REGION), eq(apiId), anyMap());
 
         updateStack(httpApiTemplate(apiName, List.of("/fail")));
-        waitForStackStatus("UPDATE_ROLLBACK_FAILED");
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_ROLLBACK_FAILED");
 
         Route independent = apiGatewayV2Service.findRouteByKey(REGION, apiId, "GET /before");
         assertEquals(independentRouteId.get(), independent.getRouteId());
@@ -157,22 +158,6 @@ class CloudFormationApiGatewayV2CleanupIntegrationTest {
                 .post("/")
         .then()
                 .statusCode(200);
-    }
-
-    private void waitForStackStatus(String expected) {
-        for (int attempt = 0; attempt < 100; attempt++) {
-            String status = cloudFormationService.describeStacks(stackName, REGION).getFirst().getStatus();
-            if (expected.equals(status)) {
-                return;
-            }
-            try {
-                Thread.sleep(25);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("Interrupted while waiting for stack status", e);
-            }
-        }
-        throw new AssertionError("Stack did not reach " + expected);
     }
 
     private static String apiIdForName(String apiName) {

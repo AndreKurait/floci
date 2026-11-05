@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iot;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.testing.IotDataRequests;
 import io.github.hectorvent.floci.testing.IotMqttTlsProfile;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.junit.QuarkusTest;
@@ -19,6 +20,8 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.services.iotdataplane.IotDataPlaneClient;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -194,9 +197,69 @@ class IotMqttEnabledIntegrationTest {
             MqttPublish received = subscriber.takePublish();
             assertEquals(topic, received.topic());
             assertArrayEquals(payload, received.payload());
+            assertEquals(1, received.qos(), "measured on AWS IoT: the lower of the publish and subscription QoS");
         }
 
         awaitPublishedEvent(topic, payload);
+    }
+
+    /** Measured on AWS IoT: a data plane Publish reaches every matching subscriber and runs the matching rule once. */
+    @Test
+    void dataPlanePublishReachesAWildcardSubscriberAndFiresItsRuleOnce() throws Exception {
+        String prefix = "dataplane/" + System.nanoTime();
+        String queueUrl = createQueue("dataplane-rule-" + System.nanoTime());
+        String rule = "dataPlaneRule" + System.nanoTime();
+        createSqsRule(rule, "SELECT * FROM '" + prefix + "/b'", queueUrl);
+        try (MqttTestClient subscriber = connectMqtt("dataplane-sub");
+             IotDataPlaneClient iotData = IotDataRequests.iotDataClient("test")) {
+            subscriber.subscribe(prefix + "/#", 1);
+
+            iotData.publish(request -> request.topic(prefix + "/b").qos(1).payload(SdkBytes.fromUtf8String("{\"cmd\":\"on\"}")));
+
+            MqttPublish received = subscriber.takePublish();
+            assertEquals(prefix + "/b", received.topic());
+            assertEquals("{\"cmd\":\"on\"}", new String(received.payload(), StandardCharsets.UTF_8));
+            assertEquals(1, received.qos());
+            assertFalse(received.retained(), "a live copy carries RETAIN 0");
+            List<JsonNode> fired = awaitMessages(queueUrl, 1);
+            assertEquals(1, fired.size(), "the rule fired once: " + fired);
+            assertEquals("on", fired.get(0).path("cmd").asText());
+        } finally {
+            deleteRule(rule);
+        }
+    }
+
+    /**
+     * Measured on AWS IoT: a retained data plane Publish reaches a current subscriber as a live copy, and a later
+     * subscriber of its exact topic as the retained message, each at the lower of the publish and subscription QoS.
+     */
+    @Test
+    void retainedDataPlanePublishReachesACurrentAndALaterSubscriber() throws Exception {
+        String prefix = "dataplane/" + System.nanoTime();
+        String topic = prefix + "/config";
+        try (MqttTestClient current = connectMqtt("dataplane-current");
+             IotDataPlaneClient iotData = IotDataRequests.iotDataClient("test")) {
+            current.subscribe(prefix + "/#", 0);
+
+            iotData.publish(request -> request.topic(topic).qos(1).retain(true).payload(SdkBytes.fromUtf8String("config-v1")));
+            cleanup.register(() -> given().contentType("application/octet-stream").queryParam("retain", true)
+                    .body(new byte[0]).when().post("/topics/" + topic).then().statusCode(200));
+
+            MqttPublish live = current.takePublish();
+            assertEquals("config-v1", new String(live.payload(), StandardCharsets.UTF_8));
+            assertEquals(0, live.qos());
+            assertFalse(live.retained(), "a live copy carries RETAIN 0");
+
+            try (MqttTestClient later = connectMqtt("dataplane-later")) {
+                later.subscribe(topic, 1);
+
+                MqttPublish retained = later.takePublish();
+                assertEquals(topic, retained.topic());
+                assertEquals("config-v1", new String(retained.payload(), StandardCharsets.UTF_8));
+                assertEquals(1, retained.qos());
+                assertTrue(retained.retained());
+            }
+        }
     }
 
     @Test
@@ -891,7 +954,7 @@ class IotMqttEnabledIntegrationTest {
         out.writeBytes(bytes);
     }
 
-    private record MqttPublish(String topic, byte[] payload) {
+    private record MqttPublish(String topic, byte[] payload, int qos, boolean retained) {
     }
 
     private static final class MqttTestClient implements AutoCloseable {
@@ -913,7 +976,7 @@ class IotMqttEnabledIntegrationTest {
 
                 @Override
                 public void messageArrived(String topic, MqttMessage message) {
-                    testClient.publishes.add(new MqttPublish(topic, message.getPayload()));
+                    testClient.publishes.add(new MqttPublish(topic, message.getPayload(), message.getQos(), message.isRetained()));
                 }
 
                 @Override
@@ -1007,7 +1070,7 @@ class IotMqttEnabledIntegrationTest {
 
                 @Override
                 public void messageArrived(String topic, org.eclipse.paho.mqttv5.common.MqttMessage message) {
-                    testClient.publishes.add(new MqttPublish(topic, message.getPayload()));
+                    testClient.publishes.add(new MqttPublish(topic, message.getPayload(), message.getQos(), message.isRetained()));
                 }
 
                 @Override

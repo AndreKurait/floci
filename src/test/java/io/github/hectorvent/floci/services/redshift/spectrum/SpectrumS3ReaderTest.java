@@ -281,6 +281,7 @@ class SpectrumS3ReaderTest {
     private static IamService iamWithRole() {
         IamService iam = mock(IamService.class);
         IamRole role = mock(IamRole.class);
+        when(role.getArn()).thenReturn("arn:aws:iam::000000000000:role/Reader");
         when(role.getAssumeRolePolicyDocument()).thenReturn("""
                 {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
                 "Principal":{"Service":"redshift.amazonaws.com"},"Action":"sts:AssumeRole"}]}""");

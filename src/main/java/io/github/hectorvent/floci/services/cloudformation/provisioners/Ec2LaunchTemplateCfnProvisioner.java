@@ -145,6 +145,31 @@ public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
+    private LaunchTemplateData.CapacityReservationSpecification capacityReservationSpecification(
+            JsonNode raw, CloudFormationTemplateEngine engine) {
+        CfnPropertyTypes.Reader types = new CfnPropertyTypes.Reader(engine);
+        String shape = CfnPropertyTypes.memberShape(
+                CfnPropertyTypes.propertyShape("AWS::EC2::LaunchTemplate", "LaunchTemplateData"),
+                "CapacityReservationSpecification");
+        JsonNode block = types.read("LaunchTemplateData/CapacityReservationSpecification", raw, shape);
+        types.finish();
+        if (block == null || block.isEmpty()) {
+            return null;
+        }
+        LaunchTemplateData.CapacityReservationSpecification specification =
+                new LaunchTemplateData.CapacityReservationSpecification();
+        specification.setCapacityReservationPreference(block.path("CapacityReservationPreference").asText(null));
+        JsonNode targetNode = block.path("CapacityReservationTarget");
+        if (targetNode.isObject()) {
+            LaunchTemplateData.CapacityReservationTarget target = new LaunchTemplateData.CapacityReservationTarget();
+            target.setCapacityReservationId(targetNode.path("CapacityReservationId").asText(null));
+            target.setCapacityReservationResourceGroupArn(
+                    targetNode.path("CapacityReservationResourceGroupArn").asText(null));
+            specification.setCapacityReservationTarget(target);
+        }
+        return specification;
+    }
+
     private LaunchTemplateData launchTemplateData(JsonNode props, ProvisionContext ctx) {
         JsonNode node = props == null ? null : ctx.engine().resolveNodeOmittingNoValue(props.get("LaunchTemplateData"));
         if (node == null || node.isNull() || node.isMissingNode()) {
@@ -160,9 +185,14 @@ public class Ec2LaunchTemplateCfnProvisioner implements CfnResourceProvisioner {
             JsonNode dataNode = node.deepCopy();
             if (dataNode instanceof ObjectNode object) {
                 object.remove("MetadataOptions");
+                object.remove("CapacityReservationSpecification");
             }
             LaunchTemplateData data = MAPPER.treeToValue(dataNode, LaunchTemplateData.class);
             data.setMetadataOptions(metadata);
+            JsonNode capacity = written != null && written.isObject()
+                    && !CloudFormationTemplateEngine.callsIntrinsic(written)
+                    ? written.get("CapacityReservationSpecification") : null;
+            data.setCapacityReservationSpecification(capacityReservationSpecification(capacity, ctx.engine()));
             String encodedUserData = node.path("UserData").asText(null);
             data.setEncodedUserData(encodedUserData);
             data.setUserData(Ec2UserDataDecoder.decode(encodedUserData));

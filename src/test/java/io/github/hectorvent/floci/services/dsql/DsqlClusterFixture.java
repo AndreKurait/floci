@@ -15,6 +15,8 @@ import java.util.Properties;
 
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.anyOf;
+import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -65,17 +67,39 @@ public final class DsqlClusterFixture {
         return host;
     }
 
+    public String identifier() {
+        return identifier;
+    }
+
+    public String arn() {
+        return "arn:aws:dsql:" + REGION + ":" + ACCOUNT + ":cluster/" + identifier;
+    }
+
+    /** Gives the cluster {@code policy} through the control plane, as the account's root. */
+    public void putPolicy(String policy) {
+        dsql().body(Map.of("policy", policy)).post("/cluster/" + identifier + "/policy").then().statusCode(200);
+    }
+
+    /** Takes the cluster's policy away, if it has one. */
+    public void removePolicy() {
+        dsql().delete("/cluster/" + identifier + "/policy").then().statusCode(anyOf(is(200), is(404)));
+    }
+
     public String url() {
         return "jdbc:postgresql://127.0.0.1:" + endpoint.port() + "/postgres";
     }
 
-    /** What JDBC needs to sign in as {@code user}: TLS, without checking Floci's certificate. */
+    /**
+     * What JDBC needs to sign in as {@code user}: TLS naming the cluster as its server, as DSQL
+     * requires, without checking Floci's certificate.
+     */
     public Properties properties(String user, String password) {
         Properties properties = new Properties();
         properties.setProperty("user", user);
         properties.setProperty("password", password);
         properties.setProperty("sslmode", "require");
-        properties.setProperty("sslfactory", "org.postgresql.ssl.NonValidatingFactory");
+        properties.setProperty("sslfactory", DsqlServerNameSocketFactory.class.getName());
+        properties.setProperty(DsqlServerNameSocketFactory.SERVER_NAME, host);
         return properties;
     }
 

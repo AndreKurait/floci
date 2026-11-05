@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.sagemaker;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -7,7 +8,9 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.sagemaker.model.SageMakerEntities.EndpointConfigResource;
@@ -140,17 +143,33 @@ public class SageMakerService {
     }
 
     public ObjectNode listModels(JsonNode request, String region) {
-        List<ModelResource> models = modelStore.scan(k -> k.startsWith(region + "::")).stream()
-                .sorted(Comparator.comparing(m -> m.modelName)).toList();
+        String sortBy = text(request, "SortBy");
+        String sortOrder = text(request, "SortOrder");
+        List<String> violations = new ArrayList<>();
+        if (sortBy != null && !sortBy.equals("Name") && !sortBy.equals("CreationTime")) {
+            violations.add(SmithyValidationErrors.notInEnum(sortBy, "sortBy", List.of("Name", "CreationTime")));
+        }
+        if (sortOrder != null && !sortOrder.equals("Ascending") && !sortOrder.equals("Descending")) {
+            violations.add(SmithyValidationErrors.notInEnum(sortOrder, "sortOrder", List.of("Ascending", "Descending")));
+        }
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.validationException(violations);
+        }
+        Comparator<ModelResource> comparator = "Name".equals(sortBy)
+                ? Comparator.comparing(m -> m.modelName)
+                : Comparator.comparingLong((ModelResource m) -> m.creationTime).thenComparing(m -> m.modelName);
+        if (sortOrder == null || sortOrder.equals("Descending")) {
+            comparator = comparator.reversed();
+        }
+        List<ModelResource> models = modelStore.scan(k -> k.startsWith(region + "::")).stream().sorted(comparator).toList();
         String nameContains = text(request, "NameContains");
         if (nameContains != null && !nameContains.isBlank()) {
             models = models.stream().filter(m -> m.modelName.contains(nameContains)).toList();
         }
-        return paginate(models, request, m -> m.modelName, (m, n) -> {
-            n.put("ModelName", m.modelName);
-            n.put("ModelArn", m.modelArn);
-            n.put("CreationTime", epoch(m.creationTime));
-        }, "Models");
+        return paginateModels(models, request, comparator, region,
+                sortBy == null ? "CreationTime" : sortBy,
+                sortOrder == null ? "Descending" : sortOrder,
+                nameContains == null || nameContains.isBlank() ? "" : nameContains);
     }
 
     public synchronized ObjectNode createEndpointConfig(JsonNode request, String region) {
@@ -607,12 +626,7 @@ public class SageMakerService {
         return arr;
     }
 
-    /**
-     * Applies AWS's {@code MaxResults}/{@code NextToken} contract to an already-filtered,
-     * name-sorted list: {@code MaxResults} (1-100, default {@value #DEFAULT_LIMIT}) caps the
-     * page, and an opaque {@code NextToken} (the last name returned) resumes strictly after it,
-     * matching the sort the caller applied.
-     */
+    /** Applies name-ascending pagination for the existing endpoint and training-job lists. */
     private <T> ObjectNode paginate(List<T> sorted, JsonNode request, Function<T, String> nameOf,
                                     BiConsumer<T, ObjectNode> render, String itemsField) {
         int max = maxResults(request);
@@ -621,6 +635,71 @@ public class SageMakerService {
         if (nextToken != null && !nextToken.isBlank()) {
             remaining = remaining.stream().dropWhile(v -> nameOf.apply(v).compareTo(nextToken) <= 0).toList();
         }
+        return page(remaining, max, render, itemsField, nameOf);
+    }
+
+    private ObjectNode paginateModels(List<ModelResource> sorted, JsonNode request,
+                                      Comparator<ModelResource> comparator, String region,
+                                      String sortBy, String sortOrder, String nameContains) {
+        int max = maxResults(request);
+        String nextToken = text(request, "NextToken");
+        List<ModelResource> remaining = sorted;
+        if (nextToken != null && !nextToken.isBlank()) {
+            ModelResource anchor;
+            if (sortBy.equals("Name")) {
+                anchor = new ModelResource();
+                anchor.modelName = nextToken;
+            } else {
+                anchor = decodeModelCursor(nextToken, region, sortOrder, nameContains);
+            }
+            remaining = remaining.stream().dropWhile(m -> comparator.compare(m, anchor) <= 0).toList();
+        }
+        return page(remaining, max, (m, n) -> {
+            n.put("ModelName", m.modelName);
+            n.put("ModelArn", m.modelArn);
+            n.put("CreationTime", epoch(m.creationTime));
+        }, "Models", m -> sortBy.equals("Name") ? m.modelName
+                : encodeModelCursor(m, region, sortOrder, nameContains));
+    }
+
+    private String encodeModelCursor(ModelResource model, String region, String sortOrder, String nameContains) {
+        ObjectNode cursor = mapper.createObjectNode();
+        cursor.put("version", 1);
+        cursor.put("region", region);
+        cursor.put("sortBy", "CreationTime");
+        cursor.put("sortOrder", sortOrder);
+        cursor.put("nameContains", nameContains);
+        cursor.put("creationTime", model.creationTime);
+        cursor.put("modelName", model.modelName);
+        return Base64Url.encode(cursor.toString());
+    }
+
+    private ModelResource decodeModelCursor(String token, String region, String sortOrder, String nameContains) {
+        JsonNode cursor;
+        try {
+            cursor = mapper.readTree(Base64Url.decode(token));
+        } catch (IllegalArgumentException | JsonProcessingException e) {
+            throw validation("Invalid NextToken.");
+        }
+        if (cursor == null || !cursor.path("version").isInt() || cursor.path("version").asInt() != 1
+                || !region.equals(cursor.path("region").asText(null))
+                || !"CreationTime".equals(cursor.path("sortBy").asText(null))
+                || !sortOrder.equals(cursor.path("sortOrder").asText(null))
+                || !nameContains.equals(cursor.path("nameContains").asText(null))
+                || !cursor.path("creationTime").isIntegralNumber()
+                || !cursor.path("creationTime").canConvertToLong()
+                || !cursor.path("modelName").isTextual()
+                || cursor.path("modelName").asText().isBlank()) {
+            throw validation("Invalid NextToken.");
+        }
+        ModelResource anchor = new ModelResource();
+        anchor.creationTime = cursor.path("creationTime").asLong();
+        anchor.modelName = cursor.path("modelName").asText();
+        return anchor;
+    }
+
+    private <T> ObjectNode page(List<T> remaining, int max, BiConsumer<T, ObjectNode> render,
+                                String itemsField, Function<T, String> tokenOf) {
         List<T> page = remaining.stream().limit(max).toList();
         ArrayNode arr = mapper.createArrayNode();
         page.forEach(v -> {
@@ -631,7 +710,7 @@ public class SageMakerService {
         ObjectNode out = mapper.createObjectNode();
         out.set(itemsField, arr);
         if (page.size() == max && remaining.size() > max) {
-            out.put("NextToken", nameOf.apply(page.get(page.size() - 1)));
+            out.put("NextToken", tokenOf.apply(page.get(page.size() - 1)));
         }
         return out;
     }

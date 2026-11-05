@@ -2,27 +2,37 @@ package io.github.hectorvent.floci.services.ram;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.ram.model.ResourceShare;
+import io.github.hectorvent.floci.services.ram.model.ResourceShareAssociation;
 import io.github.hectorvent.floci.services.ram.model.ResourceShareInvitation;
 import io.github.hectorvent.floci.services.ram.model.SharedResource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -70,11 +80,96 @@ class RamServiceTest {
         assertTrue(service.listResources(ACCEPTER, "OTHER-ACCOUNTS", List.of(), "us-east-1").isEmpty());
         assertTrue(service.listPrincipals(ACCEPTER, "OTHER-ACCOUNTS", List.of(), "us-east-1").isEmpty());
         assertTrue(service.listResources(OWNER, "SELF", List.of(), "us-east-1").isEmpty());
+        assertTrue(associations(OWNER, "us-east-1", "RESOURCE", null,
+                List.of(share.getResourceShareArn()), null, null, null, null).items().isEmpty());
 
         // The share itself remains readable with DELETED status.
         List<ResourceShare> own = service.getResourceShares(OWNER, "SELF", "us-east-1");
         assertEquals(1, own.size());
         assertEquals("DELETED", own.get(0).getStatus());
+    }
+
+    @Test
+    void getResourceShareAssociationsFiltersOwnedResourcesAndPrincipals() {
+        ResourceShare share = service.createResourceShare("associations", List.of(OU_ARN),
+                List.of(TGW_ARN), false, "us-east-1", OWNER);
+        service.createResourceShare("other-region", List.of(OU_ARN), List.of(TGW_ARN),
+                false, "eu-west-1", OWNER);
+        service.createResourceShare("other-owner", List.of(OWNER), List.of(TGW_ARN),
+                false, "us-east-1", ACCEPTER);
+
+        PaginatedResult<ResourceShareAssociation> resources = associations(
+                OWNER, "us-east-1", "RESOURCE", null, List.of(), TGW_ARN, null, null, null);
+        assertEquals(1, resources.items().size());
+        assertEquals(share.getResourceShareArn(), resources.items().getFirst().resourceShareArn());
+        assertEquals(TGW_ARN, resources.items().getFirst().associatedEntity());
+        assertEquals(share.getCreationTime(), resources.items().getFirst().creationTime());
+        assertNull(resources.nextToken());
+
+        assertEquals(1, associations(OWNER, "us-east-1", "PRINCIPAL", null,
+                List.of(share.getResourceShareArn()), null, OU_ARN, null, null).items().size());
+        assertTrue(associations(ACCEPTER, "us-east-1", "RESOURCE", null,
+                List.of(share.getResourceShareArn()), TGW_ARN, null, null, null).items().isEmpty());
+        assertTrue(associations(OWNER, "eu-west-1", "RESOURCE", null,
+                List.of(share.getResourceShareArn()), TGW_ARN, null, null, null).items().isEmpty());
+        assertTrue(associations(OWNER, "us-east-1", "RESOURCE", "DISASSOCIATED",
+                List.of(), null, null, null, null).items().isEmpty());
+        assertTrue(associations(OWNER, "us-east-1", "SOURCE", null,
+                List.of(), null, null, null, null).items().isEmpty());
+
+        service.disassociateResourceShare(share.getResourceShareArn(), List.of(TGW_ARN), List.of(),
+                OWNER, "us-east-1");
+        assertTrue(associations(OWNER, "us-east-1", "RESOURCE", null,
+                List.of(share.getResourceShareArn()), null, null, null, null).items().isEmpty());
+    }
+
+    @Test
+    void getResourceShareAssociationsPagesWithoutLeakingFiltersAcrossTokens() {
+        ResourceShare share = service.createResourceShare("many-associations", List.of(OU_ARN),
+                List.of(TGW_ARN, TGW_ARN + "2"), false, "us-east-1", OWNER);
+        PaginatedResult<ResourceShareAssociation> first = associations(OWNER, "us-east-1", "RESOURCE",
+                null, List.of(share.getResourceShareArn()), null, null, 1, null);
+        assertEquals(1, first.items().size());
+        assertNotNull(first.nextToken());
+        PaginatedResult<ResourceShareAssociation> second = associations(OWNER, "us-east-1", "RESOURCE",
+                null, List.of(share.getResourceShareArn()), null, null, 1, first.nextToken());
+        assertEquals(1, second.items().size());
+        assertNotEquals(first.items().getFirst().associatedEntity(), second.items().getFirst().associatedEntity());
+        assertNull(second.nextToken());
+
+        AwsException mismatched = assertThrows(AwsException.class, () -> associations(
+                OWNER, "us-east-1", "PRINCIPAL", null, List.of(share.getResourceShareArn()),
+                null, null, 1, first.nextToken()));
+        assertEquals("InvalidNextTokenException", mismatched.getErrorCode());
+        AwsException malformed = assertThrows(AwsException.class, () -> associations(
+                OWNER, "us-east-1", "RESOURCE", null, List.of(share.getResourceShareArn()),
+                null, null, 1, "not-a-token"));
+        assertEquals("InvalidNextTokenException", malformed.getErrorCode());
+    }
+
+    @Test
+    void getResourceShareAssociationsRejectsInvalidInput() {
+        assertInvalidParameter(() -> associations(OWNER, "us-east-1", null, null,
+                List.of(), null, null, null, null));
+        assertInvalidParameter(() -> associations(OWNER, "us-east-1", "RESOURCE", null,
+                List.of(), null, OWNER, null, null));
+        assertInvalidParameter(() -> associations(OWNER, "us-east-1", "PRINCIPAL", null,
+                List.of(), TGW_ARN, null, null, null));
+        assertInvalidParameter(() -> associations(OWNER, "us-east-1", "RESOURCE", null,
+                List.of(), null, null, 0, null));
+        assertInvalidParameter(() -> associations(OWNER, "us-east-1", "RESOURCE", null,
+                List.of(), null, null, 501, null));
+        AwsException malformedArn = assertThrows(AwsException.class, () -> associations(
+                OWNER, "us-east-1", "RESOURCE", null, List.of("not-an-arn"),
+                null, null, null, null));
+        assertEquals("MalformedArnException", malformedArn.getErrorCode());
+    }
+
+    private PaginatedResult<ResourceShareAssociation> associations(String caller, String region, String type,
+            String status, List<String> shareArns, String resourceArn, String principal,
+            Integer maxResults, String nextToken) {
+        return service.getResourceShareAssociations(caller, region, type, status, shareArns,
+                resourceArn, principal, maxResults, nextToken);
     }
 
     @Test
@@ -392,6 +487,89 @@ class RamServiceTest {
     }
 
     @Test
+    void consecutiveWritesInOneClockTickAdvanceLastUpdatedTime() {
+        Clock fixedClock = Clock.fixed(Instant.parse("2030-01-01T00:00:00Z"), ZoneOffset.UTC);
+        RamService fixedClockService = new RamService(new SharedStorageFactory(), null, fixedClock);
+        fixedClockService.initializeStorage();
+
+        ResourceShare created = fixedClockService.createResourceShare(
+                "original", List.of(), List.of(), false, "us-east-1", OWNER);
+        assertEquals(created.getCreationTime(), created.getLastUpdatedTime());
+        String arn = created.getResourceShareArn();
+        ResourceShare firstUpdate = fixedClockService.updateResourceShare(
+                arn, "first", null, OWNER, "us-east-1");
+        ResourceShare secondUpdate = fixedClockService.updateResourceShare(
+                arn, "second", null, OWNER, "us-east-1");
+
+        assertEquals(created.getCreationTime(), firstUpdate.getCreationTime());
+        assertEquals(created.getCreationTime(), secondUpdate.getCreationTime());
+        assertTrue(firstUpdate.getLastUpdatedTime().toEpochMilli()
+                > created.getLastUpdatedTime().toEpochMilli());
+        assertTrue(secondUpdate.getLastUpdatedTime().toEpochMilli()
+                > firstUpdate.getLastUpdatedTime().toEpochMilli());
+    }
+
+    @Test
+    void updateOfLegacyUnprefixedShareAdvancesLastUpdatedTime() {
+        TestStorageFactory storage = new TestStorageFactory(false);
+        Instant creationTime = Instant.parse("2029-01-01T00:00:00Z");
+        String arn = "arn:aws:ram:us-east-1:" + OWNER + ":resource-share/legacy";
+        RamService legacyService = new RamService(
+                storage, null, Clock.fixed(Instant.parse("2030-01-01T00:00:00Z"), ZoneOffset.UTC));
+        legacyService.initializeStorage();
+        ResourceShare legacy = new ResourceShare(
+                arn, "legacy", OWNER, List.of(), List.of(), false, "ACTIVE",
+                creationTime, creationTime, Map.of());
+        storage.putLegacy("ram-resource-shares.json", arn, legacy);
+
+        ResourceShare updated = legacyService.updateResourceShare(
+                arn, "updated", null, OWNER, "us-east-1");
+
+        assertEquals(creationTime, updated.getCreationTime());
+        assertTrue(updated.getLastUpdatedTime().isAfter(creationTime));
+    }
+
+    @Test
+    void overlappingUpdatesAdvanceLastUpdatedTimeForEachWrite() throws Exception {
+        TestStorageFactory storage = new TestStorageFactory(true);
+        Clock fixedClock = Clock.fixed(Instant.parse("2030-01-01T00:00:00Z"), ZoneOffset.UTC);
+        RamService concurrentService = new RamService(storage, null, fixedClock);
+        concurrentService.initializeStorage();
+        ResourceShare seeded = concurrentService.createResourceShare(
+                "original", List.of(), List.of(), false, "us-east-1", OWNER);
+        storage.armShareReads();
+
+        int threadCount = 2;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        try {
+            CountDownLatch ready = new CountDownLatch(threadCount);
+            CountDownLatch start = new CountDownLatch(1);
+            List<Future<ResourceShare>> results = new ArrayList<>();
+            for (String name : List.of("first", "second")) {
+                results.add(executor.submit(() -> {
+                    ready.countDown();
+                    assertTrue(start.await(5, TimeUnit.SECONDS));
+                    return concurrentService.updateResourceShare(
+                            seeded.getResourceShareArn(), name, null, OWNER, "us-east-1");
+                }));
+            }
+            assertTrue(ready.await(5, TimeUnit.SECONDS), "every thread reached the start gate");
+            start.countDown();
+
+            Set<Instant> updateTimes = new HashSet<>();
+            for (Future<ResourceShare> result : results) {
+                updateTimes.add(result.get(5, TimeUnit.SECONDS).getLastUpdatedTime());
+            }
+            assertEquals(threadCount, updateTimes.size(), "each overlapping write gets a unique timestamp");
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertTrue(concurrentService.getResourceShares(OWNER, "SELF", "us-east-1").stream()
+                .findFirst().orElseThrow().getLastUpdatedTime().isAfter(seeded.getLastUpdatedTime()));
+    }
+
+    @Test
     void accountPrincipalWithoutOrganizationSharingCreatesPendingInvitation() {
         ResourceShare share = service.createResourceShare(
                 "direct-share", List.of(ACCEPTER), List.of(TGW_ARN), false, "us-east-1", OWNER);
@@ -666,6 +844,67 @@ class RamServiceTest {
                                                     TypeReference<Map<String, V>> typeReference) {
             return (AccountAwareStorageBackend<V>) stores.computeIfAbsent(
                     fileName, ignored -> AccountAwareStorageBackend.inMemory("000000000000"));
+        }
+    }
+
+    private static final class TestStorageFactory extends StorageFactory {
+        private final Map<String, RawStorage> rawStores = new HashMap<>();
+        private final Map<String, AccountAwareStorageBackend<Object>> stores = new HashMap<>();
+        private final boolean coordinateShareReads;
+
+        private TestStorageFactory(boolean coordinateShareReads) {
+            super(null, null);
+            this.coordinateShareReads = coordinateShareReads;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <V> AccountAwareStorageBackend<V> create(String serviceName,
+                                                    String fileName,
+                                                    TypeReference<Map<String, V>> typeReference) {
+            AccountAwareStorageBackend<Object> store = stores.computeIfAbsent(fileName, ignored -> {
+                RawStorage raw = new RawStorage(coordinateShareReads && fileName.equals("ram-resource-shares.json"));
+                rawStores.put(fileName, raw);
+                return new AccountAwareStorageBackend<>(raw, null, "000000000000");
+            });
+            return (AccountAwareStorageBackend<V>) store;
+        }
+
+        private void putLegacy(String fileName, String key, ResourceShare value) {
+            rawStores.get(fileName).put(key, value);
+        }
+
+        private void armShareReads() {
+            rawStores.get("ram-resource-shares.json").armReads();
+        }
+    }
+
+    private static final class RawStorage extends InMemoryStorage<String, Object> {
+        private final boolean coordinateReads;
+        private final AtomicInteger coordinatedReads = new AtomicInteger();
+        private volatile CountDownLatch readGate = new CountDownLatch(0);
+
+        private RawStorage(boolean coordinateReads) {
+            this.coordinateReads = coordinateReads;
+        }
+
+        private void armReads() {
+            coordinatedReads.set(0);
+            readGate = new CountDownLatch(2);
+        }
+
+        @Override
+        public Optional<Object> get(String key) {
+            if (coordinateReads && key.startsWith(OWNER + "/") && coordinatedReads.incrementAndGet() <= 2) {
+                CountDownLatch gate = readGate;
+                gate.countDown();
+                try {
+                    gate.await(250, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return super.get(key);
         }
     }
 }

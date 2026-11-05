@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.redshift.model;
 
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -21,6 +22,7 @@ public class Cluster {
     private String clusterParameterGroupName;
     private List<String> vpcSecurityGroupIds = new ArrayList<>();
     private List<String> iamRoleArns = new ArrayList<>();
+    private String defaultIamRoleArn;
 
     public String getClusterIdentifier() { return clusterIdentifier; }
     public void setClusterIdentifier(String clusterIdentifier) { this.clusterIdentifier = clusterIdentifier; }
@@ -46,8 +48,10 @@ public class Cluster {
     public void setVpcSecurityGroupIds(List<String> vpcSecurityGroupIds) { this.vpcSecurityGroupIds = vpcSecurityGroupIds; }
     public List<String> getIamRoleArns() { return iamRoleArns; }
     public void setIamRoleArns(List<String> iamRoleArns) { this.iamRoleArns = iamRoleArns; }
+    public String getDefaultIamRoleArn() { return defaultIamRoleArn; }
+    public void setDefaultIamRoleArn(String defaultIamRoleArn) { this.defaultIamRoleArn = defaultIamRoleArn; }
 
-    // Audit logging config as set by EnableLogging; no log delivery is emulated.
+    // Audit logging configuration set by EnableLogging.
     private boolean loggingEnabled = false;
     private String loggingBucketName;
     private String loggingS3KeyPrefix;
@@ -60,14 +64,22 @@ public class Cluster {
     public void setLoggingS3KeyPrefix(String loggingS3KeyPrefix) { this.loggingS3KeyPrefix = loggingS3KeyPrefix; }
 
     private String loggingDestinationType;
+    private String loggingRegion;
     private List<String> loggingExports;
+    private boolean userActivityLoggingEnabled;
     private String loggingS3TableKmsKeyId;
     private String loggingS3TableGranularity;
 
     public String getLoggingDestinationType() { return loggingDestinationType; }
     public void setLoggingDestinationType(String loggingDestinationType) { this.loggingDestinationType = loggingDestinationType; }
+    public String getLoggingRegion() { return loggingRegion; }
+    public void setLoggingRegion(String loggingRegion) { this.loggingRegion = loggingRegion; }
     public List<String> getLoggingExports() { return loggingExports; }
     public void setLoggingExports(List<String> loggingExports) { this.loggingExports = loggingExports; }
+    public boolean isUserActivityLoggingEnabled() { return userActivityLoggingEnabled; }
+    public void setUserActivityLoggingEnabled(boolean userActivityLoggingEnabled) {
+        this.userActivityLoggingEnabled = userActivityLoggingEnabled;
+    }
     public String getLoggingS3TableKmsKeyId() { return loggingS3TableKmsKeyId; }
     public void setLoggingS3TableKmsKeyId(String loggingS3TableKmsKeyId) { this.loggingS3TableKmsKeyId = loggingS3TableKmsKeyId; }
     public String getLoggingS3TableGranularity() { return loggingS3TableGranularity; }
@@ -79,6 +91,22 @@ public class Cluster {
     private Integer snapshotCopyManualRetentionPeriod;
     private String snapshotCopyGrantName;
     private String snapshotScheduleIdentifier;
+    private Instant automatedSnapshotAnchor;
+    private String snapshotRegion;
+    private Integer automatedSnapshotRetentionPeriod;
+    private String snapshotGeneration;
+
+    public String getSnapshotGeneration() { return snapshotGeneration; }
+    public void setSnapshotGeneration(String value) { snapshotGeneration = value; }
+
+    public Instant getAutomatedSnapshotAnchor() { return automatedSnapshotAnchor; }
+    public void setAutomatedSnapshotAnchor(Instant value) { automatedSnapshotAnchor = value; }
+    public String getSnapshotRegion() { return snapshotRegion; }
+    public void setSnapshotRegion(String value) { snapshotRegion = value; }
+    public int getAutomatedSnapshotRetentionPeriod() {
+        return automatedSnapshotRetentionPeriod == null ? 1 : automatedSnapshotRetentionPeriod;
+    }
+    public void setAutomatedSnapshotRetentionPeriod(Integer value) { automatedSnapshotRetentionPeriod = value; }
 
     public String getSnapshotCopyDestinationRegion() { return snapshotCopyDestinationRegion; }
     public void setSnapshotCopyDestinationRegion(String snapshotCopyDestinationRegion) { this.snapshotCopyDestinationRegion = snapshotCopyDestinationRegion; }

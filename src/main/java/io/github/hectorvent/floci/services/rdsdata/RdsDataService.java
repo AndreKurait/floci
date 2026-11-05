@@ -9,6 +9,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.DatabaseSecretCredentials;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SqlParameterParser.ParsedSql;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
+import io.github.hectorvent.floci.services.rds.container.RdsBackendEndpointResolver;
 import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
@@ -73,6 +75,7 @@ public class RdsDataService implements Resettable {
     private final ConcurrentMap<String, TransactionContext> transactions = new ConcurrentHashMap<>();
     private final ScheduledExecutorService transactionCleanupExecutor;
     private final RdsBackendGate backendGate;
+    private final RdsBackendEndpointResolver backendEndpointResolver;
     private final boolean databaseResumingExceptionEnabled;
 
     @Inject
@@ -81,19 +84,11 @@ public class RdsDataService implements Resettable {
                           ObjectMapper objectMapper,
                           RdsDataConnectionFactory connectionFactory,
                           EmulatorConfig config,
-                          RdsBackendGate backendGate) {
+                          RdsBackendGate backendGate,
+                          RdsBackendEndpointResolver backendEndpointResolver) {
         this(resourceResolver, secretsManagerService, objectMapper, connectionFactory,
                 Duration.ofSeconds(config.services().rdsData().transactionTtlSeconds()), backendGate,
-                config.services().rdsData().databaseResumingExceptionEnabled());
-    }
-
-    RdsDataService(RdsDataResourceResolver resourceResolver,
-                   SecretsManagerService secretsManagerService,
-                   ObjectMapper objectMapper,
-                   RdsDataConnectionFactory connectionFactory,
-                   Duration transactionTtl) {
-        this(resourceResolver, secretsManagerService, objectMapper, connectionFactory, transactionTtl,
-                RdsBackendGate.OPEN);
+                backendEndpointResolver, config.services().rdsData().databaseResumingExceptionEnabled());
     }
 
     RdsDataService(RdsDataResourceResolver resourceResolver,
@@ -101,8 +96,9 @@ public class RdsDataService implements Resettable {
                    ObjectMapper objectMapper,
                    RdsDataConnectionFactory connectionFactory,
                    Duration transactionTtl,
-                   RdsBackendGate backendGate) {
-        this(resourceResolver, secretsManagerService, objectMapper, connectionFactory, transactionTtl, backendGate, false);
+                   RdsBackendEndpointResolver backendEndpointResolver) {
+        this(resourceResolver, secretsManagerService, objectMapper, connectionFactory, transactionTtl,
+                RdsBackendGate.OPEN, backendEndpointResolver);
     }
 
     RdsDataService(RdsDataResourceResolver resourceResolver,
@@ -111,6 +107,18 @@ public class RdsDataService implements Resettable {
                    RdsDataConnectionFactory connectionFactory,
                    Duration transactionTtl,
                    RdsBackendGate backendGate,
+                   RdsBackendEndpointResolver backendEndpointResolver) {
+        this(resourceResolver, secretsManagerService, objectMapper, connectionFactory, transactionTtl,
+                backendGate, backendEndpointResolver, false);
+    }
+
+    RdsDataService(RdsDataResourceResolver resourceResolver,
+                   SecretsManagerService secretsManagerService,
+                   ObjectMapper objectMapper,
+                   RdsDataConnectionFactory connectionFactory,
+                   Duration transactionTtl,
+                   RdsBackendGate backendGate,
+                   RdsBackendEndpointResolver backendEndpointResolver,
                    boolean databaseResumingExceptionEnabled) {
         this.resourceResolver = resourceResolver;
         this.secretsManagerService = secretsManagerService;
@@ -118,6 +126,7 @@ public class RdsDataService implements Resettable {
         this.connectionFactory = connectionFactory;
         this.transactionTtl = transactionTtl;
         this.backendGate = backendGate;
+        this.backendEndpointResolver = backendEndpointResolver;
         this.databaseResumingExceptionEnabled = databaseResumingExceptionEnabled;
         this.transactionCleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread thread = new Thread(r, "rds-data-transaction-cleanup");
@@ -205,7 +214,9 @@ public class RdsDataService implements Resettable {
         boolean leaseHandedOver = false;
         Connection connection = null;
         try {
-            connection = connectionFactory.open(target, credentials.username(), credentials.password(), database);
+            EndpointInfo endpoint = resolveBackendEndpoint(target);
+            connection = connectionFactory.open(
+                    target, endpoint, credentials.username(), credentials.password(), database);
             connection.setAutoCommit(false);
             String transactionId = UUID.randomUUID().toString();
             transactions.put(transactionId, new TransactionContext(
@@ -305,9 +316,22 @@ public class RdsDataService implements Resettable {
                 resourceResolver.resolve(resourceArn, region);
         DatabaseSecretCredentials credentials = credentials(request, target, region);
         String database = databaseName(request, target);
-        try (RdsBackendGate.Lease _ = enterBackend(target);
-             Connection connection = connectionFactory.open(target, credentials.username(), credentials.password(), database)) {
-            return work.execute(connection, target.engine());
+        try (RdsBackendGate.Lease _ = enterBackend(target)) {
+            EndpointInfo endpoint = resolveBackendEndpoint(target);
+            try (Connection connection = connectionFactory.open(
+                    target, endpoint, credentials.username(), credentials.password(), database)) {
+                return work.execute(connection, target.engine());
+            }
+        }
+    }
+
+    private EndpointInfo resolveBackendEndpoint(RdsDataResourceResolver.DatabaseTarget target) {
+        try {
+            return backendEndpointResolver.resolveBackendEndpoint(target.runtimeId(), target.engine());
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Could not resolve backend endpoint for RDS runtime {0}", target.runtimeId());
+            throw new AwsException("InternalServerErrorException",
+                    "Could not resolve backend endpoint for RDS runtime " + target.runtimeId(), 500);
         }
     }
 
@@ -317,7 +341,7 @@ public class RdsDataService implements Resettable {
      */
     private RdsBackendGate.Lease enterBackend(RdsDataResourceResolver.DatabaseTarget target) {
         try {
-            return backendGate.enter(target.host(), target.port(), !databaseResumingExceptionEnabled);
+            return backendGate.enterRuntime(target.runtimeId(), !databaseResumingExceptionEnabled);
         } catch (RdsBackendGate.ResumingException e) {
             throw new AwsException("DatabaseResumingException",
                     "The Aurora Serverless v2 DB instance is resuming. Wait a few seconds and try again.", 400);

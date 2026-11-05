@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.core.common;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
@@ -11,12 +13,15 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PaginationTest {
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final List<String> ITEMS = List.of("c", "a", "b");
     private static final AwsException INVALID = new AwsException("BadRequestException", "bad", 400);
     private static final Function<String, AwsException> INVALID_TOKEN = token -> INVALID;
@@ -63,6 +68,34 @@ class PaginationTest {
     }
 
     @Test
+    void signedPaging_resumesWithAnIssuedMarkerAndRejectsForeignOrChangedMarkers() {
+        SignedMarkers markers = new SignedMarkers();
+        PaginatedResult<String> first = signedPage(markers, 1, null, "account:region:");
+        assertThat(first.items(), contains("a"));
+        assertEquals("account:region:a", markers.cursorOf(first.nextToken()));
+
+        PaginatedResult<String> second = signedPage(markers, 2, first.nextToken(), "account:region:");
+        assertThat(second.items(), contains("b", "c"));
+        assertNull(second.nextToken());
+
+        assertSame(INVALID, assertThrows(AwsException.class,
+                () -> signedPage(markers, 1, first.nextToken(), "other:region:")));
+        assertSame(INVALID, assertThrows(AwsException.class,
+                () -> signedPage(new SignedMarkers(), 1, first.nextToken(), "account:region:")));
+        assertSame(INVALID, assertThrows(AwsException.class,
+                () -> signedPage(markers, 1, first.nextToken() + "x", "account:region:")));
+    }
+
+    @Test
+    void signedPaging_rejectsAnEmptyOrMalformedMarker() {
+        SignedMarkers markers = new SignedMarkers();
+        assertSame(INVALID, assertThrows(AwsException.class,
+                () -> signedPage(markers, 1, "", "")));
+        assertSame(INVALID, assertThrows(AwsException.class,
+                () -> signedPage(markers, 1, "!!!", "")));
+    }
+
+    @Test
     void paging_aLimitNearIntMaxDoesNotReportAFurtherPage() {
         String afterFirst = page(1, null, "ns").nextToken();
 
@@ -93,8 +126,107 @@ class PaginationTest {
         assertEquals("Invalid Marker.", e.getMessage());
     }
 
+    @Test
+    void tokenStartsWith_matchesTheDecodedCursorPrefix() {
+        String token = page(1, null, "ns").nextToken();
+
+        assertTrue(Pagination.tokenStartsWith(token, "ns:"));
+        assertFalse(Pagination.tokenStartsWith(token, "other:"));
+    }
+
+    @Test
+    void tokenStartsWith_isFalseForATokenThatDoesNotDecode() {
+        assertFalse(Pagination.tokenStartsWith("!!!", ""));
+    }
+
+    @Test
+    void tokenStartsWith_isFalseForAnAbsentToken() {
+        assertFalse(Pagination.tokenStartsWith(null, ""));
+        assertFalse(Pagination.tokenStartsWith("", ""));
+    }
+
+    @Test
+    void boundedNamespacedPaging_usesTheDefaultAndCanChangePageSize() {
+        PaginatedResult<String> first = bounded(null, null);
+        assertEquals(List.of("a", "b"), first.items());
+        PaginatedResult<String> last = bounded(3, first.nextToken());
+        assertEquals(List.of("c"), last.items());
+        assertNull(last.nextToken());
+    }
+
+    @Test
+    void boundedNamespacedPaging_refusesOutOfRangeSizes() {
+        for (int size : new int[] {-1, 0, 4}) {
+            assertInvalid(() -> bounded(size, null));
+        }
+    }
+
+    @Test
+    void boundedNamespacedPaging_refusesLongTokensEvenWhenTheirScopeIsValid() {
+        String boundary = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(("ns:" + "z".repeat(21)).getBytes(StandardCharsets.UTF_8));
+        assertEquals(32, boundary.length());
+        assertTrue(bounded(1, boundary).items().isEmpty());
+        String token = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(("ns:" + "a".repeat(100)).getBytes(StandardCharsets.UTF_8));
+        assertInvalid(() -> bounded(1, token));
+    }
+
+    @Test
+    void boundedNamespacedPaging_refusesMalformedAndForeignTokens() {
+        assertInvalid(() -> bounded(1, "!!!"));
+        assertInvalid(() -> bounded(1, page(1, null, "other").nextToken()));
+    }
+
+    @Test
+    void jsonPageSize_preservesOmittedNullZeroAndIntegerValues() throws Exception {
+        for (String field : List.of("MaxResults", "PageSize")) {
+            assertNull(Pagination.parseMaxResults(MAPPER.readTree("{}"), field, "InvalidInput"));
+            assertNull(Pagination.parseMaxResults(MAPPER.readTree("{\"" + field + "\":null}"), field, "InvalidInput"));
+            assertEquals(0, Pagination.parseMaxResults(MAPPER.readTree("{\"" + field + "\":0}"), field, "InvalidInput"));
+            assertEquals(2, Pagination.parseMaxResults(MAPPER.readTree("{\"" + field + "\":2}"), field, "InvalidInput"));
+        }
+    }
+
+    @Test
+    void jsonPageSize_refusesOverflowAndCoercibleNonIntegers() throws Exception {
+        for (String value : List.of("4294967297", "1.5", "\"1\"", "{}", "[]", "true")) {
+            assertInvalid(() -> Pagination.parseMaxResults(MAPPER.readTree("{\"MaxResults\":" + value + "}"),
+                    "MaxResults", "InvalidInput"));
+        }
+    }
+
+    @Test
+    void jsonToken_preservesNullEmptyAndTextButRefusesOtherShapes() throws Exception {
+        for (String field : List.of("NextToken", "PageToken")) {
+            assertNull(Pagination.parseNextToken(MAPPER.readTree("{}"), field, "InvalidInput"));
+            assertNull(Pagination.parseNextToken(MAPPER.readTree("{\"" + field + "\":null}"), field, "InvalidInput"));
+            assertEquals("", Pagination.parseNextToken(MAPPER.readTree("{\"" + field + "\":\"\"}"), field, "InvalidInput"));
+            assertEquals("token", Pagination.parseNextToken(MAPPER.readTree("{\"" + field + "\":\"token\"}"), field, "InvalidInput"));
+            for (String value : List.of("1", "true", "{}", "[]")) {
+                assertInvalid(() -> Pagination.parseNextToken(MAPPER.readTree("{\"" + field + "\":" + value + "}"),
+                        field, "InvalidInput"));
+            }
+        }
+    }
+
+    private static PaginatedResult<String> bounded(Integer size, String token) {
+        return Pagination.paginate(ITEMS, Function.identity(), size, token, 2, 3, 32, "InvalidInput", "ns");
+    }
+
+    private static void assertInvalid(Executable call) {
+        AwsException error = assertThrows(AwsException.class, call);
+        assertEquals("InvalidInput", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+    }
+
     private static PaginatedResult<String> page(int limit, String token, String namespace) {
         return Pagination.paginate(ITEMS, Function.identity(), limit, token, namespace, INVALID_TOKEN);
+    }
+
+    private static PaginatedResult<String> signedPage(SignedMarkers markers, int limit,
+                                                       String marker, String scope) {
+        return Pagination.paginate(ITEMS, Function.identity(), limit, marker, markers, scope, INVALID_TOKEN);
     }
 
     private static String decode(String token) {

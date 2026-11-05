@@ -1,7 +1,12 @@
 package io.github.hectorvent.floci.services.redshift;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.redshift.container.RedshiftContainerHandle;
 import io.github.hectorvent.floci.services.redshift.container.RedshiftContainerManager;
+import io.github.hectorvent.floci.services.redshift.model.ClusterParameterGroup;
+import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
@@ -15,7 +20,9 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -52,6 +59,9 @@ public class RedshiftOperationsTest {
 
     @Inject
     RedshiftService service;
+
+    @Inject
+    StorageFactory storageFactory;
 
     @Test
     @Order(1)
@@ -115,6 +125,31 @@ public class RedshiftOperationsTest {
             .body(containsString("<ParameterName>statement_timeout</ParameterName>"))
             .body(containsString("<ParameterValue>5000</ParameterValue>"));
 
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH_HEADER)
+            .formParam("Action", "ResetClusterParameterGroup")
+            .formParam("ParameterGroupName", "pg-test-1")
+            .formParam("ResetAllParameters", "false")
+            .formParam("Parameters.Parameter.1.ParameterName", "statement_timeout")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<ResetClusterParameterGroupResult>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", AUTH_HEADER)
+            .formParam("Action", "DescribeClusterParameters")
+            .formParam("ParameterGroupName", "pg-test-1")
+            .formParam("Source", "user")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<Parameter>")));
+
         // 4. DeleteClusterParameterGroup
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -132,14 +167,14 @@ public class RedshiftOperationsTest {
     @Test
     @Order(2)
     void clusterAndSnapshotLifecycle() {
-        when(containerManager.start(any(), eq("cluster-src"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-src"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c1", "cluster-src", "localhost", 5439));
         doAnswer(invocation -> {
             Path p = invocation.getArgument(3);
             Files.writeString(p, "-- dump sql table test_data;");
             return null;
         }).when(containerManager).takeSnapshot(any(), eq("cluster-src"), eq("admin"), any(Path.class));
-        when(containerManager.start(any(), eq("cluster-restored"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-restored"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c2", "cluster-restored", "localhost", 5440));
 
         // 1. CreateCluster
@@ -418,6 +453,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-src")
         .when()
             .post("/")
@@ -477,6 +513,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-restored")
         .when()
             .post("/")
@@ -805,7 +842,7 @@ public class RedshiftOperationsTest {
     @Test
     @Order(3)
     void tagLifecycle() {
-        when(containerManager.start(any(), eq("cluster-tags"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-tags"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c3", "cluster-tags", "localhost", 5441));
 
         given()
@@ -863,6 +900,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-tags")
         .when()
             .post("/")
@@ -981,7 +1019,7 @@ public class RedshiftOperationsTest {
     @Test
     @Order(9)
     void snapshotCopyLifecycle() {
-        when(containerManager.start(any(), eq("cluster-copy"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-copy"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c9", "cluster-copy", "localhost", 5449));
         assertEquals(200, redshift("CreateCluster", "ClusterIdentifier", "cluster-copy", "NodeType", "dc2.large",
                 "MasterUsername", "admin", "MasterUserPassword", "password123").statusCode());
@@ -1048,7 +1086,8 @@ public class RedshiftOperationsTest {
                 400, "InvalidSnapshotCopyGrantStateFault");
         assertEquals(200, redshift("DisableSnapshotCopy", "ClusterIdentifier", "cluster-copy").statusCode());
 
-        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-copy").statusCode());
+        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-copy",
+                "SkipFinalClusterSnapshot", "true").statusCode());
         assertEquals(200, redshift("DeleteSnapshotCopyGrant", "SnapshotCopyGrantName", "copy-lifecycle-grant").statusCode());
     }
 
@@ -1059,7 +1098,7 @@ public class RedshiftOperationsTest {
     @Test
     @Order(10)
     void snapshotScheduleLifecycle() {
-        when(containerManager.start(any(), eq("cluster-sched"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-sched"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c10", "cluster-sched", "localhost", 5450));
         assertEquals(200, redshift("CreateCluster", "ClusterIdentifier", "cluster-sched", "NodeType", "dc2.large",
                 "MasterUsername", "admin", "MasterUserPassword", "password123").statusCode());
@@ -1151,7 +1190,8 @@ public class RedshiftOperationsTest {
         assertEquals(0, describeSchedules("ScheduleIdentifier", "sched-1").getList("SnapshotSchedule").size());
         assertFault(redshift("DeleteSnapshotSchedule", "ScheduleIdentifier", "sched-1"), 400, "SnapshotScheduleNotFound");
 
-        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-sched").statusCode());
+        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-sched",
+                "SkipFinalClusterSnapshot", "true").statusCode());
     }
 
     @Test
@@ -1160,5 +1200,98 @@ public class RedshiftOperationsTest {
         Response response = redshift("DescribeSnapshotSchedules", "Marker", "!!!");
         assertFault(response, 400, "InvalidParameterValue");
         assertEquals("Invalid Marker.", XmlPath.from(response.asString()).getString("ErrorResponse.Error.Message"));
+    }
+
+    @Test
+    @Order(12)
+    void invalidResetListsLeaveStoredOverridesUnchanged() {
+        String name = "reset-validation-guard";
+        service.createClusterParameterGroup(name, "redshift-1.0", "validation test");
+        try {
+            service.modifyClusterParameterGroup(name, List.of(new Parameter("max_cursor_result_set_size", "1000")));
+
+            assertFault(redshift("ResetClusterParameterGroup", "ParameterGroupName", name, "Parameters", "invalid"),
+                    400, "InvalidParameterValue");
+            assertEquals("1000", service.describeClusterParameters(name).getFirst().getParameterValue());
+            assertFault(redshift("ResetClusterParameterGroup", "ParameterGroupName", name,
+                    "ResetAllParameters", "false", "Parameters", ""), 400, "InvalidParameterCombination");
+            assertEquals("1000", service.describeClusterParameters(name).getFirst().getParameterValue());
+
+            for (String prefix : List.of("Parameters.Parameter", "Parameters.member")) {
+                List<String> fields = new ArrayList<>(List.of("ParameterGroupName", name));
+                for (int index = 1; index <= 21; index++) {
+                    fields.add(prefix + "." + index + ".ParameterName");
+                    fields.add("max_cursor_result_set_size");
+                }
+                assertFault(redshift("ResetClusterParameterGroup", fields.toArray(String[]::new)),
+                        400, "InvalidParameterValue");
+                assertEquals("1000", service.describeClusterParameters(name).getFirst().getParameterValue());
+            }
+        } finally {
+            service.deleteClusterParameterGroup(name);
+        }
+    }
+
+    @Test
+    @Order(13)
+    void reservedDefaultNameRejectsCreationAndPreservesLegacyGroupLifecycle() {
+        String name = RedshiftService.DEFAULT_PARAMETER_GROUP_NAME;
+        assertFault(redshift("CreateClusterParameterGroup", "ParameterGroupName", name,
+                "ParameterGroupFamily", "redshift-1.0", "Description", "reserved"), 400, "InvalidParameterValue");
+        assertFault(redshift("ResetClusterParameterGroup", "ParameterGroupName", name), 400, "InvalidParameterValue");
+
+        AccountAwareStorageBackend<ClusterParameterGroup> backend = storageFactory.create(
+                "redshift", "redshift-parameter-groups.json", new TypeReference<Map<String, ClusterParameterGroup>>() {});
+        assertTrue(backend.get(name).isEmpty());
+        ClusterParameterGroup legacy = new ClusterParameterGroup(name, "redshift-1.0", "legacy custom group");
+        legacy.setParameters(List.of(new Parameter("max_cursor_result_set_size", "1000")));
+        backend.put(name, legacy);
+        backend.flush();
+        try {
+            redshift("DescribeClusterParameterGroups", "ParameterGroupName", name).then().statusCode(200)
+                    .body(containsString("<Description>legacy custom group</Description>"));
+            redshift("DescribeClusterParameters", "ParameterGroupName", name).then().statusCode(200)
+                    .body(containsString("<ParameterValue>1000</ParameterValue>"));
+            redshift("ModifyClusterParameterGroup", "ParameterGroupName", name,
+                    "Parameters.Parameter.1.ParameterName", "max_cursor_result_set_size",
+                    "Parameters.Parameter.1.ParameterValue", "2000").then().statusCode(200);
+            redshift("DescribeClusterParameters", "ParameterGroupName", name).then().statusCode(200)
+                    .body(containsString("<ParameterValue>2000</ParameterValue>"));
+            redshift("ResetClusterParameterGroup", "ParameterGroupName", name,
+                    "Parameters.Parameter.1.ParameterName", "max_cursor_result_set_size").then().statusCode(200);
+            redshift("DescribeClusterParameters", "ParameterGroupName", name).then().statusCode(200)
+                    .body(containsString("<ParameterValue>0</ParameterValue>"))
+                    .body(containsString("<Source>engine-default</Source>"));
+            redshift("DeleteClusterParameterGroup", "ParameterGroupName", name).then().statusCode(200);
+        } finally {
+            backend.delete(name);
+            backend.flush();
+        }
+        redshift("DescribeClusterParameterGroups", "ParameterGroupName", name).then().statusCode(200)
+                .body(not(containsString("legacy custom group")));
+        assertFault(redshift("ResetClusterParameterGroup", "ParameterGroupName", name), 400, "InvalidParameterValue");
+    }
+
+    @Test
+    @Order(14)
+    void botocoreEmptyListResetsAllParameters() {
+        String name = "reset-empty-list";
+        service.createClusterParameterGroup(name, "redshift-1.0", "empty list test");
+        try {
+            service.modifyClusterParameterGroup(name, List.of(new Parameter("max_cursor_result_set_size", "1000")));
+
+            redshift("ResetClusterParameterGroup", "ParameterGroupName", name,
+                    "ResetAllParameters", "true", "Parameters", "").then().statusCode(200);
+
+            assertEquals("0", service.describeClusterParameters(name).getFirst().getParameterValue());
+            assertEquals("engine-default", service.describeClusterParameters(name).getFirst().getSource());
+            service.modifyClusterParameterGroup(name, List.of(new Parameter("max_cursor_result_set_size", "1000")));
+
+            redshift("ResetClusterParameterGroup", "ParameterGroupName", name, "Parameters", "").then().statusCode(200);
+
+            assertEquals("0", service.describeClusterParameters(name).getFirst().getParameterValue());
+        } finally {
+            service.deleteClusterParameterGroup(name);
+        }
     }
 }
