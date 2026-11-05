@@ -3,7 +3,10 @@ package io.github.hectorvent.floci.services.ssm;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.ssm.model.Command;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -17,9 +20,34 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.verifyNoInteractions;
 
 @QuarkusTest
+@TestProfile(SsmDirectCommandProfile.class)
 class SsmDeliveryLimitIntegrationTest extends SsmCommandIntegrationFixture {
     private static final String ACCOUNT = "222222222222";
     private static final String REGION = "us-west-2";
+    private String customDocument;
+
+    @BeforeEach
+    void createCustomDocument() {
+        customDocument = "delivery-limits-" + UUID.randomUUID();
+        Response created = call(ACCOUNT, REGION, "AmazonSSM.CreateDocument", Map.of(
+                "Name", customDocument, "DocumentType", "Command", "Content", """
+                        {
+                          "schemaVersion": "2.2",
+                          "parameters": {"commands": {"type": "StringList"}},
+                          "mainSteps": [{
+                            "action": "aws:runShellScript", "name": "run",
+                            "inputs": {"runCommand": "{{ commands }}"}
+                          }]
+                        }
+                        """));
+        assertEquals(200, created.statusCode(), created.asString());
+    }
+
+    @AfterEach
+    void deleteCustomDocument() {
+        Response deleted = call(ACCOUNT, REGION, "AmazonSSM.DeleteDocument", Map.of("Name", customDocument));
+        assertEquals(200, deleted.statusCode(), deleted.asString());
+    }
 
     @ParameterizedTest
     @CsvSource({"AWS-RunShellScript,2592001", "AWS-RunShellScript,2147483647",
@@ -95,7 +123,8 @@ class SsmDeliveryLimitIntegrationTest extends SsmCommandIntegrationFixture {
     }
 
     private Response send(String document, String instance, Integer timeout) {
-        Map<String, Object> request = new HashMap<>(Map.of("DocumentName", document,
+        String name = "CustomDocument".equals(document) ? customDocument : document;
+        Map<String, Object> request = new HashMap<>(Map.of("DocumentName", name,
                 "InstanceIds", List.of(instance), "Parameters", Map.of("commands", List.of("echo limit"))));
         if (timeout != null) {
             request.put("TimeoutSeconds", timeout);

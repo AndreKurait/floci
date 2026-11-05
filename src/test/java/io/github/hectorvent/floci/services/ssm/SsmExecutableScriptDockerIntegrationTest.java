@@ -39,7 +39,8 @@ class SsmExecutableScriptDockerIntegrationTest {
     public static class Profile implements QuarkusTestProfile {
         @Override
         public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.ec2.mock", "false",
+            return Map.of("floci.services.ssm.direct-command-execution-enabled", "true",
+                    "floci.services.ec2.mock", "false",
                     "floci.services.ec2.privileged", "false",
                     "floci.services.ec2.volume-block-devices", "false",
                     "floci.services.ec2.vpc-networks.enabled", "false");
@@ -59,7 +60,7 @@ class SsmExecutableScriptDockerIntegrationTest {
     URI endpoint;
 
     @Test
-    void sdkRunsTheGuestInterpreterAndPreservesFailures(@TempDir Path directory) throws Exception {
+    void directCompatibilityRunsTheGuestInterpreterAndPreservesFailures(@TempDir Path directory) throws Exception {
         try {
             docker.pingCmd().exec();
         } catch (RuntimeException unavailable) {

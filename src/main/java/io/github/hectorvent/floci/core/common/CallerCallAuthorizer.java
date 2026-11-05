@@ -98,7 +98,34 @@ public class CallerCallAuthorizer {
                 || (!localRoot && !iam.resolveAccountId(accessKey).filter(account::equals).isPresent())) {
             return Decision.DENY;
         }
-        return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action, resourceArn, resource, localRoot, requestContext));
+        return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action,
+                resourceArn, resource, resource.region(), localRoot, requestContext));
+    }
+
+    /** Evaluates an action whose AWS authorization model has no resource type, against {@code *}. */
+    public Decision authorizeUnscopedRequest(String accessKey, String account, String callerArn, String action,
+                                            String region, String sourceIp, boolean secureTransport) {
+        if (!enforcementEnabled()) {
+            return Decision.ALLOW;
+        }
+        if (accessKey == null || account == null || !AwsArnUtils.isArn(callerArn)) {
+            return Decision.DENY;
+        }
+        AwsArnUtils.Arn principal = AwsArnUtils.parse(callerArn);
+        boolean localRoot = "test".equals(accessKey) && "iam".equals(principal.service())
+                && principal.region().isEmpty() && "root".equals(principal.resource());
+        if (!principal.partition().equals(AwsRegions.partitionFor(region))
+                || !principal.accountId().equals(account)
+                || (!localRoot && !iam.resolveAccountId(accessKey).filter(account::equals).isPresent())) {
+            return Decision.DENY;
+        }
+        Map<String, List<String>> context = new HashMap<>();
+        if (sourceIp != null && !sourceIp.isBlank()) {
+            context.put("aws:SourceIp", List.of(sourceIp));
+        }
+        context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        return RequestScopes.callAs(account, region, () -> authorizeCaller(accessKey, callerArn, action,
+                "*", null, region, localRoot, context));
     }
 
     /**
@@ -165,7 +192,8 @@ public class CallerCallAuthorizer {
     }
 
     private Decision authorizeCaller(String accessKey, String callerArn, String action, String resourceArn,
-                                     AwsArnUtils.Arn resource, boolean localRoot, Map<String, List<String>> requestContext) {
+                                     AwsArnUtils.Arn resource, String region, boolean localRoot,
+                                     Map<String, List<String>> requestContext) {
         Instant now = clock.instant();
         if (iam.isInactiveAccessKey(accessKey) || iam.isExpiredSession(accessKey, now)) {
             return Decision.DENY;
@@ -179,8 +207,10 @@ public class CallerCallAuthorizer {
             return Decision.DENY;
         }
         String account = AwsArnUtils.parse(callerArn).accountId();
-        List<ResourcePolicy> policies = ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn);
-        String owner = policies.isEmpty() ? resource.accountId() : policies.getFirst().ownerAccountId();
+        List<ResourcePolicy> policies = resource == null ? List.of()
+                : ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn);
+        String owner = resource == null ? account
+                : policies.isEmpty() ? resource.accountId() : policies.getFirst().ownerAccountId();
         List<String> documents = policies.stream().map(ResourcePolicy::policyDocument)
                 .filter(document -> document != null && !document.isBlank()).toList();
         List<List<String>> scps = scpProvider.isResolvable()
@@ -188,7 +218,7 @@ public class CallerCallAuthorizer {
         Map<String, List<String>> context = new HashMap<>(requestContext);
         putRequestTime(context, now);
         arns.putPrincipalKeys(context);
-        context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(), account, owner);
+        context = IamConditionContextResolver.withGlobalContext(context, resourceArn, region, account, owner);
         ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,
                 RequestPrincipal.caller(arns), action, resourceArn, context);
         ResourceAccountRelationship relationship = account.equals(owner)

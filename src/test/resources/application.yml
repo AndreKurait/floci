@@ -143,6 +143,7 @@ floci:
   services:
     ssm:
       enabled: true
+      direct-command-execution-enabled: false
       max-parameter-history: 5
       resource-data-sync-interval-ms: 100
     sqs:

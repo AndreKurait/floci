@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
@@ -24,6 +25,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 @QuarkusTest
+@TestProfile(SsmDirectCommandProfile.class)
 class SsmDeliveryIntegerIntegrationTest extends SsmCommandIntegrationFixture {
     private static final String ACCOUNT = "222222222222";
     private static final String REGION = "us-west-2";
