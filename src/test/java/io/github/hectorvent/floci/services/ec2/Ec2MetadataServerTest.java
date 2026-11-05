@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ec2;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -108,12 +109,12 @@ class Ec2MetadataServerTest {
         instance.setPrivateIpAddress("10.0.0.10");
         instance.setRegion("us-west-2");
 
-        assertTrue(Ec2MetadataServer.instanceIdentityDocument(instance, "000000000000", "us-west-2a")
-                .contains("\"architecture\":\"arm64\""));
+        assertEquals("arm64", new JsonObject(Ec2MetadataServer.instanceIdentityDocument(
+                instance, "000000000000", "us-west-2a")).getString("architecture"));
 
         instance.setArchitecture(null);
-        assertTrue(Ec2MetadataServer.instanceIdentityDocument(instance, "000000000000", "us-west-2a")
-                .contains("\"architecture\":\"x86_64\""));
+        assertEquals("x86_64", new JsonObject(Ec2MetadataServer.instanceIdentityDocument(
+                instance, "000000000000", "us-west-2a")).getString("architecture"));
     }
 
     @Test
@@ -122,8 +123,8 @@ class Ec2MetadataServerTest {
         instance.setInstanceId("i-china");
         instance.setRegion("cn-north-1");
 
-        assertTrue(Ec2MetadataServer.instanceIdentityDocument(instance, "000000000000", "cn-north-1b")
-                .contains("\"availabilityZone\":\"cn-north-1b\""));
+        assertEquals("cn-north-1b", new JsonObject(Ec2MetadataServer.instanceIdentityDocument(
+                instance, "000000000000", "cn-north-1b")).getString("availabilityZone"));
     }
 
     @Test
