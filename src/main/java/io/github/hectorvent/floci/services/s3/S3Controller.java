@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.AwsCanonicalUserId;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.IamEnforcementFilter;
 import io.github.hectorvent.floci.core.common.MultipartFormParser;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -65,8 +66,6 @@ import java.io.UncheckedIOException;
 import java.math.BigInteger;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -905,7 +904,8 @@ public class S3Controller {
             }
             if (params.has("acl")) {
                 checkVersionId(bucket, versionId);
-                s3Service.authorizeObjectWrite(bucket, key, versionId, "s3:PutObjectAcl", authorization, null);
+                s3Service.authorizeObjectWrite(bucket, key, versionId, "s3:PutObjectAcl", authorization,
+                        S3ObjectActions.cannedAclConditions(httpHeaders::getHeaderString));
                 s3Service.putObjectAcl(bucket, key, versionId,
                         new String(readWholeBody(body), StandardCharsets.UTF_8),
                         httpHeaders.getHeaderString("x-amz-acl"),
@@ -3614,13 +3614,7 @@ public class S3Controller {
     private void validateChecksumHeaders(HttpHeaders httpHeaders, UriInfo uriInfo, byte[] data) {
         UploadChecksums checksums = uploadChecksums(httpHeaders, uriInfo);
         checksums.requireWellFormedContentMd5();
-        byte[] md5;
-        try {
-            md5 = MessageDigest.getInstance("MD5").digest(data);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("MD5 algorithm is not available", e);
-        }
-        checksums.verify(md5, claimedAlgorithm -> claimedAlgorithm.compute(data));
+        checksums.verify(Digests.md5(data), claimedAlgorithm -> claimedAlgorithm.compute(data));
     }
 
     private UploadChecksums uploadChecksums(HttpHeaders httpHeaders, UriInfo uriInfo) {

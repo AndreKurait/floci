@@ -77,7 +77,7 @@ approval policies or registering an AWS-owned baseline ARN is not implemented.
 | Action | Description |
 |---|---|
 | `UpdateInstanceInformation` | Register or update an SSM agent record for an instance. Does not create an EC2 instance or register the container with IMDS (see [Run Command Execution](#run-command-execution)) |
-| `DescribeInstanceInformation` | List registered SSM managed instances |
+| `DescribeInstanceInformation` | Filter and paginate registered managed nodes in the caller's account and region |
 | `SendCommand` | Create command invocations for target instances |
 | `GetCommandInvocation` | Return a command invocation result |
 | `ListCommands` | List command records |
@@ -262,6 +262,20 @@ The check and write are atomic, so concurrent requests for the same explicit ver
 cannot both overwrite the association.
 
 ## Run Command Execution
+
+`DescribeInstanceInformation` supports `InstanceIds`, `AgentVersion`, `PingStatus`,
+`PlatformTypes` and `ResourceType` through modern `Filters` and the deprecated
+`InstanceInformationFilterList` wire shape. Values within a filter are alternatives;
+different keys must all match. Unknown or foreign managed-node IDs fail with
+`InvalidInstanceId`. Known EC2 nodes that are stopped, shutting down or terminated
+are omitted. A registered external agent does not require a Floci EC2 record.
+Discovery does not infer lost contact from heartbeat age.
+
+Listings default to 10 items and accept `MaxResults` from 5 to 50. Follow
+`NextToken` for more results; tokens are scoped to the account, region and filters.
+Mixing the two filter shapes, invalid keys or values, and foreign tokens fail.
+Activation, association, IAM role, source and tag filters are not implemented;
+they return `UnsupportedOperation` rather than ignoring the requested selection.
 
 By default, `SendCommand` requires a registered managed node. Execution requires
 a running SSM agent; commands wait for delivery while it is stopped. Floci delivers the selected Command document through the agent's `ssmmessages`

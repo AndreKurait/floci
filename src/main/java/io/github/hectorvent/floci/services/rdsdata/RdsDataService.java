@@ -135,12 +135,12 @@ public class RdsDataService implements Resettable {
                    RdsBackendEndpointResolver backendEndpointResolver,
                    boolean databaseResumingExceptionEnabled,
                    Clock clock) {
-        this.clock = clock;
         this.resourceResolver = resourceResolver;
         this.secretsManagerService = secretsManagerService;
         this.objectMapper = objectMapper;
         this.connectionFactory = connectionFactory;
         this.transactionTtl = transactionTtl;
+        this.clock = clock;
         this.backendGate = backendGate;
         this.backendEndpointResolver = backendEndpointResolver;
         this.databaseResumingExceptionEnabled = databaseResumingExceptionEnabled;
@@ -236,8 +236,9 @@ public class RdsDataService implements Resettable {
             connection.setAutoCommit(false);
             String transactionId = UUID.randomUUID().toString();
             transactions.put(transactionId, new TransactionContext(
-                    transactionId, connection, target.engine(), target.arn(), database, region, transactionTtl,
-                    lease, clock.instant()));
+                    transactionId, connection, target.engine(), target.arn(), database, region,
+                    clock.instant().plus(transactionTtl),
+                    lease));
             leaseHandedOver = true;
 
             ObjectNode response = objectMapper.createObjectNode();
@@ -323,7 +324,7 @@ public class RdsDataService implements Resettable {
                 requireActiveTransaction(transactionId, tx);
                 return work.execute(tx.connection, tx.engine);
             } finally {
-                tx.refresh(transactionTtl, clock.instant());
+                tx.expiresAt = clock.instant().plus(transactionTtl);
                 tx.lock.unlock();
             }
         }
@@ -903,7 +904,7 @@ public class RdsDataService implements Resettable {
 
         private TransactionContext(
                 String id, Connection connection, DatabaseEngine engine, String resourceArn,
-                String database, String region, Duration ttl, RdsBackendGate.Lease lease, Instant now) {
+                String database, String region, Instant expiresAt, RdsBackendGate.Lease lease) {
             this.id = id;
             this.connection = connection;
             this.engine = engine;
@@ -911,11 +912,7 @@ public class RdsDataService implements Resettable {
             this.database = database;
             this.region = region;
             this.lease = lease;
-            refresh(ttl, now);
-        }
-
-        private void refresh(Duration ttl, Instant now) {
-            this.expiresAt = now.plus(ttl);
+            this.expiresAt = expiresAt;
         }
 
         private void close() {

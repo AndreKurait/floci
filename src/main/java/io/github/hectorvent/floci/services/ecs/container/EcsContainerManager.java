@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.docker.AdditionalDockerNetworks;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -26,8 +27,10 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.C
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.DockerFlags;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
+import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
@@ -35,6 +38,7 @@ import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
+import io.github.hectorvent.floci.services.ecs.EcsAgentLabels;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.Container;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
@@ -256,6 +260,11 @@ public class EcsContainerManager {
                     "Privileged containers require floci.services.ecs.allow-privileged-containers"
                             + " (FLOCI_SERVICES_ECS_ALLOW_PRIVILEGED_CONTAINERS) to be enabled.", 400);
         }
+        // Parsed before anything is prepared, so a bad operator setting fails the launch with
+        // nothing to clean up.
+        DockerFlags dockerFlags = configuredDockerFlags();
+        List<String> additionalNetworks = AdditionalDockerNetworks.validated(
+                config.services().ecs().additionalDockerNetworks(), "ECS");
         String taskId = extractTaskId(task.getTaskArn());
 
         Map<String, String> containerIds = new LinkedHashMap<>();
@@ -318,8 +327,14 @@ public class EcsContainerManager {
             for (ContainerDefinition def : launchOrder) {
                 String metadataId = UUID.randomUUID().toString().replace("-", "");
                 metadataIdsByContainer.put(def.getName(), metadataId);
-                envVarsByContainer.put(def, buildEnvVars(def, overridesByName.get(def.getName()), region,
-                        metadataId, taskRoleEndpoint.vending()));
+                List<String> containerEnv = new ArrayList<>(buildEnvVars(def, overridesByName.get(def.getName()), region,
+                        metadataId, taskRoleEndpoint.vending() || usesInstanceRole(task, taskDef), dockerFlags));
+                String imdsEndpoint = instanceMetadataEndpoint(task, dockerFlags);
+                if (imdsEndpoint != null && containerEnv.stream()
+                        .noneMatch(kv -> kv.startsWith(INSTANCE_METADATA_ENDPOINT_ENV + "="))) {
+                    containerEnv.add(INSTANCE_METADATA_ENDPOINT_ENV + "=" + imdsEndpoint);
+                }
+                envVarsByContainer.put(def, containerEnv);
                 imagesByContainer.put(def,
                         containerBuilder.resolveImage(ecrRegistryManager.rewriteImageUri(def.getImage())));
             }
@@ -405,9 +420,21 @@ public class EcsContainerManager {
                         // containers do: host.docker.internal on Linux, plus Floci's embedded DNS so the
                         // reachable AWS_ENDPOINT_URL hostname resolves to Floci instead of the container's
                         // own loopback.
-                        .withHostDockerInternalOnLinux()
-                        .withEmbeddedDns()
-                        .withJavaTrustStore()
+                        .withHostDockerInternalOnLinux();
+                // The operator's flags first: a --dns there replaces Floci's embedded DNS, which
+                // withEmbeddedDns() only adds when no server is set yet.
+                dockerFlags.applyTo(specBuilder, "ECS");
+                specBuilder.withEmbeddedDns()
+                        .withJavaTrustStore();
+                // The definition's own dockerLabels, as ECS applies them; then the labels the ECS
+                // agent sets, which override a duplicate there as on ECS; then Floci's ownership
+                // labels, which win on a key conflict: reconciliation and teardown find their
+                // containers by those, and a task must not be able to hide from or adopt them.
+                if (def.getDockerLabels() != null) {
+                    specBuilder.withLabels(def.getDockerLabels());
+                }
+                specBuilder
+                        .withLabels(EcsAgentLabels.forDocker(task, taskDef, def.getName()))
                         .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                                 "ecs", taskId, regionResolver.getAccountId(), region))
                         .withLabels(ownerLabels());
@@ -479,12 +506,12 @@ public class EcsContainerManager {
                     boolean publishToHost = !containerDetector.isRunningInContainer()
                             || publishAwsvpcPorts;
                     for (PortMapping pm : def.getPortMappings()) {
+                        int hostPort = publishedHostPort(pm, taskDef.getNetworkMode(), publishAwsvpcPorts,
+                                config.services().ecs().dynamicAwsvpcHostPorts());
                         if (awsvpc && publishToHost) {
-                            int hostPort = awsvpcHostPort(pm, publishAwsvpcPorts,
-                                    config.services().ecs().dynamicAwsvpcHostPorts());
                             specBuilder.withPortBinding(pm.containerPort(), hostPort, hostPortBindAddress());
-                        } else if (!awsvpc && pm.hostPort() > 0) {
-                            specBuilder.withPortBinding(pm.containerPort(), pm.hostPort());
+                        } else if (hostPort > 0) {
+                            specBuilder.withPortBinding(pm.containerPort(), hostPort);
                         } else if (publishToHost) {
                             specBuilder.withDynamicPort(pm.containerPort());
                         } else {
@@ -561,10 +588,15 @@ public class EcsContainerManager {
 
                 ContainerSpec spec = specBuilder.build();
 
+                // An awsvpc task's containers live in their task's network namespace, which
+                // cannot join further networks of its own.
+                List<String> joinNetworks = protectedNetwork == null ? additionalNetworks : List.of();
                 String dockerId;
                 if (def == firelensRouter) {
                     dockerId = lifecycleManager.create(spec, platform);
                     try {
+                        registerPendingInstanceMetadata(task, region, dockerId);
+                        AdditionalDockerNetworks.attach(lifecycleManager.getDockerClient(), dockerId, joinNetworks);
                         copyFirelensConfig(dockerId, firelensConfig, isFluentdRouter(firelensRouter),
                                 firelensExternalConfig, firelensBackoffMillis);
                         lifecycleManager.startCreated(dockerId, spec);
@@ -573,10 +605,18 @@ public class EcsContainerManager {
                         throw e;
                     }
                     fluentHost = inspectContainerIp(dockerId);
-                } else {
+                } else if (joinNetworks.isEmpty() && !servesInstanceMetadata(task)) {
                     ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec, platform);
                     dockerId = info.containerId();
+                } else {
+                    // IMDS knows the container before its process starts (it may ask at once).
+                    ContainerInfo info = lifecycleManager.createAndStartEphemeral(spec, platform, created -> {
+                        registerPendingInstanceMetadata(task, region, created);
+                        AdditionalDockerNetworks.attach(lifecycleManager.getDockerClient(), created, joinNetworks);
+                    });
+                    dockerId = info.containerId();
                 }
+                registerInstanceMetadata(task, region, dockerId);
 
                 containerIds.put(def.getName(), dockerId);
 
@@ -1413,18 +1453,23 @@ public class EcsContainerManager {
                 continue;
             }
             for (PortMapping port : container.getPortMappings()) {
-                bindings.put(port.containerPort(), awsvpcHostPort(port, publishAwsvpcPortsToHost,
-                        dynamicAwsvpcHostPorts));
+                bindings.put(port.containerPort(), publishedHostPort(port, NetworkMode.awsvpc,
+                        publishAwsvpcPortsToHost, dynamicAwsvpcHostPorts));
             }
         }
         return bindings;
     }
 
-    private static int awsvpcHostPort(PortMapping port, boolean publishToHost, boolean dynamicHostPorts) {
-        if (publishToHost && !dynamicHostPorts) {
-            return port.hostPort() > 0 ? port.hostPort() : port.containerPort();
+    /** Host port to publish for a mapping; zero means no fixed host-port reservation. */
+    public static int publishedHostPort(PortMapping port, NetworkMode networkMode,
+                                        boolean publishAwsvpcPortsToHost, boolean dynamicAwsvpcHostPorts) {
+        if (networkMode != NetworkMode.awsvpc) {
+            return Math.max(0, port.hostPort());
         }
-        return 0;
+        if (!publishAwsvpcPortsToHost || dynamicAwsvpcHostPorts) {
+            return 0;
+        }
+        return port.hostPort() > 0 ? port.hostPort() : port.containerPort();
     }
 
     private record PreparedNetwork(NetworkInterface eni, SecurityGroupFirewallManager.Namespace namespace) {}
@@ -1546,18 +1591,21 @@ public class EcsContainerManager {
         // A force removal terminates Docker's follow-log transport even when the preceding stop failed.
         // Preserve handles for any container that still may be running after both operations failed.
         terminatedContainerIds.forEach(dockerId -> finalizeLogStream(handle, dockerId));
-        if (handle.allContainersRemoved()) {
-            cleanupProtectedNetwork(handle);
-            removeTaskVolumes(handle);
-            // Only now: a container that survived a failed removal still holds its address.
-            releaseTaskLinkLocalAddresses(handle.getTaskArn());
+        try {
+            if (handle.allContainersRemoved()) {
+                // Confirm the helper released its host ports before unregister forgets its identity.
+                if (firewallManager != null && handle.getNetworkInterfaceId() != null) {
+                    firewallManager.removeNamespaceStrict(handle.getNetworkInterfaceId());
+                }
+                cleanupProtectedNetwork(handle);
+                removeTaskVolumes(handle);
+                // Only now: a container that survived a failed removal still holds its address.
+                releaseTaskLinkLocalAddresses(handle.getTaskArn());
+            }
+        } finally {
+            // A failed container or helper removal must not keep the stopping task's credentials usable.
+            revokeTaskRoleCredentials(handle.getTaskArn());
         }
-        // Revoked whether or not removal succeeded, unlike everything above. A task being
-        // stopped must not keep usable credentials just because Docker could not remove one of
-        // its containers: the retry that would eventually revoke them depends on the handle
-        // being retained, which only happens while a log stream is still open, so a container
-        // without one (a FireLens router, say) would strand them for the life of the process.
-        revokeTaskRoleCredentials(handle.getTaskArn());
         return exitCodes;
     }
 
@@ -1853,6 +1901,12 @@ public class EcsContainerManager {
     }
 
     private String inspectContainerIp(String dockerId) {
+        String ip = inspectContainerIpOrNull(dockerId);
+        return ip != null ? ip : "127.0.0.1";
+    }
+
+    /** The container's address, or null when Docker cannot say (never the loopback fallback). */
+    private String inspectContainerIpOrNull(String dockerId) {
         try {
             InspectContainerResponse inspect = lifecycleManager.getDockerClient().inspectContainerCmd(dockerId).exec();
             Map<String, ContainerNetwork> networks = inspect.getNetworkSettings().getNetworks();
@@ -1875,7 +1929,7 @@ public class EcsContainerManager {
         } catch (Exception e) {
             LOG.warnv("Could not resolve FireLens container IP for {0}: {1}", dockerId, e.getMessage());
         }
-        return "127.0.0.1";
+        return null;
     }
     /**
      * Issues the task's role credentials and makes sure the endpoint that serves them is up,
@@ -1941,6 +1995,7 @@ public class EcsContainerManager {
         if (taskRoleCredentials != null) {
             taskRoleCredentials.revoke(taskArn);
         }
+        releaseInstanceRole(taskArn);
     }
 
     /**
@@ -1954,6 +2009,155 @@ public class EcsContainerManager {
         if (linkLocalAddresses != null) {
             linkLocalAddresses.releaseAll(taskArn);
         }
+        releaseInstanceMetadata(taskArn);
+    }
+
+    // ── EC2 instance metadata for EC2 launch type tasks ──────────────────────
+
+    static final String INSTANCE_METADATA_ENDPOINT_ENV = "AWS_EC2_METADATA_SERVICE_ENDPOINT";
+
+    /**
+     * Serves an EC2 launch type task's containers the instance metadata of the container instance
+     * the task was placed on, as an ECS-on-EC2 task reaches its host's IMDS. Absent in unit tests
+     * that build this manager by hand.
+     */
+    @Inject
+    Ec2MetadataServer instanceMetadataServer;
+
+    /** ec2InstanceId -> the instance IMDS answers for; one per container instance, shared by its tasks. */
+    private final Map<String, io.github.hectorvent.floci.services.ec2.model.Instance> metadataInstances =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** taskArn -> the container addresses registered for it. */
+    private final Map<String, List<String>> metadataAddressesByTask = new java.util.concurrent.ConcurrentHashMap<>();
+    /** ec2InstanceId -> the tasks registered with IMDS as that instance, which share its credentials. */
+    private final Map<String, Set<String>> metadataTasksByInstance = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Whether a task's SDK is meant to find the container instance's instance-profile role through
+     * IMDS, as an ECS-on-EC2 task without a task role does: placed on an instance that carries a
+     * profile, and asking for no task role. Such a task is given no static keys, which the SDK
+     * would otherwise prefer over IMDS. A task with a task role keeps today's behaviour (the
+     * task-role endpoint when enabled, else the baseline keys).
+     */
+    boolean usesInstanceRole(EcsTask task, TaskDefinition taskDef) {
+        return instanceMetadataServer != null && task.getEc2InstanceId() != null
+                && task.getIamInstanceProfileArn() != null && !task.getIamInstanceProfileArn().isBlank()
+                && (taskDef.getTaskRoleArn() == null || taskDef.getTaskRoleArn().isBlank());
+    }
+
+    /**
+     * Revokes the instance-role credentials IMDS issued for a task's container instance once no
+     * task is left on it: the instance stands in for an EC2 host only while it runs tasks, and
+     * IMDS mints fresh credentials for the next task placed there.
+     */
+    private void releaseInstanceRole(String taskArn) {
+        if (instanceMetadataServer == null) {
+            return;
+        }
+        for (Map.Entry<String, Set<String>> entry : metadataTasksByInstance.entrySet()) {
+            if (entry.getValue().remove(taskArn) && entry.getValue().isEmpty()) {
+                String instanceId = entry.getKey();
+                metadataTasksByInstance.remove(instanceId, entry.getValue());
+                io.github.hectorvent.floci.services.ec2.model.Instance instance = metadataInstances.remove(instanceId);
+                if (instance != null) {
+                    instanceMetadataServer.unregisterInstance(instance);
+                }
+            }
+        }
+    }
+
+    /** Floci's IMDS server as a task container reaches it, or null when the task is not on an EC2 instance. */
+    String instanceMetadataEndpoint(EcsTask task, DockerFlags dockerFlags) {
+        if (instanceMetadataServer == null || task.getEc2InstanceId() == null) {
+            return null;
+        }
+        String base = flociEndpointFor(dockerFlags);
+        if (base == null) {
+            return null;
+        }
+        java.net.URI uri = java.net.URI.create(base);
+        return "http://" + uri.getHost() + ":" + config.services().ec2().imdsPort();
+    }
+
+    /**
+     * Before Docker starts a task container: IMDS resolves the container's address on its first
+     * request, so a process that asks for credentials as it starts is served.
+     */
+    private boolean servesInstanceMetadata(EcsTask task) {
+        return instanceMetadataServer != null && task.getEc2InstanceId() != null;
+    }
+
+    void registerPendingInstanceMetadata(EcsTask task, String region, String dockerId) {
+        if (!servesInstanceMetadata(task)) {
+            return;
+        }
+        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+                metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, null));
+        metadataTasksByInstance.computeIfAbsent(task.getEc2InstanceId(), ignored -> ConcurrentHashMap.newKeySet())
+                .add(task.getTaskArn());
+        instanceMetadataServer.registerPendingContainer(dockerId, task.getTaskArn(),
+                () -> inspectContainerIpOrNull(dockerId), instance);
+    }
+
+    void registerInstanceMetadata(EcsTask task, String region, String dockerId) {
+        if (instanceMetadataServer == null || task.getEc2InstanceId() == null) {
+            return;
+        }
+        String ip = inspectContainerIp(dockerId);
+        if (ip == null) {
+            LOG.warnv("No address for container {0} of task {1}; its instance metadata is not served",
+                    dockerId, task.getTaskArn());
+            return;
+        }
+        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+                metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, ip));
+        if (instance.getPrivateIpAddress() == null) {
+            instance.setPrivateIpAddress(ip);
+        }
+        instanceMetadataServer.registerContainer(ip, task.getEc2InstanceId(), instance, task.getTaskArn());
+        instanceMetadataServer.forgetPendingContainer(dockerId);
+        metadataTasksByInstance.computeIfAbsent(task.getEc2InstanceId(), ignored -> ConcurrentHashMap.newKeySet())
+                .add(task.getTaskArn());
+        metadataAddressesByTask.computeIfAbsent(task.getTaskArn(), ignored -> new java.util.concurrent.CopyOnWriteArrayList<>())
+                .add(ip);
+    }
+
+    private void releaseInstanceMetadata(String taskArn) {
+        List<String> addresses = metadataAddressesByTask.remove(taskArn);
+        if (instanceMetadataServer == null) {
+            return;
+        }
+        // Only addresses this task still owns: Docker may have given one to a later task already.
+        for (String ip : addresses == null ? List.<String>of() : addresses) {
+            metadataInstances.values().forEach(instance ->
+                    instanceMetadataServer.unregisterContainer(ip, instance, taskArn));
+        }
+        metadataInstances.values().forEach(instance -> instanceMetadataServer.unregisterContainer(null, instance, taskArn));
+    }
+
+    /** The EC2 instance a container instance stands for, as IMDS describes it. */
+    private static io.github.hectorvent.floci.services.ec2.model.Instance containerInstanceHost(
+            EcsTask task, String region, String ip) {
+        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+                new io.github.hectorvent.floci.services.ec2.model.Instance();
+        instance.setInstanceId(task.getEc2InstanceId());
+        instance.setImageId("ami-ecs-optimized");
+        instance.setInstanceType("m5.large");
+        if (task.getAvailabilityZone() != null) {
+            instance.setPlacement(new io.github.hectorvent.floci.services.ec2.model.Placement(task.getAvailabilityZone()));
+        }
+        instance.setRegion(region);
+        instance.setOwnerId(accountOf(task.getTaskArn()));
+        instance.setState(io.github.hectorvent.floci.services.ec2.model.InstanceState.running());
+        instance.setPrivateIpAddress(ip);
+        // The profile IMDS serves credentials for; Ec2MetadataServer checks IAM holds it per request.
+        instance.setIamInstanceProfileArn(task.getIamInstanceProfileArn());
+        return instance;
+    }
+
+    private static String accountOf(String arn) {
+        String[] parts = arn.split(":");
+        return parts.length > 4 ? parts[4] : null;
     }
 
     /**
@@ -2012,8 +2216,43 @@ public class EcsContainerManager {
         }
     }
 
+    /**
+     * The operator's ECS docker-flags ({@code floci.services.ecs.docker-flags}); none when unset.
+     *
+     * @throws IllegalArgumentException for an unsupported flag or a flag missing its value
+     */
+    private DockerFlags configuredDockerFlags() {
+        Optional<String> configured = config.services().ecs().dockerFlags();
+        return configured == null ? DockerFlags.none()
+                : configured.filter(value -> !value.isBlank())
+                        .map(value -> DockerFlags.parse(value, "ECS"))
+                        .orElseGet(DockerFlags::none);
+    }
+
+    /** Whether the operator configured ECS docker-flags at all: then tasks reach AWS by name. */
+    private boolean sealed() {
+        Optional<String> configured = config.services().ecs().dockerFlags();
+        return configured != null && configured.filter(value -> !value.isBlank()).isPresent();
+    }
+
+    /**
+     * Floci's base URL as a task container reaches it. With a {@code --dns} of the operator's the
+     * container cannot resolve Floci's embedded-DNS name, so it is given an address instead, as
+     * Lambda containers with their own DNS are.
+     */
+    private String flociEndpointFor(DockerFlags dockerFlags) {
+        return dockerFlags.setsDns() ? awsEnv.flociEndpoint(false) : awsEnv.flociEndpoint();
+    }
+
+    /**
+     * Floci's SDK endpoint variables. A sealed task does not get them: it reaches AWS by the
+     * service's real names through the operator's DNS, as an ECS task does.
+     */
+    private static final List<String> SDK_ENDPOINT_KEYS = List.of("AWS_ENDPOINT_URL", "FLOCI_ENDPOINT", "FLOCI_HOSTNAME");
+
     private List<String> buildEnvVars(ContainerDefinition def, ContainerOverride override, String region,
-                                      String metadataId, boolean vendingTaskRoleCredentials) {
+                                      String metadataId, boolean vendingTaskRoleCredentials,
+                                      DockerFlags dockerFlags) {
         // AWS SDK baseline (endpoint + region + credentials) first so the task can reach the
         // emulator, then the task-def environment, then task-def secrets, then the override
         // environment. Later entries win on key conflict, so an explicit task-def value or
@@ -2034,9 +2273,12 @@ public class EcsContainerManager {
             // task that deliberately sets its own credentials still keeps them.
             BASELINE_CREDENTIAL_KEYS.forEach(envMap::remove);
         }
+        if (sealed()) {
+            SDK_ENDPOINT_KEYS.forEach(envMap::remove);
+        }
         // The task metadata endpoint, which an application, the ECS SDK integrations and the
         // aws-for-fluent-bit init process all read from this variable.
-        String flociEndpoint = awsEnv.flociEndpoint();
+        String flociEndpoint = flociEndpointFor(dockerFlags);
         if (metadataId != null && flociEndpoint != null) {
             envMap.put("ECS_CONTAINER_METADATA_URI_V4", flociEndpoint + "/v4/" + metadataId);
         }

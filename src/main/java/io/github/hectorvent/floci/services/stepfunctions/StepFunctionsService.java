@@ -26,6 +26,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
+import io.github.hectorvent.floci.services.stepfunctions.model.ExecutionConfiguration;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
 import io.github.hectorvent.floci.services.stepfunctions.model.MockedTestCase;
@@ -841,6 +842,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             exec.setStateMachineArn(resolved.baseArn());
             exec.setStateMachineVersionArn(resolved.versionArn());
             exec.setStateMachineAliasArn(resolved.aliasArn());
+            if (!express) {
+                exec.setStateMachineConfiguration(ExecutionConfiguration.capture(sm, resolved.baseArn()));
+            }
             exec.setName(execName);
             exec.setInput(input);
             exec.setStatus("RUNNING");
@@ -938,6 +942,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
 
     private record ResolvedStateMachine(
             StateMachine stateMachine, String baseArn, String versionArn, String aliasArn) {
+        private ResolvedStateMachine {
+            // Descriptions are detached copies; execution identity remains the base machine.
+            stateMachine.setStateMachineArn(baseArn);
+        }
     }
 
     private ResolvedStateMachine resolveStateMachineForExecution(String arn) {
@@ -1025,6 +1033,26 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     public Execution describeExecution(String arn) {
         return executionStore.get(arn)
                 .orElseThrow(() -> new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400));
+    }
+
+    public ExecutionConfiguration describeStateMachineForExecution(String arn) {
+        try {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            if (arn.length() > MAX_ARN_LENGTH || !"states".equals(parsed.service())
+                    || parsed.region().isBlank() || parsed.accountId().isBlank()
+                    || !parsed.resource().matches("execution:[^:\\s]+:[^:\\s]+")) {
+                throw new IllegalArgumentException("Not a Standard execution ARN");
+            }
+        } catch (IllegalArgumentException error) {
+            throw new AwsException("InvalidArn", "Invalid Arn: '" + arn + "'", 400);
+        }
+        Execution execution = describeExecution(arn);
+        ExecutionConfiguration configuration = execution.getStateMachineConfiguration();
+        if (configuration == null) {
+            throw new AwsException("UnsupportedOperation",
+                    "This execution predates configuration capture; its original definition is unavailable.", 400);
+        }
+        return configuration.copy();
     }
 
     public List<Execution> listExecutions(String stateMachineArn) {

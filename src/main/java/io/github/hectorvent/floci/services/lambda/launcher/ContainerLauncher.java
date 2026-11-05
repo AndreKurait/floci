@@ -1,14 +1,16 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
-import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.Version;
+import com.github.dockerjava.api.model.VersionComponent;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.docker.AdditionalDockerNetworks;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.DockerFlags;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
@@ -26,7 +28,6 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
-import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -51,8 +52,8 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -66,6 +67,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
@@ -82,6 +84,8 @@ import java.util.stream.Stream;
 @ApplicationScoped
 @Typed(ContainerLauncher.class)
 public class ContainerLauncher implements LambdaRuntimeLauncher {
+
+    private enum ContainerEngine { PODMAN, DOCKER, UNKNOWN }
 
     private static final Logger LOG = Logger.getLogger(ContainerLauncher.class);
     private static final String TASK_DIR = "/var/task";
@@ -132,6 +136,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
     private final LambdaFunctionStore functionStore;
     private final LambdaVpcNetworkManager vpcNetworkManager;
+    private final AtomicBoolean engineWarningLogged = new AtomicBoolean();
+    private volatile ContainerEngine containerEngine;
 
     public ContainerLauncher(ContainerBuilder containerBuilder,
                              ContainerLifecycleManager lifecycleManager,
@@ -269,7 +275,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         LambdaVpcNetworkManager.Attachment vpcNetwork = null;
         try {
 
-        LambdaDockerFlags dockerFlags = configuredDockerFlags();
+        DockerFlags dockerFlags = configuredDockerFlags();
         // Resolve the image for the same platform used by container creation.
         String image = "Image".equals(fn.getPackageType()) && fn.getImageUri() != null
                 ? fn.getImageUri()
@@ -346,8 +352,13 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withEnv(env)
                 .withMemoryMb(fn.getMemorySize())
                 .withDockerNetwork(config.services().lambda().dockerNetwork())
-                .withHostDockerInternalOnLinux()
                 .withLogRotation();
+        List<String> configuredExtraHosts = config.services().lambda().extraHosts().orElse(List.of());
+        boolean hasExplicitHostAlias = Stream.concat(dockerFlags.extraHosts().stream(), configuredExtraHosts.stream())
+                .anyMatch(ContainerLauncher::isHostDockerInternalEntry);
+        if (dockerHostResolver.isLinuxHost() && !hasExplicitHostAlias && !isPodmanDaemon()) {
+            specBuilder.withHostDockerInternalOnLinux();
+        }
 
         applyDockerFlags(specBuilder, dockerFlags);
         specBuilder.withLabels(ContainerStorageHelper.resourceIdentityLabels(
@@ -368,14 +379,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Inject extra hosts entries into the container if present. Split on the FIRST
         // colon, mirroring docker --add-host: hostnames cannot contain colons, but IPv6
         // addresses do (e.g. "db.internal:2001:db8::1").
-        config.services().lambda().extraHosts().ifPresent(hosts -> hosts.forEach(entry -> {
+        configuredExtraHosts.forEach(entry -> {
             int sep = entry.indexOf(':');
             if (sep <= 0 || sep == entry.length() - 1) {
                 LOG.warnv("Ignoring malformed lambda extra-hosts entry (expected hostname:ip): {0}", entry);
                 return;
             }
             specBuilder.withExtraHost(entry.substring(0, sep), entry.substring(sep + 1));
-        }));
+        });
 
         // Whether /var/task is served from a shared read-only volume (large code) or copied
         // directly into this container (small code). Decided once here so both the spec (below)
@@ -457,7 +468,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
         DockerClient dockerClient = lifecycleManager.getDockerClient();
-        attachAdditionalNetworks(dockerClient, containerId, additionalNetworks);
+        AdditionalDockerNetworks.attach(dockerClient, containerId, additionalNetworks);
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -650,14 +661,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         };
     }
 
-    private Optional<String> requestedDockerPlatform(LambdaFunction fn, LambdaDockerFlags dockerFlags) {
+    private Optional<String> requestedDockerPlatform(LambdaFunction fn, DockerFlags dockerFlags) {
         if (dockerFlags.platform() != null) {
             return Optional.of(dockerFlags.platform());
         }
         return config.services().lambda().honourArchitectures() ? dockerPlatform(fn) : Optional.empty();
     }
 
-    private String createContainer(ContainerSpec spec, LambdaFunction fn, LambdaDockerFlags dockerFlags) {
+    private String createContainer(ContainerSpec spec, LambdaFunction fn, DockerFlags dockerFlags) {
         Optional<String> platform = requestedDockerPlatform(fn, dockerFlags);
         if (platform.isEmpty() && config.services().lambda().honourArchitectures()) {
             throw new IllegalStateException("Invalid persisted architectures "
@@ -668,112 +679,74 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     }
 
     private List<String> configuredAdditionalDockerNetworks() {
-        List<String> networks = config.services().lambda().additionalDockerNetworks().orElse(List.of());
-        Set<String> distinct = new HashSet<>();
-        for (String network : networks) {
-            if (network == null || !network.matches("[A-Za-z0-9][A-Za-z0-9_.-]*")
-                    || !distinct.add(network)) {
-                throw new IllegalArgumentException(
-                        "Lambda additional Docker networks must contain distinct Docker network names or IDs");
+        return AdditionalDockerNetworks.validated(config.services().lambda().additionalDockerNetworks(), "Lambda");
+    }
+
+    private boolean isPodmanDaemon() {
+        ContainerEngine cached = containerEngine;
+        if (cached != null) {
+            return cached == ContainerEngine.PODMAN;
+        }
+        return detectContainerEngine() == ContainerEngine.PODMAN;
+    }
+
+    private synchronized ContainerEngine detectContainerEngine() {
+        if (containerEngine != null) {
+            return containerEngine;
+        }
+        try {
+            // The socket's daemon can differ from the JVM's OS or container runtime.
+            Version version = lifecycleManager.getDockerClient().versionCmd().exec();
+            if (version != null) {
+                List<VersionComponent> components = version.getComponents();
+                List<String> engineNames = Stream.concat(
+                                Stream.of(version.getPlatform() == null ? null : version.getPlatform().getName()),
+                                components == null ? Stream.empty()
+                                        : components.stream().filter(Objects::nonNull).map(VersionComponent::getName))
+                        .filter(Objects::nonNull)
+                        .map(name -> name.toLowerCase(Locale.ROOT))
+                        .toList();
+                if (engineNames.stream().anyMatch(name -> name.contains("podman"))) {
+                    containerEngine = ContainerEngine.PODMAN;
+                    return containerEngine;
+                }
+                if (engineNames.stream().anyMatch(name -> name.contains("docker") || name.contains("moby"))) {
+                    containerEngine = ContainerEngine.DOCKER;
+                    return containerEngine;
+                }
             }
+            warnUnknownEngine("no Docker or Podman identity in /version");
+            containerEngine = ContainerEngine.UNKNOWN;
+        } catch (RuntimeException e) {
+            warnUnknownEngine(e.toString());
+            return ContainerEngine.UNKNOWN;
         }
-        return List.copyOf(networks);
+        return containerEngine;
     }
 
-    private static void attachAdditionalNetworks(
-            DockerClient dockerClient, String containerId, List<String> networks) {
-        if (networks.isEmpty()) {
-            return;
-        }
-        Set<String> connectedIds = new HashSet<>();
-        dockerClient.inspectContainerCmd(containerId).exec().getNetworkSettings().getNetworks()
-                .forEach((name, endpoint) -> {
-                    String id = endpoint.getNetworkID();
-                    // Docker leaves NetworkID empty until the container starts.
-                    connectedIds.add(id == null || id.isBlank()
-                            ? dockerClient.inspectNetworkCmd().withNetworkId(name).exec().getId() : id);
-                });
-        for (String network : networks) {
-            String id = dockerClient.inspectNetworkCmd().withNetworkId(network).exec().getId();
-            if (connectedIds.add(id)) {
-                dockerClient.connectToNetworkCmd()
-                        .withNetworkId(id)
-                        .withContainerId(containerId)
-                        .withContainerNetwork(new AdditionalNetworkEndpoint())
-                        .exec();
-            }
+    private void warnUnknownEngine(String reason) {
+        if (engineWarningLogged.compareAndSet(false, true)) {
+            LOG.warnv("Could not identify the container engine ({0}); retaining the Docker host-gateway mapping",
+                    reason);
         }
     }
 
-    /** Docker's gateway priority is not yet exposed by docker-java's endpoint model. */
-    @RegisterForReflection
-    private static final class AdditionalNetworkEndpoint extends ContainerNetwork {
-        @JsonProperty("GwPriority")
-        public int getGatewayPriority() {
-            return -1;
-        }
+    private static boolean isHostDockerInternalEntry(String entry) {
+        int separator = entry.indexOf(':');
+        return separator > 0 && separator < entry.length() - 1
+                && "host.docker.internal".equalsIgnoreCase(entry.substring(0, separator));
     }
 
-    private LambdaDockerFlags configuredDockerFlags() {
+    private DockerFlags configuredDockerFlags() {
         Optional<String> configured = Optional.ofNullable(config.services().lambda().dockerFlags())
                 .orElse(Optional.empty());
         return configured.filter(value -> !value.isBlank())
-                .map(LambdaDockerFlags::parse)
-                .orElseGet(() -> LambdaDockerFlags.parse(null));
+                .map(DockerFlags::parse)
+                .orElseGet(() -> DockerFlags.none());
     }
 
-    private static void applyDockerFlags(ContainerBuilder.Builder builder, LambdaDockerFlags flags) {
-        builder.withEnv(flags.environment());
-        for (String volume : flags.volumes()) {
-            String[] parts = volume.split(":", -1);
-            if (parts.length < 2 || parts.length > 3 || parts[0].isBlank() || parts[1].isBlank()) {
-                throw new IllegalArgumentException("Invalid Lambda Docker volume: " + volume);
-            }
-            if (parts.length == 3 && "ro".equals(parts[2])) {
-                builder.withReadOnlyBind(parts[0], parts[1]);
-            } else if (parts.length == 2 || "rw".equals(parts[2])) {
-                builder.withBind(parts[0], parts[1]);
-            } else {
-                throw new IllegalArgumentException("Invalid Lambda Docker volume mode: " + volume);
-            }
-        }
-        for (String publishedPort : flags.publishedPorts()) {
-            String[] parts = publishedPort.split(":", -1);
-            String hostIp = parts.length == 3 ? parts[0] : null;
-            String hostPort = parts.length == 2 ? parts[0] : parts.length == 3 ? parts[1] : "";
-            String containerPort = parts.length == 2 ? parts[1] : parts.length == 3 ? parts[2] : "";
-            if (hostPort.isBlank() || containerPort.isBlank()) {
-                throw new IllegalArgumentException("Invalid Lambda Docker published port: " + publishedPort);
-            }
-            int parsedHostPort = Integer.parseInt(hostPort);
-            int parsedContainerPort = Integer.parseInt(containerPort);
-            if (hostIp == null) {
-                builder.withPortBinding(parsedContainerPort, parsedHostPort);
-            } else if ("127.0.0.1".equals(hostIp)) {
-                builder.withLoopbackPortBinding(parsedContainerPort, parsedHostPort);
-            } else {
-                throw new IllegalArgumentException("Lambda Docker published ports only support "
-                        + "127.0.0.1 as an explicit host address: " + publishedPort);
-            }
-        }
-        for (String extraHost : flags.extraHosts()) {
-            int separator = extraHost.indexOf(':');
-            if (separator <= 0 || separator == extraHost.length() - 1) {
-                throw new IllegalArgumentException("Invalid Lambda Docker extra host: " + extraHost);
-            }
-            builder.withExtraHost(extraHost.substring(0, separator), extraHost.substring(separator + 1));
-        }
-        for (String dnsServer : flags.dnsServers()) {
-            builder.withDnsServer(dnsServer);
-        }
-        builder.withLabels(flags.labels());
-        if (flags.network() != null) {
-            builder.withNetworkMode(flags.network());
-        }
-        if (flags.user() != null) {
-            builder.withUser(flags.user());
-        }
-        builder.withPrivileged(flags.privileged());
+    private static void applyDockerFlags(ContainerBuilder.Builder builder, DockerFlags flags) {
+        flags.applyTo(builder, "Lambda");
     }
 
     public void stop(ContainerHandle handle) {

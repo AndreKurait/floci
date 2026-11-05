@@ -65,6 +65,7 @@ class EcsServiceRestartLeftoversTest {
         });
         EcsService restarted = service(storage, false, manager, mock(EcsLoadBalancerRegistrar.class), null);
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         EcsTask task = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null,
                 null, null, REGION).getFirst();
         assertEquals("RUNNING", task.getLastStatus());
@@ -100,6 +101,7 @@ class EcsServiceRestartLeftoversTest {
         definition.setImage("busybox:stable");
         restarted.registerTaskDefinition("web", List.of(definition), NetworkMode.bridge, null, null,
                 null, null, List.of(), REGION);
+        restarted.registerContainerInstance(null, null, null, REGION);
         restarted.runTask(null, "web", 1, LaunchType.EC2, null, null, null, null, REGION);
         restarted.reconcile();
         restarted.reconcile();
@@ -166,6 +168,7 @@ class EcsServiceRestartLeftoversTest {
                 null, null, List.of(), REGION);
 
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         EcsTask blocked = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null,
                 null, null, REGION).getFirst();
 
@@ -173,6 +176,7 @@ class EcsServiceRestartLeftoversTest {
         assertThat(blocked.getStoppedReason(), containsString("previous run"));
         verify(containerManager, never()).startTask(any(), any(), any(), anyString());
 
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION);
 
         verify(containerManager, times(3)).removeLeftoverContainers();
@@ -215,6 +219,7 @@ class EcsServiceRestartLeftoversTest {
                 null, null, List.of(), REGION);
 
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION);
 
         verify(containerManager, never()).removeLeftoverContainers();
@@ -275,6 +280,7 @@ class EcsServiceRestartLeftoversTest {
         ecs.createService("app-cluster", "alpha", "web", 0, LaunchType.EC2, List.of(lb), null, REGION);
 
         // A task of no service at all: any container can take the address a stale entry points at.
+        ecs.registerContainerInstance("app-cluster", null, null, REGION);
         EcsTask task = ecs.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst();
 
