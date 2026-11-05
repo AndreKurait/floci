@@ -197,6 +197,7 @@ AWS::SQS::QueuePolicy	SqsCfnProvisioner
 AWS::SSM::Document	SsmDocumentCfnProvisioner
 AWS::SSM::Parameter	SsmCfnProvisioner
 AWS::SSM::PatchBaseline	SsmPatchBaselineCfnProvisioner
+AWS::SSM::ResourceDataSync	SsmResourceDataSyncCfnProvisioner
 AWS::Scheduler::Schedule	SchedulerScheduleCfnProvisioner
 AWS::Scheduler::ScheduleGroup	SchedulerScheduleGroupCfnProvisioner
 AWS::SecretsManager::Secret	SecretsManagerCfnProvisioner

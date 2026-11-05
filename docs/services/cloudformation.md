@@ -269,7 +269,7 @@ cross-resource references.
 | Signer | `SigningProfile` (identifiers only; Floci has no Signer API) |
 | IAM | `Role`, `User` (template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete), `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile` |
 | Organizations | `Organization`, `OrganizationalUnit`, `Account`, `Policy`, `ResourcePolicy` |
-| SSM | `Document` (JSON content, version selection, replacement and rollback; see SSM documents for unsupported properties), `Parameter`, `PatchBaseline` (backed by SSM configuration, tags and patch-group bindings; OperatingSystem changes replace the baseline; DefaultBaseline only registers a default; does not execute patches on managed nodes) |
+| SSM | `Document` (JSON content, version selection, replacement and rollback; see SSM documents for unsupported properties), `Parameter`, `PatchBaseline` (backed by SSM configuration, tags and patch-group bindings; OperatingSystem changes replace the baseline; DefaultBaseline only registers a default; does not execute patches on managed nodes), `ResourceDataSync` (owns SSM inventory delivery configuration with legacy or nested S3 destinations; destination changes require replacement; checks SSM admission status; does not collect guest inventory) |
 | KMS | `Key`, `Alias` |
 | Secrets Manager | `Secret`, `SecretTargetAttachment` |
 | ECR | `Repository` |
