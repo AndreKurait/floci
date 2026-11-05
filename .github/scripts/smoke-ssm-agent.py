@@ -90,6 +90,23 @@ class Smoke:
         )
         return json.loads(result.stdout) if result.stdout.strip() else {}
 
+    def registered_agent(self, instance):
+        try:
+            nodes = self.aws(
+                "ssm", "describe-instance-information",
+                Filters=[{"Key": "InstanceIds", "Values": [instance]}],
+            ).get("InstanceInformationList", [])
+        except subprocess.CalledProcessError as error:
+            if "(InvalidInstanceId) when calling the DescribeInstanceInformation operation:" in (error.stderr or ""):
+                return None
+            raise
+        if not nodes:
+            return None
+        if (len(nodes) != 1 or nodes[0].get("InstanceId") != instance
+                or nodes[0].get("AgentVersion") != AGENT_VERSION):
+            raise ValueError("SSM did not observe the expected stock agent")
+        return nodes[0] if nodes[0].get("PingStatus") == "Online" else None
+
     def prepare(self):
         print("Preparing the pinned stock-agent guest", flush=True)
         architecture = docker("info", "--format", "{{.Architecture}}").stdout.strip()
@@ -315,12 +332,8 @@ class Smoke:
             "ps", "-q", "--filter", "ancestor=" + self.guest_image).stdout.strip())
         if inspect(self.guest)["Image"] != self.record["guest_image_id"]:
             raise ValueError("EC2 launched a different guest image")
-        nodes = wait_for("The stock agent did not register", lambda: self.aws(
-            "ssm", "describe-instance-information",
-            Filters=[{"Key": "InstanceIds", "Values": [instance]}],
-        ).get("InstanceInformationList"), seconds=180)
-        if len(nodes) != 1 or nodes[0]["AgentVersion"] != AGENT_VERSION:
-            raise ValueError("SSM did not observe the expected stock agent")
+        wait_for("The stock agent did not register",
+                 lambda: self.registered_agent(instance), seconds=180)
         self.record["agent_executed"] = True
 
         def completed():
