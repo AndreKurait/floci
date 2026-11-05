@@ -11360,6 +11360,63 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return resolveLaunchTemplateData(region, id, name, version, true);
     }
 
+    /** Dispatch the snapshot that passed IAM, even if Default or Latest changed during this request. */
+    LaunchTemplateData resolveRunInstancesLaunchTemplateData(String region, String id, String name, String version,
+                                                              boolean decodeUserData) {
+        LaunchTemplate captured = null;
+        if (requestContextInstance != null) {
+            try {
+                captured = requestContextInstance.get().getAuthorizedEc2LaunchTemplate();
+            } catch (ContextNotActiveException expected) {
+                // Internal callers without an HTTP authorization pass use ordinary template resolution.
+            }
+        }
+        if (captured == null) {
+            return resolveLaunchTemplateData(region, id, name, version, decodeUserData);
+        }
+        LaunchTemplateData data = new LaunchTemplateData(captured.getData());
+        if (decodeUserData) {
+            data.setUserData(Ec2UserDataDecoder.decodeIfMissing(data.getUserData(), data.getEncodedUserData()));
+        }
+        return data;
+    }
+
+    /** Read the selected version without creating regional defaults or allocating launch resources. */
+    public LaunchTemplate launchTemplateForAuthorization(String region, String id, String name, String version) {
+        LaunchTemplate template = findLaunchTemplate(region, id, name);
+        synchronized (template) {
+            return copyForVersion(template, resolveLaunchTemplateVersion(
+                    template, version, template.getDefaultVersionNumber()));
+        }
+    }
+
+    public record LaunchNetwork(String subnetId, List<String> securityGroupIds) {}
+
+    /** Resolve the same network as RunInstances without reserving an address or attaching an interface. */
+    public LaunchNetwork launchNetworkForAuthorization(String region, String subnetId, String networkInterfaceId,
+                                                        List<String> groupIds, String availabilityZone) {
+        ensureDefaultResources(region);
+        if (isSet(networkInterfaceId)) {
+            NetworkInterface networkInterface = requireStandaloneNetworkInterface(region, networkInterfaceId);
+            return new LaunchNetwork(networkInterface.getSubnetId(),
+                    networkInterface.getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        }
+        Subnet subnet;
+        if (isSet(subnetId)) {
+            subnet = requireSubnet(region, subnetId);
+        } else if (isSet(availabilityZone)) {
+            subnet = resolveSubnetForAvailabilityZone(region, availabilityZone);
+        } else {
+            subnet = subnets.scan(k -> true).stream()
+                    .filter(value -> region.equals(value.getRegion()) && value.isDefaultForAz())
+                    .findFirst().orElse(null);
+        }
+        String selectedSubnet = subnet == null ? null : subnet.getSubnetId();
+        String vpcId = subnet == null ? resolveDefaultVpcId(region) : subnet.getVpcId();
+        return new LaunchNetwork(selectedSubnet, resolveSecurityGroups(region, vpcId, groupIds, selectedSubnet)
+                .stream().map(GroupIdentifier::getGroupId).toList());
+    }
+
     public LaunchTemplateData resolveLaunchTemplateData(String region, String id, String name, String version,
                                                         boolean decodeUserData) {
         ensureDefaultResources(region);

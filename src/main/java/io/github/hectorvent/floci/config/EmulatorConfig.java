@@ -2529,6 +2529,27 @@ public interface EmulatorConfig {
 
         Optional<String> dockerNetwork();
 
+        /**
+         * Additional Docker create flags applied to every ECS task container, with the grammar of
+         * {@code floci.services.lambda.docker-flags} ({@code --dns}, {@code --add-host},
+         * {@code -v}, {@code --env}, {@code --label}, ...). A {@code --dns} server replaces Floci's
+         * embedded DNS. When set, task containers are not given Floci's SDK endpoint variables
+         * ({@code AWS_ENDPOINT_URL}, {@code FLOCI_ENDPOINT}, {@code FLOCI_HOSTNAME}): they reach
+         * AWS by its real names through the configured DNS, as on ECS.
+         *
+         * Env var: FLOCI_SERVICES_ECS_DOCKER_FLAGS
+         */
+        Optional<String> dockerFlags();
+
+        /**
+         * Additional existing Docker networks an ECS task container joins before it starts. The
+         * primary network remains selected by docker-network or docker-flags. Not applied to
+         * awsvpc tasks, whose containers share their task's network namespace.
+         *
+         * Env var: FLOCI_SERVICES_ECS_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
+
         @WithDefault("512")
         int defaultMemoryMb();
 
@@ -3857,6 +3878,13 @@ public interface EmulatorConfig {
         /** Optional local probe interval ceiling; zero preserves each target group's interval. */
         @WithDefault("0")
         long maxHealthCheckIntervalMillis();
+
+        /**
+         * Accounts (12-digit ids) whose Application Load Balancers may be in a single Availability
+         * Zone, for local setups that model single-zone deployments. AWS refuses an ALB in fewer than
+         * two zones. Unset (the default) keeps the two-zone rule for every account.
+         */
+        Optional<List<String>> singleZoneAlbAccounts();
     }
 
     interface EksServiceConfig {

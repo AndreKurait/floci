@@ -12,6 +12,7 @@ import com.github.dockerjava.api.model.Ports;
 import com.github.dockerjava.api.model.PushResponseItem;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.testing.TestImages;
@@ -88,10 +89,11 @@ class EcsImagePullDockerIntegrationTest {
     }
 
     @AfterEach
-    void cleanUp() {
+    void cleanUp() throws Exception {
         for (String taskArn : taskArns) {
             ecsService.stopTask(clusterName, taskArn, "test teardown", REGION);
         }
+        ecsService.awaitPendingStops();
         for (String image : images) {
             try {
                 dockerClient.removeImageCmd(image).withForce(true).exec();
@@ -143,7 +145,7 @@ class EcsImagePullDockerIntegrationTest {
 
     private EcsTask runTask(TaskDefinition taskDef) {
         EcsTask task = ecsService.runTask(clusterName, taskDef.getTaskDefinitionArn(), 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArns.add(task.getTaskArn());
         EcsTask described = ecsService.describeTasks(clusterName, List.of(task.getTaskArn()), REGION).getFirst();
         assertEquals("RUNNING", described.getLastStatus(), "the container must be up: " + described.getStoppedReason());

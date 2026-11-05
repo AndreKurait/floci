@@ -1418,6 +1418,7 @@ class IamEnforcementFilterTest {
     @Test
     void filterPassesEc2ResourceTagConditionContextAndHonoursTheDeny() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        String resource = "arn:aws:ec2:us-east-1:222233334444:instance/i-11111111111111111";
         Map<String, List<String>> conditions = Map.of("aws:ResourceTag/Team", List.of("engineering"));
 
         String auth = "AWS4-HMAC-SHA256 Credential=AKIATAGGED/20260907/us-east-1/ec2/aws4_request, "
@@ -1434,15 +1435,18 @@ class IamEnforcementFilterTest {
                           {"Effect":"Allow","Action":"ec2:TerminateInstances","Resource":"*",
                            "Condition":{"StringEquals":{"aws:ResourceTag/Team":"payments"}}}
                         ]}""")));
+        when(arnBuilder.buildResources("ec2", "ec2:TerminateInstances", containerRequest,
+                "us-east-1", "222233334444", "aws")).thenReturn(List.of(resource));
         when(conditionContextResolver.resolve("ec2", "ec2:TerminateInstances", containerRequest))
                 .thenReturn(conditions);
+        when(conditionContextResolver.ec2TerminationContext(resource, conditions)).thenReturn(conditions);
         when(evaluator.evaluateResolvedResourcePolicy(
                 any(),
                 eq(ResourcePolicyDecision.NEUTRAL),
                 eq(ResourceAccountRelationship.SAME_ACCOUNT),
                 eq("ec2:TerminateInstances"),
-                eq("*"),
-                eq(globalContext(conditions, "*", "222233334444"))))
+                eq(resource),
+                eq(globalContext(conditions, resource, "222233334444"))))
                 .thenReturn(IamPolicyEvaluator.Decision.DENY);
 
         newFilter().filter(containerRequest);
@@ -1452,8 +1456,9 @@ class IamEnforcementFilterTest {
                 eq(ResourcePolicyDecision.NEUTRAL),
                 eq(ResourceAccountRelationship.SAME_ACCOUNT),
                 eq("ec2:TerminateInstances"),
-                eq("*"),
-                eq(globalContext(conditions, "*", "222233334444")));
+                eq(resource),
+                eq(globalContext(conditions, resource, "222233334444")));
+        verify(conditionContextResolver).ec2TerminationContext(resource, conditions);
         verify(containerRequest).abortWith(any(Response.class));
     }
 
@@ -1462,22 +1467,22 @@ class IamEnforcementFilterTest {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         Map<String, List<String>> first = Map.of("aws:ResourceTag/Team", List.of("payments"));
         Map<String, List<String>> second = Map.of("aws:ResourceTag/Team", List.of("engineering"));
-        stubTaggedTerminate(containerRequest, first, List.of(second));
+        List<String> resources = stubTaggedTerminate(containerRequest, first, second);
         when(evaluator.evaluateResolvedResourcePolicy(
                 any(),
                 eq(ResourcePolicyDecision.NEUTRAL),
                 eq(ResourceAccountRelationship.SAME_ACCOUNT),
                 eq("ec2:TerminateInstances"),
-                eq("*"),
-                eq(globalContext(first, "*", "222233334444"))))
+                eq(resources.getFirst()),
+                eq(globalContext(first, resources.getFirst(), "222233334444"))))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
         when(evaluator.evaluateResolvedResourcePolicy(
                 any(),
                 eq(ResourcePolicyDecision.NEUTRAL),
                 eq(ResourceAccountRelationship.SAME_ACCOUNT),
                 eq("ec2:TerminateInstances"),
-                eq("*"),
-                eq(globalContext(second, "*", "222233334444"))))
+                eq(resources.getLast()),
+                eq(globalContext(second, resources.getLast(), "222233334444"))))
                 .thenReturn(IamPolicyEvaluator.Decision.DENY);
 
         newFilter().filter(containerRequest);
@@ -1487,8 +1492,10 @@ class IamEnforcementFilterTest {
                 eq(ResourcePolicyDecision.NEUTRAL),
                 eq(ResourceAccountRelationship.SAME_ACCOUNT),
                 eq("ec2:TerminateInstances"),
-                eq("*"),
-                eq(globalContext(second, "*", "222233334444")));
+                eq(resources.getLast()),
+                eq(globalContext(second, resources.getLast(), "222233334444")));
+        verify(conditionContextResolver).ec2TerminationContext(resources.getFirst(), first);
+        verify(conditionContextResolver).ec2TerminationContext(resources.getLast(), first);
         verify(containerRequest).abortWith(any(Response.class));
     }
 
@@ -1497,26 +1504,28 @@ class IamEnforcementFilterTest {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         Map<String, List<String>> first = Map.of("aws:ResourceTag/Team", List.of("payments"));
         Map<String, List<String>> second = Map.of("aws:ResourceTag/Team", List.of("payments"));
-        stubTaggedTerminate(containerRequest, first, List.of(second));
+        List<String> resources = stubTaggedTerminate(containerRequest, first, second);
         when(evaluator.evaluateResolvedResourcePolicy(
                 any(),
                 eq(ResourcePolicyDecision.NEUTRAL),
                 eq(ResourceAccountRelationship.SAME_ACCOUNT),
                 eq("ec2:TerminateInstances"),
-                eq("*"),
+                anyString(),
                 any()))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
 
         newFilter().filter(containerRequest);
 
-        verify(evaluator, times(2))
-                .evaluateResolvedResourcePolicy(
-                        any(),
-                        eq(ResourcePolicyDecision.NEUTRAL),
-                        eq(ResourceAccountRelationship.SAME_ACCOUNT),
-                        eq("ec2:TerminateInstances"),
-                        eq("*"),
-                        any());
+        verify(evaluator).evaluateResolvedResourcePolicy(
+                any(), eq(ResourcePolicyDecision.NEUTRAL), eq(ResourceAccountRelationship.SAME_ACCOUNT),
+                eq("ec2:TerminateInstances"), eq(resources.getFirst()),
+                eq(globalContext(first, resources.getFirst(), "222233334444")));
+        verify(evaluator).evaluateResolvedResourcePolicy(
+                any(), eq(ResourcePolicyDecision.NEUTRAL), eq(ResourceAccountRelationship.SAME_ACCOUNT),
+                eq("ec2:TerminateInstances"), eq(resources.getLast()),
+                eq(globalContext(second, resources.getLast(), "222233334444")));
+        verify(conditionContextResolver).ec2TerminationContext(resources.getFirst(), first);
+        verify(conditionContextResolver).ec2TerminationContext(resources.getLast(), first);
         verify(containerRequest, never()).abortWith(any());
     }
 
@@ -1529,9 +1538,9 @@ class IamEnforcementFilterTest {
                 serviceContext, resourceArn, "us-east-1", accountId, null);
     }
 
-    private void stubTaggedTerminate(ContainerRequestContext containerRequest,
+    private List<String> stubTaggedTerminate(ContainerRequestContext containerRequest,
                                      Map<String, List<String>> first,
-                                     List<Map<String, List<String>>> remaining) {
+                                     Map<String, List<String>> second) {
         String auth = "AWS4-HMAC-SHA256 Credential=AKIATAGGED/20260907/us-east-1/ec2/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
         requestContext.setAccountId("222233334444");
@@ -1547,8 +1556,14 @@ class IamEnforcementFilterTest {
                         ]}""")));
         when(conditionContextResolver.resolve("ec2", "ec2:TerminateInstances", containerRequest))
                 .thenReturn(first);
-        when(conditionContextResolver.resolveRemainingTargets("ec2", "ec2:TerminateInstances", containerRequest))
-                .thenReturn(remaining);
+        List<String> resources = List.of(
+                "arn:aws:ec2:us-east-1:222233334444:instance/i-11111111111111111",
+                "arn:aws:ec2:us-east-1:222233334444:instance/i-22222222222222222");
+        when(arnBuilder.buildResources("ec2", "ec2:TerminateInstances", containerRequest,
+                "us-east-1", "222233334444", "aws")).thenReturn(resources);
+        when(conditionContextResolver.ec2TerminationContext(resources.getFirst(), first)).thenReturn(first);
+        when(conditionContextResolver.ec2TerminationContext(resources.getLast(), first)).thenReturn(second);
+        return resources;
     }
 
     @Test

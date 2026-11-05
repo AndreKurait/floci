@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.HttpHeaders;
@@ -35,10 +37,9 @@ import java.util.regex.Pattern;
  * such a member.
  *
  * <p>An EC2 request names an instance profile rather than a role, and passes the roles the profile
- * holds. Launching from a launch template passes nothing here: the EC2 user guide warns that a user
- * who can create launch template versions "can potentially update a launch template to pass an IAM
- * role to an instance even if they don't have the iam:PassRole permission", so the role is checked
- * where the template is created.
+ * holds. A direct RunInstances call also passes the profile inherited from its selected launch
+ * template version, unless the request overrides it. The EC2 guide's warning about unchecked
+ * later launches concerns fleets fulfilling capacity without another caller request.
  *
  * <p>IAM's {@code AddRoleToInstanceProfile} passes the role it adds to {@code ec2.amazonaws.com}, since
  * every instance running with the profile then gets that role's credentials: "The caller of this
@@ -292,7 +293,8 @@ final class PassedRoles {
             case "lambda:CreateWebFunction" ->
                     fromJson(ctx, LAMBDA, "revisionConfig", "serviceConfig", "executionRoleArn");
             case "lambda:CreateWebFunctionRevision" -> fromJson(ctx, LAMBDA, "serviceConfig", "executionRoleArn");
-            case "ec2:RunInstances", "ec2:AssociateIamInstanceProfile", "ec2:ReplaceIamInstanceProfileAssociation" ->
+            case "ec2:RunInstances" -> runInstancesProfile(ctx, lookups);
+            case "ec2:AssociateIamInstanceProfile", "ec2:ReplaceIamInstanceProfileAssociation" ->
                     fromInstanceProfile(ctx, lookups, "IamInstanceProfile");
             case "ec2:RequestSpotInstances" ->
                     fromInstanceProfile(ctx, lookups, "LaunchSpecification.IamInstanceProfile");
@@ -958,6 +960,22 @@ final class PassedRoles {
     private static List<PassedRole> fromForm(ContainerRequestContext ctx, String service, String parameter) {
         String roleArn = IamConditionContextResolver.formParameters(ctx).get(parameter);
         return roleArn == null ? List.of() : passed(List.of(roleArn), service);
+    }
+
+    /** A request override wins over the instance profile in the captured launch-template version. */
+    private static List<PassedRole> runInstancesProfile(ContainerRequestContext ctx, Lookups lookups) {
+        Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
+        if (blankToNull(form.get("IamInstanceProfile.Name")) != null
+                || blankToNull(form.get("IamInstanceProfile.Arn")) != null) {
+            return fromInstanceProfile(ctx, lookups, "IamInstanceProfile");
+        }
+        LaunchTemplate template = Ec2LaunchAuthorization.capturedTemplate(ctx);
+        if (template == null) {
+            return launchTemplateRoles(form, "LaunchTemplate.", lookups);
+        }
+        LaunchTemplateData.IamInstanceProfile profile = template.getData().getIamInstanceProfile();
+        return profile == null ? List.of()
+                : passed(lookups.instanceProfileRoleArns(profile.getName(), profile.getArn()), EC2);
     }
 
     /** The roles of the instance profile named by {@code prefix}.Name or {@code prefix}.Arn. */

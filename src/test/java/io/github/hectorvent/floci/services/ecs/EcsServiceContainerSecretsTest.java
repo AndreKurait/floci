@@ -49,6 +49,7 @@ class EcsServiceContainerSecretsTest {
         service.registerTaskDefinition("secret-task", List.of(app), NetworkMode.bridge, null, null,
                 null, null, null, "us-east-1");
 
+        service.registerContainerInstance("test-cluster", null, null, "us-east-1");
         List<EcsTask> tasks = service.runTask("test-cluster", "secret-task", 1,
                 LaunchType.EC2, null, null, List.of(), null, "us-east-1");
 

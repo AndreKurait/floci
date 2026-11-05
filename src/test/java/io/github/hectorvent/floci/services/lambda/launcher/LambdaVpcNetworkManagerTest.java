@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.DockerFlags;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
@@ -72,7 +73,7 @@ class LambdaVpcNetworkManagerTest {
         }
 
         IllegalStateException failure = assertThrows(IllegalStateException.class, () ->
-                manager.prepare(function(), "environment", "192.0.2.1", 9001, LambdaDockerFlags.parse("")));
+                manager.prepare(function(), "environment", "192.0.2.1", 9001, DockerFlags.parse("")));
         assertEquals("Protected Lambda namespace could not attach to its VPC", failure.getMessage());
 
         if (helperRemoved) {
@@ -95,7 +96,7 @@ class LambdaVpcNetworkManagerTest {
         when(firewall.enabled()).thenReturn(true);
 
         assertThrows(IllegalArgumentException.class, () ->
-                manager.prepare(function(), "environment", "192.0.2.1", 9001, LambdaDockerFlags.parse(flags)));
+                manager.prepare(function(), "environment", "192.0.2.1", 9001, DockerFlags.parse(flags)));
 
         verifyNoInteractions(ec2, lifecycle);
     }
@@ -110,7 +111,7 @@ class LambdaVpcNetworkManagerTest {
         when(lambda.additionalDockerNetworks()).thenReturn(Optional.of(List.of("unfiltered")));
 
         assertThrows(IllegalArgumentException.class, () ->
-                manager.prepare(function(), "environment", "192.0.2.1", 9001, LambdaDockerFlags.parse("")));
+                manager.prepare(function(), "environment", "192.0.2.1", 9001, DockerFlags.parse("")));
 
         verifyNoInteractions(ec2, lifecycle);
     }
@@ -118,7 +119,7 @@ class LambdaVpcNetworkManagerTest {
     @Test
     void disabledEnforcementDoesNotAllocateNetworkResources() {
         assertTrue(manager.prepare(function(), "environment", "192.0.2.1", 9001,
-                LambdaDockerFlags.parse("")).isEmpty());
+                DockerFlags.parse("")).isEmpty());
         verifyNoInteractions(ec2, lifecycle);
     }
 
@@ -129,7 +130,7 @@ class LambdaVpcNetworkManagerTest {
         function.setVpcConfig(Map.of("SecurityGroupIds", List.of("sg-caller")));
 
         assertThrows(IllegalStateException.class, () -> manager.prepare(function, "environment",
-                "192.0.2.1", 9001, LambdaDockerFlags.parse("")));
+                "192.0.2.1", 9001, DockerFlags.parse("")));
 
         verifyNoInteractions(ec2, lifecycle);
     }

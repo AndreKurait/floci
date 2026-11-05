@@ -72,6 +72,7 @@ class EcsLeftoverContainersDockerIntegrationTest {
         TaskDefinition taskDef = ecsService.registerTaskDefinition(unique("leftover-td"), List.of(app),
                 NetworkMode.bridge, null, null, null, null, null, REGION);
 
+        ecsService.registerContainerInstance(clusterName, null, null, REGION);
         EcsTask task = ecsService.runTask(clusterName, taskDef.getTaskDefinitionArn(), 1, LaunchType.EC2, null, null,
                 null, null, REGION).getFirst();
         String foreignId = null;

@@ -90,7 +90,8 @@ class Ec2QueryHandlerTest {
             LaunchTemplateData.Placement placement = new LaunchTemplateData.Placement();
             placement.setAvailabilityZone(templateZone);
             data.setPlacement(placement);
-            when(service.resolveLaunchTemplateData("us-east-1", "lt-test", null, null, true)).thenReturn(data);
+            when(service.resolveRunInstancesLaunchTemplateData("us-east-1", "lt-test", null, null, true))
+                    .thenReturn(data);
         }
         Response response = handler(service).handle("RunInstances", params, "us-east-1");
         assertEquals(200, response.getStatus(), response.getEntity().toString());
