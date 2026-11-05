@@ -1594,6 +1594,11 @@ public class ResourceArnBuilder {
         }
         if (queueUrl != null && !queueUrl.isEmpty()) {
             String queueName = queueUrl.substring(queueUrl.lastIndexOf('/') + 1);
+            String parent = queueUrl.substring(0, Math.max(0, queueUrl.lastIndexOf('/')));
+            String owner = parent.substring(parent.lastIndexOf('/') + 1);
+            if (owner.matches("[0-9]{12}")) {
+                accountId = owner;
+            }
             return AwsArnUtils.Arn.of("sqs", region, accountId, queueName).toString();
         }
         return AwsArnUtils.Arn.of("sqs", region, accountId, "*").toString();

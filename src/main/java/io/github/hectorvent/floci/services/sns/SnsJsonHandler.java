@@ -242,7 +242,9 @@ public class SnsJsonHandler {
         Map<String, String> attributes = jsonNodeToMap(request.path("Attributes"));
         Subscription sub = snsService.subscribe(topicArn, protocol, endpoint, region, attributes);
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("SubscriptionArn", sub.getSubscriptionArn());
+        boolean pending = "true".equals(sub.getAttributes().get("PendingConfirmation"));
+        response.put("SubscriptionArn", pending && !request.path("ReturnSubscriptionArn").asBoolean(false)
+                ? "pending confirmation" : sub.getSubscriptionArn());
         return Response.ok(response).build();
     }
 
