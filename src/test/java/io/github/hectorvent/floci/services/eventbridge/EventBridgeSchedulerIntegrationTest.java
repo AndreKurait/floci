@@ -58,7 +58,7 @@ class EventBridgeSchedulerIntegrationTest {
                 new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new RegionResolver(REGION, ACCOUNT),
                 new ObjectMapper(), scheduler, dispatcher, replayDispatcher,
-                new ResourceGroupsTaggingService(null));
+                new ResourceGroupsTaggingService(null), mock(AppSyncTargetValidator.class));
     }
 
     @AfterEach
@@ -358,6 +358,7 @@ class EventBridgeSchedulerIntegrationTest {
                     @Override public boolean enabled() { return false; }
                     @Override public Optional<String> certPath() { return Optional.empty(); }
                     @Override public Optional<String> keyPath() { return Optional.empty(); }
+                    @Override public Optional<String> extraCaCerts() { return Optional.empty(); }
                     @Override public boolean selfSigned() { return true; }
                     @Override public int awsHttpsPort() { return 443; }
                 };

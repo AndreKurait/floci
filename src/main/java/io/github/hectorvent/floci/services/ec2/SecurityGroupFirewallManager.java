@@ -354,6 +354,17 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 || second.transportAddresses().contains(first.transportAddress());
     }
 
+    /** Removes the port-owning helper without forgetting its identity if Docker fails. */
+    public void removeNamespaceStrict(String eniId) {
+        ProtectedEndpoint endpoint;
+        synchronized (this) {
+            endpoint = endpoints.get(eniId);
+        }
+        if (endpoint != null) {
+            lifecycleManager.removeIfExistsStrict(endpoint.helperId());
+        }
+    }
+
     public synchronized void unregister(String eniId) {
         if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
             vpcRouting.get().unregister(eniId);

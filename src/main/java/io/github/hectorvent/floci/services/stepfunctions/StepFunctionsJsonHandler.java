@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
+import io.github.hectorvent.floci.services.stepfunctions.model.ExecutionConfiguration;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
 import io.github.hectorvent.floci.services.stepfunctions.model.RoutingConfiguration;
@@ -59,6 +60,7 @@ public class StepFunctionsJsonHandler {
             case "CreateStateMachine" -> handleCreateStateMachine(request, region);
             case "UpdateStateMachine" -> handleUpdateStateMachine(request);
             case "DescribeStateMachine" -> handleDescribeStateMachine(request);
+            case "DescribeStateMachineForExecution" -> handleDescribeStateMachineForExecution(request);
             case "ListStateMachines" -> handleListStateMachines(request, region);
             case "DeleteStateMachine" -> handleDeleteStateMachine(request);
             case "PublishStateMachineVersion" -> handlePublishStateMachineVersion(request);
@@ -288,6 +290,34 @@ public class StepFunctionsJsonHandler {
         }
         if (sm.getRevisionId() != null) {
             response.put("revisionId", sm.getRevisionId());
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleDescribeStateMachineForExecution(JsonNode request) {
+        String included = optionalText(request, "includedData");
+        if (included != null && !"ALL_DATA".equals(included) && !"METADATA_ONLY".equals(included)) {
+            throw new AwsException("ValidationException", "includedData must be ALL_DATA or METADATA_ONLY.", 400);
+        }
+        ExecutionConfiguration configuration = service.describeStateMachineForExecution(
+                requiredText(request, "executionArn"));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("stateMachineArn", configuration.stateMachineArn());
+        response.put("name", configuration.name());
+        response.put("definition", "METADATA_ONLY".equals(included) ? "{}" : configuration.definition());
+        response.put("roleArn", configuration.roleArn());
+        response.put("updateDate", configuration.updateDate());
+        if (configuration.revisionId() != null) {
+            response.put("revisionId", configuration.revisionId());
+        }
+        if (configuration.loggingConfiguration() != null) {
+            response.set("loggingConfiguration", configuration.loggingConfiguration());
+        }
+        if (configuration.tracingConfiguration() != null) {
+            response.set("tracingConfiguration", configuration.tracingConfiguration());
+        }
+        if (configuration.encryptionConfiguration() != null) {
+            response.set("encryptionConfiguration", configuration.encryptionConfiguration());
         }
         return Response.ok(response).build();
     }
