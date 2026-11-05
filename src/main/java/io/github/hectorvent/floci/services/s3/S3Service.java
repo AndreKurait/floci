@@ -7117,15 +7117,21 @@ public class S3Service implements Resettable, ResourceProvider {
      */
     private void fireNotifications(String bucketName, String key, String eventName, S3Object obj,
                                    String sequencer) {
+        AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName).orElse(null);
+        if (ownedBucket == null) {
+            return;
+        }
+        RequestScopes.runAs(ownedBucket.account(), ownedBucket.value().getRegion(), () ->
+                fireBucketNotifications(ownedBucket.value(), bucketName, key, eventName, obj, sequencer));
+    }
+
+    private void fireBucketNotifications(Bucket bucket, String bucketName, String key, String eventName,
+                                         S3Object obj, String sequencer) {
         if (s3UpdatedEvent != null && eventName.startsWith("ObjectCreated")) {
             s3UpdatedEvent.fire(new S3ObjectUpdatedEvent(bucketName, key));
         }
         if (sqsService == null && snsService == null && lambdaService == null
                 && lambdaServiceProvider == null && lambdaInvoker == null && eventBridgeService == null) {
-            return;
-        }
-        Bucket bucket = bucketStore.get(bucketName).orElse(null);
-        if (bucket == null) {
             return;
         }
         NotificationConfiguration config = bucket.getNotificationConfiguration();
