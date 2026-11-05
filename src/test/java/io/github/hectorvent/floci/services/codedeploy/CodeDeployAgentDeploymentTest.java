@@ -3,12 +3,14 @@ package io.github.hectorvent.floci.services.codedeploy;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.codedeploy.model.Deployment;
 import io.github.hectorvent.floci.services.codedeploy.model.DeploymentGroup;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -17,11 +19,14 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -29,7 +34,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -48,6 +57,7 @@ class CodeDeployAgentDeploymentTest {
     private CodeDeployAgentDeployment runner;
     private DeploymentGroup group;
     private AutoScalingService autoScaling;
+    private CodeDeployClassicTraffic traffic;
     private final List<Running> runs = new ArrayList<>();
 
     @BeforeEach
@@ -56,6 +66,8 @@ class CodeDeployAgentDeploymentTest {
         when(signer.sign(anyString())).thenAnswer(call -> call.getArgument(0));
         commands = new CodeDeployAgentCommands(new ObjectMapper(), signer, Duration.ZERO, Duration.ZERO);
         autoScaling = mock(AutoScalingService.class);
+        traffic = new CodeDeployClassicTraffic(mock(ElbClassicService.class),
+                mock(ServiceRoleCallAuthorizer.class), new ObjectMapper());
         runner = runner(Duration.ofSeconds(5), Duration.ofSeconds(5));
         group = new DeploymentGroup();
         group.setDeploymentGroupId("group-id");
@@ -90,7 +102,7 @@ class CodeDeployAgentDeploymentTest {
     }
 
     @Test
-    void rejectedTrafficControlAndUnknownPoliciesCannotStartAnAgentDeployment() {
+    void incompleteTrafficControlAndUnknownPoliciesCannotStartAnAgentDeployment() {
         assertThrows(AwsException.class, () -> prepare("CodeDeployDefault.HalfAtATime"));
         group.setDeploymentStyle(Map.of("deploymentType", "IN_PLACE", "deploymentOption", "WITH_TRAFFIC_CONTROL"));
         assertThrows(AwsException.class, () -> prepare(null));
@@ -134,6 +146,105 @@ class CodeDeployAgentDeploymentTest {
         assertEquals("Succeeded", run.deployment().getStatus());
         assertEquals(PHASES, events(run, FIRST).stream().map(event -> event.get("lifecycleEventName")).toList());
         assertTrue(events(run, FIRST).stream().allMatch(event -> "Succeeded".equals(event.get("status"))));
+    }
+
+    @Test
+    void serviceTrafficPhasesWaitForDrainAndHealthBetweenStockAgentHooks() throws Exception {
+        useTraffic();
+        CompletableFuture<Void> drained = new CompletableFuture<>();
+        CompletableFuture<Void> healthy = new CompletableFuture<>();
+        CountDownLatch drainStarted = new CountDownLatch(1);
+        CountDownLatch healthStarted = new CountDownLatch(1);
+        doAnswer(call -> {
+            boolean allow = call.getArgument(2);
+            (allow ? healthStarted : drainStarted).countDown();
+            (allow ? healthy : drained).get(5, TimeUnit.SECONDS);
+            return null;
+        }).when(traffic).change(any(), eq(FIRST), anyBoolean(), any(), any());
+        Running run = start(prepare(null));
+        try {
+            complete(FIRST, "BeforeBlockTraffic", "Succeeded", "{}");
+            assertTrue(drainStarted.await(5, TimeUnit.SECONDS));
+            assertEquals("BlockTraffic", events(run, FIRST).getLast().get("lifecycleEventName"));
+            assertEquals("InProgress", events(run, FIRST).getLast().get("status"));
+            assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
+            drained.complete(null);
+            complete(FIRST, "AfterBlockTraffic", "Succeeded", "{}");
+            for (String phase : PHASES) {
+                complete(FIRST, phase, "Succeeded", "{}");
+            }
+            complete(FIRST, "BeforeAllowTraffic", "Succeeded", "{}");
+            assertTrue(healthStarted.await(5, TimeUnit.SECONDS));
+            assertEquals("AllowTraffic", events(run, FIRST).getLast().get("lifecycleEventName"));
+            assertFalse(run.finished().isDone());
+            assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
+            healthy.complete(null);
+            complete(FIRST, "AfterAllowTraffic", "Succeeded", "{}");
+            done(run);
+            assertEquals("Succeeded", run.deployment().getStatus());
+            assertEquals(13, events(run, FIRST).size());
+            assertTrue(events(run, FIRST).stream().allMatch(event -> "Succeeded".equals(event.get("status"))));
+        } finally {
+            drained.complete(null);
+            healthy.complete(null);
+        }
+    }
+
+    @Test
+    void stopDuringServiceTrafficWaitSkipsTheRemainingAgentHooks() throws Exception {
+        useTraffic();
+        CountDownLatch draining = new CountDownLatch(1);
+        doAnswer(call -> {
+            draining.countDown();
+            BooleanSupplier cancelled = call.getArgument(4);
+            await().atMost(Duration.ofSeconds(5)).until(cancelled::getAsBoolean);
+            throw new CancellationException("Stopped during drain");
+        }).when(traffic).change(any(), eq(FIRST), eq(false), any(), any());
+        Running run = start(prepare(null));
+        complete(FIRST, "BeforeBlockTraffic", "Succeeded", "{}");
+        assertTrue(draining.await(5, TimeUnit.SECONDS));
+        run.stop().set(true);
+        done(run);
+        assertEquals("Stopped", run.deployment().getStatus());
+        assertEquals("Skipped", events(run, FIRST).getLast().get("status"));
+        assertEquals(2, events(run, FIRST).size());
+        assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
+    }
+
+    @Test
+    void allAtOncePermissionFailureReleasesAnotherHostsTrafficWait() throws Exception {
+        useTraffic();
+        members(FIRST, SECOND);
+        CountDownLatch firstWaiting = new CountDownLatch(1);
+        doAnswer(call -> {
+            String instance = call.getArgument(1);
+            if (FIRST.equals(instance)) {
+                firstWaiting.countDown();
+                BooleanSupplier cancelled = call.getArgument(4);
+                await().atMost(Duration.ofSeconds(5)).until(cancelled::getAsBoolean);
+                throw new CancellationException("Coordinator closed");
+            }
+            assertTrue(firstWaiting.await(5, TimeUnit.SECONDS));
+            throw new AwsException("IAM_ROLE_PERMISSIONS", "Service role denied traffic change", 403);
+        }).when(traffic).change(any(), anyString(), eq(false), any(), any());
+        Running run = start(prepare("CodeDeployDefault.AllAtOnce"));
+        complete(FIRST, "BeforeBlockTraffic", "Succeeded", "{}");
+        complete(SECOND, "BeforeBlockTraffic", "Succeeded", "{}");
+        done(run);
+        assertEquals("Failed", run.deployment().getStatus());
+        assertEquals("IAM_ROLE_PERMISSIONS", run.deployment().getErrorInformation().get("code"));
+        assertEquals("Skipped", events(run, FIRST).getLast().get("status"));
+        assertEquals("Failed", events(run, SECOND).getLast().get("status"));
+        assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
+        assertTrue(commands.poll(ACCOUNT, REGION, host(SECOND)).isEmpty());
+    }
+
+    private void useTraffic() {
+        traffic = mock(CodeDeployClassicTraffic.class);
+        group.setDeploymentStyle(Map.of("deploymentType", "IN_PLACE", "deploymentOption", "WITH_TRAFFIC_CONTROL"));
+        when(traffic.prepare(ACCOUNT, REGION, group)).thenReturn(new CodeDeployClassicTraffic.Plan(
+                ACCOUNT, REGION, "arn:aws:iam::123456789012:role/deploy", List.of("frontend")));
+        runner = runner(Duration.ofSeconds(5), Duration.ofSeconds(5));
     }
 
     @Test
@@ -220,7 +331,7 @@ class CodeDeployAgentDeploymentTest {
 
     private CodeDeployAgentDeployment runner(Duration start, Duration complete) {
         return new CodeDeployAgentDeployment(commands, autoScaling, mock(Ec2Service.class),
-                new RegionResolver(REGION, ACCOUNT), new ObjectMapper(), start, complete);
+                new RegionResolver(REGION, ACCOUNT), new ObjectMapper(), traffic, start, complete);
     }
 
     private CodeDeployAgentDeployment.Prepared prepare(String config) {

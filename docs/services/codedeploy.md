@@ -96,6 +96,12 @@ existing Auto Scaling members and EC2 tags, schedules the lifecycle commands,
 and records the agent's results. `DownloadBundle` and `Install` require actual
 agent completion. The existing inline-AppSpec path uses SSM for script hooks.
 
+An in-place group can specify `WITH_TRAFFIC_CONTROL` and Classic load balancers.
+Floci waits for connections to drain before installation and for healthy
+registration before the agent's final traffic hook. These operations use the
+deployment group's service-role permissions and owning account. Target-group
+traffic control and automatic rollback for S3 Server revisions remain unsupported.
+
 The host-agent APIs use the independent `codedeploy-commands` and
 `codedeploy-commands-secure` IAM namespaces. See the
 [agent runtime contract](../design/codedeploy-agent-runtime.md) for supported

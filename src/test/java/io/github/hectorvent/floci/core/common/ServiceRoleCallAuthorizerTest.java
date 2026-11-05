@@ -102,6 +102,65 @@ class ServiceRoleCallAuthorizerTest {
                 new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator), evaluator, providers, scpInstance, clock);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "eu-west-1"})
+    void unscopedServiceCallsUseWildcardResourceAndTheRequestedRegion(String region) {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"codedeploy.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""");
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of("""
+                {"Statement":{"Effect":"Allow","Action":"elasticloadbalancing:DescribeInstanceHealth",
+                "Resource":"*","Condition":{"StringEquals":{"aws:RequestedRegion":"us-east-1"}}}}""")));
+        assertEquals("us-east-1".equals(region) ? Decision.ALLOW : Decision.DENY,
+                authorizer.authorizeUnscopedWithoutSourceContext("codedeploy", ROLE,
+                        "elasticloadbalancing:DescribeInstanceHealth", ACCOUNT, region));
+        assertTrue(sessions.isEmpty());
+        verifyNoInteractions(provider);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"scoped-grant", "explicit-deny", "boundary", "scp", "wrong-account", "wrong-partition",
+            "trust-source"})
+    void unscopedServiceCallsRetainRoleAndPolicyBoundaries(String refusal) {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"codedeploy.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""");
+        switch (refusal) {
+            case "scoped-grant" -> when(iam.resolvePrincipalContext(ROLE))
+                    .thenReturn(CallerContext.of(List.of(ALLOW.replace("\"Resource\":\"*\"",
+                            "\"Resource\":\"arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app\""))));
+            case "explicit-deny" -> when(iam.resolvePrincipalContext(ROLE))
+                    .thenReturn(CallerContext.of(List.of(ALLOW, DENY)));
+            case "boundary" -> when(iam.resolvePrincipalContext(ROLE))
+                    .thenReturn(new CallerContext(List.of(ALLOW), null, DENY));
+            case "scp" -> when(scps.effectiveScpLevels(ACCOUNT)).thenReturn(List.of(List.of(DENY)));
+            case "trust-source" -> role.setAssumeRolePolicyDocument(TRUST.replace("events.amazonaws.com",
+                    "codedeploy.amazonaws.com"));
+            default -> { }
+        }
+        assertEquals(Decision.DENY, authorizer.authorizeUnscopedWithoutSourceContext("codedeploy", ROLE,
+                "elasticloadbalancing:DescribeInstanceHealth", "wrong-account".equals(refusal) ? OTHER : ACCOUNT,
+                "wrong-partition".equals(refusal) ? "cn-north-1" : "us-east-1"));
+        assertTrue(sessions.isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"prod", "staging"})
+    void serviceRoleResourceTagConditionsUseTheActualResource(String stage) {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"codedeploy.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""");
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of("""
+                {"Statement":{"Effect":"Allow","Action":"elasticloadbalancing:RegisterInstancesWithLoadBalancer",
+                "Resource":"*","Condition":{"StringEquals":{"elasticloadbalancing:ResourceTag/Stage":"prod"}}}}""")));
+        assertEquals("prod".equals(stage) ? Decision.ALLOW : Decision.DENY,
+                authorizer.authorizeWithoutSourceContext("codedeploy", ROLE,
+                        "elasticloadbalancing:RegisterInstancesWithLoadBalancer",
+                        "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app",
+                        ACCOUNT, "aws", Map.of("elasticloadbalancing:ResourceTag/Stage", List.of(stage))));
+        assertTrue(sessions.isEmpty());
+    }
+
 
 
     @ParameterizedTest

@@ -85,6 +85,14 @@ public class ServiceRoleCallAuthorizer {
      */
     public Decision authorizeWithoutSourceContext(String service, String roleArn, String action,
                                                   String resourceArn, String ownerAccount, String ownerPartition) {
+        return authorizeWithoutSourceContext(service, roleArn, action, resourceArn,
+                ownerAccount, ownerPartition, Map.of());
+    }
+
+    /** Includes resource conditions obtained by the calling service from its stored resource. */
+    public Decision authorizeWithoutSourceContext(String service, String roleArn, String action,
+                                                  String resourceArn, String ownerAccount, String ownerPartition,
+                                                  Map<String, List<String>> resourceContext) {
         if (!config.services().iam().enforcementEnabled()) {
             return Decision.ALLOW;
         }
@@ -93,21 +101,39 @@ public class ServiceRoleCallAuthorizer {
             return Decision.DENY;
         }
         return authorizeRole(service, roleArn, action, resourceArn, ownerAccount,
-                ownerPartition, null, null);
+                ownerPartition, null, null, AwsArnUtils.parse(resourceArn).region(), resourceContext);
+    }
+
+    /** Evaluates an action whose AWS authorization model has no resource type, against {@code *}. */
+    public Decision authorizeUnscopedWithoutSourceContext(String service, String roleArn, String action,
+                                                          String ownerAccount, String region) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return Decision.ALLOW;
+        }
+        return authorizeRole(service, roleArn, action, "*", ownerAccount,
+                AwsRegions.partitionFor(region), null, null, region, Map.of());
     }
 
     private Decision authorizeRole(String service, String roleArn, String action, String resourceArn,
                                    String ownerAccount, String partition, String sourceArn, String sourceAccount) {
-        if (!AwsArnUtils.isArnFor(roleArn, "iam") || !AwsArnUtils.isArn(resourceArn)) {
+        if (!AwsArnUtils.isArn(resourceArn)) {
             return Decision.DENY;
         }
-        if (!AwsArnUtils.parse(resourceArn).partition().equals(partition)) {
+        return authorizeRole(service, roleArn, action, resourceArn, ownerAccount, partition,
+                sourceArn, sourceAccount, AwsArnUtils.parse(resourceArn).region(), Map.of());
+    }
+
+    private Decision authorizeRole(String service, String roleArn, String action, String resourceArn,
+                                    String ownerAccount, String partition, String sourceArn, String sourceAccount,
+                                    String region, Map<String, List<String>> resourceContext) {
+        if (!AwsArnUtils.isArnFor(roleArn, "iam")
+                || (!"*".equals(resourceArn) && (!AwsArnUtils.isArn(resourceArn)
+                    || !AwsArnUtils.parse(resourceArn).partition().equals(partition)))) {
             return Decision.DENY;
         }
         AwsArnUtils.Arn roleId = AwsArnUtils.parse(roleArn);
         if (!roleId.region().isEmpty() || !roleId.resource().startsWith("role/")
-                || !roleId.accountId().equals(ownerAccount) || !roleId.partition().equals(partition)
-                || !roleId.partition().equals(AwsArnUtils.parse(resourceArn).partition())) {
+                || !roleId.accountId().equals(ownerAccount) || !roleId.partition().equals(partition)) {
             return Decision.DENY;
         }
         String roleName = roleId.resource().substring(roleId.resource().lastIndexOf('/') + 1);
@@ -129,7 +155,7 @@ public class ServiceRoleCallAuthorizer {
             if (principal == null || caller == null || !role.getArn().equals(principal.principalArn())) {
                 return Decision.DENY;
             }
-            return evaluateSession(action, resourceArn, role, principal, caller, now);
+            return evaluateSession(action, resourceArn, role, principal, caller, now, region, resourceContext);
         }
     }
 
@@ -141,23 +167,26 @@ public class ServiceRoleCallAuthorizer {
     }
 
     private Decision evaluateSession(String action, String resourceArn, IamRole role,
-                                     IamService.CallerArns principal, CallerContext caller, Instant now) {
+                                      IamService.CallerArns principal, CallerContext caller, Instant now,
+                                      String region, Map<String, List<String>> resourceContext) {
         AwsArnUtils.Arn roleId = AwsArnUtils.parse(role.getArn());
-        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
-        List<ResourcePolicy> policies = ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn);
-        String owner = policies.isEmpty() ? resource.accountId() : policies.getFirst().ownerAccountId();
+        AwsArnUtils.Arn resource = "*".equals(resourceArn) ? null : AwsArnUtils.parse(resourceArn);
+        List<ResourcePolicy> policies = resource == null ? List.of()
+                : ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn);
+        String owner = resource == null ? roleId.accountId()
+                : policies.isEmpty() ? resource.accountId() : policies.getFirst().ownerAccountId();
         List<String> documents = policies.stream().map(ResourcePolicy::policyDocument)
                 .filter(document -> document != null && !document.isBlank()).toList();
         List<List<String>> scps = scpProvider.isResolvable()
                 ? scpProvider.get().effectiveScpLevels(roleId.accountId()) : null;
-        Map<String, List<String>> principalContext = new HashMap<>(
-                Map.of("aws:CurrentTime", List.of(now.toString()),
-                        "aws:EpochTime", List.of(Long.toString(now.getEpochSecond()))));
+        Map<String, List<String>> principalContext = new HashMap<>(resourceContext);
+        principalContext.put("aws:CurrentTime", List.of(now.toString()));
+        principalContext.put("aws:EpochTime", List.of(Long.toString(now.getEpochSecond())));
         principal.putPrincipalKeys(principalContext);
         Map.copyOf(role.getTags()).forEach((key, value) ->
                 principalContext.put("aws:PrincipalTag/" + key, List.of(value)));
         Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
-                principalContext, resourceArn, resource.region(), roleId.accountId(), owner);
+                principalContext, resourceArn, region, roleId.accountId(), owner);
         ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,
                 RequestPrincipal.caller(principal), action, resourceArn, context);
         ResourceAccountRelationship relationship = roleId.accountId().equals(owner)
