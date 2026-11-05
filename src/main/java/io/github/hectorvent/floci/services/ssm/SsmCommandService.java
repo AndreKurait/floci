@@ -144,6 +144,12 @@ public class SsmCommandService implements Resettable {
         return instanceStore.scan(k -> k.startsWith(prefix));
     }
 
+    void requireManagedInstance(String instanceId, String region) {
+        if (instanceStore.get(instanceKey(region, instanceId)).isEmpty()) {
+            throw new AwsException("InvalidInstanceId", "The managed instance is not registered in this account and region.", 400);
+        }
+    }
+
     // ── Public SendCommand API ──────────────────────────────────────────────
 
     public Command sendCommand(JsonNode request, String region) {
