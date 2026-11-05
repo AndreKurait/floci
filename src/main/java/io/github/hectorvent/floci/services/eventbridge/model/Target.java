@@ -44,6 +44,7 @@ public class Target {
         retryPolicy = source.retryPolicy;
         deadLetterConfig = source.deadLetterConfig;
         httpParameters = source.httpParameters;
+        appSyncParameters = source.appSyncParameters;
     }
 
     public String getId() { return id; }
