@@ -19,9 +19,9 @@
 | `DescribeParameters` | List parameters with optional filters |
 | `LabelParameterVersion` | Attach a label to a specific version |
 | `UnlabelParameterVersion` | Remove labels from a specific version |
-| `AddTagsToResource` | Tag a parameter or customer patch baseline |
-| `ListTagsForResource` | List tags on a parameter or customer patch baseline |
-| `RemoveTagsFromResource` | Remove tags from a parameter or customer patch baseline |
+| `AddTagsToResource` | Tag a parameter, custom document or customer patch baseline |
+| `ListTagsForResource` | List tags on a parameter, custom document or customer patch baseline |
+| `RemoveTagsFromResource` | Remove tags from a parameter, custom document or customer patch baseline |
 | `PutResourcePolicy` | Attach or update the resource policy of an Advanced-tier parameter |
 | `GetResourcePolicies` | List the resource policy attached to a parameter |
 | `DeleteResourcePolicy` | Remove a parameter's resource policy |
@@ -73,6 +73,22 @@ Predefined baselines retain the existing identity catalog; reading their full
 approval policies or registering an AWS-owned baseline ARN is not implemented.
 
 ### Run Command
+
+With IAM enforcement enabled, `SendCommand` checks its document ARN and every
+explicit instance target. EC2 targets use `ec2:...:instance/<id>` resources;
+hybrid managed nodes use `ssm:...:managed-instance/<id>`. The two implemented
+AWS shell documents use AWS-owned document ARNs with an empty account field.
+A document grant alone cannot authorize an instance, and an explicit deny on
+either resource prevents submission.
+
+Custom documents retain `CreateDocument.Tags` and expose their own tags through
+the document description and `ResourceType=Document` tagging APIs. Tags survive
+document updates and storage reloads. A same-named parameter has separate tags.
+The three document tagging APIs authorize the document ARN identified by `ResourceId`.
+Command authorization reads `aws:ResourceTag/<key>` from each document and
+`ssm:resourceTag/<key>` from each EC2 target. One target's tags cannot authorize
+another target in the same command. Tag-selected `Targets`, hybrid-node tag
+conditions and shared cross-account command documents remain unsupported.
 
 | Action | Description |
 |---|---|

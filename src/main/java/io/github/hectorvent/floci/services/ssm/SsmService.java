@@ -1341,6 +1341,12 @@ public class SsmService implements ResourceProvider {
     }
 
     public synchronized SsmDocument createDocument(String name, String content, String documentType, String region) {
+        return createDocument(name, content, documentType, region, Map.of());
+    }
+
+    public synchronized SsmDocument createDocument(String name, String content, String documentType, String region,
+                                                   Map<String, String> tags) {
+        validateTagKeys(tags);
         String storageKey = regionKey(region, name);
         if (documentStore.get(storageKey).isPresent()) {
             throw new AwsException("DocumentAlreadyExists",
@@ -1348,8 +1354,41 @@ public class SsmService implements ResourceProvider {
         }
         SsmDocument document = new SsmDocument(name, content, documentType);
         document.setOwner(regionResolver.getAccountId());
+        document.setTags(tags);
         documentStore.put(storageKey, document);
         return document;
+    }
+
+    public synchronized Map<String, String> listDocumentTags(String name, String region) {
+        return documentForTags(name, region).getTags();
+    }
+
+    public synchronized void addDocumentTags(String name, Map<String, String> tags, String region) {
+        validateTagKeys(tags);
+        SsmDocument document = documentForTags(name, region);
+        Map<String, String> merged = document.getTags();
+        merged.putAll(tags);
+        document.setTags(merged);
+        documentStore.put(regionKey(region, name), document);
+    }
+
+    public synchronized void removeDocumentTags(String name, List<String> keys, String region) {
+        SsmDocument document = documentForTags(name, region);
+        Map<String, String> remaining = document.getTags();
+        keys.forEach(remaining::remove);
+        document.setTags(remaining);
+        documentStore.put(regionKey(region, name), document);
+    }
+
+    private SsmDocument documentForTags(String name, String region) {
+        return documentStore.get(regionKey(region, name))
+                .orElseThrow(() -> new AwsException("InvalidResourceId",
+                        "Document " + name + " does not exist.", 400));
+    }
+
+    /** The built-in command documents this emulator executes are owned by AWS. */
+    public static boolean isAwsCommandDocument(String name) {
+        return "AWS-RunShellScript".equals(name) || "AWS-RunPowerShellScript".equals(name);
     }
 
     public synchronized SsmDocument updateDocument(String name, String content, String region) {

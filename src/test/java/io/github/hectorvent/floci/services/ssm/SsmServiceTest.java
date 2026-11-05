@@ -857,6 +857,7 @@ class SsmServiceTest {
                   "Content":"third","DocumentVersion":3}}
                 """);
         SsmService service = serviceWithPersistentDocuments(path);
+        assertEquals(Map.of(), service.listDocumentTags("LegacyDoc", "us-east-1"));
         assertEquals(3, service.getDocument("LegacyDoc", "us-east-1").getDefaultVersion());
         service.updateDocument("LegacyDoc", "fourth", "us-east-1");
 
@@ -871,6 +872,34 @@ class SsmServiceTest {
         assertFalse(legacySelection.hasRetainedContent("1"));
         assertNull(legacySelection.getContentForVersion("1"));
         assertEquals(Map.of("3", "third", "4", "fourth"), legacySelection.getVersions());
+    }
+
+    @Test
+    void documentTagsPersistWithoutSharingMutableMaps(@TempDir Path directory) {
+        Path path = directory.resolve("tagged-documents.json");
+        SsmService service = serviceWithPersistentDocuments(path);
+        Map<String, String> supplied = new LinkedHashMap<>(Map.of("workflow", "first"));
+        SsmDocument created = service.createDocument("Doc", "first", "Command", "us-east-1", supplied);
+        supplied.put("workflow", "mutated");
+        created.getTags().clear();
+        service.listDocumentTags("Doc", "us-east-1").clear();
+        assertEquals(Map.of("workflow", "first"), service.listDocumentTags("Doc", "us-east-1"));
+        service.updateDocument("Doc", "second", "us-east-1");
+        service.addDocumentTags("Doc", Map.of("workflow", "updated", "owner", "retained"), "us-east-1");
+
+        SsmService reloaded = serviceWithPersistentDocuments(path);
+        assertEquals(Map.of("workflow", "updated", "owner", "retained"),
+                reloaded.listDocumentTags("Doc", "us-east-1"));
+        reloaded.removeDocumentTags("Doc", List.of("workflow"), "us-east-1");
+        assertEquals(Map.of("owner", "retained"),
+                serviceWithPersistentDocuments(path).listDocumentTags("Doc", "us-east-1"));
+        reloaded.createDocument("Doc", "west", "Command", "us-west-2", Map.of("owner", "west"));
+        assertEquals(Map.of("owner", "retained"), reloaded.listDocumentTags("Doc", "us-east-1"));
+        assertEquals(Map.of("owner", "west"), reloaded.listDocumentTags("Doc", "us-west-2"));
+        reloaded.deleteDocument("Doc", "us-east-1");
+        AwsException missing = assertThrows(AwsException.class,
+                () -> serviceWithPersistentDocuments(path).listDocumentTags("Doc", "us-east-1"));
+        assertEquals("InvalidResourceId", missing.getErrorCode());
     }
 
     private static SsmService serviceWithPersistentDocuments(Path path) {

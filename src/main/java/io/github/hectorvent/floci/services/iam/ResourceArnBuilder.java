@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
+import io.github.hectorvent.floci.services.ssm.SsmService;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
@@ -246,7 +247,7 @@ public class ResourceArnBuilder {
                     ? List.of(new AwsArnUtils.Arn(partition, "dynamodb", region, accountId, "table/*").toString())
                     : buildDynamoDbArns(ctx, region, accountId);
             case "kinesis"        -> List.of(buildKinesisArn(ctx, region, accountId));
-            case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
+            case "ssm"            -> buildSsmResources(operation, ctx, region, accountId, partition);
             case "iam"            -> buildIamArns(ctx, region, accountId);
             case "elasticloadbalancing" -> buildElbResources(operation, ctx, region, accountId, partition);
             case "resource-groups" -> "resource-groups:ListGroups".equals(operation)
@@ -1867,6 +1868,39 @@ public class ResourceArnBuilder {
     }
 
     // ── SSM ──────────────────────────────────────────────────────────────────────
+    private List<String> buildSsmResources(String operation, ContainerRequestContext ctx,
+                                           String region, String accountId, String partition) {
+        String action = operation == null ? IamActionRegistry.targetOperation(ctx) : operation;
+        if (action != null && action.startsWith("ssm:")) {
+            action = action.substring(4);
+        }
+        JsonNode json = readJsonBody(ctx);
+        if (json != null && "Document".equals(json.path("ResourceType").asText())
+                && ("AddTagsToResource".equals(action) || "ListTagsForResource".equals(action)
+                || "RemoveTagsFromResource".equals(action))) {
+            return List.of(new AwsArnUtils.Arn(partition, "ssm", region, accountId,
+                    "document/" + json.path("ResourceId").asText()).toString());
+        }
+        if (!"SendCommand".equals(action)) {
+            return List.of(buildSsmArn(ctx, region, accountId));
+        }
+        if (json == null) {
+            return List.of("*");
+        }
+        String name = json.path("DocumentName").asText();
+        Set<String> resources = new LinkedHashSet<>();
+        resources.add(AwsArnUtils.isArnFor(name, "ssm") ? name
+                : new AwsArnUtils.Arn(partition, "ssm", region,
+                        SsmService.isAwsCommandDocument(name) ? "" : accountId, "document/" + name).toString());
+        for (JsonNode target : json.path("InstanceIds")) {
+            String id = target.asText();
+            boolean managed = id.startsWith("mi-");
+            resources.add(new AwsArnUtils.Arn(partition, managed ? "ssm" : "ec2", region, accountId,
+                    (managed ? "managed-instance/" : "instance/") + id).toString());
+        }
+        return List.copyOf(resources);
+    }
+
     private String buildSsmArn(ContainerRequestContext ctx, String region, String accountId) {
         JsonNode json = readJsonBody(ctx);
         if (json != null && json.isObject()) {
