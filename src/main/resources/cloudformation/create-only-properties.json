@@ -815,6 +815,16 @@
   "AWS::SSM::PatchBaseline": [
     "OperatingSystem"
   ],
+  "AWS::SSM::ResourceDataSync": [
+    "KMSKeyArn",
+    "SyncFormat",
+    "BucketPrefix",
+    "SyncName",
+    "BucketRegion",
+    "BucketName",
+    "S3Destination",
+    "SyncType"
+  ],
   "AWS::StepFunctions::StateMachine": [
     "StateMachineName",
     "StateMachineType"

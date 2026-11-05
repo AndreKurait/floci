@@ -17,7 +17,8 @@
     "AWS::Events::Rule": "AWS::Events::Rule",
     "AWS::Lambda::Function": "AWS::Lambda::Function",
     "AWS::Lambda::LayerVersion": "AWS::Lambda::LayerVersion",
-    "AWS::SSM::PatchBaseline": "AWS::SSM::PatchBaseline"
+    "AWS::SSM::PatchBaseline": "AWS::SSM::PatchBaseline",
+    "AWS::SSM::ResourceDataSync": "AWS::SSM::ResourceDataSync"
   },
   "shapes": {
     "AWS::AutoScaling::LaunchConfiguration": {
@@ -2703,6 +2704,69 @@
         "Value",
         "Key"
       ]
+    },
+    "AWS::SSM::ResourceDataSync": {
+      "type": "structure",
+      "members": {
+        "S3Destination": "AWS::SSM::ResourceDataSync/S3Destination",
+        "KMSKeyArn": "String",
+        "SyncSource": "AWS::SSM::ResourceDataSync/SyncSource",
+        "BucketName": "String",
+        "BucketRegion": "String",
+        "SyncFormat": "String",
+        "SyncName": "String",
+        "SyncType": "String",
+        "BucketPrefix": "String"
+      },
+      "required": [
+        "SyncName"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync/AwsOrganizationsSource": {
+      "type": "structure",
+      "members": {
+        "OrganizationalUnits": "AWS::SSM::ResourceDataSync/AwsOrganizationsSource.OrganizationalUnits",
+        "OrganizationSourceType": "String"
+      },
+      "required": [
+        "OrganizationSourceType"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync/AwsOrganizationsSource.OrganizationalUnits": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::ResourceDataSync/S3Destination": {
+      "type": "structure",
+      "members": {
+        "KMSKeyArn": "String",
+        "BucketPrefix": "String",
+        "BucketName": "String",
+        "BucketRegion": "String",
+        "SyncFormat": "String"
+      },
+      "required": [
+        "BucketName",
+        "BucketRegion",
+        "SyncFormat"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync/SyncSource": {
+      "type": "structure",
+      "members": {
+        "IncludeFutureRegions": "Boolean",
+        "SourceRegions": "AWS::SSM::ResourceDataSync/SyncSource.SourceRegions",
+        "SourceType": "String",
+        "AwsOrganizationsSource": "AWS::SSM::ResourceDataSync/AwsOrganizationsSource"
+      },
+      "required": [
+        "SourceType",
+        "SourceRegions"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync/SyncSource.SourceRegions": {
+      "type": "list",
+      "member": "String"
     },
     "Boolean": {
       "type": "boolean"

@@ -191,6 +191,7 @@ service_labels:
 # Parenthetical shown after a type name. Keyed by the full type.
 notes:
   AWS::SSM::PatchBaseline: 'backed by SSM configuration, tags and patch-group bindings; OperatingSystem changes replace the baseline; DefaultBaseline only registers a default; does not execute patches on managed nodes'
+  AWS::SSM::ResourceDataSync: 'owns SSM inventory delivery configuration with legacy or nested S3 destinations; destination changes require replacement; checks SSM admission status; does not collect guest inventory'
   AWS::S3::BucketPolicy: document stored on the bucket; S3 does not evaluate it
   AWS::SQS::QueuePolicy: accepted; policy not enforced
   AWS::Lambda::Function: Zip via S3/inline `ZipFile`, Image, and the `hot-reload` bind-mount bucket

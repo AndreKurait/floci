@@ -142,6 +142,25 @@ The worker interval defaults to 1,000 ms and is configurable with
 Organizations data sharing and `AWSKMSKeyARN` are explicitly unsupported.
 Native agent collection and State Manager scheduling remain separate features.
 
+### CloudFormation inventory destinations
+
+`AWS::SSM::ResourceDataSync` owns a real SSM inventory sync. `Ref` returns `SyncName`;
+the AWS schema defines no `Fn::GetAtt` attributes. Both the legacy top-level S3
+destination fields and nested `S3Destination` are supported. Combining them fails
+before creating a sync.
+
+Creation reads the actual SSM status using the AWS provider's initial two-second
+callback and bounded ten-second retries. `Successful` and `InProgress` satisfy
+resource admission; `Failed` fails creation and removes the new sync. Admission
+does not establish that inventory was exported: inspect the sync status and S3
+objects for that result.
+
+Destination properties are create-only. A replacement requires a new `SyncName`,
+creates it before retiring the previous sync, and honors rollback and retention.
+Changing a destination while keeping its custom name fails without modifying the
+old sync. Stack deletion stops future exports and preserves existing S3 objects.
+Explorer `SyncSource` and KMS-encrypted delivery remain unsupported.
+
 ### ec2messages Agent Protocol
 
 | Action | Description |
