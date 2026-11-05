@@ -14,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import static io.github.hectorvent.floci.testing.CfnStackWaits.awaitTerminal;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
@@ -1371,7 +1372,9 @@ class CloudFormationDeletionPolicyIntegrationTest {
             .extract().asString();
 
         int start = xml.indexOf("<StackId>") + "<StackId>".length();
-        return xml.substring(start, xml.indexOf("</StackId>", start));
+        String stackId = xml.substring(start, xml.indexOf("</StackId>", start));
+        awaitTerminal(stackId, auth);
+        return stackId;
     }
 
     private static void deleteStack(String stackName) {
