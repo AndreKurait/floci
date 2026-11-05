@@ -1,5 +1,5 @@
-"""Tests for request_shapes, the generator behind regen_dynamodb_shapes, regen_sesv2_shapes and regen_ecs_shapes,
-and of the constraints regen_resource_groups_shapes and regen_ecr_shapes vendor.
+"""Tests for request_shapes, the generator behind regen_dynamodb_shapes, regen_sesv2_shapes, regen_ecs_shapes and
+regen_emr_serverless_shapes, and of the constraints regen_resource_groups_shapes and regen_ecr_shapes vendor.
 
 Run with: pytest tools/aws -q  (or: make aws-data-test)
 """
@@ -14,6 +14,7 @@ import pytest
 import regen_dynamodb_shapes
 import regen_ecr_shapes
 import regen_ecs_shapes
+import regen_emr_serverless_shapes
 import regen_sesv2_shapes
 import request_shapes as r
 
@@ -104,6 +105,29 @@ def test_drops_uri_and_query_members():
     assert doc["shapes"]["GetEmailIdentityRequest"] == {"type": "structure", "members": {}}
     assert "Identity" not in doc["shapes"]
     assert "NextToken" not in doc["shapes"]
+
+
+def test_keeps_output_shapes_when_asked():
+    doc = r.build(SESV2_MODEL, "botocore test", "tools/aws/regen_emr_serverless_shapes.py", outputs=True)
+
+    assert doc["operations"] == {"GetEmailIdentity": "GetEmailIdentityRequest", "SendEmail": "SendEmailRequest"}
+    assert doc["shapes"]["SendEmailResponse"] == {"type": "structure", "members": {"MessageId": "OutboundMessageId"}}
+    assert doc["shapes"]["OutboundMessageId"] == {"type": "string"}
+    assert doc["shapes"]["GetEmailIdentityRequest"] == {"type": "structure", "members": {}}
+
+
+def test_emr_serverless_shapes_keep_the_output_shapes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(r, "main", lambda argv, **kwargs: calls.append((argv, kwargs)) or 0)
+
+    assert regen_emr_serverless_shapes.main(["--check"]) == 0
+    assert calls == [(["--check"], {
+        "script": regen_emr_serverless_shapes.__file__,
+        "model": Path("emr-serverless/2021-07-13"),
+        "output": r.REPO_ROOT / "src/main/resources/aws/emr-serverless-shapes.json",
+        "description": regen_emr_serverless_shapes.__doc__,
+        "outputs": True,
+    })]
 
 
 def _main(output: Path) -> int:

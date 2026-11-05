@@ -58,6 +58,48 @@ A statement run against a workgroup reports `WorkgroupName` and omits `ClusterId
 - **`ExecuteSql` and `BatchExecuteSql`** (the deprecated pre-2020 operations) return `ValidationException`.
 - **Type mapping.** JDBC `BOOLEAN` and `BIT` map to `booleanValue`; integer types to `longValue`; floating-point types to `doubleValue`; `NUMERIC` and `DECIMAL` to `stringValue` (as AWS does); binary types to `blobValue`; everything else, including dates, timestamps, and uuid, to `stringValue`. A SQL `NULL` maps to `isNull`. A result column of type `line`, `json`, or `jsonb` fails the statement with the Redshift error text.
 
+## Client token retries
+
+`ExecuteStatement` and `BatchExecuteStatement` accept an optional `ClientToken`, a case-sensitive
+string of 1 to 64 characters. Repeating an admitted request with the same token returns the
+original statement `Id` and `CreatedAt` without running SQL or publishing its terminal event
+again. This applies while the statement is queued or running and after it finishes, fails or is
+cancelled. Omit the token, or use a new one, to submit independent work. AWS SDKs normally generate
+the token automatically and keep it for their retries.
+
+Tokens expire 8 hours after first admission. Retries do not extend this deadline. Validation,
+reported storage errors and queue-admission failures do not consume the token. An SQL execution failure after
+admission does consume it. `WaitTimeSeconds` on a retry can wait for the original execution without
+submitting another one.
+
+Request validation and database-target resolution run before admission coordination. Only requests
+sharing an account, region, execute operation and token share an admission lock; tokenless requests
+use no token lock. The executor reserves queue capacity before writing admission state, so a full
+queue cannot create a receipt that reappears after restart. Workers run SQL only after admission
+writes succeed. Reset still signals cancellation if clearing either storage backend reports an
+error. Expired receipts are removed in one atomic batch per sweep, with concurrently replaced
+receipts retained.
+
+Receipts use the configured storage mode. Persistent, hybrid and WAL modes retain them across a
+normal restart; memory mode loses them. Interrupted statements keep the existing recovery behavior:
+they become `FAILED`, and SQL is never replayed automatically. This does not provide a distributed
+transaction between PostgreSQL and Floci storage or an exactly-once guarantee after a host crash.
+Persistent and WAL modes use atomic admission writes that report write failures before enqueueing
+SQL. Hybrid mode retains its write-behind behavior: disk flush failures are logged while the live
+in-memory state remains available.
+The token deadline is independent of result retention: if a configured result TTL shorter than
+8 hours removes the statement, its receipt still returns the original admission response until
+the token expires, without restoring results.
+
+Floci scopes tokens by account, region and execute operation. It validates the request and resolves
+the database target before looking up a receipt, including on retries. Within that scope, reusing
+a token with changed SQL, parameters or event settings replays the original operation; it does not
+change that operation. The precise AWS behavior for changed payloads, different IAM principals,
+cross-operation reuse and responses after result eviction has not been verified against a live
+AWS cluster. These are explicit Floci policies. See the
+[AWS Data API guide](https://docs.aws.amazon.com/redshift/latest/mgmt/data-api.html) for the documented
+8-hour token window and SDK retry behavior.
+
 ## Statement status events
 
 [Redshift Data API status events](https://docs.aws.amazon.com/redshift/latest/mgmt/data-api-monitoring-events.html)

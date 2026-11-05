@@ -71,6 +71,15 @@ public class RedshiftProxyManager {
                                         String backendHost, int backendPort, String advertisedHost,
                                         String masterUsername, String masterPassword, String dbName,
                                         PasswordValidator passwordValidator, List<String> iamRoleArns) {
+        startProxy(relayKey, proxyPort, backendHost, backendPort, advertisedHost, masterUsername,
+                masterPassword, dbName, passwordValidator, iamRoleArns, null);
+    }
+
+    public synchronized void startProxy(String relayKey, int proxyPort,
+                                        String backendHost, int backendPort, String advertisedHost,
+                                        String masterUsername, String masterPassword, String dbName,
+                                        PasswordValidator passwordValidator, List<String> iamRoleArns,
+                                        String defaultIamRoleArn) {
         // A prior unclosable entry for this key is left in place: its listener may still
         // be bound, and only a successful stop (never a fresh start) may drop it.
         // Make sure the self-signed proxy certificate covers the host clients will connect to,
@@ -86,6 +95,7 @@ public class RedshiftProxyManager {
                 iamRoleArns,
                 redshiftConfig.proxyHandshakeTimeoutMillis(), redshiftConfig.proxyBackendConnectTimeoutMillis(),
                 redshiftConfig.proxyMaxConnections(), spectrumInterceptor);
+        proxy.updateIamRoles(iamRoleArns, defaultIamRoleArn);
         try {
             proxy.start(proxyPort);
         } catch (IOException | RuntimeException e) {
@@ -121,6 +131,13 @@ public class RedshiftProxyManager {
         if (proxy != null) {
             proxy.updateIamRoles(iamRoleArns);
             LOG.infov("Updated Redshift proxy IAM roles for cluster {0}", relayKey);
+        }
+    }
+
+    public synchronized void updateIamRoles(String relayKey, List<String> iamRoleArns, String defaultIamRoleArn) {
+        RedshiftAuthProxy proxy = proxies.get(relayKey);
+        if (proxy != null) {
+            proxy.updateIamRoles(iamRoleArns, defaultIamRoleArn);
         }
     }
 

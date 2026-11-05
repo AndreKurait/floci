@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambdaweb;
 
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
@@ -45,12 +46,16 @@ class LambdaWebIntegrationTest {
     @Inject
     S3Service s3Service;
 
+    @Inject
+    IamService iamService;
+
     private static String revision1;
     private static String revision2;
     private static String domainName;
 
     @BeforeAll
     void seedCode() {
+        LambdaWebRoles.trustLambda(iamService, ROLE);
         s3Service.createBucket(BUCKET, "us-east-1");
         s3Service.putObject(BUCKET, KEY, LambdaWebZips.indexJs(""), "application/zip", Map.of());
     }
@@ -393,6 +398,27 @@ class LambdaWebIntegrationTest {
                 .then().statusCode(400)
                 .body("message", equalTo("The environmentVariables cannot contain reserved keys."
                         + " The request specified the reserved keys [AWS_REGION]."));
+
+        given().contentType("application/json")
+                .body("""
+                        {"buildConfig": %s, "serviceConfig": {"executionRoleArn": "%s"}}
+                        """.formatted(BUILD, "arn:aws:iam::000000000000:role/web-it-missing"))
+                .when().post(revisions)
+                .then().statusCode(400)
+                .header("X-Amzn-Errortype", "ValidationException")
+                .body("message", equalTo("The execution role arn:aws:iam::000000000000:role/web-it-missing cannot be"
+                        + " assumed by lambda.amazonaws.com. Verify its trust policy. If the role was just created,"
+                        + " retry in a few seconds."));
+
+        given().contentType("application/json")
+                .body("""
+                        {"buildConfig": %s, "serviceConfig": {"executionRoleArn": "%s"}}
+                        """.formatted(BUILD, ROLE.replace("000000000000", "111122223333")))
+                .when().post(revisions)
+                .then().statusCode(403)
+                .header("X-Amzn-Errortype", "AccessDeniedException")
+                .body("Message", equalTo("Cross-account pass role is not allowed."))
+                .body("message", nullValue());
 
         given().contentType("application/json")
                 .body("""

@@ -21,6 +21,7 @@ public class Cluster {
     private String clusterParameterGroupName;
     private List<String> vpcSecurityGroupIds = new ArrayList<>();
     private List<String> iamRoleArns = new ArrayList<>();
+    private String defaultIamRoleArn;
 
     public String getClusterIdentifier() { return clusterIdentifier; }
     public void setClusterIdentifier(String clusterIdentifier) { this.clusterIdentifier = clusterIdentifier; }
@@ -46,6 +47,8 @@ public class Cluster {
     public void setVpcSecurityGroupIds(List<String> vpcSecurityGroupIds) { this.vpcSecurityGroupIds = vpcSecurityGroupIds; }
     public List<String> getIamRoleArns() { return iamRoleArns; }
     public void setIamRoleArns(List<String> iamRoleArns) { this.iamRoleArns = iamRoleArns; }
+    public String getDefaultIamRoleArn() { return defaultIamRoleArn; }
+    public void setDefaultIamRoleArn(String defaultIamRoleArn) { this.defaultIamRoleArn = defaultIamRoleArn; }
 
     // Audit logging config as set by EnableLogging; no log delivery is emulated.
     private boolean loggingEnabled = false;

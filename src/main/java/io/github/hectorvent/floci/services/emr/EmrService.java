@@ -45,6 +45,9 @@ public class EmrService {
 
     private static final String UPPER_ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final SecureRandom RANDOM = new SecureRandom();
+    // AWS's answer to a change on a terminated cluster, for AddJobFlowSteps and ModifyInstanceFleet.
+    private static final String JOB_FLOW_SHUT_DOWN =
+            "A job flow that is shutting down, terminated, or finished may not be modified.";
 
     private final StorageBackend<String, EmrCluster> clusterStore;
     private final StorageBackend<String, SecurityConfiguration> secConfigStore;
@@ -81,9 +84,7 @@ public class EmrService {
         // Only a missing Name fails AWS's framework validation: the member is REQUIRED but its
         // constraint is len=[0..256], so an explicit empty string is accepted by real EMR.
         if (cluster.getName() == null) {
-            throw SmithyValidationErrors.validationException(
-                    "Value null at 'name' failed to satisfy constraint: "
-                            + "Member must not be null");
+            throw SmithyValidationErrors.validationException(SmithyValidationErrors.notNull("name"));
         }
         String id = "j-" + randomId(13);
         cluster.setId(id);
@@ -212,10 +213,12 @@ public class EmrService {
     // ──────────────────────────── Steps ────────────────────────────
 
     public synchronized List<String> addJobFlowSteps(String clusterId, List<EmrStep> steps) {
-        EmrCluster cluster = requireCluster(clusterId);
+        // AWS's own wording for an unknown job flow here, not DescribeCluster's: a botocore ClientError
+        // (raster-foundry/raster-foundry#352) and a CloudTrail record on AWS re:Post both show it.
+        EmrCluster cluster = clusterId == null ? requireCluster(null) : findCluster(clusterId).orElseThrow(
+                () -> new AwsException("ValidationException", "Specified job flow ID does not exist.", 400));
         if ("TERMINATED".equals(cluster.getState())) {
-            throw new AwsException("ValidationException",
-                    "A job flow that is shutting down, terminated, or finished may not be modified.", 400);
+            throw new AwsException("ValidationException", JOB_FLOW_SHUT_DOWN, 400);
         }
         List<String> ids = new ArrayList<>();
         for (EmrStep step : steps) {
@@ -315,7 +318,12 @@ public class EmrService {
         List<EmrInstanceGroup> groups = new ArrayList<>();
         for (InstanceGroupModification mod : modifications) {
             EmrCluster found = clusterId != null ? requireCluster(clusterId) : clusterOwning(region, mod.instanceGroupId());
-            rejectTerminatedCluster(found);
+            // AWS's answer here, recorded by Terraform users
+            // (hashicorp/terraform-provider-aws#1355 and #9400).
+            if ("TERMINATED".equals(found.getState())) {
+                throw new AwsException("ValidationException",
+                        "An instance group may only be modified when the cluster is running or waiting.", 400);
+            }
             // One copy per cluster, so two groups of the same cluster are changed and stored together.
             EmrCluster cluster = touched.computeIfAbsent(found.getId(), id -> found);
             EmrInstanceGroup group = requireInstanceGroup(cluster, mod.instanceGroupId());
@@ -368,7 +376,12 @@ public class EmrService {
         if (instanceFleetId == null) {
             throw invalid("InstanceFleetId is required.");
         }
-        rejectTerminatedCluster(cluster);
+        // AWS's answer for a cluster terminated a while before, ErrorCode member included
+        // (hashicorp/terraform-provider-aws#31375, 2023).
+        if ("TERMINATED".equals(cluster.getState())) {
+            throw new AwsException("InvalidRequestException", JOB_FLOW_SHUT_DOWN, 400,
+                    Map.of("ErrorCode", "INVALID_JOB_SHUT_DOWN"));
+        }
         EmrInstanceFleet fleet = cluster.getInstanceFleets().stream()
                 .filter(f -> instanceFleetId.equals(f.getId()))
                 .findFirst()

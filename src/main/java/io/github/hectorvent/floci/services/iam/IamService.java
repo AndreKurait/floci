@@ -2390,6 +2390,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // Centralized root access management (org-scoped, IAM Query endpoint)
     // =========================================================================
 
+    // The toggles themselves. Who may read or move them, and which organization's record they
+    // belong to, is CentralRootAccess: it is the caller of all five and the only one that should
+    // be, these having no caller check of their own.
+
     /** Currently-enabled centralized root features, in enablement order. Empty for a fresh org. */
     public List<String> listOrganizationsFeatures() {
         return new ArrayList<>(currentRootFeatures().getEnabledFeatures());
@@ -5337,6 +5341,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 }
                 return sessionTokenContext(session);
             }
+            if (isAccountRootArn(session.getRoleArn())) {
+                // A privileged session (AssumeRoot) acts as the member account's root user, which
+                // no identity policy grants and none denies: collecting role policies for a root
+                // ARN finds none, which would refuse everything. What scopes it is its task
+                // policy, and the five AWS publishes for the purpose carry Deny statements only,
+                // so it is read beside the root's own allow-all rather than as a session policy,
+                // where an intersection with nothing to allow would refuse everything too.
+                return new CallerContext(session.getSessionPolicyDocument() == null
+                        ? List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY)
+                        : List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY, session.getSessionPolicyDocument()),
+                        null, null);
+            }
             List<String> identityPolicies = collectRolePolicies(session.getRoleArn());
             String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
             return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc);
@@ -5605,6 +5621,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                             null));
                 }
                 return issuingUser(session).map(IamService::callerForUser);
+            }
+            if (isAccountRootArn(roleArn)) {
+                // A privileged session (AssumeRoot) is the member account's root user, not an
+                // assumed role: the ARN it reports is the root ARN it was minted for, and its
+                // aws:userid is the account id, as the account root's always is.
+                return Optional.of(new CallerArns(roleArn, roleArn, CallerArns.TYPE_ACCOUNT,
+                        AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId()), null));
             }
             String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
             String accountId = AwsArnUtils.accountOrDefault(roleArn, regionResolver.getAccountId());

@@ -13,6 +13,7 @@ import software.amazon.awssdk.services.redshift.RedshiftClient;
 import software.amazon.awssdk.services.redshift.model.CreateClusterRequest;
 import software.amazon.awssdk.services.redshift.model.DeleteClusterRequest;
 import software.amazon.awssdk.services.redshiftdata.RedshiftDataClient;
+import software.amazon.awssdk.services.redshiftdata.model.BatchExecuteStatementRequest;
 import software.amazon.awssdk.services.redshiftdata.model.DescribeStatementRequest;
 import software.amazon.awssdk.services.redshiftdata.model.DescribeStatementResponse;
 import software.amazon.awssdk.services.redshiftdata.model.ExecuteStatementRequest;
@@ -60,7 +61,8 @@ class RedshiftDataOperationsTest {
     static void cleanup() {
         if (redshift != null && clusterId != null) {
             try {
-                redshift.deleteCluster(DeleteClusterRequest.builder().clusterIdentifier(clusterId).build());
+                redshift.deleteCluster(DeleteClusterRequest.builder().clusterIdentifier(clusterId)
+                        .skipFinalClusterSnapshot(true).build());
             } catch (Exception e) {
                 LOG.warnf(e, "Failed to clean up Redshift cluster %s", clusterId);
             }
@@ -71,6 +73,37 @@ class RedshiftDataOperationsTest {
         if (redshift != null) {
             redshift.close();
         }
+    }
+
+    @Test
+    @DisplayName("explicit client token retries an INSERT without inserting twice")
+    void executeStatementClientTokenRetry() throws Exception {
+        run("CREATE TABLE compat_idempotent_single (id int)");
+        ExecuteStatementRequest request = ExecuteStatementRequest.builder()
+                .clusterIdentifier(clusterId).database(DATABASE).dbUser(USERNAME)
+                .clientToken(TestFixtures.uniqueName("single-token"))
+                .sql("INSERT INTO compat_idempotent_single VALUES (1)").build();
+        String first = data.executeStatement(request).id();
+        awaitFinished(first);
+        assertThat(data.executeStatement(request).id()).isEqualTo(first);
+        String count = run("SELECT COUNT(*) FROM compat_idempotent_single");
+        assertThat(data.getStatementResult(r -> r.id(count)).records().get(0).get(0).longValue()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("explicit client token retries a batch without repeating its mutations")
+    void batchExecuteStatementClientTokenRetry() throws Exception {
+        run("CREATE TABLE compat_idempotent_batch (id int)");
+        BatchExecuteStatementRequest request = BatchExecuteStatementRequest.builder()
+                .clusterIdentifier(clusterId).database(DATABASE).dbUser(USERNAME)
+                .clientToken(TestFixtures.uniqueName("batch-token"))
+                .sqls("INSERT INTO compat_idempotent_batch VALUES (1)",
+                        "INSERT INTO compat_idempotent_batch VALUES (2)").build();
+        String first = data.batchExecuteStatement(request).id();
+        awaitFinished(first);
+        assertThat(data.batchExecuteStatement(request).id()).isEqualTo(first);
+        String count = run("SELECT COUNT(*) FROM compat_idempotent_batch");
+        assertThat(data.getStatementResult(r -> r.id(count)).records().get(0).get(0).longValue()).isEqualTo(2L);
     }
 
     @Test

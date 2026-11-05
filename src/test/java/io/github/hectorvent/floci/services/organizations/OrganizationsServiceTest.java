@@ -12,6 +12,8 @@ import io.github.hectorvent.floci.services.organizations.model.OrganizationPolic
 import io.github.hectorvent.floci.services.organizations.model.OrganizationalUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -75,6 +77,44 @@ class OrganizationsServiceTest {
                 service.createAccount(MANAGEMENT_ACCOUNT, "dev@example.com", "Dev", null, false);
         assertTrue(status.getId().matches("car-[a-z0-9]{8}"), status.getId());
         assertTrue(status.getAccountId().matches("\\d{12}"), status.getAccountId());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"INSPECTOR_POLICY", "UPGRADE_ROLLOUT_POLICY", "BEDROCK_POLICY",
+            "S3_POLICY", "NETWORK_SECURITY_DIRECTOR_POLICY", "GUARDDUTY_POLICY"})
+    void managementPolicyTypesSupportTheExistingLifecycle(String type) {
+        Organization organization = service.createOrganization(MANAGEMENT_ACCOUNT, "ALL");
+        String rootId = organization.getRoot().getId();
+        AwsException disabled = assertThrows(AwsException.class, () -> service.createPolicy(
+                MANAGEMENT_ACCOUNT, "{}", "description", "Policy", type, null));
+        assertEquals("PolicyTypeNotEnabledException", disabled.getErrorCode());
+
+        service.enablePolicyType(MANAGEMENT_ACCOUNT, rootId, type);
+        OrganizationPolicy policy = service.createPolicy(MANAGEMENT_ACCOUNT, "{}", "description", "Policy", type, null);
+        assertEquals(type, policy.getType());
+        assertEquals(List.of(policy), service.listPolicies(MANAGEMENT_ACCOUNT, type));
+        service.attachPolicy(MANAGEMENT_ACCOUNT, policy.getId(), rootId);
+        assertEquals(List.of(policy), service.listPoliciesForTarget(MANAGEMENT_ACCOUNT, rootId, type));
+        OrganizationsService.EffectivePolicy effective = service.describeEffectivePolicy(
+                MANAGEMENT_ACCOUNT, type, MANAGEMENT_ACCOUNT);
+        assertEquals(type, effective.policyType());
+        assertEquals("{}", effective.policyContent());
+        assertEquals(MANAGEMENT_ACCOUNT, effective.targetId());
+        assertTrue(service.listAccountsWithInvalidEffectivePolicy(MANAGEMENT_ACCOUNT, type).isEmpty());
+        service.detachPolicy(MANAGEMENT_ACCOUNT, policy.getId(), rootId);
+        assertTrue(service.listPoliciesForTarget(MANAGEMENT_ACCOUNT, rootId, type).isEmpty());
+        service.deletePolicy(MANAGEMENT_ACCOUNT, policy.getId());
+        assertTrue(service.listPolicies(MANAGEMENT_ACCOUNT, type).isEmpty());
+        service.disablePolicyType(MANAGEMENT_ACCOUNT, rootId, type);
+        assertTrue(organization.getRoot().getPolicyTypes().stream().noneMatch(entry -> type.equals(entry.getType())));
+    }
+
+    @Test
+    void guardDutyWithNoAttachedPolicyReportsTheMissingEffectivePolicy() {
+        service.createOrganization(MANAGEMENT_ACCOUNT, "ALL");
+        AwsException missing = assertThrows(AwsException.class, () -> service.describeEffectivePolicy(
+                MANAGEMENT_ACCOUNT, "GUARDDUTY_POLICY", MANAGEMENT_ACCOUNT));
+        assertEquals("EffectivePolicyNotFoundException", missing.getErrorCode());
     }
 
     @Test

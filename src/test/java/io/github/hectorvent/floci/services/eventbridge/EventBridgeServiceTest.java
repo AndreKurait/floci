@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.eventbridge.model.Rule;
 import io.github.hectorvent.floci.services.eventbridge.model.RuleState;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
+import io.github.hectorvent.floci.testing.PartitionMatrix;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -113,6 +114,67 @@ class EventBridgeServiceTest {
         service.createEventBus("my-bus", null, null, REGION);
         assertThrows(AwsException.class, () ->
                 service.createEventBus("my-bus", null, null, REGION));
+    }
+
+    @Test
+    void tagResourceRejectsArnFromAnotherAccount() {
+        EventBus bus = service.createEventBus("owned-bus", null, null, REGION);
+        String foreignAccountArn = bus.getArn().replace(":000000000000:", ":111111111111:");
+
+        AwsException error = assertThrows(AwsException.class, () ->
+                service.tagResource(foreignAccountArn, Map.of("env", "test"), REGION));
+
+        assertEquals("ResourceNotFoundException", error.getErrorCode());
+        assertTrue(service.listTagsForResource(bus.getArn(), REGION).isEmpty());
+    }
+
+    @Test
+    void tagResourceRejectsArnFromAnotherRegion() {
+        EventBus bus = service.createEventBus("owned-bus", null, null, REGION);
+        String foreignRegionArn = bus.getArn().replace(":us-east-1:", ":eu-west-1:");
+
+        AwsException error = assertThrows(AwsException.class, () ->
+                service.tagResource(foreignRegionArn, Map.of("env", "test"), REGION));
+
+        assertEquals("ResourceNotFoundException", error.getErrorCode());
+        assertTrue(service.listTagsForResource(bus.getArn(), REGION).isEmpty());
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void tagResourceAcceptsResourceArnFromRequestedPartition(PartitionMatrix.PartitionCase partitionCase) {
+        String region = partitionCase.region();
+        EventBus bus = service.createEventBus("partition-bus", null, null, region);
+
+        service.tagResource(bus.getArn(), Map.of("env", "test"), region);
+
+        assertEquals(Map.of("env", "test"), service.listTagsForResource(bus.getArn(), region));
+        PartitionMatrix.assertArnIn(partitionCase, bus.getArn());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "event-bus/missing", "event-bus/", "rule/missing", "archive/missing", "replay/missing"
+    })
+    void listTagsForResourceRejectsMissingOrUnsupportedResources(String resource) {
+        String arn = "arn:aws:events:us-east-1:000000000000:" + resource;
+
+        AwsException error = assertThrows(AwsException.class, () ->
+                service.listTagsForResource(arn, REGION));
+
+        assertEquals("ResourceNotFoundException", error.getErrorCode());
+    }
+
+    @Test
+    void listTagsForResourceRejectsArnFromAnotherAccount() {
+        EventBus bus = service.createEventBus("owned-bus", null, null, REGION);
+        service.tagResource(bus.getArn(), Map.of("env", "test"), REGION);
+        String foreignAccountArn = bus.getArn().replace(":000000000000:", ":111111111111:");
+
+        AwsException error = assertThrows(AwsException.class, () ->
+                service.listTagsForResource(foreignAccountArn, REGION));
+
+        assertEquals("ResourceNotFoundException", error.getErrorCode());
     }
 
     @Test

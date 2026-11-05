@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.emrserverless.model.Application;
 import io.github.hectorvent.floci.services.emrserverless.model.JobDriver;
 import io.github.hectorvent.floci.services.emrserverless.model.JobRun;
+import io.github.hectorvent.floci.services.emrserverless.model.JobRunAttemptSummary;
 import io.github.hectorvent.floci.services.emrserverless.model.JobRunRecord;
 import io.github.hectorvent.floci.services.emrserverless.model.JobRunSummary;
 import io.github.hectorvent.floci.services.emrserverless.model.StartJobRunRequest;
@@ -38,6 +39,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -62,11 +64,21 @@ public class EmrServerlessJobRunService {
     private static final String MODE_STREAMING = "STREAMING";
 
     private static final Set<String> TERMINAL_STATES = Set.of(STATE_SUCCESS, "FAILED", STATE_CANCELLED);
+    private static final List<String> STATES = List.of("SUBMITTED", "PENDING", "SCHEDULED", STATE_RUNNING,
+            STATE_SUCCESS, "FAILED", "CANCELLING", STATE_CANCELLED, "QUEUED");
+    // JobRunStateSet holds at most 8 states.
+    private static final int MAX_FILTER_STATES = 8;
     private static final List<String> MODES = List.of(MODE_BATCH, MODE_STREAMING);
     // JobRun.executionTimeoutMinutes: "If you didn't specify a timeout, this value defaults to 720 minutes."
     private static final long DEFAULT_EXECUTION_TIMEOUT_MINUTES = 720;
     // The model's Duration, which bounds executionTimeoutMinutes.
     private static final long MAX_EXECUTION_TIMEOUT_MINUTES = 1_000_000;
+    // The EMR Serverless 7.11.0 release notes: for BATCH job runs the maximum "is 7 days from this release
+    // onwards", and the timeout "can no longer be set to 0".
+    private static final long MAX_BATCH_EXECUTION_TIMEOUT_MINUTES = 10_080;
+    private static final Pattern RELEASE_LABEL = Pattern.compile("emr-(\\d{1,6})\\.(\\d{1,6})(?:\\..*)?");
+    // Nothing runs, so no run fails and none is retried: every run is its own one attempt.
+    private static final int ATTEMPT = 1;
     private static final int MAX_LIST_RESULTS = 50;
     // IAMRoleArn's pattern, as the model and AWS's validation message spell it.
     private static final String ROLE_ARN_PATTERN =
@@ -130,15 +142,54 @@ public class EmrServerlessJobRunService {
         if (body.getTags() != null) {
             EmrServerlessService.validateTags(body.getTags());
         }
-        JobRunRecord record = applications.admitJobRun(applicationId, app -> newRun(app, body, original));
+        JobRunRecord record = applications.admitJobRun(applicationId, app -> checkBatchTimeout(app, body),
+                app -> newRun(app, body, original));
         LOG.infov("Started EMR Serverless job run {0} on application {1}", record.getJobRun().getJobRunId(),
                 applicationId);
         return settle(record).getJobRun();
     }
 
-    public synchronized JobRun getJobRun(String applicationId, String jobRunId) {
+    /**
+     * The run, as its {@code attempt} saw it; without one, "the latest attempt". A run has one
+     * attempt, so any other number names nothing. No source gives AWS's answer for an attempt a run
+     * never made; ResourceNotFoundException, in Floci's words, is the modeled error that fits.
+     */
+    public synchronized JobRun getJobRun(String applicationId, String jobRunId, Integer attempt) {
+        if (attempt != null) {
+            String violation = SmithyValidationErrors.outOfRange("attempt", attempt, ATTEMPT, Integer.MAX_VALUE);
+            if (violation != null) {
+                throw SmithyValidationErrors.validationException(violation);
+            }
+        }
         applications.getApplication(applicationId);
-        return settle(findRun(applicationId, jobRunId)).getJobRun();
+        JobRunRecord record = findRun(applicationId, jobRunId);
+        if (attempt != null && attempt != ATTEMPT) {
+            throw new AwsException("ResourceNotFoundException",
+                    "Job run " + jobRunId + " has no attempt " + attempt, 404);
+        }
+        return settle(record).getJobRun();
+    }
+
+    /** A run's attempts, which are its one attempt. */
+    public synchronized PaginatedResult<JobRunAttemptSummary> listJobRunAttempts(String applicationId,
+                                                                               String jobRunId,
+                                                                               Integer maxResults,
+                                                                               String nextToken) {
+        if (maxResults != null) {
+            String violation = SmithyValidationErrors.outOfRange("maxResults", maxResults, 1, MAX_LIST_RESULTS);
+            if (violation != null) {
+                throw SmithyValidationErrors.validationException(violation);
+            }
+        }
+        applications.getApplication(applicationId);
+        JobRunRecord record = settle(findRun(applicationId, jobRunId));
+        PaginatedResult<JobRunRecord> page = Pagination.paginate(List.of(record),
+                only -> String.format("%010d", ATTEMPT), maxResults != null ? maxResults : MAX_LIST_RESULTS,
+                nextToken, String.join("|", "ListJobRunAttempts", applicationId, jobRunId),
+                token -> new AwsException("ValidationException", "Invalid nextToken.", 400));
+        return new PaginatedResult<>(
+                page.items().stream().map(EmrServerlessJobRunService::toAttemptSummary).toList(),
+                page.nextToken());
     }
 
     /**
@@ -151,11 +202,19 @@ public class EmrServerlessJobRunService {
     public synchronized PaginatedResult<JobRunSummary> listJobRuns(String applicationId, List<String> states,
                                                                    Instant createdAtAfter, Instant createdAtBefore,
                                                                    String mode, Integer maxResults, String nextToken) {
+        List<String> violations = new ArrayList<>();
         if (maxResults != null) {
-            String violation = outOfRange("maxResults", maxResults, 1, MAX_LIST_RESULTS);
+            String violation = SmithyValidationErrors.outOfRange("maxResults", maxResults, 1, MAX_LIST_RESULTS);
             if (violation != null) {
-                throw SmithyValidationErrors.validationException(violation);
+                violations.add(violation);
             }
+        }
+        violations.addAll(EmrServerlessService.statesViolations(states, STATES, MAX_FILTER_STATES));
+        if (mode != null && !MODES.contains(mode)) {
+            violations.add(SmithyValidationErrors.notInEnum(mode, "mode", MODES));
+        }
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.validationException(violations);
         }
         List<JobRunRecord> matching = new ArrayList<>();
         Map<String, String> cursors = new HashMap<>();
@@ -197,6 +256,35 @@ public class EmrServerlessJobRunService {
         finish(record, STATE_CANCELLED, clock.instant().truncatedTo(ChronoUnit.MILLIS));
         LOG.infov("Cancelled EMR Serverless job run {0} on application {1}", jobRunId, applicationId);
         return record.getJobRun();
+    }
+
+    public synchronized Map<String, String> listTags(EmrServerlessService.ResourceArn resource) {
+        JobRun run = runFor(resource).getJobRun();
+        return run.getTags() != null ? new LinkedHashMap<>(run.getTags()) : new LinkedHashMap<>();
+    }
+
+    public synchronized void tagResource(EmrServerlessService.ResourceArn resource, Map<String, String> tags) {
+        JobRunRecord record = runFor(resource);
+        record.getJobRun().setTags(EmrServerlessService.withTags(record.getJobRun().getTags(), tags));
+        store.put(record.getJobRun().getJobRunId(), record);
+    }
+
+    public synchronized void untagResource(EmrServerlessService.ResourceArn resource, List<String> tagKeys) {
+        JobRunRecord record = runFor(resource);
+        record.getJobRun().setTags(EmrServerlessService.withoutTags(record.getJobRun().getTags(), tagKeys));
+        store.put(record.getJobRun().getJobRunId(), record);
+    }
+
+    /** GetJobRun's {@code attempt}, an integer in the query string. */
+    static Integer parseAttempt(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationException", "attempt must be an integer.", 400);
+        }
     }
 
     /**
@@ -245,6 +333,9 @@ public class EmrServerlessJobRunService {
                 ? request.getExecutionTimeoutMinutes() : DEFAULT_EXECUTION_TIMEOUT_MINUTES);
         run.setMode(request.getMode());
         run.setRetryPolicy(request.getRetryPolicy());
+        run.setAttempt(ATTEMPT);
+        run.setAttemptCreatedAt(now);
+        run.setAttemptUpdatedAt(now);
         run.setStartedAt(now);
 
         JobRunRecord record = new JobRunRecord();
@@ -287,6 +378,7 @@ public class EmrServerlessJobRunService {
         run.setState(state);
         run.setEndedAt(endedAt);
         run.setUpdatedAt(endedAt);
+        run.setAttemptUpdatedAt(endedAt);
         run.setTotalExecutionDurationSeconds((int) Duration.between(run.getStartedAt(), endedAt).toSeconds());
         store.put(run.getJobRunId(), record);
     }
@@ -296,6 +388,16 @@ public class EmrServerlessJobRunService {
                 .filter(record -> applicationId.equals(record.getJobRun().getApplicationId()))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Job run " + jobRunId + " not found", 404));
+    }
+
+    // The run a tagging ARN names. The ARN must be the run's own, so one naming another account names nothing,
+    // and a deleted application's runs name nothing, as the application's own ARN does.
+    private JobRunRecord runFor(EmrServerlessService.ResourceArn resource) {
+        return store.get(resource.jobRunId())
+                .filter(record -> resource.applicationId().equals(record.getJobRun().getApplicationId()))
+                .filter(record -> resource.arn().equals(record.getJobRun().getArn()))
+                .filter(record -> applications.isLive(resource.applicationId()))
+                .orElseThrow(() -> EmrServerlessService.resourceNotFound(resource.arn()));
     }
 
     private JobRunRecord runWithClientToken(String clientToken) {
@@ -351,12 +453,11 @@ public class EmrServerlessJobRunService {
                     + "Member must satisfy regular expression pattern: " + ROLE_ARN_PATTERN);
         }
         if (request.getMode() != null && !MODES.contains(request.getMode())) {
-            violations.add("Value '" + request.getMode() + "' at 'mode' failed to satisfy constraint: "
-                    + "Member must satisfy enum value set: " + MODES);
+            violations.add(SmithyValidationErrors.notInEnum(request.getMode(), "mode", MODES));
         }
         if (request.getExecutionTimeoutMinutes() != null) {
-            String violation = outOfRange("executionTimeoutMinutes", request.getExecutionTimeoutMinutes(), 0,
-                    MAX_EXECUTION_TIMEOUT_MINUTES);
+            String violation = SmithyValidationErrors.outOfRange("executionTimeoutMinutes",
+                    request.getExecutionTimeoutMinutes(), 0, MAX_EXECUTION_TIMEOUT_MINUTES);
             if (violation != null) {
                 violations.add(violation);
             }
@@ -383,16 +484,31 @@ public class EmrServerlessJobRunService {
         return "Value null at '" + member + "' failed to satisfy constraint: Member must not be null";
     }
 
-    private static String outOfRange(String member, long value, long min, long max) {
-        if (value < min) {
-            return "Value '" + value + "' at '" + member + "' failed to satisfy constraint: "
-                    + "Member must have value greater than or equal to " + min;
+    /**
+     * From Amazon EMR release 7.11.0 a BATCH run's timeout is 1 to 10080 minutes; an earlier release, or
+     * a STREAMING run, keeps the model's 0 to 1,000,000, 0 meaning none. No source gives AWS's error, so
+     * the wording is Floci's.
+     */
+    private static void checkBatchTimeout(Application app, StartJobRunRequest request) {
+        Long minutes = request.getExecutionTimeoutMinutes();
+        if (minutes == null || MODE_STREAMING.equals(request.getMode())
+                || !boundsBatchTimeouts(app.getReleaseLabel())) {
+            return;
         }
-        if (value > max) {
-            return "Value '" + value + "' at '" + member + "' failed to satisfy constraint: "
-                    + "Member must have value less than or equal to " + max;
+        if (minutes == 0 || minutes > MAX_BATCH_EXECUTION_TIMEOUT_MINUTES) {
+            throw new AwsException("ValidationException", "executionTimeoutMinutes must be between 1 and "
+                    + MAX_BATCH_EXECUTION_TIMEOUT_MINUTES + " for a BATCH job run on release emr-7.11.0 or later.",
+                    400);
         }
-        return null;
+    }
+
+    private static boolean boundsBatchTimeouts(String releaseLabel) {
+        Matcher matcher = RELEASE_LABEL.matcher(releaseLabel != null ? releaseLabel : "");
+        if (!matcher.matches()) {
+            return false;
+        }
+        int major = Integer.parseInt(matcher.group(1));
+        return major > 7 || (major == 7 && Integer.parseInt(matcher.group(2)) >= 11);
     }
 
     private static JobRunSummary toSummary(JobRunRecord record) {
@@ -411,6 +527,30 @@ public class EmrServerlessJobRunService {
         summary.setStateDetails(run.getStateDetails());
         summary.setReleaseLabel(run.getReleaseLabel());
         summary.setType(record.getApplicationType());
+        summary.setAttempt(run.getAttempt());
+        summary.setAttemptCreatedAt(run.getAttemptCreatedAt());
+        summary.setAttemptUpdatedAt(run.getAttemptUpdatedAt());
+        return summary;
+    }
+
+    private static JobRunAttemptSummary toAttemptSummary(JobRunRecord record) {
+        JobRun run = record.getJobRun();
+        JobRunAttemptSummary summary = new JobRunAttemptSummary();
+        summary.setApplicationId(run.getApplicationId());
+        summary.setId(run.getJobRunId());
+        summary.setName(run.getName());
+        summary.setMode(run.getMode());
+        summary.setArn(run.getArn());
+        summary.setCreatedBy(run.getCreatedBy());
+        summary.setJobCreatedAt(run.getCreatedAt());
+        summary.setCreatedAt(run.getCreatedAt());
+        summary.setUpdatedAt(run.getUpdatedAt());
+        summary.setExecutionRole(run.getExecutionRole());
+        summary.setState(run.getState());
+        summary.setStateDetails(run.getStateDetails());
+        summary.setReleaseLabel(run.getReleaseLabel());
+        summary.setType(record.getApplicationType());
+        summary.setAttempt(ATTEMPT);
         return summary;
     }
 }

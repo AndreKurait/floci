@@ -7,8 +7,10 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.iam.RootAccessOrganization;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
 import io.github.hectorvent.floci.services.organizations.model.Handshake;
@@ -28,13 +30,16 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 /**
@@ -53,7 +58,7 @@ import java.util.regex.Pattern;
  * @see <a href="https://docs.aws.amazon.com/organizations/latest/APIReference/Welcome.html">AWS Organizations API Reference</a>
  */
 @ApplicationScoped
-public class OrganizationsService implements ScpProvider {
+public class OrganizationsService implements ScpProvider, RootAccessOrganization {
 
     private static final Logger LOG = Logger.getLogger(OrganizationsService.class);
 
@@ -82,7 +87,13 @@ public class OrganizationsService implements ScpProvider {
             "AISERVICES_OPT_OUT_POLICY",
             "CHATBOT_POLICY",
             "DECLARATIVE_POLICY_EC2",
-            "SECURITYHUB_POLICY");
+            "SECURITYHUB_POLICY",
+            "INSPECTOR_POLICY",
+            "UPGRADE_ROLLOUT_POLICY",
+            "BEDROCK_POLICY",
+            "S3_POLICY",
+            "NETWORK_SECURITY_DIRECTOR_POLICY",
+            "GUARDDUTY_POLICY");
 
     private static final Set<String> POLICY_TYPE_SET = Set.copyOf(POLICY_TYPES);
 
@@ -91,9 +102,8 @@ public class OrganizationsService implements ScpProvider {
      * rejects the two access-control types outright — they are evaluated as a deny-by-intersection
      * chain rather than merged into a single effective document, so there is nothing to return.
      *
-     * <p>This is floci's rendering of the model's {@code EffectivePolicyType} shape; the last five
-     * entries were added to the shape after it was first written here. Ordered for the same reason
-     * as {@link #POLICY_TYPES}.
+     * <p>This is floci's rendering of the model's {@code EffectivePolicyType} shape. Ordered for
+     * the same reason as {@link #POLICY_TYPES}.
      */
     private static final List<String> EFFECTIVE_POLICY_TYPES = List.of(
             "TAG_POLICY",
@@ -106,7 +116,8 @@ public class OrganizationsService implements ScpProvider {
             "UPGRADE_ROLLOUT_POLICY",
             "BEDROCK_POLICY",
             "S3_POLICY",
-            "NETWORK_SECURITY_DIRECTOR_POLICY");
+            "NETWORK_SECURITY_DIRECTOR_POLICY",
+            "GUARDDUTY_POLICY");
 
     private static final Set<String> EFFECTIVE_POLICY_TYPE_SET = Set.copyOf(EFFECTIVE_POLICY_TYPES);
 
@@ -461,7 +472,82 @@ public class OrganizationsService implements ScpProvider {
      */
     public String organizationPath(String callerAccountId, String resourceId) {
         Organization organization = requireOrganizationForCaller(callerAccountId);
-        return organization.getId() + "/" + String.join("/", ancestryOf(organization, resourceId)) + "/";
+        return organizationPath(organization.getId(), organization.getRoot().getId(), resourceId,
+                id -> parentOf(organization, id));
+    }
+
+    private static String organizationPath(String organizationId, String rootId, String resourceId,
+                                           Function<String, String> parentLookup) {
+        return organizationId + "/" + String.join("/", ancestryOf(rootId, resourceId, parentLookup)) + "/";
+    }
+
+    /** Capture parent IDs before selecting a list page, not once for every serialized row. */
+    public OrganizationPaths organizationPaths(String callerAccountId) {
+        return new OrganizationPaths(requireOrganizationForCaller(callerAccountId));
+    }
+
+    /**
+     * Request-local ancestry data. Selected objects can outlive their stored rows, so render
+     * their captured parent without looking the leaf up again. This is not an atomic snapshot:
+     * a newly created parent is resolved on demand, scoped to the originally authorized org.
+     */
+    public final class OrganizationPaths {
+        private final Organization organization;
+        private final String organizationId;
+        private final String rootId;
+        private final Map<String, String> parents = new LinkedHashMap<>();
+
+        private OrganizationPaths(Organization organization) {
+            this.organization = organization;
+            this.organizationId = organization.getId();
+            this.rootId = organization.getRoot().getId();
+            organizationalUnitsIn(organization).forEach(unit -> parents.put(unit.getId(), unit.getParentId()));
+        }
+
+        public String accountPath(OrganizationAccount account) {
+            return path(account.getOrganizationId(), account.getId(), account.getParentId());
+        }
+
+        public String unitPath(OrganizationalUnit unit) {
+            return path(unit.getOrganizationId(), unit.getId(), unit.getParentId());
+        }
+
+        private String path(String selectedOrganizationId, String id, String parentId) {
+            if (!organizationId.equals(selectedOrganizationId)) {
+                throw accessDenied("The selected resource does not belong to the authorized organization.");
+            }
+            try {
+                return organizationPath(organizationId, rootId, id,
+                        current -> id.equals(current) ? parentId : cachedParent(current));
+            } catch (AwsException missingAncestor) {
+                if ("OrganizationalUnitNotFoundException".equals(missingAncestor.getErrorCode())
+                        && removedOrMoved(id, parentId)) {
+                    return null;
+                }
+                throw missingAncestor;
+            }
+        }
+
+        private String cachedParent(String id) {
+            String parent = parents.get(id);
+            if (parent == null) {
+                parent = requireOrganizationalUnit(organization, id).getParentId();
+                parents.put(id, parent);
+            }
+            return parent;
+        }
+
+        private boolean removedOrMoved(String id, String capturedParent) {
+            try {
+                return !capturedParent.equals(parentOf(organization, id));
+            } catch (AwsException missingTarget) {
+                if ("AccountNotFoundException".equals(missingTarget.getErrorCode())
+                        || "OrganizationalUnitNotFoundException".equals(missingTarget.getErrorCode())) {
+                    return true;
+                }
+                throw missingTarget;
+            }
+        }
     }
 
     public List<ChildRef> listChildren(String callerAccountId, String parentId, String childType) {
@@ -1405,6 +1491,31 @@ public class OrganizationsService implements ScpProvider {
 
     // ──────────────────────────── Collection helpers ────────────────────────────
 
+    @Override
+    public Optional<Membership> membershipOf(String accountId) {
+        return findOrganizationForAccount(accountId).map(organization -> {
+            Set<String> delegatedAdmins = new LinkedHashSet<>();
+            Set<String> members = new LinkedHashSet<>();
+            members.add(organization.getMasterAccountId());
+            for (OrganizationAccount account : accountsIn(organization)) {
+                members.add(account.getId());
+                if (namesIam(account.getDelegatedServices().keySet())) {
+                    delegatedAdmins.add(account.getId());
+                }
+            }
+            return new Membership(organization.getId(), organization.getMasterAccountId(),
+                    FEATURE_SET_ALL.equals(organization.getFeatureSet()),
+                    namesIam(organization.getEnabledServicePrincipals().keySet()),
+                    delegatedAdmins, members);
+        });
+    }
+
+    /** Whether IAM is among these principals, legacy per-partition spellings folded in. */
+    private static boolean namesIam(Set<String> principals) {
+        return principals.stream()
+                .anyMatch(principal -> IAM_SERVICE_PRINCIPAL.equals(ServicePrincipals.canonical(principal)));
+    }
+
     private List<OrganizationAccount> accountsIn(Organization organization) {
         return accounts.scanAllAccounts().stream()
                 .filter(account -> organization.getId().equals(account.getOrganizationId()))
@@ -1573,14 +1684,18 @@ public class OrganizationsService implements ScpProvider {
 
     /** The chain from the root down to (and including) {@code targetId}. */
     private List<String> ancestryOf(Organization organization, String targetId) {
+        return ancestryOf(organization.getRoot().getId(), targetId, id -> parentOf(organization, id));
+    }
+
+    private static List<String> ancestryOf(String rootId, String targetId, Function<String, String> parentLookup) {
         List<String> chain = new ArrayList<>();
         String current = targetId;
-        while (current != null && !organization.getRoot().getId().equals(current)) {
+        while (current != null && !rootId.equals(current)) {
             chain.add(current);
-            current = parentOf(organization, current);
+            current = parentLookup.apply(current);
         }
-        chain.add(organization.getRoot().getId());
-        java.util.Collections.reverse(chain);
+        chain.add(rootId);
+        Collections.reverse(chain);
         return chain;
     }
 

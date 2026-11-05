@@ -100,13 +100,13 @@ class EmrServerlessJobRunServiceTest {
         Instant submittedAt = started.getCreatedAt();
 
         clock.advance(Duration.ofSeconds(29));
-        JobRun running = service.getJobRun(applicationId, jobRunId);
+        JobRun running = service.getJobRun(applicationId, jobRunId, null);
         assertEquals("RUNNING", running.getState());
         assertNull(running.getEndedAt());
         assertNull(running.getTotalExecutionDurationSeconds());
 
         clock.advance(Duration.ofSeconds(1));
-        JobRun finished = service.getJobRun(applicationId, jobRunId);
+        JobRun finished = service.getJobRun(applicationId, jobRunId, null);
         assertEquals("SUCCESS", finished.getState());
         assertEquals(submittedAt.plusSeconds(30), finished.getEndedAt());
         assertEquals(submittedAt.plusSeconds(30), finished.getUpdatedAt());
@@ -124,7 +124,7 @@ class EmrServerlessJobRunServiceTest {
         assertEquals("CANCELLED", cancelled.getState());
         assertEquals(10, cancelled.getTotalExecutionDurationSeconds());
         clock.advance(Duration.ofMinutes(5));
-        assertEquals("CANCELLED", service.getJobRun(applicationId, jobRunId).getState());
+        assertEquals("CANCELLED", service.getJobRun(applicationId, jobRunId, null).getState());
     }
 
     @Test
@@ -135,12 +135,29 @@ class EmrServerlessJobRunServiceTest {
         Instant submittedAt = started.getCreatedAt();
 
         clock.advance(Duration.ofMinutes(5).minusSeconds(1));
-        assertEquals("RUNNING", service.getJobRun(applicationId, jobRunId).getState());
+        assertEquals("RUNNING", service.getJobRun(applicationId, jobRunId, null).getState());
 
         clock.advance(Duration.ofSeconds(1));
-        JobRun timedOut = service.getJobRun(applicationId, jobRunId);
+        JobRun timedOut = service.getJobRun(applicationId, jobRunId, null);
         assertEquals("CANCELLED", timedOut.getState());
         assertEquals(submittedAt.plus(Duration.ofMinutes(5)), timedOut.getEndedAt());
+    }
+
+    @Test
+    void anAttemptTheRunNeverMadeIsRefusedBeforeTheRunSettles() {
+        EmrServerlessJobRunService service = service(30);
+        JobRun started = service.startJobRun(applicationId, request(null, null));
+        String jobRunId = started.getJobRunId();
+        clock.advance(Duration.ofSeconds(30));
+
+        AwsException noAttempt = assertThrows(AwsException.class,
+                () -> service.getJobRun(applicationId, jobRunId, 2));
+        assertEquals("ResourceNotFoundException", noAttempt.getErrorCode());
+        assertEquals("RUNNING", store.get(jobRunId).orElseThrow().getJobRun().getState());
+
+        JobRun finished = service.getJobRun(applicationId, jobRunId, 1);
+        assertEquals("SUCCESS", finished.getState());
+        assertEquals(started.getCreatedAt().plusSeconds(30), finished.getEndedAt());
     }
 
     @Test
@@ -150,7 +167,7 @@ class EmrServerlessJobRunServiceTest {
 
         clock.advance(Duration.ofDays(2));
 
-        assertEquals("RUNNING", service.getJobRun(applicationId, jobRunId).getState());
+        assertEquals("RUNNING", service.getJobRun(applicationId, jobRunId, null).getState());
     }
 
     @Test

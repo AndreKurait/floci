@@ -343,19 +343,31 @@ public class EksAddonService {
     }
 
     public Update describeUpdate(Cluster cluster, String updateId, String addonName) {
-        requireActiveCluster(cluster);
-        if (updateId == null || updateId.isBlank()) {
-            throw new AwsException("InvalidParameterException", "updateId is required", 400);
-        }
-        StoredUpdate stored = updatesStorage.get(prefix(cluster) + updateId)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "No update: " + updateId + " found for cluster: " + cluster.getName(), 404));
+        StoredUpdate stored = storedUpdate(cluster, updateId);
         if (addonName != null && !addonName.isBlank()
                 && stored.addonName() != null && !stored.addonName().equalsIgnoreCase(addonName.trim())) {
             throw new AwsException("ResourceNotFoundException",
                     "No update: " + updateId + " found for addon: " + addonName, 404);
         }
         return stored.update();
+    }
+
+    /**
+     * The name of the add-on the update {@code updateId} was made to, looked up as {@link #describeUpdate} looks
+     * it up, which returns the update whether or not the request names its add-on.
+     */
+    public String updateAddonName(Cluster cluster, String updateId) {
+        return storedUpdate(cluster, updateId).addonName();
+    }
+
+    private StoredUpdate storedUpdate(Cluster cluster, String updateId) {
+        requireActiveCluster(cluster);
+        if (updateId == null || updateId.isBlank()) {
+            throw new AwsException("InvalidParameterException", "updateId is required", 400);
+        }
+        return updatesStorage.get(prefix(cluster) + updateId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "No update: " + updateId + " found for cluster: " + cluster.getName(), 404));
     }
 
     public AddonVersionsPage describeAddonVersions(String addonName, String kubernetesVersion,

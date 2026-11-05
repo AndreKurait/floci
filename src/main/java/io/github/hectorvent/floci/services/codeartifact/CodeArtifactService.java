@@ -829,10 +829,10 @@ public class CodeArtifactService implements Resettable {
      * size and hash, the same way {@link #getContainerBackedPackageVersionAsset} already computes
      * a single asset's hash on the fly rather than trusting a stored value that doesn't exist.
      *
-     * <p>{@code npm}/{@code pypi}/{@code nuget} genuinely have exactly one asset per version
-     * (confirmed by {@link RepositorySidecarManager#listPackageVersionAssetNames}'s own
-     * implementations for those three); only {@code maven} and {@code generic} can return more
-     * than one.
+     * <p>{@code npm}/{@code nuget} genuinely have exactly one asset per version. {@code pypi} does
+     * not: a single release can hold both a source distribution and a wheel, and {@link
+     * PypiserverSidecarClient#listPackageVersionAssetNames} already lists every filename
+     * pypiserver's own per-project JSON reports for that version, not just one.
      *
      * <p>For a container-backed format, only the names are enumerated up front; {@code
      * maxResults}/{@code nextToken} are applied to that name list before any byte is fetched, so

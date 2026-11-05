@@ -93,16 +93,18 @@ part in authorizing calls to the function:
 - `GetFunction`, `GetFunctionConfiguration` and `ListDurableExecutionsByFunction`, given a full ARN
   with a version or alias, read the function in the account in the ARN, and need its function
   policy to allow the caller in the same way.
+- Provisioned-concurrency configuration operations also act in the account named by the function
+  reference. Cross-account access requires that function's policy to allow the caller.
 - Other operations act on the caller's own function of the name the ARN gives, whatever account
   the ARN names, and are authorized against that function. Floci does not serve them on another
   account's function, which AWS allows through a function policy.
 - Within one account, a statement naming the caller grants on its own. One naming only the
   account, as `AddPermission --principal <account-id>` writes it, delegates to the account, so the
   caller's identity policy has to allow the call too.
-- An invoke is authorized against the version or alias it names, in the function name or in
-  `Qualifier`. A grant added with `Qualifier` covers that version or alias only, and a grant on the
-  function does not cover a qualified invoke. Other operations are authorized against the
-  unqualified function.
+- An invoke or provisioned-concurrency configuration operation is authorized against the version or
+  alias it names, in the function name or in `Qualifier`. A grant added with `Qualifier` covers that
+  version or alias only, and a grant on the function does not cover a qualified operation.
+  Other operations are authorized against the unqualified function.
 - A statement conditioned on `InvokedViaFunctionUrl` does not admit a direct `Invoke`.
 - `aws:PrincipalOrgID` is not part of the request context, so a grant added with `PrincipalOrgID`
   admits no caller.
@@ -485,7 +487,9 @@ Deleting the configuration, alias or function removes the owned environments. Ch
 alias's version reinitializes its existing allocation for the new published version and
 releases the old version's configuration conflict. The alias retains its requested quota;
 retired environments retain their local container capacity until cleanup succeeds. An identical
-Put preserves the existing healthy allocation. An alias with a configuration cannot move to
+Put preserves the existing healthy allocation. Failed background alias refreshes retain their
+previous allocation and retry on later reconciliation without blocking other configurations.
+An alias with a configuration cannot move to
 `$LATEST`; remove the configuration first. Get and Delete remain available if the alias gains
 unsupported weighted routing.
 
@@ -499,6 +503,10 @@ accounting, automatic scaling, or weighted-alias allocation. Provisioned runtime
 their numeric `AWS_LAMBDA_FUNCTION_VERSION` and
 `AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`.
 
+Configuration replacement and deletion remain committed if environment removal fails.
+Failed removals retain ownership and are retried while Floci is running; they continue
+to count against local container limits until cleanup succeeds.
+
 Shutdown drains provisioned and on-demand containers concurrently within one
 `floci.services.lambda.container-drain-timeout-seconds` budget. The default is 15 seconds;
 set `FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS` when a larger fleet needs more
@@ -509,6 +517,14 @@ owned for a later retirement or reset retry; a completed removal is not repeated
 A launch that outlasts the deadline is reported as incomplete cleanup. Its invocation is
 refused, and any returned container remains owned for a later cleanup retry; the deadline
 does not guarantee cancellation of an unresponsive container launcher.
+
+If an invocation finishes after the shutdown deadline, releasing its still-owned
+container starts a separate bounded cleanup attempt. This does not extend the
+initial shutdown wait.
+
+When using `floci-cli`, set `floci stop --timeout <seconds>` above the configured
+drain budget. The CLI currently defaults to 10 seconds, including for `floci restart`.
+For a longer drain, explicitly stop with the larger timeout and then start Floci.
 
 ## Not Implemented
 

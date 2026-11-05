@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.storage.WriteProfile;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
@@ -20,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
@@ -39,8 +41,10 @@ public class CloudWatchMetricsService {
     @Inject
     public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
                                     AlarmSnsNotifier alarmSnsNotifier) {
+        // Services publish into this store every minute, SQS for every active queue, so under
+        // persistent mode it is journaled rather than rewritten in full on every datum.
         this.metricStore = storageFactory.create("cloudwatchmetrics", "cwmetrics.json",
-                new TypeReference<Map<String, MetricDatum>>() {});
+                new TypeReference<Map<String, MetricDatum>>() {}, WriteProfile.APPEND_HEAVY);
         this.alarmStore = storageFactory.create("cloudwatchmetrics", "cwalarms.json",
                 new TypeReference<Map<String, MetricAlarm>>() {});
         this.regionResolver = regionResolver;
@@ -127,6 +131,22 @@ public class CloudWatchMetricsService {
             aware.putForAccount(accountId, key, datum);
         } else {
             metricStore.put(key, datum);
+        }
+    }
+
+    /**
+     * Drops the {@code namespace} datapoints stamped before {@code cutoff}, in every account. A service
+     * that writes its own metrics each minute, such as SQS, calls it so that history stays bounded.
+     */
+    public void deleteMetricDataBefore(String namespace, Instant cutoff) {
+        long cutoffSeconds = cutoff.getEpochSecond();
+        Predicate<MetricDatum> expired = d -> namespace.equals(d.getNamespace()) && d.getTimestamp() < cutoffSeconds;
+        if (metricStore instanceof AccountAwareStorageBackend<MetricDatum> aware) {
+            aware.deleteAllAccountsMatching(expired);
+            return;
+        }
+        for (String key : List.copyOf(metricStore.keys())) {
+            metricStore.get(key).filter(expired).ifPresent(ignored -> metricStore.delete(key));
         }
     }
 

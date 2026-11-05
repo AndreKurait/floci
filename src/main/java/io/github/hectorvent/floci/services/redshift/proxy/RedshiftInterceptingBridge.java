@@ -61,6 +61,7 @@ public class RedshiftInterceptingBridge {
     private final IamService iamService;
     private final String clusterAccountId;
     private final List<String> iamRoleArns;
+    private final String defaultIamRoleArn;
     private final SpectrumInterceptor spectrumInterceptor;
     private final String clusterKey;
     private final String databaseName;
@@ -96,12 +97,21 @@ public class RedshiftInterceptingBridge {
     public RedshiftInterceptingBridge(Socket client, Socket backend, S3Service s3Service, IamService iamService,
                                       String clusterAccountId, List<String> iamRoleArns,
                                       SpectrumInterceptor spectrumInterceptor, String clusterKey, String databaseName) {
+        this(client, backend, s3Service, iamService, clusterAccountId, iamRoleArns, spectrumInterceptor,
+                clusterKey, databaseName, null);
+    }
+
+    public RedshiftInterceptingBridge(Socket client, Socket backend, S3Service s3Service, IamService iamService,
+                                      String clusterAccountId, List<String> iamRoleArns,
+                                      SpectrumInterceptor spectrumInterceptor, String clusterKey, String databaseName,
+                                      String defaultIamRoleArn) {
         this.client = client;
         this.backend = backend;
         this.s3Service = s3Service;
         this.iamService = iamService;
         this.clusterAccountId = clusterAccountId;
         this.iamRoleArns = iamRoleArns == null ? List.of() : List.copyOf(iamRoleArns);
+        this.defaultIamRoleArn = defaultIamRoleArn;
         this.spectrumInterceptor = spectrumInterceptor;
         this.clusterKey = clusterKey;
         this.databaseName = databaseName;
@@ -565,7 +575,7 @@ public class RedshiftInterceptingBridge {
 
     private CopyStatementParser.S3Statement parseS3Statement(String sql) {
         try {
-            return CopyStatementParser.parse(sql);
+            return CopyStatementParser.parse(sql, defaultIamRoleArn);
         } catch (RuntimeException e) {
             LOG.warnv("CopyStatementParser failed, forwarding original statement: {0}", e.getMessage());
             return null;

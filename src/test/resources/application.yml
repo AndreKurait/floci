@@ -140,6 +140,7 @@ floci:
       default-visibility-timeout: 30
       max-message-size: 1048576
       endpoint-strategy: floci
+      cloudwatch-metrics-enabled: false   # tests publish themselves, so no tick stamps another test's queue behind its back
     s3:
       enabled: true
       enforce-auth: false

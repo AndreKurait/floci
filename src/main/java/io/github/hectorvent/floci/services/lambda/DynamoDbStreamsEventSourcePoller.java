@@ -350,7 +350,10 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         String eventJson = buildDynamoDbEvent(matched, esm);
         InvokeResult invokeResult;
         try {
-            invokeResult = executorService.invoke(fn, eventJson.getBytes(), InvocationType.RequestResponse);
+            String qualifier = LambdaTargetResolver.mappingQualifier(esm);
+            invokeResult = qualifier == null
+                    ? executorService.invoke(fn, eventJson.getBytes(), InvocationType.RequestResponse)
+                    : executorService.invoke(fn, eventJson.getBytes(), InvocationType.RequestResponse, 0, qualifier);
         } catch (AwsException e) {
             if ("TooManyRequestsException".equals(e.getErrorCode())) {
                 LOG.infov("DynamoDB Streams ESM {0}: function {1} throttled, shard iterator not advanced",

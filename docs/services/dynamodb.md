@@ -230,6 +230,8 @@ region is rejected.
 | `FLOCI_SERVICES_DYNAMODB_ENABLED` | `true` | Enable or disable the service |
 | `FLOCI_STORAGE_SERVICES_DYNAMODB_MODE` | *(global default)* | Storage mode override for DynamoDB (`memory`, `persistent`, `hybrid`, `wal`) |
 | `FLOCI_STORAGE_SERVICES_DYNAMODB_FLUSH_INTERVAL_MS` | `5000` | Flush interval for `hybrid`/`wal` storage modes (milliseconds) |
+| `FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_LAYOUT` | `single-file` | How items are laid out on disk: `single-file` or `per-table`. See [Item layout on disk](#item-layout-on-disk) |
+| `FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_SHARDS` | `1` | With the `per-table` layout, how many files each table is split into |
 | `FLOCI_SERVICES_DYNAMODB_VECTOR_INDEX_ALLOCATION_SECONDS` | `4` | Seconds a vector index added by `UpdateTable` spends in resource allocation |
 | `FLOCI_SERVICES_DYNAMODB_VECTOR_INDEX_BACKFILL_SECONDS` | `10` | Seconds that index then spends backfilling before it goes `ACTIVE` |
 | `FLOCI_SERVICES_DYNAMODB_LATEST_RESTORABLE_LAG_SECONDS` | `300` | Seconds `LatestRestorableDateTime` of point-in-time recovery trails the current time. Set `0` to restore the latest writes with `UseLatestRestorableTime` |
@@ -245,6 +247,20 @@ Under `persistent` storage mode, single-item writes (`PutItem`, `UpdateItem`, `D
 For write-heavy workloads under persistent setups, configuring `FLOCI_STORAGE_SERVICES_DYNAMODB_MODE=wal` or `hybrid` is recommended to avoid full-file rewrites on each write operation:
 - `wal`: Uses an append-only write-ahead log with background compaction.
 - `hybrid`: Keeps data in memory with periodic asynchronous disk flushes controlled by `FLOCI_STORAGE_SERVICES_DYNAMODB_FLUSH_INTERVAL_MS`.
+
+### Item layout on disk
+
+With the default `single-file` layout, every table's items live in one `dynamodb-items.json`, and any item write saves all of them: `persistent` rewrites the file on the write, `hybrid` on the next flush, and `wal` appends the whole table to its log and rewrites the whole snapshot on compaction. A small table that changes often, such as a heartbeat table, then keeps rewriting every large table beside it.
+
+`FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_LAYOUT=per-table` stores items under `dynamodb-items/` instead, as `FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_SHARDS` files per table (one by default). An item belongs to the file chosen by a hash of its key, and a write saves only the items it touched:
+
+| Mode | What an item write costs on disk |
+|---|---|
+| `persistent` | Rewrites the one file that holds the item |
+| `hybrid` | Marks that file dirty; dirty files are rewritten on the flush interval |
+| `wal` | Appends one record for the item to `dynamodb-items/journal.wal`; dirty files are rewritten and the journal emptied on `FLOCI_STORAGE_WAL_COMPACTION_INTERVAL_MS` |
+
+On first start with `per-table`, in any storage mode, an existing `dynamodb-items.json` or a `wal`-mode `dynamodb-items-snapshot.json` and `dynamodb-items.wal` is migrated into the directory, and those files are renamed with a `.migrated` suffix. When both kinds exist, the one written last is migrated. The migration is written to a staging directory and moved in place in one step, so a crash leaves either no directory or a complete one. If it cannot be written, Floci fails to start and the old files stay untouched. Once the directory holds data, old files are ignored. Switching back to `single-file` does not read the directory. A write that cannot be saved where its mode promises fails with an error, instead of only being logged: in `persistent` mode the shard file must be written, and in `wal` mode a change the journal cannot take is written to its shard file at once. The change stays in memory and is written by the next flush. Changing the shard count rewrites the files on the next start. Starting `per-table` in `persistent` or `hybrid` mode after a `wal` run that ended without compacting writes the changes left in `journal.wal` into the shard files and removes it. If `journal.wal` cannot be read, Floci fails to start and leaves it untouched. The other DynamoDB stores (tables, backups, point-in-time recovery history, exports, imports) keep their single files.
 
 ## Examples
 
@@ -472,7 +488,7 @@ aws dynamodb restore-table-from-backup --backup-arn $BACKUP_ARN \
   --target-table-name UsersRestored --endpoint-url $AWS_ENDPOINT_URL
 ```
 
-`RestoreTableFromBackup` creates a new table with the keys, indexes, billing mode, throughput and encryption of the backup. As on AWS, the new table has no stream, TTL, point-in-time recovery, tags or deletion protection, and its table class is `STANDARD`. The overrides follow AWS. A GSI or LSI override must match a source index by key schema and projection, and a vector index override must match one by name. `BillingModeOverride` `PROVISIONED` needs throughput for the table and for every GSI that is kept.
+`RestoreTableFromBackup` creates a new table with the keys, indexes, billing mode, throughput and encryption of the backup. As on AWS, the new table has no stream, TTL, point-in-time recovery, tags or deletion protection, and its table class is `STANDARD`. The overrides follow AWS. A GSI or LSI override must match a source index by key schema and projection, and a vector index override must match one by name. `BillingModeOverride` `PROVISIONED` needs throughput for the table and for every GSI that is kept. To restore a backup into another region, call `RestoreTableFromBackup` in that region with `SSESpecificationOverride`.
 
 Deviations from AWS: a restore is done before the response is sent. The response still says `CREATING` with `RestoreInProgress: true`, as on AWS, but the table is `ACTIVE` right away. So `BackupInUseException` and `TableInUseException` for a restore in progress never happen. `BackupSizeBytes` is always 0. Backups made by AWS Backup (`BackupType` `AWS_BACKUP`) are not emulated.
 

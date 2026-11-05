@@ -80,6 +80,8 @@ public class SqsService implements Resettable, ResourceProvider {
     private static final int DEFAULT_MESSAGE_RETENTION_PERIOD_SECONDS = 345600;
     private static final int MIN_MESSAGE_RETENTION_PERIOD_SECONDS = 60;
     private static final int MAX_MESSAGE_RETENTION_PERIOD_SECONDS = 1209600;
+    /** CloudWatch keeps reporting a queue for six hours after its last action, or while it holds a message. */
+    private static final Duration METRICS_ACTIVE_WINDOW = Duration.ofHours(6);
 
     private final StorageBackend<String, Queue> queueStore;
     private final StorageBackend<String, List<Message>> messageStore;
@@ -773,6 +775,7 @@ public class SqsService implements Resettable, ResourceProvider {
                     }
                 }
             }
+            getOrCreateQueue(storageKey).activity().accessed();
             return withCurrentQueueUrl(existing, region);
         }
 
@@ -799,8 +802,10 @@ public class SqsService implements Resettable, ResourceProvider {
         }
 
         queueStore.put(storageKey, queue);
-        messagesByQueue.put(storageKey,
-                new GuardedMessageQueue(new ArrayList<>(), messageStore, storageKey, receiptHandleSecret));
+        GuardedMessageQueue messages = new GuardedMessageQueue(new ArrayList<>(), messageStore, storageKey,
+                receiptHandleSecret);
+        messages.activity().accessed();
+        messagesByQueue.put(storageKey, messages);
         LOG.infov("Created {0} queue: {1} in region {2}", queue.isFifo() ? "FIFO" : "standard", queueName, region);
         return queue;
     }
@@ -904,7 +909,10 @@ public class SqsService implements Resettable, ResourceProvider {
         attrs.put("CreatedTimestamp", String.valueOf(queue.getCreatedTimestamp().getEpochSecond()));
         attrs.put("LastModifiedTimestamp", String.valueOf(queue.getLastModifiedTimestamp().getEpochSecond()));
 
-        GuardedMessageQueue.MessageCounts counts = unexpiredMessages(storageKey, queue).messageCounts();
+        GuardedMessageQueue messages = unexpiredMessages(storageKey, queue);
+        // AWS: a GetQueueAttributes call activates the queue, so CloudWatch reports it again.
+        messages.activity().accessed();
+        GuardedMessageQueue.MessageCounts counts = messages.messageCounts();
         attrs.put("ApproximateNumberOfMessages", String.valueOf(counts.visible()));
         attrs.put("ApproximateNumberOfMessagesNotVisible", String.valueOf(counts.inFlight()));
         attrs.put("ApproximateNumberOfMessagesDelayed", String.valueOf(counts.delayed()));
@@ -1119,6 +1127,7 @@ public class SqsService implements Resettable, ResourceProvider {
                         response.getMessageAttributes().putAll(messageAttributes);
                         response.updateMd5OfMessageAttributes();
                     }
+                    getOrCreateQueue(storageKey).activity().sent(totalSize, true);
                     return response;
                 }
 
@@ -1138,7 +1147,9 @@ public class SqsService implements Resettable, ResourceProvider {
                     message.updateMd5OfMessageAttributes();
                 }
 
-                getOrCreateQueue(storageKey).addMessage(message);
+                GuardedMessageQueue messages = getOrCreateQueue(storageKey);
+                messages.addMessage(message);
+                messages.activity().sent(totalSize, false);
                 deduplicationIdentityCache.computeIfAbsent(storageKey, k -> new ConcurrentHashMap<>())
                         .putIfAbsent(dedupCacheKey,
                                 new DeduplicationIdentity(message.getMessageId(), message.getSequenceNumber()));
@@ -1166,7 +1177,9 @@ public class SqsService implements Resettable, ResourceProvider {
             message.updateMd5OfMessageAttributes();
         }
 
-        getOrCreateQueue(storageKey).addMessage(message);
+        GuardedMessageQueue messages = getOrCreateQueue(storageKey);
+        messages.addMessage(message);
+        messages.activity().sent(totalSize, false);
         notifyReceivers(storageKey);
         LOG.debugv("Sent message {0} to queue {1}", message.getMessageId(), queueUrl);
         LOG.tracev("Sent message {0} to queue {1} body={2} attributes={3}",
@@ -1405,11 +1418,11 @@ public class SqsService implements Resettable, ResourceProvider {
                                 m.getMessageId(), queueUrl, m.getBody(), m.getMessageAttributes());
                     }
                 }
-                return result;
+                return recordReceive(polledQueue, result);
             }
             long elapsed = System.currentTimeMillis() - start;
             if (elapsed >= maxWait) {
-                return result;
+                return recordReceive(polledQueue, result);
             }
             try {
                 synchronized (lock) {
@@ -1417,9 +1430,15 @@ public class SqsService implements Resettable, ResourceProvider {
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return result;
+                return recordReceive(polledQueue, result);
             }
         }
+    }
+
+    /** AWS takes one sample per ReceiveMessage call, however long it polled. */
+    private static List<Message> recordReceive(GuardedMessageQueue polledQueue, List<Message> received) {
+        polledQueue.activity().received(received.size());
+        return received;
     }
 
     private int resolveWaitTimeSeconds(Queue queue, Integer requestedWaitTimeSeconds) {
@@ -1533,9 +1552,11 @@ public class SqsService implements Resettable, ResourceProvider {
                         "The specified queue does not exist.", 400));
         ReceiptHandle handle = checkReceiptHandle(storageKey, receiptHandle, inBatch);
 
-        GuardedMessageQueue.Removal removal =
-                getOrCreateQueue(storageKey).removeByReceiptHandle(handle, queue.isFifo());
+        GuardedMessageQueue messages = getOrCreateQueue(storageKey);
+        GuardedMessageQueue.Removal removal = messages.removeByReceiptHandle(handle, queue.isFifo());
         rejectUnusableHandle(removal.result(), receiptHandle, inBatch);
+        // AWS counts every delete with a valid handle, including a repeat for a message already gone.
+        messages.activity().deleted();
         // AWS reports success for a message that is already gone.
         if (removal.result() == GuardedMessageQueue.HandleResult.MESSAGE_GONE) {
             LOG.debugv("No message for receipt handle {0}", receiptHandle);
@@ -1561,8 +1582,9 @@ public class SqsService implements Resettable, ResourceProvider {
                         "The specified queue does not exist.", 400));
         ReceiptHandle handle = checkReceiptHandle(storageKey, receiptHandle, inBatch);
 
-        GuardedMessageQueue.HandleResult result =
-                getOrCreateQueue(storageKey).changeVisibility(handle, visibilityTimeout, queue.isFifo());
+        GuardedMessageQueue messages = getOrCreateQueue(storageKey);
+        messages.activity().accessed();
+        GuardedMessageQueue.HandleResult result = messages.changeVisibility(handle, visibilityTimeout, queue.isFifo());
         rejectUnusableHandle(result, receiptHandle, inBatch);
         if (result == GuardedMessageQueue.HandleResult.MESSAGE_GONE) {
             throw invalidReceiptHandle(receiptHandle,
@@ -1609,7 +1631,9 @@ public class SqsService implements Resettable, ResourceProvider {
     public void purgeQueue(String queueUrl, String region) {
         String storageKey = regionKey(region, queueUrl);
         ensureQueueExists(storageKey);
-        getOrCreateQueue(storageKey).purge();
+        GuardedMessageQueue messages = getOrCreateQueue(storageKey);
+        messages.purge();
+        messages.activity().accessed();
         if (clearFifoDeduplicationCacheOnPurge) {
             deduplicationCache.remove(storageKey);
             deduplicationIdentityCache.remove(storageKey);
@@ -1646,6 +1670,7 @@ public class SqsService implements Resettable, ResourceProvider {
         }
         queue.setLastModifiedTimestamp(Instant.now());
         queueStore.put(storageKey, queue);
+        getOrCreateQueue(storageKey).activity().accessed();
         LOG.infov("Updated attributes for queue: {0}", queueUrl);
     }
 
@@ -2206,6 +2231,40 @@ public class SqsService implements Resettable, ResourceProvider {
         for (String storageKey : messagesByQueue.keySet()) {
             removeExpiredMessages(storageKey);
         }
+    }
+
+    /** One active queue's AWS/SQS metrics for one publication. */
+    record QueueMetrics(String accountId, String region, String queueName, boolean fifo,
+                        GuardedMessageQueue.Gauges gauges, SqsQueueActivity.Snapshot activity) {
+    }
+
+    /**
+     * The AWS/SQS metrics of every queue CloudWatch considers active: one that holds a message or
+     * was acted on in the last six hours. Each queue's activity since the previous call is handed
+     * over, so every call starts the next sample window.
+     */
+    List<QueueMetrics> collectQueueMetrics(Instant now) {
+        Instant activeSince = now.minus(METRICS_ACTIVE_WINDOW);
+        List<QueueMetrics> metrics = new ArrayList<>();
+        messagesByQueue.forEach((storageKey, messages) -> {
+            int separator = storageKey.indexOf("::");
+            String queueUrl = baseUrl + storageKey.substring(separator + 2);
+            Queue queue = getQueueByUrl(storageKey, queueUrl).orElse(null);
+            // A queue deleted and created again meanwhile has a new message queue; this one is gone.
+            if (queue == null || messagesByQueue.get(storageKey) != messages) {
+                return;
+            }
+            messages.removeExpired(retentionCutoff(queue));
+            GuardedMessageQueue.Gauges gauges = messages.gauges(now);
+            SqsQueueActivity.Snapshot activity = messages.activity().drain();
+            Instant lastActivity = activity.lastActivity();
+            if (gauges.isEmpty() && (lastActivity == null || lastActivity.isBefore(activeSince))) {
+                return;
+            }
+            metrics.add(new QueueMetrics(accountFromQueueUrl(queueUrl), storageKey.substring(0, separator),
+                    queue.getQueueName(), queue.isFifo(), gauges, activity));
+        });
+        return metrics;
     }
 
     private void removeExpiredMessages(String storageKey) {

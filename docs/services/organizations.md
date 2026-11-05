@@ -33,6 +33,16 @@ call `LeaveOrganization`. An account in no organization gets
 
 ## Behaviour notes
 
+- OU responses include `Path`, and account responses include a single-entry `Paths` array.
+  Both use the current organization/root/OU ancestry, include the resource ID and trailing slash,
+  and reflect account moves. Delegated-administrator responses retain their separate shape.
+  List rendering reuses request-local parent IDs rather than re-reading each selected resource.
+  Concurrent removals do not invalidate an already selected page; a stale row with an ancestor
+  that is no longer available is omitted only after confirming that the row was removed or moved.
+- Management policy types include `INSPECTOR_POLICY`, `UPGRADE_ROLLOUT_POLICY`, `BEDROCK_POLICY`,
+  `S3_POLICY`, `NETWORK_SECURITY_DIRECTOR_POLICY`, and `GUARDDUTY_POLICY`. They use the existing
+  enable, create, attach, list, effective-policy, detach, delete, and disable flows. Policy content
+  is not validated against a per-type schema, and these policies do not configure the backing AWS services.
 - The AWS-managed `p-FullAWSAccess` SCP is created with the organization and attached to the
   root, every new OU and every new account. Detaching the last service control policy from a
   target is rejected with `ConstraintViolationException`, as on AWS.

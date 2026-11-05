@@ -52,7 +52,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -91,6 +93,39 @@ public class RedshiftService {
     private final DynamoDbStreamReader streamReader;
     // Proxy ports currently handed out, so allocateProxyPort never double-assigns within this JVM.
     private final Set<Integer> usedPorts = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<ResourceKey, ResourceLock> resourceLocks = new ConcurrentHashMap<>();
+
+    private record ResourceKey(String accountId, String kind, String identifier) { }
+
+    private static final class ResourceLock {
+        private final ReentrantLock lock = new ReentrantLock();
+        private int users;
+    }
+
+    private <T> T withResourceLock(String kind, String identifier, Supplier<T> work) {
+        ResourceKey key = new ResourceKey(clusters.accountId(), kind, identifier);
+        ResourceLock scoped = resourceLocks.compute(key, (ignored, existing) -> {
+            ResourceLock selected = existing == null ? new ResourceLock() : existing;
+            selected.users++;
+            return selected;
+        });
+        scoped.lock.lock();
+        try {
+            return work.get();
+        } finally {
+            scoped.lock.unlock();
+            resourceLocks.compute(key, (ignored, existing) -> --scoped.users == 0 ? null : scoped);
+        }
+    }
+
+    // Acquire resource locks before the service monitor; snapshot I/O never takes the monitor.
+    private <T> T mutateCluster(String identifier, Supplier<T> mutation) {
+        return withResourceLock("cluster", identifier, () -> mutate(mutation));
+    }
+
+    private synchronized <T> T mutate(Supplier<T> mutation) {
+        return mutation.get();
+    }
 
     @Inject
     public RedshiftService(StorageFactory storageFactory, RedshiftContainerManager containerManager,
@@ -154,7 +189,7 @@ public class RedshiftService {
                         handle.getHost(), handle.getPort(), endpoint.getAddress(),
                         cluster.getMasterUsername(), password, CLUSTER_DB_NAME,
                         passwordValidatorFor(entry.accountId(), cluster.getClusterIdentifier()),
-                        cluster.getIamRoleArns());
+                        cluster.getIamRoleArns(), cluster.getDefaultIamRoleArn());
                 cluster.setContainerHost(handle.getHost());
                 cluster.setContainerPort(handle.getPort());
                 cluster.setEndpoint(endpoint);
@@ -168,7 +203,7 @@ public class RedshiftService {
                     LOG.warnv(ex, "Failed to stop proxy during recovery rollback for cluster {0}", cluster.getClusterIdentifier());
                 }
                 try {
-                    containerManager.stop(entry.accountId(), cluster.getClusterIdentifier());
+                    containerManager.rollbackStartup(entry.accountId(), cluster.getClusterIdentifier());
                 } catch (Exception ex) {
                     LOG.warnv(ex, "Failed to stop container during recovery rollback for cluster {0}", cluster.getClusterIdentifier());
                 }
@@ -183,20 +218,35 @@ public class RedshiftService {
         return createCluster(identifier, nodeType, username, password, null, List.of(), List.of());
     }
 
-    // synchronized like modify/reboot: the container + proxy + port steps must not
-    // interleave with another admin call on the same cluster.
-    public synchronized Cluster createCluster(String identifier, String nodeType, String username, String password,
+    // Cluster lifecycle mutations take the scoped resource lock before the service monitor.
+    public Cluster createCluster(String identifier, String nodeType, String username, String password,
                                   String clusterSubnetGroupName, List<String> vpcSecurityGroupIds) {
         return createCluster(identifier, nodeType, username, password, clusterSubnetGroupName,
                 vpcSecurityGroupIds, List.of());
     }
 
-    public synchronized Cluster createCluster(String identifier, String nodeType, String username, String password,
+    public Cluster createCluster(String identifier, String nodeType, String username, String password,
                                                String clusterSubnetGroupName, List<String> vpcSecurityGroupIds,
                                                List<String> iamRoleArns) {
+        return createCluster(identifier, nodeType, username, password, clusterSubnetGroupName,
+                vpcSecurityGroupIds, iamRoleArns, null);
+    }
+
+    public Cluster createCluster(String identifier, String nodeType, String username, String password,
+                                               String clusterSubnetGroupName, List<String> vpcSecurityGroupIds,
+                                               List<String> iamRoleArns, String defaultIamRoleArn) {
+        return mutateCluster(identifier, () -> createClusterLocked(identifier, nodeType, username, password,
+                clusterSubnetGroupName, vpcSecurityGroupIds, iamRoleArns, defaultIamRoleArn));
+    }
+
+    private Cluster createClusterLocked(String identifier, String nodeType, String username, String password,
+                                               String clusterSubnetGroupName, List<String> vpcSecurityGroupIds,
+                                               List<String> iamRoleArns, String defaultIamRoleArn) {
         if (clusters.get(identifier).isPresent()) {
             throw new AwsException("ClusterAlreadyExists", "Cluster " + identifier + " already exists", 400);
         }
+        List<String> roles = iamRoleArns == null ? List.of() : List.copyOf(iamRoleArns);
+        String defaultRole = validateDefaultIamRole(defaultIamRoleArn, roles);
         // A previous cluster with this identifier may have been deleted without its temp
         // credentials being cleared; drop them so the new cluster starts with none.
         credentialBroker.revokeCluster(clusters.accountId(), identifier);
@@ -208,7 +258,8 @@ public class RedshiftService {
         cluster.setMasterPassword(password);
         cluster.setClusterSubnetGroupName(clusterSubnetGroupName);
         cluster.setVpcSecurityGroupIds(vpcSecurityGroupIds != null ? vpcSecurityGroupIds : List.of());
-        cluster.setIamRoleArns(iamRoleArns != null ? List.copyOf(iamRoleArns) : List.of());
+        cluster.setIamRoleArns(roles);
+        cluster.setDefaultIamRoleArn(defaultRole);
         // A group named at create time is applied afterwards via modifyCluster.
         cluster.setClusterParameterGroupName(DEFAULT_PARAMETER_GROUP_NAME);
         cluster.setClusterStatus("creating");
@@ -228,7 +279,7 @@ public class RedshiftService {
             proxyManager.startProxy(relayKey(accountId, identifier), proxyPort,
                     handle.getHost(), handle.getPort(), endpoint.getAddress(),
                     username, password, CLUSTER_DB_NAME,
-                    passwordValidatorFor(accountId, identifier), cluster.getIamRoleArns());
+                    passwordValidatorFor(accountId, identifier), cluster.getIamRoleArns(), cluster.getDefaultIamRoleArn());
             cluster.setContainerHost(handle.getHost());
             cluster.setContainerPort(handle.getPort());
             cluster.setEndpoint(endpoint);
@@ -264,16 +315,32 @@ public class RedshiftService {
         return cluster;
     }
 
-    public synchronized Cluster createClusterWithManagedMasterPassword(
+    public Cluster createClusterWithManagedMasterPassword(
             String identifier, String nodeType, String username, String clusterSubnetGroupName,
             List<String> vpcSecurityGroupIds, List<String> iamRoleArns,
             String kmsKeyId, String region) {
+        return createClusterWithManagedMasterPassword(identifier, nodeType, username, clusterSubnetGroupName,
+                vpcSecurityGroupIds, iamRoleArns, kmsKeyId, region, null);
+    }
+
+    public Cluster createClusterWithManagedMasterPassword(
+            String identifier, String nodeType, String username, String clusterSubnetGroupName,
+            List<String> vpcSecurityGroupIds, List<String> iamRoleArns,
+            String kmsKeyId, String region, String defaultIamRoleArn) {
+        return mutateCluster(identifier, () -> createClusterWithManagedMasterPasswordLocked(identifier,
+                nodeType, username, clusterSubnetGroupName, vpcSecurityGroupIds, iamRoleArns, kmsKeyId, region, defaultIamRoleArn));
+    }
+
+    private Cluster createClusterWithManagedMasterPasswordLocked(
+            String identifier, String nodeType, String username, String clusterSubnetGroupName,
+            List<String> vpcSecurityGroupIds, List<String> iamRoleArns,
+            String kmsKeyId, String region, String defaultIamRoleArn) {
         if (secretsManagerService == null) {
             throw new AwsException("InternalFailure", "Secrets Manager is unavailable", 500);
         }
         String password = RandomPasswordGenerator.generate(objectMapper.createObjectNode());
         Cluster cluster = createCluster(identifier, nodeType, username, password,
-                clusterSubnetGroupName, vpcSecurityGroupIds, iamRoleArns);
+                clusterSubnetGroupName, vpcSecurityGroupIds, iamRoleArns, defaultIamRoleArn);
         String secretName = "redshift/" + identifier;
         String secretString = managedMasterSecret(cluster, password);
         Secret secret;
@@ -594,13 +661,54 @@ public class RedshiftService {
         return clusters.scanForAccount(accountId, k -> true);
     }
 
-    public synchronized Cluster deleteCluster(String identifier) {
+    /** Internal deletion used by provisioner cleanup, which explicitly skips the final snapshot. */
+    public Cluster deleteCluster(String identifier) {
+        return deleteCluster(identifier, true, null, null);
+    }
+
+    public Cluster deleteCluster(String identifier, Boolean skipFinalClusterSnapshot,
+                                               String finalSnapshotIdentifier, Integer finalSnapshotRetentionPeriod) {
+        return withResourceLock("cluster", identifier, () -> {
+            Supplier<Cluster> deletion = () -> deleteClusterWithFinalSnapshot(identifier, skipFinalClusterSnapshot,
+                    finalSnapshotIdentifier, finalSnapshotRetentionPeriod);
+            return Boolean.TRUE.equals(skipFinalClusterSnapshot) ? deletion.get()
+                    : withResourceLock("snapshot", finalSnapshotIdentifier, deletion);
+        });
+    }
+
+    private Cluster deleteClusterWithFinalSnapshot(String identifier, Boolean skipFinalClusterSnapshot,
+                                                   String finalSnapshotIdentifier, Integer finalSnapshotRetentionPeriod) {
+        boolean skipSnapshot = Boolean.TRUE.equals(skipFinalClusterSnapshot);
+        if (skipSnapshot && finalSnapshotIdentifier != null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "FinalClusterSnapshotIdentifier cannot be supplied when SkipFinalClusterSnapshot is true", 400);
+        }
+        if (!skipSnapshot && (finalSnapshotIdentifier == null || finalSnapshotIdentifier.isBlank())) {
+            throw new AwsException("InvalidParameterCombination",
+                    "FinalClusterSnapshotIdentifier is required unless SkipFinalClusterSnapshot is true", 400);
+        }
+        int retentionPeriod = finalSnapshotRetentionPeriod == null ? -1 : finalSnapshotRetentionPeriod;
+        if (retentionPeriod != -1 && (retentionPeriod < 1 || retentionPeriod > 3653)) {
+            throw new AwsException("InvalidRetentionPeriodFault",
+                    "FinalClusterSnapshotRetentionPeriod must be -1 or between 1 and 3653", 400);
+        }
         Optional<Cluster> clusterOpt = clusters.get(identifier);
         if (clusterOpt.isEmpty()) {
             throw new AwsException("ClusterNotFound", "Cluster " + identifier + " not found", 404);
         }
         Cluster cluster = clusterOpt.get();
 
+        if (!skipSnapshot) {
+            if (!"available".equals(cluster.getClusterStatus())) {
+                throw new AwsException("InvalidClusterState", "Cluster must be available to create a final snapshot", 400);
+            }
+            createSnapshot(finalSnapshotIdentifier, identifier, retentionPeriod);
+        }
+
+        return mutate(() -> removeCluster(identifier, cluster));
+    }
+
+    private Cluster removeCluster(String identifier, Cluster cluster) {
         // Tear down the auth proxy and return its port before stopping the container.
         // If it fails, abort deletion so the metadata remains and the user can retry.
         if (!stopProxyAndReleasePortSafely(identifier, cluster.getProxyPort())) {
@@ -636,7 +744,14 @@ public class RedshiftService {
                 clusterParameterGroupName, vpcSecurityGroupIds, null);
     }
 
-    public synchronized Cluster modifyCluster(String clusterIdentifier, String nodeType, Integer numberOfNodes,
+    public Cluster modifyCluster(String clusterIdentifier, String nodeType, Integer numberOfNodes,
+                                               String masterUserPassword, String clusterParameterGroupName,
+                                               List<String> vpcSecurityGroupIds, Boolean multiAZ) {
+        return mutateCluster(clusterIdentifier, () -> modifyClusterLocked(clusterIdentifier, nodeType,
+                numberOfNodes, masterUserPassword, clusterParameterGroupName, vpcSecurityGroupIds, multiAZ));
+    }
+
+    private Cluster modifyClusterLocked(String clusterIdentifier, String nodeType, Integer numberOfNodes,
                                                String masterUserPassword, String clusterParameterGroupName,
                                                List<String> vpcSecurityGroupIds, Boolean multiAZ) {
         Cluster cluster = clusters.get(clusterIdentifier)
@@ -675,8 +790,19 @@ public class RedshiftService {
         return cluster;
     }
 
-    public synchronized Cluster modifyClusterIamRoles(String clusterIdentifier, List<String> addIamRoles,
+    public Cluster modifyClusterIamRoles(String clusterIdentifier, List<String> addIamRoles,
                                                       List<String> removeIamRoles) {
+        return modifyClusterIamRoles(clusterIdentifier, addIamRoles, removeIamRoles, null);
+    }
+
+    public Cluster modifyClusterIamRoles(String clusterIdentifier, List<String> addIamRoles,
+                                                      List<String> removeIamRoles, String defaultIamRoleArn) {
+        return mutateCluster(clusterIdentifier, () -> modifyClusterIamRolesLocked(clusterIdentifier,
+                addIamRoles, removeIamRoles, defaultIamRoleArn));
+    }
+
+    private Cluster modifyClusterIamRolesLocked(String clusterIdentifier, List<String> addIamRoles,
+                                                      List<String> removeIamRoles, String defaultIamRoleArn) {
         Cluster cluster = clusters.get(clusterIdentifier)
                 .orElseThrow(() -> new AwsException("ClusterNotFound", "Cluster " + clusterIdentifier + " not found", 404));
 
@@ -687,12 +813,30 @@ public class RedshiftService {
         Set<String> roles = new LinkedHashSet<>(cluster.getIamRoleArns());
         roles.addAll(addIamRoles);
         roles.removeAll(removeIamRoles);
+        String defaultRole = defaultIamRoleArn == null ? cluster.getDefaultIamRoleArn() : defaultIamRoleArn;
+        if (defaultIamRoleArn == null && !roles.contains(defaultRole)) {
+            defaultRole = null;
+        }
+        defaultRole = validateDefaultIamRole(defaultRole, List.copyOf(roles));
         cluster.setIamRoleArns(List.copyOf(roles));
+        cluster.setDefaultIamRoleArn(defaultRole);
 
-        proxyManager.updateIamRoles(relayKey(clusters.accountId(), clusterIdentifier), cluster.getIamRoleArns());
+        proxyManager.updateIamRoles(relayKey(clusters.accountId(), clusterIdentifier), cluster.getIamRoleArns(), defaultRole);
         clusters.put(clusterIdentifier, cluster);
         clusters.flush();
         return cluster;
+    }
+
+    private static String validateDefaultIamRole(String defaultIamRoleArn, List<String> iamRoleArns) {
+        if (defaultIamRoleArn == null || defaultIamRoleArn.isBlank()) {
+            return null;
+        }
+        requireIamRoleArn(defaultIamRoleArn);
+        if (!iamRoleArns.contains(defaultIamRoleArn)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Default IAM role must be associated with the cluster: " + defaultIamRoleArn, 400);
+        }
+        return defaultIamRoleArn;
     }
 
     private static void requireIamRoleArn(String arn) {
@@ -736,12 +880,19 @@ public class RedshiftService {
                 .orElseThrow(() -> new AwsException("ClusterNotFound", "Cluster " + clusterIdentifier + " not found", 404));
     }
 
-    public synchronized Cluster enableLogging(String clusterIdentifier, String bucketName, String s3KeyPrefix,
+    public Cluster enableLogging(String clusterIdentifier, String bucketName, String s3KeyPrefix,
                                               String logDestinationType, List<String> logExports) {
         return enableLogging(clusterIdentifier, bucketName, s3KeyPrefix, logDestinationType, logExports, null, null);
     }
 
-    public synchronized Cluster enableLogging(String clusterIdentifier, String bucketName, String s3KeyPrefix,
+    public Cluster enableLogging(String clusterIdentifier, String bucketName, String s3KeyPrefix,
+                                              String logDestinationType, List<String> logExports,
+                                              String s3TableKmsKeyId, String s3TableGranularity) {
+        return mutateCluster(clusterIdentifier, () -> enableLoggingLocked(clusterIdentifier, bucketName,
+                s3KeyPrefix, logDestinationType, logExports, s3TableKmsKeyId, s3TableGranularity));
+    }
+
+    private Cluster enableLoggingLocked(String clusterIdentifier, String bucketName, String s3KeyPrefix,
                                               String logDestinationType, List<String> logExports,
                                               String s3TableKmsKeyId, String s3TableGranularity) {
         Cluster cluster = clusters.get(clusterIdentifier)
@@ -772,7 +923,11 @@ public class RedshiftService {
         return cluster;
     }
 
-    public synchronized Cluster disableLogging(String clusterIdentifier) {
+    public Cluster disableLogging(String clusterIdentifier) {
+        return mutateCluster(clusterIdentifier, () -> disableLoggingLocked(clusterIdentifier));
+    }
+
+    private Cluster disableLoggingLocked(String clusterIdentifier) {
         Cluster cluster = clusters.get(clusterIdentifier)
                 .orElseThrow(() -> new AwsException("ClusterNotFound", "Cluster " + clusterIdentifier + " not found", 404));
         cluster.setLoggingEnabled(false);
@@ -787,12 +942,16 @@ public class RedshiftService {
         return cluster;
     }
 
-    public synchronized Cluster rebootCluster(String clusterIdentifier) {
+    public Cluster rebootCluster(String clusterIdentifier) {
+        return mutateCluster(clusterIdentifier, () -> rebootClusterLocked(clusterIdentifier));
+    }
+
+    private Cluster rebootClusterLocked(String clusterIdentifier) {
         Cluster cluster = clusters.get(clusterIdentifier)
                 .orElseThrow(() -> new AwsException("ClusterNotFound", "Cluster " + clusterIdentifier + " not found", 404));
 
-        // The container backing a cluster has no persistent volume (see RedshiftContainerManager),
-        // so a plain stop+recreate would silently drop the cluster's data. Dump before stopping and
+        // Replacement containers do not reattach the old anonymous volume, so a plain stop+recreate
+        // would silently drop the cluster's data. Dump before stopping and
         // restore immediately after starting, using a throwaway temp file, so no Snapshot resource is
         // created or exposed to the caller.
         Path tempDump;
@@ -805,16 +964,18 @@ public class RedshiftService {
         // Hoisted so a failure after the proxy is (re)started still tears it down and
         // returns the port, matching createCluster/restoreFromClusterSnapshot rollback.
         int proxyPort = cluster.getProxyPort() > 0 ? cluster.getProxyPort() : -1;
-        boolean originalTornDown = false; // original proxy + container already stopped
+        boolean teardownStarted = false;
+        boolean containerTeardownStarted = false;
         boolean rebooted = false;
         try {
             String accountId = clusters.accountId();
             String key = relayKey(accountId, clusterIdentifier);
 
             containerManager.takeSnapshot(accountId, clusterIdentifier, cluster.getMasterUsername(), tempDump);
+            teardownStarted = true;
             proxyManager.stopProxy(key);
+            containerTeardownStarted = true;
             containerManager.stop(accountId, clusterIdentifier);
-            originalTornDown = true;
 
             String password = cluster.getMasterPassword() != null ? cluster.getMasterPassword() : "admin";
             RedshiftContainerHandle handle = containerManager.start(
@@ -829,7 +990,7 @@ public class RedshiftService {
             cluster.setProxyPort(proxyPort);
             proxyManager.startProxy(key, proxyPort, handle.getHost(), handle.getPort(),
                     endpoint.getAddress(), cluster.getMasterUsername(), password, CLUSTER_DB_NAME,
-                    passwordValidatorFor(accountId, clusterIdentifier), cluster.getIamRoleArns());
+                    passwordValidatorFor(accountId, clusterIdentifier), cluster.getIamRoleArns(), cluster.getDefaultIamRoleArn());
             cluster.setContainerHost(handle.getHost());
             cluster.setContainerPort(handle.getPort());
             cluster.setEndpoint(endpoint);
@@ -838,15 +999,15 @@ public class RedshiftService {
             cluster.setClusterStatus("available");
             rebooted = true;
         } catch (AwsException e) {
-            rollbackReboot(clusterIdentifier, originalTornDown);
-            if (originalTornDown) {
+            rollbackReboot(clusterIdentifier, containerTeardownStarted);
+            if (teardownStarted) {
                 cluster.setClusterStatus("failed");
             }
             clusters.flush();
             throw e;
         } catch (Exception e) {
-            rollbackReboot(clusterIdentifier, originalTornDown);
-            if (originalTornDown) {
+            rollbackReboot(clusterIdentifier, containerTeardownStarted);
+            if (teardownStarted) {
                 cluster.setClusterStatus("failed");
             }
             clusters.flush();
@@ -859,9 +1020,9 @@ public class RedshiftService {
                     LOG.warnv(ex, "Failed to clean up temporary dump file {0} after rebooting cluster {1}", tempDump, clusterIdentifier);
                 }
             } else {
-                if (originalTornDown) {
-                    // Once the original container is torn down it holds no volume, so this dump can
-                    // be the only surviving copy of the cluster's data, so keep it for manual recovery.
+                if (teardownStarted) {
+                    // Teardown may have removed the original container before failing. Keep the
+                    // dump for manual recovery even when removal or log closure did not finish.
                     LOG.warnv("Reboot of cluster {0} did not complete; retained pre-reboot data dump at {1}",
                             clusterIdentifier, tempDump);
                 } else {
@@ -917,6 +1078,11 @@ public class RedshiftService {
     }
 
     public Snapshot createSnapshot(String snapshotIdentifier, String clusterIdentifier) {
+        return withResourceLock("cluster", clusterIdentifier, () -> withResourceLock("snapshot", snapshotIdentifier,
+                () -> createSnapshot(snapshotIdentifier, clusterIdentifier, null)));
+    }
+
+    private Snapshot createSnapshot(String snapshotIdentifier, String clusterIdentifier, Integer retentionPeriod) {
         validateSnapshotIdentifier(snapshotIdentifier);
         Optional<Cluster> clusterOpt = clusters.get(clusterIdentifier);
         if (clusterOpt.isEmpty()) {
@@ -935,6 +1101,7 @@ public class RedshiftService {
         snapshot.setMasterPassword(cluster.getMasterPassword());
         snapshot.setSnapshotArn(snapshotArn(clusterIdentifier, snapshotIdentifier));
         snapshot.setSnapshotCreateTime(Instant.now());
+        snapshot.setManualSnapshotRetentionPeriod(retentionPeriod);
         if (cluster.getEndpoint() != null) {
             snapshot.setPort(cluster.getEndpoint().getPort());
         } else {
@@ -948,18 +1115,31 @@ public class RedshiftService {
         if (!dumpFile.startsWith(dumpDir)) {
             throw new AwsException("InvalidParameterValue", "Invalid snapshot identifier", 400);
         }
+        boolean committed = false;
         try {
             Files.createDirectories(dumpDir);
             containerManager.takeSnapshot(clusters.accountId(), clusterIdentifier, cluster.getMasterUsername(), dumpFile);
             snapshot.setSqlDump(dumpFile.toString());
-        } catch (AwsException e) {
-            throw e;
+            snapshots.putAllAtomically(Map.of(snapshotIdentifier, snapshot));
+            committed = true;
+            snapshots.flush();
         } catch (Exception e) {
-            throw new AwsException("InternalFailure", "Failed to take snapshot for cluster " + clusterIdentifier + ": " + e.getMessage(), 500);
+            if (!committed) {
+                try {
+                    Files.deleteIfExists(dumpFile);
+                } catch (IOException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
+            }
+            if (e instanceof AwsException awsFailure) {
+                throw awsFailure;
+            }
+            AwsException failure = new AwsException("InternalFailure",
+                    "Failed to take snapshot for cluster " + clusterIdentifier + ": " + e.getMessage(), 500);
+            failure.initCause(e);
+            throw failure;
         }
 
-        snapshots.put(snapshotIdentifier, snapshot);
-        snapshots.flush();
         return snapshot;
     }
 
@@ -988,6 +1168,10 @@ public class RedshiftService {
     }
 
     public Snapshot deleteSnapshot(String snapshotIdentifier) {
+        return withResourceLock("snapshot", snapshotIdentifier, () -> mutate(() -> removeSnapshot(snapshotIdentifier)));
+    }
+
+    private Snapshot removeSnapshot(String snapshotIdentifier) {
         Optional<Snapshot> snapshotOpt = snapshots.get(snapshotIdentifier);
         if (snapshotOpt.isEmpty()) {
             throw new AwsException("ClusterSnapshotNotFound", "Snapshot " + snapshotIdentifier + " not found", 404);
@@ -1010,7 +1194,12 @@ public class RedshiftService {
         return restoreFromClusterSnapshot(clusterIdentifier, snapshotIdentifier, null);
     }
 
-    public synchronized Cluster restoreFromClusterSnapshot(String clusterIdentifier, String snapshotIdentifier, String nodeType) {
+    public Cluster restoreFromClusterSnapshot(String clusterIdentifier, String snapshotIdentifier, String nodeType) {
+        return withResourceLock("cluster", clusterIdentifier, () -> withResourceLock("snapshot", snapshotIdentifier,
+                () -> mutate(() -> restoreSnapshot(clusterIdentifier, snapshotIdentifier, nodeType))));
+    }
+
+    private Cluster restoreSnapshot(String clusterIdentifier, String snapshotIdentifier, String nodeType) {
         if (clusters.get(clusterIdentifier).isPresent()) {
             throw new AwsException("ClusterAlreadyExists", "Cluster " + clusterIdentifier + " already exists", 400);
         }
@@ -1063,7 +1252,7 @@ public class RedshiftService {
             proxyManager.startProxy(relayKey(accountId, clusterIdentifier), proxyPort,
                     handle.getHost(), handle.getPort(), endpoint.getAddress(),
                     username, password, CLUSTER_DB_NAME,
-                    passwordValidatorFor(accountId, clusterIdentifier), cluster.getIamRoleArns());
+                    passwordValidatorFor(accountId, clusterIdentifier), cluster.getIamRoleArns(), cluster.getDefaultIamRoleArn());
             cluster.setContainerHost(handle.getHost());
             cluster.setContainerPort(handle.getPort());
             cluster.setEndpoint(endpoint);
@@ -1439,7 +1628,14 @@ public class RedshiftService {
     }
 
     /** Copy is recorded on the cluster only; no snapshot is actually copied to another region. */
-    public synchronized Cluster enableSnapshotCopy(String clusterIdentifier, String destinationRegion,
+    public Cluster enableSnapshotCopy(String clusterIdentifier, String destinationRegion,
+                                                   Integer retentionPeriod, Integer manualRetentionPeriod,
+                                                   String snapshotCopyGrantName) {
+        return mutateCluster(clusterIdentifier, () -> enableSnapshotCopyLocked(clusterIdentifier,
+                destinationRegion, retentionPeriod, manualRetentionPeriod, snapshotCopyGrantName));
+    }
+
+    private Cluster enableSnapshotCopyLocked(String clusterIdentifier, String destinationRegion,
                                                    Integer retentionPeriod, Integer manualRetentionPeriod,
                                                    String snapshotCopyGrantName) {
         Cluster cluster = requireCluster(clusterIdentifier);
@@ -1470,7 +1666,11 @@ public class RedshiftService {
         return cluster;
     }
 
-    public synchronized Cluster disableSnapshotCopy(String clusterIdentifier) {
+    public Cluster disableSnapshotCopy(String clusterIdentifier) {
+        return mutateCluster(clusterIdentifier, () -> disableSnapshotCopyLocked(clusterIdentifier));
+    }
+
+    private Cluster disableSnapshotCopyLocked(String clusterIdentifier) {
         Cluster cluster = requireCluster(clusterIdentifier);
         if (cluster.getSnapshotCopyDestinationRegion() == null) {
             throw new AwsException("SnapshotCopyAlreadyDisabledFault",
@@ -1485,7 +1685,13 @@ public class RedshiftService {
         return cluster;
     }
 
-    public synchronized Cluster modifySnapshotCopyRetentionPeriod(String clusterIdentifier, int retentionPeriod,
+    public Cluster modifySnapshotCopyRetentionPeriod(String clusterIdentifier, int retentionPeriod,
+                                                                  boolean manual) {
+        return mutateCluster(clusterIdentifier,
+                () -> modifySnapshotCopyRetentionPeriodLocked(clusterIdentifier, retentionPeriod, manual));
+    }
+
+    private Cluster modifySnapshotCopyRetentionPeriodLocked(String clusterIdentifier, int retentionPeriod,
                                                                   boolean manual) {
         Cluster cluster = requireCluster(clusterIdentifier);
         // SnapshotCopyDisabledFault, not ...AlreadyDisabledFault: the model lists only this one here.
@@ -1629,7 +1835,13 @@ public class RedshiftService {
         snapshotSchedules.flush();
     }
 
-    public synchronized Cluster modifyClusterSnapshotSchedule(String clusterIdentifier, String scheduleIdentifier,
+    public Cluster modifyClusterSnapshotSchedule(String clusterIdentifier, String scheduleIdentifier,
+                                                              boolean disassociate) {
+        return mutateCluster(clusterIdentifier, () -> modifyClusterSnapshotScheduleLocked(clusterIdentifier,
+                scheduleIdentifier, disassociate));
+    }
+
+    private Cluster modifyClusterSnapshotScheduleLocked(String clusterIdentifier, String scheduleIdentifier,
                                                               boolean disassociate) {
         Cluster cluster = requireCluster(clusterIdentifier);
         if (disassociate) {
@@ -1905,17 +2117,14 @@ public class RedshiftService {
     }
 
     /**
-     * Undo a failed reboot. If {@code originalTornDown} is false the reboot failed before
-     * the original proxy + container were stopped, so the original data-bearing container
-     * is still running and nothing must be touched. Once it is true the original is gone:
-     * tear down the (replacement's) proxy and return its port, and remove any container
-     * running under the cluster's name: {@code containerManager.stop} works by name, so
-     * this also cleans a replacement that {@code containerManager.start} created before
-     * throwing (e.g. its readiness check timed out). The pre-reboot data dump is kept by
-     * the caller.
+     * Undo a failed reboot once container teardown has started. Before that point the
+     * original data-bearing container must be preserved, even if proxy shutdown failed.
+     * Teardown may be partial: stop the proxy and remove the container tracked by the
+     * manager, including a replacement retained after a failed readiness check. The
+     * caller keeps the pre-reboot data dump.
      */
-    private void rollbackReboot(String identifier, boolean originalTornDown) {
-        if (!originalTornDown) {
+    private void rollbackReboot(String identifier, boolean containerTeardownStarted) {
+        if (!containerTeardownStarted) {
             return;
         }
         try {

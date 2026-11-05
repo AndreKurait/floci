@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebRoles;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebZips;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.quarkus.test.junit.QuarkusTest;
@@ -36,8 +38,12 @@ class CloudFormationLambdaWebIntegrationTest {
     @Inject
     S3Service s3Service;
 
+    @Inject
+    IamService iamService;
+
     @Test
     void stackProvisionsFunctionRevisionAndEndpoint() {
+        LambdaWebRoles.trustLambda(iamService, "arn:aws:iam::000000000000:role/cfn-web");
         s3Service.createBucket(BUCKET, "us-east-1");
         s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
         String suffix = Long.toString(System.nanoTime(), 36);
@@ -103,6 +109,7 @@ class CloudFormationLambdaWebIntegrationTest {
 
     @Test
     void aRevisionOnCodeThatIsNotAZipFailsItsResource() {
+        LambdaWebRoles.trustLambda(iamService, "arn:aws:iam::000000000000:role/cfn-web");
         s3Service.createBucket(BUCKET, "us-east-1");
         s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
         s3Service.putObject(BUCKET, "notzip.zip", "this is not a zip\n".getBytes(StandardCharsets.UTF_8),

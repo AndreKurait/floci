@@ -18,8 +18,10 @@ import org.junit.jupiter.api.TestMethodOrder;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -620,11 +622,13 @@ class CodeArtifactPypiDockerIntegrationTest {
 
     /**
      * The real-world gap this closes: {@code ListPackageVersionAssets} used to not exist at all.
-     * Confirms the bridge enumerates pypi's one-asset-per-version simple index entry against the
-     * real pypiserver sidecar (not a mock) and reports the exact byte size and hash of a freshly
-     * uploaded file. A throwaway package, not {@link #PACKAGE_NAME}: {@link
+     * Confirms the bridge enumerates a single-asset pypi version against the real pypiserver
+     * sidecar (not a mock) and reports the exact byte size and hash of a freshly uploaded file. A
+     * throwaway package, not {@link #PACKAGE_NAME}: {@link
      * #deletePackageRemovesTheFileFromTheRealPypiserverSidecar} deletes that fixture for good with
-     * no republish afterward, unlike this format's sibling test classes.
+     * no republish afterward, unlike this format's sibling test classes. {@link
+     * #listPackageVersionAssetsListsBothTheSdistAndTheWheelOfOneVersion} covers the multi-asset
+     * case this one doesn't.
      */
     @Test
     @Order(18)
@@ -670,6 +674,101 @@ class CodeArtifactPypiDockerIntegrationTest {
                 .body("versions[0].version", equalTo("1.0.0"))
                 .body("versions[0].status", equalTo("Published"))
                 .body("versions[0].origin.originType", equalTo("INTERNAL"));
+    }
+
+    /**
+     * The bug this fixes: {@code CodeArtifactService#listPackageVersionAssets}'s own javadoc used
+     * to claim {@code pypi} genuinely has exactly one asset per version, the same wrong assumption
+     * {@link #listPackageVersionAssetsBridgesToTheRealPypiserverSidecar}'s javadoc made. A real
+     * pypi release commonly carries both a source distribution and a wheel for the same version
+     * (the exact shape {@link #copyPackageVersionsOverwriteKeepsEveryAssetWhenAPypiReleaseHasBothAnSdistAndAWheel}
+     * already uploads for its own purpose), so this confirms the real pypiserver sidecar lists
+     * both, each with its own correct size and hash, not just one of them.
+     */
+    @Test
+    @Order(20)
+    @SuppressWarnings("unchecked")
+    void listPackageVersionAssetsListsBothTheSdistAndTheWheelOfOneVersion() {
+        String packageName = "list-assets-multi-pypi-pkg";
+        String sdistFilename = "list_assets_multi_pypi_pkg-1.0.0.tar.gz";
+        String wheelFilename = "list_assets_multi_pypi_pkg-1.0.0-py3-none-any.whl";
+        byte[] sdistContent = "list-assets-multi-sdist-bytes".getBytes(StandardCharsets.UTF_8);
+        byte[] wheelContent = "list-assets-multi-wheel-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(twineUploadBody("boundary123", packageName, sdistFilename, sdistContent))
+                .post("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/")
+                .then().statusCode(200);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(twineUploadBody("boundary123", packageName, wheelFilename, wheelContent))
+                .post("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/")
+                .then().statusCode(200);
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/package/version/assets?domain=" + DOMAIN + "&repository=" + REPO + "&format=pypi"
+                        + "&package=" + packageName + "&version=1.0.0")
+                .then().statusCode(200)
+                .body("package", equalTo(packageName))
+                .body("assets.size()", equalTo(2))
+                .extract().jsonPath();
+        List<Map<String, Object>> assets = (List<Map<String, Object>>) (List<?>) body.getList("assets");
+        Map<String, Object> sdistAsset = findAssetByName(assets, sdistFilename);
+        assertEquals(sdistContent.length, sdistAsset.get("size"));
+        assertEquals(Digests.sha256Hex(sdistContent), ((Map<?, ?>) sdistAsset.get("hashes")).get("SHA-256"));
+        Map<String, Object> wheelAsset = findAssetByName(assets, wheelFilename);
+        assertEquals(wheelContent.length, wheelAsset.get("size"));
+        assertEquals(Digests.sha256Hex(wheelContent), ((Map<?, ?>) wheelAsset.get("hashes")).get("SHA-256"));
+    }
+
+    private static Map<String, Object> findAssetByName(List<Map<String, Object>> assets, String name) {
+        for (Map<String, Object> asset : assets) {
+            if (name.equals(asset.get("name"))) {
+                return asset;
+            }
+        }
+        throw new AssertionError("expected an asset named " + name + " among " + assets);
+    }
+
+    /**
+     * The real-world gap this guards against: {@code PypiserverSidecarClient#listPackageVersions}
+     * used to send one {@code HEAD} per version, one at a time, so a package with many versions
+     * answered no faster than its slowest version's own round trip, times the version count. This
+     * uploads enough versions that a broken fan-out (dropped, duplicated, or silently empty results
+     * from the bounded executor) would show up as something other than exactly this set of
+     * versions, against the real pypiserver sidecar, not a mock.
+     */
+    @Test
+    @Order(21)
+    void listPackageVersionsFetchesManyVersionsPublishTimesCorrectly() {
+        String packageName = "many-versions-pypi-pkg";
+        int versionCount = 12;
+        Set<String> expectedVersions = new HashSet<>();
+        for (int i = 1; i <= versionCount; i++) {
+            String version = "1.0." + i;
+            expectedVersions.add(version);
+            String filename = "many_versions_pypi_pkg-" + version + ".tar.gz";
+            byte[] content = ("many-versions-sdist-bytes-" + i).getBytes(StandardCharsets.UTF_8);
+            given().header("Authorization", "Bearer " + bearerToken)
+                    .contentType("multipart/form-data; boundary=boundary123")
+                    .body(twineUploadBody("boundary123", packageName, filename, content))
+                    .post("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/")
+                    .then().statusCode(200);
+        }
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=pypi"
+                        + "&package=" + packageName)
+                .then().statusCode(200)
+                .body("package", equalTo(packageName))
+                .body("versions.size()", equalTo(versionCount))
+                .extract().jsonPath();
+        List<String> actualVersions = body.getList("versions.version", String.class);
+        assertEquals(expectedVersions, new HashSet<>(actualVersions));
+        String defaultDisplayVersion = body.getString("defaultDisplayVersion");
+        assertTrue(expectedVersions.contains(defaultDisplayVersion),
+                "expected defaultDisplayVersion to be one of the uploaded versions, got "
+                        + defaultDisplayVersion);
     }
 
     /**

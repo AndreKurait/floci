@@ -107,6 +107,7 @@ class StsQueryHandlerTest {
                 mock(SAMLProviderService.class),
                 mock(SAMLTrustPolicyEvaluator.class),
                 delegation,
+                mock(CentralRootAccess.class),
                 clock);
     }
 
@@ -661,7 +662,7 @@ class StsQueryHandlerTest {
         StsQueryHandler handler = new StsQueryHandler(iamService, mock(AccountResolver.class),
                 new RegionResolver(REGION, "000000000000"), config, mock(AssumeRolePolicyEvaluator.class),
                 trust, verifier, keys, mock(SAMLProviderService.class), mock(SAMLTrustPolicyEvaluator.class),
-                mock(DelegationRequestService.class));
+                mock(DelegationRequestService.class), mock(CentralRootAccess.class));
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         params.putSingle("RoleArn", requestedRoleArn);
         params.putSingle("RoleSessionName", "app");

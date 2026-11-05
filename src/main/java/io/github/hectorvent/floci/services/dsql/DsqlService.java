@@ -6,7 +6,6 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Digests;
-import io.github.hectorvent.floci.core.common.IamConditionContextResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -28,7 +27,6 @@ import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -332,13 +330,9 @@ public class DsqlService implements Resettable {
 
     private boolean deniesCaller(String policy, String clusterArn, String region, String action) {
         CallerArns caller = principals.caller();
-        Map<String, List<String>> context = new HashMap<>();
-        caller.putPrincipalKeys(context);
-        String accountId = regionResolver.getAccountId();
-        Map<String, List<String>> effective = IamConditionContextResolver.withGlobalContext(
-                context, clusterArn, region, accountId, accountId);
-        return policyEvaluator.evaluateResourcePolicyFor(List.of(policy), RequestPrincipal.caller(caller),
-                action, clusterArn, effective) == ResourcePolicyDecision.EXPLICIT_DENY;
+        return policyEvaluator.evaluateResourcePolicyFor(List.of(policy), RequestPrincipal.caller(caller), action,
+                clusterArn, principals.policyContext(caller, clusterArn, region, Map.of()))
+                == ResourcePolicyDecision.EXPLICIT_DENY;
     }
 
     // ── Tags ──────────────────────────────────────────────────────────────────
@@ -472,7 +466,8 @@ public class DsqlService implements Resettable {
         }
     }
 
-    private Optional<DsqlCluster> clusterOfArn(String arn) {
+    /** The cluster {@code arn} names in the caller's account, if there is one. */
+    public Optional<DsqlCluster> clusterOfArn(String arn) {
         AwsArnUtils.Arn parsed = clusterArnOrNull(arn);
         if (parsed == null || !regionResolver.getAccountId().equals(parsed.accountId())) {
             return Optional.empty();
@@ -491,15 +486,14 @@ public class DsqlService implements Resettable {
         if (parsed == null) {
             throw new AwsException("AccessDeniedException", "Invalid input for 'resourceArn'. The cluster ARN that you"
                     + " specified isn't valid. Provide the cluster ARN in the format"
-                    + " 'arn:partition:dsql:region:account-id:cluster/cluster-id' and try again.User: " + caller
-                    + " is not authorized to perform: dsql:" + action + " on resource: * with an explicit deny in a"
-                    + " resource-based policy", 403);
+                    + " 'arn:partition:dsql:region:account-id:cluster/cluster-id' and try again."
+                    + DsqlPrincipals.notAuthorized(caller, "dsql:" + action, "*",
+                            DsqlPrincipals.EXPLICIT_RESOURCE_DENY), 403);
         }
         if (!regionResolver.getAccountId().equals(parsed.accountId())) {
             // Measured: another account's cluster is refused, not looked up in the caller's.
-            throw new AwsException("AccessDeniedException", "User: " + caller + " is not authorized to perform: dsql:"
-                    + action + " on resource: " + arn + " because no resource-based policy allows the dsql:" + action
-                    + " action", 403);
+            throw new AwsException("AccessDeniedException", DsqlPrincipals.notAuthorized(caller, "dsql:" + action, arn,
+                    "because no resource-based policy allows the dsql:" + action + " action"), 403);
         }
         if (!region.equals(parsed.region())) {
             throw new AwsException("BadRequestException", "Invalid input resource arn: expected region " + region, 400);

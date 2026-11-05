@@ -90,8 +90,8 @@ metadata.
 | `ami-sles15sp6` | | `registry.suse.com/bci/bci-base:15.6` |
 | `ami-sles15sp7` | | `registry.suse.com/bci/bci-base:15.7` |
 | `ami-sles160` | | `registry.suse.com/bci/bci-base:16.0` |
-| `ami-rocky9` | | `public.ecr.aws/docker/library/rockylinux:9` |
-| `ami-rocky10` | | `quay.io/rockylinux/rockylinux:10` |
+| `ami-rocky9` | | `quay.io/rockylinux/rockylinux:9.6` |
+| `ami-rocky10` | | `quay.io/rockylinux/rockylinux:10.0` |
 | `ami-rhel8` | | `registry.access.redhat.com/ubi8/ubi:8.10` |
 | `ami-rhel9` | | `registry.access.redhat.com/ubi9/ubi:9.5` |
 
@@ -737,6 +737,26 @@ through `payment-pending`/`assessing`. `DescribeCapacityReservations` supports t
 `instance-type`, `state` and `tenancy` filters alongside the shared `tag:`, `tag-key` and
 `tag-value` filters.
 
+On-demand launches consume matching open reservation capacity unless their preference is
+`none`. RunInstances also honors an explicit reservation target, including one supplied by
+its launch template. `capacity-reservations-only` requires matching reservation capacity and
+never falls back to On-Demand capacity when launching or restarting. It can accompany an
+explicit reservation target; without one, only matching open reservations are eligible.
+A matching targeted reservation with too few available slots returns
+`ReservationCapacityExceeded` on launch or restart.
+CreateFleet and AutoScaling retain the template's preference and target;
+CloudFormation launch templates preserve the same declaration. Creating an open reservation
+adopts matching, unassociated running instances with an `open` preference. DescribeInstances
+reports the acquired reservation. Stop, termination,
+cancellation and expiration release membership; a restart acquires capacity using the
+instance's retained launch preference and target. A failed membership write reports an error;
+subsequent access reconciles released membership from persisted instance state.
+
+Membership and available counts publish in one atomic storage batch. Older snapshots without
+membership remain readable. Capacity reservation resource-group targeting is unsupported.
+
+Capacity reservation zone IDs must be among those returned by `DescribeAvailabilityZones`.
+
 ### Dedicated Hosts
 
 | Action | Description |
@@ -812,6 +832,9 @@ allocated address.
 | DescribeAvailabilityZones | Returns the configured local availability zones. |
 | DescribeRegions | Returns the regions known to the local EC2 service. |
 | DescribeAccountAttributes | Returns local account-level EC2 attributes. |
+
+The modeled zones are standard Availability Zones. Each reports `NetworkBorderGroup` as its
+Region, such as `eu-west-1`. Local Zones and Wavelength Zones are not modeled.
 
 A zone id has AWS's shape, a short region prefix and `-az<n>`: `use1-az1` in `us-east-1`, `apne1-az1`
 in `ap-northeast-1`, `usgw1-az1` in `us-gov-west-1`. On AWS the pairing of a zone name with a zone id
@@ -912,6 +935,12 @@ Two behaviours worth calling out, because they are what Terraform reads back:
   (`InvalidParameterCombination`); place the subnet on the primary network interface instead.
 
 #### Launch template versions
+
+For a specified template, `DescribeLaunchTemplateVersions` returns all stored versions in
+ascending numeric order by default. `LaunchTemplateVersion.N` selects explicit version numbers,
+`$Latest`, or `$Default`; the legacy `Versions.N` spelling is also accepted. Without an explicit
+version list, `MinVersion` is exclusive and `MaxVersion` inclusive. Explicit versions take
+precedence over the range. Filtering, pagination, and listing across all templates are unchanged.
 
 `CreateLaunchTemplateVersion` accepts two members outside `LaunchTemplateData` itself:
 
@@ -1154,6 +1183,10 @@ One network per **VPC**, not per subnet: subnets inside a VPC route to each othe
 network per subnet would manufacture a partition AWS does not have. Per-subnet addressing is kept
 anyway: the network's IPAM pool is the whole VPC CIDR and each subnet allocates static addresses
 out of its own slice of it.
+
+An address a subnet picks on its own is never one that an instance, network interface or NAT
+gateway in the subnet already holds. Default subnet ids are the same in every account, so those
+subnets share a network, and what any account holds there counts.
 
 The declared CIDR is used verbatim whenever it can be. It cannot be when it is absent, malformed,
 outside RFC 1918, or already claimed on the Docker daemon, including by another Floci VPC, since

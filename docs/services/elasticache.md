@@ -40,6 +40,8 @@ Floci manages real Valkey/Redis Docker containers and proxies TCP connections to
 | `ModifyCacheParameterGroup` | Set parameters on a group |
 | `DescribeCacheParameters` | List the parameters set on a group |
 | `DeleteCacheParameterGroup` | Delete a cache parameter group |
+| `AddTagsToResource` | - |
+| `RemoveTagsFromResource` | - |
 | `ListTagsForResource` | Read stored tags for supported ElastiCache resource ARNs |
 <!-- floci:actions:end -->
 

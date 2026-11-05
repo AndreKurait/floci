@@ -85,6 +85,7 @@ public class IamQueryHandler {
     private final ServiceLastAccessedService serviceLastAccessedService;
     private final OrganizationsAccessReportService organizationsAccessReportService;
     private final DelegationRequestService delegationRequestService;
+    private final CentralRootAccess centralRootAccess;
     private final RegionResolver regionResolver;
     private final Instance<ServerCertificateReferenceProvider> serverCertificateReferenceProviders;
     /** Signs each page's Marker, so only a marker this handler issued names an item. */
@@ -96,6 +97,7 @@ public class IamQueryHandler {
                            ServiceLastAccessedService serviceLastAccessedService,
                            OrganizationsAccessReportService organizationsAccessReportService,
                            DelegationRequestService delegationRequestService,
+                           CentralRootAccess centralRootAccess,
                            RegionResolver regionResolver,
                            Instance<ServerCertificateReferenceProvider> serverCertificateReferenceProviders) {
         this.iamService = iamService;
@@ -105,6 +107,7 @@ public class IamQueryHandler {
         this.serviceLastAccessedService = serviceLastAccessedService;
         this.organizationsAccessReportService = organizationsAccessReportService;
         this.delegationRequestService = delegationRequestService;
+        this.centralRootAccess = centralRootAccess;
         this.regionResolver = regionResolver;
         this.serverCertificateReferenceProviders = serverCertificateReferenceProviders;
     }
@@ -338,6 +341,7 @@ public class IamQueryHandler {
             case "SendDelegationToken" -> handleSendDelegationToken(params, authorization);
             case "GetDelegationRequest" -> handleGetDelegationRequest(params);
             case "ListDelegationRequests" -> handleListDelegationRequests(params);
+            case "GetHumanReadableSummary" -> handleGetHumanReadableSummary(params);
 
             default -> AwsQueryResponse.error("UnsupportedOperation",
                     "Operation " + action + " is not supported.", AwsNamespaces.IAM, 400);
@@ -2024,38 +2028,42 @@ public class IamQueryHandler {
     // =========================================================================
 
     private Response handleListOrganizationsFeatures(MultivaluedMap<String, String> params) {
-        return rootFeaturesResponse("ListOrganizationsFeatures", iamService.listOrganizationsFeatures());
+        return rootFeaturesResponse("ListOrganizationsFeatures",
+                centralRootAccess.list(regionResolver.getAccountId()));
     }
 
     private Response handleEnableOrganizationsRootCredentialsManagement(MultivaluedMap<String, String> params) {
         return rootFeaturesResponse("EnableOrganizationsRootCredentialsManagement",
-                iamService.enableOrganizationsRootCredentialsManagement());
+                centralRootAccess.enableRootCredentialsManagement(regionResolver.getAccountId()));
     }
 
     private Response handleEnableOrganizationsRootSessions(MultivaluedMap<String, String> params) {
         return rootFeaturesResponse("EnableOrganizationsRootSessions",
-                iamService.enableOrganizationsRootSessions());
+                centralRootAccess.enableRootSessions(regionResolver.getAccountId()));
     }
 
     private Response handleDisableOrganizationsRootCredentialsManagement(MultivaluedMap<String, String> params) {
         return rootFeaturesResponse("DisableOrganizationsRootCredentialsManagement",
-                iamService.disableOrganizationsRootCredentialsManagement());
+                centralRootAccess.disableRootCredentialsManagement(regionResolver.getAccountId()));
     }
 
     private Response handleDisableOrganizationsRootSessions(MultivaluedMap<String, String> params) {
         return rootFeaturesResponse("DisableOrganizationsRootSessions",
-                iamService.disableOrganizationsRootSessions());
+                centralRootAccess.disableRootSessions(regionResolver.getAccountId()));
     }
 
     /**
-     * Builds the shared {@code <EnabledFeatures><member>..</member></EnabledFeatures>} result used by
-     * both {@code ListOrganizationsFeatures} and the enable/disable ops. The org-scoped
-     * {@code OrganizationId} is intentionally omitted — LZA's root-user-management module reads only
-     * the enabled-feature set, and omitting it avoids coupling the IAM endpoint to Organizations.
+     * The shared {@code OrganizationId} and {@code EnabledFeatures} result all five feature
+     * operations answer, in the order the model declares them. The organization id used to be
+     * omitted here to keep IAM off Organizations; the caller checks the reference models on these
+     * operations need the organization anyway, and {@link CentralRootAccess} asks for it through a
+     * provider interface, so the member is answered as published.
      */
-    private Response rootFeaturesResponse(String action, List<String> features) {
-        XmlBuilder xml = new XmlBuilder().start("EnabledFeatures");
-        for (String feature : features) {
+    private Response rootFeaturesResponse(String action, CentralRootAccess.Features features) {
+        XmlBuilder xml = new XmlBuilder()
+                .elem("OrganizationId", features.organizationId())
+                .start("EnabledFeatures");
+        for (String feature : features.enabledFeatures()) {
             xml.elem("member", feature);
         }
         String result = xml.end("EnabledFeatures").build();
@@ -2682,6 +2690,27 @@ public class IamQueryHandler {
         return xml.build();
     }
 
+    /**
+     * The summary of a delegation request, in Markdown, with the generation state beside it.
+     *
+     * <p>{@code SummaryContent} is left out of the answer unless the state is {@code AVAILABLE},
+     * the model saying it "is non-empty only if the SummaryState is AVAILABLE": an absent member
+     * and an empty one read the same to an SDK, and omitting it keeps the response from carrying a
+     * summary that is not there.
+     */
+    private Response handleGetHumanReadableSummary(MultivaluedMap<String, String> params) {
+        DelegationRequestService.Summary summary = delegationRequestService.summarize(
+                regionResolver.getAccountId(), getParam(params, "EntityArn"),
+                getParam(params, "Locale"));
+        String result = new XmlBuilder()
+                .elem("SummaryContent", summary.content())
+                .elem("Locale", summary.locale())
+                .elem("SummaryState", summary.state())
+                .build();
+        return Response.ok(AwsQueryResponse.envelope("GetHumanReadableSummary",
+                AwsNamespaces.IAM, result)).build();
+    }
+
     /** {@code Permissions} is a structure, so its members arrive dotted under that prefix. */
     private DelegationPermission parseDelegationPermissions(MultivaluedMap<String, String> params) {
         String templateArn = getParam(params, "Permissions.PolicyTemplateArn");
@@ -2690,7 +2719,13 @@ public class IamQueryHandler {
             String prefix = "Permissions.Parameters.member." + index;
             List<String> values = new ArrayList<>();
             for (int valueIndex : memberIndices(params, prefix + ".Values.member.")) {
-                values.add(getParam(params, prefix + ".Values.member." + valueIndex));
+                // An index is read off the keys, so one can be present through a key of its own
+                // that carries no value, as a dotted sub-member does. That is no value to store:
+                // AWS reads the member it knows and nothing from the key it does not.
+                String value = getParam(params, prefix + ".Values.member." + valueIndex);
+                if (value != null) {
+                    values.add(value);
+                }
             }
             parameters.add(new PolicyParameter(getParam(params, prefix + ".Name"),
                     getParam(params, prefix + ".Type"), values));

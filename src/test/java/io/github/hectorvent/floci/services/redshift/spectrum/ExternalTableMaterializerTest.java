@@ -100,6 +100,7 @@ class ExternalTableMaterializerTest {
         s3 = mock(S3Service.class);
         iam = mock(IamService.class);
         IamRole role = mock(IamRole.class);
+        when(role.getArn()).thenReturn("arn:aws:iam::000000000000:role/R");
         when(role.getAssumeRolePolicyDocument()).thenReturn(TRUST_POLICY);
         when(iam.findRole(ACCOUNT, "R")).thenReturn(Optional.of(role));
         EmulatorConfig config = mock(EmulatorConfig.class, Answers.RETURNS_DEEP_STUBS);

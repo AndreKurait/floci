@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryController;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.IamConditionContextResolver;
 import io.github.hectorvent.floci.core.common.IamEnforcementFilter;
 import io.github.hectorvent.floci.core.common.OidcIssuerKeyLookup;
@@ -17,6 +18,7 @@ import io.github.hectorvent.floci.core.common.WebIdentityToken;
 import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.iam.model.DelegationRequest;
+import io.github.hectorvent.floci.services.iam.model.IamPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -54,6 +56,11 @@ public class StsQueryHandler {
 
     private static final Logger LOG = Logger.getLogger(StsQueryHandler.class);
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    /** Where the five task policies the guide names for a privileged session live. */
+    private static final String ROOT_TASK_POLICY_PATH = "/root-task/";
+    /** "the maximum session duration of 900 seconds (15 minutes)", which is also the default here. */
+    private static final int MAX_ROOT_SESSION_SECONDS = 900;
+    private static final int MAX_SESSION_TOKEN_SIZE = 4096;
     private static final String STS_AUDIENCE = "sts.amazonaws.com"; // partition-literal: web-identity audience; no source outside the commercial partition (P9)
 
     private final IamService iamService;
@@ -67,6 +74,7 @@ public class StsQueryHandler {
     private final SAMLProviderService samlProviderService;
     private final SAMLTrustPolicyEvaluator samlTrustEvaluator;
     private final DelegationRequestService delegationRequestService;
+    private final CentralRootAccess centralRootAccess;
     private final Clock clock;
 
     /** CSPRNG for session secret keys and session tokens; ordinary IDs keep using {@link ThreadLocalRandom}. */
@@ -89,10 +97,11 @@ public class StsQueryHandler {
                            OidcIssuerKeyLookup oidcIssuerKeys,
                            SAMLProviderService samlProviderService,
                            SAMLTrustPolicyEvaluator samlTrustEvaluator,
-                           DelegationRequestService delegationRequestService) {
+                           DelegationRequestService delegationRequestService,
+                           CentralRootAccess centralRootAccess) {
         this(iamService, accountResolver, regionResolver, config, trustPolicyEvaluator, webIdentityTrustEvaluator,
                 tokenVerifier, oidcIssuerKeys, samlProviderService, samlTrustEvaluator, delegationRequestService,
-                Clock.systemUTC());
+                centralRootAccess, Clock.systemUTC());
     }
 
     StsQueryHandler(IamService iamService, AccountResolver accountResolver, RegionResolver regionResolver,
@@ -103,6 +112,7 @@ public class StsQueryHandler {
                     SAMLProviderService samlProviderService,
                     SAMLTrustPolicyEvaluator samlTrustEvaluator,
                     DelegationRequestService delegationRequestService,
+                    CentralRootAccess centralRootAccess,
                     Clock clock) {
         this.iamService = iamService;
         this.accountResolver = accountResolver;
@@ -115,6 +125,7 @@ public class StsQueryHandler {
         this.samlProviderService = samlProviderService;
         this.samlTrustEvaluator = samlTrustEvaluator;
         this.delegationRequestService = delegationRequestService;
+        this.centralRootAccess = centralRootAccess;
         this.clock = clock;
     }
 
@@ -131,6 +142,7 @@ public class StsQueryHandler {
             case "GetFederationToken"          -> handleGetFederationToken(params);
             case "DecodeAuthorizationMessage"  -> handleDecodeAuthorizationMessage(params);
             case "GetDelegatedAccessToken"     -> handleGetDelegatedAccessToken(params);
+            case "AssumeRoot"                  -> handleAssumeRoot(params);
             default -> AwsQueryResponse.error("UnsupportedOperation",
                     "Operation " + action + " is not supported by STS.", AwsNamespaces.STS, 400);
         };
@@ -714,6 +726,187 @@ public class StsQueryHandler {
                 .build();
         return Response.ok(AwsQueryResponse.envelope("GetDelegatedAccessToken",
                 AwsNamespaces.STS, result)).build();
+    }
+
+    /**
+     * A privileged session on a member account: "Returns a set of short term credentials you can
+     * use to perform privileged tasks on a member account in your organization." The session acts
+     * as that account's root user, scoped by the task policy the request names, which is what the
+     * guide means by "you must define TaskPolicyArn to scope the session to the privileged action
+     * to be performed during the session".
+     *
+     * <p>Four refusals, each from a published sentence and each {@code AccessDenied} 403 because
+     * the operation models only {@code RegionDisabled} and {@code ExpiredToken}: the caller must
+     * be the management account or a delegated administrator for IAM, must not be root ("You
+     * cannot use root user credentials to call sts:AssumeRoot"), must have {@code RootSessions}
+     * enabled for the organization, and the target must be a member account other than the
+     * management account, privileged tasks being what the management account does to members. Both
+     * credentials this emulator reads as the account root are refused, so the caller is an IAM
+     * user or role of that account. The
+     * task policy is held to the five AWS publishes for it, by the {@code /root-task/} path of an
+     * AWS managed policy rather than by a list of names, and anything else is a
+     * {@code ValidationError}: no source gives a code for that one, so it is the shape every other
+     * member violation answers here.
+     *
+     * <p>The global endpoint is refused when the request arrives on it, "The global endpoint is
+     * not supported for AssumeRoot. You must send this request to a Regional AWS STS endpoint." A
+     * request to a local host carries no such name, so there is nothing to refuse there.
+     */
+    private Response handleAssumeRoot(MultivaluedMap<String, String> params) {
+        if (arrivedOnTheGlobalEndpoint()) {
+            return AwsQueryResponse.error("ValidationError", "The global endpoint is not supported for"
+                    + " AssumeRoot. You must send this request to a Regional AWS STS endpoint.",
+                    AwsNamespaces.STS, 400);
+        }
+        Response validation = validateRequired(params, "TargetPrincipal", "TaskPolicyArn.arn");
+        if (validation != null) {
+            return validation;
+        }
+        String targetPrincipal = getParam(params, "TargetPrincipal");
+        if (targetPrincipal.length() < 12 || targetPrincipal.length() > 2048) {
+            String constraint = targetPrincipal.length() < 12
+                    ? "Member must have length greater than or equal to 12"
+                    : "Member must have length less than or equal to 2048";
+            return AwsQueryResponse.error("ValidationError",
+                    SmithyValidationErrors.message(List.of("Value '" + targetPrincipal
+                            + "' at 'targetPrincipal' failed to satisfy constraint: " + constraint)),
+                    AwsNamespaces.STS, 400);
+        }
+        Response durationValidation = validateDurationSeconds(params, 0, 900);
+        if (durationValidation != null) {
+            return durationValidation;
+        }
+        Response tokenSizeValidation = validateMinimumSessionTokenSize(params);
+        if (tokenSizeValidation != null) {
+            return tokenSizeValidation;
+        }
+        String callerAccountId = regionResolver.getAccountId();
+        Response rootCaller = refuseRootCredentials(callerAccountId);
+        if (rootCaller != null) {
+            return rootCaller;
+        }
+        RootAccessOrganization.Membership organization =
+                centralRootAccess.privilegedSessionOrganization(callerAccountId);
+        String targetAccountId = accountOf(targetPrincipal);
+        if (targetAccountId == null || !organization.memberAccountIds().contains(targetAccountId)
+                || organization.isManagementAccount(targetAccountId)) {
+            return AwsQueryResponse.error("AccessDenied", "User: " + callerAccountId + " is not authorized to"
+                    + " perform: sts:AssumeRoot on " + targetPrincipal + " because it is not a member account"
+                    + " of the organization.", AwsNamespaces.STS, 403);
+        }
+        String taskPolicyArn = getParam(params, "TaskPolicyArn.arn");
+        if (!namesARootTaskPolicy(taskPolicyArn)) {
+            return AwsQueryResponse.error("ValidationError", "The task policy "
+                    + taskPolicyArn + " cannot scope a privileged session. Use one of the AWS managed"
+                    + " policies under " + ROOT_TASK_POLICY_PATH + ".", AwsNamespaces.STS, 400);
+        }
+        IamPolicy taskPolicy = iamService.getPolicy(taskPolicyArn);
+
+        int durationSeconds = getIntParam(params, "DurationSeconds", MAX_ROOT_SESSION_SECONDS);
+        Instant expiration = clock.instant().plusSeconds(durationSeconds);
+        String accessKeyId = "ASIA" + randomId(16);
+        String secretKey = randomSecret(40);
+        String sessionToken = randomSecret(Math.max(200,
+                getIntParam(params, "MinimumSessionTokenSize", 0)));
+        // The session is the member account's root user, bounded by the task policy. The origin is
+        // the member account too: the privileged task is performed there, not where it was asked for.
+        iamService.registerSession(accessKeyId, secretKey, sessionToken,
+                regionResolver.buildGlobalArn("iam", targetAccountId, "root"), expiration,
+                taskPolicy.getVersions().get(taskPolicy.getDefaultVersionId()).getDocument(),
+                targetAccountId);
+        LOG.debugv("Privileged session for {0} opened by {1} under {2}", targetAccountId, callerAccountId,
+                taskPolicy.getArn());
+
+        String result = new XmlBuilder()
+                .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
+                .elem("SessionTokenSize", String.valueOf(sessionToken.length()))
+                .build();
+        return Response.ok(AwsQueryResponse.envelope("AssumeRoot", AwsNamespaces.STS, result)).build();
+    }
+
+    /**
+     * True when the ARN names one of the AWS managed policies a privileged session may be scoped
+     * by. The member's own documentation is the list: "You must use one of following Amazon Web
+     * Services managed policies to scope root session actions", naming the five that sit under
+     * {@code /root-task/}. Whose policy it is counts as much as the path: a customer-managed
+     * policy at the same path is the caller's own document, and installing one would leave the
+     * session bounded by whatever that document says rather than by a privileged task.
+     */
+    private static boolean namesARootTaskPolicy(String arn) {
+        if (!AwsManagedPolicies.isManagedPolicyArn(arn) || !AwsArnUtils.isArn(arn)) {
+            return false;
+        }
+        return AwsArnUtils.parse(arn).resource().startsWith("policy" + ROOT_TASK_POLICY_PATH);
+    }
+
+    /**
+     * {@code MinimumSessionTokenSize} is 0 to 4096 in the model, "The value must not exceed 4,096
+     * bytes", and the size it asks for is materialized, so the bound is enforced rather than
+     * clamped: a value outside it is the same {@code ValidationError} every other member violation
+     * answers, and one that is no integer at all the same {@code InvalidParameterValue}
+     * {@code DurationSeconds} gives.
+     */
+    private Response validateMinimumSessionTokenSize(MultivaluedMap<String, String> params) {
+        String value = params.getFirst("MinimumSessionTokenSize");
+        if (value == null) {
+            return null;
+        }
+        int size;
+        try {
+            size = Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return AwsQueryResponse.error("InvalidParameterValue", "Value " + value + " for parameter"
+                    + " MinimumSessionTokenSize is invalid. Reason: Must be an integer.",
+                    AwsNamespaces.STS, 400);
+        }
+        if (size < 0 || size > MAX_SESSION_TOKEN_SIZE) {
+            String constraint = size < 0
+                    ? "Member must have value greater than or equal to 0"
+                    : "Member must have value less than or equal to " + MAX_SESSION_TOKEN_SIZE;
+            return AwsQueryResponse.error("ValidationError",
+                    SmithyValidationErrors.message(List.of("Value '" + size
+                            + "' at 'minimumSessionTokenSize' failed to satisfy constraint: " + constraint)),
+                    AwsNamespaces.STS, 400);
+        }
+        return null;
+    }
+
+    /** The account a {@code TargetPrincipal} names, whether it is an account id or a principal ARN. */
+    private static String accountOf(String targetPrincipal) {
+        if (targetPrincipal.matches("\\d{12}")) {
+            return targetPrincipal;
+        }
+        return AwsArnUtils.isArn(targetPrincipal) ? AwsArnUtils.parse(targetPrincipal).accountId() : null;
+    }
+
+    /**
+     * "You cannot use root user credentials to call sts:AssumeRoot." Two credentials are the
+     * account root here and neither may open a session. One resolves to a root ARN, which is how a
+     * privileged session opening another is caught. The other is the bare 12-digit account-id key,
+     * which {@code IamEnforcementFilter} reads as "floci's account-root principal, never an IAM
+     * user's key": it resolves to no ARN at all, so the first test cannot see it, and refusing it
+     * is what leaves the operation to an IAM user or role of the management account, which is the
+     * caller AWS asks for.
+     */
+    private Response refuseRootCredentials(String callerAccountId) {
+        String accessKeyId = callerAccessKeyId();
+        boolean accountRootKey = accessKeyId != null && accessKeyId.equals(callerAccountId);
+        String callerArn = accountRootKey ? null : iamService.resolveCallerArn(accessKeyId).orElse(null);
+        if (!accountRootKey && (callerArn == null || !callerArn.endsWith(":root"))) {
+            return null;
+        }
+        return AwsQueryResponse.error("AccessDenied", "Root user credentials cannot call sts:AssumeRoot."
+                + " Call it as an IAM user or role with the sts:AssumeRoot permission.", AwsNamespaces.STS, 403);
+    }
+
+    /** True when the request arrived on the partition's global STS host rather than a Regional one. */
+    private boolean arrivedOnTheGlobalEndpoint() {
+        String host = headers == null ? null : headers.getHeaderString(HttpHeaders.HOST);
+        if (host == null || host.isBlank()) {
+            return false;
+        }
+        String name = host.split(":", 2)[0];
+        return name.equalsIgnoreCase("sts." + AwsRegions.dnsSuffixFor(regionResolver.getRegion()));
     }
 
     private Response handleDecodeAuthorizationMessage(MultivaluedMap<String, String> params) {

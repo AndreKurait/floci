@@ -62,12 +62,27 @@ steps added later complete, reporting `ALL_STEPS_COMPLETED`. A cluster with no s
 `WAITING` after its steps complete. Automatic step-completion termination also applies when
 termination protection is enabled.
 `AddJobFlowSteps` rejects a terminated cluster without adding steps or changing its
-termination status.
+termination status, and answers an unknown cluster with `ValidationException` "Specified job flow ID
+does not exist.", as AWS does.
 After automatic or manual termination, instance groups and fleets report `TERMINATED` with zero
 running or provisioned capacity; their requested and target capacities remain recorded.
 `ListInstances` retains each group's instances with their original synthetic IDs and `TERMINATED`
 status for 30 days after termination. Capacity modifications and new groups or fleets are rejected
-on terminated clusters. `InstanceStates` filters the modeled `RUNNING` and `TERMINATED` instances.
+on terminated clusters. As on AWS, `ModifyInstanceGroups` answers `ValidationException` "An instance
+group may only be modified when the cluster is running or waiting.", and `ModifyInstanceFleet` answers
+`InvalidRequestException` "A job flow that is shutting down, terminated, or finished may not be
+modified." with `ErrorCode` `INVALID_JOB_SHUT_DOWN`. `InstanceStates` filters the modeled `RUNNING` and
+`TERMINATED` instances.
+
+`TerminateJobFlows`, the four `Set*` cluster setters and `CancelSteps` refuse a request without a
+member their model requires (`JobFlowIds` and the setting, or `StepIds`) with `ValidationException`
+"1 validation error detected: Value null at 'jobFlowIds' failed to satisfy constraint: Member must
+not be null", AWS's framework wording, as `RunJobFlow` does for `Name`. They used to read a missing
+list as empty and a missing setting as its default, and answer success. An empty `JobFlowIds` is
+still accepted.
+
+A state machine drives clusters and steps through the `elasticmapreduce:` integrations, `.sync`
+included; see [Step Functions: Amazon EMR tasks](step-functions.md#amazon-emr-tasks).
 
 ## Release catalogue
 

@@ -179,11 +179,33 @@ class DsqlCompatTest {
                 .hasMessageContaining("Wrong user to action mapping. user: admin, action: DbConnect");
     }
 
+    @Test
+    @Order(6)
+    void adminSignsInWithTlsStartedAtOnce() throws Exception {
+        String token = dsql.utilities().generateDbConnectAdminAuthToken(b -> b.hostname(endpoint).region(REGION));
+
+        try (Connection connection = connect("admin", token, "direct");
+             Statement statement = connection.createStatement();
+             ResultSet row = statement.executeQuery("SELECT current_user")) {
+            assertThat(row.next()).isTrue();
+            assertThat(row.getString(1)).isEqualTo("admin");
+        }
+    }
+
     private static Connection connect(String user, String token) throws SQLException {
+        return connect(user, token, "postgres");
+    }
+
+    /**
+     * {@code sslNegotiation} is pgjdbc's: {@code postgres} sends an SSLRequest first, {@code direct}
+     * starts TLS at once, offering the ALPN protocol postgresql.
+     */
+    private static Connection connect(String user, String token, String sslNegotiation) throws SQLException {
         Properties properties = new Properties();
         properties.setProperty("user", user);
         properties.setProperty("password", token);
         properties.setProperty("sslmode", "require");
+        properties.setProperty("sslNegotiation", sslNegotiation);
         properties.setProperty("sslfactory", ServerNameSocketFactory.class.getName());
         properties.setProperty(SERVER_NAME_PROPERTY, endpoint);
         String host = TestFixtures.endpoint().getHost();

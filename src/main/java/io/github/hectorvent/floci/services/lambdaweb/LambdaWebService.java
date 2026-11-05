@@ -140,6 +140,7 @@ public class LambdaWebService implements Resettable {
     private final LambdaWebCode code;
     private final ObjectMapper objectMapper;
     private final Instance<RequestContext> requestContext;
+    private final LambdaWebExecutionRole executionRole;
 
     /** Keyed {@code region/functionName}. The backend adds the caller's account to every key. */
     private StorageBackend<String, WebFunction> functions;
@@ -152,7 +153,7 @@ public class LambdaWebService implements Resettable {
     @Inject
     public LambdaWebService(RegionResolver regionResolver, StorageFactory storageFactory, EmulatorConfig config,
                             S3Service s3Service, LambdaWebCode code, ObjectMapper objectMapper,
-                            Instance<RequestContext> requestContext) {
+                            Instance<RequestContext> requestContext, LambdaWebExecutionRole executionRole) {
         this.regionResolver = regionResolver;
         this.storageFactory = storageFactory;
         this.config = config;
@@ -160,6 +161,7 @@ public class LambdaWebService implements Resettable {
         this.code = code;
         this.objectMapper = objectMapper;
         this.requestContext = requestContext;
+        this.executionRole = executionRole;
     }
 
     @PostConstruct
@@ -301,7 +303,7 @@ public class LambdaWebService implements Resettable {
                     "The revisionConfig and endpointConfig must be specified.", 400);
         }
         requireValidTags(tags);
-        validateRevisionRules(revisionConfig);
+        validateRevisionRules(region, revisionConfig);
         String accountId = regionResolver.getAccountId();
         WebFunctionEndpoint endpoint = draftEndpoint(region, accountId, functionName, endpointConfig, false);
         return storeNewFunction(region, functionName, tags, fn -> {
@@ -401,8 +403,8 @@ public class LambdaWebService implements Resettable {
         LambdaWebValidation validation = new LambdaWebValidation();
         validateRevisionShape(validation, request, "");
         validation.throwIfAny();
-        validateRevisionRules(request);
         String functionName = resolveFunctionName(region, functionNameOrArn, "CreateWebFunctionRevision");
+        validateRevisionRules(region, request);
         synchronized (lockFor(region, functionName)) {
             WebFunction fn = function(region, functionName);
             WebFunctionRevision revision = buildRevision(fn, request);
@@ -507,8 +509,12 @@ public class LambdaWebService implements Resettable {
     }
 
     /** The rules a revision request must meet before the function is looked up. */
-    private static void validateRevisionRules(JsonNode request) {
+    private void validateRevisionRules(String region, JsonNode request) {
         JsonNode service = LambdaWebJson.structure(request, "serviceConfig");
+        String role = LambdaWebJson.text(service, "executionRoleArn");
+        if (!AwsArnUtils.parse(role).accountId().equals(regionResolver.getAccountId())) {
+            throw new LambdaWebAccessDeniedException("Cross-account pass role is not allowed.");
+        }
         Map<String, String> environment = LambdaWebJson.stringMap(service, "environmentVariables", false);
         if (environment != null) {
             List<String> reserved = environment.keySet().stream().filter(RESERVED_ENVIRONMENT_KEYS::contains).toList();
@@ -522,6 +528,7 @@ public class LambdaWebService implements Resettable {
             throw new AwsException("ValidationException", "The logGroup " + logGroup
                     + " is invalid. Log group names starting with aws/ (case-insensitive) are reserved for AWS.", 400);
         }
+        executionRole.requireAssumable(region, role);
     }
 
     private WebFunctionRevision buildRevision(WebFunction fn, JsonNode request) {

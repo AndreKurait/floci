@@ -2894,8 +2894,9 @@ class LambdaServiceTest {
                 + "Member must satisfy regular expression pattern: (\\$LATEST(\\.PUBLISHED)?|[0-9]+)", error.getMessage());
     }
 
-    @Test
-    void updateAliasValidatesProvisionedCapacityBeforeMutatingItsStoredFields() {
+    @ParameterizedTest
+    @ValueSource(strings = {"$LATEST", "2"})
+    void updateAliasValidatesProvisionedCapacityBeforeMutatingItsStoredFields(String targetVersion) {
         WarmPool warmPool = mock(WarmPool.class);
         LambdaService guarded = s3BackedService(null, warmPool, new ZipExtractor());
         LambdaFunction fn = guarded.createFunction(REGION, baseRequest("alias-capacity-fn"));
@@ -2905,10 +2906,10 @@ class LambdaServiceTest {
         doAnswer(invocation -> {
             assertTrue(Thread.holdsLock(guarded.lockForConcurrencyOp(fn.getFunctionArn())));
             throw failure;
-        }).when(warmPool).validateProvisionedAliasUpdate(fn, "live", "$LATEST");
+        }).when(warmPool).validateProvisionedAliasUpdate(fn, "live", targetVersion);
 
         assertSame(failure, assertThrows(AwsException.class, () -> guarded.updateAlias(REGION,
-                fn.getFunctionName(), "live", "$LATEST", "changed", Map.of("2", 0.1))));
+                fn.getFunctionName(), "live", targetVersion, "changed", Map.of("2", 0.1))));
         assertSame(alias, guarded.getAlias(REGION, fn.getFunctionName(), "live"));
         assertEquals("1", alias.getFunctionVersion());
         assertEquals("original", alias.getDescription());

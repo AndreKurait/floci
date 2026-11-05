@@ -787,9 +787,27 @@ that has never set one.
 | EnableOrganizationsRootSessions | Enables the `RootSessions` feature. |
 | DisableOrganizationsRootSessions | Disables the `RootSessions` feature. |
 
-Only the set of enabled features is stored, and enabling a feature twice is idempotent. Floci does not
-model root credentials or root sessions themselves, so the flags change what `ListOrganizationsFeatures`
-returns and nothing else.
+Only the set of enabled features is stored, and enabling a feature twice is idempotent. Floci does
+not model root credentials themselves, so `RootCredentialsManagement` changes what
+`ListOrganizationsFeatures` returns and nothing else; `RootSessions` is what STS `AssumeRoot` reads
+before opening a privileged session.
+
+All five answer for one organization, so all five check the caller, each refusal being a shape the
+reference models on them and on nothing else. In the order they are asked: no organization at all
+is `OrganizationNotFoundException`, an organization without All features is
+`OrganizationNotInAllFeaturesModeException`, one without trusted access for IAM in Organizations is
+`ServiceAccessNotEnabledException`, and a caller that is neither the management account nor a
+delegated administrator for IAM is `AccountNotManagementOrDelegatedAdministratorException`. The two
+enable operations add `CallerIsNotManagementAccountException`, which is modeled on them alone, so a
+delegated administrator may read the features and turn them off but not on. Each is 400 and carries
+the shape name as its code: botocore declares no `error.code` for any of the five.
+
+The feature set belongs to the organization rather than to whoever asked for it, so it is read and
+written in the management account's scope and a delegated administrator sees what the management
+account enabled. The order is chosen rather than read, and so is the account the record lives in; a
+toggle set before this moved sat in the calling account's scope and is set again once. The
+`OrganizationId` the model declares beside `EnabledFeatures` is answered now that the organization
+is known either way.
 
 ### Server Certificates
 
@@ -1091,6 +1109,7 @@ approval page of its own: the customer side of the workflow is the API.
 | SendDelegationToken | Releases the exchange token on an accepted request, finalizing it. |
 | GetDelegationRequest | Returns one request, with an optional permission check. |
 | ListDelegationRequests | Lists the requests the calling account owns. |
+| GetHumanReadableSummary | Summarizes one delegation request as Markdown, in English. |
 
 A request moves through the states AWS publishes: `UNASSIGNED`, `ASSIGNED`, `PENDING_APPROVAL`,
 `ACCEPTED`, `FINALIZED`, `REJECTED` and `EXPIRED`. A new request is `UNASSIGNED` whether or not it
@@ -1125,6 +1144,18 @@ of a state it is no longer in answers `ConcurrentModification`: no modeled error
 and `AcceptDelegationRequest` models only `NoSuchEntity`, `ServiceFailure` and
 `ConcurrentModification`, so the conflict is the closest of the three. The same lock serializes
 those transitions, so two callers claiming one request leave a single owner.
+
+Two ceilings apply to a request's length, and only one of them belongs to the request. The first is
+the twelve hours `sessionDurationType` declares, which the create holds a `SessionDuration` to. The
+second is the approver's: "root users can only approve delegation requests with a duration of 4
+hours or less. If a request specifies more than 4 hours, you must use a non-root identity to approve
+the request", so a longer request is refused at the approval rather than at the filing, and the same
+request is approvable by an IAM user or role of that account. Floci reads root as a caller whose ARN
+ends in `:root`, which is also what a key naming no IAM user resolves to, so approving a long request
+locally means signing as a user rather than with a bare account id. `AcceptDelegationRequest` models
+nothing for this and no source gives the code AWS answers, so `AccessDenied` is chosen, the guide
+stating the rule as which identity may approve and the release's own owner rule answering the same
+way.
 
 The exchange token is the other half. `SendDelegationToken` releases it, and STS
 `GetDelegatedAccessToken` exchanges it for credentials in the customer's account, acting as the
@@ -1170,8 +1201,7 @@ member's own sentence. A notification that cannot be delivered, whether the poli
 topic is gone, costs the notification and not the call that produced it: the state has already changed, and AWS rolls nothing back for a message it
 could not deliver.
 
-Two things are deliberately not modeled. `GetHumanReadableSummary` is undispatched, its summary
-being LLM-generated on AWS. `PermissionCheckResult` answers `UNSURE` when
+One thing is deliberately not modeled. `PermissionCheckResult` answers `UNSURE` when
 `DelegationPermissionCheck` is asked for, which the enum models, because a delegation request
 carries no permission for Floci to evaluate. Policy
 templates and permission boundaries are registered by AWS out of band, with no API, so
@@ -1180,6 +1210,52 @@ with no published quota behind it, so no limit is enforced. Nothing renders a re
 `PermissionPolicy` either, so the credentials the token exchanges for are bounded by the
 permissions of the identity that approved the request instead, which holds a delegation to no more
 than that identity can do itself.
+
+`GetHumanReadableSummary` answers a summary Floci writes rather than one it generates. AWS produces
+that text with a large language model, which an emulator cannot reproduce and should not imitate, so
+the format is the one the reference's own example answers, "Human readable summary in Markdown
+format", and every line of it is read off the record: what is being asked for, by whom, for how
+long, and where the request has got to. The console describes the section it backs as "a high-level
+overview generated by AI that can help you understand what categories of AWS services can be
+accessed and what types of actions can be performed in each service", and that half is missing for
+the same reason nothing renders a `PermissionPolicy`: no API registers the template AWS resolves one
+from, so there is no policy to read a service list out of. The template and the parameters the
+request carries are named instead.
+
+Who may read a summary is who may read the request, the reference saying the rules "are identical to
+GetDelegationRequest API behavior, such that a party who has permissions to call
+GetDelegationRequest for a given delegation request will always be able to retrieve the human
+readable summary for that request", so the lookup and the `NoSuchEntity` it answers are the same
+ones. Under enforcement the action is authorized against the ARN Floci mints for the request the id
+names rather than against the `EntityArn` as it arrived, which is the same ARN the five by-id
+actions resolve to: a policy naming one request covers that request alone, and a deny on it holds
+however the caller respells the ARN around the same id. The default permission AWS grants a
+request's owner is not implemented here, the same gap `GetDelegationRequest` has.
+
+Four answers on it are chosen rather than read. An `EntityArn` naming any other type of entity is
+`NOT_SUPPORTED`, which is the state the model publishes and the only thing it can mean for a type
+AWS says it does not summarize. A `Locale` Floci does not write answers `NOT_AVAILABLE` with no
+content, because "summary content is non-empty only if the `SummaryState` is `AVAILABLE`" and
+English text under another locale would contradict the response carrying it; the language decides
+and the region inside `en-GB` does not. A value that is not an ARN at all is the modeled
+`InvalidInput`, `arnType` declaring a length and no pattern, so such a value breaks nothing
+published. And a request id inside a well-formed ARN that no id could ever match answers
+`NoSuchEntity` rather than a constraint failure, the operation declaring the ARN's own length and
+nothing about what sits inside it. `FAILED` is unreachable, reporting a generation that ran and did
+not finish. An ARN of another service is read as another kind of entity too, only IAM registering
+a request at all, while the ARN's account is not matched against the request: the id is what
+resolves across accounts, the way the whole family reads one. Content past the 10000 characters
+`summaryContentType` allows is cut at the last whole line that fits, which a request carrying long
+policy parameter values can reach.
+
+The summary is Markdown and the request's own text is the requester's, so that text is escaped
+rather than passed through. `delegationRequestDescriptionType` and `requestMessageType` admit a
+newline and every printable character, so a description could otherwise open a line with a `#` or a
+`-` and forge a heading or a bullet in a document a customer reads as Floci's account of the
+request; a parameter value carrying a backtick could close a code span early and have the rest of
+the line read as prose. Markers are escaped where they would be read, at the start of a line, a
+backtick anywhere, and a value is fenced with one backtick more than it carries. A parameter value
+the record does not hold is left out rather than written as an empty one.
 
 ## AWS Managed Policies
 
@@ -1272,10 +1348,17 @@ the status, not just the request's content type.
 A REST request is authorized as the operation of the route it reached. An `X-Amz-Target` header, a
 Query `Action` field or a `smithy-protocol` header on it does not change the action it is checked
 as, and its path is matched still percent-encoded, as the router matches it, so an encoded `/`
-inside a parameter cannot make the route's rule miss.
+inside a parameter cannot make the route's rule miss. A trailing `/` is dropped first, as the router
+drops it, so `POST /clusters/` is checked as `POST /clusters`. An S3 path keeps it, since an S3 key
+may end in a slash, as a folder marker's does, and S3's rules already take a bucket's one trailing
+slash.
 
 The REST routes mapped to an action are those of S3, Lambda, API Gateway, SES v2, RDS Data,
-Kinesis, EventBridge Scheduler and EventBridge Pipes. In Lambda that is every route of the function
+Kinesis, EKS, EventBridge Scheduler, EventBridge Pipes and Aurora DSQL. In EKS that is every route,
+including those Floci does not serve yet, each checked as the action of its own name, except an
+access entry's access policy routes: Floci takes the entry's principal as the rest of the path, so a
+`GET` or `DELETE` there reads or deletes an entry and is checked as `eks:DescribeAccessEntry` or
+`eks:DeleteAccessEntry`. In Lambda that is every route of the function
 API, MicroVMs and network connectors, including those Floci does not serve yet, and the Web
 Functions routes, each checked as the action of its own name except `InvokeWithResponseStream`
 (checked as `lambda:InvokeFunction`) and `GetLayerVersionByArn` (`lambda:GetLayerVersion`). AWS also
@@ -1289,7 +1372,9 @@ names, are not served.
 
 A Scheduler request is checked against `schedule/<group>/<name>`, the group from the body's
 `GroupName` on a create or an update, from `groupName` otherwise, and `default` when neither names
-one, or `schedule-group/<name>`. A Pipes request is checked against `pipe/<name>`. A MicroVM image
+one, or `schedule-group/<name>`. A Pipes request is checked against `pipe/<name>`. A DSQL request
+is checked against `cluster/<id>`, `cluster/<id>/stream/<id>` for a stream, or the ARN a tagging
+route names; `CreateCluster` and `ListClusters` against `cluster/*`, as DSQL checks them. A MicroVM image
 or network connector request is checked against `microvm-image:<name>` or `network-connector:<id>`
 in the request's account and Region, an identifier given as an ARN taken for its name, as the
 service looks it up. `RunMicrovm` is checked against the image its `imageIdentifier` names, an
@@ -1305,8 +1390,22 @@ layer version its `Arn` names, its number read the same way. A Lambda tagging re
 connector of that ARN's Region and name, whatever account the ARN names, as Lambda looks it up, and
 an event source mapping's ARN as written.
 
+An EKS request is checked in the caller's account, where EKS looks everything up. A cluster route is
+checked against the ARN EKS holds the cluster under, or `cluster/<name>` in the request's Region for
+a cluster it does not hold, and `CreateCluster` against the cluster its body names, as the EKS user
+guide's example policy for creating a cluster grants it. A node group, Fargate profile, add-on,
+access entry or Pod Identity association route is checked against the ARN EKS holds that resource
+under, which ends in an id the request does not carry, so a policy names it with a wildcard, such as
+`nodegroup/<cluster>/<name>/*`; listing or creating them, and the other routes under a cluster, are
+checked against the cluster. A name holding an encoded `/` is read as one name, as EKS reads it.
+`DescribeUpdate` is checked against the add-on the update was made to, since the updates Floci keeps
+are its add-ons' and EKS returns one whether or not the request names its add-on, and otherwise
+against the cluster. An EKS tagging request is checked against the caller's own cluster named after
+the ARN's last `/`, whatever the ARN names before it, as EKS looks it up.
+
 The shared tagging routes, `/tags` and `/v1/tags`, hand a request to the service its ARN names,
-and it is checked as that service, against that ARN, whatever scope it is signed with. The ARN is
+and it is checked as that service, against that ARN, or for EKS the cluster it tags, whatever scope
+it is signed with. The ARN is
 the one after `/tags/` or `/v1/tags/`, the body's `resourceArn` on `POST /tags`, and the
 `resourceArn` query parameter on the other bare routes.
 
@@ -1400,6 +1499,10 @@ role each passes:
   pass the roles of the instance profile they name, to `ec2.amazonaws.com`. `CreateFlowLogs` passes
   `DeliverLogsPermissionArn` to `vpc-flow-logs.amazonaws.com`. A profile that does not exist
   passes nothing, and EC2 refuses it as without enforcement.
+- **IAM:** `AddRoleToInstanceProfile` passes the role it adds to `ec2.amazonaws.com`, since every
+  instance running with the profile then gets that role's credentials. `RoleName` names the role
+  without its path, so the check uses the ARN IAM holds the role under, or, for a role IAM does not
+  hold, the ARN the name gives.
 - **ECS:** `RegisterTaskDefinition` passes its `taskRoleArn` and `executionRoleArn` to
   `ecs-tasks.amazonaws.com`. `RunTask` and `StartTask` pass the task definition's task and execution
   roles and any role in `overrides` there too, and `CreateService`, `UpdateService` and
@@ -1416,6 +1519,15 @@ role each passes:
   `events.amazonaws.com`. **EventBridge Scheduler:** `CreateSchedule` and `UpdateSchedule` pass the
   target's `RoleArn` to `scheduler.amazonaws.com`. **EventBridge Pipes:** `CreatePipe` and
   `UpdatePipe` pass `RoleArn` to `pipes.amazonaws.com`.
+- **EKS:** `CreateCluster` passes `roleArn`, `CreateNodegroup` `nodeRole`, `CreateFargateProfile`
+  `podExecutionRoleArn`, and `CreateAddon` and `UpdateAddon` `serviceAccountRoleArn` and each of
+  their `podIdentityAssociations`' `roleArn`, to `eks.amazonaws.com`. `CreatePodIdentityAssociation`
+  and `UpdatePodIdentityAssociation` pass `roleArn` to `pods.eks.amazonaws.com`, but not
+  `targetRoleArn`, which the association's role assumes. `CreateAccessEntry` passes `principalArn`
+  to `ec2.amazonaws.com` when its `type` is `EC2_LINUX` or `EC2_WINDOWS`: "If you create an access
+  entry with type EC2_LINUX or EC2_WINDOWS, the IAM principal creating the access entry must have
+  the iam:PassRole permission." AWS also checks it for `CreateCapability`, `UpdateCapability`,
+  `RegisterCluster` and `UpdateClusterConfig`, which Floci does not serve.
 - **CloudFormation:** `CreateStack`, `UpdateStack`, `DeleteStack`, `CreateChangeSet` and
   `ContinueUpdateRollback` pass `RoleARN` to `cloudformation.amazonaws.com` when the request names
   one. `CreateStackSet` and `UpdateStackSet` pass `AdministrationRoleARN`, or, for a self-managed
@@ -1433,6 +1545,27 @@ role each passes:
   names) go to `autoscaling.amazonaws.com`.
 - **Application Auto Scaling:** `RegisterScalableTarget` passes `RoleARN` to
   `application-autoscaling.amazonaws.com` when the request names one.
+- **Redshift:** `CreateCluster` and `RestoreFromClusterSnapshot` pass the roles in `IamRoles`, and
+  `ModifyClusterIamRoles` those in `AddIamRoles`, to `redshift.amazonaws.com`, in any list form the
+  Redshift handler reads (`IamRoles.IamRoleArn.N`, `IamRoles.member.N` or `IamRoles.N`).
+  **Redshift Serverless:** `CreateNamespace` and `UpdateNamespace` pass the roles in `iamRoles` and
+  the one in `defaultIamRoleArn`, and `CreateScheduledAction` and `UpdateScheduledAction` pass
+  `roleArn`, to `redshift-serverless.amazonaws.com`.
+- **RDS:** `AddRoleToDBCluster`, `AddRoleToDBInstance`, `RemoveRoleFromDBCluster`,
+  `RemoveRoleFromDBInstance`, `CreateDBProxy` and `ModifyDBProxy` pass `RoleArn`, and
+  `StartExportTask` passes `IamRoleArn`, to `rds.amazonaws.com`. `CreateDBInstance`,
+  `CreateDBInstanceReadReplica`, `ModifyDBInstance`, `CreateDBCluster`, `ModifyDBCluster`,
+  `RestoreDBClusterFromSnapshot` and `RestoreDBClusterToPointInTime` pass the Enhanced Monitoring
+  role, `MonitoringRoleArn`, there too. They, `RestoreDBInstanceFromDBSnapshot` and
+  `RestoreDBInstanceToPointInTime` pass the directory role `DomainIAMRoleName` names, checked on the
+  ARN IAM holds it under, since the name carries no path. `CreateDBCluster` and the two cluster
+  restores pass each role in `AssociatedRoles`, and `ModifyOptionGroup` passes the role each option
+  it includes takes in its `IAM_ROLE_ARN` setting, as SQL Server's native backup and audit options
+  do. **DMS:** `CreateEndpoint` and `ModifyEndpoint` pass `ServiceAccessRoleArn` and the role
+  members the DMS model gives each engine's settings structure (`ServiceAccessRoleArn`,
+  `SecretsManagerAccessRoleArn`, `SecretsManagerOracleAsmAccessRoleArn`), and
+  `CreateReplicationInstance` and `ModifyReplicationInstance` pass
+  `KerberosAuthenticationSettings.KeyCacheSecretIamArn`, to `dms.amazonaws.com`.
 
 Launching an instance from a launch template does not check the template's role, as on AWS: the EC2
 user guide warns that a user who can create launch template versions "can potentially update a launch
@@ -1444,8 +1577,17 @@ role having been checked when the configuration was created. A
 CloudFormation operation that names no role uses the stack's own without checking it, as the
 CloudFormation API reference says the service does "even if the users don't have permission to pass
 it". The CloudFormation user guide has the default StackSet administration role checked "Even when
-you don't specify the AdministrationRoleARN parameter". The role parameters of other services are
-not checked yet.
+you don't specify the AdministrationRoleARN parameter". A Redshift request is checked on the roles
+it associates, as the Redshift management guide puts it: "To associate an IAM role with a cluster,
+a user must have iam:PassRole permission for that IAM role." A role named only as a cluster's
+default, `DefaultIamRoleArn`, is not checked on its own, since the default is one of the roles the
+cluster holds. A namespace's `defaultIamRoleArn` is, since Floci keeps it whether or not `iamRoles`
+holds it. Redshift takes a role only under the ARN IAM holds it under, path included, so the check
+on the ARN as the request names it covers the role `COPY`, `UNLOAD` and Spectrum then use. The RDS
+user guide has the Enhanced Monitoring role checked: "The user that enables Enhanced Monitoring must
+be granted the PassRole permission." Removing a role from an RDS instance or cluster is checked as
+adding one is, since the Service Reference lists `iam:PassRole` for both. The role parameters of
+other services are not checked yet.
 
 A request that names its operation, in a Query `Action`, an `X-Amz-Target` header or a Smithy RPC v2
 path (`/service/<service>/operation/<operation>`), is authorized as the action AWS checks for that
@@ -1475,6 +1617,7 @@ When `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` is active, Floci also queries regi
 - For detailed S3 bucket policy behavior and configuration, see [S3 Bucket Policy Enforcement](s3.md#bucket-policy-enforcement).
 - Lambda function policies, the statements `AddPermission` adds, take part the same way. An invoke of another account's function by ARN runs it in that account, so its function policy has to allow the caller as well; see [Function policies under IAM enforcement](lambda.md#function-policies-under-iam-enforcement).
 - SNS topic policies take part the same way for a request that names the topic in a JSON-protocol body; a topic with no policy set has the default one AWS gives a new topic. See [SNS](sns.md).
+- Aurora DSQL cluster policies take part the same way for a control plane call on the cluster, and when a client connects to the cluster's endpoint. See [DSQL](dsql.md#authentication).
 - SQS queue and API Gateway REST API policies are stored but not evaluated.
 - A call an AWS service makes to another service's resource on its own behalf, such as SES publishing an event or a notification to an SNS topic, has no IAM principal, so the target's resource policy decides it alone and has to allow the calling service, through `{"Service": "<service>.amazonaws.com"}` or `{"AWS": "*"}`. A target with no policy refuses it. Its request context holds `aws:PrincipalIsAWSService` (`true`), `aws:PrincipalServiceName` and `aws:PrincipalServiceNamesList`, `aws:SourceArn` and `aws:SourceAccount` for the resource whose configuration triggered the call, `aws:ResourceAccount` and `aws:RequestedRegion`, and none of the keys that describe an IAM principal. A publish to an SNS topic from SES also carries `aws:SourceOwner`, the key the SNS Developer Guide lists SES among the services setting, which is what the default topic policy checks, so that policy admits SES acting for the topic owner's account and no other. SES is the one service checked this way so far; see [SES IAM enforcement](ses.md#iam-enforcement).
 

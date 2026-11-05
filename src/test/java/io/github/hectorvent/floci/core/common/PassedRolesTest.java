@@ -32,6 +32,8 @@ class PassedRolesTest {
     private static final String DEFAULT_ADMINISTRATION = ROLES + "AWSCloudFormationStackSetAdministrationRole";
     private static final String EC2 = "ec2.amazonaws.com";
     private static final String AUTOSCALING = "autoscaling.amazonaws.com";
+    private static final String RDS = "rds.amazonaws.com";
+    private static final String DMS = "dms.amazonaws.com";
     private static final String PROFILE_ARN = "arn:aws:iam::111122223333:instance-profile/arn-profile";
 
     /**
@@ -40,7 +42,8 @@ class PassedRolesTest {
      * names one profile by name, and {@code arn-template}, whose version 2 names the other by ARN. The
      * instance {@code i-arn} runs with that other profile, and the group {@code g} launches from
      * {@code lt-web} once a refresh names only a version, or from {@code arn-template} at the group's
-     * version 2 once a refresh names that template alone.
+     * version 2 once a refresh names that template alone. IAM holds the role {@code app-role} under the
+     * path {@code /app/}.
      */
     private static final PassedRoles.Lookups LOOKUPS = new PassedRoles.Lookups() {
         @Override
@@ -94,6 +97,11 @@ class PassedRolesTest {
         @Override
         public String roleArn(String roleName) {
             return ROLES + roleName;
+        }
+
+        @Override
+        public Optional<String> heldRoleArn(String roleName) {
+            return "app-role".equals(roleName) ? Optional.of(ROLES + "app/app-role") : Optional.empty();
         }
     };
 
@@ -197,6 +205,40 @@ class PassedRolesTest {
                 PassedRoles.of("lambda:CreateNetworkConnector", json(operator), LOOKUPS));
         assertEquals(List.of(passed("operator", "lambda.amazonaws.com")),
                 PassedRoles.of("lambda:UpdateNetworkConnector", json(operator), LOOKUPS));
+    }
+
+    @Test
+    void eksPassesItsClusterNodePodAndAddonRolesAndANodeAccessEntrysPrincipal() {
+        String eks = "eks.amazonaws.com";
+        assertEquals(List.of(passed("cluster", eks)), PassedRoles.of("eks:CreateCluster",
+                json("{\"name\":\"c\",\"roleArn\":\"" + ROLES + "cluster\"}"), LOOKUPS));
+        assertEquals(List.of(passed("node", eks)), PassedRoles.of("eks:CreateNodegroup",
+                json("{\"nodeRole\":\"" + ROLES + "node\"}"), LOOKUPS));
+        assertEquals(List.of(passed("fargate", eks)), PassedRoles.of("eks:CreateFargateProfile",
+                json("{\"podExecutionRoleArn\":\"" + ROLES + "fargate\"}"), LOOKUPS));
+        String addon = """
+                {"serviceAccountRoleArn":"%1$saddon","podIdentityAssociations":[
+                 {"serviceAccount":"a","roleArn":"%1$spod-a"},{"serviceAccount":"b","roleArn":"%1$spod-b"}]}"""
+                .formatted(ROLES);
+        for (String action : List.of("eks:CreateAddon", "eks:UpdateAddon")) {
+            assertEquals(List.of(passed("addon", eks), passed("pod-a", eks), passed("pod-b", eks)),
+                    PassedRoles.of(action, json(addon), LOOKUPS));
+        }
+        // The association's role goes to Pod Identity; its target role is assumed with it, not passed.
+        String association = "{\"roleArn\":\"" + ROLES + "pod\",\"targetRoleArn\":\"" + ROLES + "target\"}";
+        for (String action : List.of("eks:CreatePodIdentityAssociation", "eks:UpdatePodIdentityAssociation")) {
+            assertEquals(List.of(passed("pod", "pods.eks.amazonaws.com")), PassedRoles.of(action, json(association),
+                    LOOKUPS));
+        }
+        // Only a node access entry passes its principal, to EC2.
+        for (String type : List.of("EC2_LINUX", "EC2_WINDOWS")) {
+            assertEquals(List.of(passed("worker", EC2)), PassedRoles.of("eks:CreateAccessEntry",
+                    json("{\"principalArn\":\"" + ROLES + "worker\",\"type\":\"" + type + "\"}"), LOOKUPS));
+        }
+        assertEquals(List.of(), PassedRoles.of("eks:CreateAccessEntry",
+                json("{\"principalArn\":\"" + ROLES + "admin\",\"type\":\"STANDARD\"}"), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("eks:CreateAccessEntry",
+                json("{\"principalArn\":\"" + ROLES + "admin\"}"), LOOKUPS));
     }
 
     @Test
@@ -326,6 +368,131 @@ class PassedRolesTest {
                         json("{\"ServiceNamespace\":\"ecs\",\"RoleARN\":\"" + ROLES + "scaling\"}"), LOOKUPS));
         assertEquals(List.of(), PassedRoles.of("application-autoscaling:RegisterScalableTarget",
                 json("{\"ServiceNamespace\":\"ecs\"}"), LOOKUPS));
+    }
+
+    @Test
+    void aRoleAddedToAnInstanceProfileIsPassedToEc2AsTheArnIamHoldsItUnder() {
+        assertEquals(List.of(new PassedRole(ROLES + "app/app-role", EC2)), PassedRoles.of(
+                "iam:AddRoleToInstanceProfile", form("InstanceProfileName=p&RoleName=app-role"), LOOKUPS));
+        // A role IAM does not hold is checked as the one its name gives.
+        assertEquals(List.of(passed("gone", EC2)), PassedRoles.of("iam:AddRoleToInstanceProfile",
+                form("InstanceProfileName=p&RoleName=gone"), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("iam:AddRoleToInstanceProfile", form("InstanceProfileName=p"), LOOKUPS));
+    }
+
+    @Test
+    void aRedshiftClusterPassesTheRolesItAssociatesToRedshift() {
+        String redshift = "redshift.amazonaws.com";
+        // Every list form the Redshift handler reads; the default names a role the cluster holds and passes nothing.
+        assertEquals(List.of(passed("copy", redshift), passed("unload", redshift), passed("spectrum", redshift)),
+                PassedRoles.of("redshift:CreateCluster", form("ClusterIdentifier=c&IamRoles.IamRoleArn.1=" + ROLES
+                        + "copy&IamRoles.member.2=" + ROLES + "unload&IamRoles.5=" + ROLES + "spectrum"
+                        + "&DefaultIamRoleArn=" + ROLES + "copy&IamRolesExtra.1=" + ROLES + "other"), LOOKUPS));
+        assertEquals(List.of(passed("copy", redshift)), PassedRoles.of("redshift:RestoreFromClusterSnapshot",
+                form("ClusterIdentifier=c&SnapshotIdentifier=s&IamRoles.IamRoleArn.1=" + ROLES + "copy"), LOOKUPS));
+        // Removing a role, or setting one the cluster holds as the default, passes nothing.
+        assertEquals(List.of(passed("added", redshift)), PassedRoles.of("redshift:ModifyClusterIamRoles",
+                form("ClusterIdentifier=c&AddIamRoles.IamRoleArn.1=" + ROLES + "added&RemoveIamRoles.IamRoleArn.1="
+                        + ROLES + "removed&DefaultIamRoleArn=" + ROLES + "kept"), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("redshift:CreateCluster", form("ClusterIdentifier=c"), LOOKUPS));
+    }
+
+    @Test
+    void aRedshiftServerlessNamespaceAndScheduledActionPassTheirRolesToRedshiftServerless() {
+        String serverless = "redshift-serverless.amazonaws.com";
+        for (String action : new String[] {"redshift-serverless:CreateNamespace",
+                "redshift-serverless:UpdateNamespace"}) {
+            assertEquals(List.of(passed("copy", serverless), passed("unload", serverless)), PassedRoles.of(action,
+                    json("{\"namespaceName\":\"n\",\"iamRoles\":[\"" + ROLES + "copy\",\"" + ROLES + "unload\"],"
+                            + "\"defaultIamRoleArn\":\"" + ROLES + "copy\"}"), LOOKUPS), action);
+            // Floci keeps a default the namespace's roles do not hold, so that one is passed too.
+            assertEquals(List.of(passed("copy", serverless), passed("other", serverless)), PassedRoles.of(action,
+                    json("{\"namespaceName\":\"n\",\"iamRoles\":[\"" + ROLES + "copy\"],"
+                            + "\"defaultIamRoleArn\":\"" + ROLES + "other\"}"), LOOKUPS), action);
+            assertEquals(List.of(passed("other", serverless)), PassedRoles.of(action,
+                    json("{\"namespaceName\":\"n\",\"defaultIamRoleArn\":\"" + ROLES + "other\"}"), LOOKUPS), action);
+            assertEquals(List.of(), PassedRoles.of(action, json("{\"namespaceName\":\"n\"}"), LOOKUPS), action);
+        }
+        for (String action : new String[] {"redshift-serverless:CreateScheduledAction",
+                "redshift-serverless:UpdateScheduledAction"}) {
+            assertEquals(List.of(passed("snapshots", serverless)), PassedRoles.of(action,
+                    json("{\"scheduledActionName\":\"a\",\"roleArn\":\"" + ROLES + "snapshots\"}"), LOOKUPS), action);
+        }
+    }
+
+    @Test
+    void rdsPassesEachRoleARequestNamesForAnInstanceOrClusterToRds() {
+        for (String action : new String[] {"rds:AddRoleToDBCluster", "rds:AddRoleToDBInstance",
+                "rds:RemoveRoleFromDBCluster", "rds:RemoveRoleFromDBInstance", "rds:CreateDBProxy", "rds:ModifyDBProxy"}) {
+            assertEquals(List.of(passed("feature", RDS)), PassedRoles.of(action,
+                    form("DBInstanceIdentifier=d&RoleArn=" + ROLES + "feature&FeatureName=s3Import"), LOOKUPS), action);
+        }
+        assertEquals(List.of(passed("export", RDS)), PassedRoles.of("rds:StartExportTask",
+                form("ExportTaskIdentifier=e&IamRoleArn=" + ROLES + "export"), LOOKUPS));
+        // The directory role is named without its path, so it is checked on the ARN IAM holds it under.
+        assertEquals(List.of(new PassedRole(ROLES + "app/app-role", RDS), passed("monitoring", RDS)),
+                PassedRoles.of("rds:CreateDBInstance", form("DBInstanceIdentifier=d&DomainIAMRoleName=app-role"
+                        + "&MonitoringRoleArn=" + ROLES + "monitoring"), LOOKUPS));
+        assertEquals(List.of(passed("gone", RDS)), PassedRoles.of("rds:ModifyDBCluster",
+                form("DBClusterIdentifier=c&DomainIAMRoleName=gone"), LOOKUPS));
+        // A cluster's associated roles at any index, in either list form; a restore of an instance takes no
+        // monitoring role, and a modify of a cluster no associated roles.
+        assertEquals(List.of(passed("monitoring", RDS), passed("s3", RDS), passed("lambda", RDS)),
+                PassedRoles.of("rds:RestoreDBClusterToPointInTime", form("DBClusterIdentifier=c&MonitoringRoleArn="
+                        + ROLES + "monitoring&AssociatedRoles.DBClusterAssociatedRole.1.RoleArn=" + ROLES
+                        + "s3&AssociatedRoles.member.3.RoleArn=" + ROLES + "lambda"), LOOKUPS));
+        assertEquals(List.of(passed("gone", RDS)), PassedRoles.of("rds:RestoreDBInstanceFromDBSnapshot",
+                form("DBInstanceIdentifier=d&DomainIAMRoleName=gone&MonitoringRoleArn=" + ROLES + "monitoring"), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("rds:ModifyDBCluster",
+                form("DBClusterIdentifier=c&AssociatedRoles.member.1.RoleArn=" + ROLES + "s3"), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("rds:CreateDBCluster", form("DBClusterIdentifier=c"), LOOKUPS));
+    }
+
+    @Test
+    void anOptionGroupPassesTheRoleEachOptionTakesInItsIamRoleSettingToRds() {
+        String backup = "OptionsToInclude.OptionConfiguration.1.";
+        String audit = "OptionsToInclude.OptionConfiguration.2.";
+        String legacy = "OptionsToInclude.member.1.";
+        // Read as the handler reads it: both list forms, up to the first gap, and a setting named twice
+        // as its last value.
+        assertEquals(List.of(passed("audit", RDS), passed("legacy", RDS)), PassedRoles.of("rds:ModifyOptionGroup",
+                form("OptionGroupName=g&" + backup + "OptionName=SQLSERVER_BACKUP_RESTORE&" + backup
+                        + "OptionSettings.OptionSetting.2.Name=IAM_ROLE_ARN&" + backup
+                        + "OptionSettings.OptionSetting.2.Value=" + ROLES + "after-gap&" + audit
+                        + "OptionName=SQLSERVER_AUDIT&" + audit + "OptionSettings.OptionSetting.1.Name=S3_BUCKET_ARN&"
+                        + audit + "OptionSettings.OptionSetting.1.Value=" + ROLES + "bucket&" + audit
+                        + "OptionSettings.OptionSetting.2.Name=IAM_ROLE_ARN&" + audit
+                        + "OptionSettings.OptionSetting.2.Value=" + ROLES + "first&" + audit
+                        + "OptionSettings.member.1.Name=IAM_ROLE_ARN&" + audit + "OptionSettings.member.1.Value="
+                        + ROLES + "audit&" + legacy + "OptionName=SQLSERVER_BACKUP_RESTORE&" + legacy
+                        + "OptionSettings.member.1.Name=IAM_ROLE_ARN&" + legacy + "OptionSettings.member.1.Value="
+                        + ROLES + "legacy&OptionsToInclude.OptionConfiguration.4.OptionName=SQLSERVER_AUDIT&"
+                        + "OptionsToInclude.OptionConfiguration.4.OptionSettings.OptionSetting.1.Name=IAM_ROLE_ARN&"
+                        + "OptionsToInclude.OptionConfiguration.4.OptionSettings.OptionSetting.1.Value=" + ROLES
+                        + "option-after-gap"), LOOKUPS));
+    }
+
+    @Test
+    void dmsPassesItsEndpointsAndReplicationInstancesRolesToDms() {
+        String endpoint = """
+                {"EndpointIdentifier":"e","ServiceAccessRoleArn":"%1$saccess",
+                 "S3Settings":{"ServiceAccessRoleArn":"%1$ss3","BucketName":"b"},
+                 "PostgreSQLSettings":{"SecretsManagerAccessRoleArn":"%1$ssecrets"},
+                 "OracleSettings":{"SecretsManagerOracleAsmAccessRoleArn":"%1$sasm"},
+                 "Tags":[{"Key":"ServiceAccessRoleArn","Value":"%1$stag"}],
+                 "FooSettings":{"ServiceAccessRoleArn":"%1$sunknown-structure"},
+                 "KafkaSettings":{"ServiceAccessRoleArn":"%1$sno-role-member"},
+                 "DynamoDbSettings":{"SecretsManagerAccessRoleArn":"%1$snot-its-member"}}""".formatted(ROLES);
+        // Only the role members the DMS model gives each settings structure the handler stores.
+        for (String action : new String[] {"dms:CreateEndpoint", "dms:ModifyEndpoint"}) {
+            assertEquals(List.of(passed("access", DMS), passed("s3", DMS), passed("secrets", DMS), passed("asm", DMS)),
+                    PassedRoles.of(action, json(endpoint), LOOKUPS), action);
+        }
+        for (String action : new String[] {"dms:CreateReplicationInstance", "dms:ModifyReplicationInstance"}) {
+            assertEquals(List.of(passed("key-cache", DMS)), PassedRoles.of(action, json(
+                    "{\"KerberosAuthenticationSettings\":{\"KeyCacheSecretIamArn\":\"" + ROLES + "key-cache\"}}"),
+                    LOOKUPS), action);
+        }
     }
 
     private static PassedRole passed(String roleName, String service) {

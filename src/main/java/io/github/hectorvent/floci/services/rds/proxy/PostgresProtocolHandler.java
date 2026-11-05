@@ -127,7 +127,10 @@ public class PostgresProtocolHandler {
                 handshakeTimeoutMillis, forwardStartupParameters, true);
     }
 
-    /** Standard DB Proxy IAM does not enroll the backend role in database-native IAM. */
+    /**
+     * {@code databaseIamAuthentication} is false on a standard DB Proxy endpoint, which neither
+     * enrolls the backend role in database-native IAM nor forwards a client's CancelRequest.
+     */
     public static AuthenticatedSession authenticate(Socket client, BackendConnector backendConnector,
                                       String masterUsername, String masterPassword, String dbName,
                                       boolean iamEnabled, RdsSigV4Validator sigV4,
@@ -140,7 +143,8 @@ public class PostgresProtocolHandler {
         client.setSoTimeout(handshakeTimeoutMillis);
 
         // Phase 1: Read client startup message (possibly preceded by SSL request)
-        StartupMessage startup = readStartupMessage(client, tlsCertificates, handshakeTimeoutMillis);
+        StartupMessage startup = readStartupMessage(client, backendConnector, databaseIamAuthentication,
+                tlsCertificates, handshakeTimeoutMillis);
         if (startup == null) {
             closeQuietly(client);
             return null;
@@ -471,7 +475,8 @@ public class PostgresProtocolHandler {
 
     // ── Startup ───────────────────────────────────────────────────────────────
 
-    private static StartupMessage readStartupMessage(Socket socket, RdsProxyTlsCertificates tlsCertificates,
+    private static StartupMessage readStartupMessage(Socket socket, BackendConnector backendConnector,
+            boolean forwardCancel, RdsProxyTlsCertificates tlsCertificates,
             int handshakeTimeoutMillis) throws IOException {
         Socket currentSocket = socket;
         while (true) {
@@ -489,6 +494,19 @@ public class PostgresProtocolHandler {
                 continue;
             }
 
+            if (startup.code() == PostgresWire.CANCEL_REQUEST) {
+                if (!forwardCancel) {
+                    // RDS Proxy does not support a CancelRequest from a client, so it drops one.
+                    LOG.debugv("Dropping a PostgreSQL CancelRequest sent to a DB proxy endpoint");
+                } else if (startup.body().length == 8) {
+                    forwardCancelRequest(startup.body(), backendConnector);
+                } else {
+                    LOG.warnv("Dropping a PostgreSQL CancelRequest of length {0}; it must be 16",
+                            startup.body().length + 8);
+                }
+                return null;
+            }
+
             if (startup.code() != PostgresWire.PROTOCOL_3) {
                 LOG.warnv("Unexpected PostgreSQL startup protocol version: {0}", startup.code());
                 return null;
@@ -499,6 +517,22 @@ public class PostgresProtocolHandler {
                     params.getOrDefault("user", "postgres"),
                     params.get("database"),
                     params);
+        }
+    }
+
+    /**
+     * Relays a CancelRequest to the backend on a connection of its own, as PostgreSQL expects.
+     * The client holds the backend's own process id and key from its BackendKeyData, so the
+     * request goes through unchanged. Nothing is answered: the server never replies to one.
+     */
+    private static void forwardCancelRequest(byte[] key, BackendConnector backendConnector)
+            throws IOException {
+        try (Socket backend = backendConnector.connect()) {
+            OutputStream out = backend.getOutputStream();
+            PostgresWire.writeInt32(out, 16);
+            PostgresWire.writeInt32(out, PostgresWire.CANCEL_REQUEST);
+            out.write(key);
+            out.flush();
         }
     }
 

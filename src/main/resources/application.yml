@@ -201,14 +201,23 @@ floci:
       # mount-user:           # run mounting containers as "uid[:gid]" (access point PosixUser)
       # mount-group-add:      # supplementary gid added to mounting containers
     wal:
-      # Also the cadence at which journaled stores under persistent mode (CloudWatch Logs events,
-      # the S3 object index) fold their .wal file into the store's JSON file.
+      # Also the cadence at which journaled stores under persistent mode (CloudWatch Logs events and
+      # metric datapoints, the S3 object index) fold their .wal file into the store's JSON file.
       compaction-interval-ms: 30000
     services:
       ssm:
         flush-interval-ms: 5000
       dynamodb:
         flush-interval-ms: 5000
+        # single-file: every table in dynamodb-items.json, rewritten on any item change.
+        # per-table: files per table under dynamodb-items/, rewritten only where an item changed
+        # (persistent: on the write, hybrid: on the flush interval; wal: each write appends one
+        # record to dynamodb-items/journal.wal and changed files are rewritten on the WAL
+        # compaction interval). An existing single-file store is migrated on first start.
+        item-layout: single-file          # FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_LAYOUT
+        # per-table only: files per table. A write rewrites only its item's file; changing the
+        # count rewrites the files on the next start.
+        item-shards: 1                    # FLOCI_STORAGE_SERVICES_DYNAMODB_ITEM_SHARDS
       sns:
         flush-interval-ms: 5000
       lambda:
@@ -386,6 +395,7 @@ floci:
       max-message-size: 1048576
       clear-fifo-deduplication-cache-on-purge: false
       receipt-handle-secret: local-emulator-secret
+      cloudwatch-metrics-enabled: true   # FLOCI_SERVICES_SQS_CLOUDWATCH_METRICS_ENABLED - publish AWS/SQS queue metrics to CloudWatch once a minute
       # QueueUrl shape. floci is <base-url>/<account>/<name>,
       # aws is https://sqs.<region>.<partition dns suffix>/<account>/<name>
       endpoint-strategy: floci

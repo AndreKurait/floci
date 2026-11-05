@@ -43,6 +43,7 @@ Route53 emulation supporting hosted zones, resource record sets, health checks, 
 - `DeleteHostedZone` fails with `HostedZoneNotEmpty` if the zone contains records other than the apex SOA and NS.
 - `ChangeResourceRecordSets` validates all changes atomically before applying any.
 - Supported change actions: `CREATE`, `UPSERT`, `DELETE`.
+- Alias deletion treats target DNS names without regard to ASCII letter case and accepts an optional trailing dot. The target hosted-zone ID, health-evaluation setting, and other record values must still match; a rejected change batch does not apply its other changes.
 - Hosted zone IDs are returned with the `/hostedzone/` prefix in XML responses (e.g. `/hostedzone/Z1PA6795UKMFR9`). The AWS SDK strips this prefix client-side.
 - Health check IDs are plain UUIDs without a prefix.
 - `CreateHealthCheck` with a `CallerReference` already in use returns that health check when the settings match, so an SDK retry succeeds, and fails with `HealthCheckAlreadyExists` when they differ. A deleted health check's reference can be reused at once; AWS keeps refusing it for some days.
@@ -165,6 +166,11 @@ aws route53 disassociate-vpc-from-hosted-zone \
 # Delete a hosted zone
 aws route53 delete-hosted-zone --id Z1PA6795UKMFR9
 ```
+
+Record names in change batches are stored with lowercase ASCII letters and a trailing dot.
+CREATE, UPSERT, and DELETE use that name identity while keeping the record type and
+routing set identifier distinct. A case-only CloudFormation record-name update retains
+the record. DELETE still requires matching record values and routing properties.
 
 ## Not Supported (Phase 2)
 

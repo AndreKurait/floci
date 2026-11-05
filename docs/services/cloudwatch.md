@@ -55,6 +55,12 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 Set `limit` to an integer from 1 to 50 and pass the returned `nextToken` with the same region
 and name prefix to continue. The final page omits `nextToken`.
 
+`CreateLogGroup` stores `logGroupClass` as `STANDARD` (the default), `INFREQUENT_ACCESS`, or
+`DELIVERY`. `DescribeLogGroups` returns the stored class and applies an optional `logGroupClass`
+filter before pagination. Continue with the same class filter when using `nextToken`.
+Stored groups without a class default to `STANDARD`. Class metadata does not change retention,
+delivery behavior, or the features available on a group.
+
 Log group deletion protection defaults to disabled and is persisted with the log group. When it is
 enabled, `DeleteLogGroup` returns `ValidationException` until protection is explicitly disabled
 with `PutLogGroupDeletionProtection`.
@@ -392,6 +398,9 @@ HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action p
 
 Metric streams are stored as definitions with their `running` or `stopped` state. Floci never
 delivers metrics to the Firehose delivery stream a metric stream names.
+
+SQS publishes its queue metrics under `AWS/SQS` once a minute; see
+[SQS CloudWatch Metrics](sqs.md#cloudwatch-metrics).
 
 ### SNS alarm actions
 

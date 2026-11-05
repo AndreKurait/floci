@@ -44,6 +44,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -485,7 +486,7 @@ public class NativeDynamoDbJsonHandler {
         description.put("GlobalTableStatus", "ACTIVE");
         description.put("GlobalTableArn", table.getTableArn());
         if (table.getCreationDateTime() != null) {
-            description.put("CreationDateTime", table.getCreationDateTime().getEpochSecond());
+            description.put("CreationDateTime", epochSeconds(table.getCreationDateTime()));
         }
         description.set("ReplicationGroup", replicaNodes(table, objectMapper.createArrayNode(), true));
         return description;
@@ -626,22 +627,14 @@ public class NativeDynamoDbJsonHandler {
 
         validateItemSets(item);
 
-        JsonNode oldItem = null;
-        if ("ALL_OLD".equals(returnValues) || expected != null) {
-            dynamoDbService.requireTableForItemCall(tableName, region);
-            oldItem = dynamoDbService.getItem(tableName, item, region);
-        }
-
-        if (expected != null) {
-            evaluateLegacyExpected(oldItem, expected, conditionalOperator, returnValuesOnConditionCheckFailure);
-        }
-
-        var previousItem = dynamoDbService.putItem(tableName, item, conditionExpression,
-                exprAttrNames, exprAttrValues, region, returnValuesOnConditionCheckFailure);
+        Consumer<JsonNode> expectedCheck = legacyExpectedCheck(tableName, region, item, false, expected,
+                conditionalOperator, returnValuesOnConditionCheckFailure);
+        JsonNode previousItem = dynamoDbService.putItem(tableName, item, conditionExpression,
+                exprAttrNames, exprAttrValues, region, returnValuesOnConditionCheckFailure, expectedCheck);
 
         ObjectNode response = objectMapper.createObjectNode();
-        if ("ALL_OLD" .equals(returnValues) && oldItem != null) {
-            response.set("Attributes", oldItem);
+        if ("ALL_OLD".equals(returnValues) && previousItem != null) {
+            response.set("Attributes", previousItem);
         }
         addItemCollectionMetrics(response, request, tableName, item, region);
         addWriteConsumedCapacity(response, request, tableName, region, previousItem, item);
@@ -745,13 +738,10 @@ public class NativeDynamoDbJsonHandler {
 
         String condOpDel = request.has("ConditionalOperator")
                 ? request.get("ConditionalOperator").asText() : "AND";
-        if (expectedDel != null) {
-            JsonNode existingForDel = dynamoDbService.getItem(tableName, key, region);
-            evaluateLegacyExpected(existingForDel, expectedDel, condOpDel, returnValuesOnConditionCheckFailure);
-        }
-
+        Consumer<JsonNode> expectedCheck = legacyExpectedCheck(tableName, region, key, true, expectedDel,
+                condOpDel, returnValuesOnConditionCheckFailure);
         JsonNode oldItem = dynamoDbService.deleteItem(tableName, key, conditionExpression,
-                exprAttrNames, exprAttrValues, region, returnValuesOnConditionCheckFailure);
+                exprAttrNames, exprAttrValues, region, returnValuesOnConditionCheckFailure, expectedCheck);
 
         ObjectNode response = objectMapper.createObjectNode();
         if ("ALL_OLD" .equals(returnValues) && oldItem != null) {
@@ -855,14 +845,11 @@ public class NativeDynamoDbJsonHandler {
             ExpressionEvaluator.validateSemantics(conditionExpression, "ConditionExpression", exprAttrNames, exprAttrValues);
         }
 
-        if (expectedUpd != null) {
-            JsonNode existingForUpd = dynamoDbService.getItem(tableName, key, region);
-            evaluateLegacyExpected(existingForUpd, expectedUpd, conditionalOperatorUpd, returnValuesOnConditionCheckFailure);
-        }
-
+        Consumer<JsonNode> expectedCheck = legacyExpectedCheck(tableName, region, key, true, expectedUpd,
+                conditionalOperatorUpd, returnValuesOnConditionCheckFailure);
         DynamoDbService.UpdateResult result = dynamoDbService.updateItem(
                 tableName, key, updateData, updateExpression, exprAttrNames, exprAttrValues,
-                returnValues, conditionExpression, region, returnValuesOnConditionCheckFailure);
+                returnValues, conditionExpression, region, returnValuesOnConditionCheckFailure, expectedCheck);
 
         ObjectNode response = objectMapper.createObjectNode();
         if ("ALL_NEW" .equals(returnValues) && result.newItem() != null) {
@@ -881,10 +868,26 @@ public class NativeDynamoDbJsonHandler {
         return Response.ok(response).build();
     }
 
+    /**
+     * Validates a legacy Expected map and returns its evaluation, for the service to run against
+     * the stored item under the item's lock, or null when the request has no Expected. The table
+     * and the key are checked first, so their errors take precedence over the map's.
+     */
+    private Consumer<JsonNode> legacyExpectedCheck(String tableName, String region, JsonNode keyOrItem,
+                                                   boolean isKeyArg, JsonNode expected,
+                                                   String conditionalOperator,
+                                                   String returnValuesOnConditionCheckFailure) {
+        if (expected == null) {
+            return null;
+        }
+        dynamoDbService.requireItemCallKey(tableName, keyOrItem, isKeyArg, region);
+        validateLegacyExpected(expected);
+        return existing -> evaluateLegacyExpected(existing, expected, conditionalOperator,
+                returnValuesOnConditionCheckFailure);
+    }
+
     private void evaluateLegacyExpected(JsonNode existing, JsonNode expected, String conditionalOperator,
                                           String returnValuesOnConditionCheckFailure) {
-        if (expected == null) return;
-        validateLegacyExpected(expected);
         boolean useOr = "OR".equals(conditionalOperator);
         boolean overall = !useOr;
         var fields = expected.fields();
@@ -1980,6 +1983,9 @@ public class NativeDynamoDbJsonHandler {
                     + "Member must satisfy enum value set: " + BACKUP_TYPE_FILTERS);
         }
         throwValidationErrors(violations);
+        if (exclusiveStartBackupArn != null) {
+            DynamoDbBackupArns.parse(exclusiveStartBackupArn);
+        }
         Instant lowerBound = timestampOrNull(request, "TimeRangeLowerBound");
         Instant upperBound = timestampOrNull(request, "TimeRangeUpperBound");
         if (lowerBound != null && upperBound != null && upperBound.isBefore(lowerBound)) {
@@ -2009,11 +2015,13 @@ public class NativeDynamoDbJsonHandler {
      */
     private Response handleRestoreTableFromBackup(JsonNode request, String region) {
         String backupArn = textOrNull(request, "BackupArn");
-        DynamoDbBackupArns.parse(backupArn);
+        DynamoDbBackupArns.BackupArn arn = dynamoDbService.requireOwnBackupArn(backupArn);
         String targetTableName = requireTableNameParameter(request, "TargetTableName");
         throwValidationErrors(restoreViolations(request, targetTableName));
+        DynamoDbService.requireSseOverrideAcrossRegions(arn.region(), region,
+                request.path("SSESpecificationOverride").isObject());
 
-        TableBackup backup = dynamoDbService.describeBackup(backupArn, region);
+        TableBackup backup = dynamoDbService.restoreSourceBackup(arn, targetTableName, region);
         TableDefinition table = tableService.restoreTable(DynamoDbService.snapshotOf(backup.getTable()),
                 targetTableName, parseRestoreOverrides(request), region);
         ObjectNode description = tableToNode(table);
@@ -2057,6 +2065,7 @@ public class NativeDynamoDbJsonHandler {
             throw new AwsException("ValidationException",
                     "Invalid Request: Must provide exactly one of: sourceTableArn, sourceTableName", 400);
         }
+        DynamoDbService.requireSourceInPartition(source.region(), region);
         boolean useLatestRestorableTime = request.path("UseLatestRestorableTime").asBoolean(false);
         Instant restoreDateTime = timestampOrNull(request, "RestoreDateTime");
         if (useLatestRestorableTime && restoreDateTime != null) {
@@ -3127,7 +3136,7 @@ public class NativeDynamoDbJsonHandler {
         node.put("TableId", table.getTableId());
         node.put("TableStatus", table.getTableStatus());
         node.put("TableArn", table.getTableArn());
-        node.put("CreationDateTime", table.getCreationDateTime().getEpochSecond());
+        node.put("CreationDateTime", epochSeconds(table.getCreationDateTime()));
         node.put("ItemCount", table.getItemCount());
         node.put("TableSizeBytes", table.getTableSizeBytes());
         node.put("DeletionProtectionEnabled", table.isDeletionProtectionEnabled());
@@ -3136,7 +3145,7 @@ public class NativeDynamoDbJsonHandler {
             ObjectNode billing = objectMapper.createObjectNode();
             billing.put("BillingMode", "PAY_PER_REQUEST");
             billing.put("LastUpdateToPayPerRequestDateTime",
-                    table.getCreationDateTime().getEpochSecond());
+                    epochSeconds(table.getCreationDateTime()));
             node.set("BillingModeSummary", billing);
         }
 

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
@@ -13,10 +14,12 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -47,6 +50,9 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 class ProvisionedConcurrencyPoolTest {
+    @TempDir
+    Path storagePath;
+
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";
     private final AccountAwareStorageBackend<LambdaFunction> functionStorage =
@@ -423,15 +429,15 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
-    void failedStopRemainsOwnedAndDeleteReportsRetryableFailure() throws Exception {
+    void failedStopRemainsOwnedAfterDeleteCommits() throws Exception {
         put(1);
         Environment first = launched();
         first.initialized.complete(null);
         ready();
         launcher.stopFailures.set(1);
-        AwsException failure = assertThrows(AwsException.class,
-                () -> pool.delete(REGION, "example", "live", ACCOUNT));
-        assertEquals(500, failure.getHttpStatus());
+        assertDoesNotThrow(() -> pool.delete(REGION, "example", "live", ACCOUNT));
+        assertEquals("ProvisionedConcurrencyConfigNotFoundException",
+                assertThrows(AwsException.class, this::get).getErrorCode());
         assertTrue(first.alive);
         pool.reconcileSafely();
         assertFalse(first.alive);
@@ -440,15 +446,14 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
-    void replacingCapacityReportsFailedRetirementAndWaitsForCleanupBeforeInitializing() throws Exception {
+    void replacingCapacityCommitsAndWaitsForCleanupBeforeInitializing() throws Exception {
         put(1);
         Environment first = launched();
         first.initialized.complete(null);
         ready();
         launcher.stopFailures.set(2);
 
-        AwsException failure = assertThrows(AwsException.class, () -> put(2));
-        assertEquals(500, failure.getHttpStatus());
+        assertEquals("IN_PROGRESS", assertDoesNotThrow(() -> put(2)).status());
         assertTrue(first.alive);
         assertEquals(1, launcher.starts.get());
         assertEquals("IN_PROGRESS", get().status());
@@ -469,6 +474,68 @@ class ProvisionedConcurrencyPoolTest {
         ready();
         assertEquals(3, first.stops.get());
         assertEquals(3, launcher.starts.get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"configuration", "alias", "function"})
+    void deletionCommitsWhileAnEarlierStopIsStillRunning(String scope) throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        first.faulted.set(true);
+        first.stopGate = new CompletableFuture<>();
+        CompletableFuture<ContainerHandle> discard = CompletableFuture.supplyAsync(() -> pool.acquire(version, "live"));
+        try {
+            assertSame(first, launcher.stopping.poll(2, TimeUnit.SECONDS));
+            assertDoesNotThrow(() -> {
+                switch (scope) {
+                    case "configuration" -> pool.delete(REGION, "example", "live", ACCOUNT);
+                    case "alias" -> pool.deleteQualifier(version, "live");
+                    case "function" -> pool.deleteFunction(version);
+                    default -> throw new AssertionError(scope);
+                }
+            });
+            assertEquals("ProvisionedConcurrencyConfigNotFoundException",
+                    assertThrows(AwsException.class, this::get).getErrorCode());
+            assertEquals(1, first.stops.get(), "The admitted stopper retains exclusive ownership");
+        } finally {
+            first.stopGate.complete(null);
+            assertNull(discard.get(5, TimeUnit.SECONDS));
+        }
+        assertFalse(first.alive);
+        assertDoesNotThrow(() -> put(1));
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        ready();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void lateReleaseCleansUpAfterFailedOrExpiredShutdown(boolean expiredDeadline) throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertSame(first.handle, pool.acquire(version, "live"));
+        int initialAttempts;
+        if (expiredDeadline) {
+            pool.stopManagedContainers(System.nanoTime() - 1);
+            initialAttempts = 0;
+        } else {
+            launcher.stopFailures.set(1);
+            pool.stopManagedContainers(System.nanoTime() + TimeUnit.SECONDS.toNanos(2));
+            initialAttempts = 1;
+        }
+        assertEquals(initialAttempts, first.stops.get());
+        assertTrue(first.alive);
+        assertTrue(pool.release(first.handle, false));
+        assertFalse(first.alive);
+        assertEquals(initialAttempts + 1, first.stops.get());
+        assertFalse(pool.release(first.handle, false));
+        pool.shutdown();
+        assertEquals(initialAttempts + 1, first.stops.get(),
+                "Repeated release and shutdown do not create another stop");
     }
 
     @Test
@@ -527,8 +594,13 @@ class ProvisionedConcurrencyPoolTest {
             default -> throw new AssertionError(lookup);
         }
         assertSame(failure, assertThrows(IllegalStateException.class, () -> pool.acquire(version, "live")));
-        assertSame(failure, assertThrows(IllegalStateException.class, pool::reconcile));
-        assertSame(failure, assertThrows(IllegalStateException.class, pool::reconcileSafely));
+        if ("alias".equals(lookup)) {
+            assertDoesNotThrow(pool::reconcile);
+            assertDoesNotThrow(pool::reconcileSafely);
+        } else {
+            assertSame(failure, assertThrows(IllegalStateException.class, pool::reconcile));
+            assertSame(failure, assertThrows(IllegalStateException.class, pool::reconcileSafely));
+        }
         assertTrue(first.alive);
         assertEquals(0, first.stops.get());
         reset(functionLookup, aliasLookup);
@@ -699,6 +771,67 @@ class ProvisionedConcurrencyPoolTest {
         assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", "$LATEST"));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void configuredAliasRejectsUnsupportedTargetBeforeMutation(boolean durable) throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        LambdaFunction target = function(ACCOUNT, REGION, "2");
+        if (durable) {
+            target.setDurableExecutionTimeout(60);
+        } else {
+            target.setHotReloadHostPath("/tmp/unsupported-target");
+        }
+        functions.saveForAccount(ACCOUNT, REGION, target);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> pool.validateAliasUpdate(version, "live", "2"));
+
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+        assertEquals("1", aliases.getForAccount(ACCOUNT, REGION, "example", "live")
+                .orElseThrow().getFunctionVersion());
+        assertEquals("1", storage.scanAllAccounts().getFirst().version());
+        assertEquals(0, first.stops.get());
+        assertEquals(1, launcher.starts.get());
+        pool.delete(REGION, "example", "live", ACCOUNT);
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", "2"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unsupportedRetargetPreservesPriorAllocationUntilTargetIsEligible(boolean durable) throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        LambdaFunction target = function(ACCOUNT, REGION, "2");
+        if (durable) {
+            target.setDurableExecutionTimeout(60);
+        } else {
+            target.setHotReloadHostPath("/tmp/unsupported-target");
+        }
+        functions.saveForAccount(ACCOUNT, REGION, target);
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+
+        assertDoesNotThrow(pool::reconcile);
+        assertEquals("1", storage.scanAllAccounts().getFirst().version());
+        assertEquals(0, first.stops.get());
+        assertEquals(1, launcher.starts.get());
+        target.setDurableExecutionTimeout(null);
+        target.setHotReloadHostPath(null);
+        functions.saveForAccount(ACCOUNT, REGION, target);
+        pool.reconcile();
+        pool.reconcile();
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        ready();
+        assertEquals("2", storage.scanAllAccounts().getFirst().version());
+        assertEquals(1, first.stops.get());
+        assertEquals(2, launcher.starts.get());
+    }
+
     @Test
     void aliasRetargetStorageFailurePreservesThePriorAllocation() throws Exception {
         AccountAwareStorageBackend<ProvisionedConcurrencyPool.Configuration> backend = spy(storage);
@@ -713,13 +846,71 @@ class ProvisionedConcurrencyPoolTest {
         alias(ACCOUNT, REGION, "live", "2", Map.of());
         IllegalStateException failure = new IllegalStateException("controlled alias write failure");
         doThrow(failure).when(backend).putForAccount(eq(ACCOUNT), any(), any());
-        assertSame(failure, assertThrows(IllegalStateException.class, this::get));
+        assertEquals("READY", get().status());
         assertEquals("1", storage.scanAllAccounts().getFirst().version());
         assertEquals(0, first.stops.get());
         doCallRealMethod().when(backend).putForAccount(eq(ACCOUNT), any(), any());
         assertEquals("IN_PROGRESS", get().status());
         assertEquals("2", storage.scanAllAccounts().getFirst().version());
         assertEquals(1, first.stops.get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"storage", "hotReload", "durable"})
+    void failedAliasRefreshDoesNotBlockOtherAccountsAndRecovers(String failureKind) throws Exception {
+        AccountAwareStorageBackend<ProvisionedConcurrencyPool.Configuration> backend = spy(storage);
+        pool.closeExecutors();
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, backend,
+                Clock.systemUTC(), 4, 8, false, 15);
+        put(1);
+        Environment original = launched();
+        original.initialized.complete(null);
+        ready();
+        LambdaFunction target = function(ACCOUNT, REGION, "2");
+        if ("hotReload".equals(failureKind)) {
+            target.setHotReloadHostPath("/tmp/unsupported-target");
+        } else if ("durable".equals(failureKind)) {
+            target.setDurableExecutionTimeout(60);
+        } else {
+            doThrow(new IllegalStateException("controlled alias write failure"))
+                    .when(backend).putForAccount(eq(ACCOUNT), any(), any());
+        }
+        functions.saveForAccount(ACCOUNT, REGION, target);
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+        String other = "222222222222";
+        function(other, REGION, "$LATEST");
+        function(other, REGION, "1");
+        assertDoesNotThrow(() -> pool.put(REGION, "example", "1", 1, other));
+        Environment peer = launched();
+        peer.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertEquals("READY", pool.get(REGION, "example", "1", other).status()));
+        peer.faulted.set(true);
+        assertDoesNotThrow(pool::reconcile);
+        assertEquals("IN_PROGRESS", pool.get(REGION, "example", "1", other).status());
+        Environment peerReplacement = launched();
+        peerReplacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertEquals("READY", pool.get(REGION, "example", "1", other).status()));
+        assertEquals(1, peer.stops.get());
+        assertEquals(0, original.stops.get());
+        assertEquals("1", storage.scanAllAccounts().stream()
+                .filter(value -> ACCOUNT.equals(value.account())).findFirst().orElseThrow().version());
+        if ("storage".equals(failureKind)) {
+            doCallRealMethod().when(backend).putForAccount(eq(ACCOUNT), any(), any());
+        }
+        target.setDurableExecutionTimeout(null);
+        target.setHotReloadHostPath(null);
+        functions.saveForAccount(ACCOUNT, REGION, target);
+        pool.reconcile();
+        pool.reconcile();
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        ready();
+        assertEquals(1, original.stops.get());
+        assertEquals(0, peerReplacement.stops.get());
+        assertEquals("2", storage.scanAllAccounts().stream()
+                .filter(value -> ACCOUNT.equals(value.account())).findFirst().orElseThrow().version());
     }
 
     @Test
@@ -870,7 +1061,7 @@ class ProvisionedConcurrencyPoolTest {
         ready();
         first.stopGate = new CompletableFuture<>();
         CompletableFuture<Void> removal = CompletableFuture.runAsync(() ->
-                assertThrows(AwsException.class, () -> pool.delete(REGION, "example", "live", ACCOUNT)));
+                pool.delete(REGION, "example", "live", ACCOUNT));
         try {
             assertSame(first, launcher.stopping.poll(2, TimeUnit.SECONDS));
             removal.get(3, TimeUnit.SECONDS);
@@ -1009,7 +1200,7 @@ class ProvisionedConcurrencyPoolTest {
         await().atMost(Duration.ofSeconds(2)).until(() ->
                 "READY".equals(pool.get(REGION, "example", "2", ACCOUNT).status()));
         launcher.stopFailures.set(1);
-        assertThrows(AwsException.class, () -> pool.delete(REGION, "example", "live", ACCOUNT));
+        pool.delete(REGION, "example", "live", ACCOUNT);
         launcher.stopping.clear();
         first.stopGate = new CompletableFuture<>();
         try (ExecutorService tasks = Executors.newFixedThreadPool(2)) {
@@ -1082,6 +1273,73 @@ class ProvisionedConcurrencyPoolTest {
         assertEquals(0, second.stops.get());
         await().atMost(Duration.ofSeconds(5)).until(() ->
                 "READY".equals(pool.get(REGION, "example", "live", "222222222222").status()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void storedConfigurationSurvivesFactoryRestartAndDeletedConfigurationStaysDeleted(String mode) throws Exception {
+        pool.shutdown();
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.defaultAccountId()).thenReturn(ACCOUNT);
+        when(config.services().lambda().executor()).thenReturn("docker");
+        when(config.services().lambda().containerDrainTimeoutSeconds()).thenReturn(15);
+        when(config.storage().persistentPath()).thenReturn(storagePath.toString());
+        when(config.storage().wal().compactionIntervalMs()).thenReturn(60_000L);
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode("lambda")).thenReturn(mode);
+        when(access.storageFlushInterval("lambda")).thenReturn(60_000L);
+        for (int restart = 0; restart < 3; restart++) {
+            StorageFactory factory = new StorageFactory(config, access);
+            try {
+                pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, factory, config, Clock.systemUTC());
+                pool.start();
+                if (restart == 0) {
+                    put(2);
+                    launched().initialized.complete(null);
+                    launched().initialized.complete(null);
+                    ready();
+                } else if (restart == 1) {
+                    assertEquals(2, get().requested());
+                    assertEquals("IN_PROGRESS", get().status());
+                    assertEquals(0, get().allocated());
+                    launched().initialized.complete(null);
+                    launched().initialized.complete(null);
+                    ready();
+                    pool.delete(REGION, "example", "live", ACCOUNT);
+                } else {
+                    assertThrows(AwsException.class, this::get);
+                }
+            } finally {
+                pool.shutdown();
+                factory.shutdownAll();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void configuredAliasCannotRetargetToCapacityOwnedByAnotherQualifier(boolean otherAlias) throws Exception {
+        function(ACCOUNT, REGION, "2");
+        alias(ACCOUNT, REGION, "peer", "2", Map.of());
+        put(1);
+        launched().initialized.complete(null);
+        ready();
+        String destination = otherAlias ? "peer" : "2";
+        pool.put(REGION, "example", destination, 1, ACCOUNT);
+        launched().initialized.complete(null);
+        AwsException conflict = assertThrows(AwsException.class,
+                () -> pool.validateAliasUpdate(version, "live", "2"));
+        assertEquals("ResourceConflictException", conflict.getErrorCode());
+        assertEquals(409, conflict.getHttpStatus());
+        assertEquals("Alias can't be used for Provisioned Concurrency configuration on an already Provisioned version",
+                conflict.getMessage());
+        assertEquals(1, get().requested());
+        assertEquals(2, storage.scanAllAccounts().size());
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", null));
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", "1"));
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "unconfigured", "2"));
+        pool.delete(REGION, "example", destination, ACCOUNT);
+        assertDoesNotThrow(() -> pool.validateAliasUpdate(version, "live", "2"));
     }
 
     private static final class Environment {

@@ -41,7 +41,13 @@ public class RedshiftAuthProxy {
     private final IamService iamService;
     private final SpectrumInterceptor spectrumInterceptor;
     private final String clusterAccountId;
-    private volatile List<String> iamRoleArns;
+    private volatile RoleConfiguration roleConfiguration;
+
+    record RoleConfiguration(List<String> iamRoleArns, String defaultIamRoleArn) {
+        RoleConfiguration {
+            iamRoleArns = iamRoleArns == null ? List.of() : List.copyOf(iamRoleArns);
+        }
+    }
     private final int handshakeTimeoutMillis;
     private final int backendConnectTimeoutMillis;
     private final Semaphore connectionPermits;
@@ -98,7 +104,7 @@ public class RedshiftAuthProxy {
         this.iamService = iamService;
         this.spectrumInterceptor = spectrumInterceptor;
         this.clusterAccountId = clusterAccountId;
-        this.iamRoleArns = iamRoleArns == null ? List.of() : List.copyOf(iamRoleArns);
+        this.roleConfiguration = new RoleConfiguration(iamRoleArns, null);
         this.handshakeTimeoutMillis = handshakeTimeoutMillis;
         this.backendConnectTimeoutMillis = backendConnectTimeoutMillis;
         this.connectionPermits = new Semaphore(Math.max(1, maxConnections));
@@ -159,8 +165,16 @@ public class RedshiftAuthProxy {
     }
 
     /** Swap the associated-role snapshot; new connections authorize COPY and UNLOAD against it. */
-    public void updateIamRoles(List<String> newIamRoleArns) {
-        this.iamRoleArns = newIamRoleArns == null ? List.of() : List.copyOf(newIamRoleArns);
+    public synchronized void updateIamRoles(List<String> newIamRoleArns) {
+        updateIamRoles(newIamRoleArns, roleConfiguration.defaultIamRoleArn());
+    }
+
+    public synchronized void updateIamRoles(List<String> newIamRoleArns, String defaultIamRoleArn) {
+        this.roleConfiguration = new RoleConfiguration(newIamRoleArns, defaultIamRoleArn);
+    }
+
+    RoleConfiguration roleConfiguration() {
+        return roleConfiguration;
     }
 
     public void stop() {
@@ -221,8 +235,10 @@ public class RedshiftAuthProxy {
             if (session != null) {
                 // Redshift-only DDL (DISTKEY/SORTKEY/ENCODE/...) is rewritten for the plain
                 // PostgreSQL backend on the way through; every other message is relayed verbatim.
+                RoleConfiguration roles = roleConfiguration;
                 new RedshiftInterceptingBridge(session.client(), session.backend(), s3Service, iamService,
-                        clusterAccountId, iamRoleArns, spectrumInterceptor, clusterKey, dbName).run();
+                        clusterAccountId, roles.iamRoleArns(), spectrumInterceptor, clusterKey, dbName,
+                        roles.defaultIamRoleArn()).run();
             }
         } catch (Exception e) {
             LOG.debugv("Redshift connection error for cluster {0}: {1}", clusterKey, e.getMessage());

@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.elasticache.container.ValkeyClusterFo
 import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
 import io.github.hectorvent.floci.services.elasticache.model.CacheCluster;
 import io.github.hectorvent.floci.services.elasticache.model.CacheClusterStatus;
+import io.github.hectorvent.floci.services.elasticache.model.CacheParameterGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ClusterNode;
 import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUser;
 import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUserGroup;
@@ -33,6 +34,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.reflect.Field;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -41,9 +46,13 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -148,6 +157,146 @@ class ElastiCacheServiceTest {
                 () -> svc.createReplicationGroup("g2", "d", AuthMode.PASSWORD, null, "us-east-1"));
         assertEquals("InsufficientCacheClusterCapacity", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
+    }
+
+    @Test
+    void userAndUserGroupTagsPersistAndCanBeMutatedByArn() {
+        ElastiCacheUser defaultUser = service.createUser("default-user", "default", AuthMode.PASSWORD,
+                List.of("password"), "on ~* +@all", "redis");
+        ElastiCacheUser taggedUser = service.createUser("tagged-user", "tagged", AuthMode.PASSWORD,
+                List.of("password"), "on ~* +@all", "redis", Map.of("owner", "platform"));
+        assertEquals(Map.of("owner", "platform"), taggedUser.getTags());
+
+        ElastiCacheUserGroup taggedGroup = service.createUserGroup("tagged-group", "redis",
+                List.of(defaultUser.getUserId()), "us-east-1", Map.of("team", "cache"));
+        assertEquals(Map.of("team", "cache"), taggedGroup.getTags());
+
+        service.addTagsToResource(taggedUser.getArn(), Map.of("environment", "test"), "us-east-1");
+        assertEquals(Map.of("owner", "platform", "environment", "test"),
+                service.getUser("tagged-user").getTags());
+        service.removeTagsFromResource(taggedUser.getArn(), List.of("owner"), "us-east-1");
+        assertEquals(Map.of("environment", "test"), service.getUser("tagged-user").getTags());
+
+        service.addTagsToResource(taggedGroup.getArn(), Map.of("environment", "test"), "us-east-1");
+        assertEquals(Map.of("team", "cache", "environment", "test"),
+                service.getUserGroup("tagged-group").getTags());
+    }
+
+    @Test
+    void tagResourceRejectsSameIdResourceFromAnotherRegion() {
+        ElastiCacheUser user = service.createUser("regional-user", "regional", AuthMode.PASSWORD,
+                List.of("password"), "on ~* +@all", "redis");
+        String foreignRegionArn = user.getArn().replace(":us-east-1:", ":eu-west-1:");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.addTagsToResource(foreignRegionArn, Map.of("env", "test"), "eu-west-1"));
+
+        assertEquals("UserNotFound", error.getErrorCode());
+        assertTrue(service.getUser("regional-user").getTags().isEmpty());
+    }
+
+    @Test
+    void tagMutationsUseAwsInvalidArnErrorCode() {
+        AwsException addError = assertThrows(AwsException.class,
+                () -> service.addTagsToResource("not-an-arn", Map.of("env", "test"), "us-east-1"));
+        AwsException removeError = assertThrows(AwsException.class,
+                () -> service.removeTagsFromResource("not-an-arn", List.of("env"), "us-east-1"));
+
+        assertEquals("InvalidARN", addError.getErrorCode());
+        assertEquals("InvalidARN", removeError.getErrorCode());
+        assertEquals(400, addError.getHttpStatus());
+        assertEquals(400, removeError.getHttpStatus());
+    }
+
+    @Test
+    void tagMutationsReportMissingSubnetGroupWithAwsFaultCode() {
+        String arn = "arn:aws:elasticache:us-east-1:000000000000:subnetgroup:missing-tag-subnet";
+
+        AwsException addError = assertThrows(AwsException.class,
+                () -> service.addTagsToResource(arn, Map.of("env", "test"), "us-east-1"));
+        AwsException removeError = assertThrows(AwsException.class,
+                () -> service.removeTagsFromResource(arn, List.of("env"), "us-east-1"));
+
+        assertEquals("CacheSubnetGroupNotFoundFault", addError.getErrorCode());
+        assertEquals("CacheSubnetGroupNotFoundFault", removeError.getErrorCode());
+        assertEquals(400, addError.getHttpStatus());
+        assertEquals(400, removeError.getHttpStatus());
+    }
+
+    @Test
+    void tagWritesWaitForParameterGroupDeletion() throws Exception {
+        String name = "tag-delete-race-pg";
+        String arn = "arn:aws:elasticache:us-east-1:000000000000:parametergroup:" + name;
+        service.createCacheParameterGroup(name, "redis7", "tagged", Map.of());
+
+        Field locksField = ElastiCacheService.class.getDeclaredField("parameterGroupLocks");
+        locksField.setAccessible(true);
+        Object monitor = ((ConcurrentHashMap<?, ?>) locksField.get(service)).get(name);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        AtomicReference<Thread> writer = new AtomicReference<>();
+        try {
+            Future<String> tag;
+            synchronized (monitor) {
+                tag = pool.submit(() -> {
+                    writer.set(Thread.currentThread());
+                    try {
+                        service.addTagsToResource(arn, Map.of("env", "test"), "us-east-1");
+                        return "tagged";
+                    } catch (AwsException error) {
+                        return error.getErrorCode();
+                    }
+                });
+                long ownerId = Thread.currentThread().threadId();
+                await().atMost(Duration.ofSeconds(5)).until(() -> {
+                    Thread thread = writer.get();
+                    ThreadInfo info = thread == null ? null
+                            : ManagementFactory.getThreadMXBean().getThreadInfo(thread.threadId());
+                    return tag.isDone() || info != null && info.getThreadState() == Thread.State.BLOCKED
+                            && info.getLockOwnerId() == ownerId && info.getLockInfo() != null
+                            && info.getLockInfo().getIdentityHashCode() == System.identityHashCode(monitor)
+                            && info.getLockInfo().getClassName().equals(monitor.getClass().getName());
+                });
+                assertFalse(tag.isDone(), "tagging bypassed the parameter-group lifecycle lock");
+                service.deleteCacheParameterGroup(name);
+            }
+            assertEquals("CacheParameterGroupNotFound", tag.get(5, TimeUnit.SECONDS));
+            assertTrue(service.findParameterGroup(name).isEmpty());
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "tag writer did not terminate");
+        }
+    }
+
+    @Test
+    void tagResourceDerivesPartitionFromRequestedRegion() {
+        ElastiCacheUserGroup group = service.createUserGroup("gov-group", "valkey", List.of(),
+                "us-gov-west-1");
+
+        service.addTagsToResource(group.getArn(), Map.of("env", "gov"), "us-gov-west-1");
+
+        assertEquals(Map.of("env", "gov"), service.getUserGroup("gov-group").getTags());
+    }
+
+    @Test
+    void tagMutationsSupportCacheClustersAndParameterGroups() {
+        CacheCluster cluster = service.createCacheCluster(cacheClusterRequest("tag-cluster", "redis", 1));
+        CacheParameterGroup parameterGroup = service.createCacheParameterGroup(
+                "tag-pg", "redis7", "tagged parameter group", Map.of("owner", "platform"));
+
+        service.addTagsToResource(cluster.getArn(), Map.of("environment", "test"), "us-east-1");
+        service.removeTagsFromResource(cluster.getArn(), List.of("environment"), "us-east-1");
+        assertTrue(service.findCacheClusters("tag-cluster").getFirst().getTags().isEmpty());
+
+        service.addTagsToResource("arn:aws:elasticache:us-east-1:000000000000:parametergroup:tag-pg",
+                Map.of("environment", "test"), "us-east-1");
+        assertEquals(Map.of("owner", "platform", "environment", "test"),
+                service.findParameterGroup(parameterGroup.getName()).orElseThrow().getTags());
+
+        AwsException wrongRegion = assertThrows(AwsException.class, () -> service.addTagsToResource(
+                "arn:aws:elasticache:eu-west-1:000000000000:parametergroup:tag-pg",
+                Map.of("wrong", "region"), "eu-west-1"));
+        assertEquals("CacheParameterGroupNotFound", wrongRegion.getErrorCode());
+        assertFalse(service.findParameterGroup("tag-pg").orElseThrow().getTags().containsKey("wrong"));
     }
 
     @Test

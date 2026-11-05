@@ -264,6 +264,8 @@ public class CloudWatchMetricsJsonHandler {
             if (a.getStateReasonData() != null) node.put("StateReasonData", a.getStateReasonData());
             node.put("StateUpdatedTimestamp", a.getStateUpdatedTimestamp());
         }
+        response.putArray("CompositeAlarms");
+        response.putArray("LogAlarms");
         return Response.ok(response).build();
     }
 

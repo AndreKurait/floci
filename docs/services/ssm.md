@@ -25,6 +25,9 @@
 | `DescribePatchBaselines` | List AWS-owned predefined patch baselines (filter by `OWNER`, `OPERATING_SYSTEM`, `NAME_PREFIX`) |
 | `GetDefaultPatchBaseline` | Get the default patch baseline id for an operating system |
 
+`DescribeParameters` includes the stored parameter's `ARN` in each metadata entry, matching
+`GetParameter`. This applies to filtered and paginated results as well.
+
 `GetParametersByPath` supports `Type` and `KeyId` entries in `ParameterFilters`, with `Equals`
 (the default) or `BeginsWith`. Values within one filter combine with OR; multiple
 filters combine with AND. Filtering also applies to public AMI parameters and

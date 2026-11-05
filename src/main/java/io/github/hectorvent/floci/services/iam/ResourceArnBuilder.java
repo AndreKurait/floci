@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
@@ -46,6 +47,8 @@ public class ResourceArnBuilder {
     /** The only scheme IAM accepts on an OIDC provider URL, and the part its ARN drops. */
     private static final String OIDC_URL_SCHEME = "https://";
 
+    private static final String DELEGATION_REQUEST_RESOURCE = "delegation-request/";
+
     /** What a service-linked role deletion task identifier starts with; see its resolver. */
     private static final String DELETION_TASK_PREFIX = "task" + ServiceLinkedRoles.PATH;
 
@@ -65,15 +68,25 @@ public class ResourceArnBuilder {
     private final Instance<SecretsManagerService> secretsManagerService;
     /** Looked up lazily for the same reason, to read the image a MicroVM runs. */
     private final Instance<LambdaMicrovmsService> microvmsService;
+    /** Looked up lazily for the same reason, to read the ARN an EKS cluster or what it holds is stored under. */
+    private final Instance<EksService> eksService;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
                               Instance<SecretsManagerService> secretsManagerService,
-                              Instance<LambdaMicrovmsService> microvmsService) {
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
         this.microvmsService = microvmsService;
+        this.eksService = eksService;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -105,9 +118,9 @@ public class ResourceArnBuilder {
     }
 
     /**
-     * The resources a request is checked against. Scheduler and Pipes ARNs are minted in {@code partition},
-     * the request's, as those services mint theirs, so a Region no partition publishes gets the deployment's
-     * partition rather than {@code aws}.
+     * The resources a request is checked against. Scheduler, Pipes and DSQL ARNs are minted in
+     * {@code partition}, the request's, as those services mint theirs, so a Region no partition publishes gets
+     * the deployment's partition rather than {@code aws}.
      */
     public List<String> buildResources(String credentialScope, ContainerRequestContext ctx,
                                        String region, String accountId, String partition) {
@@ -128,6 +141,8 @@ public class ResourceArnBuilder {
             case "resource-groups" -> List.of(buildResourceGroupArn(ctx, region, accountId));
             case "scheduler"      -> List.of(buildSchedulerArn(path, ctx, region, accountId, partition));
             case "pipes"          -> List.of(buildPipesArn(path, ctx, region, accountId, partition));
+            case "dsql"           -> List.of(buildDsqlArn(path, ctx, region, accountId, partition));
+            case "eks"            -> List.of(buildEksArn(path, ctx, region, accountId));
             default               -> List.of("*");
         };
     }
@@ -285,7 +300,8 @@ public class ResourceArnBuilder {
             "AcceptDelegationRequest", ResourceArnBuilder::delegationRequestArn,
             "RejectDelegationRequest", ResourceArnBuilder::delegationRequestArn,
             "GetDelegationRequest", ResourceArnBuilder::delegationRequestArn,
-            "SendDelegationToken", ResourceArnBuilder::delegationRequestArn);
+            "SendDelegationToken", ResourceArnBuilder::delegationRequestArn,
+            "GetHumanReadableSummary", ResourceArnBuilder::summarizedRequestArn);
 
     /** How one of {@link #DERIVED_RESOLVERS} reads its resource out of the request. */
     interface DerivedResolver {
@@ -484,8 +500,40 @@ public class ResourceArnBuilder {
         if (id == null || id.isBlank()) {
             return List.of("*");
         }
-        return List.of(AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "iam", accountId,
-                "delegation-request/" + id).toString());
+        return List.of(delegationRequestArn(region, accountId, id));
+    }
+
+    /**
+     * The delegation request a summary is asked for, named by the ARN Floci mints rather than
+     * the one the caller spelled.
+     *
+     * <p>{@code GetHumanReadableSummary} is the one action of this family that takes an ARN, and
+     * the lookup reads only the request id out of it, deliberately: the id is what resolves a
+     * request across accounts. So the string as it arrived cannot be what the request is
+     * authorized against. A caller allowed by a wildcard and denied on one request could
+     * otherwise respell that request's ARN, under another account or another service, and miss
+     * the deny while still reading the summary. The id is lifted out and the canonical ARN is
+     * minted around it instead, which is the same ARN the five by-id actions resolve to.
+     *
+     * <p>A value that is no ARN, or an ARN naming anything but an IAM delegation request, leaves
+     * the wildcard standing: the service answers {@code NOT_SUPPORTED} or {@code InvalidInput}
+     * for those without reading a request at all.
+     */
+    private List<String> summarizedRequestArn(ContainerRequestContext ctx, String region,
+                                              String accountId) {
+        return AwsArnUtils
+                .resourceIfArnFor(RequestBodyReader.formField(ctx, "EntityArn"), "iam")
+                .filter(resource -> resource.startsWith(DELEGATION_REQUEST_RESOURCE))
+                .map(resource -> resource.substring(DELEGATION_REQUEST_RESOURCE.length()))
+                .filter(id -> !id.isBlank())
+                .map(id -> List.of(delegationRequestArn(region, accountId, id)))
+                .orElseGet(() -> List.of("*"));
+    }
+
+    /** The ARN a delegation request carries, which is its id under the calling account. */
+    private static String delegationRequestArn(String region, String accountId, String id) {
+        return AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "iam", accountId,
+                DELEGATION_REQUEST_RESOURCE + id).toString();
     }
 
     /** An OIDC provider URL as its ARN carries it, which is the URL without its scheme. */
@@ -570,10 +618,21 @@ public class ResourceArnBuilder {
         if (iamService == null) {
             return List.of("*");
         }
-        return SigV4CredentialScope.accessKeyId(ctx.getHeaderString("Authorization"))
-                .flatMap(accessKeyId -> iamService.get().findUserNameByAccessKeyId(accessKeyId))
+        Optional<String> accessKeyId = SigV4CredentialScope.accessKeyId(ctx.getHeaderString("Authorization"));
+        Optional<List<String>> user = accessKeyId
+                .flatMap(key -> iamService.get().findUserNameByAccessKeyId(key))
                 .flatMap(userName -> storedIamEntity("user", userName, accountId))
-                .map(stored -> List.of(stored.arn()))
+                .map(stored -> List.of(stored.arn()));
+        if (user.isPresent()) {
+            return user.get();
+        }
+        // A caller that is the account root names the root user, which is what these actions act
+        // on when they are called with no UserName. AWS's own task policy for auditing root
+        // credentials is written against arn:aws:iam::*:root, so a privileged session calling
+        // GetUser or ListAccessKeys has to name that resource rather than the wildcard.
+        return accessKeyId.flatMap(key -> iamService.get().resolveCallerArn(key))
+                .filter(arn -> arn.endsWith(":root"))
+                .map(List::of)
                 .orElse(List.of("*"));
     }
 
@@ -938,6 +997,29 @@ public class ResourceArnBuilder {
         return taggedResource(ctx);
     }
 
+    /**
+     * The resource of an Aurora DSQL route, as the Service Authorization Reference names it: the cluster
+     * a cluster route names, the stream a stream route names (its cluster, to create or list streams), or
+     * the ARN a tagging route names. CreateCluster and ListClusters are checked against
+     * {@code cluster/*}, as DSQL checks them (measured).
+     */
+    private String buildDsqlArn(String path, ContainerRequestContext ctx, String region, String accountId,
+                                String partition) {
+        String cluster = "/cluster".equals(path) ? "*" : segmentAfterPrefix(path, "/cluster/");
+        if (cluster == null) {
+            cluster = segmentAfterPrefix(path, "/clusters/");
+        }
+        String streamCluster = segmentAfterPrefix(path, "/stream/");
+        if (streamCluster != null) {
+            String stream = segmentAfterPrefix(path, "/stream/" + streamCluster + "/");
+            cluster = stream == null ? streamCluster : streamCluster + "/stream/" + stream;
+        }
+        if (cluster != null) {
+            return new AwsArnUtils.Arn(partition, "dsql", region, accountId, "cluster/" + cluster).toString();
+        }
+        return taggedResource(ctx);
+    }
+
     /** The resource of an EventBridge Pipes route: {@code pipe/<name>}, or the ARN a tagging route names. */
     private String buildPipesArn(String path, ContainerRequestContext ctx, String region, String accountId,
                                  String partition) {
@@ -946,6 +1028,88 @@ public class ResourceArnBuilder {
             return new AwsArnUtils.Arn(partition, "pipes", region, accountId, "pipe/" + pipe).toString();
         }
         return taggedResource(ctx);
+    }
+
+    /**
+     * The resource of an EKS route, as the Service Reference gives it, in the caller's account, where EKS
+     * looks everything up. A cluster is the ARN EKS holds it under, or for one it holds none of, the ARN a
+     * create mints in the request's Region; {@code CreateCluster} is checked against the cluster its body
+     * names, as the EKS user guide's example policy for creating a cluster grants it. A node group, Fargate
+     * profile, add-on, access entry or Pod Identity association is the ARN EKS holds it under, which ends
+     * in an id the request does not carry, or {@code *} when EKS holds none to act on; listing or creating
+     * them, and every other route under a cluster, act on the cluster. The path is split as the router
+     * splits it, before decoding, so an encoded {@code /} stays inside a name, and an access entry's
+     * principal is the rest of the path, as EKS takes it. {@code DescribeUpdate} acts on the add-on its
+     * {@code addonName} names, since the updates EKS keeps are its add-ons', and otherwise on the cluster. A
+     * tagging route acts on the caller's cluster named by what follows the ARN's last {@code /}, as EKS tags
+     * it, whatever the ARN names before that. Deregistering a cluster acts on that cluster, and an EKS
+     * Anywhere subscription route on the subscription its id names. Listing clusters, registering one, the
+     * account-wide reads, and an identity provider config or capability, which end in an id Floci does not
+     * keep, name no resource, so they are {@code *}.
+     */
+    private String buildEksArn(String path, ContainerRequestContext ctx, String region, String accountId) {
+        if (path.equals("/tags") || path.startsWith("/tags/")) {
+            String tagged = taggedArn(ctx);
+            int slash = tagged == null ? -1 : tagged.lastIndexOf('/');
+            return slash < 0 || slash == tagged.length() - 1 ? "*"
+                    : eksClusterArn(tagged.substring(slash + 1), region, accountId);
+        }
+        String[] segments = IamActionRegistry.routedPath(ctx.getUriInfo()).substring(1).split("/", -1);
+        if (segments.length == 1) {
+            JsonNode body = "clusters".equals(segments[0]) && "POST".equalsIgnoreCase(ctx.getMethod())
+                    ? readJsonBody(ctx) : null;
+            String cluster = body == null ? null : body.path("name").asText(null);
+            return cluster == null || cluster.isBlank() ? "*" : eksClusterArn(cluster, region, accountId);
+        }
+        String name = pathSegment(segments[1]);
+        if (name.isEmpty()) {
+            return "*";
+        }
+        return switch (segments[0]) {
+            case "clusters" -> eksClusterRouteArn(name, segments, region, accountId);
+            case "cluster-registrations" -> eksClusterArn(name, region, accountId);
+            case "eks-anywhere-subscriptions" ->
+                    AwsArnUtils.Arn.of("eks", region, accountId, "eks-anywhere-subscription/" + name).toString();
+            default -> "*";
+        };
+    }
+
+    /** The resource of a route under the cluster {@code cluster}, its path split into {@code segments}. */
+    private String eksClusterRouteArn(String cluster, String[] segments, String region, String accountId) {
+        if (segments.length < 4 || segments[3].isEmpty()) {
+            return eksClusterArn(cluster, region, accountId);
+        }
+        String collection = segments[2];
+        return switch (collection) {
+            case "node-groups", "fargate-profiles", "addons", "pod-identity-associations" ->
+                    eksHeldArn(cluster, collection, pathSegment(segments[3]));
+            case "access-entries" -> eksHeldArn(cluster, collection,
+                    pathSegment(String.join("/", List.of(segments).subList(3, segments.length))));
+            case "updates" -> {
+                // The updates Floci keeps are its add-ons', and EKS returns one whether or not the request names
+                // its add-on, so the update is checked against the add-on it was made to.
+                Optional<String> addon = segments.length == 4 && eksService != null
+                        ? eksService.get().findResourceArn(cluster, collection, pathSegment(segments[3]))
+                        : Optional.empty();
+                yield addon.orElseGet(() -> eksClusterArn(cluster, region, accountId));
+            }
+            case "identity-provider-configs" ->
+                    "associate".equals(segments[3]) ? eksClusterArn(cluster, region, accountId) : "*";
+            case "capabilities" -> "*";
+            default -> eksClusterArn(cluster, region, accountId);
+        };
+    }
+
+    /** The ARN EKS holds the cluster {@code name} under, or else the one a create mints in {@code region}. */
+    private String eksClusterArn(String name, String region, String accountId) {
+        Optional<String> held = eksService == null ? Optional.empty()
+                : eksService.get().findResourceArn(name, null, null);
+        return held.orElseGet(() -> AwsArnUtils.Arn.of("eks", region, accountId, "cluster/" + name).toString());
+    }
+
+    /** The ARN EKS holds {@code name} of {@code collection} in the cluster under, or {@code *} when it holds none. */
+    private String eksHeldArn(String cluster, String collection, String name) {
+        return eksService == null ? "*" : eksService.get().findResourceArn(cluster, collection, name).orElse("*");
     }
 
     /** The ARN a shared tagging route names, or {@code *} for any other route. */

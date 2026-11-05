@@ -25,6 +25,7 @@ public class LambdaFunctionStore implements Resettable {
 
     private final StorageBackend<String, LambdaFunction> backend;
     private final ConcurrentHashMap<String, LambdaFunction> urlIdIndex = new ConcurrentHashMap<>();
+    // Retain locks across deletion and reset so a queued operation cannot race a newly created lock.
     private final ConcurrentHashMap<String, Object> concurrencyOpLocks = new ConcurrentHashMap<>();
 
     @Inject

@@ -1,6 +1,5 @@
 package io.github.hectorvent.floci.services.ses;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -41,8 +40,8 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
+import static io.github.hectorvent.floci.services.ses.SesV2Json.readOptionBody;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.remapV1Exception;
-import static io.github.hectorvent.floci.services.ses.SesV2Json.requireJsonObject;
 
 /**
  * REST JSON controller for the three SES V2 send endpoints:
@@ -93,8 +92,7 @@ public class SesSendController {
                         "Account sending is disabled.", 400);
             }
 
-            JsonNode request = objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             SesV2RequestShapes.check("SendEmail", request);
             validateTrackingOverrides(request);
 
@@ -246,8 +244,7 @@ public class SesSendController {
                         "Account sending is disabled.", 400);
             }
 
-            JsonNode request = objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             SesV2RequestShapes.check("SendBulkEmail", request);
             validateTrackingOverrides(request);
             String fromEmailAddress = request.path("FromEmailAddress").asText(null);
@@ -393,8 +390,7 @@ public class SesSendController {
                 throw new AwsException("SendingPausedException",
                         "Account sending is disabled.", 400);
             }
-            JsonNode request = objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             SesV2RequestShapes.check("SendCustomVerificationEmail", request);
             templateName = request.path("TemplateName").asText(null);
             String messageId = sesService.sendCustomVerificationEmail(
@@ -411,8 +407,6 @@ public class SesSendController {
                         "Custom verification email template <" + templateName + "> does not exist", 404);
             }
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("BadRequestException", e.getMessage(), 400);
         }
     }
 

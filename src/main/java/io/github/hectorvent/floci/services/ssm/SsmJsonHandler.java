@@ -329,6 +329,7 @@ public class SsmJsonHandler {
         for (Parameter p : page.items()) {
             ObjectNode node = objectMapper.createObjectNode();
             node.put("Name", p.getName());
+            node.put("ARN", p.getArn());
             node.put("Type", p.getType());
             node.put("Version", p.getVersion());
             node.put("LastModifiedDate", p.getLastModifiedDate().toEpochMilli() / 1000.0);

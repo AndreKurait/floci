@@ -366,13 +366,13 @@ class EmrIntegrationTest {
 
     @Test
     @Order(17)
-    void addStepsToUnknownClusterIsInvalidRequest() {
+    void addStepsToUnknownClusterIsAValidationException() {
         emr("AddJobFlowSteps",
                 "{\"JobFlowId\":\"j-DOESNOTEXIST0\",\"Steps\":[{\"Name\":\"s\","
                         + "\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}}]}")
                 .then().statusCode(400)
-                .body("__type", equalTo("InvalidRequestException"))
-                .body("message", equalTo("Cluster id 'j-DOESNOTEXIST0' is not valid."));
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("Specified job flow ID does not exist."));
     }
 
     @Test
@@ -402,6 +402,40 @@ class EmrIntegrationTest {
         emr("DescribeCluster", "{\"ClusterId\":\"" + protectedId + "\"}")
                 .then().statusCode(200)
                 .body("Cluster.Status.State", equalTo("WAITING"));
+    }
+
+    @Test
+    void settersAndCancelStepsRefuseARequestWithoutTheMembersTheyRequire() {
+        String id = emr("RunJobFlow", "{\"Name\":\"required\",\"Instances\":{\"KeepJobFlowAliveWhenNoSteps\":true}}")
+                .then().statusCode(200).extract().path("JobFlowId");
+        String ids = "\"JobFlowIds\":[\"" + id + "\"]";
+
+        assertMissing("TerminateJobFlows", "{}", "jobFlowIds");
+        assertMissing("SetTerminationProtection", "{\"TerminationProtected\":true}", "jobFlowIds");
+        assertMissing("SetTerminationProtection", "{" + ids + "}", "terminationProtected");
+        assertMissing("SetVisibleToAllUsers", "{" + ids + "}", "visibleToAllUsers");
+        assertMissing("SetKeepJobFlowAliveWhenNoSteps", "{" + ids + "}", "keepJobFlowAliveWhenNoSteps");
+        assertMissing("SetUnhealthyNodeReplacement", "{" + ids + "}", "unhealthyNodeReplacement");
+        assertMissing("CancelSteps", "{\"ClusterId\":\"" + id + "\"}", "stepIds");
+        emr("SetVisibleToAllUsers", "{}").then().statusCode(400)
+                .body("message", equalTo("2 validation errors detected: "
+                        + "Value null at 'jobFlowIds' failed to satisfy constraint: Member must not be null; "
+                        + "Value null at 'visibleToAllUsers' failed to satisfy constraint: Member must not be null"));
+        emr("TerminateJobFlows", "{\"JobFlowIds\":[]}").then().statusCode(200);
+
+        emr("DescribeCluster", "{\"ClusterId\":\"" + id + "\"}").then().statusCode(200)
+                .body("Cluster.Status.State", equalTo("WAITING"))
+                .body("Cluster.TerminationProtected", equalTo(false))
+                .body("Cluster.VisibleToAllUsers", equalTo(true))
+                .body("Cluster.AutoTerminate", equalTo(false));
+        emr("TerminateJobFlows", "{" + ids + "}").then().statusCode(200);
+    }
+
+    private static void assertMissing(String action, String body, String member) {
+        emr(action, body).then().statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("1 validation error detected: Value null at '" + member
+                        + "' failed to satisfy constraint: Member must not be null"));
     }
 
     // Catches: a cluster stored before the DNS fix keeps reporting its old us-east-1 master name.

@@ -8,7 +8,9 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.lambdaweb.LambdaWebClient;
+import software.amazon.awssdk.services.lambdaweb.model.AccessDeniedException;
 import software.amazon.awssdk.services.lambdaweb.model.AuthType;
 import software.amazon.awssdk.services.lambdaweb.model.AutoDeploymentMode;
 import software.amazon.awssdk.services.lambdaweb.model.BuildConfig;
@@ -42,8 +44,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class LambdaWebTest {
 
     private static final String FUNCTION_NAME = "sdk-test-web-fn";
-    private static final String ROLE = "arn:aws:iam::000000000000:role/lambda-web-role";
+    private static final String LAMBDA_TRUST = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+            + "\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}";
     private static LambdaWebClient lambdaWeb;
+    private static IamClient iam;
+    private static String roleName;
+    private static String role;
     private static S3Client s3;
     private static String bucket;
     private static String functionArn;
@@ -54,6 +60,9 @@ class LambdaWebTest {
     static void setup() {
         lambdaWeb = TestFixtures.lambdaWebClient();
         s3 = TestFixtures.s3Client();
+        iam = TestFixtures.iamClient();
+        roleName = TestFixtures.uniqueName("sdk-test-web-role");
+        role = iam.createRole(r -> r.roleName(roleName).assumeRolePolicyDocument(LAMBDA_TRUST)).role().arn();
         bucket = TestFixtures.uniqueName("sdk-test-web-code");
         s3.createBucket(r -> r.bucket(bucket));
         s3.putObject(r -> r.bucket(bucket).key("app.zip"), RequestBody.fromBytes(LambdaUtils.minimalZip()));
@@ -79,6 +88,12 @@ class LambdaWebTest {
             }
             s3.close();
         }
+        if (iam != null) {
+            if (role != null) {
+                iam.deleteRole(r -> r.roleName(roleName));
+            }
+            iam.close();
+        }
     }
 
     private static BuildConfig buildConfig() {
@@ -95,7 +110,7 @@ class LambdaWebTest {
                 .functionName(FUNCTION_NAME)
                 .revisionConfig(RevisionConfig.builder()
                         .buildConfig(buildConfig())
-                        .serviceConfig(ServiceConfig.builder().executionRoleArn(ROLE).build())
+                        .serviceConfig(ServiceConfig.builder().executionRoleArn(role).build())
                         .build())
                 .endpointConfig(EndpointConfig.builder()
                         .endpointName("dev")
@@ -147,7 +162,7 @@ class LambdaWebTest {
                 .functionName(FUNCTION_NAME)
                 .description("second")
                 .buildConfig(buildConfig())
-                .serviceConfig(ServiceConfig.builder().executionRoleArn(ROLE).timeoutSeconds(60)
+                .serviceConfig(ServiceConfig.builder().executionRoleArn(role).timeoutSeconds(60)
                         .environmentVariables(Map.of("APP_VERSION", "2")).build()));
         secondRevisionId = revision.revisionId();
         assertThat(revision.stateAsString()).isEqualTo("Pending");
@@ -195,7 +210,7 @@ class LambdaWebTest {
         assertThatThrownBy(() -> lambdaWeb.createWebFunctionRevision(r -> r
                 .functionName(FUNCTION_NAME)
                 .buildConfig(buildConfig())
-                .serviceConfig(ServiceConfig.builder().executionRoleArn(ROLE).timeoutSeconds(2).build())))
+                .serviceConfig(ServiceConfig.builder().executionRoleArn(role).timeoutSeconds(2).build())))
                 .isInstanceOf(ValidationException.class)
                 .hasMessageContaining("1 validation error detected: Value '2' at 'serviceConfig.timeoutSeconds' failed"
                         + " to satisfy constraint: Member must have value greater than or equal to 3");
@@ -207,6 +222,21 @@ class LambdaWebTest {
                 .endpointType(EndpointType.HOME_REGION).authType(AuthType.APPLICATION_MANAGED)))
                 .isInstanceOf(ValidationException.class)
                 .hasMessageContaining("The revisionWeights must be specified when the autoDeploymentMode is Disabled.");
+        String missingRole = role.replace(roleName, roleName + "-missing");
+        assertThatThrownBy(() -> lambdaWeb.createWebFunctionRevision(r -> r
+                .functionName(FUNCTION_NAME)
+                .buildConfig(buildConfig())
+                .serviceConfig(ServiceConfig.builder().executionRoleArn(missingRole).build())))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("The execution role " + missingRole + " cannot be assumed by lambda.amazonaws.com."
+                        + " Verify its trust policy. If the role was just created, retry in a few seconds.");
+        assertThatThrownBy(() -> lambdaWeb.createWebFunctionRevision(r -> r
+                .functionName(FUNCTION_NAME)
+                .buildConfig(buildConfig())
+                .serviceConfig(ServiceConfig.builder()
+                        .executionRoleArn("arn:aws:iam::111122223333:role/" + roleName).build())))
+                .isInstanceOfSatisfying(AccessDeniedException.class, e -> assertThat(e.statusCode()).isEqualTo(403))
+                .hasMessageContaining("Cross-account pass role is not allowed.");
     }
 
     @Test

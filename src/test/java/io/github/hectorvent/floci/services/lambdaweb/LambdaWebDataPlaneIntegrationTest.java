@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambdaweb;
 
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
@@ -36,6 +37,9 @@ class LambdaWebDataPlaneIntegrationTest {
 
     @Inject
     S3Service s3Service;
+
+    @Inject
+    IamService iamService;
 
     @Inject
     LambdaWebMetrics metrics;
@@ -123,6 +127,35 @@ class LambdaWebDataPlaneIntegrationTest {
         given().when().delete(BASE + "/web-functions/" + functionName + "/endpoints/dev").then().statusCode(204);
         given().header("Host", domain).when().get("/")
                 .then().statusCode(404).header("lambda-web-error-type", "Platform.InvalidEndpoint");
+        given().when().delete(BASE + "/web-functions/" + functionName).then().statusCode(204);
+    }
+
+    @Test
+    void anEnvironmentDoesNotStartWhenLambdaCanNoLongerAssumeTheRole() {
+        String functionName = "dp-role-" + Long.toString(System.nanoTime(), 36);
+        String domain = createFunction(functionName, "ApplicationManaged", LambdaWebZips.indexJs(""),
+                "arn:aws:iam::000000000000:role/" + functionName);
+        iamService.updateAssumeRolePolicy(functionName, """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                  "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}""");
+
+        Response response = given().header("Host", domain).when().get("/");
+        response.then().statusLine("HTTP/1.1 502 Bad Gateway")
+                .header("content-type", "text/html")
+                .header("connection", "keep-alive")
+                .header("lambda-web-error-type", "Platform.CannotAssumeRole")
+                .header("lambda-web-request-id", matchesPattern(REQUEST_ID))
+                .header("lambda-web-logstream", nullValue())
+                .header("content-length", "228")
+                .body(equalTo(LambdaWebErrorPages.html(LambdaWebErrorPages.CANNOT_ASSUME_ROLE,
+                        response.header("lambda-web-request-id"))));
+
+        iamService.deleteRole(functionName);
+        given().header("Host", domain).when().get("/")
+                .then().statusCode(502).header("lambda-web-error-type", "Platform.CannotAssumeRole");
+        given().contentType("application/json").body("{}")
+                .when().post(BASE + "/web-functions/" + functionName + "/list-revisions")
+                .then().statusCode(200).body("revisions[0].state", equalTo("Active"));
         given().when().delete(BASE + "/web-functions/" + functionName).then().statusCode(204);
     }
 
@@ -282,6 +315,11 @@ class LambdaWebDataPlaneIntegrationTest {
     }
 
     private String createFunction(String functionName, String authType, byte[] code) {
+        return createFunction(functionName, authType, code, ROLE);
+    }
+
+    private String createFunction(String functionName, String authType, byte[] code, String role) {
+        LambdaWebRoles.trustLambda(iamService, role);
         s3Service.createBucket(BUCKET, "us-east-1");
         s3Service.putObject(BUCKET, "app.zip", code, "application/zip", Map.of());
         return given().contentType("application/json")
@@ -293,7 +331,7 @@ class LambdaWebDataPlaneIntegrationTest {
                            "serviceConfig": {"executionRoleArn": "%s"}},
                          "endpointConfig": {"endpointName": "dev", "endpointType": "HomeRegion",
                                             "authType": "%s", "autoDeploymentMode": "LatestRevision"}}
-                        """.formatted(functionName, BUCKET, ROLE, authType))
+                        """.formatted(functionName, BUCKET, role, authType))
                 .when().put(BASE + "/web-functions")
                 .then().statusCode(202)
                 .extract().path("endpoint.domainName");

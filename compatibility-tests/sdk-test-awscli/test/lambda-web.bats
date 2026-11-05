@@ -8,7 +8,11 @@ setup() {
     load 'test_helper/common-setup'
     FUNCTION_NAME=""
     BUCKET="cli-lambda-web-code-$$"
-    ROLE_ARN="arn:aws:iam::000000000000:role/lambda-web"
+    ROLE_NAME="cli-lambda-web-$$"
+    ROLE_ARN="arn:aws:iam::000000000000:role/$ROLE_NAME"
+    aws_cmd iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document \
+        '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
+        >/dev/null 2>&1 || true
     aws_cmd s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1 || true
     # A revision whose code is not a zip fails. python3 ships in the CLI image.
     python3 -c 'import sys, zipfile
@@ -24,6 +28,7 @@ teardown() {
         aws_cmd iam delete-role --role-name "awscli-lambdaweb-$FUNCTION_NAME" >/dev/null 2>&1 || true
     fi
     aws_cmd s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
+    aws_cmd iam delete-role --role-name "$ROLE_NAME" >/dev/null 2>&1 || true
 }
 
 build_config() {
@@ -134,6 +139,24 @@ create_function() {
         --endpoint-config '{"endpointName":"dev","endpointType":"HomeRegion","authType":"ApplicationManaged"}'
     assert_failure
     assert_output --partial "Invalid function name or ARN '-bad'"
+}
+
+@test "Lambda Web: an execution role Lambda cannot assume is refused" {
+    FUNCTION_NAME=$(unique_name "cli-web")
+    create_function "$FUNCTION_NAME" >/dev/null
+
+    run aws_cmd lambda-web create-web-function-revision --function-name "$FUNCTION_NAME" \
+        --build-config "$(build_config)" --service-config "{\"executionRoleArn\":\"$ROLE_ARN-missing\"}"
+    assert_failure
+    assert_output --partial "ValidationException"
+    assert_output --partial "The execution role $ROLE_ARN-missing cannot be assumed by lambda.amazonaws.com."
+
+    run aws_cmd lambda-web create-web-function-revision --function-name "$FUNCTION_NAME" \
+        --build-config "$(build_config)" \
+        --service-config "{\"executionRoleArn\":\"arn:aws:iam::111122223333:role/$ROLE_NAME\"}"
+    assert_failure
+    assert_output --partial "AccessDeniedException"
+    assert_output --partial "Cross-account pass role is not allowed."
 }
 
 @test "Lambda Web: deploy the hello world app and invoke its endpoint" {

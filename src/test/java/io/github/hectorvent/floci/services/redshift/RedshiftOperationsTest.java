@@ -453,6 +453,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-src")
         .when()
             .post("/")
@@ -512,6 +513,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-restored")
         .when()
             .post("/")
@@ -898,6 +900,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-tags")
         .when()
             .post("/")
@@ -1083,7 +1086,8 @@ public class RedshiftOperationsTest {
                 400, "InvalidSnapshotCopyGrantStateFault");
         assertEquals(200, redshift("DisableSnapshotCopy", "ClusterIdentifier", "cluster-copy").statusCode());
 
-        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-copy").statusCode());
+        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-copy",
+                "SkipFinalClusterSnapshot", "true").statusCode());
         assertEquals(200, redshift("DeleteSnapshotCopyGrant", "SnapshotCopyGrantName", "copy-lifecycle-grant").statusCode());
     }
 
@@ -1186,7 +1190,8 @@ public class RedshiftOperationsTest {
         assertEquals(0, describeSchedules("ScheduleIdentifier", "sched-1").getList("SnapshotSchedule").size());
         assertFault(redshift("DeleteSnapshotSchedule", "ScheduleIdentifier", "sched-1"), 400, "SnapshotScheduleNotFound");
 
-        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-sched").statusCode());
+        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-sched",
+                "SkipFinalClusterSnapshot", "true").statusCode());
     }
 
     @Test

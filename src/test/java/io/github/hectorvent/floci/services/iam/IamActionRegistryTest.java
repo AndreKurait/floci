@@ -364,6 +364,46 @@ class IamActionRegistryTest {
     }
 
     @Test
+    void aTrailingSlashIsCheckedAsTheRouteWithoutIt() {
+        // The router matches /clusters/ as /clusters, so the rule ending at the route's last segment covers it.
+        // An S3 path is matched as sent, as before: a key may end in a slash.
+        String[][] routes = {
+            {"eks", "POST", "/clusters/", "eks:CreateCluster"},
+            {"eks", "GET", "/clusters/c/node-groups/ng/", "eks:DescribeNodegroup"},
+            {"scheduler", "GET", "/schedules/", "scheduler:ListSchedules"},
+            {"pipes", "GET", "/v1/pipes/p/", "pipes:DescribePipe"},
+            {"lambda", "GET", "/2015-03-31/functions/fn/", "lambda:GetFunction"},
+            {"s3", "GET", "/bucket/", "s3:ListBucket"},
+            {"s3", "GET", "/bucket/folder/", "s3:GetObject"},
+            {"s3", "PUT", "/bucket//", "s3:PutObject"},
+            {"s3", "GET", "/bucket//", "s3:GetObject"},
+            {"s3", "DELETE", "/bucket//", "s3:DeleteObject"},
+        };
+        for (String[] route : routes) {
+            assertEquals(route[3], registry.resolveRoute(route[0], mockCtx(route[1], route[2],
+                    new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}")), route[2]);
+        }
+    }
+
+    @Test
+    void anEksAccessEntryRouteTakesThePrincipalAsTheRestOfThePath() {
+        // EKS reads the principal greedily, so a GET or DELETE under an entry reads or deletes an entry.
+        String entry = "/clusters/c/access-entries/arn:aws:iam::000000000000:role/team/worker";
+        String[][] routes = {
+            {"GET", entry, "eks:DescribeAccessEntry"},
+            {"GET", entry + "/access-policies", "eks:DescribeAccessEntry"},
+            {"DELETE", entry + "/access-policies/arn:aws:eks::aws:cluster-access-policy/Admin", "eks:DeleteAccessEntry"},
+            {"POST", entry + "/access-policies", "eks:AssociateAccessPolicy"},
+            {"POST", entry, "eks:UpdateAccessEntry"},
+            {"GET", "/clusters/c/access-entries", "eks:ListAccessEntries"},
+        };
+        for (String[] route : routes) {
+            assertEquals(route[2], registry.resolveRoute("eks", mockCtx(route[0], route[1],
+                    new MultivaluedHashMap<>(), MediaType.APPLICATION_JSON_TYPE, "{}")), route[1]);
+        }
+    }
+
+    @Test
     void returnsNullForUnknownRestJsonRoute() {
         ContainerRequestContext ctx = mockCtx(
                 "POST", "/some/unknown/path",

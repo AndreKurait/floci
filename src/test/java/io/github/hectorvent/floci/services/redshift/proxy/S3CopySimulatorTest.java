@@ -53,6 +53,46 @@ import static org.mockito.Mockito.when;
 
 class S3CopySimulatorTest {
 
+    @Test
+    void quotedDefaultIsValidatedAsAnArnForCopyAndUnload() {
+        IamService iamService = mock(IamService.class);
+        for (String defaultRole : new String[]{null, ROLE_ARN}) {
+            for (String authorization : List.of("IAM_ROLE 'default'", "IAM_ROLE \"default\"",
+                    "CREDENTIALS 'aws_iam_role=default'")) {
+                CopyStatementParser.S3CopyFrom copy = (CopyStatementParser.S3CopyFrom) CopyStatementParser.parse(
+                        "COPY people FROM 's3://bucket/data' " + authorization, defaultRole);
+                CopyStatementParser.S3Unload unload = (CopyStatementParser.S3Unload) CopyStatementParser.parse(
+                        "UNLOAD ('SELECT 1') TO 's3://bucket/out/' " + authorization, defaultRole);
+                S3CopySimulator.S3TransferException copyError = assertThrows(S3CopySimulator.S3TransferException.class,
+                        () -> S3CopySimulator.prepareCopy(copy, s3, iamService, "000000000000", List.of(ROLE_ARN)));
+                S3CopySimulator.S3TransferException unloadError = assertThrows(S3CopySimulator.S3TransferException.class,
+                        () -> S3CopySimulator.prepareUnload(unload, s3, iamService, "000000000000", List.of(ROLE_ARN)));
+                assertEquals("42501", copyError.sqlState());
+                assertEquals("42501", unloadError.sqlState());
+                assertTrue(copyError.getMessage().contains("malformed ARN"), copyError.getMessage());
+                assertTrue(unloadError.getMessage().contains("malformed ARN"), unloadError.getMessage());
+            }
+        }
+        verifyNoInteractions(s3, iamService);
+    }
+
+    @Test
+    void missingDefaultRoleFailsCopyAndUnloadBeforeTouchingS3() {
+        CopyStatementParser.S3CopyFrom copy = (CopyStatementParser.S3CopyFrom) CopyStatementParser.parse(
+                "COPY people FROM 's3://bucket/data' IAM_ROLE default");
+        CopyStatementParser.S3Unload unload = (CopyStatementParser.S3Unload) CopyStatementParser.parse(
+                "UNLOAD ('SELECT 1') TO 's3://bucket/out/' IAM_ROLE default");
+        S3CopySimulator.S3TransferException copyError = assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> S3CopySimulator.prepareCopy(copy, s3, null, "000000000000", List.of()));
+        S3CopySimulator.S3TransferException unloadError = assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> S3CopySimulator.prepareUnload(unload, s3, null, "000000000000", List.of()));
+        assertEquals("42501", copyError.sqlState());
+        assertEquals("42501", unloadError.sqlState());
+        assertTrue(copyError.getMessage().contains("No default IAM role"));
+        assertTrue(unloadError.getMessage().contains("No default IAM role"));
+        verifyNoInteractions(s3);
+    }
+
     private ServerSocket listener;
     private Socket simClient;   // simulator's "client" end
     private Socket simBackend;  // simulator's "backend" end
@@ -192,6 +232,13 @@ class S3CopySimulatorTest {
 
     private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/CopyRole";
 
+    /** A role IAM holds under {@code arn}, which is the only ARN Redshift takes it under. */
+    private static IamRole heldRole(String arn) {
+        IamRole role = mock(IamRole.class);
+        when(role.getArn()).thenReturn(arn);
+        return role;
+    }
+
     @Test
     void prepareCopyWithMalformedIamRoleArnFailsBeforeTouchingS3() {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
@@ -258,7 +305,7 @@ class S3CopySimulatorTest {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
                 "t", List.of(), "b", "k", "|", 0, false, false, null, ROLE_ARN);
         IamService iamService = mock(IamService.class);
-        IamRole role = mock(IamRole.class);
+        IamRole role = heldRole(ROLE_ARN);
         when(iamService.findRole("000000000000", "CopyRole"))
                 .thenReturn(Optional.of(role));
         when(role.getAssumeRolePolicyDocument()).thenReturn(""
@@ -281,8 +328,9 @@ class S3CopySimulatorTest {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
                 "t", List.of(), "b", "k", "|", 0, false, false, null, ROLE_ARN);
         IamService iamService = mock(IamService.class);
+        IamRole role = heldRole(ROLE_ARN);
         when(iamService.findRole(any(), any()))
-                .thenReturn(Optional.of(mock(IamRole.class)));
+                .thenReturn(Optional.of(role));
 
         S3CopySimulator.CopyInput input = S3CopySimulator.prepareCopy(spec, s3, iamService);
 
@@ -303,8 +351,9 @@ class S3CopySimulatorTest {
         CopyStatementParser.S3CopyFrom spec = new CopyStatementParser.S3CopyFrom(
                 "t", List.of(), "b", "k", "|", 0, false, false, null, ROLE_ARN);
         IamService iamService = mock(IamService.class);
+        IamRole role = heldRole(ROLE_ARN);
         when(iamService.findRole(any(), any()))
-                .thenReturn(Optional.of(mock(IamRole.class)));
+                .thenReturn(Optional.of(role));
 
         S3CopySimulator.CopyInput input = S3CopySimulator.prepareCopy(spec, s3, iamService);
         S3CopySimulator.streamCopyInput(input, new ByteArrayOutputStream());
@@ -1789,7 +1838,7 @@ class S3CopySimulatorTest {
     void runCopyFrom_withJsonAuto_releasesIamSessionEvenWhenCatalogDiscoveryFails() throws Exception {
         when(s3.objectExists("wh", "data.json")).thenReturn(true);
         IamService iamService = mock(IamService.class);
-        IamRole role = mock(IamRole.class);
+        IamRole role = heldRole("arn:aws:iam::000000000000:role/Role");
         when(role.getAssumeRolePolicyDocument()).thenReturn(
                 "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"redshift.amazonaws.com\"}}]}");
         when(iamService.findRole("000000000000", "Role")).thenReturn(Optional.of(role));

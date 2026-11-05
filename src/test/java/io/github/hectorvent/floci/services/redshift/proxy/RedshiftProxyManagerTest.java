@@ -115,6 +115,33 @@ class RedshiftProxyManagerTest {
     }
 
     @Test
+    void defaultRoleAndAssociatedRolesAreInstalledTogetherBeforeAcceptingConnections() throws Exception {
+        RedshiftProxyManager manager = newManager();
+        String first = "arn:aws:iam::111111111111:role/first";
+        String second = "arn:aws:iam::111111111111:role/second";
+        int port = FreePorts.anyInterfacePort();
+        try {
+            manager.startProxy(KEY, port, "localhost", 1, "localhost", "admin", "pw", "dev",
+                    null, List.of(first), first);
+            RedshiftAuthProxy proxy = registry(manager).get(KEY);
+            RedshiftAuthProxy.RoleConfiguration connected = proxy.roleConfiguration();
+            assertEquals(List.of(first), connected.iamRoleArns());
+            assertEquals(first, connected.defaultIamRoleArn());
+            assertThrows(UnsupportedOperationException.class, () -> connected.iamRoleArns().add(second));
+
+            manager.updateIamRoles(KEY, List.of(second), second);
+            RedshiftAuthProxy.RoleConfiguration nextConnection = proxy.roleConfiguration();
+            assertEquals(List.of(second), nextConnection.iamRoleArns());
+            assertEquals(second, nextConnection.defaultIamRoleArn());
+            assertEquals(List.of(first), connected.iamRoleArns());
+            assertEquals(first, connected.defaultIamRoleArn());
+            assertPortUnavailable(port);
+        } finally {
+            manager.stopAll();
+        }
+    }
+
+    @Test
     void updateIamRolesForUnknownKeyIsANoOp() {
         RedshiftProxyManager manager = newManager();
         assertDoesNotThrow(() -> manager.updateIamRoles("missing", List.of()));
@@ -288,11 +315,8 @@ class RedshiftProxyManagerTest {
         return (String) field.get(proxy);
     }
 
-    @SuppressWarnings("unchecked")
-    private static List<String> iamRoleArns(RedshiftAuthProxy proxy) throws Exception {
-        Field field = RedshiftAuthProxy.class.getDeclaredField("iamRoleArns");
-        field.setAccessible(true);
-        return (List<String>) field.get(proxy);
+    private static List<String> iamRoleArns(RedshiftAuthProxy proxy) {
+        return proxy.roleConfiguration().iamRoleArns();
     }
 
 
