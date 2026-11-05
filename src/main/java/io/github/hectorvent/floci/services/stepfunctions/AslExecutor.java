@@ -1,6 +1,5 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -43,6 +42,8 @@ import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeHandler;
+import io.github.hectorvent.floci.services.eventbridge.EventBridgeInvoker;
+import io.github.hectorvent.floci.services.eventbridge.EventBridgeInvoker.ConnectionHttpParameters;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
@@ -267,6 +268,7 @@ public class AslExecutor {
     private final EcsService ecsService;
     private final EcsJsonHandler ecsJsonHandler;
     private final EventBridgeHandler eventBridgeHandler;
+    private final EventBridgeInvoker eventBridgeInvoker;
     private final SchedulerService schedulerService;
     private final SchedulerController schedulerController;
     private final RdsDataService rdsDataService;
@@ -317,7 +319,7 @@ public class AslExecutor {
                        ServiceRegistry serviceRegistry, NestedTaskCredentials nestedTaskCredentials,
                        LambdaTaskAuthorizer lambdaTaskAuthorizer, ApiGatewayTaskInvoker apiGatewayTaskInvoker,
                        EmrTaskInvoker emrTaskInvoker, EmrServerlessTaskInvoker emrServerlessTaskInvoker,
-                       SdkManagementTaskInvoker sdkManagementTaskInvoker) {
+                       SdkManagementTaskInvoker sdkManagementTaskInvoker, EventBridgeInvoker eventBridgeInvoker) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
@@ -325,7 +327,7 @@ public class AslExecutor {
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
                 nestedTaskCredentials, lambdaTaskAuthorizer, null, null, apiGatewayTaskInvoker, emrTaskInvoker,
-                emrServerlessTaskInvoker, sdkManagementTaskInvoker, null);
+                emrServerlessTaskInvoker, sdkManagementTaskInvoker, null, eventBridgeInvoker);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -345,7 +347,7 @@ public class AslExecutor {
                 Duration expressMaxExecutionTimeOverride, LongSupplier nanoTimeOverride,
                 ApiGatewayTaskInvoker apiGatewayTaskInvoker, EmrTaskInvoker emrTaskInvoker,
                 EmrServerlessTaskInvoker emrServerlessTaskInvoker, SdkManagementTaskInvoker sdkManagementTaskInvoker,
-                NestedWaiter nestedWaiter) {
+                NestedWaiter nestedWaiter, EventBridgeInvoker eventBridgeInvoker) {
         this.apiGatewayTaskInvoker = apiGatewayTaskInvoker;
         this.emrTaskInvoker = emrTaskInvoker;
         this.emrServerlessTaskInvoker = emrServerlessTaskInvoker;
@@ -367,6 +369,7 @@ public class AslExecutor {
         this.ecsService = ecsService;
         this.ecsJsonHandler = ecsJsonHandler;
         this.eventBridgeHandler = eventBridgeHandler;
+        this.eventBridgeInvoker = eventBridgeInvoker;
         this.schedulerService = schedulerService;
         this.schedulerController = schedulerController;
         this.rdsDataService = rdsDataService;
@@ -414,7 +417,7 @@ public class AslExecutor {
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null, null, null, null,
-                null, null, null);
+                null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -436,7 +439,7 @@ public class AslExecutor {
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null, null, null, null, null, null,
-                null);
+                null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -979,6 +982,9 @@ public class AslExecutor {
         JsonNode credentials = null;
         boolean readCredentials = stateDef.has("Credentials")
                 && (iamEnforcementEnabled() || (mockedInvocation == null && nestedTask));
+        // Otherwise only the scheduled event reads them, and what it cannot read it leaves out.
+        boolean recordCredentialsOnly = stateDef.has("Credentials") && !readCredentials && !isActivity;
+        JsonNode recordedCredentials = null;
         if (jsonata) {
             effectiveInput = input;
             if (stateDef.has("Arguments")) {
@@ -989,17 +995,26 @@ public class AslExecutor {
             if (readCredentials) {
                 credentials = jsonataEvaluator.resolveTemplate(stateDef.get("Credentials"), "Credentials",
                         buildStatesVar(input, null, context), variables);
+            } else if (recordCredentialsOnly) {
+                recordedCredentials = credentialsOrNull(stateName,
+                        () -> jsonataEvaluator.resolveTemplate(stateDef.get("Credentials"), "Credentials",
+                                buildStatesVar(input, null, context), variables));
             }
         } else {
             effectiveInput = applyInputPath(stateDef, input, context);
             if (readCredentials) {
                 credentials = resolveParameters(stateDef.get("Credentials"), effectiveInput, context);
+            } else if (recordCredentialsOnly) {
+                JsonNode credentialsInput = effectiveInput;
+                recordedCredentials = credentialsOrNull(stateName,
+                        () -> resolveParameters(stateDef.get("Credentials"), credentialsInput, context));
             }
             if (stateDef.has("Parameters")) {
                 effectiveInput = resolveParameters(stateDef.get("Parameters"), effectiveInput, context);
             }
         }
-        String credentialsRoleArn = credentials == null ? null : credentials.path("RoleArn").asText(null);
+        JsonNode taskCredentials = credentials;
+        JsonNode scheduledCredentials = credentials != null ? credentials : recordedCredentials;
 
         // Registered after the input template resolved, so a template failure leaves no token behind.
         CompletableFuture<JsonNode> tokenFuture = needsToken ? sfnService.get().registerPendingToken(taskToken,
@@ -1011,7 +1026,7 @@ public class AslExecutor {
         // does not extend the Task's own TimeoutSeconds.
         long taskDeadlineNanos = taskDeadlineNanos(stateDef);
         try {
-            addTaskScheduledEvent(chain, profile, stateDef, effectiveInput, sm);
+            addTaskScheduledEvent(chain, profile, stateDef, effectiveInput, sm, scheduledCredentials);
             addTaskStartedEvent(chain, profile);
             try {
                 String taskAccount = null;
@@ -1029,7 +1044,7 @@ public class AslExecutor {
                                 effectiveResource, resourceInput, sm, resourceToken,
                                 context.path("Execution").path("Id").asText(null),
                                 executionDeadlineNanos, taskDeadlineNanos,
-                                jsonata ? null : stateDef.path("Parameters"), credentialsRoleArn,
+                                jsonata ? null : stateDef.path("Parameters"), taskCredentials,
                                 jobResponse -> RequestScopes.runAs(
                                         AwsArnUtils.parse(sm.getStateMachineArn()).accountId(),
                                         () -> addTaskSubmittedEvent(chain, profile, jobResponse))));
@@ -1086,6 +1101,17 @@ public class AslExecutor {
             JsonNode output = mergeResult(stateDef, input, taskResult);
             output = applyOutputPath(stateDef, output, context);
             return new StateResult(output, stateDef.path("Next").asText(null));
+        }
+    }
+
+    /** A task's {@code Credentials} when only the history reads them, so a failure is not the task's. */
+    private JsonNode credentialsOrNull(String stateName, Callable<JsonNode> resolve) throws Exception {
+        try {
+            return resolve.call();
+        } catch (FailStateException e) {
+            LOG.debugv("Task state {0}: Credentials did not resolve, so its history omits them: {1}",
+                    stateName, e.getMessage());
+            return null;
         }
     }
 
@@ -1230,6 +1256,19 @@ public class AslExecutor {
         return colon >= 0 ? fn.substring(colon + 1) : null;
     }
 
+    /** Integrations {@link TaskPermissions} does not map stay unchecked, Lambda and API Gateway check their own. */
+    private void authorizeTask(StatesIntegration integration, JsonNode input, StateMachine sm, JsonNode credentials) {
+        Optional<TaskPermissions> required = TaskPermissions.of(integration, input, sm);
+        if (required.isEmpty()) {
+            return;
+        }
+        if (credentials != null) {
+            NestedTaskCredentials.validateShape(credentials);
+        }
+        lambdaTaskAuthorizer.authorize(sm, credentials == null ? null : credentials.path("RoleArn").asText(),
+                required.get().errorPrefix(), required.get().permissions());
+    }
+
     private boolean iamEnforcementEnabled() {
         return config != null && config.services() != null && config.services().iam() != null
                 && config.services().iam().enforcementEnabled();
@@ -1290,15 +1329,16 @@ public class AslExecutor {
     }
 
     /**
-     * @param credentialsRoleArn the role the task's {@code Credentials} name, read only under IAM
-     *                           enforcement, or null when the task runs as the execution role
+     * @param credentials the task's resolved {@code Credentials}, read only under IAM enforcement or
+     *                    for a nested execution, or null when the task runs as the execution role
      * @param jobSubmitted called with the response of the call that started a {@code .sync} job,
      *                     once it has returned and before the job is waited on
      */
     private JsonNode invokeResource(String resource, JsonNode input, StateMachine sm, String taskToken,
                                     String executionArn, long executionDeadlineNanos, long taskDeadlineNanos,
-                                    JsonNode rawParameters, String credentialsRoleArn,
+                                    JsonNode rawParameters, JsonNode credentials,
                                     Consumer<JsonNode> jobSubmitted) throws Exception {
+        String credentialsRoleArn = credentials == null ? null : credentials.path("RoleArn").asText(null);
         // Support Lambda resources: direct ARN or optimized integration
         String functionName = null;
         String functionRef = null;
@@ -1410,6 +1450,10 @@ public class AslExecutor {
 
         if (integration == null) {
             return invokeNonIntegrationResource(resource, input, taskToken);
+        }
+
+        if (iamEnforcementEnabled()) {
+            authorizeTask(integration, input, sm, credentials);
         }
 
         if (integration.is("apigateway", "invoke") && integration.suffix().isEmpty()) {
@@ -5115,12 +5159,10 @@ public class AslExecutor {
     }
 
     /**
-     * Implements the Step Functions HTTP Task request flow for direct task-provided
-     * fields. EventBridge connection lookup and connection-level header, query
-     * parameter, and body merging are intentionally not implemented yet.
-     *
-     * TODO: Resolve Authentication/InvocationConfig ConnectionArn through the
-     * EventBridge connection store and merge connection credentials/parameters.
+     * Implements the Step Functions HTTP Task request flow. The EventBridge connection's
+     * authorization, headers, query parameters and body parameters are merged over the
+     * task's, the connection's value winning on a conflict, as
+     * <a href="https://docs.aws.amazon.com/step-functions/latest/dg/call-https-apis.html#http-task-data-merge">documented</a>.
      *
      * TODO: Add HTTP retry support. This can be done via Mutiny's retry mechanism
      * but most likely better to be done at a higher level to support other tasks.
@@ -5148,17 +5190,27 @@ public class AslExecutor {
         }
 
         validateHttpMethod(method);
-        validateConnectionArn(input);
+        String connectionArn = connectionArn(input);
         validateHttpHeaders(headers);
+        // The connection's OAuth token exchange spends the same TimeoutSeconds as the request.
+        long deadlineNanos = nanoTime.getAsLong() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        ConnectionHttpParameters connection = connectionHttpParameters(connectionArn, region);
+        long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - nanoTime.getAsLong());
+        if (remainingMillis <= 0) {
+            throw new FailStateException("States.Http.Socket", "The timeout period of " + timeoutMillis
+                    + "ms has been exceeded while authorizing with the connection");
+        }
 
-        HttpRequestPayload requestPayload = requestPayload(requestBody, requestBodyEncoding,
+        HttpRequestPayload requestPayload = requestPayload(
+                mergeConnectionBody(requestBody, connection.bodyParameters()), requestBodyEncoding,
                 input.path("Transform").path("RequestEncodingOptions"));
         MultiMap requestHeaders = requestHeaders(headers, requestPayload.contentType());
-        MultiMap requestQueryParameters = queryParameters(queryParameters);
+        connection.headers().forEach(requestHeaders::set);
+        MultiMap requestQueryParameters = queryParameters(queryParameters, connection.queryStringParameters());
 
         try {
             HttpRequest<Buffer> request = webClient.requestAbs(HttpMethod.valueOf(method), rawUri)
-                .timeout(timeoutMillis)
+                .timeout(remainingMillis)
                 .putHeaders(requestHeaders)
                 .putHeader("User-Agent", "Amazon|StepFunctions|HttpInvoke|" + region);
             request.queryParams().addAll(requestQueryParameters);
@@ -5218,13 +5270,15 @@ public class AslExecutor {
         }
     }
 
+    // Built field by field: binding a record through Jackson needs reflection metadata, and the native
+    // image has none for a private record, so valueToTree returned {} there.
     private JsonNode httpResultJson(HttpResponse<Buffer> response) {
-       HttpTaskResponse stepHttpResponse = new HttpTaskResponse(
-            response.statusCode(),
-            response.statusMessage(),
-            httpResponseHeaders(response),
-            httpResponseBody(response));
-        return objectMapper.valueToTree(stepHttpResponse);
+        ObjectNode result = objectMapper.createObjectNode();
+        result.put("StatusCode", response.statusCode());
+        result.put("StatusText", response.statusMessage());
+        result.set("Headers", objectMapper.valueToTree(httpResponseHeaders(response)));
+        result.set("ResponseBody", httpResponseBody(response));
+        return result;
     }
 
     private Map<String, List<String>> httpResponseHeaders(HttpResponse<Buffer> response) {
@@ -5305,13 +5359,6 @@ public class AslExecutor {
     private record HttpRequestPayload(Buffer body, String contentType) {
     }
 
-    private record HttpTaskResponse(
-            @JsonProperty("StatusCode") int statusCode,
-            @JsonProperty("StatusText") String statusText,
-            @JsonProperty("Headers") Map<String, List<String>> headers,
-            @JsonProperty("ResponseBody") JsonNode responseBody) {
-    }
-
     private void validateHttpMethod(String method) {
         if (method == null || method.isBlank()) {
             throw new FailStateException("States.Runtime", "Method is required for HTTP task");
@@ -5323,7 +5370,7 @@ public class AslExecutor {
         }
     }
 
-    private void validateConnectionArn(JsonNode input) {
+    private String connectionArn(JsonNode input) {
         String connectionArn = input.path("InvocationConfig").path("ConnectionArn").asText(null);
         if (connectionArn == null || connectionArn.isBlank()) {
             connectionArn = input.path("Authentication").path("ConnectionArn").asText(null);
@@ -5332,6 +5379,36 @@ public class AslExecutor {
             throw new FailStateException("States.Runtime",
                     "ConnectionArn is required for HTTP task Authentication or InvocationConfig");
         }
+        return connectionArn;
+    }
+
+    private ConnectionHttpParameters connectionHttpParameters(String connectionArn, String region) {
+        try {
+            return eventBridgeInvoker.connectionHttpParameters(connectionArn, region);
+        } catch (AwsException e) {
+            String error = "ResourceNotFoundException".equals(e.getErrorCode())
+                    ? "Events.ConnectionResource.ResourceNotFound"
+                    : "Events.ConnectionResource.InternalError";
+            throw new FailStateException(error, e.getMessage());
+        }
+    }
+
+    // A string body cannot take the connection's body parameters; AWS fails the task rather than drop them
+    private JsonNode mergeConnectionBody(JsonNode requestBody, Map<String, String> bodyParameters) {
+        if (bodyParameters.isEmpty()) {
+            return requestBody;
+        }
+        ObjectNode merged;
+        if (requestBody.isMissingNode() || requestBody.isNull()) {
+            merged = objectMapper.createObjectNode();
+        } else if (requestBody instanceof ObjectNode objectBody) {
+            merged = objectBody.deepCopy();
+        } else {
+            throw new FailStateException("States.Runtime",
+                    "The RequestBody cannot be merged with the connection's body parameters: it is not a JSON object");
+        }
+        bodyParameters.forEach(merged::put);
+        return merged;
     }
 
     /**
@@ -5359,16 +5436,21 @@ public class AslExecutor {
         }
     }
 
-    private MultiMap queryParameters(JsonNode queryParameters) {
+    /**
+     * The task's query parameters with the connection's merged over them. Query names are
+     * case-sensitive, so a connection parameter replaces only a task parameter of the same name.
+     */
+    private MultiMap queryParameters(JsonNode queryParameters, Map<String, String> connectionParameters) {
         MultiMap params = MultiMap.caseInsensitiveMultiMap();
-        if (queryParameters.isMissingNode() || queryParameters.isNull()) {
-            return params;
+        if (!queryParameters.isMissingNode() && !queryParameters.isNull()) {
+            if (!queryParameters.isObject()) {
+                throw new FailStateException("States.Runtime", "QueryParameters must be a JSON object for HTTP task");
+            }
+            queryParameters.properties().stream()
+                    .filter(entry -> !connectionParameters.containsKey(entry.getKey()))
+                    .forEach(entry -> addQueryParameterValues(params, entry.getKey(), entry.getValue()));
         }
-        if (!queryParameters.isObject()) {
-            throw new FailStateException("States.Runtime", "QueryParameters must be a JSON object for HTTP task");
-        }
-
-        queryParameters.properties().forEach(entry -> addQueryParameterValues(params, entry.getKey(), entry.getValue()));
+        connectionParameters.forEach(params::add);
         return params;
     }
 
@@ -6084,7 +6166,7 @@ public class AslExecutor {
     }
 
     private void addTaskScheduledEvent(HistoryChain chain, TaskEventProfile profile, JsonNode stateDef,
-                                       JsonNode effectiveInput, StateMachine sm) {
+                                       JsonNode effectiveInput, StateMachine sm, JsonNode credentials) {
         LinkedHashMap<String, Object> details = new LinkedHashMap<>();
         if (profile.resourceType() != null) {
             details.put("resourceType", profile.resourceType());
@@ -6102,6 +6184,10 @@ public class AslExecutor {
         }
         if (stateDef.path("HeartbeatSeconds").isNumber()) {
             details.put("heartbeatInSeconds", stateDef.path("HeartbeatSeconds").asLong());
+        }
+        // ActivityScheduledEventDetails has no taskCredentials member.
+        if (credentials != null && credentials.path("RoleArn").isTextual() && !"Activity".equals(profile.prefix())) {
+            details.put("taskCredentials", Map.of("roleArn", credentials.path("RoleArn").asText()));
         }
         chain.publish(profile.prefix() + "Scheduled", details);
     }

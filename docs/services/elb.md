@@ -47,6 +47,20 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 
 HTTPS listeners require a default certificate. Supply one when creating a listener or changing an HTTP listener to HTTPS; an omitted certificate list on an existing HTTPS listener keeps its default.
 
+Listener responses omit `Certificates` when the listener has none. Configured certificates
+remain present in create, describe and modify responses.
+
+Creating an HTTPS or TLS listener without `SslPolicy` selects `ELBSecurityPolicy-2016-08`,
+matching AWS's default for API, CLI and CloudFormation creation. An explicit policy
+is preserved, and omitting the policy on subsequent modifications retains its current
+value. These policies remain present in create, describe and modify responses;
+listeners with no policy, such as HTTP listeners, omit `SslPolicy`.
+
+Changing HTTPS to HTTP or TLS to TCP removes the SSL policy and certificate configuration.
+Changing HTTP to HTTPS or TCP to TLS requires an explicit SSL policy and default certificate;
+missing either rejects the modification without changing the listener. Changing other
+properties without changing protocol retains the existing security settings.
+
 Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on both create and modify requests. Their portless control-plane configuration does not provide GENEVE packet forwarding.
 
 | Action | Description |
@@ -88,6 +102,10 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 
 ## Behavior Notes
 
+- `DescribeLoadBalancers`, `DescribeTargetGroups`, `DescribeListeners`, `DescribeRules`,
+  `DescribeAccountLimits` and `DescribeListenerCertificates` return their complete matching
+  results without a `NextMarker`. These handlers do not yet split results using `PageSize`
+  or resume from `Marker`.
 - HTTP and HTTPS target groups use their configured protocol for both application requests
   and WebSocket upgrades. An HTTPS target requires a TLS handshake; a failed handshake
   never falls back to plaintext. Backend certificates may be self-signed or expired, as on

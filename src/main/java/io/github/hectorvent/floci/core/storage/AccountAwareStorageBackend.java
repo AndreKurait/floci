@@ -77,10 +77,7 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
 
     @Override
     public void putAll(Map<String, V> entries) {
-        String prefix = prefix() + "/";
-        Map<String, V> prefixedEntries = new LinkedHashMap<>();
-        entries.forEach((key, value) -> prefixedEntries.put(prefix + key, value));
-        delegate.putAll(prefixedEntries);
+        putAllForAccount(prefix(), entries);
     }
 
     @Override
@@ -175,6 +172,11 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     /** Scans all values across every account, without any account prefix filtering. */
     public List<V> scanAllAccounts() {
         return delegate.scan(k -> true);
+    }
+
+    /** Whether no account holds a value. */
+    public boolean isEmptyInAllAccounts() {
+        return delegate.isEmpty();
     }
 
     /** Removes matching values using their actual stored keys, including unprefixed legacy keys. */
@@ -443,6 +445,7 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         Map<String, V> prefixedEntries = new LinkedHashMap<>();
         entries.forEach((key, value) -> prefixedEntries.put(prefix + key, value));
         delegate.putAll(prefixedEntries);
+        trackOwner(accountId);
     }
 
     public void deleteForAccount(String accountId, String key) {

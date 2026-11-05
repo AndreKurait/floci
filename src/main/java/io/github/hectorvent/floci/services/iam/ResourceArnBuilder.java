@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.sqs.SqsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -229,7 +230,8 @@ public class ResourceArnBuilder {
     private List<String> namedResources(String credentialScope, String operation, ContainerRequestContext ctx,
                                         String region, String accountId, String partition) {
         List<String> named = operation == null || !operation.startsWith(credentialScope + ":") ? List.of()
-                : RequestResources.of(operation, ctx, partition, region, accountId, storedResourceArns(credentialScope));
+                : RequestResources.of(operation, ctx, partition, region, accountId, storedResourceArns(credentialScope),
+                        IamActionRegistry.pathLabels(credentialScope, ctx));
         return named.isEmpty() ? List.of("*") : named;
     }
 
@@ -1549,8 +1551,7 @@ public class ResourceArnBuilder {
             }
         }
         if (queueUrl != null && !queueUrl.isEmpty()) {
-            String queueName = queueUrl.substring(queueUrl.lastIndexOf('/') + 1);
-            return AwsArnUtils.Arn.of("sqs", region, accountId, queueName).toString();
+            return SqsService.queueArn(queueUrl, AwsRegions.partitionFor(region), region, accountId);
         }
         return AwsArnUtils.Arn.of("sqs", region, accountId, "*").toString();
     }

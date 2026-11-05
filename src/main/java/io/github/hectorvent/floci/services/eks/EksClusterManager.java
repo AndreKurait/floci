@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerNetworks;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
@@ -794,7 +795,13 @@ public class EksClusterManager
         try {
             info = lifecycleManager.startCreated(containerId, spec);
         } catch (Exception e) {
-            lifecycleManager.removeIfExists(containerName);
+            try {
+                lifecycleManager.removeIfExistsStrict(containerName, true);
+            } catch (RuntimeException cleanup) {
+                e.addSuppressed(cleanup);
+                LOG.warnv("Could not remove failed EKS container {0}; retaining it for cleanup retry: {1}",
+                        containerName, cleanup.getMessage());
+            }
             throw e;
         }
 
@@ -865,21 +872,8 @@ public class EksClusterManager
 
     // Floci in a container reaches k3s over the Docker network; on the host it uses the published port.
     private boolean onAnotherNetwork(Container survivor) {
-        if (!containerDetector.isRunningInContainer()) {
-            return false;
-        }
-        Optional<String> network = containerBuilder.resolveDockerNetwork(config.services().eks().dockerNetwork());
-        if (network.isEmpty() || survivor.getNetworkSettings() == null
-                || survivor.getNetworkSettings().getNetworks() == null
-                || survivor.getNetworkSettings().getNetworks().isEmpty()) {
-            return false;
-        }
-        boolean moved = !survivor.getNetworkSettings().getNetworks().containsKey(network.get());
-        if (moved) {
-            LOG.infov("Surviving k3s container {0} is not on Docker network {1}; replacing it (its data volume is kept)",
-                    survivor.getId(), network.get());
-        }
-        return moved;
+        return containerDetector.isRunningInContainer() && ContainerNetworks.onAnotherNetwork(
+                survivor, containerBuilder.resolveDockerNetwork(config.services().eks().dockerNetwork()).orElse(null));
     }
 
     /** An adopted container keeps advertising the host its certificate was created for. */
@@ -933,7 +927,7 @@ public class EksClusterManager
                 .map(Container::getLabels).orElse(null));
         DockerClient docker = lifecycleManager.getDockerClient();
         try {
-            lifecycleManager.removeIfExistsStrict(backupName);
+            lifecycleManager.removeIfExistsStrict(backupName, true);
         } catch (RuntimeException cleanup) {
             LOG.warnv("Could not clear prior EKS capacity backup for cluster {0}: {1}; keeping current node",
                     cluster.getName(), cleanup.getMessage());
@@ -958,7 +952,7 @@ public class EksClusterManager
                 return false;
             }
             try {
-                lifecycleManager.removeIfExistsStrict(containerName);
+                lifecycleManager.removeIfExistsStrict(containerName, true);
                 docker.renameContainerCmd(oldId).withName(containerName).exec();
                 if (!adoptSurvivingCluster(cluster, oldId, oldCertificateHost)) {
                     throw new IllegalStateException("Could not adopt previous EKS container " + oldId);
@@ -970,7 +964,7 @@ public class EksClusterManager
             return false;
         }
         try {
-            lifecycleManager.removeIfExistsStrict(backupName);
+            lifecycleManager.removeIfExistsStrict(backupName, true);
         } catch (RuntimeException cleanup) {
             LOG.warnv("EKS cluster {0} replacement is running, but its stopped capacity backup"
                     + " could not be removed: {1}; cluster deletion will retry",
@@ -1121,7 +1115,7 @@ public class EksClusterManager
         // Strict: a container Docker could not remove may still be running and publishing the
         // port, so the delete fails and keeps the cluster record, its metadata endpoint, log
         // handle and port reservation; a retried delete releases them once the container is gone.
-        lifecycleManager.stopAndRemoveStrict(cluster.getContainerId(), logStream);
+        lifecycleManager.stopAndRemoveStrict(cluster.getContainerId(), logStream, 5, true);
         unregisterMetadataEndpoint(cluster);
         // Removed by value so an overlapping delete cannot drop a handle it does not own.
         if (logStream != null) {
@@ -1140,7 +1134,7 @@ public class EksClusterManager
         if (cluster.getDockerName() != null) {
             // A failed backup cleanup must not leave the live node running. Keep the cluster
             // record so explicit deletion can be retried once Docker accepts the removal.
-            lifecycleManager.removeIfExistsStrict(capacityBackupName(cluster));
+            lifecycleManager.removeIfExistsStrict(capacityBackupName(cluster), true);
         }
         ContainerStorageHelper.removeNamedVolume(config, lifecycleManager, clusterResourceName(cluster));
         LOG.infov("Stopped k3s container for cluster {0}", cluster.getName());

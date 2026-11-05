@@ -108,6 +108,7 @@ public class Ec2QueryHandler {
                 case "StartInstances" -> handleStartInstances(params, region);
                 case "StopInstances" -> handleStopInstances(params, region);
                 case "RebootInstances" -> handleRebootInstances(params, region);
+                case "GetConsoleOutput" -> handleGetConsoleOutput(params, region);
                 case "MonitorInstances" -> handleMonitoring(params, region, "MonitorInstances", true);
                 case "UnmonitorInstances" -> handleMonitoring(params, region, "UnmonitorInstances", false);
                 case "DescribeInstanceStatus" -> handleDescribeInstanceStatus(params, region);
@@ -303,6 +304,9 @@ public class Ec2QueryHandler {
                 // NAT Gateways
                 case "CreateNatGateway" -> handleCreateNatGateway(params, region);
                 case "DescribeNatGateways" -> handleDescribeNatGateways(params, region);
+                case "CreateInstanceConnectEndpoint" -> handleCreateInstanceConnectEndpoint(params, region);
+                case "DescribeInstanceConnectEndpoints" -> handleDescribeInstanceConnectEndpoints(params, region);
+                case "DeleteInstanceConnectEndpoint" -> handleDeleteInstanceConnectEndpoint(params, region);
                 case "DeleteNatGateway" -> handleDeleteNatGateway(params, region);
                 // Capacity Reservations
                 case "CreateCapacityReservation" -> handleCreateCapacityReservation(params, region);
@@ -1555,6 +1559,26 @@ public class Ec2QueryHandler {
         return xmlResponse(buildInstanceStateChangeXml("StopInstancesResponse", changes));
     }
 
+    private Response handleGetConsoleOutput(MultivaluedMap<String, String> p, String region) {
+        // AWS answers a dry run before it looks at the instance, even for an empty or malformed id.
+        checkDryRun(p);
+        String instanceId = p.getFirst("InstanceId");
+        if (instanceId == null || instanceId.isBlank()) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter InstanceId", 400);
+        }
+        String output = service.getConsoleOutput(region, instanceId);
+        String encoded = Base64.getEncoder().encodeToString(
+                output.getBytes(StandardCharsets.UTF_8));
+        XmlBuilder xml = new XmlBuilder()
+                .start("GetConsoleOutputResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("instanceId", instanceId)
+                .elem("timestamp", Instant.now().toString())
+                .elem("output", encoded)
+                .end("GetConsoleOutputResponse");
+        return xmlResponse(xml.build());
+    }
+
     private Response handleRebootInstances(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "InstanceId");
         service.rebootInstances(region, ids);
@@ -1929,25 +1953,77 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeVpcEndpointServices(MultivaluedMap<String, String> p, String region) {
         List<String> requested = getList(p, "ServiceName");
+        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<String> azNames = service.describeAvailabilityZones(region, List.of(), List.of(), null).stream()
                 .map(z -> z.get("zoneName")).toList();
+
+        // Build the full list of service details with all properties for filtering
+        List<ServiceDetail> services = buildServiceDetails(region, requested, azNames);
+        try {
+            // Apply filters
+            services = applyVpcEndpointServiceFilters(services, filters);
+        } catch (AwsException e) {
+            return ec2Error(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+        }
 
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVpcEndpointServicesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
                 .start("serviceNameSet");
+        for (ServiceDetail svc : services) {
+            xml.elem("item", svc.serviceName);
+        }
+        xml.end("serviceNameSet").start("serviceDetailSet");
+        for (ServiceDetail svc : services) {
+            xml.start("item")
+                    .elem("serviceName", svc.serviceName)
+                    .start("serviceType");
+            for (String serviceType : svc.serviceTypes) {
+                xml.start("item").elem("serviceType", serviceType).end("item");
+            }
+            xml.end("serviceType")
+                    .start("availabilityZoneSet");
+            for (String az : svc.availabilityZones) xml.elem("item", az);
+            xml.end("availabilityZoneSet")
+                    .elem("owner", svc.owner)
+                    .elem("acceptanceRequired", svc.acceptanceRequired)
+                    .elem("managesVpcEndpoints", svc.managesVpcEndpoints)
+                    .end("item");
+        }
+        xml.end("serviceDetailSet").end("DescribeVpcEndpointServicesResponse");
+        return xmlResponse(xml.build());
+    }
+
+    /**
+     * Service detail for VPC endpoint service, used for filtering.
+     */
+    private record ServiceDetail(
+            String serviceName,
+            List<String> serviceTypes,
+            List<String> availabilityZones,
+            String owner,
+            String acceptanceRequired,
+            String managesVpcEndpoints,
+            String serviceRegion,
+            List<String> supportedIpAddressTypes) {
+    }
+
+    private List<ServiceDetail> buildServiceDetails(String region, List<String> requested, List<String> azNames) {
+        List<ServiceDetail> services = new ArrayList<>();
+
         // S3 is the one service with both offerings. The gateway keeps com.amazonaws in every
         // partition; the interface takes the region's prefix, so in China the two are named apart.
         String s3Gateway = "com.amazonaws." + region + ".s3";
         String s3Interface = AwsRegionFacts.vpcEndpointServiceName(region, "s3");
-        List<String> fullNames = new ArrayList<>();
-        // An explicit ServiceName filter wins: the emulator supports any
-        // interface service in every AZ, so echo exactly what was asked. CDK's
-        // InterfaceVpcEndpoint queries a specific (often custom) service name
-        // and fails if the response omits it or lists no AZs.
+
+        // Requested service names are echoed verbatim, exactly as AWS does. The emulator
+        // supports any interface service in every AZ, so a requested (often custom) name
+        // must come back unchanged with AZs, otherwise CDK's InterfaceVpcEndpoint fails.
+        List<String> fullNames;
         if (!requested.isEmpty()) {
-            fullNames.addAll(requested);
+            fullNames = new ArrayList<>(requested);
         } else {
+            fullNames = new ArrayList<>();
             for (String name : INTERFACE_ENDPOINT_SERVICES) {
                 fullNames.add(AwsRegionFacts.vpcEndpointServiceName(region, name));
             }
@@ -1956,13 +2032,8 @@ public class Ec2QueryHandler {
                 fullNames.add(s3Interface);
             }
         }
+
         for (String full : fullNames) {
-            xml.elem("item", full);
-        }
-        xml.end("serviceNameSet").start("serviceDetailSet");
-        for (String full : fullNames) {
-            // Where both S3 offerings share a name, AWS reports both types on that one
-            // service detail. Everything else is Interface.
             List<String> serviceTypes;
             if (full.equals(s3Interface) && !s3Interface.equals(s3Gateway)) {
                 serviceTypes = List.of("Interface");
@@ -1973,23 +2044,97 @@ public class Ec2QueryHandler {
             } else {
                 serviceTypes = List.of("Interface");
             }
-            xml.start("item")
-                    .elem("serviceName", full)
-                    .start("serviceType");
-            for (String serviceType : serviceTypes) {
-                xml.start("item").elem("serviceType", serviceType).end("item");
-            }
-            xml.end("serviceType")
-                    .start("availabilityZoneSet");
-            for (String az : azNames) xml.elem("item", az);
-            xml.end("availabilityZoneSet")
-                    .elem("owner", "amazon")
-                    .elem("acceptanceRequired", "false")
-                    .elem("managesVpcEndpoints", "false")
-                    .end("item");
+            services.add(new ServiceDetail(
+                    full,
+                    serviceTypes,
+                    azNames,
+                    "amazon",
+                    "false",
+                    "false",
+                    region,
+                    List.of("ipv4", "ipv6")));
         }
-        xml.end("serviceDetailSet").end("DescribeVpcEndpointServicesResponse");
-        return xmlResponse(xml.build());
+
+        return services;
+    }
+
+    private List<ServiceDetail> applyVpcEndpointServiceFilters(List<ServiceDetail> services,
+                                                                List<Map.Entry<String, List<String>>> filters) {
+        if (filters == null || filters.isEmpty()) {
+            return services;
+        }
+
+        // Validate filter names before iterating services (AWS returns InvalidFilter for unknown names)
+        Ec2Service.requireSupportedFilters(
+                filters.stream().map(Map.Entry::getKey).toList(),
+                Set.of("owner", "service-name", "service-region", "service-type",
+                        "supported-ip-address-types", "tag-key"),
+                "InvalidFilter");
+
+        // Validate service-name filter values: AWS rejects values containing regex
+        // metacharacters other than the supported * and ? wildcards.
+        for (Map.Entry<String, List<String>> filter : filters) {
+            if ("service-name".equals(filter.getKey())) {
+                for (String value : filter.getValue()) {
+                    if (!isValidServiceNameFilterValue(value)) {
+                        throw new AwsException("InvalidFilter",
+                                "The filter value " + value + " contains unsupported characters", 400);
+                    }
+                }
+            }
+        }
+
+        return services.stream()
+                .filter(svc -> {
+                    for (Map.Entry<String, List<String>> filter : filters) {
+                        String name = filter.getKey();
+                        List<String> values = filter.getValue();
+                        if (values.isEmpty()) {
+                            continue; // Empty filter matches everything
+                        }
+                        if (!matchesFilter(svc, name, values)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                })
+                .toList();
+    }
+
+    private boolean matchesFilter(ServiceDetail svc, String filterName, List<String> values) {
+        return switch (filterName) {
+            case "owner" -> values.contains(svc.owner);
+            case "service-name" -> values.stream().anyMatch(v -> Ec2Service.wildcardMatches(v, svc.serviceName));
+            case "service-region" -> values.contains(svc.serviceRegion);
+            case "service-type" -> svc.serviceTypes.stream().anyMatch(t -> values.contains(t));
+            case "supported-ip-address-types" -> svc.supportedIpAddressTypes.stream()
+                    .anyMatch(t -> values.contains(t));
+            case String n when n.startsWith("tag:") -> {
+                // VPC endpoint services don't have user tags, so no tag filters match
+                yield false;
+            }
+            case "tag-key" -> false; // No tags on these services
+            default -> throw new AwsException("InvalidFilter",
+                    "The filter '" + filterName + "' is invalid.", 400);
+        };
+    }
+
+    private boolean isValidServiceNameFilterValue(String value) {
+        if (value == null || value.isEmpty()) {
+            return true;
+        }
+        // AWS supports only * and ? as wildcards in service-name filters. Values
+        // containing other regex metacharacters are rejected with InvalidFilter.
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '*' || c == '?') {
+                continue;
+            }
+            if (!Character.isLetterOrDigit(c) && c != '.' && c != '-') {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ─── Flow Logs ────────────────────────────────────────────────────────────
@@ -4512,6 +4657,96 @@ public class Ec2QueryHandler {
         return xmlResponse(xml.build());
     }
 
+    // ─── EC2 Instance Connect Endpoint handlers ───────────────────────────────
+
+    private Response handleCreateInstanceConnectEndpoint(MultivaluedMap<String, String> p, String region) {
+        String preserve = p.getFirst("PreserveClientIp");
+        // The service validates the request before answering a DryRun, as AWS does.
+        InstanceConnectEndpoint endpoint = service.createInstanceConnectEndpoint(region, p.getFirst("SubnetId"),
+                getList(p, "SecurityGroupId"), preserve == null ? null : Boolean.parseBoolean(preserve),
+                p.getFirst("IpAddressType"), parseTagsForResource(p, "instance-connect-endpoint"),
+                p.getFirst("ClientToken"), Boolean.parseBoolean(p.getFirst("DryRun")));
+        XmlBuilder xml = new XmlBuilder()
+                .start("CreateInstanceConnectEndpointResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("instanceConnectEndpoint").raw(instanceConnectEndpointXml(endpoint)).end("instanceConnectEndpoint")
+                .elem("clientToken", p.getFirst("ClientToken"))
+                .end("CreateInstanceConnectEndpointResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDescribeInstanceConnectEndpoints(MultivaluedMap<String, String> p, String region) {
+        String maxResults = p.getFirst("MaxResults");
+        PaginatedResult<InstanceConnectEndpoint> page = service.describeInstanceConnectEndpoints(region,
+                getList(p, "InstanceConnectEndpointId"), getFiltersList(p),
+                maxResults == null || maxResults.isEmpty() ? null : parseIntParam(p, "MaxResults", 0),
+                p.getFirst("NextToken"));
+        // After the describe, so an unknown ID, filter or NextToken fails on its own error first.
+        checkDryRun(p);
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeInstanceConnectEndpointsResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("instanceConnectEndpointSet");
+        for (InstanceConnectEndpoint endpoint : page.items()) {
+            xml.start("item").raw(instanceConnectEndpointXml(endpoint)).end("item");
+        }
+        xml.end("instanceConnectEndpointSet");
+        if (page.nextToken() != null) {
+            xml.elem("nextToken", page.nextToken());
+        }
+        xml.end("DescribeInstanceConnectEndpointsResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDeleteInstanceConnectEndpoint(MultivaluedMap<String, String> p, String region) {
+        String id = p.getFirst("InstanceConnectEndpointId");
+        if (id == null || id.isBlank()) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter InstanceConnectEndpointId", 400);
+        }
+        service.describeInstanceConnectEndpoints(region, List.of(id), List.of());
+        checkDryRun(p);
+        InstanceConnectEndpoint endpoint = service.deleteInstanceConnectEndpoint(region, id);
+        XmlBuilder xml = new XmlBuilder()
+                .start("DeleteInstanceConnectEndpointResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("instanceConnectEndpoint").raw(instanceConnectEndpointXml(endpoint)).end("instanceConnectEndpoint")
+                .end("DeleteInstanceConnectEndpointResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private String instanceConnectEndpointXml(InstanceConnectEndpoint endpoint) {
+        XmlBuilder xml = new XmlBuilder()
+                .elem("ownerId", endpoint.getOwnerId())
+                .elem("instanceConnectEndpointId", endpoint.getInstanceConnectEndpointId())
+                .elem("instanceConnectEndpointArn", endpoint.getInstanceConnectEndpointArn())
+                .elem("state", endpoint.getState())
+                .elem("stateMessage", "")
+                .elem("dnsName", endpoint.getDnsName())
+                .elem("fipsDnsName", endpoint.getFipsDnsName())
+                .start("networkInterfaceIdSet");
+        endpoint.getNetworkInterfaceIds().forEach(id -> xml.elem("item", id));
+        xml.end("networkInterfaceIdSet")
+                .elem("vpcId", endpoint.getVpcId())
+                .elem("availabilityZone", endpoint.getAvailabilityZone())
+                .elem("availabilityZoneId", endpoint.getAvailabilityZoneId())
+                .elem("createdAt", endpoint.getCreatedAt() == null ? null : ISO_FMT.format(endpoint.getCreatedAt()))
+                .elem("subnetId", endpoint.getSubnetId())
+                .elem("preserveClientIp", endpoint.isPreserveClientIp())
+                .start("securityGroupIdSet");
+        endpoint.getSecurityGroupIds().forEach(id -> xml.elem("item", id));
+        xml.end("securityGroupIdSet")
+                .elem("ipAddressType", endpoint.getIpAddressType())
+                .start("publicDnsNames")
+                .start("ipv4")
+                .elem("dnsName", endpoint.getDnsName())
+                .elem("fipsDnsName", endpoint.getFipsDnsName())
+                .end("ipv4")
+                .end("publicDnsNames");
+        xml.raw(tagSetXml(endpoint.getTags()));
+        return xml.build();
+    }
+
     // ─── Capacity Reservation handlers ────────────────────────────────────────
 
     private Response handleCreateCapacityReservation(MultivaluedMap<String, String> p, String region) {
@@ -4762,7 +4997,8 @@ public class Ec2QueryHandler {
     private Response handleAssociateAddress(MultivaluedMap<String, String> p, String region) {
         String allocationId = p.getFirst("AllocationId");
         String instanceId = p.getFirst("InstanceId");
-        Address addr = service.associateAddress(region, allocationId, instanceId, p.getFirst("PrivateIpAddress"));
+        Address addr = service.associateAddress(region, allocationId, instanceId,
+                p.getFirst("NetworkInterfaceId"), p.getFirst("PrivateIpAddress"));
         XmlBuilder xml = new XmlBuilder()
                 .start("AssociateAddressResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -4913,6 +5149,7 @@ public class Ec2QueryHandler {
                         .end("instanceStorageInfo");
             }
             xml.start("processorInfo")
+                    .elem("manufacturer", (String) t.get("processorManufacturer"))
                     .start("supportedArchitectures");
             for (String arch : (List<String>) t.get("supportedArchitectures")) {
                 xml.elem("item", arch);
@@ -5041,7 +5278,8 @@ public class Ec2QueryHandler {
                 region,
                 p.getFirst("LaunchTemplateId"),
                 p.getFirst("LaunchTemplateName"),
-                firstPresent(p, "SetDefaultVersion", "DefaultVersion"));
+                firstPresent(p, "SetDefaultVersion", "DefaultVersion"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
         XmlBuilder xml = new XmlBuilder()
                 .start("ModifyLaunchTemplateResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())

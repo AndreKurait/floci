@@ -60,6 +60,15 @@ A type nothing names is not checked: an action lists the optional resources its 
 that covers what it does name. An operation whose action acts on no resource type, or whose request
 names none, is checked on `*`, as AWS checks it.
 
+A REST request (`rest-json`) carries members in its path and its query as well as its body: a label of its path,
+`{DomainName}`, and a parameter of its query, `?arn`, are members as its body's are, under their botocore names, and
+the file records where each is (`located`), which the reader lays over the body from the path the request was routed
+by and its query. A namespace read this way also takes the operations of each botocore model Floci reads REST routes
+for under it (`regen_rest_routes.MODELS`) that the reference lists for none of its clients, each checked as the action
+of its own name with that action's resource types when the reference has that action, and left out when it does not:
+the reference lists one client's operations per namespace, and
+OpenSearch Service's are the `es` client's alone, while the `opensearch` client's are named after `es` actions.
+
 Every operation in `NAMESPACES` is read, whether Floci serves it or not. Explicit `CORRECTIONS`
 in `HAND_BUILT` are also read, overriding only those operations while the remaining operations
 keep their existing resource builders, and so are the operations `READ_IN_HAND_BUILT` lists, which
@@ -141,17 +150,19 @@ from regen_iam_passed_roles import (
     namespace_of,
 )
 from regen_partitions import resolve_botocore_data
+from regen_rest_routes import MODELS as REST_MODELS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
-NAMESPACES = ("acm", "application-autoscaling", "athena", "bcm-data-exports", "bcm-pricing-calculator", "budgets", "ce",
-              "cloudtrail", "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "cur", "datasync", "ecr",
-              "elasticloadbalancing", "elasticmapreduce", "events", "firehose", "globalaccelerator", "kinesisanalytics",
-              "payment-cryptography", "redshift-data", "rekognition", "servicediscovery", "servicequotas", "sso",
-              "states", "textract", "timestream-influxdb", "translate")
+NAMESPACES = ("access-analyzer", "acm", "application-autoscaling", "athena", "bcm-data-exports",
+              "bcm-pricing-calculator", "budgets", "ce", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
+              "cognito-idp", "cur", "datasync", "ecr", "elasticloadbalancing", "elasticmapreduce", "es", "events",
+              "firehose", "globalaccelerator", "kinesisanalytics", "payment-cryptography", "redshift",
+              "redshift-data", "rekognition", "servicediscovery", "servicequotas", "sso", "states", "textract",
+              "timestream-influxdb", "translate")
 
 # SDK clients the reference lists for a namespace's operations whose requests Floci does not serve, and why: their
 # members are not read.
@@ -159,6 +170,10 @@ CLIENTS_NOT_READ: dict[str, str] = {
     "kinesisanalytics": "Kinesis Data Analytics v1, SQL applications on the KinesisAnalytics_20150814 target, which "
                         "Floci does not serve (it serves v2, kinesisanalyticsv2); its operations share v2's names and "
                         "name their resources by other members",
+    "payment-cryptography-data": "the Payment Cryptography data plane, REST routes such as "
+                                 "/keys/{KeyIdentifier}/encrypt, which Floci does not serve (it serves the control "
+                                 "plane's JSON operations); its KeyIdentifier may be an alias, read on the control "
+                                 "plane by the handler, not by its path",
 }
 
 # The namespaces whose resources ResourceArnBuilder builds itself.
@@ -177,11 +192,11 @@ READ_IN_HAND_BUILT: dict[str, str] = {
 }
 
 _LATER = "not read yet: a later batch, with the tests that show its ARNs are the ones its handlers mint"
-_REST = "REST: its requests name their resources in the path, which RequestResources does not read yet"
+_REST = ("REST: its requests name their resources in the path, which RequestResources reads from the route a request "
+         "matched in the vendored REST routes (regen_rest_routes.MODELS), which do not have its model yet")
 
 # Namespaces Floci serves whose resources are not read yet, and why.
 NOT_COVERED: dict[str, str] = {
-    "access-analyzer": _REST,
     "account": _REST,
     "airflow": _REST,
     "app-integrations": _REST,
@@ -224,7 +239,6 @@ NOT_COVERED: dict[str, str] = {
                         "or EnvironmentId alone, so reading it needs the stored environment those find",
     "elasticfilesystem": _REST,
     "emr-serverless": _REST,
-    "es": _REST,
     "execute-api": _REST,
     "fis": _REST,
     "glue": _LATER,
@@ -243,7 +257,6 @@ NOT_COVERED: dict[str, str] = {
     "ram": _REST,
     "rds": _LATER,
     "rds-data": _REST,
-    "redshift": _LATER,
     "redshift-serverless": "not read yet: its namespace, workgroup, snapshot and managed VPC endpoint ARNs end in an "
                            "id the service mints, `namespace/<id>`, while its requests name them by namespaceName, "
                            "workgroupName, snapshotName and endpointName, so reading it needs the stored ARNs those "
@@ -520,6 +533,65 @@ CORRECTIONS: dict[str, tuple[list[dict], str]] = {
         "using the option ALL_PROVISIONED_ACCOUNTS to, at most, 3,500 AWS accounts', the AWS_ACCOUNT option "
         "provisioning it 'in a single AWS account', IAM Identity Center User Guide), read through the permission set; "
         "its TargetId names the account only for AWS_ACCOUNT, the handler reading a null one as none"),
+    "redshift:GetClusterCredentials": ([
+        {"type": "dbname", "fill": {"ClusterName": "ClusterIdentifier", "DbName": "DbName"},
+         "unless": {"DbName": [None]}},
+        {"type": "dbuser", "fill": {"ClusterName": "ClusterIdentifier", "DbUser": "DbUser"}},
+    ], "the database is checked only when the request names one ('If the DbName parameter is specified, the IAM "
+       "policy must allow access to the resource dbname for the specified database name'), and the Management "
+       "Guide's policy granting the action on a dbuser alone allows it; the rule names the database by "
+       "ClusterIdentifier alone when DbName is absent"),
+    "redshift:RestoreFromClusterSnapshot": ([
+        {"type": "cluster", "fill": {"ClusterName": "ClusterIdentifier"}},
+        {"type": "snapshot", "fill": {"ClusterName": "SnapshotClusterIdentifier", "SnapshotName": "SnapshotIdentifier"}},
+        {"types": ["snapshot"], "arn": "SnapshotArn"},
+    ], "the snapshot's cluster is SnapshotClusterIdentifier ('The name of the cluster the source snapshot was created "
+       "from'), not ClusterIdentifier, the cluster 'that will be created from restoring the snapshot'; its "
+       "DefaultIamRoleArn is an IAM role's ARN and its RedshiftIdcApplicationArn an IAM Identity Center "
+       "application's, never a cluster's or a snapshot's"),
+    **{f"redshift:{operation}": ([{"types": ["cluster", "eventsubscription", "hsmclientcertificate", "hsmconfiguration",
+                                             "integration", "parametergroup", "securitygroup",
+                                             "securitygroupingress-cidr", "securitygroupingress-ec2securitygroup",
+                                             "snapshot", "snapshotcopygrant", "snapshotschedule", "subnetgroup",
+                                             "usagelimit"], "arn": "ResourceName"}],
+                                 "the request names the resource by its ARN in ResourceName ('The Amazon Resource "
+                                 "Name (ARN) to which you want to add the tag or tags'), whose name does not end in "
+                                 "Arn")
+       for operation in ("CreateTags", "DeleteTags", "DescribeTags")},
+    **{f"redshift:{operation}": ([{"type": kind, "fill": fill}], f"{why}, never a {kind}'s")
+       for operation, kind, fill, why in (
+           ("CreateCluster", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its DefaultIamRoleArn is an IAM role's ARN and its RedshiftIdcApplicationArn an IAM Identity Center "
+            "application's"),
+           ("CreateCustomDomainAssociation", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its CustomDomainCertificateArn is an ACM certificate's ARN"),
+           ("CreateEventSubscription", "eventsubscription", {"EventSubscriptionName": "SubscriptionName"},
+            "its SnsTopicArn is an SNS topic's ARN"),
+           ("CreateIntegration", "integration", {},
+            "its SourceArn is the source database's ARN and its TargetArn the target data warehouse's"),
+           ("DescribeClusterSnapshots", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its SnapshotArn is a snapshot's ARN"),
+           ("DescribeNodeConfigurationOptions", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its SnapshotArn is a snapshot's ARN"),
+           ("ListRecommendations", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its NamespaceArn is a namespace's ARN"),
+           ("ModifyClusterIamRoles", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its DefaultIamRoleArn is an IAM role's ARN"),
+           ("ModifyCustomDomainAssociation", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its CustomDomainCertificateArn is an ACM certificate's ARN"),
+           ("ModifyEventSubscription", "eventsubscription", {"EventSubscriptionName": "SubscriptionName"},
+            "its SnsTopicArn is an SNS topic's ARN"),
+           ("ModifyLakehouseConfiguration", "cluster", {"ClusterName": "ClusterIdentifier"},
+            "its LakehouseIdcApplicationArn is an IAM Identity Center application's ARN"))},
+    **{f"redshift:{operation}": ([{"types": [kind], "arn": arn}], f"{why}, never a {kind}'s")
+       for operation, kind, arn, why in (
+           ("AssociateDataShareConsumer", "datashare", "DataShareArn",
+            "its ConsumerArn is the consumer namespace's ARN"),
+           ("DisassociateDataShareConsumer", "datashare", "DataShareArn",
+            "its ConsumerArn is the consumer namespace's ARN"),
+           ("ModifyRedshiftIdcApplication", "redshiftidcapplication", "RedshiftIdcApplicationArn",
+            "its IamRoleArn is an IAM role's ARN and its AuthorizedTokenIssuerList's TrustedTokenIssuerArn a trusted "
+            "token issuer's"))},
 }
 
 # Resource types whose ARN a request may give with a qualifier, one more `:<name>` past its format, which their
@@ -588,8 +660,11 @@ CREATING_RE = re.compile(r"^(Create|Run|Allocate|Register|Put|Import|Copy|Reques
 # An operation's verb: what follows is what it acts on.
 SUBJECT_RE = re.compile(r"^[A-Z][a-z]+")
 # The protocols whose requests RequestResources reads: form parameters or a JSON or CBOR body.
-READ_PROTOCOLS = {"json", "query", "ec2", "smithy-rpc-v2-cbor"}
+READ_PROTOCOLS = {"json", "query", "ec2", "smithy-rpc-v2-cbor", "rest-json"}
 BODY_LOCATIONS = (None, "")
+# Where a REST request carries a member outside its body, as the file writes it: a label of its path, `{Name}`, or a
+# parameter of its query, `?name`.
+LOCATED_RE = re.compile(r"^(\{[A-Za-z0-9_]+\}|\?[A-Za-z0-9_.-]+)$")
 
 
 def stem(name: str) -> str:
@@ -662,7 +737,7 @@ def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
             continue
         root = model["shapes"][spec["input"]["shape"]]
         for name, member in root.get("members", {}).items():
-            if member.get("location") not in BODY_LOCATIONS:
+            if member.get("location") not in BODY_LOCATIONS and _located(member) is None:
                 continue
             shape = model["shapes"][member["shape"]]
             if _strings(model, shape) is not None:
@@ -670,6 +745,34 @@ def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
             for path in _nested_arns(model, name, shape):
                 found.setdefault(path.removesuffix("[]"), path)
     return found
+
+
+def located_members(models: dict[str, dict], operation: str) -> dict[str, str]:
+    """The members of a REST request that its path or its query carries, holding a string, by name, with where:
+    `{Label}` for a label of its path, `?name` for a parameter of its query. The reader lays them over the request's
+    body under their names, so a resource reads them as it reads a member of the body."""
+    found: dict[str, str] = {}
+    for client, model in sorted(models.items()):
+        spec = model["operations"].get(operation)
+        if spec is None or "input" not in spec or "rest-json" not in _protocols(model):
+            continue
+        for name, member in model["shapes"][spec["input"]["shape"]].get("members", {}).items():
+            where = _located(member)
+            if where is None or _strings(model, model["shapes"][member["shape"]]) != "":
+                continue
+            if found.setdefault(name, where) != where:
+                raise ValueError(f"{operation}'s {name} is {found[name]} in one client and {where} in {client}")
+    return dict(sorted(found.items()))
+
+
+def _located(member: dict) -> str | None:
+    """Where a REST request carries a member outside its body, as `located_members` writes it; None for its body or a
+    header."""
+    if member.get("location") == "uri":
+        return "{" + member.get("locationName", "") + "}"
+    if member.get("location") == "querystring":
+        return "?" + member.get("locationName", "")
+    return None
 
 
 def _strings(model: dict, shape: dict) -> str | None:
@@ -980,7 +1083,22 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
     creates = creates_for(operation, types, formats, members)
     if creates:
         entry["creates"] = creates
+    named = _named(resources) | _named(creates)
+    located = {member: where for member, where in located_members(models, operation.split(":", 1)[1]).items()
+               if member in named}
+    if located:
+        entry["located"] = located
     return entry
+
+
+def _named(value: object) -> set[str]:
+    """The member names an operation's resources read: every key and string they hold, each up to its first `[` or
+    `.`, a superset that keeps `located` to the members something reads."""
+    if isinstance(value, dict):
+        return set().union(*(_named(key) | _named(item) for key, item in value.items())) if value else set()
+    if isinstance(value, list):
+        return set().union(*(_named(item) for item in value)) if value else set()
+    return {re.split(r"[\[.]", value, maxsplit=1)[0]} if isinstance(value, str) else set()
 
 
 def with_found(resources: list[dict], namespace: str, types: list[str], members: dict[str, str]) -> list[dict]:
@@ -1006,8 +1124,48 @@ def with_through(resources: list[dict], namespace: str, types: list[str], member
     return resources + through
 
 
+def rest_operations(data: Path) -> dict[str, set[str]]:
+    """The operation names of each botocore model whose REST routes Floci reads under a namespace the file reads."""
+    return {client: set(model["operations"])
+            for client, model in load_models(data, {client for client, namespace in REST_MODELS.items()
+                                                    if namespace in NAMESPACES}).items()}
+
+
+def with_rest_operations(upstream: dict[str, dict], documents: list[dict],
+                         given: dict[str, set[str]]) -> dict[str, dict]:
+    """`upstream` with the operations of the models Floci reads REST routes for (`regen_rest_routes.MODELS`), each
+    given as its operation names: an operation the reference lists gets the model among its clients, and one it lists
+    for none of them is checked as the action of its own name, or the one the reference maps it to, with that
+    action's resource types, when the reference has that action; one it does not have is left out, so `--verify`
+    reports a vendored one as no longer listed. The reference lists the operations of one client of a namespace:
+    OpenSearch Service's are the `es` client's alone, while the `opensearch` client's are named after `es` actions all
+    the same."""
+    mapped = authorized_actions_from(documents)
+    actions = {document["Name"]: {action["Name"].lower(): action for action in document.get("Actions", [])}
+               for document in documents}
+    found = dict(upstream)
+    for client, names in sorted(given.items()):
+        namespace = REST_MODELS[client]
+        for name in sorted(names):
+            operation = f"{namespace}:{name}"
+            if operation in found:
+                if client not in found[operation]["clients"]:
+                    found[operation] = {**found[operation], "clients": sorted(found[operation]["clients"] + [client])}
+                continue
+            action_name = mapped.get(namespace, {}).get(name, operation).split(":", 1)[1]
+            action = actions.get(namespace, {}).get(action_name.lower())
+            if action is None:
+                continue
+            found[operation] = {
+                "action": f"{namespace}:{action['Name']}",
+                "types": [resource["Name"] for resource in action.get("Resources") or []],
+                "clients": [client],
+            }
+    return found
+
+
 def build(documents: list[dict], provenance: str, data: Path, botocore: str) -> dict:
-    upstream = checked_actions(documents)
+    upstream = with_rest_operations(checked_actions(documents), documents, rest_operations(data))
     covered = {operation: value for operation, value in upstream.items() if reads(operation)}
     _check_overrides(covered)
     read_namespaces = set(NAMESPACES) | {namespace_of(operation) for operation in covered}
@@ -1182,7 +1340,7 @@ def validate(document: dict) -> list[str]:
         if not OPERATION_RE.match(operation) or namespace not in namespaces:
             problems.append(f"{operation!r} is not an operation of a namespace the file reads")
             continue
-        if not isinstance(entry, dict) or not {"action", "types", "resources"} <= set(entry) <= {"action", "types", "resources", "creates"}:
+        if not isinstance(entry, dict) or not {"action", "types", "resources"} <= set(entry) <= {"action", "types", "resources", "creates", "located"}:
             problems.append(f"{operation} is not an action, its types and its resources")
             continue
         if not isinstance(entry["action"], str) or not OPERATION_RE.match(entry["action"]) \
@@ -1196,6 +1354,12 @@ def validate(document: dict) -> list[str]:
             problems += _resource_problems(operation, resource, set(types), formats.get(namespace, {}))
         for created in entry.get("creates", []) if isinstance(entry.get("creates", []), list) else [None]:
             problems += _created_problems(operation, created, set(types), formats.get(namespace, {}))
+        located = entry.get("located", {})
+        if not isinstance(located, dict) or not located and "located" in entry or not all(
+                isinstance(member, str) and PATH_RE.match(member) and isinstance(where, str) and LOCATED_RE.match(where)
+                for member, where in located.items()):
+            problems.append(f"{operation} does not give each member it locates a label of its path or a parameter of "
+                            f"its query")
     return problems
 
 
@@ -1375,7 +1539,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         try:
             documents, provenance = fetch_references(args.source_dir)
-            upstream = checked_actions(documents)
+            listed = checked_actions(documents)
+            upstream = with_rest_operations(listed, documents, {
+                client: {operation.split(":", 1)[1] for operation in document["operations"]
+                         if namespace_of(operation) == namespace and operation not in listed}
+                for client, namespace in REST_MODELS.items() if client in document["namespaces"].get(namespace, [])})
             formats = arn_formats(documents, set(document["namespaces"]))
         except (OSError, ValueError) as e:
             print(f"error: could not read the Service Reference ({e})", file=sys.stderr)
