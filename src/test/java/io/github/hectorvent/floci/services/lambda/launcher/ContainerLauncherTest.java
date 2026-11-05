@@ -991,6 +991,10 @@ class ContainerLauncherTest {
             "/etc/pki/ca-trust/extracted/java/cacerts, false",
             "/etc/pki/ca-trust/extracted/java, false",
             "/var/lang/lib/security/cacerts.backup, true",
+            "/VAR/lang/lib/security, true",
+            "/var/lang/lib/../lib/security, false",
+            "/var/lang//lib/security/, false",
+            "/var/lang/lib/security/../other, true",
             "/opt/cacerts, true"
     })
     void launchFunction_keepsAnExplicitlyMountedRuntimeTrustStore(String destination, boolean injectStore)
@@ -998,6 +1002,7 @@ class ContainerLauncherTest {
         Path codePath = Files.createDirectory(tempDir.resolve("code"));
         when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
                 "--volume /host/trust:" + destination + ":ro"));
+        when(imageResolver.resolve(eq("java21"), any())).thenReturn("public.ecr.aws/lambda/java:21");
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("mounted-trust");
         fn.setRuntime("java21");
@@ -1012,6 +1017,29 @@ class ContainerLauncherTest {
         assertTrue(spec.env().contains("JAVA_TOOL_OPTIONS=-Dapplication.option=kept"));
         assertTrue(spec.binds().stream().anyMatch(bind -> bind.getVolume().getPath().equals(destination)
                 && bind.getAccessMode() == AccessMode.ro));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void launchFunction_keepsAutomaticTrustForCustomJavaRuntimeImages(boolean platformOverride) throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        when(lambda.dockerFlags()).thenReturn(Optional.of(
+                "--platform linux/arm64 --volume /host/trust:/var/lang/lib/security/cacerts:ro"));
+        when(lambda.runtimeImages()).thenReturn(Map.of(
+                platformOverride ? "java21.linux.arm64" : "java21", "registry.example/custom-java:21"));
+        launcher = newLauncher(new ImageResolver(config));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("custom-java-mounted-trust");
+        fn.setRuntime("java21");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(Files.createDirectory(tempDir.resolve("custom-java-code")).toString());
+
+        launcher.launch(fn);
+
+        ArgumentCaptor<ContainerSpec> captured = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycleManager).create(captured.capture(), eq("linux/arm64"));
+        assertEquals("registry.example/custom-java:21", captured.getValue().image());
+        assertTrue(captured.getValue().javaTrustStore());
     }
 
     @Test

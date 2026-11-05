@@ -375,7 +375,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         // A container image's runtime is its own, Java as likely as any.
         if ("Image".equals(fn.getPackageType())
-                || (isJavaRuntime(fn.getRuntime()) && !mountsRuntimeJavaTrustStore(dockerFlags))) {
+                || (isJavaRuntime(fn.getRuntime()) && !mountsRuntimeJavaTrustStore(dockerFlags, image))) {
             specBuilder.withJavaTrustStore();
         }
 
@@ -791,12 +791,35 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .orElseGet(() -> LambdaDockerFlags.parse(null));
     }
 
-    private static boolean mountsRuntimeJavaTrustStore(LambdaDockerFlags flags) {
-        List<Path> stores = List.of(Path.of("/var/lang/lib/security/cacerts"),
-                Path.of("/etc/pki/ca-trust/extracted/java/cacerts"));
+    private static boolean mountsRuntimeJavaTrustStore(LambdaDockerFlags flags, String image) {
+        if (image == null || !image.startsWith("public.ecr.aws/lambda/java:")) {
+            return false;
+        }
+        List<String> stores = List.of("/var/lang/lib/security/cacerts",
+                "/etc/pki/ca-trust/extracted/java/cacerts");
         return flags.volumes().stream()
-                .map(volume -> Path.of(volume.split(":", -1)[1]).normalize())
-                .anyMatch(target -> stores.stream().anyMatch(store -> store.startsWith(target)));
+                .map(volume -> volume.split(":", -1)[1])
+                .filter(target -> target.startsWith("/"))
+                .map(ContainerLauncher::normalizeContainerPath)
+                .anyMatch(target -> stores.stream().anyMatch(store -> store.equals(target)
+                        || store.startsWith(target.endsWith("/") ? target : target + "/")));
+    }
+
+    private static String normalizeContainerPath(String path) {
+        List<String> parts = new ArrayList<>();
+        for (String part : path.split("/")) {
+            if (part.isEmpty() || ".".equals(part)) {
+                continue;
+            }
+            if ("..".equals(part)) {
+                if (!parts.isEmpty()) {
+                    parts.removeLast();
+                }
+            } else {
+                parts.add(part);
+            }
+        }
+        return "/" + String.join("/", parts);
     }
 
     private static void applyDockerFlags(ContainerBuilder.Builder builder, LambdaDockerFlags flags) {
