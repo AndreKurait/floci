@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Ec2LaunchAuthorization;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import jakarta.ws.rs.container.ContainerRequestContext;
 
 import java.util.ArrayList;
@@ -14,11 +16,14 @@ final class Ec2ResourceArns {
     }
 
     static List<String> of(String operation, ContainerRequestContext context, String region,
-                           String account, String partition) {
+                           String account, String partition, Ec2Service service) {
         if (operation == null) {
             return List.of("*");
         }
         return switch (operation) {
+            case "ec2:RunInstances" -> Ec2LaunchAuthorization.resources(
+                    context, service, region, account, partition);
+            case "ec2:TerminateInstances" -> instances(context, region, account, partition);
             case "ec2:CopyImage" -> copy(context, region, partition);
             case "ec2:DescribeImageAttribute", "ec2:ModifyImageAttribute", "ec2:DeregisterImage" ->
                     named(RequestBodyReader.formField(context, "ImageId"), "image", region, partition);
@@ -30,6 +35,19 @@ final class Ec2ResourceArns {
             case "ec2:CreateTags", "ec2:DeleteTags" -> tags(context, region, account, partition);
             default -> List.of("*");
         };
+    }
+
+    private static List<String> instances(ContainerRequestContext context, String region,
+                                          String account, String partition) {
+        List<String> resources = new ArrayList<>();
+        for (int index = 1; ; index++) {
+            String id = RequestBodyReader.formField(context, "InstanceId." + index);
+            if (id == null) {
+                break;
+            }
+            resources.add(new AwsArnUtils.Arn(partition, "ec2", region, account, "instance/" + id).toString());
+        }
+        return resources.isEmpty() ? List.of("*") : List.copyOf(resources);
     }
 
     private static List<String> copy(ContainerRequestContext context, String region, String partition) {

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import jakarta.enterprise.context.RequestScoped;
 
@@ -19,6 +20,8 @@ public class RequestContext {
     private String accessKeyId;
     private String sessionToken;
     private Boolean iamGovernanceBypass;
+    /** Dispatch must keep the launch template snapshot that passed this request's permission checks. */
+    private LaunchTemplate authorizedEc2LaunchTemplate;
     /** Set only after the native SigV4 header verifier authenticates this request. */
     private SessionCredential verifiedSession;
     private String verifiedSecret;
@@ -92,5 +95,13 @@ public class RequestContext {
 
     public void setIamGovernanceBypass(Boolean iamGovernanceBypass) {
         this.iamGovernanceBypass = iamGovernanceBypass;
+    }
+
+    public LaunchTemplate getAuthorizedEc2LaunchTemplate() {
+        return authorizedEc2LaunchTemplate;
+    }
+
+    public void setAuthorizedEc2LaunchTemplate(LaunchTemplate template) {
+        authorizedEc2LaunchTemplate = template;
     }
 }

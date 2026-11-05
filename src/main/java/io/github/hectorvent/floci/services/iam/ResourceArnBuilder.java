@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.kms.KmsService;
@@ -108,6 +109,7 @@ public class ResourceArnBuilder {
      */
     private final Instance<StoredResourceArns> storedResourceArns;
     private final Instance<StepFunctionsService> stepFunctionsService;
+    private final Instance<Ec2Service> ec2Service;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -116,7 +118,8 @@ public class ResourceArnBuilder {
                               Instance<EksService> eksService,
                               Instance<KmsService> kmsService,
                               Instance<StoredResourceArns> storedResourceArns,
-                              Instance<StepFunctionsService> stepFunctionsService) {
+                              Instance<StepFunctionsService> stepFunctionsService,
+                              Instance<Ec2Service> ec2Service) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -125,6 +128,18 @@ public class ResourceArnBuilder {
         this.kmsService = kmsService;
         this.storedResourceArns = storedResourceArns;
         this.stepFunctionsService = stepFunctionsService;
+        this.ec2Service = ec2Service;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService,
+                              Instance<KmsService> kmsService,
+                              Instance<StoredResourceArns> storedResourceArns,
+                              Instance<StepFunctionsService> stepFunctionsService) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
+                storedResourceArns, stepFunctionsService, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -221,7 +236,8 @@ public class ResourceArnBuilder {
                 : IamActionRegistry.decodedPath(ctx);
         return switch (credentialScope) {
             case "s3"             -> buildS3Resources(operation, path, region);
-            case "ec2"            -> Ec2ResourceArns.of(operation, ctx, region, accountId, partition);
+            case "ec2"            -> Ec2ResourceArns.of(operation, ctx, region, accountId, partition,
+                    ec2Service != null && ec2Service.isResolvable() ? ec2Service.get() : null);
             case "lambda"         -> List.of(buildLambdaArn(path, ctx, region, accountId));
             case "sqs"            -> List.of(buildSqsArn(ctx, region, accountId));
             case "sns"            -> List.of(buildSnsArn(ctx, region, accountId));

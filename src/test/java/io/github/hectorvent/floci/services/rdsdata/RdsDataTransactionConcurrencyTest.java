@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
+import io.github.hectorvent.floci.testing.MutableClock;
 import org.h2.Driver;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -49,16 +50,14 @@ class RdsDataTransactionConcurrencyTest {
     private static final String BLOCKED_BATCH = "insert into items(id) values (1)";
 
     private final ObjectMapper mapper = new ObjectMapper();
+    private final MutableClock clock = new MutableClock();
     private final CountDownLatch started = new CountDownLatch(1);
     private final CountDownLatch release = new CountDownLatch(1);
-    private final AtomicReference<Instant> now = new AtomicReference<>(Instant.EPOCH);
-    private final Clock clock = mock(Clock.class);
     private String jdbcUrl;
     private RdsDataService service;
 
     @BeforeEach
     void setUp() throws Exception {
-        when(clock.instant()).thenAnswer(invocation -> now.get());
         Driver.load();
         jdbcUrl = "jdbc:h2:mem:busy_" + UUID.randomUUID() + ";MODE=PostgreSQL;DB_CLOSE_DELAY=-1";
         try (Connection connection = DriverManager.getConnection(jdbcUrl, "sa", "");
@@ -97,7 +96,7 @@ class RdsDataTransactionConcurrencyTest {
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Future<ObjectNode> first = executor.submit(() -> service.executeStatement(request(tx, BLOCKED_QUERY), REGION));
             try {
-                assertTrue(started.await(5, TimeUnit.SECONDS));
+                awaitStarted(first);
                 Future<AwsException> second = executor.submit(() -> assertThrows(AwsException.class,
                         () -> perform(operation, tx)));
                 AwsException error = second.get(5, TimeUnit.SECONDS);
@@ -110,6 +109,7 @@ class RdsDataTransactionConcurrencyTest {
                 service.rollbackTransaction(request(independent, null), REGION);
             } finally {
                 release.countDown();
+                first.get(5, TimeUnit.SECONDS);
             }
             assertEquals(1, first.get(5, TimeUnit.SECONDS).path("records").path(0).path(0).path("longValue").asInt());
         }
@@ -123,11 +123,12 @@ class RdsDataTransactionConcurrencyTest {
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Future<ObjectNode> first = executor.submit(() -> service.batchExecuteStatement(batch(tx, BLOCKED_BATCH), REGION));
             try {
-                assertTrue(started.await(5, TimeUnit.SECONDS));
+                awaitStarted(first);
                 Future<AwsException> second = executor.submit(() -> assertThrows(AwsException.class, () -> query(tx)));
                 assertEquals("Transaction is still running a query", second.get(5, TimeUnit.SECONDS).getMessage());
             } finally {
                 release.countDown();
+                first.get(5, TimeUnit.SECONDS);
             }
             assertEquals(1, first.get(5, TimeUnit.SECONDS).path("updateResults").size());
         }
@@ -153,20 +154,20 @@ class RdsDataTransactionConcurrencyTest {
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Future<ObjectNode> first = executor.submit(() -> service.executeStatement(request(tx, BLOCKED_QUERY), REGION));
             try {
-                assertTrue(started.await(5, TimeUnit.SECONDS));
-                now.updateAndGet(instant -> instant.plusSeconds(2));
+                awaitStarted(first);
+                clock.advance(Duration.ofSeconds(2));
                 Future<String> independent = executor.submit(this::begin);
                 String other = independent.get(5, TimeUnit.SECONDS);
                 service.rollbackTransaction(request(other, null), REGION);
             } finally {
                 release.countDown();
+                first.get(5, TimeUnit.SECONDS);
             }
-            first.get(5, TimeUnit.SECONDS);
         }
         assertEquals(2, query(tx));
-        now.updateAndGet(instant -> instant.plusSeconds(2));
-        assertEquals("TransactionNotFoundException",
-                assertThrows(AwsException.class, () -> query(tx)).getErrorCode());
+        clock.advance(Duration.ofSeconds(2));
+        AwsException expired = assertThrows(AwsException.class, () -> query(tx));
+        assertEquals("TransactionNotFoundException", expired.getErrorCode());
     }
 
     @Test
@@ -175,15 +176,23 @@ class RdsDataTransactionConcurrencyTest {
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Future<ObjectNode> first = executor.submit(() -> service.executeStatement(request(tx, BLOCKED_QUERY), REGION));
             try {
-                assertTrue(started.await(5, TimeUnit.SECONDS));
+                awaitStarted(first);
                 Future<AwsException> invalid = executor.submit(() -> assertThrows(AwsException.class,
                         () -> service.executeStatement(request(tx, "select 2"), "us-west-2")));
                 assertEquals("TransactionNotFoundException", invalid.get(5, TimeUnit.SECONDS).getErrorCode());
             } finally {
                 release.countDown();
+                first.get(5, TimeUnit.SECONDS);
             }
-            first.get(5, TimeUnit.SECONDS);
         }
+    }
+
+    private void awaitStarted(Future<?> query) throws Exception {
+        boolean entered = started.await(5, TimeUnit.SECONDS);
+        if (!entered && query.isDone()) {
+            query.get(5, TimeUnit.SECONDS);
+        }
+        assertTrue(entered, "Query did not reach JDBC execution before the entry deadline");
     }
 
     private Connection connection() throws SQLException {

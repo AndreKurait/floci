@@ -737,6 +737,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             abortIfDenied(ctx, caller, principal, attributesAction, attributesAction, credentialScope, resources,
                     targetContexts, region, accountId, akid);
         }
+        if ("ec2:RunInstances".equals(action)) {
+            requestContext.setAuthorizedEc2LaunchTemplate(Ec2LaunchAuthorization.capturedTemplate(ctx));
+        }
     }
 
     // The DELETE subresources S3Controller.deleteObject routes away from DeleteObject (?uploadId= is
@@ -1321,6 +1324,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             List<Map<String, List<String>>> batchContexts = "dynamodb".equals(credentialScope)
                     ? conditionContextResolver.dynamoDbBatchConditionContexts(action, ctx, resource) : null;
             List<Map<String, List<String>>> resourceContexts = targetContexts;
+            if ("ec2:TerminateInstances".equals(action)) {
+                resourceContexts = List.of(conditionContextResolver.ec2TerminationContext(
+                        resource, targetContexts.isEmpty() ? null : targetContexts.getFirst()));
+            }
             if (batchContexts != null && !batchContexts.isEmpty()) {
                 resourceContexts = new ArrayList<>();
                 for (Map<String, List<String>> targetContext : targetContexts) {

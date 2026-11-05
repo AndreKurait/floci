@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbTableNames;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -757,7 +758,30 @@ public class IamConditionContextResolver {
         for (int spec = 1; form.containsKey("TagSpecification." + spec + ".ResourceType"); spec++) {
             addRequestTags(conditions, form, "TagSpecification." + spec + ".Tag.");
         }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        LaunchTemplate template = Ec2LaunchAuthorization.template(ctx,
+                ec2Service.isResolvable() ? ec2Service.get() : null, region);
+        if (template != null) {
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+            String partition = requestContext.getPartition() == null
+                    ? AwsRegions.partitionFor(region) : requestContext.getPartition();
+            conditions.put("ec2:LaunchTemplate", List.of(new AwsArnUtils.Arn(
+                    partition, "ec2", region, account, "launch-template/" + template.getLaunchTemplateId()).toString()));
+        }
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    /** A termination batch pairs each instance ARN with that instance's own tags. */
+    public Map<String, List<String>> ec2TerminationContext(String resource, Map<String, List<String>> base) {
+        Map<String, List<String>> conditions = base == null ? new LinkedHashMap<>() : new LinkedHashMap<>(base);
+        conditions.keySet().removeIf(key -> key.startsWith(RESOURCE_TAG_PREFIX));
+        if (AwsArnUtils.isArn(resource)) {
+            String id = AwsArnUtils.parse(resource).resource();
+            if (id.startsWith("instance/")) {
+                addResourceTags(conditions, id.substring("instance/".length()));
+            }
+        }
+        return conditions;
     }
 
     /**
