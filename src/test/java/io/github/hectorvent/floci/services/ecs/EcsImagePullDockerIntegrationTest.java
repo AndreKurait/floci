@@ -89,10 +89,11 @@ class EcsImagePullDockerIntegrationTest {
     }
 
     @AfterEach
-    void cleanUp() {
+    void cleanUp() throws Exception {
         for (String taskArn : taskArns) {
             ecsService.stopTask(clusterName, taskArn, "test teardown", REGION);
         }
+        ecsService.awaitPendingStops();
         for (String image : images) {
             try {
                 dockerClient.removeImageCmd(image).withForce(true).exec();

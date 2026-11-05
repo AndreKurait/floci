@@ -16,6 +16,8 @@ import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
@@ -80,9 +82,13 @@ class EcsServiceInstanceProfileTest {
     }
 
     @ParameterizedTest
+    @NullSource
     @ValueSource(strings = {
             "arn:aws:iam::111122223333:instance-profile/app-host",
             "arn:aws:iam::000000000000:role/app-host",
+            "arn:aws-us-gov:iam::000000000000:instance-profile/app-host",
+            "arn:aws-cn:iam::000000000000:instance-profile/app-host",
+            "arn:aws:iam:eu-west-1:000000000000:instance-profile/app-host",
             "app-cluster",
             ""})
     void registrationRefusesAProfileThatIsNotAnInstanceProfileArnOfTheCallingAccount(String value) {
@@ -95,6 +101,19 @@ class EcsServiceInstanceProfileTest {
 
         assertEquals("InvalidParameterException", failure.getErrorCode());
         assertTrue(failure.getMessage().contains(EcsService.IAM_INSTANCE_PROFILE_ATTRIBUTE), failure.getMessage());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"aws, eu-west-1", "aws-us-gov, us-gov-west-1", "aws-cn, cn-north-1"})
+    void registrationAcceptsAnInstanceProfileInTheRegionalPartition(String partition, String region) {
+        EcsService service = service(manager(), region);
+        service.createCluster("app-cluster", region);
+        String profile = "arn:" + partition + ":iam::" + ACCOUNT + ":instance-profile/app/app-host";
+
+        assertEquals(profile, EcsService.containerInstanceAttribute(service.registerContainerInstance(
+                "app-cluster", null,
+                List.of(new Attribute(EcsService.IAM_INSTANCE_PROFILE_ATTRIBUTE, profile, null, null)), region),
+                EcsService.IAM_INSTANCE_PROFILE_ATTRIBUTE));
     }
 
     private static void registerTaskDefinition(EcsService service) {
@@ -116,10 +135,14 @@ class EcsServiceInstanceProfileTest {
     }
 
     private static EcsService service(EcsContainerManager manager) {
+        return service(manager, REGION);
+    }
+
+    private static EcsService service(EcsContainerManager manager, String region) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
-        EcsService service = new EcsService(new RegionResolver(REGION, ACCOUNT), manager,
+        EcsService service = new EcsService(new RegionResolver(region, ACCOUNT), manager,
                 config, mock(EcsLoadBalancerRegistrar.class), new InMemoryStorage(), null,
                 new EcsExecSessionRegistry(), null);
         service.initializeStorage();

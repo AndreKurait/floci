@@ -30,6 +30,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.stubbing.Answer;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -39,9 +40,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -49,6 +52,7 @@ import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -92,7 +96,7 @@ class EcsContainerManagerInstanceRoleTest {
                 .thenAnswer(invocation -> new LaunchImage(invocation.getArgument(0), null));
         when(lifecycleManager.createAndStartEphemeral(any(), nullable(String.class))).thenReturn(new ContainerInfo("docker-id", Map.of()));
         when(lifecycleManager.createAndStartEphemeral(any(), nullable(String.class), any())).thenAnswer(invocation -> {
-            invocation.<java.util.function.Consumer<String>>getArgument(2).accept("docker-id");
+            invocation.<Consumer<String>>getArgument(2).accept("docker-id");
             return new ContainerInfo("docker-id", Map.of());
         });
         dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
@@ -209,16 +213,16 @@ class EcsContainerManagerInstanceRoleTest {
         // A Go SDK process asks IMDS for credentials within milliseconds of starting (some services
         // exit on the first refusal), so the address has to resolve before startTask returns.
         int[] status = new int[1];
-        org.mockito.stubbing.Answer<ContainerInfo> starts = invocation -> {
+        Answer<ContainerInfo> starts = invocation -> {
             if (invocation.getArguments().length > 2) {
-                invocation.<java.util.function.Consumer<String>>getArgument(2).accept("docker-id");
+                invocation.<Consumer<String>>getArgument(2).accept("docker-id");
             }
             status[0] = get("/latest/meta-data/iam/security-credentials/", null).statusCode();
             return new ContainerInfo("docker-id", Map.of());
         };
-        org.mockito.Mockito.doAnswer(starts).when(lifecycleManager)
+        doAnswer(starts).when(lifecycleManager)
                 .createAndStartEphemeral(any(), nullable(String.class), any());
-        org.mockito.Mockito.doAnswer(starts).when(lifecycleManager).createAndStartEphemeral(any(), nullable(String.class));
+        doAnswer(starts).when(lifecycleManager).createAndStartEphemeral(any(), nullable(String.class));
 
         manager.startTask(task("0123456789abcdef0123456789abcdef", PROFILE), taskDefinition(null), null, "eu-west-1");
 
@@ -245,8 +249,8 @@ class EcsContainerManagerInstanceRoleTest {
     void aPendingContainerDockerCannotInspectServesNoOne() throws Exception {
         // inspectContainerIp falls back to 127.0.0.1; a pending container must not match a host-local caller.
         int[] status = new int[1];
-        org.mockito.Mockito.doAnswer(invocation -> {
-            invocation.<java.util.function.Consumer<String>>getArgument(2).accept("docker-id");
+        doAnswer(invocation -> {
+            invocation.<Consumer<String>>getArgument(2).accept("docker-id");
             when(dockerClient.inspectContainerCmd(anyString()).exec()).thenThrow(new RuntimeException("daemon busy"));
             status[0] = get("/latest/meta-data/iam/security-credentials/", null).statusCode();
             return new ContainerInfo("docker-id", Map.of());
@@ -259,12 +263,12 @@ class EcsContainerManagerInstanceRoleTest {
 
     @Test
     void aContainerThatFailsToStartLeavesNoPendingRegistration() {
-        org.mockito.Mockito.doAnswer(invocation -> {
-            invocation.<java.util.function.Consumer<String>>getArgument(2).accept("docker-id");
+        doAnswer(invocation -> {
+            invocation.<Consumer<String>>getArgument(2).accept("docker-id");
             throw new RuntimeException("start failed");
         }).when(lifecycleManager).createAndStartEphemeral(any(), nullable(String.class), any());
 
-        org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class, () -> manager.startTask(
+        assertThrows(RuntimeException.class, () -> manager.startTask(
                 task("0123456789abcdef0123456789abcdef", PROFILE), taskDefinition(null), null, "eu-west-1"));
 
         assertEquals(0, imds.pendingContainerCount());

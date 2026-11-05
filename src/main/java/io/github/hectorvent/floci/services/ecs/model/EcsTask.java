@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ecs.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -38,13 +39,13 @@ public class EcsTask {
     private List<Container> containers;
     private String containerInstanceArn;
     /** The EC2 instance behind {@link #containerInstanceArn}; Floci's own, not part of the ECS Task shape. */
-    @com.fasterxml.jackson.annotation.JsonIgnore
+    @JsonIgnore
     private String ec2InstanceId;
     /**
      * The instance profile of the container instance the task was placed on, from its
      * {@code floci.iam-instance-profile} attribute; Floci's own, not part of the ECS Task shape.
      */
-    @com.fasterxml.jackson.annotation.JsonIgnore
+    @JsonIgnore
     private String iamInstanceProfileArn;
     private boolean protectionEnabled;
     private Instant protectedUntil;
@@ -287,15 +288,15 @@ public class EcsTask {
     /** Advances the version AWS bumps on every task state transition. */
     public void bumpVersion() { this.version++; }
 
-    @com.fasterxml.jackson.annotation.JsonIgnore
+    @JsonIgnore
     public String getEc2InstanceId() { return ec2InstanceId; }
 
-    @com.fasterxml.jackson.annotation.JsonIgnore
+    @JsonIgnore
     public void setEc2InstanceId(String ec2InstanceId) { this.ec2InstanceId = ec2InstanceId; }
 
-    @com.fasterxml.jackson.annotation.JsonIgnore
+    @JsonIgnore
     public String getIamInstanceProfileArn() { return iamInstanceProfileArn; }
 
-    @com.fasterxml.jackson.annotation.JsonIgnore
+    @JsonIgnore
     public void setIamInstanceProfileArn(String iamInstanceProfileArn) { this.iamInstanceProfileArn = iamInstanceProfileArn; }
 }

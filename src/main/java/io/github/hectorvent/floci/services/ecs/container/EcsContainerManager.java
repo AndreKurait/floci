@@ -34,7 +34,10 @@ import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
@@ -79,6 +82,7 @@ import org.jboss.logging.Logger;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -2025,12 +2029,12 @@ public class EcsContainerManager {
     Ec2MetadataServer instanceMetadataServer;
 
     /** ec2InstanceId -> the instance IMDS answers for; one per container instance, shared by its tasks. */
-    private final Map<String, io.github.hectorvent.floci.services.ec2.model.Instance> metadataInstances =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Instance> metadataInstances =
+            new ConcurrentHashMap<>();
     /** taskArn -> the container addresses registered for it. */
-    private final Map<String, List<String>> metadataAddressesByTask = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, List<String>> metadataAddressesByTask = new ConcurrentHashMap<>();
     /** ec2InstanceId -> the tasks registered with IMDS as that instance, which share its credentials. */
-    private final Map<String, Set<String>> metadataTasksByInstance = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, Set<String>> metadataTasksByInstance = new ConcurrentHashMap<>();
 
     /**
      * Whether a task's SDK is meant to find the container instance's instance-profile role through
@@ -2058,7 +2062,7 @@ public class EcsContainerManager {
             if (entry.getValue().remove(taskArn) && entry.getValue().isEmpty()) {
                 String instanceId = entry.getKey();
                 metadataTasksByInstance.remove(instanceId, entry.getValue());
-                io.github.hectorvent.floci.services.ec2.model.Instance instance = metadataInstances.remove(instanceId);
+                Instance instance = metadataInstances.remove(instanceId);
                 if (instance != null) {
                     instanceMetadataServer.unregisterInstance(instance);
                 }
@@ -2075,7 +2079,7 @@ public class EcsContainerManager {
         if (base == null) {
             return null;
         }
-        java.net.URI uri = java.net.URI.create(base);
+        URI uri = URI.create(base);
         return "http://" + uri.getHost() + ":" + config.services().ec2().imdsPort();
     }
 
@@ -2091,7 +2095,7 @@ public class EcsContainerManager {
         if (!servesInstanceMetadata(task)) {
             return;
         }
-        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+        Instance instance =
                 metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, null));
         metadataTasksByInstance.computeIfAbsent(task.getEc2InstanceId(), ignored -> ConcurrentHashMap.newKeySet())
                 .add(task.getTaskArn());
@@ -2109,7 +2113,7 @@ public class EcsContainerManager {
                     dockerId, task.getTaskArn());
             return;
         }
-        io.github.hectorvent.floci.services.ec2.model.Instance instance =
+        Instance instance =
                 metadataInstances.computeIfAbsent(task.getEc2InstanceId(), id -> containerInstanceHost(task, region, ip));
         if (instance.getPrivateIpAddress() == null) {
             instance.setPrivateIpAddress(ip);
@@ -2118,7 +2122,7 @@ public class EcsContainerManager {
         instanceMetadataServer.forgetPendingContainer(dockerId);
         metadataTasksByInstance.computeIfAbsent(task.getEc2InstanceId(), ignored -> ConcurrentHashMap.newKeySet())
                 .add(task.getTaskArn());
-        metadataAddressesByTask.computeIfAbsent(task.getTaskArn(), ignored -> new java.util.concurrent.CopyOnWriteArrayList<>())
+        metadataAddressesByTask.computeIfAbsent(task.getTaskArn(), ignored -> new CopyOnWriteArrayList<>())
                 .add(ip);
     }
 
@@ -2136,28 +2140,23 @@ public class EcsContainerManager {
     }
 
     /** The EC2 instance a container instance stands for, as IMDS describes it. */
-    private static io.github.hectorvent.floci.services.ec2.model.Instance containerInstanceHost(
+    private static Instance containerInstanceHost(
             EcsTask task, String region, String ip) {
-        io.github.hectorvent.floci.services.ec2.model.Instance instance =
-                new io.github.hectorvent.floci.services.ec2.model.Instance();
+        Instance instance =
+                new Instance();
         instance.setInstanceId(task.getEc2InstanceId());
         instance.setImageId("ami-ecs-optimized");
         instance.setInstanceType("m5.large");
         if (task.getAvailabilityZone() != null) {
-            instance.setPlacement(new io.github.hectorvent.floci.services.ec2.model.Placement(task.getAvailabilityZone()));
+            instance.setPlacement(new Placement(task.getAvailabilityZone()));
         }
         instance.setRegion(region);
-        instance.setOwnerId(accountOf(task.getTaskArn()));
-        instance.setState(io.github.hectorvent.floci.services.ec2.model.InstanceState.running());
+        instance.setOwnerId(AwsArnUtils.parse(task.getTaskArn()).accountId());
+        instance.setState(InstanceState.running());
         instance.setPrivateIpAddress(ip);
         // The profile IMDS serves credentials for; Ec2MetadataServer checks IAM holds it per request.
         instance.setIamInstanceProfileArn(task.getIamInstanceProfileArn());
         return instance;
-    }
-
-    private static String accountOf(String arn) {
-        String[] parts = arn.split(":");
-        return parts.length > 4 ? parts[4] : null;
     }
 
     /**
