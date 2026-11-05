@@ -805,6 +805,10 @@
     "QueueName"
   ],
   "AWS::SQS::QueuePolicy": [],
+  "AWS::SSM::Document": [
+    "Name",
+    "DocumentType"
+  ],
   "AWS::SSM::Parameter": [
     "Name"
   ],

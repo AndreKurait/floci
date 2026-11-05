@@ -121,6 +121,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.SignerCfn
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SnsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SqsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmDocumentCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmPatchBaselineCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.StepFunctionsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.TransferCfnProvisioner;
@@ -390,6 +391,7 @@ final class CfnProvisionerFixture {
             }
             if (ssmService != null) {
                 discovered.add(new SsmCfnProvisioner(ssmService));
+                discovered.add(new SsmDocumentCfnProvisioner(ssmService));
             }
             if (ssmPatchBaselines != null) {
                 discovered.add(new SsmPatchBaselineCfnProvisioner(ssmPatchBaselines));

@@ -27,6 +27,14 @@ public interface CfnResourceProvisioner {
 
     Set<String> resourceTypes();
 
+    /**
+     * Replacement rules that depend on the desired properties, which may still contain unresolved
+     * expressions. This read-only preview cannot override unconditional create-only schema properties.
+     */
+    default Map<String, CfnReplacement> conditionalReplacements(String resourceType, JsonNode properties) {
+        return Map.of();
+    }
+
     /** GetAtt attributes the registry schema types as integers, by resource type. */
     default Map<String, Set<String>> integerAttributes() {
         return Map.of();

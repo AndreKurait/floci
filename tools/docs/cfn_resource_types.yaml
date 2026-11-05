@@ -236,6 +236,7 @@ notes:
   AWS::AppConfig::Environment: '`Tags` and `DeletionProtectionCheck` are accepted and not stored'
   AWS::AppConfig::ConfigurationProfile: '`Tags`, `KmsKeyIdentifier`, `RetrievalRoleArn`, `Validators` and `DeletionProtectionCheck` are accepted and not stored'
   AWS::AppConfig::DeploymentStrategy: '`Tags` are accepted and not stored; `ReplicateTo: SSM_DOCUMENT` writes no SSM document'
+  AWS::SSM::Document: 'JSON content, version selection, replacement and rollback; see SSM documents for unsupported properties'
   AWS::CloudFront::Function: '`KeyValueStoreAssociations` is ignored'
   AWS::GuardDuty::MalwareProtectionPlan: 'management plane only: no scan runs, so the plan stays ACTIVE; Ref returns the plan id; a BucketName change is rejected'
   AWS::BedrockAgentCore::Runtime: 'Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored'

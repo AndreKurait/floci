@@ -59,6 +59,11 @@ public class CfnResourceDispatcher {
         return registry.isCustomResourceType(resourceType);
     }
 
+    public Map<String, CfnReplacement> conditionalReplacements(String resourceType, JsonNode properties) {
+        return registry.forType(resourceType)
+                .map(owner -> owner.conditionalReplacements(resourceType, properties)).orElse(Map.of());
+    }
+
     /** Resolve an attribute using its resource owner's declared type. */
     public JsonNode attributeValue(String resourceType, String attributeName, String value) {
         return registry.forType(resourceType)
