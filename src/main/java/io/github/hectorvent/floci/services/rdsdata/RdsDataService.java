@@ -30,6 +30,7 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -72,6 +73,7 @@ public class RdsDataService implements Resettable {
     private final ObjectMapper objectMapper;
     private final RdsDataConnectionFactory connectionFactory;
     private final Duration transactionTtl;
+    private final Clock clock;
     private final ConcurrentMap<String, TransactionContext> transactions = new ConcurrentHashMap<>();
     private final ScheduledExecutorService transactionCleanupExecutor;
     private final RdsBackendGate backendGate;
@@ -120,6 +122,20 @@ public class RdsDataService implements Resettable {
                    RdsBackendGate backendGate,
                    RdsBackendEndpointResolver backendEndpointResolver,
                    boolean databaseResumingExceptionEnabled) {
+        this(resourceResolver, secretsManagerService, objectMapper, connectionFactory, transactionTtl,
+                backendGate, backendEndpointResolver, databaseResumingExceptionEnabled, Clock.systemUTC());
+    }
+
+    RdsDataService(RdsDataResourceResolver resourceResolver,
+                   SecretsManagerService secretsManagerService,
+                   ObjectMapper objectMapper,
+                   RdsDataConnectionFactory connectionFactory,
+                   Duration transactionTtl,
+                   RdsBackendGate backendGate,
+                   RdsBackendEndpointResolver backendEndpointResolver,
+                   boolean databaseResumingExceptionEnabled,
+                   Clock clock) {
+        this.clock = clock;
         this.resourceResolver = resourceResolver;
         this.secretsManagerService = secretsManagerService;
         this.objectMapper = objectMapper;
@@ -221,7 +237,7 @@ public class RdsDataService implements Resettable {
             String transactionId = UUID.randomUUID().toString();
             transactions.put(transactionId, new TransactionContext(
                     transactionId, connection, target.engine(), target.arn(), database, region, transactionTtl,
-                    lease));
+                    lease, clock.instant()));
             leaseHandedOver = true;
 
             ObjectNode response = objectMapper.createObjectNode();
@@ -307,7 +323,7 @@ public class RdsDataService implements Resettable {
                 requireActiveTransaction(transactionId, tx);
                 return work.execute(tx.connection, tx.engine);
             } finally {
-                tx.refresh(transactionTtl);
+                tx.refresh(transactionTtl, clock.instant());
                 tx.lock.unlock();
             }
         }
@@ -719,7 +735,7 @@ public class RdsDataService implements Resettable {
     }
 
     private void cleanupExpiredTransactions() {
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         transactions.forEach((id, tx) -> {
             if (tx.expiresAt.isBefore(now) && tx.lock.tryLock()) {
                 try {
@@ -887,7 +903,7 @@ public class RdsDataService implements Resettable {
 
         private TransactionContext(
                 String id, Connection connection, DatabaseEngine engine, String resourceArn,
-                String database, String region, Duration ttl, RdsBackendGate.Lease lease) {
+                String database, String region, Duration ttl, RdsBackendGate.Lease lease, Instant now) {
             this.id = id;
             this.connection = connection;
             this.engine = engine;
@@ -895,11 +911,11 @@ public class RdsDataService implements Resettable {
             this.database = database;
             this.region = region;
             this.lease = lease;
-            refresh(ttl);
+            refresh(ttl, now);
         }
 
-        private void refresh(Duration ttl) {
-            this.expiresAt = Instant.now().plus(ttl);
+        private void refresh(Duration ttl, Instant now) {
+            this.expiresAt = now.plus(ttl);
         }
 
         private void close() {
