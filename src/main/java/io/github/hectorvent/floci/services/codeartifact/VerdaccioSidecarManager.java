@@ -58,6 +58,7 @@ public class VerdaccioSidecarManager implements ContainerTeardown {
     private final ContainerLifecycleManager lifecycleManager;
     private final EmulatorConfig config;
     private final PerKeyContainerPool pool;
+    private final SidecarRepositoryLease lease;
 
     @Inject
     public VerdaccioSidecarManager(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
@@ -66,6 +67,7 @@ public class VerdaccioSidecarManager implements ContainerTeardown {
         this.lifecycleManager = lifecycleManager;
         this.config = config;
         this.pool = new PerKeyContainerPool(lifecycleManager, HEALTH_PATH);
+        this.lease = new SidecarRepositoryLease("Verdaccio", pool);
     }
 
     /**
@@ -79,7 +81,34 @@ public class VerdaccioSidecarManager implements ContainerTeardown {
 
     /** Stops and removes the container for one npm repository, if one was ever started. */
     public void release(String npmRepositoryId) {
-        pool.stopContainer(npmRepositoryId);
+        lease.release(npmRepositoryId);
+    }
+
+    /** Only a repository resolved under CodeArtifactService's deletion lock may admit an id. */
+    public void registerRepository(String npmRepositoryId) {
+        lease.registerRepository(npmRepositoryId);
+    }
+
+    /** Registers a call that may use this repository's sidecar before it touches the container. */
+    public void beginUse(String npmRepositoryId) {
+        lease.beginUse(npmRepositoryId);
+    }
+
+    /** Completes a prior {@link #beginUse}, stopping a released container after its last use. */
+    public void endUse(String npmRepositoryId) {
+        lease.endUse(npmRepositoryId);
+    }
+
+    /**
+     * Whether this npm repository's own Verdaccio container is already running, without starting
+     * one for a repository that has never used npm at all. Every CodeArtifact repository gets an
+     * npm sidecar id at creation regardless of whether it is ever actually used through npm (see
+     * {@code CodeArtifactService#ensureFormatContainerId}'s own callers), so a caller that only
+     * wants to ask an already-running container what it holds must check this first rather than
+     * provision a brand-new container just to find it has nothing.
+     */
+    public boolean isRunning(String npmRepositoryId) {
+        return pool.isTracked(npmRepositoryId);
     }
 
     private PerKeyContainerPool.StartedContainer startContainer(String npmRepositoryId, String publicUrl) {
@@ -128,6 +157,6 @@ public class VerdaccioSidecarManager implements ContainerTeardown {
 
     @Override
     public void stopManagedContainers() {
-        pool.stopAll();
+        lease.stopManagedContainers();
     }
 }

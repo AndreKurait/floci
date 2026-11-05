@@ -6,6 +6,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -171,7 +174,7 @@ public class CodeDeployService {
             if (store == null) {
                 continue;
             }
-            double now = Instant.now().toEpochMilli() / 1000.0;
+            double now = EpochSeconds.fromInstant(Instant.now());
             boolean changed = false;
             for (String name : BUILT_IN_CONFIG_NAMES) {
                 if (!store.containsKey(name)) {
@@ -261,7 +264,7 @@ public class CodeDeployService {
     private Map<String, DeploymentConfig> deploymentConfigsFor(String region) {
         return deploymentConfigs.computeIfAbsent(region, r -> {
             ConcurrentHashMap<String, DeploymentConfig> store = new ConcurrentHashMap<>();
-            double now = Instant.now().toEpochMilli() / 1000.0;
+            double now = EpochSeconds.fromInstant(Instant.now());
             for (String name : BUILT_IN_CONFIG_NAMES) {
                 store.put(name, buildBuiltInConfig(name, now));
             }
@@ -336,7 +339,7 @@ public class CodeDeployService {
         Application app = new Application();
         app.setApplicationId(UUID.randomUUID().toString());
         app.setApplicationName(name);
-        app.setCreateTime(Instant.now().toEpochMilli() / 1000.0);
+        app.setCreateTime(EpochSeconds.fromInstant(Instant.now()));
         app.setLinkedToGitHub(false);
         app.setComputePlatform(computePlatform != null ? computePlatform : "Server");
         store.put(name, app);
@@ -350,6 +353,14 @@ public class CodeDeployService {
     }
 
     public Application getApplication(String region, String name) {
+        if (name == null || name.isEmpty()) {
+            throw new AwsException("ApplicationNameRequiredException",
+                    "The minimum number of required characters for applicationName is 1.", 400);
+        }
+        if (name.isBlank()) {
+            throw new AwsException("InvalidApplicationNameException",
+                    "The application name was specified in an invalid format.", 400);
+        }
         Application app = applicationsFor(region).get(name);
         if (app == null) {
             throw new AwsException("ApplicationDoesNotExistException",
@@ -387,6 +398,12 @@ public class CodeDeployService {
 
     public List<String> listApplications(String region) {
         return new ArrayList<>(applicationsFor(region).keySet());
+    }
+
+    public PaginatedResult<String> listApplications(String region, String nextToken) {
+        return Pagination.paginate(listApplications(region), name -> name, 100, nextToken,
+                "codedeploy:ListApplications:" + regionResolver.getAccountId() + ":" + region,
+                token -> new AwsException("InvalidNextTokenException", "Invalid nextToken.", 400));
     }
 
     public List<Application> batchGetApplications(String region, List<String> names) {
@@ -512,7 +529,7 @@ public class CodeDeployService {
         cfg.setDeploymentConfigId(UUID.randomUUID().toString());
         cfg.setDeploymentConfigName(name);
         cfg.setMinimumHealthyHosts(minimumHealthyHosts);
-        cfg.setCreateTime(Instant.now().toEpochMilli() / 1000.0);
+        cfg.setCreateTime(EpochSeconds.fromInstant(Instant.now()));
         cfg.setComputePlatform(computePlatform != null ? computePlatform : "Server");
         cfg.setTrafficRoutingConfig(trafficRoutingConfig);
         cfg.setZonalConfig(zonalConfig);
@@ -582,7 +599,7 @@ public class CodeDeployService {
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
 
         String deploymentId = generateDeploymentId();
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        double now = EpochSeconds.fromInstant(Instant.now());
 
         Deployment deployment = new Deployment();
         deployment.setDeploymentId(deploymentId);
@@ -715,7 +732,7 @@ public class CodeDeployService {
                 "instance/" + instanceName).toString());
         inst.setIamSessionArn(iamSessionArn);
         inst.setIamUserArn(iamUserArn);
-        inst.setRegisterTime(Instant.now().toEpochMilli() / 1000.0);
+        inst.setRegisterTime(EpochSeconds.fromInstant(Instant.now()));
         inst.setRegistrationStatus("Registered");
         store.put(instanceName, inst);
         persistRegion(onPremisesInstances, region);
@@ -724,7 +741,7 @@ public class CodeDeployService {
 
     public void deregisterOnPremisesInstance(String region, String instanceName) {
         OnPremisesInstance inst = requireOnPremisesInstance(region, instanceName);
-        inst.setDeregisterTime(Instant.now().toEpochMilli() / 1000.0);
+        inst.setDeregisterTime(EpochSeconds.fromInstant(Instant.now()));
         inst.setRegistrationStatus("Deregistered");
         persistRegion(onPremisesInstances, region);
     }
@@ -785,7 +802,7 @@ public class CodeDeployService {
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
 
         String deploymentId = generateDeploymentId();
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        double now = EpochSeconds.fromInstant(Instant.now());
 
         Deployment deployment = new Deployment();
         deployment.setDeploymentId(deploymentId);
@@ -845,7 +862,7 @@ public class CodeDeployService {
         String deploymentId = deployment.getDeploymentId();
         try {
             deployment.setStatus("InProgress");
-            deployment.setStartTime(Instant.now().toEpochMilli() / 1000.0);
+            deployment.setStartTime(EpochSeconds.fromInstant(Instant.now()));
             instanceTargetMaps.forEach(m -> updateTargetStatus(m, "InProgress"));
 
             boolean anyFailed = false;
@@ -853,7 +870,7 @@ public class CodeDeployService {
                 if (stopFlag.get()) {
                     instanceTargetMaps.forEach(m -> updateTargetStatus(m, "Skipped"));
                     deployment.setStatus("Stopped");
-                    deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+                    deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
                     return;
                 }
                 String instanceId = instanceIds.get(i);
@@ -873,18 +890,18 @@ public class CodeDeployService {
             } else {
                 deployment.setStatus("Succeeded");
             }
-            deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             instanceTargetMaps.forEach(m -> updateTargetStatus(m, "Skipped"));
             deployment.setStatus("Stopped");
-            deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
         } catch (Exception e) {
             LOG.warnv("Server deployment {0} failed: {1}", deploymentId, e.getMessage());
             instanceTargetMaps.forEach(m -> updateTargetStatus(m, "Failed"));
             deployment.setStatus("Failed");
-            deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
             deployment.setErrorInformation(Map.of("code", "DeploymentFailed",
                     "message", e.getMessage() != null ? e.getMessage() : "Unknown error"));
         } finally {
@@ -1230,7 +1247,7 @@ public class CodeDeployService {
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
 
         String deploymentId = generateDeploymentId();
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        double now = EpochSeconds.fromInstant(Instant.now());
 
         Deployment deployment = new Deployment();
         deployment.setDeploymentId(deploymentId);
@@ -1330,7 +1347,7 @@ public class CodeDeployService {
         TaskSet blueTaskSet = null;
         try {
             deployment.setStatus("InProgress");
-            deployment.setStartTime(Instant.now().toEpochMilli() / 1000.0);
+            deployment.setStartTime(EpochSeconds.fromInstant(Instant.now()));
             updateEcsTargetStatus(ecsTargetMap, "InProgress");
 
             if (stopFlag.get()) { finishEcsStopped(deployment, ecsTargetMap); return; }
@@ -1447,7 +1464,7 @@ public class CodeDeployService {
 
             updateEcsTargetStatus(ecsTargetMap, "Succeeded");
             deployment.setStatus("Succeeded");
-            deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -1538,20 +1555,20 @@ public class CodeDeployService {
 
     private void updateEcsTargetStatus(Map<String, Object> ecsTargetMap, String status) {
         ecsTargetMap.put("status", status);
-        ecsTargetMap.put("lastUpdatedAt", Instant.now().toEpochMilli() / 1000.0);
+        ecsTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(Instant.now()));
     }
 
     private void finishEcsStopped(Deployment deployment, Map<String, Object> ecsTargetMap) {
         updateEcsTargetStatus(ecsTargetMap, "Skipped");
         deployment.setStatus("Stopped");
-        deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+        deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
     }
 
     private void finishEcsFailed(Deployment deployment, Map<String, Object> ecsTargetMap,
                                   String errorCode, String message) {
         updateEcsTargetStatus(ecsTargetMap, "Failed");
         deployment.setStatus("Failed");
-        deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+        deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
         deployment.setErrorInformation(Map.of("code", errorCode, "message", message != null ? message : ""));
     }
 
@@ -1590,7 +1607,7 @@ public class CodeDeployService {
         String deploymentId = deployment.getDeploymentId();
         try {
             deployment.setStatus("InProgress");
-            deployment.setStartTime(Instant.now().toEpochMilli() / 1000.0);
+            deployment.setStartTime(EpochSeconds.fromInstant(Instant.now()));
             updateTargetStatus(lambdaTargetMap, "InProgress");
 
             if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
@@ -1619,7 +1636,7 @@ public class CodeDeployService {
 
             updateTargetStatus(lambdaTargetMap, "Succeeded");
             deployment.setStatus("Succeeded");
-            deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -1765,18 +1782,18 @@ public class CodeDeployService {
     private Map<String, Object> addLifecycleEvent(Map<String, Object> lambdaTargetMap, String name) {
         Map<String, Object> event = new ConcurrentHashMap<>();
         event.put("lifecycleEventName", name);
-        event.put("startTime", Instant.now().toEpochMilli() / 1000.0);
+        event.put("startTime", EpochSeconds.fromInstant(Instant.now()));
         event.put("status", "InProgress");
         List<Map<String, Object>> events = (List<Map<String, Object>>) lambdaTargetMap.get("lifecycleEvents");
         if (events != null) {
             events.add(event);
         }
-        lambdaTargetMap.put("lastUpdatedAt", Instant.now().toEpochMilli() / 1000.0);
+        lambdaTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(Instant.now()));
         return event;
     }
 
     private void finishLifecycleEvent(Map<String, Object> event, String status) {
-        event.put("endTime", Instant.now().toEpochMilli() / 1000.0);
+        event.put("endTime", EpochSeconds.fromInstant(Instant.now()));
         event.put("status", status);
     }
 
@@ -1788,20 +1805,20 @@ public class CodeDeployService {
 
     private void updateTargetStatus(Map<String, Object> lambdaTargetMap, String status) {
         lambdaTargetMap.put("status", status);
-        lambdaTargetMap.put("lastUpdatedAt", Instant.now().toEpochMilli() / 1000.0);
+        lambdaTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(Instant.now()));
     }
 
     private void finishStopped(Deployment deployment, Map<String, Object> lambdaTargetMap) {
         updateTargetStatus(lambdaTargetMap, "Skipped");
         deployment.setStatus("Stopped");
-        deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+        deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
     }
 
     private void finishFailed(Deployment deployment, Map<String, Object> lambdaTargetMap,
                                String errorCode, String message) {
         updateTargetStatus(lambdaTargetMap, "Failed");
         deployment.setStatus("Failed");
-        deployment.setCompleteTime(Instant.now().toEpochMilli() / 1000.0);
+        deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
         deployment.setErrorInformation(Map.of("code", errorCode, "message", message != null ? message : ""));
     }
 
