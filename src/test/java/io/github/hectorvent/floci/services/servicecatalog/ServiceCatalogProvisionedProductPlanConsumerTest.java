@@ -1,14 +1,19 @@
 package io.github.hectorvent.floci.services.servicecatalog;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.testing.MutableClock;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import jakarta.inject.Inject;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Wire-level tests for {@code CreateProvisionedProductPlan},
@@ -37,6 +42,12 @@ class ServiceCatalogProvisionedProductPlanConsumerTest {
     private static final String CONTENT_TYPE = "application/x-amz-json-1.1";
     private static final String AUTH_HEADER =
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/servicecatalog/aws4_request";
+
+    @Inject
+    ObjectMapper objectMapper;
+
+    @Inject
+    MutableClock clock;
 
     @BeforeAll
     static void configureRestAssured() {
@@ -95,7 +106,7 @@ class ServiceCatalogProvisionedProductPlanConsumerTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("InvalidParametersException"))
-            .body("message", org.hamcrest.Matchers.startsWith("PlanType must be one of"));
+            .body("message", Matchers.startsWith("PlanType must be one of"));
     }
 
     @Test
@@ -112,7 +123,7 @@ class ServiceCatalogProvisionedProductPlanConsumerTest {
             .body("PlanName", equalTo("ab-create-plan"))
             .body("ProvisionProductId", equalTo(productId))
             .body("ProvisioningArtifactId", equalTo(artifactId))
-            .body("PlanId", org.hamcrest.Matchers.notNullValue());
+            .body("PlanId", Matchers.notNullValue());
     }
 
     // ---------- DescribeProvisionedProductPlan ----------
@@ -145,16 +156,22 @@ class ServiceCatalogProvisionedProductPlanConsumerTest {
     // ---------- ExecuteProvisionedProductPlan ----------
 
     @Test
-    void executeProvisionedProductPlan_returnsRecordDetail() {
+    void executeProvisionedProductPlan_returnsRecordDetail() throws Exception {
         String productId = createProduct("ab-plan-execute-product");
         String artifactId = firstArtifactId(productId);
         String planId = createPlan(productId, artifactId, "ab-execute-plan");
 
-        call("ExecuteProvisionedProductPlan", "{\"PlanId\":\"" + planId
+        double beforeExecution = clock.instant().toEpochMilli() / 1000.0;
+        Response executed = call("ExecuteProvisionedProductPlan", "{\"PlanId\":\"" + planId
                 + "\",\"IdempotencyToken\":\"tok-execute-plan\"}")
         .then()
             .statusCode(200)
-            .body("RecordDetail.Status", equalTo("SUCCEEDED"));
+            .body("RecordDetail.Status", equalTo("SUCCEEDED"))
+            .extract().response();
+        double afterExecution = clock.instant().toEpochMilli() / 1000.0;
+        double createdTime = objectMapper.readTree(executed.asString())
+                .path("RecordDetail").path("CreatedTime").asDouble();
+        assertTrue(createdTime >= beforeExecution && createdTime <= afterExecution);
     }
 
     @Test

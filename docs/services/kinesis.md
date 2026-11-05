@@ -48,7 +48,9 @@ to continue. Truncated pages also return `NextToken`, which CLI and SDK paginato
 back without an `ExclusiveStartStreamName`. Tokens are scoped to this operation and region,
 use the same configurable lifetime as `ListShards` tokens (see the TTL setting below),
 and remain usable if the cursor stream is deleted.
-`StreamSummaries` are not currently modeled.
+Each page also returns `StreamSummaries`, one entry per name in `StreamNames` and in the same
+order, with `StreamName`, `StreamARN`, `StreamStatus`, `StreamModeDetails` and
+`StreamCreationTimestamp`.
 
 ## Local Inspection Endpoints
 
@@ -79,6 +81,18 @@ aws kinesis describe-stream --stream-arn arn:aws:kinesis:us-east-1:000000000000:
 `GetShardIterator` supports all five iterator types: `TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`.
 
 A `LATEST` iterator is positioned at the shard tip at the moment the iterator is created, matching AWS: records written after the iterator was obtained are returned, records written before are not. This supports the standard tailing pattern: obtain a `LATEST` iterator, trigger the action that produces the record, then poll `GetRecords` following `NextShardIterator`.
+
+A closed shard returns a JSON null `NextShardIterator` on its final page, including
+when that page contains records. Earlier pages keep their continuation iterator.
+Only the terminal page includes `ChildShards`: each direct child's ID, all of its
+parent IDs and its hash-key range. A caught-up open shard keeps a non-null iterator.
+Consumers should process the final records before stopping at the null iterator.
+
+The internal Pipes and Firehose readers retain a sequence cursor after the final
+record to avoid replaying a terminal batch. Firehose commits that cursor only after
+delivery succeeds; its unflushed buffer remains in memory. Pipes keeps its existing
+advance-before-delivery policy and first-shard polling limitation; child scheduling
+and full lineage orchestration are not implemented.
 
 ## Record Retention
 
@@ -125,7 +139,14 @@ action, so that limit is intentionally unenforced here.
 
 ## Enhanced Fan-Out (EFO)
 
-`SubscribeToShard` uses a snapshot-and-close model: the server returns one batch of records as a binary EventStream response and closes the connection. The SDK resubscribes automatically using the `ContinuationSequenceNumber` from the last delivered record. All five `StartingPosition` types are supported: `TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`.
+`SubscribeToShard` uses a snapshot-and-close model: the server returns one batch
+of records as a binary EventStream response and closes the connection. For a
+nonterminal batch, use `ContinuationSequenceNumber` from the last delivered record
+when resubscribing. At a closed shard's end, the event includes the same direct
+`ChildShards` metadata and omits `ContinuationSequenceNumber`, even when it includes
+final records. This remains a snapshot response rather than a long-lived
+subscription. All five `StartingPosition` types are supported: `TRIM_HORIZON`,
+`LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`.
 
 ```bash
 export AWS_ENDPOINT_URL=http://localhost:4566

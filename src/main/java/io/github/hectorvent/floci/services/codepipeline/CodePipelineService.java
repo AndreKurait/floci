@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.DeadlineCharSequence;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -1437,7 +1438,7 @@ public class CodePipelineService {
         ObjectNode item = mapper.createObjectNode();
         item.set("definition", webhook.deepCopy());
         item.put("url", "http://localhost:4566/codepipeline/webhooks/" + name);
-        item.put("arn", AwsArnUtils.Arn.of("codepipeline", region, account, "webhook/" + name).toString());
+        item.put("arn", AwsArnUtils.Arn.of("codepipeline", region, account, "webhook:" + name).toString());
         if (request.path("tags").isArray() && !request.path("tags").isEmpty()) {
             item.set("tags", request.path("tags").deepCopy());
         }
@@ -2037,7 +2038,7 @@ public class CodePipelineService {
                 revision.put("revisionChangeIdentifier", unquoteETag(object.getETag()));
                 revision.put("revisionSummary", bucket + "/" + key);
                 revision.put("revisionUrl", "s3://" + bucket + "/" + key);
-                revision.put("created", object.getLastModified().toEpochMilli() / 1000.0);
+                revision.put("created", EpochSeconds.fromInstant(object.getLastModified()));
                 execution.getArtifactRevisions().add(revision);
                 upsertSourceRevision(execution, state.getActionName(), revisionId, bucket, key, object);
                 pinResolvedS3Version(execution, state.getActionName(), object.getVersionId());
@@ -3164,7 +3165,7 @@ public class CodePipelineService {
     }
 
     private static double now() {
-        return Instant.now().toEpochMilli() / 1000.0;
+        return EpochSeconds.fromInstant(Instant.now());
     }
 
     private static void putIfNotNull(ObjectNode node, String field, Object value) {

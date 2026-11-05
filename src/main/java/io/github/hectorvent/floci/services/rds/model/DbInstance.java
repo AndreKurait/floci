@@ -28,6 +28,8 @@ public class DbInstance {
     private String storageType;
     /** The RDS certificate authority for the instance; null on one stored before it was recorded. */
     private String caCertificateIdentifier;
+    /** The license model the request named; null means the engine's default. */
+    private String licenseModel;
     private DbInstanceStatus status;
     private DbEndpoint endpoint;
     private boolean iamDatabaseAuthenticationEnabled;
@@ -80,11 +82,15 @@ public class DbInstance {
     // gone.
     private String readReplicaSourceDbInstanceIdentifier;
     private List<String> readReplicaDbInstanceIdentifiers = new ArrayList<>();
+    /** The ARNs of this instance's automated backups replicated to other Regions. */
+    private List<String> automatedBackupReplicationArns = new ArrayList<>();
     private String readReplicationStatus;
 
     private String dockerVolumeName;
     private String volumeId;
     private String containerStorageResourceId;
+    private boolean backendCleanupRequired;
+    private boolean managedSecretCleanupRequired;
 
     private transient String containerId;
     private transient String containerHost;
@@ -139,6 +145,8 @@ public class DbInstance {
     public String getStorageType() { return storageType != null ? storageType : DEFAULT_STORAGE_TYPE; }
     public void setStorageType(String storageType) { this.storageType = storageType; }
 
+    public String getLicenseModel() { return licenseModel; }
+    public void setLicenseModel(String licenseModel) { this.licenseModel = licenseModel; }
     public String getCaCertificateIdentifier() { return caCertificateIdentifier; }
     public void setCaCertificateIdentifier(String caCertificateIdentifier) {
         this.caCertificateIdentifier = caCertificateIdentifier;
@@ -243,6 +251,12 @@ public class DbInstance {
         this.readReplicaSourceDbInstanceIdentifier = readReplicaSourceDbInstanceIdentifier;
     }
 
+    public List<String> getAutomatedBackupReplicationArns() { return automatedBackupReplicationArns; }
+    public void setAutomatedBackupReplicationArns(List<String> automatedBackupReplicationArns) {
+        this.automatedBackupReplicationArns = automatedBackupReplicationArns != null
+                ? new ArrayList<>(automatedBackupReplicationArns) : new ArrayList<>();
+    }
+
     public List<String> getReadReplicaDbInstanceIdentifiers() { return readReplicaDbInstanceIdentifiers; }
     public void setReadReplicaDbInstanceIdentifiers(List<String> readReplicaDbInstanceIdentifiers) {
         this.readReplicaDbInstanceIdentifiers = readReplicaDbInstanceIdentifiers != null
@@ -281,6 +295,16 @@ public class DbInstance {
     public String getContainerStorageResourceId() { return containerStorageResourceId; }
     public void setContainerStorageResourceId(String containerStorageResourceId) {
         this.containerStorageResourceId = containerStorageResourceId;
+    }
+
+    public boolean isBackendCleanupRequired() { return backendCleanupRequired; }
+    public void setBackendCleanupRequired(boolean backendCleanupRequired) {
+        this.backendCleanupRequired = backendCleanupRequired;
+    }
+
+    public boolean isManagedSecretCleanupRequired() { return managedSecretCleanupRequired; }
+    public void setManagedSecretCleanupRequired(boolean managedSecretCleanupRequired) {
+        this.managedSecretCleanupRequired = managedSecretCleanupRequired;
     }
 
     public String getContainerId() { return containerId; }

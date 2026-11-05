@@ -14,6 +14,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.io.Closeable;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -22,6 +25,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiFunction;
 import java.util.logging.LogRecord;
 import java.util.stream.Stream;
 
@@ -43,6 +47,27 @@ class ContainerLogStreamerTest {
 
     private static byte[] utf8(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static void write(OutputStream stream, String text) {
+        try {
+            stream.write(utf8(text));
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static void close(OutputStream stream) {
+        try {
+            stream.close();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    // The container lines that records logged, without their prefix.
+    private static List<Object> loggedLines(List<LogRecord> records) {
+        return records.stream().map(record -> record.getParameters()[1]).toList();
     }
 
     @Test
@@ -208,6 +233,22 @@ class ContainerLogStreamerTest {
     }
 
     @Test
+    void consoleLinesLogsEachLineAsItArrivesAndALastOneWithoutANewlineWhenClosed() {
+        OutputStream console = ContainerLogStreamer.consoleLines("emr:j-1:bootstrap-action-1");
+
+        List<LogRecord> asWritten = LogCapture.capture(ContainerLogStreamer.class, () -> {
+            write(console, "Collecting pan");
+            write(console, "das\n\nInstalled pandas\nDone");
+        });
+        List<LogRecord> asClosed = LogCapture.capture(ContainerLogStreamer.class, () -> close(console));
+
+        // A blank line is dropped, as the attach methods drop one.
+        assertEquals(List.of("Collecting pandas", "Installed pandas"), loggedLines(asWritten));
+        assertEquals(List.of("Done"), loggedLines(asClosed));
+        assertEquals("emr:j-1:bootstrap-action-1", asClosed.getFirst().getParameters()[0]);
+    }
+
+    @Test
     void reassemblesSingleLineSplitAcrossFrames() {
         // A ~1.5 KB stdout line that Docker delivers as multiple frames must arrive
         // as ONE CloudWatch event, not several (regression for the >1024-byte split).
@@ -349,7 +390,7 @@ class ContainerLogStreamerTest {
         // heap is exhausted — regression guard for the unbounded-growth review finding.
         ContainerLogStreamer.LogLineBuffer buffer = new ContainerLogStreamer.LogLineBuffer();
         byte[] overlong = new byte[256 * 1024];
-        java.util.Arrays.fill(overlong, (byte) 'a');
+        Arrays.fill(overlong, (byte) 'a');
 
         List<String> lines = buffer.append(overlong);
 
@@ -366,7 +407,7 @@ class ContainerLogStreamerTest {
         ContainerLogStreamer.LogLineBuffer buffer = new ContainerLogStreamer.LogLineBuffer();
         int cap = 256 * 1024;
         byte[] fill = new byte[cap - 1];
-        java.util.Arrays.fill(fill, (byte) 'a');
+        Arrays.fill(fill, (byte) 'a');
         assertEquals(List.of(), buffer.append(fill));
 
         List<String> lines = buffer.append(utf8("€"));
@@ -387,7 +428,7 @@ class ContainerLogStreamerTest {
         ContainerLogStreamer.LogLineBuffer buffer = new ContainerLogStreamer.LogLineBuffer();
         int cap = 256 * 1024;
         byte[] fill = new byte[cap - 4];
-        java.util.Arrays.fill(fill, (byte) 'a');
+        Arrays.fill(fill, (byte) 'a');
         byte[] rocket = utf8("🚀");
 
         assertEquals(List.of(), buffer.append(fill));
@@ -405,7 +446,7 @@ class ContainerLogStreamerTest {
         // force-split at the hard ceiling, not buffered without bound.
         ContainerLogStreamer.LogLineBuffer buffer = new ContainerLogStreamer.LogLineBuffer();
         byte[] leads = new byte[256 * 1024 + 64];
-        java.util.Arrays.fill(leads, (byte) 0xE2); // 1110xxxx lead byte, never followed by continuations
+        Arrays.fill(leads, (byte) 0xE2); // 1110xxxx lead byte, never followed by continuations
         List<String> lines = buffer.append(leads);
         assertFalse(lines.isEmpty(), "a boundary-less lead-byte run must be force-split, not buffered unbounded");
     }
@@ -416,7 +457,7 @@ class ContainerLogStreamerTest {
         // cap rather than growing unbounded.
         ContainerLogStreamer.LogLineBuffer buffer = new ContainerLogStreamer.LogLineBuffer();
         byte[] continuations = new byte[256 * 1024 + 64];
-        java.util.Arrays.fill(continuations, (byte) 0x80); // 10xxxxxx continuation
+        Arrays.fill(continuations, (byte) 0x80); // 10xxxxxx continuation
         List<String> lines = buffer.append(continuations);
         assertFalse(lines.isEmpty(), "a continuation-only run must be force-split, not buffered unbounded");
     }
@@ -534,7 +575,7 @@ class ContainerLogStreamerTest {
         // Fragments of ONE newline-free write are delivered by the transport reader AFTER close() is
         // called; the terminal callback then flushes their reassembled line. A separate thread supplies
         // the reader callbacks, mirroring the transport.
-        List<String> emitted = java.util.Collections.synchronizedList(new ArrayList<>());
+        List<String> emitted = Collections.synchronizedList(new ArrayList<>());
         ContainerLogStreamer.LogReassemblyCallback cb =
                 new ContainerLogStreamer.LogReassemblyCallback(emitted::add);
 
@@ -611,7 +652,7 @@ class ContainerLogStreamerTest {
         assertEquals(List.of("unterminated-tail"), emitted);
     }
 
-    private static LogContainerCmd attachWith(java.util.function.BiFunction<ContainerLogStreamer, String, Closeable> attach) {
+    private static LogContainerCmd attachWith(BiFunction<ContainerLogStreamer, String, Closeable> attach) {
         DockerClient dockerClient = mock(DockerClient.class);
         LogContainerCmd command = mock(LogContainerCmd.class, RETURNS_SELF);
         when(dockerClient.logContainerCmd("container-1")).thenReturn(command);

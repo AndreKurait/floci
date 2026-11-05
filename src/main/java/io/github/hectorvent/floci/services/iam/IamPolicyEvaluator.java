@@ -25,7 +25,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
@@ -806,9 +808,9 @@ public class IamPolicyEvaluator {
                 continue;
             }
             List<String> values = entry.getValue().stream()
-                    .filter(java.util.Objects::nonNull)
+                    .filter(Objects::nonNull)
                     .toList();
-            normalized.putIfAbsent(entry.getKey().toLowerCase(java.util.Locale.ROOT), values);
+            normalized.putIfAbsent(entry.getKey().toLowerCase(Locale.ROOT), values);
         }
         return normalized;
     }
@@ -1271,13 +1273,21 @@ public class IamPolicyEvaluator {
      */
     private enum SetQuantifier { NONE, FOR_ALL_VALUES, FOR_ANY_VALUE }
 
-    private static final Set<String> SUPPORTED_CONDITION_OPERATORS = Set.of(
-            "StringEquals", "StringNotEquals", "StringEqualsIgnoreCase", "StringNotEqualsIgnoreCase",
-            "StringLike", "StringNotLike", "ArnEquals", "ArnLike", "ArnNotEquals", "ArnNotLike", "Bool",
-            "NumericEquals", "NumericNotEquals", "NumericLessThan", "NumericLessThanEquals",
-            "NumericGreaterThan", "NumericGreaterThanEquals", "DateEquals", "DateNotEquals",
-            "DateLessThan", "DateLessThanEquals", "DateGreaterThan", "DateGreaterThanEquals",
-            "IpAddress", "NotIpAddress");
+    /** Known IAM base names, and whether this evaluator implements them. */
+    private static final Map<String, Boolean> CONDITION_OPERATORS = Map.ofEntries(
+            Map.entry("StringEquals", true), Map.entry("StringNotEquals", true),
+            Map.entry("StringEqualsIgnoreCase", true), Map.entry("StringNotEqualsIgnoreCase", true),
+            Map.entry("StringLike", true), Map.entry("StringNotLike", true),
+            Map.entry("ArnEquals", true), Map.entry("ArnLike", true),
+            Map.entry("ArnNotEquals", true), Map.entry("ArnNotLike", true), Map.entry("Bool", true),
+            Map.entry("NumericEquals", true), Map.entry("NumericNotEquals", true),
+            Map.entry("NumericLessThan", true), Map.entry("NumericLessThanEquals", true),
+            Map.entry("NumericGreaterThan", true), Map.entry("NumericGreaterThanEquals", true),
+            Map.entry("DateEquals", true), Map.entry("DateNotEquals", true),
+            Map.entry("DateLessThan", true), Map.entry("DateLessThanEquals", true),
+            Map.entry("DateGreaterThan", true), Map.entry("DateGreaterThanEquals", true),
+            Map.entry("IpAddress", true), Map.entry("NotIpAddress", true),
+            Map.entry("Null", true), Map.entry("BinaryEquals", false));
 
     /**
      * The operators a policy variable may be used with: "Conditions support variables when you
@@ -1323,7 +1333,18 @@ public class IamPolicyEvaluator {
         if ("Null".equals(parsed.baseOp())) {
             return !parsed.ifExists() && parsed.quantifier() == SetQuantifier.NONE;
         }
-        return SUPPORTED_CONDITION_OPERATORS.contains(parsed.baseOp());
+        return Boolean.TRUE.equals(CONDITION_OPERATORS.get(parsed.baseOp()));
+    }
+
+    /** Recognizes the parsed IAM name without promising that this evaluator implements it. */
+    public static boolean isKnownConditionOperator(String operator) {
+        return CONDITION_OPERATORS.containsKey(parseOperator(operator).baseOp());
+    }
+
+    /** The invalid Null modifier combination, including an optional set-operator prefix. */
+    public static boolean isNullConditionOperatorWithIfExists(String operator) {
+        ParsedOperator parsed = parseOperator(operator);
+        return "Null".equals(parsed.baseOp()) && parsed.ifExists();
     }
 
     /**
@@ -1391,7 +1412,7 @@ public class IamPolicyEvaluator {
         boolean substitute = policyVariables && VARIABLE_CONDITION_OPERATORS.contains(baseOp);
 
         for (Map.Entry<String, List<String>> entry : keyValueMap.entrySet()) {
-            String condKey = entry.getKey().toLowerCase(java.util.Locale.ROOT);
+            String condKey = entry.getKey().toLowerCase(Locale.ROOT);
             List<String> condValues = entry.getValue();
             List<String> ctxValues = ctx.get(condKey);
 

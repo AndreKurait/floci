@@ -7,7 +7,9 @@ import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Alarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.AlarmHistoryItem;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
@@ -67,6 +69,77 @@ class CloudWatchMetricsServiceTest {
         assertNotSame(original.getTags(), result.getTags());
     }
 
+    // AWS: StateTransitionedTimestamp is when StateValue last changed; StateUpdatedTimestamp moves
+    // on any state update, even one that keeps the value.
+    @Test
+    void stateTransitionedTimestampMovesOnlyWhenTheStateValueChanges() throws Exception {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("transitions");
+        service.putMetricAlarm(alarm, REGION);
+        assertEquals(alarm.getStateUpdatedTimestamp(), alarm.getStateTransitionedTimestamp());
+
+        alarm.setStateUpdatedTimestamp(100);
+        alarm.setStateTransitionedTimestamp(100);
+        service.setAlarmState("transitions", "INSUFFICIENT_DATA", "same state", null, REGION);
+        assertTrue(alarm.getStateUpdatedTimestamp() > 100);
+        assertEquals(100, alarm.getStateTransitionedTimestamp());
+
+        service.setAlarmState("transitions", "ALARM", "breached", null, REGION);
+        long transitioned = alarm.getStateTransitionedTimestamp();
+        assertTrue(transitioned > 100);
+
+        alarm.setStateTransitionedTimestamp(200);
+        MetricAlarm replacement = new MetricAlarm();
+        replacement.setAlarmName("transitions");
+        service.putMetricAlarm(replacement, REGION);
+        assertEquals(200, service.describeAlarms(List.of("transitions"), null, REGION).getFirst()
+                .getStateTransitionedTimestamp());
+    }
+
+    @Test
+    void aCompositeTransitionMovesItsStateTransitionedTimestamp() {
+        MetricAlarm child = new MetricAlarm();
+        child.setAlarmName("child");
+        service.putMetricAlarm(child, REGION);
+        CompositeAlarm parent = new CompositeAlarm();
+        parent.setAlarmName("parent");
+        parent.setAlarmRule("ALARM(child)");
+        service.putCompositeAlarm(parent, REGION);
+        CompositeAlarm stored = service.describeCompositeAlarms(List.of("parent"), null, REGION).getFirst();
+        assertEquals("OK", stored.getStateValue());
+        stored.setStateTransitionedTimestamp(100);
+
+        service.setAlarmState("child", "ALARM", "breached", null, REGION);
+        assertEquals("ALARM", stored.getStateValue());
+        assertTrue(stored.getStateTransitionedTimestamp() > 100);
+    }
+
+    // A stored alarm without a transition time keeps reporting its last state update as the
+    // transition when a same-state SetAlarmState moves StateUpdatedTimestamp.
+    @Test
+    void aSameStateUpdateOfAnAlarmStoredWithoutATransitionKeepsItsLastTransition() {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("legacy");
+        service.putMetricAlarm(alarm, REGION);
+        service.setAlarmState("legacy", "ALARM", "breached", null, REGION);
+        alarm.setStateTransitionedTimestamp(0);
+        alarm.setStateUpdatedTimestamp(1000);
+
+        service.setAlarmState("legacy", "ALARM", "still breached", null, REGION);
+
+        assertTrue(alarm.getStateUpdatedTimestamp() > 1000);
+        assertEquals(1000, alarm.lastTransitionTimestamp());
+    }
+
+    // Alarms stored before StateTransitionedTimestamp existed report their last state update.
+    @Test
+    void anAlarmStoredWithoutATransitionTimestampReportsItsLastStateUpdate() throws Exception {
+        Alarm legacy = new ObjectMapper().readValue(
+                "{\"alarmType\":\"MetricAlarm\",\"alarmName\":\"old\",\"stateUpdatedTimestamp\":123}", Alarm.class);
+        assertEquals(0, legacy.getStateTransitionedTimestamp());
+        assertEquals(123, legacy.lastTransitionTimestamp());
+    }
+
     @ParameterizedTest
     @NullSource
     @ValueSource(strings = {"", "alarm", "UNKNOWN"})
@@ -82,7 +155,7 @@ class CloudWatchMetricsServiceTest {
         assertEquals(value == null
                 ? "1 validation error detected: Value null at 'stateValue' failed to satisfy constraint: Member must not be null"
                 : "1 validation error detected: Value '" + value + "' at 'stateValue' failed to satisfy constraint: "
-                        + "Member must satisfy enum value set: [OK, ALARM, INSUFFICIENT_DATA]", error.getMessage());
+                        + "Member must satisfy enum value set: [INSUFFICIENT_DATA, ALARM, OK]", error.getMessage());
         assertEquals("OK", alarm.getStateValue());
         assertEquals("preserved", alarm.getStateReason());
         assertEquals("{}", alarm.getStateReasonData());
@@ -206,6 +279,95 @@ class CloudWatchMetricsServiceTest {
         List<CloudWatchMetricsService.MetricIdentity> result = service.listMetrics(
                 NAMESPACE, "Latency", List.of(new Dimension("Service", "auth")), REGION);
         assertEquals(1, result.size());
+    }
+
+    @Test
+    void listMetricsPagesDistinctDimensionsAndScopesTheCursor() {
+        List<MetricDatum> datums = new ArrayList<>();
+        for (int i = 0; i < 501; i++) {
+            MetricDatum datum = datum("Latency", 1);
+            datum.setDimensions(List.of(new Dimension("A", "one"), new Dimension("B", "two"),
+                    new Dimension("C", "host-" + i)));
+            datums.add(datum);
+        }
+        service.putMetricData(NAMESPACE, datums, REGION);
+
+        List<Dimension> filters = List.of(new Dimension("A", "one"), new Dimension("B", "two"));
+        PaginatedResult<CloudWatchMetricsService.MetricIdentity> first =
+                service.listMetricsPage(NAMESPACE, "Latency", filters, null, REGION);
+        assertEquals(500, first.items().size());
+        assertNotNull(first.nextToken());
+        PaginatedResult<CloudWatchMetricsService.MetricIdentity> second =
+                service.listMetricsPage(NAMESPACE, "Latency", List.of(filters.get(1), filters.get(0)),
+                        first.nextToken(), REGION);
+        assertEquals(1, second.items().size());
+        assertNull(second.nextToken());
+        List<CloudWatchMetricsService.MetricIdentity> all = new ArrayList<>(first.items());
+        all.addAll(second.items());
+        assertEquals(501, all.stream().map(metric -> metric.dimensions().get(2).value()).distinct().count());
+
+        PaginatedResult<CloudWatchMetricsService.MetricIdentity> filtered = service.listMetricsPage(
+                NAMESPACE, "Latency", List.of(new Dimension("C", "host-500")), null, REGION);
+        assertEquals(1, filtered.items().size());
+        assertNull(filtered.nextToken());
+        AwsException changedFilter = assertThrows(AwsException.class, () -> service.listMetricsPage(
+                NAMESPACE, "Latency", List.of(new Dimension("A", "other")), first.nextToken(), REGION));
+        assertEquals("InvalidParameterValue", changedFilter.getErrorCode());
+        AwsException changedRegion = assertThrows(AwsException.class, () -> service.listMetricsPage(
+                NAMESPACE, "Latency", filters, first.nextToken(), "us-west-2"));
+        assertEquals("InvalidParameterValue", changedRegion.getErrorCode());
+        AwsException malformed = assertThrows(AwsException.class, () -> service.listMetricsPage(
+                NAMESPACE, "Latency", filters, "not-a-token", REGION));
+        assertEquals("InvalidParameterValue", malformed.getErrorCode());
+    }
+
+    @Test
+    void listMetricsPageBoundaryPreservesDifferentOrdersOfRepeatedDimensionNames() {
+        List<Dimension> firstDimensions = List.of(new Dimension("A", "one"), new Dimension("A", "two"));
+        List<Dimension> secondDimensions = firstDimensions.reversed();
+        String metricName = "repeated-dimension";
+        CloudWatchMetricsService.MetricIdentity firstIdentity =
+                new CloudWatchMetricsService.MetricIdentity(NAMESPACE, metricName, firstDimensions);
+        while (CloudWatchMetricsService.metricCursor(firstIdentity).charAt(0) < '8') {
+            metricName += "-next";
+            firstIdentity = new CloudWatchMetricsService.MetricIdentity(NAMESPACE, metricName, firstDimensions);
+        }
+        CloudWatchMetricsService.MetricIdentity secondIdentity =
+                new CloudWatchMetricsService.MetricIdentity(NAMESPACE, metricName, secondDimensions);
+        String boundaryCursor = CloudWatchMetricsService.metricCursor(firstIdentity);
+        assertNotEquals(boundaryCursor, CloudWatchMetricsService.metricCursor(secondIdentity));
+
+        List<MetricDatum> datums = new ArrayList<>();
+        MetricDatum first = datum(metricName, 1);
+        first.setDimensions(firstDimensions);
+        datums.add(first);
+        MetricDatum second = datum(metricName, 1);
+        second.setDimensions(secondDimensions);
+        datums.add(second);
+        for (int i = 0; datums.size() < 501; i++) {
+            String fillerName = "filler-" + i;
+            CloudWatchMetricsService.MetricIdentity filler =
+                    new CloudWatchMetricsService.MetricIdentity(NAMESPACE, fillerName, List.of());
+            if (CloudWatchMetricsService.metricCursor(filler).compareTo(boundaryCursor) < 0) {
+                datums.add(datum(fillerName, 1));
+            }
+        }
+        service.putMetricData(NAMESPACE, datums, REGION);
+
+        PaginatedResult<CloudWatchMetricsService.MetricIdentity> firstPage =
+                service.listMetricsPage(NAMESPACE, null, null, null, REGION);
+        PaginatedResult<CloudWatchMetricsService.MetricIdentity> secondPage =
+                service.listMetricsPage(NAMESPACE, null, null, firstPage.nextToken(), REGION);
+        assertEquals(500, firstPage.items().size());
+        assertEquals(1, secondPage.items().size());
+        assertNull(secondPage.nextToken());
+        assertEquals(metricName, secondPage.items().getFirst().metricName());
+    }
+
+    @Test
+    void listMetricsFilterScopeAllowsMissingValuesForRepeatedNames() {
+        List<Dimension> filters = List.of(new Dimension("A", null), new Dimension("A", "one"));
+        assertTrue(service.listMetricsPage(NAMESPACE, null, filters, null, REGION).items().isEmpty());
     }
 
     @Test
@@ -477,7 +639,8 @@ class CloudWatchMetricsServiceTest {
         assertEquals("INSUFFICIENT_DATA", createdAlarm.path("stateValue").asText());
         assertEquals(created, createdAlarm.path("alarmConfigurationUpdatedTimestamp").asText());
         assertTrue(created.endsWith("+0000"));
-        for (String hidden : List.of("region", "tags", "stateReason", "stateReasonData", "alarmType", "unit")) {
+        for (String hidden : List.of("region", "tags", "stateReason", "stateReasonData", "alarmType", "unit",
+                "stateTransitionedTimestamp")) {
             assertFalse(createdAlarm.has(hidden), hidden);
         }
 
@@ -517,6 +680,18 @@ class CloudWatchMetricsServiceTest {
         assertTrue(history("filtered", List.of("CompositeAlarm"), null, null, null, null, null).isEmpty());
         assertTrue(service.describeAlarmHistory("filtered", null, null, null, null, null, null, null, "eu-west-1")
                 .items().isEmpty());
+    }
+
+    // A state change's history entry and the alarm's StateTransitionedTimestamp come from the same instant.
+    @Test
+    void aStateUpdateHistoryEntryIsStampedWithTheAlarmsTransitionTime() {
+        putAlarm("stamped");
+        service.setAlarmState("stamped", "ALARM", "breached", null, REGION);
+
+        MetricAlarm alarm = service.describeAlarms(List.of("stamped"), null, REGION).getFirst();
+        AlarmHistoryItem entry = history("stamped", null, "StateUpdate", null, null, null, null).getFirst();
+        assertEquals(alarm.getStateTransitionedTimestamp(), entry.timestamp() / 1000);
+        assertEquals(alarm.getStateUpdatedTimestamp(), entry.timestamp() / 1000);
     }
 
     @Test
