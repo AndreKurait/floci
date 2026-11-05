@@ -157,8 +157,35 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    /**
+     * These calls authorize the base state-machine ARN. A version or alias in the
+     * request is a qualifier condition, including when an alias selects a version.
+     */
+    private Map<String, List<String>> stepFunctionsConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("states:DescribeStateMachine".equals(action) || "states:StartExecution".equals(action))) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        String value = body == null ? null : body.path("stateMachineArn").asText(null);
+        if (value == null) {
+            return null;
+        }
+        try {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(value);
+            String[] resource = arn.resource().split(":", -1);
+            if ("states".equals(arn.service()) && resource.length == 3
+                    && "stateMachine".equals(resource[0]) && !resource[1].isBlank() && !resource[2].isBlank()) {
+                return Map.of("states:StateMachineQualifier", List.of(resource[2]));
+            }
+        } catch (IllegalArgumentException expected) {
+            // Leave malformed selectors to the ordinary authorization and API validation.
+        }
+        return null;
     }
 
     /** Group mutations and stream access use the handler's group and request scope. */
