@@ -52,12 +52,14 @@ public class SsmJsonHandler {
     private final IamEnforcementFilter iamEnforcementFilter;
     private final SsmPatchBaselineService patchBaselines;
     private final SsmResourceDataSyncService resourceDataSyncs;
+    private final SsmAgentAssociationService agentAssociations;
 
     @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
                           SsmInventoryService inventoryService, ObjectMapper objectMapper,
                           IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
-                          SsmResourceDataSyncService resourceDataSyncs) {
+                          SsmResourceDataSyncService resourceDataSyncs,
+                          SsmAgentAssociationService agentAssociations) {
         this.ssmService = ssmService;
         this.commandService = commandService;
         this.inventoryService = inventoryService;
@@ -65,6 +67,7 @@ public class SsmJsonHandler {
         this.iamEnforcementFilter = iamEnforcementFilter;
         this.patchBaselines = patchBaselines;
         this.resourceDataSyncs = resourceDataSyncs;
+        this.agentAssociations = agentAssociations;
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
@@ -135,6 +138,11 @@ public class SsmJsonHandler {
             case "DescribeDocumentPermission" -> handleDescribeDocumentPermission(request, region);
             case "ListDocuments" -> handleListDocuments(request, region);
             // Associations
+            case "ListInstanceAssociations" -> Response.ok(agentAssociations.list(request, region)).build();
+            case "UpdateInstanceAssociationStatus" -> {
+                agentAssociations.updateStatus(request, region);
+                yield Response.ok(objectMapper.createObjectNode()).build();
+            }
             case "CreateAssociation" -> handleCreateAssociation(request, region);
             case "UpdateAssociation" -> handleUpdateAssociation(request, region);
             case "DescribeAssociation" -> handleDescribeAssociation(request, region);
@@ -630,20 +638,7 @@ public class SsmJsonHandler {
     }
 
     private String resolveDocumentVersion(JsonNode request, SsmDocument document) {
-        String requested = optionalText(request, "DocumentVersion");
-        String version;
-        if (requested == null || requested.isBlank() || "$DEFAULT".equals(requested)) {
-            version = String.valueOf(document.getDefaultVersion());
-        } else if ("$LATEST".equals(requested)) {
-            version = String.valueOf(document.getDocumentVersion());
-        } else {
-            version = requested;
-        }
-        if (!document.hasRetainedContent(version)) {
-            throw new AwsException("InvalidDocumentVersion",
-                    "The document version is not valid or does not exist.", 400);
-        }
-        return version;
+        return SsmService.resolveDocumentVersion(document, optionalText(request, "DocumentVersion"));
     }
 
     private Response handleCreateDocument(JsonNode request, String region) {
