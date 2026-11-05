@@ -17,6 +17,7 @@ import org.junit.jupiter.api.TestFactory;
 import java.io.ByteArrayInputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -280,10 +281,12 @@ class RequestResourceMembersTest {
     /**
      * Each resource alone, from a request naming it and nothing else, gives exactly its ARN, in the account its
      * account member names when it has one, with those sharing its explicit member selector, those the operation
-     * always names, such as a create's new resource (Cloud Map's {@code CreateService}), and those filled from the ARN
-     * it is read from (a permission set made in an instance); one named through another resource of its service's
-     * own, the ARN its service gives for that. A member the table locates in a REST request's path or query is given
-     * there, a body giving it naming nothing, and such a request is not checked as a form.
+     * always names, such as a create's new resource (Cloud Map's {@code CreateService}), those filled from the ARN
+     * it is read from (a permission set made in an instance), and those a member it shares fills, their other
+     * variables open (Redshift's {@code DeleteClusterSnapshot} names {@code cluster:<id>} by the
+     * {@code SnapshotClusterIdentifier} that also fills {@code snapshot:<id>/<name>}); one named through another
+     * resource of its service's own, the ARN its service gives for that. A member the table locates in a REST
+     * request's path or query is given there, and a body or a form giving it another value names nothing.
      */
     @TestFactory
     Stream<DynamicTest> everyResourceOfTheTableIsReadFromAJsonBodyAndAForm() {
@@ -313,43 +316,39 @@ class RequestResourceMembersTest {
                         }
                     });
                     // A member the table locates in a REST request's path or query goes there, where the reader takes it
-                    // from; a REST request has no form, so the form is checked for an operation locating none.
+                    // from, and the body and the form give it another value, which names nothing.
                     Map<String, String> located = table.located().getOrDefault(operation.getKey(), Map.of());
                     Map<String, String> labels = new LinkedHashMap<>();
                     MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
                     given.forEach((member, value) -> {
                         String where = member.field() == null && !member.list() ? located.get(member.name()) : null;
-                        if (where == null) {
-                            put(body, member, value);
-                        } else if (where.startsWith("{")) {
+                        if (where != null && where.startsWith("{")) {
                             labels.put(where.substring(1, where.length() - 1), value);
-                        } else {
+                        } else if (where != null) {
                             query.add(where.substring(1), value);
                         }
-                        form.append('&').append(parameter(member)).append('=').append(encoded(value));
+                        String sent = where == null ? value : "other";
+                        put(body, member, sent);
+                        form.append('&').append(parameter(member)).append('=').append(encoded(sent));
                     });
                     List<String> named = operation.getValue().stream()
-                            .filter(other -> (other == resource || named(other) || fillsFromTheArn(other, resource)
+                            .filter(other -> (other == resource || named(other) || sharesAMember(other, given)
+                                    || fillsFromTheArn(other, resource)
                                     || !other.find().isEmpty() && other.find().equals(resource.find())
                                     && other.when().equals(resource.when()) && other.unless().equals(resource.unless()))
                                     && (other.endpoint() == null || resource.endpoint() == null
                                     || other.endpoint().equals(resource.endpoint())))
                             .map(other -> other == resource ? expected : expected(
                                     table.formats().get(namespace).get(other.types().getFirst()).format(), other,
-                                    "000000000000"))
+                                    "000000000000", given.keySet()))
                             .distinct().toList();
                     StoredResourceArns stored = runningOn(namespace, arn);
-                    ContainerRequestContext request = servedBy(json(body.toString()), resource.endpoint());
-                    UriInfo uriInfo = mock(UriInfo.class);
-                    when(uriInfo.getQueryParameters()).thenReturn(query);
-                    when(request.getUriInfo()).thenReturn(uriInfo);
-                    assertEquals(named, RequestResources.of(operation.getKey(), request, "aws", "us-east-1",
+                    assertEquals(named, RequestResources.of(operation.getKey(),
+                            sentWith(servedBy(json(body.toString()), resource.endpoint()), query), "aws", "us-east-1",
                             "000000000000", stored, labels), body + " " + labels + " " + query);
-                    if (given.keySet().stream().noneMatch(member -> located.containsKey(member.name()))) {
-                        assertEquals(named, RequestResources.of(operation.getKey(),
-                                servedBy(form(form.toString()), resource.endpoint()), "aws", "us-east-1",
-                                "000000000000", stored), form.toString());
-                    }
+                    assertEquals(named, RequestResources.of(operation.getKey(),
+                            sentWith(servedBy(form(form.toString()), resource.endpoint()), query), "aws", "us-east-1",
+                            "000000000000", stored, labels), form + " " + labels + " " + query);
                 })));
     }
 
@@ -416,6 +415,25 @@ class RequestResourceMembersTest {
         };
     }
 
+    /**
+     * Whether a request giving these members names the resource too: it fills a variable from one of them, not from
+     * the ARN one holds ({@link #fillsFromTheArn} decides those), and no {@code when} or {@code unless} the request's
+     * values fail leaves it out (each member given is {@code x}, any other absent, which a value list holds as
+     * {@code ""}).
+     */
+    private static boolean sharesAMember(Resource resource, Map<Member, String> given) {
+        if (resource.arn() != null || resource.fill().values().stream()
+                .noneMatch(member -> given.containsKey(member) && !resource.arnOf().containsKey(member.path()))) {
+            return false;
+        }
+        Map<String, String> values = given.entrySet().stream()
+                .collect(Collectors.toMap(entry -> entry.getKey().name(), Map.Entry::getValue, (a, b) -> a));
+        return resource.when().entrySet().stream()
+                .allMatch(when -> when.getValue().contains(values.getOrDefault(when.getKey(), "")))
+                && resource.unless().entrySet().stream()
+                .noneMatch(unless -> unless.getValue().contains(values.getOrDefault(unless.getKey(), "")));
+    }
+
     /** The value at the member's path in a body: in its list's first element, and in its field's structure. */
     private static void put(ObjectNode body, Member member, String value) {
         if (member.field() == null) {
@@ -443,10 +461,17 @@ class RequestResourceMembersTest {
 
     /** The format in the account with each variable the resource fills {@code x}, and each other open. */
     private static String expected(String format, Resource resource, String account) {
+        return expected(format, resource, account, resource.fill().values());
+    }
+
+    /** The format in the account with each variable the resource fills from one of {@code given} {@code x}. */
+    private static String expected(String format, Resource resource, String account, Collection<Member> given) {
         String arn = format.replace("${Partition}", "aws").replace("${Region}", "us-east-1")
                 .replace("${Account}", account);
-        for (String variable : resource.fill().keySet()) {
-            arn = arn.replace("${" + variable + "}", "x");
+        for (Map.Entry<String, Member> variable : resource.fill().entrySet()) {
+            if (given.contains(variable.getValue())) {
+                arn = arn.replace("${" + variable.getKey() + "}", "x");
+            }
         }
         for (Map.Entry<String, String> variable : resource.fixed().entrySet()) {
             arn = arn.replace("${" + variable.getKey() + "}", variable.getValue());
@@ -487,6 +512,15 @@ class RequestResourceMembersTest {
             when(request.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY))
                     .thenReturn(new ProtocolClaim(WireProtocol.AWS_JSON_1_1, service, null, null));
         }
+        return request;
+    }
+
+    /** The request with the query it is sent with. */
+    private static ContainerRequestContext sentWith(ContainerRequestContext request,
+                                                    MultivaluedMap<String, String> query) {
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getQueryParameters()).thenReturn(query);
+        when(request.getUriInfo()).thenReturn(uriInfo);
         return request;
     }
 

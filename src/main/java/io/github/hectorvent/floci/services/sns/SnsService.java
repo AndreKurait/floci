@@ -1202,7 +1202,7 @@ public class SnsService implements Resettable, ResourceProvider {
             deliverMessage(sub, message, subject, messageAttributes, notification, effectiveArn, messageGroupId, dedupId,
                     messageStructure);
         }
-        LOG.infov("Published message {0} to topic {1}", messageId, effectiveArn);
+        LOG.debugv("Published message {0} to topic {1}", messageId, effectiveArn);
         return messageId;
     }
 
@@ -1410,7 +1410,7 @@ public class SnsService implements Resettable, ResourceProvider {
         recordPushNotification(new PushNotification(
                 endpoint.getArn(), app.getArn(), app.getPlatform(), endpoint.getToken(),
                 payload, subject, messageAttributes, messageId, Instant.now()));
-        LOG.infov("Captured push notification {0} -> {1} ({2})", messageId, endpoint.getArn(), app.getPlatform());
+        LOG.debugv("Captured push notification {0} -> {1} ({2})", messageId, endpoint.getArn(), app.getPlatform());
         return messageId;
     }
 
@@ -3131,7 +3131,7 @@ public class SnsService implements Resettable, ResourceProvider {
         String effectiveRegion = region != null ? region : regionResolver.getDefaultRegion();
         SentSms sms = new SentSms(messageId, effectiveRegion, phoneNumber, message, subject, Instant.now());
         smsStore.put("sms::" + effectiveRegion + "::" + messageId, sms);
-        LOG.infov("SNS SMS published: messageId={0} phone={1}", messageId, phoneNumber);
+        LOG.debugv("SNS SMS published: messageId={0} phone={1}", messageId, phoneNumber);
         return messageId;
     }
 

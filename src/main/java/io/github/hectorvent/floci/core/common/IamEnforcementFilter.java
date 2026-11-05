@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.iam.StsSessionTags;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
+import io.github.hectorvent.floci.services.s3.S3ScratchSpace;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.core.http.HttpServerRequest;
@@ -586,12 +587,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
             callerArns.get().putPrincipalKeys(conditionContext);
         }
-        // Floci Spectrum transfer writes internal materialization to its own scratch bucket under the minted
-        // role session key. Since AWS Spectrum has no S3 write, this transfer is internal and must not be
-        // evaluated against the role's policies, permissions boundary, or SCPs (which often enforce read-only
-        // on data lake buckets). Tying authorization ahead of role policies directly to the minted transfer key
-        // and scratch key ensures boundary/SCP checks apply only to the actual S3 source reads.
-        if (isSpectrumScratchTransfer(credentialScope, action, resources, akid, callerArns.orElse(null))) {
+        // Internal transfers bypass customer policies only for a registered session scope in a tagged bucket.
+        if (isScratchTransfer(ctx, credentialScope, action, resources, akid, callerArns.orElse(null))) {
             return;
         }
         // A create that carries tags is checked with them where its own action takes them, as the tagging
@@ -747,14 +744,6 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     // presigned URLs add, is a DeleteObject.
     private static final Set<String> NON_DELETE_OBJECT_SUBRESOURCES = Set.of("uploadId", "tagging", "annotation");
 
-    private static final Set<String> SPECTRUM_SCRATCH_ACTIONS =
-            Set.of("s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload");
-
-    private static final Pattern SPECTRUM_SCRATCH_OBJECT = Pattern.compile(
-            "arn:" + AwsArnUtils.PARTITION_REGEX + ":s3:::"
-                    + Pattern.quote(S3Service.REDSHIFT_SPECTRUM_SCRATCH_BUCKET)
-                    + "/spectrum-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\\.csv");
-
     private static final Set<String> GOVERNANCE_BYPASS_ACTIONS =
             Set.of("s3:PutObjectRetention", "s3:DeleteObject", "s3:DeleteObjectVersion");
 
@@ -795,33 +784,25 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return "POST".equalsIgnoreCase(ctx.getMethod()) && namesUpload && !params.containsKey("uploads");
     }
 
-    /**
-     * A write or delete of the scratch object in the Spectrum scratch bucket by the exact assumed-role
-     * session running that transfer. The transfer is Floci's own, so it is authorized ahead of the
-     * role's policies and permissions boundaries; any other action, bucket, key or session stays
-     * under normal policy evaluation.
-     */
-    private boolean isSpectrumScratchTransfer(String credentialScope, String action,
-                                              List<String> resources, String akid,
-                                              CallerArns callerArns) {
+    private boolean isScratchTransfer(ContainerRequestContext ctx, String credentialScope, String action,
+                                      List<String> resources, String akid, CallerArns callerArns) {
         if (!"s3".equals(credentialScope) || akid == null || callerArns == null
                 || !CallerArns.TYPE_ASSUMED_ROLE.equals(callerArns.principalType())
-                || !SPECTRUM_SCRATCH_ACTIONS.contains(action) || resources.isEmpty()) {
+                || resources.isEmpty() || s3ServiceProvider == null || !s3ServiceProvider.isResolvable()) {
             return false;
         }
-        if (s3ServiceProvider != null && s3ServiceProvider.isResolvable()
-                && !s3ServiceProvider.get().isSpectrumScratchBucket(S3Service.REDSHIFT_SPECTRUM_SCRATCH_BUCKET)) {
+        Optional<String> allowed = iamService.scratchResourceArn(akid);
+        if (allowed.isEmpty()) {
             return false;
         }
-        Optional<String> allowedScratchArn = iamService.spectrumScratchResourceArn(akid);
-        if (allowedScratchArn.isEmpty()) {
-            return false;
+        String prefix = "s3:ListBucket".equals(action) ? ctx.getUriInfo().getQueryParameters().getFirst("prefix") : null;
+        for (S3ScratchSpace space : S3ScratchSpace.values()) {
+            if (space.permits(action, allowed.get(), resources, prefix)
+                    && s3ServiceProvider.get().isScratchBucket(space.bucketName())) {
+                return true;
+            }
         }
-        String expectedArn = allowedScratchArn.get();
-        if (!SPECTRUM_SCRATCH_OBJECT.matcher(expectedArn).matches()) {
-            return false;
-        }
-        return resources.stream().allMatch(expectedArn::equals);
+        return false;
     }
 
     /**
@@ -1513,7 +1494,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             ResourcePolicyDecision resourcePolicyDecision,
             String resourceOwnerAccountId) {
         authorizeAdditionalResource(authorizationHeader, action, resource, resourcePolicyDecision,
-                resourceOwnerAccountId, null, null);
+                resourceOwnerAccountId, null, null, null);
     }
 
     /** Carries service-parsed authentication facts to a secondary resource's policy evaluation. */
@@ -1525,7 +1506,14 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String resourceOwnerAccountId,
             Map<String, List<String>> authenticationConditions) {
         authorizeAdditionalResource(authorizationHeader, action, resource, resourcePolicyDecision,
-                resourceOwnerAccountId, authenticationConditions, null);
+                resourceOwnerAccountId, authenticationConditions, null, null);
+    }
+
+    /** Authorizes a secondary resource with service-parsed request condition keys. */
+    public void authorizeAdditionalResource(String authorizationHeader, String action, String resource,
+                                              Map<String, List<String>> requestConditions) {
+        authorizeAdditionalResource(authorizationHeader, action, resource, null, null, null, null,
+                requestConditions);
     }
 
     /**
@@ -1545,14 +1533,17 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     public void authorizePostObject(String authorizationHeader, String resource, String region,
                                     Map<String, List<String>> authenticationConditions) {
         authorizeAdditionalResource(authorizationHeader, "s3:PutObject", resource, null, null,
-                authenticationConditions, new DeniedEvent("PostObject", region));
+                authenticationConditions, new DeniedEvent("PostObject", region), null);
     }
 
     /** A CloudTrail record to write when IAM refuses a request: its event name and its Region. */
     private record DeniedEvent(String name, String region) {
     }
 
-    /** As the public overload; a denial is also recorded in CloudTrail when {@code deniedEvent} is given. */
+    /**
+     * As the public overloads; a denial is also recorded in CloudTrail when {@code deniedEvent} is given, and
+     * {@code requestConditions}, when given, joins the condition context.
+     */
     private void authorizeAdditionalResource(
             String authorizationHeader,
             String action,
@@ -1560,7 +1551,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             ResourcePolicyDecision resourcePolicyDecision,
             String resourceOwnerAccountId,
             Map<String, List<String>> authenticationConditions,
-            DeniedEvent deniedEvent) {
+            DeniedEvent deniedEvent,
+            Map<String, List<String>> requestConditions) {
         if (!config.services().iam().enforcementEnabled()) {
             return;
         }
@@ -1634,6 +1626,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if (callerArns.isPresent()) {
                 caller = caller.withPrincipalArn(callerArns.get().callerArn());
                 callerArns.get().putPrincipalKeys(conditionContext);
+            }
+            if (requestConditions != null && !requestConditions.isEmpty()) {
+                if (conditionContext == null) {
+                    conditionContext = new HashMap<>();
+                }
+                conditionContext.putAll(requestConditions);
             }
 
             ResourcePolicyDecision effectiveDecision = resourcePolicyDecision;
