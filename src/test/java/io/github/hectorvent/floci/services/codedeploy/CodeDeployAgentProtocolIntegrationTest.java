@@ -109,23 +109,6 @@ class CodeDeployAgentProtocolIntegrationTest {
     }
 
     @Test
-    void theLegacyAgentProtocolUsesItsOwnSigningAndPolicyNamespace() {
-        String key = user("codedeploy-commands:*");
-        String id = "d-" + UUID.randomUUID();
-        CodeDeployAgentCommands.Session session = commands.open(ACCOUNT, REGION, id, id,
-                List.of("legacy-host"), Map.of("DeploymentId", id));
-        cleanup.register(() -> commands.close(session));
-        commands.enqueue(session, "legacy-host", "DownloadBundle");
-        call(key, "codedeploy-commands", REGION, "CodeDeployCommandService_v20141006.PollHostCommand",
-                Map.of("HostIdentifier", "legacy-host")).statusCode(200)
-                .body("HostCommand.DeploymentExecutionId", equalTo(id));
-        call(key, "codedeploy-commands", REGION, SECURE_TARGET + "PollHostCommand",
-                Map.of("HostIdentifier", "no-deployment")).statusCode(400)
-                .body("__type", equalTo("AccessDeniedException"))
-                .body(containsString(SECURE + ":PollHostCommand"));
-    }
-
-    @Test
     void invalidDiagnosticsCannotAcknowledgeOrCompleteAHostCommand() {
         String key = user(SECURE + ":*");
         String id = "d-" + UUID.randomUUID();

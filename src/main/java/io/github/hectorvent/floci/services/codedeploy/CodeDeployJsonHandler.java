@@ -34,8 +34,9 @@ public class CodeDeployJsonHandler {
         this.agentHandler = agentHandler;
     }
 
-    public Response handleAgent(String action, JsonNode request, String region, String account) {
-        return agentHandler.handle(action, request, region, account);
+    public Response handleAgent(String action, JsonNode request, String region, String account,
+                                 boolean instanceAuthentication) {
+        return agentHandler.handle(action, request, region, account, instanceAuthentication);
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {

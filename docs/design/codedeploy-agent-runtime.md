@@ -134,12 +134,22 @@ durations. Runtime requests use the normal deadlines, and agent completion
 retains the script name, error, message and log. Download and installation have
 the same acknowledgement/result requirements as script hooks.
 
-The agent endpoints have independent IAM namespaces:
-`codedeploy-commands-secure` and `codedeploy-commands`. A public
-`codedeploy:*` policy does not grant agent commands. These are account-scoped
-authorization and selected-host checks, not an assertion that an IAM principal
-has been bound to a particular EC2 instance's attested identity. That binding
-requires separate qualification.
+The default agent configuration (`enable_auth_policy: false`) uses
+`codedeploy-commands`. With IAM enforcement enabled, Floci verifies its SigV4
+signature and live IMDS-issued instance-profile credential, even if general
+signature validation is disabled. The issuing account, Region, partition and
+instance must match the requested host or the command's recorded host. A role
+session merely named after an instance, an IAM user and the separate EC2
+identity-role credential cannot establish that binding. The instance ARN is
+recorded at issuance and is never restored from serialized session state.
+
+The optional `enable_auth_policy: true` configuration uses
+`codedeploy-commands-secure` and retains ordinary IAM policy enforcement. Public
+`codedeploy:*` permissions do not grant either agent mode. Default EC2 operation
+does not need a `codedeploy-commands:*` policy. See AWS's
+[agent configuration reference](https://docs.aws.amazon.com/codedeploy/latest/userguide/reference-agent-configuration.html)
+and [VPC endpoint authentication instructions](https://docs.aws.amazon.com/codedeploy/latest/userguide/vpc-endpoints.html).
+On-premises agent authentication remains outside this EC2 runtime's support.
 
 ## Qualification
 
@@ -179,6 +189,12 @@ The SDK compatibility suite's `CodeDeployAgentTest` verifies signed
 specifications and command completion against the standalone server, including
 native-image CI. It simulates the agent protocol and verifies the CMS signature;
 the Docker fixture supplies the separate guest-installation evidence.
+
+`CodeDeployDefaultAgentAuthenticationIntegrationTest` obtains credentials over
+IMDS and uses the AWS SDK signer for the default command protocol. It covers
+commercial, GovCloud and China partitions, ownership of all command operations,
+signature and token failures, revocation, lookalike role-session names, and the
+secure endpoint's separate permission requirement.
 
 Configuration-only API tests, a command-protocol simulator and a
 `CreateDeployment` success response are insufficient. Native AMI initialization,

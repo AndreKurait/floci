@@ -4540,6 +4540,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return currentSession(accessKeyId).map(SessionCredential::getEc2InstanceId);
     }
 
+    /** Live instance-profile provenance, never inferred from an assumed role's session name. */
+    public Optional<SessionCredential> ec2InstanceProfileSession(String accessKeyId) {
+        return currentSession(accessKeyId)
+                .filter(session -> session.getEc2RoleId() != null && !session.getEc2RoleId().isBlank())
+                .filter(session -> session.getEc2InstanceArn() != null);
+    }
+
     /** Whether an access key ID identifies Floci's documented public deployer credential. */
     public boolean isSeededDeployerAccessKey(String accessKeyId) {
         return DEFAULT_DEPLOYER_ACCESS_KEY_ID.equals(accessKeyId);

@@ -52,6 +52,9 @@ public class SessionCredential {
     private boolean lambdaExecutionRole;
     private String ec2InstanceId;
     private String ec2RoleId;
+    /** Exact launching instance; only live IMDS issuance may establish this identity. */
+    @JsonIgnore
+    private String ec2InstanceArn;
     /** Exact ECS task ARN this session was minted for, when this is a task-role session. */
     private String ecsTaskArn;
     /** Exact object action and ARN for an internally generated S3 presigned URL. */
@@ -179,6 +182,8 @@ public class SessionCredential {
 
     public String getEc2InstanceId() { return ec2InstanceId; }
     public void setEc2InstanceId(String ec2InstanceId) { this.ec2InstanceId = ec2InstanceId; }
+    public String getEc2InstanceArn() { return ec2InstanceArn; }
+    public void setEc2InstanceArn(String ec2InstanceArn) { this.ec2InstanceArn = ec2InstanceArn; }
 
     public String getEcsTaskArn() { return ecsTaskArn; }
     public void setEcsTaskArn(String ecsTaskArn) { this.ecsTaskArn = ecsTaskArn; }

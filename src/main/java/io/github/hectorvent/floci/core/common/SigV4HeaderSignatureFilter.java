@@ -94,7 +94,9 @@ import java.util.function.UnaryOperator;
  *
  * <p>With global verification off, the optional Lambda identity facility authenticates only
  * native execution-role and one-hop session records. Other credentials retain their existing
- * behavior; no unknown-key secret fallback is added. With both flags off no headers are read.
+ * behavior; no unknown-key secret fallback is added. Default CodeDeploy agent requests also
+ * require signature verification when IAM enforcement is on, because their authorization
+ * depends on the issuing instance rather than an identity-policy grant.
  */
 @Provider
 @Priority(Priorities.AUTHENTICATION)
@@ -166,10 +168,15 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         EmulatorConfig config = configProvider.get();
         boolean validateAll = config.auth().validateSignatures();
         boolean lambdaIdentity = config.services().iam().lambdaIdentityVerificationEnabled();
-        if (!validateAll && !lambdaIdentity) {
+        boolean iamEnforcement = config.services().iam().enforcementEnabled();
+        if (!validateAll && !lambdaIdentity && !iamEnforcement) {
             return;
         }
         Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
+        boolean defaultAgent = iamEnforcement && defaultCodeDeployAgent(ctx, resource);
+        if (!validateAll && !lambdaIdentity && !defaultAgent) {
+            return;
+        }
         if (resource != null && VERIFIED_ELSEWHERE.contains(resource)) {
             return;
         }
@@ -191,20 +198,34 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             }
             signed = SigV4AuthorizationHeader.parse(authorization);
             if (signed == null) {
+                if (defaultAgent) {
+                    incompleteSignature(ctx, resource, "The CodeDeploy agent requires a signed instance request.");
+                }
                 return;
             }
         }
 
         CredentialScope scope = CredentialScope.parse(signed.credential());
-        SessionCredential nativeSession = !lambdaIdentity || scope == null ? null
-                : iamService.lambdaIdentitySession(scope.accessKeyId()).orElse(null);
-        if (!validateAll && nativeSession == null) {
+        SessionCredential nativeSession = null;
+        if (scope != null) {
+            if (defaultAgent) {
+                nativeSession = iamService.ec2InstanceProfileSession(scope.accessKeyId()).orElse(null);
+            } else if (lambdaIdentity) {
+                nativeSession = iamService.lambdaIdentitySession(scope.accessKeyId()).orElse(null);
+            }
+        }
+        if (!validateAll && !defaultAgent && nativeSession == null) {
             return;
         }
         if (scope == null || isBlank(signed.signedHeaders()) || isBlank(signed.signature())) {
             incompleteSignature(ctx, resource, "Authorization header requires 'Credential' (in the form "
                     + "<access key>/<date>/<region>/<service>/aws4_request), 'SignedHeaders' and "
                     + "'Signature' parameters.");
+            return;
+        }
+        if (defaultAgent && !"codedeploy-commands".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: "
+                    + "'codedeploy-commands'");
             return;
         }
         if (!SigV4RequestValidator.containsHeader(signed.signedHeaders(), "host")) {
@@ -310,6 +331,12 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         } else if (verifiedRequest != null) {
             verifiedRequest.setVerifiedSession(nativeSession, secretKey.get(), token);
         }
+    }
+
+    private boolean defaultCodeDeployAgent(ContainerRequestContext ctx, Class<?> resource) {
+        String target = resource == AwsJson11Controller.class ? ctx.getHeaderString("X-Amz-Target") : null;
+        return target != null && catalog.matchTarget(target)
+                .map(match -> "codedeploy-commands".equals(match.descriptor().externalKey())).orElse(false);
     }
 
     /** Whether {@code signature} verifies for this request; package-private for the unit test. */

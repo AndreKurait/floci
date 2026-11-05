@@ -109,8 +109,10 @@ Per-deployment rollback settings override the group's settings. Successful
 revision history persists across restarts and is scoped to the account, Region
 and group ID. Automatic alarm and request-stop policy triggers remain unsupported.
 
-The host-agent APIs use the independent `codedeploy-commands` and
-`codedeploy-commands-secure` IAM namespaces. See the
+With IAM enforcement enabled, the default host-agent API authenticates signed
+instance-profile credentials and limits them to that instance's commands. It
+does not require an extra IAM policy. The optional `enable_auth_policy: true`
+agent mode uses the `codedeploy-commands-secure` IAM namespace. See the
 [agent runtime contract](../design/codedeploy-agent-runtime.md) for supported
 deployment policies, endpoint configuration, deadlines and qualification limits.
 

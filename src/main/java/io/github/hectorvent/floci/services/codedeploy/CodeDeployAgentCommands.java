@@ -139,6 +139,12 @@ public class CodeDeployAgentCommands {
         return Map.of("CommandStatus", command.status);
     }
 
+    public synchronized void authorizeHostCommand(String account, String region, String identifier, String host) {
+        if (!command(account, region, identifier).host.equals(host)) {
+            throw new AwsException("AccessDeniedException", "The command belongs to a different instance", 403);
+        }
+    }
+
     public synchronized Map<String, Object> specification(String account, String region,
                                                           String executionId, String host) {
         Session session = sessions.get(new DeploymentKey(account, region, executionId));

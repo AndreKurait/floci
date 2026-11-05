@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
@@ -29,6 +30,18 @@ class Ec2InstanceCredentialsTest {
     private static final Instant NOW = Instant.parse("2026-09-16T10:00:00Z");
 
     @Test
+    void serializedSessionStateCannotEstablishAnInstancesIdentity() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        SessionCredential restored = mapper.readValue("""
+                {"ec2InstanceId":"i-first","ec2RoleId":"AROA-first",
+                 "ec2InstanceArn":"arn:aws:ec2:us-east-1:123456789012:instance/i-first"}
+                """, SessionCredential.class);
+        assertNull(restored.getEc2InstanceArn());
+        restored.setEc2InstanceArn("arn:aws:ec2:us-east-1:123456789012:instance/i-first");
+        assertFalse(mapper.readTree(mapper.writeValueAsBytes(restored)).has("ec2InstanceArn"));
+    }
+
+    @Test
     void credentialsAreRegisteredStableAndRotateWithOverlap() {
         Fixture fixture = fixture();
         SessionCredential first = fixture.get(NOW);
@@ -36,6 +49,7 @@ class Ec2InstanceCredentialsTest {
         assertEquals(40, first.getSecretAccessKey().length());
         assertEquals(ACCOUNT, first.getOriginAccountId());
         assertEquals("i-first", first.getEc2InstanceId());
+        assertEquals("arn:aws:ec2:us-east-1:" + ACCOUNT + ":instance/i-first", first.getEc2InstanceArn());
         assertEquals(fixture.role.getRoleId(), first.getEc2RoleId());
         assertEquals(NOW.plusSeconds(3600), first.getExpiration());
         verify(fixture.iam).registerEc2InstanceSession(first);
