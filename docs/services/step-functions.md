@@ -647,6 +647,9 @@ They use the state-machine region and execution role, or an explicitly selected
 `Credentials.RoleArn`. With IAM enforcement enabled, the role's trust, any task-role
 assumption, and the service's normal IAM/resource checks apply. EC2 Query member
 names, SDK result arrays and scalar types come from pinned botocore models.
+Version and alias starts use the base state-machine ARN for the service trust's
+`aws:SourceArn` and `$$.StateMachine.Id`. The selected version still supplies the
+definition and execution role; version descriptions retain their qualified ARN.
 SSM parameter-map keys retain their spelling; modeled timestamps become ISO strings.
 The existing service implementations remain responsible for validation and effects.
 Failures use the service's modeled SDK exception classes, with `Ec2.Ec2Exception`
