@@ -208,6 +208,19 @@ association version pending while preserving any previously stored execution tim
 Association creation is not evidence that a document ran, inventory was collected or
 a target became compliant. The Run Command execution paths below are separate.
 
+CloudFormation `AWS::SSM::Association` creates that backing configuration and returns
+its ID through both `Ref` and `Fn::GetAtt AssociationId`. Document references, target
+conditions, parameters, schedules and rate controls are resolved from the template.
+Updates preserve the association ID, except a changed legacy `InstanceId` replaces
+the association. Failed updates restore the previous configuration; replacement
+retention and stack deletion operate on the owned association.
+
+`ApplyOnlyAtCronInterval`, `AssociationDispatchAssumeRole`, `AutomationTargetParameterName`,
+`CalendarNames`, `OutputLocation`, `ScheduleOffset`, `SyncCompliance`, `Tags` and
+`WaitForSuccessTimeoutSeconds` are not yet supported by this CloudFormation owner.
+Nonempty declarations fail before creating or changing an association. Omit the
+execution wait only when successful configuration creation is the intended contract.
+
 `UpdateAssociation.Name` selects the new document without changing the association ID.
 The requested document version is validated against that document before any stored
 fields change. Changing the document without a version selects its `$DEFAULT`, so a
