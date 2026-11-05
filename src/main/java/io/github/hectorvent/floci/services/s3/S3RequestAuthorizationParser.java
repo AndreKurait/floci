@@ -70,14 +70,16 @@ final class S3RequestAuthorizationParser {
         if (authorization != null && !authorization.isBlank()) {
             String accessKeyId = extractAuthorizationHeaderAccessKeyId(authorization);
             if (accessKeyId == null) {
-                // Only SigV4 is parsed; unsupported schemes are reported as malformed auth.
+                // Unsupported schemes are reported as malformed auth.
                 String message = "The authorization header is malformed; the credential scope is invalid.";
                 throw new AwsException("AuthorizationHeaderMalformed", message, 400);
             }
             String sessionToken = !isBlank(headerSessionToken)
                     ? headerSessionToken
                     : queryParameters.getFirst("X-Amz-Security-Token");
-            return new S3Service.RequestAuthorization(true, accessKeyId, sessionToken);
+            String trimmed = authorization.trim();
+            return new S3Service.RequestAuthorization(true, accessKeyId, sessionToken, null,
+                    trimmed.substring(0, trimmed.indexOf(' ')));
         }
 
         if (queryParameters.containsKey("X-Amz-Algorithm")) {
@@ -88,7 +90,8 @@ final class S3RequestAuthorizationParser {
                         AUTHORIZATION_QUERY_PARAMETERS_ERROR_STATUS);
             }
             return new S3Service.RequestAuthorization(
-                    true, accessKeyId, queryParameters.getFirst("X-Amz-Security-Token"));
+                    true, accessKeyId, queryParameters.getFirst("X-Amz-Security-Token"), null,
+                    queryParameters.getFirst("X-Amz-Algorithm"));
         }
 
         return S3Service.RequestAuthorization.unsigned();

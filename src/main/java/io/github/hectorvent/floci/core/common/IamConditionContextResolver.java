@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import io.github.hectorvent.floci.services.s3.S3ObjectKeys;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.S3SignatureConditions;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -394,6 +395,11 @@ public class IamConditionContextResolver {
                     ctx.getUriInfo().getQueryParameters());
         }
         Map<String, List<String>> conditions = s3ActionConditionContext(action, ctx);
+        Map<String, List<String>> signature = S3SignatureConditions.request(ctx.getHeaderString("Authorization"),
+                ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters());
+        if (!signature.isEmpty()) {
+            conditions = merge(conditions, signature);
+        }
         // A version action is checked only for a request naming a version, and carries its id.
         if (S3ObjectActions.isVersionAction(action) && ctx.getUriInfo() != null) {
             String versionId = ctx.getUriInfo().getQueryParameters().getFirst("versionId");

@@ -101,7 +101,7 @@ class IamSecureTransportIntegrationTest {
     }
 
     @Test
-    void bucketDenyUsesTlsInsteadOfForwardedHeaders() {
+    void bucketPolicyRequiresSigningAndTlsInsteadOfForwardedHeaders() {
         policy("""
                 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}
                 """);
@@ -112,8 +112,11 @@ class IamSecureTransportIntegrationTest {
                 owner.putBucketPolicy(request -> request.bucket(bucket).policy("""
                         {"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*",
                         "Action":"s3:*","Resource":["arn:aws:s3:::%s","arn:aws:s3:::%s/*"],
-                        "Condition":{"Bool":{"aws:SecureTransport":false}}}]}
-                        """.formatted(bucket, bucket)));
+                        "Condition":{"Bool":{"aws:SecureTransport":false}}},
+                        {"Effect":"Deny","Principal":"*","Action":"s3:*",
+                        "Resource":["arn:aws:s3:::%s","arn:aws:s3:::%s/*"],
+                        "Condition":{"StringNotEquals":{"s3:signatureversion":"AWS4-HMAC-SHA256"}}}]}
+                        """.formatted(bucket, bucket, bucket, bucket)));
                 https.putObject(request -> request.bucket(bucket).key("tls")
                         .overrideConfiguration(configuration -> configuration.putHeader("X-Forwarded-Proto", "http")),
                         RequestBody.fromString("tls-data"));
@@ -139,27 +142,21 @@ class IamSecureTransportIntegrationTest {
                 "Action":"ecr:DescribeRepositories","Resource":"*",
                 "Condition":{"Bool":{"aws:SecureTransport":true}}}]}
                 """);
-        String repository = user + "-repo";
-        try (EcrClient owner = ecr(root, true); EcrClient https = ecr(caller, true); EcrClient http = ecr(caller, false)) {
-            owner.createRepository(request -> request.repositoryName(repository));
-            try {
-                assertEquals(repository, https.describeRepositories(request -> request.repositoryNames(repository))
-                        .repositories().getFirst().repositoryName());
-                EcrException denied = assertThrows(EcrException.class,
-                        () -> http.describeRepositories(request -> request.repositoryNames(repository)
-                                .overrideConfiguration(configuration -> configuration.putHeader("X-Forwarded-Proto", "https"))));
-                assertEquals("AccessDeniedException", denied.awsErrorDetails().errorCode());
-            } finally {
-                owner.deleteRepository(request -> request.repositoryName(repository));
-            }
+        try (EcrClient https = ecr(caller, true); EcrClient http = ecr(caller, false)) {
+            assertTrue(https.describeRepositories().repositories().isEmpty());
+            EcrException denied = assertThrows(EcrException.class,
+                    () -> http.describeRepositories(request -> request
+                            .overrideConfiguration(configuration -> configuration.putHeader("X-Forwarded-Proto", "https"))));
+            assertEquals("AccessDeniedException", denied.awsErrorDetails().errorCode());
         }
     }
 
     @Test
-    void perObjectAuthorizationAlsoReceivesTheActualTransport() {
+    void perObjectAuthorizationReceivesSigningAndTheActualTransport() {
         policy("""
                 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*",
-                "Condition":{"Bool":{"aws:SecureTransport":true}}}]}
+                "Condition":{"Bool":{"aws:SecureTransport":true},
+                "StringEquals":{"s3:signatureversion":"AWS4-HMAC-SHA256"}}}]}
                 """);
         String bucket = user + "-bulk";
         try (S3Client owner = s3(root, true); S3Client https = s3(caller, true); S3Client http = s3(caller, false)) {

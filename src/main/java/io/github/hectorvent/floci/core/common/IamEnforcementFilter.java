@@ -1502,8 +1502,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * covered by its signed policy document and do not correspond to what {@code S3Controller}
      * actually applies to the uploaded object, so trusting one here would let an attacker satisfy a
      * tag-scoped grant condition with a header the object is never actually tagged with. Only the
-     * caller-identity {@code aws:PrincipalArn} and the server-derived global keys, including
-     * the connection's TLS state, are safe to add.
+     * caller-identity {@code aws:PrincipalArn}, explicit signing facts from the service and
+     * server-derived global keys, including the connection's TLS state, are safe to add.
      */
     public void authorizeAdditionalResource(
             String authorizationHeader,
@@ -1512,7 +1512,19 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             ResourcePolicyDecision resourcePolicyDecision,
             String resourceOwnerAccountId) {
         authorizeAdditionalResource(authorizationHeader, action, resource, resourcePolicyDecision,
-                resourceOwnerAccountId, null);
+                resourceOwnerAccountId, null, null);
+    }
+
+    /** Carries service-parsed authentication facts to a secondary resource's policy evaluation. */
+    public void authorizeAdditionalResource(
+            String authorizationHeader,
+            String action,
+            String resource,
+            ResourcePolicyDecision resourcePolicyDecision,
+            String resourceOwnerAccountId,
+            Map<String, List<String>> authenticationConditions) {
+        authorizeAdditionalResource(authorizationHeader, action, resource, resourcePolicyDecision,
+                resourceOwnerAccountId, authenticationConditions, null);
     }
 
     /**
@@ -1525,8 +1537,14 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * query credential names.
      */
     public void authorizePostObject(String authorizationHeader, String resource, String region) {
+        authorizePostObject(authorizationHeader, resource, region, null);
+    }
+
+    /** The form's own signing facts, without trusting unrelated outer HTTP headers. */
+    public void authorizePostObject(String authorizationHeader, String resource, String region,
+                                    Map<String, List<String>> authenticationConditions) {
         authorizeAdditionalResource(authorizationHeader, "s3:PutObject", resource, null, null,
-                new DeniedEvent("PostObject", region));
+                authenticationConditions, new DeniedEvent("PostObject", region));
     }
 
     /** A CloudTrail record to write when IAM refuses a request: its event name and its Region. */
@@ -1540,6 +1558,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String resource,
             ResourcePolicyDecision resourcePolicyDecision,
             String resourceOwnerAccountId,
+            Map<String, List<String>> authenticationConditions,
             DeniedEvent deniedEvent) {
         if (!config.services().iam().enforcementEnabled()) {
             return;
@@ -1606,13 +1625,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 caller = caller.withScpLevels(scpLevels);
             }
 
-            Map<String, List<String>> conditionContext = null;
+            Map<String, List<String>> conditionContext = new HashMap<>(
+                    authenticationConditions == null ? Map.of() : authenticationConditions);
             Optional<CallerArns> callerArns = accountRootPrincipal
                     ? Optional.of(accountRootArns(accountId))
                     : iamService.resolveCallerArns(akid);
             if (callerArns.isPresent()) {
                 caller = caller.withPrincipalArn(callerArns.get().callerArn());
-                conditionContext = new HashMap<>();
                 callerArns.get().putPrincipalKeys(conditionContext);
             }
 

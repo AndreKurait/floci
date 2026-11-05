@@ -142,20 +142,19 @@ public class S3Service implements Resettable, ResourceProvider {
     private final AtomicLong lastEventSequencer = new AtomicLong();
     private final AtomicLong dataGenerations = new AtomicLong();
 
-    record RequestAuthorization(boolean signed, String accessKeyId, String sessionToken, Boolean secureTransport) {
+    record RequestAuthorization(boolean signed, String accessKeyId, String sessionToken,
+                                Boolean secureTransport, String signatureVersion) {
         RequestAuthorization(boolean signed, String accessKeyId, String sessionToken) {
-            this(signed, accessKeyId, sessionToken, null);
+            this(signed, accessKeyId, sessionToken, null, null);
+        }
+
+        Map<String, List<String>> signatureConditions() {
+            return signed ? S3SignatureConditions.forAlgorithm(signatureVersion) : Map.of();
         }
 
         static RequestAuthorization unsigned() {
             return new RequestAuthorization(false, null, null);
         }
-    }
-
-    record SignedPrincipalResourcePolicyEvaluation(
-            ResourcePolicyDecision decision,
-            String resourceOwnerAccountId
-    ) {
     }
 
     private final StorageBackend<String, Bucket> bucketStore;
@@ -1679,6 +1678,9 @@ public class S3Service implements Resettable, ResourceProvider {
         if (authorization != null && authorization.secureTransport() != null) {
             context.put("aws:SecureTransport", List.of(authorization.secureTransport().toString()));
         }
+        if (authorization != null) {
+            context.putAll(authorization.signatureConditions());
+        }
         if (caller != null) {
             caller.putPrincipalKeys(context);
         }
@@ -1703,36 +1705,6 @@ public class S3Service implements Resettable, ResourceProvider {
     private static AwsException accessDeniedException(String bucketName, String key) {
         String resourcePath = key != null ? "/" + bucketName + "/" + key : "/" + bucketName;
         return new AwsException("AccessDenied", "Access Denied", 403, Map.of("Resource", resourcePath));
-    }
-
-    SignedPrincipalResourcePolicyEvaluation signedPrincipalResourcePolicyDecision(
-            String bucketName,
-            String action,
-            String resourceArn,
-            RequestAuthorization authorization) {
-        if (authorization == null || !authorization.signed()
-                || LEGACY_ACCESS_KEY_ID.equals(authorization.accessKeyId()) || iamService == null) {
-            return new SignedPrincipalResourcePolicyEvaluation(ResourcePolicyDecision.NEUTRAL, null);
-        }
-
-        Optional<CallerArns> caller = resolveCaller(authorization.accessKeyId());
-        if (caller.isEmpty()) {
-            return new SignedPrincipalResourcePolicyEvaluation(ResourcePolicyDecision.NEUTRAL, null);
-        }
-
-        AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName)
-                .orElseThrow(() -> new AwsException(
-                        "NoSuchBucket", "The specified bucket does not exist.", 404));
-        String policy = ownedBucket.value().getPolicy();
-        ResourcePolicyDecision decision = policy == null || policy.isBlank()
-                ? ResourcePolicyDecision.NEUTRAL
-                : policyEvaluator.evaluateResourcePolicyFor(
-                        List.of(policy),
-                        RequestPrincipal.caller(caller.get()),
-                        action,
-                        resourceArn,
-                        bucketPolicyContext(caller.get(), authorization, null));
-        return new SignedPrincipalResourcePolicyEvaluation(decision, ownedBucket.account());
     }
 
     private boolean readableObjectExists(String bucketName, String key) {
