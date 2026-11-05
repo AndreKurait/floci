@@ -737,6 +737,12 @@ re-registered `containerInstanceArn` all round-trip. The agent version is report
 `agentVersion`. An instance also reports `registeredAt` and a `version` counter that each state
 change increments.
 
+The emulator-specific `floci.iam-instance-profile` registration attribute names the
+EC2 instance profile used by the container instance's IMDS. It must be an IAM
+instance-profile ARN in the registering account and the request region's partition,
+with an empty ARN region. Registration validates that identity; IMDS checks that
+the profile exists in IAM when serving credentials.
+
 `DeregisterContainerInstance` leaves the instance in the cluster as `INACTIVE` rather than
 dropping it, so a later `DescribeContainerInstances` still answers for it, as on AWS. A cluster's
 `registeredContainerInstancesCount` counts only the `ACTIVE` and `DRAINING` instances.
