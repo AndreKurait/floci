@@ -455,6 +455,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             ctx.abortWith(accessDeniedForRequest(action, credentialScope, ctx));
             return;
         }
+        if ("codedeploy-commands".equals(credentialScope)) {
+            // The default agent handler binds verified IMDS credentials to the command's host.
+            // Only the optional codedeploy-commands-secure endpoint uses identity-policy grants.
+            return;
+        }
 
         // Service control policies from the caller's organization, when the Organizations
         // service is present and SCP enforcement is enabled. Resolved lazily via Instance

@@ -102,8 +102,10 @@ registration before the agent's final traffic hook. These operations use the
 deployment group's service-role permissions and owning account. Target-group
 traffic control and automatic rollback for S3 Server revisions remain unsupported.
 
-The host-agent APIs use the independent `codedeploy-commands` and
-`codedeploy-commands-secure` IAM namespaces. See the
+With IAM enforcement enabled, the default host-agent API authenticates signed
+instance-profile credentials and limits them to that instance's commands. It
+does not require an extra IAM policy. The optional `enable_auth_policy: true`
+agent mode uses the `codedeploy-commands-secure` IAM namespace. See the
 [agent runtime contract](../design/codedeploy-agent-runtime.md) for supported
 deployment policies, endpoint configuration, deadlines and qualification limits.
 
