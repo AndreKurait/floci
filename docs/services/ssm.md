@@ -103,10 +103,44 @@ Values remain strings. Invalid batches leave the previous inventory intact.
 The SSM storage setting controls persistence across restarts.
 
 This implements inventory upload and entry reads. Inventory collection scheduling,
-compliance item contexts, inventory aggregators, custom-schema deletion and S3 resource
-data sync are not implemented by these actions. AWS's full attribute-schema and
+compliance item contexts, inventory aggregators and custom-schema deletion are not
+implemented by these actions. AWS's full attribute-schema and
 daily byte-quota validation are not modeled. A successful upload does not prove a
 State Manager document executed.
+
+### Inventory resource data sync
+
+| Action | Description |
+|---|---|
+| `CreateResourceDataSync` | Configure asynchronous inventory export to S3 |
+| `ListResourceDataSync` | Page through configurations and their last attempt/success statuses |
+| `DeleteResourceDataSync` | Stop future exports while preserving existing S3 objects |
+
+`SyncToDestination` creates an inventory baseline and exports subsequent uploads.
+Each type is written as JSON lines at
+`<prefix>/<type>/accountid=<account>/region=<region>/resourcetype=ManagedInstanceInventory/<instance>.json`.
+Rows include `resourceId`, `captureTime` and `schemaVersion`. Empty inventory content
+overwrites that type's object with an empty body. Hash-only refreshes export the
+retained content with the new capture time.
+
+Configurations and acknowledged inventory revisions use the SSM storage mode.
+Failed writes retain their error and the prior successful-sync time; the worker
+retries after the destination or policy is repaired. Success is recorded only
+after all pending writes complete. There are five configurations per account and
+region. Deletion, reset and shutdown wait for in-flight exports to finish.
+
+With S3 auth or IAM enforcement enabled, delivery evaluates the SSM service
+principal against the bucket policy for `s3:GetBucketAcl` and `s3:PutObject`,
+including the source account, sync ARN, SigV4 signing version and
+`bucket-owner-full-control` ACL. Service-to-service network context is redacted;
+the worker does not inherit the caller's transport or source IP.
+Cross-account destinations require the existing S3 global bucket namespace.
+The destination must be in the same partition and must not use S3 Object Lock.
+
+The worker interval defaults to 1,000 ms and is configurable with
+`FLOCI_SERVICES_SSM_RESOURCE_DATA_SYNC_INTERVAL_MS`. Explorer `SyncFromSource`,
+Organizations data sharing and `AWSKMSKeyARN` are explicitly unsupported.
+Native agent collection and State Manager scheduling remain separate features.
 
 ### ec2messages Agent Protocol
 
