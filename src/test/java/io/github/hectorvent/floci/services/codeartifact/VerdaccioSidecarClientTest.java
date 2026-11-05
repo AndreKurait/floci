@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.codeartifact;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -199,6 +200,34 @@ class VerdaccioSidecarClientTest {
     }
 
     /**
+     * Found by hectorvent's review of the npm external-connection work: an unconditional {@code
+     * dist-tags.latest} in every write's own PUT body used to clobber a real local {@code latest}
+     * the moment any other version was copied or retained (confirmed live against the pinned
+     * image: Verdaccio preserves an existing package's own {@code dist-tags.latest} when a write
+     * omits the field, see {@code VerdaccioSidecarClient#storeVersion}'s own javadoc). This reads
+     * the exact body this client sends, not just the end-to-end result, so a future caller that
+     * reintroduces a hardcoded {@code dist-tags.latest} fails here directly rather than only ever
+     * showing up as a flaky-looking order-dependent symptom in a live test.
+     */
+    @Test
+    void storePackageVersionAssetSendsNoDistTagsOfItsOwn() throws Exception {
+        VerdaccioSidecarManager manager = manager();
+        seedPooledContainer(manager, "npm-repo-1", "tracked-verdaccio-1", backendUrl);
+        AtomicReference<String> observedBody = new AtomicReference<>();
+        backend.createContext("/demo-pkg", exchange -> {
+            observedBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            exchange.sendResponseHeaders(201, -1);
+            exchange.close();
+        });
+
+        client(manager).storePackageVersionAsset("npm-repo-1", "dom", "repo", null, "demo-pkg", "1.0.0",
+                "demo-pkg-1.0.0.tgz", "tarball bytes".getBytes(StandardCharsets.UTF_8));
+
+        JsonNode sentBody = new ObjectMapper().readTree(observedBody.get());
+        assertTrue(sentBody.path("dist-tags").isMissingNode(), "must not send its own dist-tags: " + observedBody.get());
+    }
+
+    /**
      * Mirrors the real npm unpublish mechanism, confirmed against a live Verdaccio container: GET
      * the packument for its {@code _rev}, then {@code DELETE} the package path with that revision
      * appended as {@code /-rev/<rev>}.
@@ -273,6 +302,38 @@ class VerdaccioSidecarClientTest {
                 "dom", "repo");
 
         assertTrue(packages.isEmpty());
+    }
+
+    /**
+     * Raised by Greptile's review: a real npm {@code dist.tarball} filename is not required to
+     * embed its version at all, so resolving a download's archived-status check by guessing a
+     * {@code <packageName>-<version>.tgz} shape out of the filename's own text can both miss a
+     * real tarball named something else entirely and misread an unrelated version out of one
+     * that happens to coincidentally fit that shape. This resolves against the packument's own
+     * {@code dist.tarball} instead, confirmed here with a tarball named nothing like its version.
+     */
+    @Test
+    void versionForTarballFilenameResolvesAFilenameThatDoesNotEmbedItsVersion() throws Exception {
+        VerdaccioSidecarManager manager = manager();
+        seedPooledContainer(manager, "npm-repo-1", "tracked-verdaccio-1", backendUrl);
+        respondWithMetadata("/demo-pkg", "1.0.0", "/demo-pkg/-/bundle.tgz");
+
+        Optional<String> version = client(manager).versionForTarballFilename("npm-repo-1", "dom", "repo", null,
+                "demo-pkg", "bundle.tgz");
+
+        assertEquals(Optional.of("1.0.0"), version);
+    }
+
+    @Test
+    void versionForTarballFilenameIsEmptyWhenNoVersionsTarballMatches() throws Exception {
+        VerdaccioSidecarManager manager = manager();
+        seedPooledContainer(manager, "npm-repo-1", "tracked-verdaccio-1", backendUrl);
+        respondWithMetadata("/demo-pkg", "1.0.0", "/demo-pkg/-/demo-pkg-1.0.0.tgz");
+
+        Optional<String> version = client(manager).versionForTarballFilename("npm-repo-1", "dom", "repo", null,
+                "demo-pkg", "never-published.tgz");
+
+        assertEquals(Optional.empty(), version);
     }
 
     private VerdaccioSidecarManager manager() {

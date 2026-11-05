@@ -30,9 +30,9 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 | `TagLogGroup` | Tag a log group |
 | `UntagLogGroup` | Remove tags |
 | `ListTagsLogGroup` | List tags |
-| `TagResource` | Tag a log group by ARN |
-| `UntagResource` | Remove tags from a log group by ARN |
-| `ListTagsForResource` | List tags for a log group ARN |
+| `TagResource` | Tag a log group, delivery source, delivery destination or delivery by ARN |
+| `UntagResource` | Remove tags from a log group, delivery source, delivery destination or delivery by ARN |
+| `ListTagsForResource` | List tags for a log group, delivery source, delivery destination or delivery ARN |
 | `PutSubscriptionFilter` | Create or update a subscription filter (see [Subscription filters](#subscription-filters)) |
 | `DescribeSubscriptionFilters` | List subscription filters on a log group |
 | `DeleteSubscriptionFilter` | Delete a subscription filter |
@@ -50,6 +50,19 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 | `StartQuery` | Start a Logs Insights query (see [Logs Insights](#logs-insights)) |
 | `GetQueryResults` | Get the status and results of a Logs Insights query |
 | `StopQuery` | Stop a query that has not completed yet |
+| `PutDeliverySource` | Create or replace a vended-log delivery source (see [Vended log delivery](#vended-log-delivery)) |
+| `GetDeliverySource` | Return a delivery source |
+| `DeleteDeliverySource` | Delete a delivery source no delivery uses |
+| `DescribeDeliverySources` | List delivery sources, optionally only those for given resource ARNs |
+| `PutDeliveryDestination` | Create or replace a delivery destination: a log group, S3 bucket, Firehose stream or X-Ray |
+| `GetDeliveryDestination` | Return a delivery destination |
+| `DeleteDeliveryDestination` | Delete a delivery destination no delivery uses |
+| `DescribeDeliveryDestinations` | List delivery destinations, optionally only those with given names |
+| `CreateDelivery` | Pair a delivery source with a delivery destination |
+| `GetDelivery` | Return a delivery, with its record fields and S3 configuration |
+| `UpdateDeliveryConfiguration` | Change a delivery's record fields, delimiter or S3 configuration |
+| `DeleteDelivery` | Delete a delivery |
+| `DescribeDeliveries` | List deliveries, optionally only those from given delivery sources |
 
 `DescribeLogGroups` returns names in ASCII order, with up to 50 groups per page by default.
 Set `limit` to an integer from 1 to 50 and pass the returned `nextToken` with the same region
@@ -76,6 +89,42 @@ metric filters and subscription filters use: terms, quoted phrases, `?` alternat
 exclusions, JSON and space-delimited patterns. An invalid pattern is refused with
 `InvalidParameterException`, and so is a request that names no log group by `logGroupName` or
 `logGroupIdentifier`.
+
+### Vended log delivery {#vended-log-delivery}
+
+Delivery sources, delivery destinations and the deliveries that pair them, which Terraform's
+`aws_cloudwatch_log_delivery_source`, `aws_cloudwatch_log_delivery_destination` and
+`aws_cloudwatch_log_delivery` manage, for example for an EventBridge bus's logs. Floci stores the
+configuration and does not deliver the source's logs.
+
+- `PutDeliverySource` and `PutDeliveryDestination` create the resource or replace every parameter
+  of an existing one. A source reports the service of its resource's ARN (`events` for an event
+  bus) and the `logType` it was given.
+- A destination's `deliveryDestinationType` follows from its resource's ARN: `CWL` for a log group,
+  `S3` for a bucket, `FH` for a Firehose stream. Only an X-Ray destination, which has no resource,
+  names its type.
+- `CreateDelivery` needs an existing source and destination, and one delivery per pair; a second is
+  `ConflictException`. Its id is 16 letters and digits. For an EventBridge event bus source,
+  `recordFields` defaults to the bus's ten template fields and `s3DeliveryConfiguration` to the
+  `{region}/{yyyy}/{MM}/{dd}/{HH}/` suffix path, as AWS reports them. `GetDelivery` returns those;
+  `DescribeDeliveries` leaves them out, as AWS does.
+- A source or destination a delivery uses cannot be deleted (`ConflictException`).
+- Tags are set on create and through `TagResource`, `UntagResource` and `ListTagsForResource` on the
+  resource's ARN; the Get and Describe responses carry none, as on AWS.
+- `DescribeDeliverySources` narrows to `resourceArns`, `DescribeDeliveryDestinations` to `names` and
+  `DescribeDeliveries` to `deliverySourceNames`; a name that matches nothing is left out, not an error.
+- Requests are checked against the Logs API model's lengths, patterns, enums and required members,
+  with AWS's `ValidationException` wording, for example "1 validation error detected: Value at
+  'limit' failed to satisfy constraint: Member must have value less than or equal to 50".
+- An unknown name or id is `ResourceNotFoundException`, "Requested Delivery Source does not exist in
+  this account." (likewise for a Delivery Destination and a Delivery).
+- With IAM enforcement on, each action is authorized on the resources the AWS Service Authorization
+  Reference lists for it: the source, destination or delivery it names, and for `CreateDelivery` the
+  source, the destination and the new delivery; `DeleteDeliverySource` on the source it deletes. The
+  Describe actions are authorized on `*`, as the reference lists no resource for them.
+
+Not modelled: delivery destination policies (`PutDeliveryDestinationPolicy` and its siblings), and
+record field defaults for sources other than an EventBridge event bus.
 
 ### Subscription filters {#subscription-filters}
 
@@ -369,6 +418,15 @@ legacy `2009-05-15` API, which supports only `ListMetrics` and `GetMetricStatist
 An invalid version or action returns HTTP 404 `InvalidAction`; an absent action returns
 HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
 
+JSON `PutMetricData` accepts a gzip-compressed body (`Content-Encoding: gzip`), which the AWS
+CLI, boto3 and the other SDKs that call CloudWatch over JSON send by default for any body of
+10 KiB or more. With signature validation and IAM enforcement on, the signature is checked over
+the compressed bytes as sent and IAM decides the request before the body is decompressed. As on
+the CBOR protocol, the decompressed body is limited to 10 MiB: a larger one returns HTTP 413
+`PayloadTooLargeException`, a body that cannot be decompressed returns HTTP 400
+`InvalidRequestException`, and an empty body reads as no input. Other JSON operations do not
+decompress their body.
+
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
 JSON 1.0 requests name their operation in `X-Amz-Target` with the `GraniteServiceVersion20100801.`
@@ -432,14 +490,48 @@ rejected with `ValidationError`.
 
 ### Metric alarm updates
 
-Updating a metric alarm preserves its current state, state reason, state timestamp and tags.
+Updating a metric alarm preserves its current state, state reason, state timestamps and tags.
 Tags supplied to `PutMetricAlarm` apply only when creating an alarm; use `TagResource` and
 `UntagResource` to change existing tags. `SetAlarmState` requires `StateReason` and rejects
 missing or unknown state values before changing the alarm.
 
+`StateTransitionedTimestamp` records when an alarm's `StateValue` last changed, while
+`StateUpdatedTimestamp` moves on every state update, including one that keeps the value.
+Alarms stored before Floci recorded it report their last state update.
+
 `SetAlarmState` enforces the modeled maximum lengths of 1023 characters for
 `StateReason` and 4000 characters for `StateReasonData` before changing alarm state.
 Length checks count Unicode code points and preserve empty and whitespace values.
+
+### Composite alarm evaluation
+
+A composite alarm is evaluated when it is created, when `PutCompositeAlarm` updates it, and when
+one of its children changes state, up through nested composite alarms. `PutMetricAlarm` on an
+existing child, or a `SetAlarmState` to the state a child already has, is not a change of state,
+so a composite alarm set with `SetAlarmState` keeps that state until a child really changes. An
+update that leaves the state unchanged also keeps the state reason, reason data and timestamps.
+A composite alarm on a cycle of rules is not evaluated, not even by the update that closes the
+cycle, where CloudWatch evaluates that alarm and the ones after it. One above a cycle is still
+evaluated when one of its children changes state. A change of state records the `StateReason`
+CloudWatch writes:
+
+- `<alarm ARN> was created and its alarm rule evaluates to OK` when the alarm is created,
+- `<alarm ARN> was updated and its new alarm rule evaluates to ALARM` when an update changes it,
+- `<child ARN> transitioned to ALARM at Monday 14 September, 2026 06:29:58 UTC` when a child does.
+
+`StateReasonData` lists under `triggeringAlarms` the children whose state agrees with the new one,
+the most recently changed first, each with its state and when it took it. After a child's change
+it lists only the children that changed state since the composite alarm last did. The list stops
+before the 4000 characters `StateReasonData` can hold, counted in Unicode code points like the
+length checks. Floci keeps state times to the second, so the timestamps end in `.000`.
+
+Every alarm a rule names must exist, or `PutCompositeAlarm` fails with `ValidationError` and
+`Could not save the composite alarm as alarms [<ARN>] in the alarm rule do not exist`.
+`DeleteAlarms` deletes nothing when it names more than one composite alarm
+(`Cannot delete [2] Composite Alarms as only one composite alarm delete is allowed in single request`)
+or an alarm that a composite alarm's rule names, even when it deletes that composite alarm too
+(`Cannot delete <name> as there are composite alarm(s) depending on it.`), so delete composite
+alarms before their children. Names that match no alarm are ignored.
 
 ### SNS alarm actions
 
@@ -460,6 +552,21 @@ metric does not retain the previous definition.
 
 This is management-plane support: the alarm evaluator currently evaluates only single-metric
 alarms, not metric-math expressions. `SetAlarmState` remains available for manual transitions.
+
+### DescribeAlarms filters {#describealarms-filters}
+
+`DescribeAlarms` applies every filter a request gives: `AlarmNames` or `AlarmNamePrefix`,
+`AlarmTypes`, `StateValue` and `ActionPrefix`. `StateValue` and `ActionPrefix` narrow metric and
+composite alarms alike. The API reference calls `ActionPrefix` a prefix for any action, so an alarm
+matches when one of its `AlarmActions`, `OKActions` or `InsufficientDataActions` starts with it.
+
+`ChildrenOfAlarmName` lists the metric and composite alarms a composite alarm's rule names, by name
+or ARN, with only their name, ARN, `StateValue` and `StateUpdatedTimestamp`. `ParentsOfAlarmName`
+lists the composite alarms whose rules name an alarm, with only their name and ARN. Neither lists
+the alarm it names. Either one with any other member except `MaxRecords` and `NextToken` is refused
+with `ValidationError`, as is a `StateValue` outside `OK`, `ALARM` and `INSUFFICIENT_DATA`, an
+empty or over-long `ActionPrefix`, and an empty or over-long alarm name in either member.
+`MaxRecords` and `NextToken` are accepted, but every match comes back in one response.
 
 ### Alarm history {#alarm-history}
 

@@ -27,6 +27,7 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -37,6 +38,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPOutputStream;
+
+import static io.github.hectorvent.floci.services.ec2.Ec2Ids.randomHex;
 
 /**
  * Manages VPC Flow Logs (a floci addition — absent upstream) and a background
@@ -155,12 +158,23 @@ public class FlowLogService {
                                  String trafficType, String logDestinationType,
                                  String logDestination, String deliverLogsPermissionArn,
                                  String logFormat, int maxAggregationInterval) {
+        return createFlowLog(region, resourceId, resourceType, trafficType, logDestinationType,
+                logDestination, null, deliverLogsPermissionArn, logFormat, maxAggregationInterval);
+    }
+
+    public FlowLog createFlowLog(String region, String resourceId, String resourceType,
+                                 String trafficType, String logDestinationType,
+                                 String logDestination, String logGroupName,
+                                 String deliverLogsPermissionArn,
+                                 String logFormat, int maxAggregationInterval) {
+        String groupName = logGroupName != null ? logGroupName : logGroupFromArn(logDestination);
         FlowLog fl = new FlowLog();
         fl.setFlowLogId("fl-" + randomHex(17));
         fl.setResourceId(resourceId);
         fl.setResourceType(resourceType != null ? resourceType : "VPC");
         fl.setTrafficType(trafficType != null ? trafficType : "ALL");
-        fl.setLogDestinationType(logDestinationType != null ? logDestinationType : "s3");
+        fl.setLogDestinationType(effectiveLogDestinationType(logDestinationType, logDestination, logGroupName));
+        fl.setLogGroupName(groupName);
         fl.setLogDestination(logDestination);
         fl.setDeliverLogsPermissionArn(deliverLogsPermissionArn);
         fl.setBucketName(bucketFromArn(logDestination));
@@ -269,7 +283,7 @@ public class FlowLogService {
         // endpoint — which is how traffic to an AWS service over PrivateLink shows
         // up in flow logs. The endpoint's service is recorded in pkt-dst-aws-service.
         List<String> endpointIps = new ArrayList<>();
-        Map<String, String> endpointService = new java.util.HashMap<>(); // ip -> service short name (e.g. S3)
+        Map<String, String> endpointService = new HashMap<>(); // ip -> service short name (e.g. S3)
         String resourceVpc = vpcOfFlowLogResource(fl);
         for (NetworkInterface ni : ec2Service.endpointNetworkInterfaces(fl.getRegion())) {
             if (ni.getPrivateIpAddress() == null || ni.getPrivateIpAddress().isBlank()) {
@@ -568,6 +582,34 @@ public class FlowLogService {
         }
     }
 
+    /**
+     * The LogDestinationType a flow log gets: the requested one, else cloud-watch-logs when a log
+     * group is named directly or by a CloudWatch Logs ARN, else s3. CloudFormation compares an
+     * update against this, so create and compare cannot drift apart.
+     */
+    public static String effectiveLogDestinationType(String logDestinationType, String logDestination,
+                                                     String logGroupName) {
+        if (logDestinationType != null && !logDestinationType.isBlank()) {
+            return logDestinationType;
+        }
+        return logGroupName != null || logGroupFromArn(logDestination) != null ? "cloud-watch-logs" : "s3";
+    }
+
+    /**
+     * The group named by a CloudWatch Logs ARN ({@code arn:aws:logs:r:a:log-group:name[:*]}), or
+     * null for anything else. Only a {@code logs} ARN counts: an S3 prefix may itself contain
+     * {@code :log-group:}.
+     */
+    static String logGroupFromArn(String arn) {
+        String resource = AwsArnUtils.resourceIfArnFor(arn, "logs").orElse("");
+        if (!resource.startsWith("log-group:")) {
+            return null;
+        }
+        String name = resource.substring("log-group:".length());
+        name = name.endsWith(":*") ? name.substring(0, name.length() - 2) : name;
+        return name.isBlank() ? null : name;
+    }
+
     static String bucketFromArn(String arn) {
         if (arn == null) {
             return null;
@@ -607,16 +649,6 @@ public class FlowLogService {
 
     private static String nz(String s) {
         return (s == null || s.isEmpty()) ? "-" : s;
-    }
-
-    private static String randomHex(int len) {
-        String chars = "0123456789abcdef";
-        StringBuilder sb = new StringBuilder(len);
-        ThreadLocalRandom r = ThreadLocalRandom.current();
-        for (int i = 0; i < len; i++) {
-            sb.append(chars.charAt(r.nextInt(chars.length())));
-        }
-        return sb.toString();
     }
 
     /** Lightweight holder for the ENI fields a flow record needs. */

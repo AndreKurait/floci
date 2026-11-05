@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.redshift.proxy;
 
+import io.github.hectorvent.floci.core.common.ListenBacklog;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.rds.proxy.PasswordValidator;
 import io.github.hectorvent.floci.services.rds.proxy.PostgresProtocolHandler;
@@ -39,6 +40,7 @@ public class RedshiftAuthProxy {
     private final RdsProxyTlsCertificates tlsCertificates;
     private final PasswordValidator passwordValidator;
     private final S3Service s3Service;
+    private final RedshiftParquetWriter parquetWriter;
     private final IamService iamService;
     private final SpectrumInterceptor spectrumInterceptor;
     private final RedshiftAuditLogPublisher auditLogPublisher;
@@ -52,6 +54,7 @@ public class RedshiftAuthProxy {
     }
     private final int handshakeTimeoutMillis;
     private final int backendConnectTimeoutMillis;
+    private final int maxConnections;
     private final Semaphore connectionPermits;
 
     private volatile boolean running;
@@ -95,7 +98,7 @@ public class RedshiftAuthProxy {
                              int maxConnections, SpectrumInterceptor spectrumInterceptor) {
         this(clusterKey, backendHost, backendPort, masterUsername, masterPassword, dbName, sigV4,
                 tlsCertificates, passwordValidator, s3Service, iamService, clusterAccountId, iamRoleArns,
-                handshakeTimeoutMillis, backendConnectTimeoutMillis, maxConnections, spectrumInterceptor, null);
+                handshakeTimeoutMillis, backendConnectTimeoutMillis, maxConnections, spectrumInterceptor, null, null);
     }
 
     public RedshiftAuthProxy(String clusterKey, String backendHost, int backendPort,
@@ -107,7 +110,7 @@ public class RedshiftAuthProxy {
                              List<String> iamRoleArns,
                              int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
                              int maxConnections, SpectrumInterceptor spectrumInterceptor,
-                             RedshiftAuditLogPublisher auditLogPublisher) {
+                             RedshiftAuditLogPublisher auditLogPublisher, RedshiftParquetWriter parquetWriter) {
         this.clusterKey = clusterKey;
         this.backendHost = backendHost;
         this.backendPort = backendPort;
@@ -118,6 +121,7 @@ public class RedshiftAuthProxy {
         this.tlsCertificates = tlsCertificates;
         this.passwordValidator = passwordValidator;
         this.s3Service = s3Service;
+        this.parquetWriter = parquetWriter;
         this.iamService = iamService;
         this.spectrumInterceptor = spectrumInterceptor;
         this.auditLogPublisher = auditLogPublisher;
@@ -125,7 +129,13 @@ public class RedshiftAuthProxy {
         this.roleConfiguration = new RoleConfiguration(iamRoleArns, null);
         this.handshakeTimeoutMillis = handshakeTimeoutMillis;
         this.backendConnectTimeoutMillis = backendConnectTimeoutMillis;
-        this.connectionPermits = new Semaphore(Math.max(1, maxConnections));
+        this.maxConnections = Math.max(1, maxConnections);
+        this.connectionPermits = new Semaphore(this.maxConnections);
+    }
+
+    /** Client connections currently open on this proxy: each holds one permit from accept to close. */
+    public int activeConnections() {
+        return maxConnections - connectionPermits.availablePermits();
     }
 
     public void start(int proxyPort) throws IOException {
@@ -147,17 +157,10 @@ public class RedshiftAuthProxy {
     private ServerSocket bindListener(int proxyPort) throws IOException {
         BindException lastFailure = null;
         for (int attempt = 0; attempt < 40; attempt++) {
-            ServerSocket socket = new ServerSocket();
             try {
-                socket.setReuseAddress(true);
-                socket.bind(new InetSocketAddress(proxyPort));
-                return socket;
+                return listenSocket(proxyPort, ListenBacklog.ACCEPT);
             } catch (BindException e) {
-                closeQuietly(socket);
                 lastFailure = e;
-            } catch (IOException e) {
-                closeQuietly(socket);
-                throw e;
             }
             try {
                 Thread.sleep(25);
@@ -167,6 +170,14 @@ public class RedshiftAuthProxy {
             }
         }
         throw lastFailure;
+    }
+
+    /**
+     * Binds one listener attempt. A seam so a test can pin the accept backlog: a bound
+     * {@code ServerSocket} does not report the backlog it was created with.
+     */
+    ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
+        return ListenBacklog.acceptSocket(proxyPort, backlog);
     }
 
     private static void closeQuietly(ServerSocket s) {
@@ -267,7 +278,7 @@ public class RedshiftAuthProxy {
                 RoleConfiguration roles = roleConfiguration;
                 new RedshiftInterceptingBridge(session.client(), session.backend(), s3Service, iamService,
                         clusterAccountId, roles.iamRoleArns(), spectrumInterceptor, clusterKey, login.database,
-                        roles.defaultIamRoleArn(), auditLogPublisher, login.username).run();
+                        roles.defaultIamRoleArn(), auditLogPublisher, login.username, parquetWriter).run();
                 publishConnection(client, login, "disconnection");
             } else {
                 publishConnection(client, login, login.backendUnavailable ? "connection_error" : "authentication failure");

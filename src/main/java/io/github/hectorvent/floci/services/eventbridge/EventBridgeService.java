@@ -53,12 +53,14 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
@@ -82,6 +84,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     private final TargetDispatcher dispatcher;
     private final ResourceGroupsTaggingService resourceGroupsTaggingService;
     private final ReplayDispatcher replayDispatcher;
+    private final AppSyncTargetValidator appSyncTargetValidator;
 
     @Inject
     public EventBridgeService(StorageFactory storageFactory,
@@ -91,7 +94,8 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                               RuleScheduler ruleScheduler,
                               TargetDispatcher dispatcher,
                               ReplayDispatcher replayDispatcher,
-                              ResourceGroupsTaggingService resourceGroupsTaggingService) {
+                              ResourceGroupsTaggingService resourceGroupsTaggingService,
+                              AppSyncTargetValidator appSyncTargetValidator) {
         this(
                 storageFactory.create("eventbridge", "eventbridge-buses.json",
                         new TypeReference<Map<String, EventBus>>() {}),
@@ -110,7 +114,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                 storageFactory.create("eventbridge", "eventbridge-api-destinations.json",
                         new TypeReference<Map<String, ApiDestination>>() {}),
                 regionResolver, objectMapper, ruleScheduler, dispatcher, replayDispatcher,
-                resourceGroupsTaggingService
+                resourceGroupsTaggingService, appSyncTargetValidator
         );
     }
 
@@ -127,7 +131,8 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                        RuleScheduler ruleScheduler,
                        TargetDispatcher dispatcher,
                        ReplayDispatcher replayDispatcher,
-                       ResourceGroupsTaggingService resourceGroupsTaggingService) {
+                       ResourceGroupsTaggingService resourceGroupsTaggingService,
+                       AppSyncTargetValidator appSyncTargetValidator) {
         this.busStore = busStore;
         this.ruleStore = ruleStore;
         this.targetStore = targetStore;
@@ -142,6 +147,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         this.dispatcher = dispatcher;
         this.replayDispatcher = replayDispatcher;
         this.resourceGroupsTaggingService = resourceGroupsTaggingService;
+        this.appSyncTargetValidator = appSyncTargetValidator;
     }
 
     @PostConstruct
@@ -173,6 +179,17 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
 
     public EventBus createEventBus(String name, String description,
                                    Map<String, String> tags, String region) {
+        return createEventBus(name, description, null, null, null, tags, region);
+    }
+
+    /**
+     * Creates a custom bus with the KMS key, dead-letter queue and log configuration the request
+     * gives, as {@code CreateEventBus} takes them; a null member leaves the bus without it. The
+     * dead-letter and log configurations are stored as their JSON, as {@link #updateEventBus} does.
+     */
+    public EventBus createEventBus(String name, String description, String kmsKeyIdentifier,
+                                   String deadLetterConfig, String logConfig,
+                                   Map<String, String> tags, String region) {
         validateCustomEventBusName(name);
         validateEventBusDescription(description);
         String key = busKey(region, name);
@@ -186,6 +203,15 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                 description,
                 Instant.now()
         );
+        if (kmsKeyIdentifier != null && !kmsKeyIdentifier.isBlank()) {
+            bus.setKmsKeyIdentifier(kmsKeyIdentifier);
+        }
+        if (deadLetterConfig != null && !deadLetterConfig.isBlank()) {
+            bus.setDeadLetterConfig(deadLetterConfig);
+        }
+        if (logConfig != null && !logConfig.isBlank()) {
+            bus.setLogConfig(logConfig);
+        }
         if (tags != null) {
             bus.getTags().putAll(tags);
             resourceGroupsTaggingService.tagResources(List.of(bus.getArn()), tags, region);
@@ -466,6 +492,20 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
 
     public int putTargets(String ruleName, String busName, List<Target> newTargets, String region) {
         validateTargetSettings(newTargets);
+        newTargets.forEach(appSyncTargetValidator::validate);
+        return upsertTargets(ruleName, busName, newTargets, region);
+    }
+
+    /**
+     * Internal rollback path for previously accepted targets. Local shape checks still apply,
+     * but restoring a snapshot must not depend on the GraphQL sidecar being available.
+     */
+    public int restoreAcceptedTargets(String ruleName, String busName, List<Target> targets, String region) {
+        validateTargetSettings(targets);
+        return upsertTargets(ruleName, busName, targets, region);
+    }
+
+    private int upsertTargets(String ruleName, String busName, List<Target> newTargets, String region) {
         String effectiveBus = resolvedBusName(busName);
         String key = ruleKey(region, effectiveBus, ruleName);
         Rule rule = ruleStore.get(key)
@@ -505,6 +545,15 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     private static void validateTargetSettings(List<Target> targets) {
         for (int i = 0; i < targets.size(); i++) {
             Target target = targets.get(i);
+            String operation = target.getAppSyncParameters() == null
+                    ? null : target.getAppSyncParameters().graphQLOperation();
+            if (operation != null) {
+                String violation = SmithyValidationErrors.Violations.WITHOUT_VALUES.lengthOutOfRange(
+                        "targets." + (i + 1) + ".member.appSyncParameters.graphQLOperation", operation, 1, 1048576);
+                if (violation != null) {
+                    throw SmithyValidationErrors.validationException(violation);
+                }
+            }
             Integer attempts = target.getRetryPolicy() != null ? target.getRetryPolicy().maximumRetryAttempts() : null;
             Integer age = target.getRetryPolicy() != null ? target.getRetryPolicy().maximumEventAgeInSeconds() : null;
             String arn = target.getDeadLetterConfig() != null ? target.getDeadLetterConfig().arn() : null;
@@ -914,6 +963,25 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
      *                  {@code null} whenever the target is in the caller's own account.
      */
     public PutEventsResult putEvents(List<Map<String, Object>> entries, String region, String accountId) {
+        return putEvents(entries, region, accountId, false);
+    }
+
+    /**
+     * Publishes the entries of a {@code PutEvents} request. As {@link #putEvents(List, String)}, except that
+     * an entry for an event bus that does not exist is answered as published, with an event id and not
+     * counted as failed, and goes no further, as the EventBridge User Guide gives it: "If you use PutEvents
+     * to publish an event to an event bus that does not exist, EventBridge event matching will not find a
+     * corresponding rule and will drop the event. Although EventBridge will send a 200 response, it will not
+     * fail the request or include the event in the FailedEntryCount value of the request response." Floci's
+     * own deliveries to a bus, for a rule, a pipe or a schedule, go through {@link #putEvents} and still fail
+     * such an entry: the guide's sentence is about the action, and no document says how AWS answers them.
+     */
+    public PutEventsResult putEventsFromRequest(List<Map<String, Object>> entries, String region) {
+        return putEvents(entries, region, null, true);
+    }
+
+    private PutEventsResult putEvents(List<Map<String, Object>> entries, String region, String accountId,
+                                      boolean dropForMissingBus) {
         int failed = 0;
         List<Map<String, String>> resultEntries = new ArrayList<>();
 
@@ -967,6 +1035,12 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             if ("default".equals(effectiveBus)) {
                 getOrCreateDefaultBus(region);
             } else if (accountGet(busStore, accountId, busStoreKey).isEmpty()) {
+                if (dropForMissingBus) {
+                    LOG.infov("PutEvents dropped an event for event bus {0}, which does not exist in {1}",
+                            effectiveBus, region);
+                    resultEntries.add(Map.of("EventId", UUID.randomUUID().toString()));
+                    continue;
+                }
                 failed++;
                 Map<String, String> errorEntry = new HashMap<>();
                 errorEntry.put("ErrorCode", "InvalidArgument");
@@ -1149,9 +1223,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             }
             JsonNode resourcesPattern = pattern.get("resources");
             if (resourcesPattern != null && resourcesPattern.isArray()) {
-                var resources = ((ArrayNode) event.get("Resources")).elements();
+                Iterator<JsonNode> resources = ((ArrayNode) event.get("Resources")).elements();
                 while (resources.hasNext()) {
-                    var resource = resources.next().asText(null);
+                    String resource = resources.next().asText(null);
                     if (matchesArrayField(resourcesPattern, resource)) {
                         return true;
                     }
@@ -1179,9 +1253,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                 return false;
             }
         }
-        var fields = pattern.fields();
+        Iterator<Map.Entry<String, JsonNode>> fields = pattern.fields();
         while (fields.hasNext()) {
-            var field = fields.next();
+            Map.Entry<String, JsonNode> field = fields.next();
             if ("$or".equals(field.getKey())) {
                 continue;
             }
@@ -1479,7 +1553,8 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                     "Parameter EventSourceArn is not valid. Reason: Creating cross-region archive is not permitted.",
                     400);
         }
-        String busName = eventSourceArn.substring(eventSourceArn.indexOf('/') + 1);
+        String busName = source != null && source.resource().startsWith("event-bus/")
+                ? source.resource().substring("event-bus/".length()) : eventSourceArn;
         EventBus bus = "default".equals(busName)
                 ? getOrCreateDefaultBus(region)
                 : busStore.get(busKey(region, busName)).orElse(null);
@@ -1597,11 +1672,15 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     /**
-     * The ARN of the caller's connection or API destination of the name in the Region, which follows the name with
-     * the id it was minted with, as its handlers look it up.
+     * The ARN of the caller's connection or API destination of the one name in the Region, which follows the name
+     * with the id it was minted with, as its handlers look it up.
      */
     @Override
-    public Optional<String> find(String type, String name, String region) {
+    public Optional<String> find(String type, List<String> names, String region) {
+        if (names.size() != 1) {
+            return Optional.empty();
+        }
+        String name = names.getFirst();
         return switch (type) {
             case "connection" -> connectionStore.get(connectionKey(region, name)).map(Connection::getConnectionArn);
             case "api-destination" -> apiDestinationStore.get(apiDestinationKey(region, name)).map(ApiDestination::getArn);
@@ -2140,9 +2219,13 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     private static String archiveNameFromArn(String arn) {
-        if (arn == null) return null;
-        int idx = arn.lastIndexOf("archive/");
-        return idx >= 0 ? arn.substring(idx + "archive/".length()) : arn;
+        if (arn == null) {
+            return null;
+        }
+        return AwsArnUtils.resourceIfArnFor(arn, "events")
+                .filter(resource -> resource.startsWith("archive/"))
+                .map(resource -> resource.substring("archive/".length()))
+                .orElse(arn);
     }
 
     private void startSchedulerIfNeeded(Rule rule) {
@@ -2165,7 +2248,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         }
     }
 
-    private <V> java.util.Optional<V> accountGet(StorageBackend<String, V> store, String accountId, String key) {
+    private <V> Optional<V> accountGet(StorageBackend<String, V> store, String accountId, String key) {
         if (accountId != null && store instanceof AccountAwareStorageBackend<V> aware) {
             return aware.getForAccount(accountId, key);
         }
@@ -2173,7 +2256,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     private <V> List<V> accountScan(StorageBackend<String, V> store, String accountId,
-                                    java.util.function.Predicate<String> filter) {
+                                    Predicate<String> filter) {
         if (accountId != null && store instanceof AccountAwareStorageBackend<V> aware) {
             return aware.scanForAccount(accountId, filter);
         }

@@ -2,8 +2,10 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import org.jboss.logging.Logger;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -115,6 +117,15 @@ public class PerKeyContainerPool {
      * registration, orphaning it since nothing calls stop for the key again.
      */
     public void stopContainer(String key) {
+        stopContainer(key, false);
+    }
+
+    /** Stops one key only after Docker confirms that its container is gone. */
+    public void stopContainerStrict(String key) {
+        stopContainer(key, true);
+    }
+
+    private void stopContainer(String key, boolean strict) {
         if (key == null) {
             return;
         }
@@ -122,7 +133,7 @@ public class PerKeyContainerPool {
         synchronized (lock) {
             List<PendingRemoval> removals;
             synchronized (registryLock) {
-                StartedContainer container = containers.remove(key);
+                StartedContainer container = strict ? containers.get(key) : containers.remove(key);
                 if (container != null) {
                     pendingCleanup.put(container.containerId(), new PendingRemoval(key, container.containerId()));
                 }
@@ -154,6 +165,8 @@ public class PerKeyContainerPool {
         lifecycleManager.stopAndRemoveStrict(removal.containerId(), null);
         synchronized (registryLock) {
             pendingCleanup.remove(removal.containerId(), removal);
+            containers.computeIfPresent(removal.key(), (key, active) ->
+                    removal.containerId().equals(active.containerId()) ? null : active);
         }
     }
 
@@ -178,5 +191,34 @@ public class PerKeyContainerPool {
                 LOG.debugv(e, "Failed to stop pooled sidecar container {0}; retained for retry", containerId);
             }
         });
+    }
+
+    /** Stops unprotected containers, retaining failed removals for a later teardown retry. */
+    public void stopAllStrictExcept(Set<String> protectedKeys) {
+        List<String> keys;
+        synchronized (registryLock) {
+            generation++;
+            Set<String> ownedKeys = new HashSet<>(containers.keySet());
+            pendingCleanup.values().forEach(removal -> ownedKeys.add(removal.key()));
+            keys = List.copyOf(ownedKeys);
+        }
+        RuntimeException failure = null;
+        for (String key : keys) {
+            if (protectedKeys.contains(key)) {
+                continue;
+            }
+            try {
+                stopContainerStrict(key);
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 }

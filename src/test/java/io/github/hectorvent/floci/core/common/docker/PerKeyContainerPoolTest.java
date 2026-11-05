@@ -16,6 +16,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -51,6 +52,22 @@ class PerKeyContainerPoolTest {
     @AfterEach
     void stopFakeContainers() {
         fakeContainers.forEach(server -> server.stop(0));
+    }
+
+    @Test
+    void strictResetRetriesDetachedFailuresAndPreservesProtectedKeys() throws IOException {
+        String url = startFakePing(200);
+        pool.ensureReady("retry", () -> new StartedContainer("failed", url));
+        pool.ensureReady("protected", () -> new StartedContainer("protected", url));
+        doThrow(new IllegalStateException("busy")).doNothing()
+                .when(lifecycleManager).stopAndRemoveStrict("failed", null);
+        assertThrows(IllegalStateException.class, () -> pool.stopContainer("retry"));
+
+        pool.stopAllStrictExcept(Set.of("protected"));
+
+        verify(lifecycleManager, times(2)).stopAndRemoveStrict("failed", null);
+        verify(lifecycleManager, never()).stopAndRemoveStrict("protected", null);
+        assertTrue(pool.isTracked("protected"));
     }
 
     @Test

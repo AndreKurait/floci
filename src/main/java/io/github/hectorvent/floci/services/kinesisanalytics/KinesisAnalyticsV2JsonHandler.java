@@ -6,6 +6,9 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.kinesisanalytics.model.FlinkApplication;
 import io.github.hectorvent.floci.services.kinesisanalytics.model.Snapshot;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -114,9 +117,12 @@ public class KinesisAnalyticsV2JsonHandler {
     }
 
     private Response handleListApplications(JsonNode request, String region) {
+        Integer limit = Pagination.parseMaxResults(request, "Limit", "InvalidRequestException");
+        String nextToken = Pagination.parseNextToken(request, "NextToken", "InvalidRequestException");
+        PaginatedResult<FlinkApplication> page = service.listApplications(region, limit, nextToken);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode summaries = response.putArray("ApplicationSummaries");
-        for (FlinkApplication app : service.listApplications(region)) {
+        for (FlinkApplication app : page.items()) {
             ObjectNode summary = summaries.addObject();
             summary.put("ApplicationName", app.getApplicationName());
             summary.put("ApplicationARN", app.getApplicationArn());
@@ -126,6 +132,9 @@ public class KinesisAnalyticsV2JsonHandler {
             if (app.getApplicationMode() != null) {
                 summary.put("ApplicationMode", app.getApplicationMode());
             }
+        }
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
         }
         return Response.ok(response).build();
     }
@@ -205,10 +214,16 @@ public class KinesisAnalyticsV2JsonHandler {
 
     private Response handleListApplicationSnapshots(JsonNode request, String region) {
         String applicationName = request.path("ApplicationName").asText(null);
+        Integer limit = Pagination.parseMaxResults(request, "Limit", "InvalidArgumentException");
+        String nextToken = Pagination.parseNextToken(request, "NextToken", "InvalidArgumentException");
+        PaginatedResult<Snapshot> page = service.listApplicationSnapshots(applicationName, region, limit, nextToken);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode summaries = response.putArray("SnapshotSummaries");
-        for (Snapshot snapshot : service.listApplicationSnapshots(applicationName, region)) {
+        for (Snapshot snapshot : page.items()) {
             summaries.add(snapshotDetailNode(snapshot));
+        }
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
         }
         return Response.ok(response).build();
     }
@@ -230,7 +245,7 @@ public class KinesisAnalyticsV2JsonHandler {
         node.put("SnapshotStatus", snapshot.getSnapshotStatus().name());
         node.put("ApplicationVersionId", snapshot.getApplicationVersionId());
         if (snapshot.getSnapshotCreationTimestamp() != null) {
-            node.put("SnapshotCreationTimestamp", snapshot.getSnapshotCreationTimestamp().toEpochMilli() / 1000.0);
+            node.put("SnapshotCreationTimestamp", EpochSeconds.fromInstant(snapshot.getSnapshotCreationTimestamp()));
         }
         if (snapshot.getRuntimeEnvironment() != null) {
             node.put("RuntimeEnvironment", snapshot.getRuntimeEnvironment());
@@ -311,10 +326,10 @@ public class KinesisAnalyticsV2JsonHandler {
             detail.put("ApplicationMode", app.getApplicationMode());
         }
         if (app.getCreateTimestamp() != null) {
-            detail.put("CreateTimestamp", app.getCreateTimestamp().toEpochMilli() / 1000.0);
+            detail.put("CreateTimestamp", EpochSeconds.fromInstant(app.getCreateTimestamp()));
         }
         if (app.getLastUpdateTimestamp() != null) {
-            detail.put("LastUpdateTimestamp", app.getLastUpdateTimestamp().toEpochMilli() / 1000.0);
+            detail.put("LastUpdateTimestamp", EpochSeconds.fromInstant(app.getLastUpdateTimestamp()));
         }
         if (app.hasCode()) {
             detail.set("ApplicationConfigurationDescription", applicationConfigurationNode(app));

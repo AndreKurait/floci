@@ -71,6 +71,24 @@ enforces the one-external-connection-per-repository limit AWS enforces. A reposi
 upstream repositories or an external connection, but not both, matching AWS; `CreateRepository`
 and `UpdateRepository` also cap direct upstreams at 10, AWS's own repository limit.
 
+For the Maven format specifically, an external connection is more than stored metadata: a real
+`mvn`/Gradle GET or HEAD miss on a repository with one of the 5 Maven external connections
+attached (`public:maven-central`, `public:maven-clojars`, `public:maven-commonsware`,
+`public:maven-googleandroid`, `public:maven-gradleplugins`) is retried against the real public
+repository and, if found, retained into the repository exactly as a real CodeArtifact repository
+would, with the same AWS-documented rules a real one applies: release versions only (AWS never imports a Maven SNAPSHOT through an external
+connection), the standard `.pom`/`.jar`/`-javadoc.jar`/`-sources.jar` set imported together on a
+standard-named request, a non-standard asset name imported individually and only on demand, a
+retained version's own origin checked against any later asset request for the same version
+(rejecting one that would mix in a different connection's bytes), and a direct `mvn deploy` of a
+version already present in the connection rejected with `ConflictException`. See the
+upstream-resolution limitation further down for exactly what this does not yet cover (a
+repository-to-repository `upstreams` chain, for any format including Maven). npm's own `public:npmjs`
+external connection and NuGet's own `public:nuget-org` one resolve the same way, each against its
+own format's one real public connection and documented rules; see their own repository endpoint
+sections and the known-limitations entry below for exactly how. pypi's own external connection does
+not yet.
+
 `PublishPackageVersion` creates a package version in the `Unfinished` state when the `unfinished`
 flag is set, and `Published` otherwise. While still `Unfinished`, publishing a new asset name is
 always accepted; once `Published`, a new asset name always conflicts, since real CodeArtifact never
@@ -291,9 +309,10 @@ state.
   time, since neither sidecar can answer for one after the fact (`GetPackageVersionReadme`'s own
   constraint, described earlier in this document); `nuget` needs no equivalent step, since
   `GetPackageVersionReadme` already answers it live from the `.nupkg` this action already copies
-  in full. `includeFromUpstream` is accepted but has no effect, since Floci has no
-  upstream-ingestion path for any format to begin with (see
-  the upstream-resolution limitation below).
+  in full. `includeFromUpstream` is accepted but has no effect: it names a source repository's
+  own upstream-repository chain specifically, which this emulator does not resolve for any
+  format yet (see the upstream-resolution limitation below). Maven's own external-connection
+  retention is a different mechanism and does not change this.
 - **The 5 GB asset size quota is nominal.** `PublishPackageVersion` and the Maven, pypi, and
   nuget repository endpoints all receive the request body as a single byte array before Floci ever
   checks its length, so a request already large enough to exhaust available heap fails before the
@@ -324,17 +343,42 @@ state.
   would mean isolating each sidecar on its own Docker network reachable only from Floci's own
   process, a change that would need to apply uniformly across all four sidecar-backed formats, not
   a one-off fix to any single proxy.
-- **None of the Maven, npm, pypi, or nuget repository endpoints resolve through upstream
-  repositories or external connections.** On real CodeArtifact, a repository with another
-  repository configured as an upstream (`UpdateRepository`'s `upstreams`) or with an
-  `AssociateExternalConnection` to a public repository (`public:maven-central`, `public:npmjs`,
-  `public:pypi`, `public:nuget-org`, etc.) serves packages from those sources too, not just its
-  own. Floci's proxies only ever look up the repository's own backing storage: a package that
-  exists solely in an upstream, or only through an external connection, returns 404 through a
-  repository that has it configured as one; the pypi proxy's pypiserver container is started with
-  `--disable-fallback`, and the nuget proxy's BaGetter container with `Mirror__Enabled=false`,
-  specifically so neither ever silently redirects a missing package to the real, public PyPI or
-  nuget.org.
+- **The Maven, NuGet, and npm endpoints' own external connections resolve; pypi's does not.**
+  On real CodeArtifact, a repository with another repository configured as an upstream
+  (`UpdateRepository`'s `upstreams`) or with an `AssociateExternalConnection` to a public
+  repository serves packages from those sources too, not just its own. Floci's Maven endpoint
+  does this for a direct external connection to one of the 5 real public Maven repositories
+  (`public:maven-central`, `public:maven-clojars`, `public:maven-commonsware`,
+  `public:maven-googleandroid`, `public:maven-gradleplugins`): a GET/HEAD miss fetches and
+  retains the package version from the real public repository, following AWS's own documented
+  rules (release versions only; the standard 4 assets imported together, a non-standard asset
+  name imported only on demand; a retained version's origin checked against any later asset
+  fetched for it, rejecting one from a different connection; `upstream: BLOCK` respected). A real
+  `mvn deploy` of a version already present in the external connection is also rejected (409),
+  matching AWS's documented publish-side behavior. NuGet's own `public:nuget-org` external
+  connection works the same way, against its own one real public connection and its own
+  single-asset-per-version shape; a real `nuget push`/`dotnet nuget push` of a version already
+  present in the connection is rejected the same way. npm's own `public:npmjs` external connection
+  works differently, since `npm install <pkg>@<version>` never names a single version on the wire
+  the way Maven's GAV layout or NuGet's content route do, only the bare package: a packument read
+  merges the real registry's own versions and dist-tags into whatever this repository already
+  knows (never written back to Verdaccio itself, since its publish protocol has no way to record a
+  version's metadata without that version's real tarball bytes in the same call), and a tarball
+  download for a version not yet genuinely retained triggers the real fetch and retention, using
+  the same claim/fence/origin-tracking machinery. None of this applies to a repository-to-
+  repository upstream (`UpdateRepository`'s `upstreams`, for any format including Maven, NuGet,
+  and npm, which is a materially different mechanism, not yet built) or to pypi's own external
+  connection, which still 404s exactly as before: the pypi proxy's pypiserver container is started
+  with `--disable-fallback`, specifically so it never silently redirects a missing package to the
+  real, public PyPI.
+- **Maven external-connection retention is the one place this emulator makes a real outbound
+  call to the public internet**, rather than only ever talking to a container it started itself.
+  An offline environment, or a real outage of the public repository being connected to, means a
+  miss simply 404s, exactly as AWS documents ("the only workaround is to try again later").
+  There is no caching of that failure, so a later retry against a recovered source works
+  immediately, but there is also no retry/backoff of its own beyond the client's own.
+  Package-group-level `EXTERNAL_UPSTREAM` (once package groups exist in this emulator) is not
+  consulted yet by this check, only the plain package-level `upstream` restriction.
 - **The npm repository endpoint does not enforce the 5 GB asset size quota.** Unlike
   `PublishPackageVersion` and the Maven endpoint, it streams the request straight through to the
   backing Verdaccio container rather than buffering it first, so there is nowhere in the request
@@ -368,9 +412,11 @@ state.
   AWS's own documented restriction that only NuGet's V3 protocol works against CodeArtifact at all
   and that `nuget list` specifically isn't supported.
 - **`DescribePackage`'s origin controls default to `publish: ALLOW`/`upstream: BLOCK`** (the
-  default for a package whose first version was published directly, since Floci never ingests
-  packages from an upstream source) **until a caller sets them explicitly with
-  `PutPackageOriginConfiguration`.** For Maven, npm, pypi, and nuget, `DescribePackage` asks the
+  default for a package whose first version was published directly) **until a caller sets them
+  explicitly with `PutPackageOriginConfiguration`, or until the package's first version is
+  retained from a Maven external connection, which instead defaults it to `publish: BLOCK`/
+  `upstream: ALLOW`**, matching AWS's own documented "ingested from a public source" default. For
+  Maven, npm, pypi, and nuget, `DescribePackage` asks the
   repository's sidecar whether the package exists, which starts that sidecar if it is not already
   running; a package that exists only because `PutPackageOriginConfiguration` created it (no
   versions yet) is found without touching any sidecar.
@@ -379,8 +425,9 @@ state.
   begin with; Maven, npm, pypi, and nuget publishes go through their own native wire protocol (`mvn
   deploy`, `npm publish`, `twine upload`, `nuget push`) directly against the repository endpoint,
   which does not yet check this setting. `upstream` is stored and reported faithfully for every
-  format but is never enforced for any of them, since Floci has no upstream ingestion path to
-  block in the first place. `CopyPackageVersions` deliberately does not check `publish: BLOCK`
+  format; it gates Maven's own external-connection retention (see the upstream-resolution
+  limitation above) but is not enforced anywhere else, since Floci has no other upstream
+  ingestion path to block yet. `CopyPackageVersions` deliberately does not check `publish: BLOCK`
   either, for any format: the User Guide's own definition of that control scopes it to direct
   publish "using package managers or similar tools," a mechanism Copy is not.
 - **`DescribeDomain`'s `assetSizeBytes` only counts what was published after this field started
