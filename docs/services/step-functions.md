@@ -593,6 +593,15 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 
 | Resource | Result | Notable failure |
 | --- | --- | --- |
+| `arn:aws:states:::aws-sdk:ec2:runInstances` | `{ReservationId, OwnerId, Instances}` | `Ec2.Ec2Exception`; the cause retains the EC2 error code |
+| `arn:aws:states:::aws-sdk:ec2:describeInstances` | `{Reservations, NextToken?}` | `Ec2.Ec2Exception` |
+| `arn:aws:states:::aws-sdk:ec2:terminateInstances` | `{TerminatingInstances}` | `Ec2.Ec2Exception` |
+| `arn:aws:states:::aws-sdk:ssm:describeInstanceInformation` | `{InstanceInformationList, NextToken?}` | `Ssm.InvalidFilterKeyException` |
+| `arn:aws:states:::aws-sdk:ssm:sendCommand` | `{Command}` | `Ssm.InvalidInstanceIdException` |
+| `arn:aws:states:::aws-sdk:ssm:getCommandInvocation` | invocation status and output | `Ssm.InvocationDoesNotExistException` |
+| `arn:aws:states:::aws-sdk:ssm:listCommands` | `{Commands}` | `Ssm.InvalidCommandIdException` |
+| `arn:aws:states:::aws-sdk:ssm:listCommandInvocations` | `{CommandInvocations}` | `Ssm.InvalidCommandIdException` |
+| `arn:aws:states:::aws-sdk:ssm:cancelCommand` | `{}` | `Ssm.InvalidCommandIdException` |
 | `arn:aws:states:::aws-sdk:ecs:updateService` | `{Service}` | `Ecs.ServiceNotFoundException` |
 | `arn:aws:states:::aws-sdk:ecs:listServices` | `{ServiceArns, NextToken?}` | `Ecs.ClusterNotFoundException` |
 | `arn:aws:states:::aws-sdk:ecs:describeServices` | `{Services, Failures}` | Missing services appear in `Failures` |
@@ -632,6 +641,24 @@ state-machine execution role's per-action IAM policies. Name-based lookups use t
 execution scope; explicit ARNs retain the underlying service's cross-account lookup
 behavior. The underlying services' validation still applies. They implement
 request-response calls, without job-completion polling.
+
+The EC2 and SSM tasks make signed requests through Floci's ordinary AWS listener.
+They use the state-machine region and execution role, or an explicitly selected
+`Credentials.RoleArn`. With IAM enforcement enabled, the role's trust, any task-role
+assumption, and the service's normal IAM/resource checks apply. EC2 Query member
+names, SDK result arrays and scalar types come from pinned botocore models.
+SSM parameter-map keys retain their spelling; modeled timestamps become ISO strings.
+The existing service implementations remain responsible for validation and effects.
+Failures use the service's modeled SDK exception classes, with `Ec2.Ec2Exception`
+or `Ssm.SsmException` for unmodeled service errors. Their causes retain the wire error
+code and message. EC2's SDK model does not declare operation-specific exceptions.
+
+These are request-response integrations. `runInstances` returns the launch
+response; `sendCommand` returns a command ID before a guest completes the command.
+Use explicit Choice/Wait loops around instance readiness and command status.
+`CancelCommand` and `TerminateInstances` remain separate operations. Stopping
+a workflow does not automatically terminate its instances or cancel its commands.
+There are no `.sync` variants for these compute operations.
 
 For example, force a deployment of an existing disposable service:
 

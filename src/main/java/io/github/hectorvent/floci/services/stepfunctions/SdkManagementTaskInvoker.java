@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.ServiceRegistry;
 import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
 import io.github.hectorvent.floci.services.lambda.LambdaController;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerJsonHandler;
+import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -34,15 +35,22 @@ public class SdkManagementTaskInvoker {
     private final SecretsManagerJsonHandler secrets;
     private final ServiceRegistry registry;
     private final ObjectMapper mapper;
+    private final SdkComputeTaskInvoker compute;
 
     @Inject
     public SdkManagementTaskInvoker(EcsJsonHandler ecs, LambdaController lambda, SecretsManagerJsonHandler secrets,
-                                     ServiceRegistry registry, ObjectMapper mapper) {
+                                     ServiceRegistry registry, ObjectMapper mapper, SdkComputeTaskInvoker compute) {
         this.ecs = ecs;
         this.lambda = lambda;
         this.secrets = secrets;
         this.registry = registry;
         this.mapper = mapper;
+        this.compute = compute;
+    }
+
+    SdkManagementTaskInvoker(EcsJsonHandler ecs, LambdaController lambda, SecretsManagerJsonHandler secrets,
+                            ServiceRegistry registry, ObjectMapper mapper) {
+        this(ecs, lambda, secrets, registry, mapper, null);
     }
 
     static boolean supports(StatesIntegration integration) {
@@ -50,11 +58,19 @@ public class SdkManagementTaskInvoker {
             case "ecs" -> ECS_ACTIONS.contains(integration.api());
             case "lambda" -> LAMBDA_ACTIONS.contains(integration.api());
             case "secretsmanager" -> "describeSecret".equals(integration.api());
-            default -> false;
+            default -> SdkComputeTaskInvoker.supports(integration);
         };
     }
 
     JsonNode invoke(StatesIntegration integration, JsonNode input, String region) throws Exception {
+        return invoke(integration, input, region, null, null);
+    }
+
+    JsonNode invoke(StatesIntegration integration, JsonNode input, String region, StateMachine machine,
+                    String credentialsRoleArn) throws Exception {
+        if (SdkComputeTaskInvoker.supports(integration)) {
+            return compute.invoke(integration, input, machine, credentialsRoleArn);
+        }
         String prefix = switch (integration.service()) {
             case "ecs" -> "Ecs";
             case "lambda" -> "Lambda";
