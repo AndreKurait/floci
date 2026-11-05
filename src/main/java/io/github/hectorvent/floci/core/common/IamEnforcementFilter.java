@@ -1327,6 +1327,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if ("ec2:TerminateInstances".equals(action)) {
                 resourceContexts = List.of(conditionContextResolver.ec2TerminationContext(
                         resource, targetContexts.isEmpty() ? null : targetContexts.getFirst()));
+            } else if ("ssm:SendCommand".equals(action)) {
+                resourceContexts = targetContexts.stream().map(base ->
+                        conditionContextResolver.ssmCommandResourceContext(resource, base, region, accountId)).toList();
             }
             if (batchContexts != null && !batchContexts.isEmpty()) {
                 resourceContexts = new ArrayList<>();
