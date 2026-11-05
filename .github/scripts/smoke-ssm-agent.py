@@ -151,6 +151,11 @@ class Smoke:
             "FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE": self.server,
             "FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH": "/catalog.json",
             "FLOCI_SERVICES_EC2_MOCK": "false", "FLOCI_SERVICES_EC2_PRIVILEGED": "false",
+            "FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED": "true",
+            "FLOCI_SERVICES_EC2_AWS_FAITHFUL_PRIVATE_IP": "true",
+            "FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED": "true",
+            "FLOCI_NETWORK_VPC_ROUTING_ENABLED": "true",
+            "FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API": "true",
             "FLOCI_SERVICES_EC2_VOLUME_BLOCK_DEVICES": "false",
             "FLOCI_SERVICES_EC2_PUBLISH_SECURITY_GROUP_PORTS": "false",
             "FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED": "true",
@@ -180,6 +185,80 @@ class Smoke:
                 raise ValueError("The stock image launch changed: " + field)
         self.record["healthy_ready_seconds"] = time.monotonic() - began
 
+    def prepare_vpc(self):
+        print("Preparing private and public subnets with a routed NAT gateway", flush=True)
+        self.created["vpc"] = self.aws("ec2", "create-vpc", CidrBlock="10.73.0.0/24")["Vpc"]["VpcId"]
+        for key, cidr in (("subnet", "10.73.0.0/26"), ("public_subnet", "10.73.0.64/26")):
+            self.created[key] = self.aws(
+                "ec2", "create-subnet", VpcId=self.created["vpc"], CidrBlock=cidr
+            )["Subnet"]["SubnetId"]
+        self.created["gateway"] = self.aws(
+            "ec2", "create-internet-gateway"
+        )["InternetGateway"]["InternetGatewayId"]
+        self.aws("ec2", "attach-internet-gateway", InternetGatewayId=self.created["gateway"],
+                 VpcId=self.created["vpc"])
+        self.created["gateway_attachment"] = True
+        for prefix, subnet in (("private", "subnet"), ("public", "public_subnet")):
+            routes = self.aws("ec2", "create-route-table", VpcId=self.created["vpc"])["RouteTable"]["RouteTableId"]
+            self.created[prefix + "_routes"] = routes
+            self.created[prefix + "_association"] = self.aws(
+                "ec2", "associate-route-table", RouteTableId=routes, SubnetId=self.created[subnet]
+            )["AssociationId"]
+        self.aws("ec2", "create-route", RouteTableId=self.created["public_routes"],
+                 DestinationCidrBlock="0.0.0.0/0", GatewayId=self.created["gateway"])
+        address = self.aws("ec2", "allocate-address", Domain="vpc")
+        self.created["allocation"] = address["AllocationId"]
+        nat = self.aws("ec2", "create-nat-gateway", SubnetId=self.created["public_subnet"],
+                       AllocationId=address["AllocationId"])["NatGateway"]
+        self.created["nat"] = nat["NatGatewayId"]
+        if nat["State"] != "available":
+            raise ValueError("The modeled NAT did not become available: " + json.dumps(nat))
+        self.record["nat_public_ip"] = address["PublicIp"]
+        self.aws("ec2", "create-route", RouteTableId=self.created["private_routes"],
+                 DestinationCidrBlock="0.0.0.0/0", NatGatewayId=self.created["nat"])
+        self.created["group"] = self.aws(
+            "ec2", "create-security-group", VpcId=self.created["vpc"], GroupName=self.owner,
+            Description="Stock SSM agent through a private subnet and public NAT",
+        )["GroupId"]
+        permissions = self.aws("ec2", "describe-security-groups",
+                               GroupIds=[self.created["group"]])["SecurityGroups"][0]["IpPermissionsEgress"]
+        if permissions:
+            self.aws("ec2", "revoke-security-group-egress", GroupId=self.created["group"],
+                     IpPermissions=permissions)
+        self.aws("ec2", "authorize-security-group-egress", GroupId=self.created["group"], IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+            "IpRanges": [{"CidrIp": "192.0.2.1/32", "Description": "Modeled public AWS HTTPS APIs"}],
+        }])
+
+    def verify_vpc_path(self):
+        guest = inspect(self.guest)
+        mode = guest["HostConfig"]["NetworkMode"]
+        if not mode.startswith("container:"):
+            raise ValueError("The guest does not use a protected network namespace")
+        namespace = inspect(mode.split(":", 1)[1])
+        if namespace["Config"]["Labels"].get("io.floci.security-group.helper") != "true":
+            raise ValueError("The guest network namespace has no security-group enforcement")
+        settings = dict(value.split("=", 1) for value in guest["Config"]["Env"] if "=" in value)
+        if settings.get("AWS_ENDPOINT_URL"):
+            raise ValueError("The private guest received an AWS endpoint override")
+        hostname = "ssm." + REGION + ".amazonaws.com"
+        addresses = set(line.split()[0] for line in docker(
+            "exec", self.guest, "getent", "ahostsv4", hostname).stdout.splitlines())
+        if addresses != {"192.0.2.1"}:
+            raise ValueError("The private guest did not resolve the modeled public AWS destination")
+        bridges = docker("ps", "-q", "--filter", "label=floci_namespace=" + self.owner,
+                         "--filter", "label=io.floci.service=vpc-aws-api").stdout.split()
+        if len(bridges) != 1:
+            raise ValueError("Expected one owned public AWS API bridge")
+        observed = docker("logs", bridges[0])
+        if "AF=2 " + self.record["nat_public_ip"] + ":" not in observed.stdout + observed.stderr:
+            raise ValueError("The public AWS endpoint did not observe the NAT Elastic IP")
+        self.record["protected_vpc_path"] = {
+            "qualified": True, "namespace": namespace["Id"], "hostname": hostname,
+            "dns_addresses": sorted(addresses), "endpoint_override_absent": True,
+            "nat_source_observed": self.record["nat_public_ip"],
+        }
+
     def exercise(self):
         print("Creating the instance role and tag-targeted inventory association", flush=True)
         name = self.owner
@@ -194,14 +273,7 @@ class Smoke:
         self.created["profile"] = True
         self.aws("iam", "add-role-to-instance-profile", InstanceProfileName=name, RoleName=name)
         self.created["profile_role"] = True
-        self.created["vpc"] = self.aws("ec2", "create-vpc", CidrBlock="10.73.0.0/24")["Vpc"]["VpcId"]
-        self.created["subnet"] = self.aws(
-            "ec2", "create-subnet", VpcId=self.created["vpc"], CidrBlock="10.73.0.0/26"
-        )["Subnet"]["SubnetId"]
-        self.created["group"] = self.aws(
-            "ec2", "create-security-group", VpcId=self.created["vpc"], GroupName=name,
-            Description="Stock SSM agent inventory smoke",
-        )["GroupId"]
+        self.prepare_vpc()
         document = {"schemaVersion": "2.2", "mainSteps": [{
             "action": "aws:softwareInventory", "name": "software",
             "inputs": {"applications": "Enabled", "awsComponents": "Enabled"},
@@ -281,6 +353,7 @@ class Smoke:
             association_executed=True, application_count=len(entries),
             installed_agent=installed, agent_and_inventory_seconds=time.monotonic() - began,
         )
+        self.verify_vpc_path()
 
     def cleanup(self):
         print("Cleaning up the API resources and owned runtime", flush=True)
@@ -311,6 +384,18 @@ class Smoke:
             ("association", "ssm", "delete-association", {"AssociationId": self.created.get("association")}),
             ("document", "ssm", "delete-document", {"Name": self.owner}),
             ("group", "ec2", "delete-security-group", {"GroupId": self.created.get("group")}),
+            ("private_association", "ec2", "disassociate-route-table",
+             {"AssociationId": self.created.get("private_association")}),
+            ("private_routes", "ec2", "delete-route-table", {"RouteTableId": self.created.get("private_routes")}),
+            ("nat", "ec2", "delete-nat-gateway", {"NatGatewayId": self.created.get("nat")}),
+            ("allocation", "ec2", "release-address", {"AllocationId": self.created.get("allocation")}),
+            ("public_association", "ec2", "disassociate-route-table",
+             {"AssociationId": self.created.get("public_association")}),
+            ("public_routes", "ec2", "delete-route-table", {"RouteTableId": self.created.get("public_routes")}),
+            ("gateway_attachment", "ec2", "detach-internet-gateway",
+             {"InternetGatewayId": self.created.get("gateway"), "VpcId": self.created.get("vpc")}),
+            ("gateway", "ec2", "delete-internet-gateway", {"InternetGatewayId": self.created.get("gateway")}),
+            ("public_subnet", "ec2", "delete-subnet", {"SubnetId": self.created.get("public_subnet")}),
             ("subnet", "ec2", "delete-subnet", {"SubnetId": self.created.get("subnet")}),
             ("vpc", "ec2", "delete-vpc", {"VpcId": self.created.get("vpc")}),
             ("profile_role", "iam", "remove-role-from-instance-profile",
@@ -386,11 +471,11 @@ def gateway_open_count(smoke):
                for line in (result.stdout + result.stderr).splitlines())
 
 
-def wait_for_gateway(smoke, after_count=0):
+def wait_for_gateway(smoke, after_count=0, seconds=45):
     def opened():
         count = gateway_open_count(smoke)
         return count if count > after_count else None
-    count = wait_for("The real agent did not authenticate a new message gateway channel", opened, seconds=45)
+    count = wait_for("The real agent did not authenticate a new message gateway channel", opened, seconds=seconds)
     smoke.record["native_gateway_authenticated"] = True
     smoke.record["native_gateway_connection_count"] = count
     return count
@@ -540,14 +625,13 @@ def exercise_cancellation(smoke):
     smoke.record["native_cancellation_qualified"] = True
 
 
-def exercise_stopped_agent(smoke):
-    print("Stopping the real agent and observing delivery expiry and recovery", flush=True)
-    def processes():
-        return docker("exec", smoke.guest, "/bin/sh", "-ec",
-                            AGENT_PROCESSES).stdout.strip().splitlines()
+def agent_processes(smoke):
+    return docker("exec", smoke.guest, "/bin/sh", "-ec",
+                  AGENT_PROCESSES).stdout.strip().splitlines()
 
-    before = processes()
-    smoke.record["agent_processes_before_stop"] = before
+
+def stop_agent(smoke):
+    before = agent_processes(smoke)
     if not any(line.endswith(" /usr/bin/amazon-ssm-agent") for line in before):
         raise ValueError("The real agent was not running before the negative check")
     pids = [line.split()[0] for line in before]
@@ -556,11 +640,34 @@ def exercise_stopped_agent(smoke):
     docker("exec", smoke.guest, "/bin/sh", "-c",
                  'for pid do kill -TERM "$pid" 2>/dev/null || true; done',
                  "stop-owned-stock-agent", *pids)
-    wait_for("The real agent did not stop", lambda: not processes(), seconds=45)
-    smoke.record["agent_processes_after_stop"] = processes()
+    wait_for("The real agent did not stop", lambda: not agent_processes(smoke), seconds=45)
+    return before
+
+
+def start_agent(smoke):
+    docker("exec", smoke.guest, "/bin/sh", "-ec", """
+nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+  -u AWS_ENDPOINT_URL -u AWS_REGION -u AWS_DEFAULT_REGION -u AWS_CA_BUNDLE -u SSL_CERT_FILE \
+  /usr/bin/amazon-ssm-agent </dev/null >/var/log/amazon/ssm/restart.log 2>&1 &
+""")
+    wait_for("The unchanged agent did not restart", lambda: agent_processes(smoke), seconds=45)
+
+
+def exercise_delivery_outage(smoke, *, remove_route=False):
+    reason = "missing NAT route" if remove_route else "stopped agent"
+    print("Observing delivery expiry and recovery with a " + reason, flush=True)
+    before = stop_agent(smoke)
+    process_prefix = "route_agent" if remove_route else "agent"
+    smoke.record[process_prefix + "_processes_before_stop"] = before
+    smoke.record[process_prefix + "_processes_after_stop"] = agent_processes(smoke)
+    previous_connections = gateway_open_count(smoke)
+    if remove_route:
+        smoke.aws("ec2", "delete-route", RouteTableId=smoke.created["private_routes"],
+                  DestinationCidrBlock="0.0.0.0/0")
+        start_agent(smoke)
     instance = smoke.created["instance"]
     marker = uuid.uuid4().hex
-    path = "/tmp/floci-stopped-agent-" + marker
+    path = "/tmp/floci-undelivered-" + marker
     began = time.monotonic()
     command = smoke.aws("ssm", "send-command", InstanceIds=[instance],
                         DocumentName="AWS-RunShellScript", TimeoutSeconds=30,
@@ -574,24 +681,30 @@ def exercise_stopped_agent(smoke):
 
     invocation = wait_for("The undelivered command did not expire",
                                 lambda: completed(command["CommandId"]), seconds=70)
-    smoke.record["stopped_agent"] = {
+    key = "missing_nat_route" if remove_route else "stopped_agent"
+    smoke.record[key] = {
         "seconds": time.monotonic() - began, "command": command, "invocation": invocation,
-        "processes_after_command": processes(),
+        "processes_after_command": agent_processes(smoke),
     }
     if invocation["Status"] != "TimedOut" or invocation["StatusDetails"] != "Delivery Timed Out":
-        raise ValueError("A command without a live agent did not expire as undelivered")
-    if invocation["ResponseCode"] != -1 or processes():
-        raise ValueError("The stopped-agent command unexpectedly executed")
+        raise ValueError("A command with a " + reason + " did not expire as undelivered")
+    if invocation["ResponseCode"] != -1:
+        raise ValueError("The undelivered command unexpectedly executed")
+    if bool(agent_processes(smoke)) != remove_route:
+        raise ValueError("The agent's process state changed during the " + reason + " check")
+    if gateway_open_count(smoke) != previous_connections:
+        raise ValueError("The agent opened a control channel during the " + reason + " check")
     docker("exec", smoke.guest, "/bin/sh", "-ec", 'test ! -e "$1"', "marker-check", path)
-    smoke.record["stopped_agent"]["side_effect_absent"] = True
-    previous_connections = gateway_open_count(smoke)
-    docker("exec", smoke.guest, "/bin/sh", "-ec", """
-nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-  -u AWS_ENDPOINT_URL -u AWS_REGION -u AWS_DEFAULT_REGION -u AWS_CA_BUNDLE -u SSL_CERT_FILE \
-  /usr/bin/amazon-ssm-agent </dev/null >/var/log/amazon/ssm/restart.log 2>&1 &
-""")
-    wait_for("The unchanged agent did not restart", processes, seconds=45)
-    gateway_connections = wait_for_gateway(smoke, after_count=previous_connections)
+    smoke.record[key]["side_effect_absent"] = True
+    restored = time.monotonic()
+    if remove_route:
+        smoke.aws("ec2", "create-route", RouteTableId=smoke.created["private_routes"],
+                  DestinationCidrBlock="0.0.0.0/0", NatGatewayId=smoke.created["nat"])
+    else:
+        start_agent(smoke)
+    gateway_connections = wait_for_gateway(
+        smoke, after_count=previous_connections, seconds=180 if remove_route else 45)
+    smoke.record[key]["reconnection_seconds"] = time.monotonic() - restored
     began = time.monotonic()
     recovery = smoke.aws("ssm", "send-command", InstanceIds=[instance],
                          DocumentName="AWS-RunShellScript", TimeoutSeconds=60,
@@ -604,14 +717,16 @@ nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     if recovered["StandardOutputContent"].strip() != "recovered:" + marker:
         raise ValueError("The recovered agent did not return the submitted unique output")
     docker("exec", smoke.guest, "/bin/sh", "-ec", 'test ! -e "$1"', "marker-check", path)
-    smoke.record["recovered_agent"] = {
+    smoke.record["recovered_network" if remove_route else "recovered_agent"] = {
         "seconds": time.monotonic() - began, "command": recovery, "invocation": recovered,
         "expired_command_side_effect_still_absent": True,
         "gateway_connections_before_restart": previous_connections,
         "gateway_connections_after_restart": gateway_connections,
         "transport": gateway_execution(smoke, recovery["CommandId"]),
     }
-    smoke.record["stopped_agent_delivery_timeout_and_recovery"] = True
+    qualification = "nat_route_delivery_timeout_and_recovery" if remove_route else (
+        "stopped_agent_delivery_timeout_and_recovery")
+    smoke.record[qualification] = True
 
 
 
@@ -631,7 +746,8 @@ def main():
             wait_for_gateway(smoke)
             exercise_commands(smoke)
             exercise_cancellation(smoke)
-            exercise_stopped_agent(smoke)
+            exercise_delivery_outage(smoke)
+            exercise_delivery_outage(smoke, remove_route=True)
             smoke.record.update(status="passed", command_transport_qualified=True)
         except Exception as error:
             smoke.record.update(status="failed", error=str(error))
