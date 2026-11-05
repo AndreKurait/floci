@@ -604,6 +604,17 @@ User data is returned as the original base64-decoded bytes, without decompressin
 
 ### Supported IMDS endpoints
 
+The metadata and user-data `GET` paths below also accept `1.0` and EC2's dated
+metadata versions through `2026-04-15`. A category is available only in versions
+that include it; unknown versions return `404`. For example, `2014-02-25` exposes
+the service domain, while `2015-10-20` also exposes the partition. Metadata schema
+versions are independent of IMDSv1/v2 token authentication. Token creation uses
+`/latest/api/token`; dated token paths return `403`.
+
+The instance identity document uses JSON serialization with separate field lines,
+so stock bootstrap scripts can extract fields such as the region without changing
+their metadata version or parsers.
+
 | Endpoint | Returns |
 |---|---|
 | `GET /latest/meta-data/instance-id` | Instance ID |
@@ -618,6 +629,9 @@ User data is returned as the original base64-decoded bytes, without decompressin
 | `GET /latest/meta-data/security-groups` | Security group names |
 | `GET /latest/meta-data/placement/availability-zone` | AZ |
 | `GET /latest/meta-data/placement/region` | Region |
+| `GET /latest/meta-data/services/` | Service metadata keys (`domain` and `partition`); also accepts the path without a trailing slash |
+| `GET /latest/meta-data/services/partition` | AWS partition for the instance's region |
+| `GET /latest/meta-data/services/domain` | AWS DNS suffix for the instance's region |
 | `GET /latest/meta-data/iam/info` | IAM instance profile info |
 | `GET /latest/meta-data/iam/security-credentials/` | Role name list |
 | `GET /latest/meta-data/iam/security-credentials/{role}` | Temporary credentials |
@@ -625,6 +639,8 @@ User data is returned as the original base64-decoded bytes, without decompressin
 | `GET /latest/meta-data/identity-credentials/ec2/security-credentials/ec2-instance` | Instance identity role credentials |
 | `GET /latest/user-data` | Original user-data bytes, including compressed content |
 | `GET /latest/dynamic/instance-identity/document` | Identity document JSON |
+
+Service metadata uses the instance's region, so stock agents can construct their partition-specific ARNs and AWS endpoints.
 
 IAM credentials are served when the instance has an `IamInstanceProfile.Arn` that resolves to an existing instance profile with one role in the profile's account. The role list uses the role name, which can differ from the profile name. Missing profiles, missing roles, and requests for another role return `404`.
 

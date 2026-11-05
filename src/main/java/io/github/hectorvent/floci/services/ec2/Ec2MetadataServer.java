@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
@@ -13,6 +14,7 @@ import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.json.JsonObject;
+import io.vertx.ext.web.Route;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
@@ -53,7 +55,13 @@ public class Ec2MetadataServer {
     /** IMDSv2 tokens live from one second up to six hours. */
     private static final int MAX_TOKEN_TTL_SECONDS = 21_600;
     private static final String IDENTITY_ROLE = "ec2-instance";
-    private static final String INSTANCE_TAGS_PREFIX = "/latest/meta-data/tags/instance/";
+    private static final String INSTANCE_TAGS_PREFIX = "/meta-data/tags/instance/";
+    private static final Set<String> METADATA_VERSIONS = Set.of(
+            "1.0", "2007-01-19", "2007-03-01", "2007-08-29", "2007-10-10", "2007-12-15",
+            "2008-02-01", "2008-09-01", "2009-04-04", "2011-01-01", "2011-05-01", "2012-01-12",
+            "2014-02-25", "2014-11-05", "2015-10-20", "2016-04-19", "2016-06-30", "2016-09-02",
+            "2018-03-28", "2018-08-17", "2018-09-24", "2019-10-01", "2020-10-27", "2021-01-03",
+            "2021-03-23", "2021-07-15", "2022-09-24", "2024-04-11", "2025-10-04", "2026-04-15");
 
     private final Vertx vertx;
     private final EmulatorConfig config;
@@ -222,42 +230,56 @@ public class Ec2MetadataServer {
 
         // IMDSv2 token endpoint
         router.put("/latest/api/token").handler(this::handleToken);
+        router.put("/:metadataVersion/api/token").handler(ctx -> ctx.response().setStatusCode(403).end());
 
         // Metadata endpoints
-        router.get("/latest/meta-data/instance-id").handler(ctx -> handleText(ctx, inst -> inst.getInstanceId()));
-        router.get("/latest/meta-data/ami-id").handler(ctx -> handleText(ctx, inst -> inst.getImageId()));
-        router.get("/latest/meta-data/instance-type").handler(ctx -> handleText(ctx, inst -> inst.getInstanceType()));
-        router.get("/latest/meta-data/local-ipv4").handler(ctx -> handleText(ctx, inst -> inst.getPrivateIpAddress()));
-        router.get("/latest/meta-data/public-ipv4").handler(ctx -> handleText(ctx, inst -> inst.getPublicIpAddress()));
-        router.get("/latest/meta-data/public-hostname").handler(ctx -> handleText(ctx, inst -> inst.getPublicDnsName()));
-        router.get("/latest/meta-data/local-hostname").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
-        router.get("/latest/meta-data/hostname").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
-        router.get("/latest/meta-data/mac").handler(ctx -> handleMac(ctx));
-        router.get("/latest/meta-data/security-groups").handler(ctx -> handleSecurityGroups(ctx));
-        router.get("/latest/meta-data/placement/availability-zone").handler(ctx -> handleText(ctx, inst ->
+        metadataGet(router, "meta-data/instance-id", "1.0").handler(ctx -> handleText(ctx, inst -> inst.getInstanceId()));
+        metadataGet(router, "meta-data/ami-id", "1.0").handler(ctx -> handleText(ctx, inst -> inst.getImageId()));
+        metadataGet(router, "meta-data/instance-type", "2007-08-29")
+                .handler(ctx -> handleText(ctx, inst -> inst.getInstanceType()));
+        metadataGet(router, "meta-data/local-ipv4", "1.0").handler(ctx -> handleText(ctx, inst -> inst.getPrivateIpAddress()));
+        metadataGet(router, "meta-data/public-ipv4", "2007-01-19")
+                .handler(ctx -> handleText(ctx, inst -> inst.getPublicIpAddress()));
+        metadataGet(router, "meta-data/public-hostname", "2007-01-19")
+                .handler(ctx -> handleText(ctx, inst -> inst.getPublicDnsName()));
+        metadataGet(router, "meta-data/local-hostname", "2007-01-19")
+                .handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
+        metadataGet(router, "meta-data/hostname", "1.0").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
+        metadataGet(router, "meta-data/mac", "2011-01-01").handler(ctx -> handleMac(ctx));
+        metadataGet(router, "meta-data/security-groups", "1.0").handler(ctx -> handleSecurityGroups(ctx));
+        metadataGet(router, "meta-data/placement/availability-zone", "2008-02-01").handler(ctx -> handleText(ctx, inst ->
                 inst.getPlacement() != null
                         ? inst.getPlacement().getAvailabilityZone()
                         : config.defaultAvailabilityZone()));
-        router.get("/latest/meta-data/placement/region").handler(ctx -> handleText(ctx, inst -> inst.getRegion()));
-        router.get("/latest/meta-data/iam/info").handler(ctx -> handleIamInfo(ctx));
-        router.get("/latest/meta-data/iam/security-credentials/").handler(ctx -> handleCredentialsList(ctx));
-        router.get("/latest/meta-data/iam/security-credentials/:role").handler(ctx -> handleCredentials(ctx));
-        router.get("/latest/meta-data/identity-credentials").handler(ctx -> handleListing(ctx, "ec2/"));
-        router.get("/latest/meta-data/identity-credentials/").handler(ctx -> handleListing(ctx, "ec2/"));
-        router.get("/latest/meta-data/identity-credentials/ec2").handler(ctx -> handleListing(ctx, "info\nsecurity-credentials/"));
-        router.get("/latest/meta-data/identity-credentials/ec2/").handler(ctx -> handleListing(ctx, "info\nsecurity-credentials/"));
-        router.get("/latest/meta-data/identity-credentials/ec2/info").handler(ctx -> handleIdentityInfo(ctx));
-        router.get("/latest/meta-data/identity-credentials/ec2/security-credentials")
+        metadataGet(router, "meta-data/placement/region", "2019-10-01")
+                .handler(ctx -> handleText(ctx, inst -> inst.getRegion()));
+        metadataGet(router, "meta-data/services", "2014-02-25").handler(this::handleServicesListing);
+        metadataGet(router, "meta-data/services/", "2014-02-25").handler(this::handleServicesListing);
+        metadataGet(router, "meta-data/services/partition", "2015-10-20")
+                .handler(ctx -> handleText(ctx, inst -> AwsRegions.partitionFor(inst.getRegion())));
+        metadataGet(router, "meta-data/services/domain", "2014-02-25")
+                .handler(ctx -> handleText(ctx, inst -> AwsRegions.dnsSuffixFor(inst.getRegion())));
+        metadataGet(router, "meta-data/iam/info", "2012-01-12").handler(ctx -> handleIamInfo(ctx));
+        metadataGet(router, "meta-data/iam/security-credentials/", "2012-01-12").handler(ctx -> handleCredentialsList(ctx));
+        metadataGet(router, "meta-data/iam/security-credentials/:role", "2012-01-12").handler(ctx -> handleCredentials(ctx));
+        metadataGet(router, "meta-data/identity-credentials", "2018-03-28").handler(ctx -> handleListing(ctx, "ec2/"));
+        metadataGet(router, "meta-data/identity-credentials/", "2018-03-28").handler(ctx -> handleListing(ctx, "ec2/"));
+        metadataGet(router, "meta-data/identity-credentials/ec2", "2018-03-28")
+                .handler(ctx -> handleListing(ctx, "info\nsecurity-credentials/"));
+        metadataGet(router, "meta-data/identity-credentials/ec2/", "2018-03-28")
+                .handler(ctx -> handleListing(ctx, "info\nsecurity-credentials/"));
+        metadataGet(router, "meta-data/identity-credentials/ec2/info", "2018-03-28").handler(ctx -> handleIdentityInfo(ctx));
+        metadataGet(router, "meta-data/identity-credentials/ec2/security-credentials", "2018-03-28")
                 .handler(ctx -> handleListing(ctx, IDENTITY_ROLE));
-        router.get("/latest/meta-data/identity-credentials/ec2/security-credentials/")
+        metadataGet(router, "meta-data/identity-credentials/ec2/security-credentials/", "2018-03-28")
                 .handler(ctx -> handleListing(ctx, IDENTITY_ROLE));
-        router.get("/latest/meta-data/identity-credentials/ec2/security-credentials/" + IDENTITY_ROLE)
+        metadataGet(router, "meta-data/identity-credentials/ec2/security-credentials/" + IDENTITY_ROLE, "2018-03-28")
                 .handler(ctx -> handleIdentityCredentials(ctx));
-        router.get("/latest/meta-data/tags/instance").handler(ctx -> handleInstanceTagKeys(ctx));
-        router.get("/latest/meta-data/tags/instance/").handler(ctx -> handleInstanceTagKeys(ctx));
-        router.getWithRegex("/latest/meta-data/tags/instance/.+").handler(ctx -> handleInstanceTagValue(ctx));
-        router.get("/latest/user-data").handler(ctx -> handleUserData(ctx));
-        router.get("/latest/dynamic/instance-identity/document").handler(ctx -> handleIdentityDocument(ctx));
+        metadataGet(router, "meta-data/tags/instance", "2021-03-23").handler(ctx -> handleInstanceTagKeys(ctx));
+        metadataGet(router, "meta-data/tags/instance/", "2021-03-23").handler(ctx -> handleInstanceTagKeys(ctx));
+        metadataGet(router, "meta-data/tags/instance/*", "2021-03-23").handler(ctx -> handleInstanceTagValue(ctx));
+        metadataGet(router, "user-data", "1.0").handler(ctx -> handleUserData(ctx));
+        metadataGet(router, "dynamic/instance-identity/document", "2009-04-04").handler(ctx -> handleIdentityDocument(ctx));
 
         httpServer = vertx.createHttpServer();
         httpServer.requestHandler(router).listen(port, result -> {
@@ -270,6 +292,26 @@ public class Ec2MetadataServer {
             }
         });
         return future;
+    }
+
+    private static Route metadataGet(Router router, String path, String firstVersion) {
+        return router.get("/:metadataVersion/" + path).handler(ctx -> {
+            if (supportsVersion(ctx, firstVersion)) {
+                ctx.next();
+            } else {
+                ctx.response().setStatusCode(404).end();
+            }
+        });
+    }
+
+    private static boolean supportsVersion(RoutingContext ctx, String firstVersion) {
+        String version = ctx.pathParam("metadataVersion");
+        return "latest".equals(version)
+                || (METADATA_VERSIONS.contains(version) && version.compareTo(firstVersion) >= 0);
+    }
+
+    private void handleServicesListing(RoutingContext ctx) {
+        handleListing(ctx, supportsVersion(ctx, "2015-10-20") ? "domain\npartition" : "domain");
     }
 
     public synchronized void stop() {
@@ -503,9 +545,10 @@ public class Ec2MetadataServer {
         }
 
         String path = ctx.request().path();
-        String tagKey = path.length() <= INSTANCE_TAGS_PREFIX.length()
+        String prefix = "/" + ctx.pathParam("metadataVersion") + INSTANCE_TAGS_PREFIX;
+        String tagKey = path.length() <= prefix.length()
                 ? ""
-                : URLDecoder.decode(path.substring(INSTANCE_TAGS_PREFIX.length()), StandardCharsets.UTF_8);
+                : URLDecoder.decode(path.substring(prefix.length()), StandardCharsets.UTF_8);
         Optional<String> value = instanceTagValue(inst, tagKey);
         if (value.isEmpty()) {
             ctx.response().setStatusCode(404).end("not-found");
@@ -562,16 +605,16 @@ public class Ec2MetadataServer {
         String architecture = inst.getArchitecture() == null || inst.getArchitecture().isBlank()
                 ? "x86_64"
                 : inst.getArchitecture();
-        String body = "{\"accountId\":\"" + accountId + "\","
-                + "\"architecture\":\"" + architecture + "\","
-                + "\"availabilityZone\":\"" + az + "\","
-                + "\"imageId\":\"" + inst.getImageId() + "\","
-                + "\"instanceId\":\"" + inst.getInstanceId() + "\","
-                + "\"instanceType\":\"" + inst.getInstanceType() + "\","
-                + "\"privateIp\":\"" + nvl(inst.getPrivateIpAddress()) + "\","
-                + "\"region\":\"" + inst.getRegion() + "\","
-                + "\"version\":\"2017-09-30\"}";
-        return body;
+        return new JsonObject()
+                .put("accountId", accountId)
+                .put("architecture", architecture)
+                .put("availabilityZone", az)
+                .put("imageId", inst.getImageId())
+                .put("instanceId", inst.getInstanceId())
+                .put("instanceType", inst.getInstanceType())
+                .put("privateIp", nvl(inst.getPrivateIpAddress()))
+                .put("region", inst.getRegion())
+                .put("version", "2017-09-30").encodePrettily();
     }
 
     // ── Instance resolution ───────────────────────────────────────────────────

@@ -10,6 +10,8 @@ import io.restassured.specification.RequestSpecification;
 import io.vertx.core.json.JsonObject;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.http.HttpResponse;
 import java.util.Set;
@@ -31,8 +33,9 @@ class Ec2MetadataProfileIntegrationTest {
     @Inject
     IamService iam;
 
-    @Test
-    void iamInfoMatchesCreatedProfileAndRejectsMissingOrMismatchedAttachments() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"latest", "2012-01-12", "2016-09-02"})
+    void iamInfoMatchesCreatedProfileAndRejectsMissingOrMismatchedAttachments(String version) throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String roleName = "metadata-role-" + suffix;
         String profileName = "metadata-profile-" + suffix;
@@ -53,29 +56,32 @@ class Ec2MetadataProfileIntegrationTest {
         try (Ec2MetadataTestFixture fixture = new Ec2MetadataTestFixture()) {
             fixture.start(iam, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), instance);
             String token = token(fixture);
-            assertEquals(404, info(fixture, token).statusCode());
+            assertEquals(404, info(fixture, token, version).statusCode());
             iamRequest("AddRoleToInstanceProfile")
                     .formParam("InstanceProfileName", profileName).formParam("RoleName", roleName)
                     .post("/").then().statusCode(200);
             roleAdded = true;
-            HttpResponse<String> response = info(fixture, token);
+            HttpResponse<String> response = info(fixture, token, version);
             assertEquals(200, response.statusCode());
             JsonObject body = new JsonObject(response.body());
             assertEquals("Success", body.getString("Code"));
             assertEquals(profileArn, body.getString("InstanceProfileArn"));
             assertEquals(profileId, body.getString("InstanceProfileId"));
+            HttpResponse<String> roles = fixture.get("/" + version + "/meta-data/iam/security-credentials/", token);
+            assertEquals(200, roles.statusCode());
+            assertEquals(roleName, roles.body());
             instance.setIamInstanceProfileArn(profileArn.replace("/nodes/", "/other/"));
-            assertEquals(404, info(fixture, token).statusCode());
+            assertEquals(404, info(fixture, token, version).statusCode());
             instance.setIamInstanceProfileArn(profileArn);
             iamRequest("RemoveRoleFromInstanceProfile")
                     .formParam("InstanceProfileName", profileName).formParam("RoleName", roleName)
                     .post("/").then().statusCode(200);
             roleAdded = false;
-            assertEquals(404, info(fixture, token).statusCode());
+            assertEquals(404, info(fixture, token, version).statusCode());
             iamRequest("DeleteInstanceProfile").formParam("InstanceProfileName", profileName)
                     .post("/").then().statusCode(200);
             profileDeleted = true;
-            assertEquals(404, info(fixture, token).statusCode());
+            assertEquals(404, info(fixture, token, version).statusCode());
         } finally {
             if (roleAdded) {
                 iamRequest("RemoveRoleFromInstanceProfile")
@@ -155,7 +161,11 @@ class Ec2MetadataProfileIntegrationTest {
     }
 
     private static HttpResponse<String> info(Ec2MetadataTestFixture fixture, String token) throws Exception {
-        return fixture.get("/latest/meta-data/iam/info", token);
+        return info(fixture, token, "latest");
+    }
+
+    private static HttpResponse<String> info(Ec2MetadataTestFixture fixture, String token, String version) throws Exception {
+        return fixture.get("/" + version + "/meta-data/iam/info", token);
     }
 
     private static RequestSpecification iamRequest(String action) {

@@ -105,6 +105,10 @@ class Ec2MetadataTokenTest {
     @ParameterizedTest
     @ValueSource(strings = {
             "/latest/meta-data/instance-id",
+            "/latest/meta-data/services",
+            "/latest/meta-data/services/",
+            "/latest/meta-data/services/partition",
+            "/latest/meta-data/services/domain",
             "/latest/dynamic/instance-identity/document",
             "/latest/user-data",
             "/latest/meta-data/iam/info",
