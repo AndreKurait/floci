@@ -26,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class Ec2MetadataResponseTest {
 
@@ -43,10 +44,27 @@ class Ec2MetadataResponseTest {
     @Test
     void stalledBodyTimesOutAndCancelsTheExchange() throws Exception {
         try (BodyServer server = new BodyServer(true, false); HttpClient client = HttpClient.newHttpClient()) {
-            assertTimeoutPreemptively(Duration.ofSeconds(8), () ->
+            HttpTimeoutException failure = assertTimeoutPreemptively(Duration.ofSeconds(8), () ->
                     assertThrows(HttpTimeoutException.class, () -> Ec2MetadataTestFixture.sendResponse(
                             client, server.request(), HttpResponse.BodyHandlers.ofString())));
+            assertTrue(failure.getMessage().contains("statusCode=200, bytesReceived=1, bodyCompleted=false"),
+                    failure::getMessage);
             server.headersSent.get(3, TimeUnit.SECONDS);
+            server.completed.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void missingHeadersTimeoutDoesNotClaimAStalledBody() throws Exception {
+        try (BodyServer server = new BodyServer(true, false, true); HttpClient client = HttpClient.newHttpClient()) {
+            HttpTimeoutException failure = assertTimeoutPreemptively(Duration.ofSeconds(8), () ->
+                    assertThrows(HttpTimeoutException.class, () -> Ec2MetadataTestFixture.sendResponse(
+                            client, server.request(), HttpResponse.BodyHandlers.ofString())));
+            String diagnostic = failure.getMessage();
+            for (Throwable suppressed : failure.getSuppressed()) {
+                diagnostic += " " + suppressed.getMessage();
+            }
+            assertTrue(diagnostic.contains("statusCode=-1, bytesReceived=0, bodyCompleted=false"), diagnostic);
             server.completed.get(3, TimeUnit.SECONDS);
         }
     }
@@ -95,9 +113,13 @@ class Ec2MetadataResponseTest {
         private final Thread thread;
 
         BodyServer(boolean partial, boolean closeEarly) throws IOException {
+            this(partial, closeEarly, false);
+        }
+
+        BodyServer(boolean partial, boolean closeEarly, boolean holdHeaders) throws IOException {
             listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
             listener.setSoTimeout(5000);
-            thread = Thread.ofPlatform().start(() -> serve(partial, closeEarly));
+            thread = Thread.ofPlatform().start(() -> serve(partial, closeEarly, holdHeaders));
         }
 
         HttpRequest request() {
@@ -109,7 +131,7 @@ class Ec2MetadataResponseTest {
                     .timeout(timeout).GET().build();
         }
 
-        private void serve(boolean partial, boolean closeEarly) {
+        private void serve(boolean partial, boolean closeEarly, boolean holdHeaders) {
             try (Socket socket = listener.accept()) {
                 accepted.set(socket);
                 socket.setSoTimeout(10000);
@@ -118,6 +140,11 @@ class Ec2MetadataResponseTest {
                 do {
                     line = input.readLine();
                 } while (line != null && !line.isEmpty());
+                if (holdHeaders) {
+                    awaitCancellation(input);
+                    completed.complete(null);
+                    return;
+                }
                 OutputStream output = socket.getOutputStream();
                 output.write("HTTP/1.1 200 OK\r\nContent-Length: 16384\r\nConnection: close\r\n\r\n"
                         .getBytes(StandardCharsets.US_ASCII));
@@ -125,16 +152,20 @@ class Ec2MetadataResponseTest {
                 output.flush();
                 headersSent.complete(null);
                 if (partial && !closeEarly) {
-                    try {
-                        assertEquals(-1, input.read(), "Cancellation must close the client exchange");
-                    } catch (SocketException expected) {
-                        // Cancellation may reset the connection instead of sending EOF.
-                    }
+                    awaitCancellation(input);
                 }
                 completed.complete(null);
             } catch (Throwable failure) {
                 headersSent.completeExceptionally(failure);
                 completed.completeExceptionally(failure);
+            }
+        }
+
+        private static void awaitCancellation(BufferedReader input) throws IOException {
+            try {
+                assertEquals(-1, input.read(), "Cancellation must close the client exchange");
+            } catch (SocketException expected) {
+                // Cancellation may reset the connection instead of sending EOF.
             }
         }
 

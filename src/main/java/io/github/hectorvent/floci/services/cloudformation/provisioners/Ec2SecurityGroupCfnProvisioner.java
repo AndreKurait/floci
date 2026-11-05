@@ -110,7 +110,16 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
                     INGRESS_RULES_ATTR,
                     perms -> ec2Service.authorizeSecurityGroupIngress(region, sg.getGroupId(), perms),
                     perms -> ec2Service.revokeSecurityGroupIngress(region, sg.getGroupId(), perms));
-            reconcileRules(props, "SecurityGroupEgress", sg.getIpPermissionsEgress(), engine, peerGroupId, r,
+            List<IpPermission> egress = sg.getIpPermissionsEgress();
+            JsonNode declaredEgress = props == null ? null : props.get("SecurityGroupEgress");
+            if (reconciled == null && declaredEgress != null && declaredEgress.isArray()
+                    && !declaredEgress.isEmpty() && !egress.isEmpty()) {
+                // A newly created group owns EC2's implicit defaults. Existing groups retain
+                // independent rules through the ordinary template-rule ownership check below.
+                ec2Service.revokeSecurityGroupEgress(region, sg.getGroupId(), List.copyOf(egress));
+                egress = List.of();
+            }
+            reconcileRules(props, "SecurityGroupEgress", egress, engine, peerGroupId, r,
                     EGRESS_RULES_ATTR,
                     perms -> ec2Service.authorizeSecurityGroupEgress(region, sg.getGroupId(), perms),
                     perms -> ec2Service.revokeSecurityGroupEgress(region, sg.getGroupId(), perms));
