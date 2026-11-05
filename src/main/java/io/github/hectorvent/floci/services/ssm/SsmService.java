@@ -1579,7 +1579,7 @@ public class SsmService implements ResourceProvider {
         association.setMaxConcurrency(maxConcurrency);
         association.setComplianceSeverity(complianceSeverity);
         association.setAssociationVersion("1");
-        // Storing a configuration does not execute it. State Manager execution is not implemented.
+        // Execution starts only when a targeted agent discovers this association.
         association.setStatus(new SsmAssociation.AssociationStatus(
                 "Pending", "Awaiting association execution", now, null));
         association.setOverview(new SsmAssociation.AssociationOverview("Pending", "Creating"));
@@ -1657,6 +1657,68 @@ public class SsmService implements ResourceProvider {
 
     public List<SsmAssociation> listAssociations(String region) {
         return listAssociations(region, Map.of());
+    }
+
+    synchronized void recordAssociationExecution(String associationId, String expectedVersion, String instanceId,
+                                                 SsmAssociation.InstanceExecution execution,
+                                                 Set<String> targetedInstances, String region) {
+        SsmAssociation association = describeAssociation(associationId, null, null, region);
+        if (!Objects.equals(expectedVersion, associationVersion(association))) {
+            throw new AwsException("InvalidAssociationVersion",
+                    "The association version must match the latest version.", 400);
+        }
+        Map<String, SsmAssociation.InstanceExecution> executions = new HashMap<>(association.getInstanceExecutions());
+        SsmAssociation.InstanceExecution previous = executions.get(instanceId);
+        if (previous != null && expectedVersion.equals(previous.associationVersion())
+                && (previous.executionDate().isAfter(execution.executionDate())
+                || (previous.executionDate().equals(execution.executionDate())
+                && isTerminalExecution(previous.status()) && !isTerminalExecution(execution.status())))) {
+            return;
+        }
+        executions.put(instanceId, execution);
+        association.setInstanceExecutions(executions);
+        List<String> statuses = targetedInstances.stream().map(id -> {
+            SsmAssociation.InstanceExecution reported = executions.get(id);
+            return reported != null && expectedVersion.equals(reported.associationVersion())
+                    ? reported.status() : "Pending";
+        }).toList();
+        boolean failed = statuses.stream().anyMatch(status ->
+                isTerminalExecution(status) && !"Success".equals(status));
+        String status = failed ? "Failed"
+                : !statuses.isEmpty() && statuses.stream().allMatch("Success"::equals) ? "Success" : "Pending";
+        String detail = "Pending".equals(status) && statuses.contains("InProgress") ? "InProgress" : status;
+        Instant last = association.getLastExecutionDate();
+        if (last == null || execution.executionDate().isAfter(last)) {
+            association.setLastExecutionDate(execution.executionDate());
+        }
+        association.setStatus(new SsmAssociation.AssociationStatus(
+                status, "Latest execution reported by targeted agents", association.getLastExecutionDate(), null));
+        association.setOverview(new SsmAssociation.AssociationOverview(status, detail));
+        associationStore.put(regionKey(region, associationId), association);
+    }
+
+    private static boolean isTerminalExecution(String status) {
+        return !"Pending".equals(status) && !"InProgress".equals(status);
+    }
+
+    static String associationVersion(SsmAssociation association) {
+        return Long.toString(parseAssociationVersion(association.getAssociationVersion()));
+    }
+
+    static String resolveDocumentVersion(SsmDocument document, String requested) {
+        String version;
+        if (requested == null || requested.isBlank() || "$DEFAULT".equals(requested)) {
+            version = String.valueOf(document.getDefaultVersion());
+        } else if ("$LATEST".equals(requested)) {
+            version = String.valueOf(document.getDocumentVersion());
+        } else {
+            version = requested;
+        }
+        if (!document.hasRetainedContent(version)) {
+            throw new AwsException("InvalidDocumentVersion",
+                    "The document version is not valid or does not exist.", 400);
+        }
+        return version;
     }
 
     public List<SsmAssociation> listAssociations(String region, Map<String, List<String>> filters) {

@@ -140,7 +140,8 @@ The destination must be in the same partition and must not use S3 Object Lock.
 The worker interval defaults to 1,000 ms and is configurable with
 `FLOCI_SERVICES_SSM_RESOURCE_DATA_SYNC_INTERVAL_MS`. Explorer `SyncFromSource`,
 Organizations data sharing and `AWSKMSKeyARN` are explicitly unsupported.
-Native agent collection and State Manager scheduling remain separate features.
+Collection and scheduling require a running SSM agent and an association. Resource
+data sync exports the inventory that managed nodes actually report.
 
 ### CloudFormation inventory destinations
 
@@ -202,11 +203,23 @@ it does not run Patch Manager or prove that managed nodes installed patches.
 ## State Manager associations
 
 Association create, describe, list, update and delete operations store and return the
-configuration. Floci does not yet schedule or execute associations. New associations
-therefore remain `Pending` and have no `LastExecutionDate`. An update marks the new
-association version pending while preserving any previously stored execution timestamp.
-Association creation is not evidence that a document ran, inventory was collected or
-a target became compliant. The Run Command execution paths below are separate.
+configuration. A running SSM agent discovers its configuration through
+`ListInstanceAssociations`, fetches the selected version with `GetDocument`, and executes
+the document using its own plugins and schedule. Discovery supports legacy instance
+associations, `InstanceIds` targets, and live EC2 tag targets in the caller's account
+and region.
+
+New associations remain `Pending` until an agent reports execution through
+`UpdateInstanceAssociationStatus`. Reports retain each node's association version,
+status and execution date. One successful target does not complete other pending
+targets. Older reports cannot overwrite newer executions, and a delayed progress
+report cannot undo a completed execution at the same date. An updated association
+requires reports for its new version.
+
+These agent APIs do not provide centralized dispatch, concurrency/error budgets,
+resource-group target resolution, or compliance aggregation. Association creation
+alone does not prove that a document ran or inventory was collected. The Run Command
+execution paths below are separate.
 
 CloudFormation `AWS::SSM::Association` creates that backing configuration and returns
 its ID through both `Ref` and `Fn::GetAtt AssociationId`. Document references, target
