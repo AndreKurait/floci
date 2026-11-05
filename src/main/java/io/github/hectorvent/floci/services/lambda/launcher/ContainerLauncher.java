@@ -572,7 +572,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     }
 
     private static boolean mountsRuntimeJavaTrustStore(LambdaDockerFlags flags, String image) {
-        if (image == null || !image.startsWith("public.ecr.aws/lambda/java:")) {
+        if (image == null
+                || !image.startsWith("public.ecr.aws/lambda/java:")) { // partition-literal: fixed public runtime image
             return false;
         }
         List<String> stores = List.of("/var/lang/lib/security/cacerts",
