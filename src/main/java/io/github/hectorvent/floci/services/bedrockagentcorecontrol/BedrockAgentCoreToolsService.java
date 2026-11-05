@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.bedrockagentcorecontrol;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -17,14 +18,12 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class BedrockAgentCoreToolsService {
 
     private static final Pattern TOOL_NAME = Pattern.compile("[a-zA-Z][a-zA-Z0-9_]{0,47}");
-    private static final String ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
     private final StorageBackend<String, ObjectNode> storage;
     private final RegionResolver regionResolver;
@@ -67,7 +66,7 @@ public class BedrockAgentCoreToolsService {
             throw new AwsException("ConflictException", "Browser already exists: " + name, 409);
         }
 
-        String id = name + "-" + random(10);
+        String id = name + "-" + BedrockAgentCoreControllerSupport.randomAlphanumeric(10);
         Instant now = Instant.now();
         ObjectNode browser = request.deepCopy();
         browser.put("browserId", id);
@@ -81,7 +80,7 @@ public class BedrockAgentCoreToolsService {
 
     public ObjectNode getBrowser(String browserId, String region) {
         if ("aws.browser.v1".equals(browserId)) {
-            ObjectNode browser = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+            ObjectNode browser = JsonNodeFactory.instance.objectNode();
             browser.put("browserId", browserId);
             browser.put("browserArn", regionResolver.buildArn("bedrock-agentcore", region, "browser/" + browserId));
             browser.put("name", browserId);
@@ -122,7 +121,7 @@ public class BedrockAgentCoreToolsService {
         if (findByName("browser-profile", region, name) != null) {
             throw new AwsException("ConflictException", "Browser profile already exists: " + name, 409);
         }
-        String id = name + "-" + random(10);
+        String id = name + "-" + BedrockAgentCoreControllerSupport.randomAlphanumeric(10);
         Instant now = Instant.now();
         ObjectNode profile = request.deepCopy();
         profile.put("profileId", id);
@@ -160,7 +159,7 @@ public class BedrockAgentCoreToolsService {
         if (findByName("code-interpreter", region, name) != null) {
             throw new AwsException("ConflictException", "Code interpreter already exists: " + name, 409);
         }
-        String id = name + "-" + random(10);
+        String id = name + "-" + BedrockAgentCoreControllerSupport.randomAlphanumeric(10);
         Instant now = Instant.now();
         ObjectNode interpreter = request.deepCopy();
         interpreter.put("codeInterpreterId", id);
@@ -175,7 +174,7 @@ public class BedrockAgentCoreToolsService {
 
     public ObjectNode getCodeInterpreter(String codeInterpreterId, String region) {
         if ("aws.codeinterpreter.v1".equals(codeInterpreterId)) {
-            ObjectNode interpreter = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+            ObjectNode interpreter = JsonNodeFactory.instance.objectNode();
             interpreter.put("codeInterpreterId", codeInterpreterId);
             interpreter.put("codeInterpreterArn", AwsArnUtils.Arn.of("bedrock-agentcore", region, "aws",
                     "code-interpreter/aws.codeinterpreter.v1").toString());
@@ -445,13 +444,6 @@ public class BedrockAgentCoreToolsService {
         return value == null || value.isNull() ? null : value.asText();
     }
 
-    private static String random(int length) {
-        StringBuilder value = new StringBuilder(length);
-        for (int i = 0; i < length; i++) {
-            value.append(ALNUM.charAt(ThreadLocalRandom.current().nextInt(ALNUM.length())));
-        }
-        return value.toString();
-    }
 
     private static String key(String family, String region, String id) {
         return prefix(family, region) + id;

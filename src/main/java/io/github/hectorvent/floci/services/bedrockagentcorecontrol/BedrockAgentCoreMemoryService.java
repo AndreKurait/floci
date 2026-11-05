@@ -18,7 +18,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
@@ -30,7 +29,6 @@ public class BedrockAgentCoreMemoryService {
     private static final String ARN_SERVICE = "bedrock-agentcore";
     private static final String STATUS_ACTIVE = "ACTIVE";
     private static final String STATUS_DELETING = "DELETING";
-    private static final String ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     private static final int MAX_PAGE = 100;
 
     private final StorageBackend<String, Memory> storage;
@@ -89,7 +87,7 @@ public class BedrockAgentCoreMemoryService {
         }
         validateExpiry(eventExpiryDuration);
         Instant now = Instant.now();
-        String id = sanitize(name) + "-" + random(10);
+        String id = sanitize(name) + "-" + BedrockAgentCoreControllerSupport.randomAlphanumeric(10);
         Memory memory = new Memory();
         memory.setMemoryId(id);
         memory.setName(name);
@@ -226,11 +224,11 @@ public class BedrockAgentCoreMemoryService {
 
     /** The memory a memory ARN names; ValidationException for any other ARN, ResourceNotFoundException when gone. */
     public Memory getByArn(String region, String arn) {
-        String[] parts = arn == null ? new String[0] : arn.split(":");
-        if (parts.length < 6 || !parts[5].startsWith("memory/")) {
+        String resource = BedrockAgentCoreArns.resource(arn);
+        if (resource == null || !resource.startsWith("memory/")) {
             throw new AwsException("ValidationException", "Unsupported resource ARN: " + arn, 400);
         }
-        return get(parts[5].substring("memory/".length()), region);
+        return get(resource.substring("memory/".length()), region);
     }
 
     private static String sanitize(String name) {
@@ -241,13 +239,6 @@ public class BedrockAgentCoreMemoryService {
         return s.length() > 60 ? s.substring(0, 60) : s;
     }
 
-    private static String random(int len) {
-        StringBuilder sb = new StringBuilder(len);
-        for (int i = 0; i < len; i++) {
-            sb.append(ALNUM.charAt(ThreadLocalRandom.current().nextInt(ALNUM.length())));
-        }
-        return sb.toString();
-    }
 
     private static String key(String region, String id) {
         return keyPrefix(region) + id;

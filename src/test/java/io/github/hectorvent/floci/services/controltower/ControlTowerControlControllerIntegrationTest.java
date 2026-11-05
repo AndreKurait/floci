@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.controltower;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -10,6 +11,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 
 @QuarkusTest
 class ControlTowerControlControllerIntegrationTest {
@@ -42,6 +44,25 @@ class ControlTowerControlControllerIntegrationTest {
                 .then().statusCode(200).extract().path("operationIdentifier");
         post("/get-control-operation", "{\"operationIdentifier\":\"" + reset + "\"}")
                 .then().statusCode(200).body("controlOperation.operationType", equalTo("RESET_ENABLED_CONTROL"));
+    }
+
+    @Test
+    void enabledControlTagsCanBeListedAddedAndRemoved() {
+        String control = "arn:aws:controltower:us-east-1::control/AWS-GR_EBS_OPTIMIZED_INSTANCE";
+        String target = "arn:aws:organizations::000000000000:ou/o-example/ou-example-tagged01";
+        String enabledArn = post("/enable-control", "{\"controlIdentifier\":\"" + control
+                + "\",\"targetIdentifier\":\"" + target + "\",\"tags\":{\"env\":\"test\"}}")
+                .then().statusCode(200).extract().path("arn");
+
+        given().header("Authorization", auth()).get("/tags/" + enabledArn)
+                .then().statusCode(200).body("tags.env", equalTo("test"));
+        given().contentType("application/json").header("Authorization", auth())
+                .body("{\"tags\":{\"team\":\"platform\"}}").post("/tags/" + enabledArn)
+                .then().statusCode(204);
+        given().header("Authorization", auth()).queryParam("tagKeys", "env").delete("/tags/" + enabledArn)
+                .then().statusCode(204);
+        given().header("Authorization", auth()).get("/tags/" + enabledArn)
+                .then().statusCode(200).body("tags.team", equalTo("platform")).body("tags.env", nullValue());
     }
 
     @Test
@@ -81,7 +102,7 @@ class ControlTowerControlControllerIntegrationTest {
                 .then().statusCode(400).body("__type", containsString("ValidationException"));
     }
 
-    private static io.restassured.response.Response post(String path, String body) {
+    private static Response post(String path, String body) {
         return given().contentType("application/json").header("Authorization", auth()).body(body).post(path);
     }
 

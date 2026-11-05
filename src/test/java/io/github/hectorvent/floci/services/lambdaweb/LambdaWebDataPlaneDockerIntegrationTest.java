@@ -79,6 +79,7 @@ class LambdaWebDataPlaneDockerIntegrationTest {
             const http = require('node:http');
             const [host, port] = process.env.AWS_LAMBDA_HTTP_ENDPOINT.split(':');
             console.log('starting');
+            const STALE_DATE = 'Thu, 01 Jan 2015 00:00:00 GMT';
             if (process.env.MODE === 'throw') { throw new Error('init boom'); }
             if (process.env.MODE === 'exit') { process.exit(1); }
             if (process.env.MODE === 'missing') { require('no-such-module'); }
@@ -117,6 +118,12 @@ class LambdaWebDataPlaneDockerIntegrationTest {
                 }, (e) => { res.statusCode = 500; res.end(String(e)); });
                 return;
               }
+              if (req.url === '/date/none') { res.sendDate = false; res.end('none'); return; }
+              if (req.url === '/date/stale') { res.setHeader('Date', STALE_DATE); res.end('stale'); return; }
+              if (req.url === '/date/lower') { res.setHeader('date', STALE_DATE); res.end('lower'); return; }
+              if (req.url === '/type/none') { res.end('none'); return; }
+              if (req.url === '/type/empty') { res.end(); return; }
+              if (req.url === '/type/lower') { res.setHeader('content-type', 'application/x-custom'); res.end('lower'); return; }
               if (req.url.startsWith('/crash')) { setTimeout(() => process.exit(1), 50); return; }
               if (req.url.startsWith('/exit')) { res.end('bye', () => process.exit(0)); return; }
               let body = '';
@@ -127,7 +134,7 @@ class LambdaWebDataPlaneDockerIntegrationTest {
                   env: {endpoint: process.env.AWS_LAMBDA_HTTP_ENDPOINT, init: process.env.AWS_LAMBDA_INITIALIZATION_TYPE,
                         exec: process.env.AWS_EXECUTION_ENV, account: process.env.AWS_ACCOUNT_ID,
                         region: process.env.AWS_REGION, custom: process.env.CUSTOM},
-                  execArgv: process.execArgv}));
+                  execArgv: process.execArgv, heapSizeLimit: require('node:v8').getHeapStatistics().heap_size_limit}));
               });
             }).listen(Number(port), host);
             """;
@@ -236,6 +243,31 @@ class LambdaWebDataPlaneDockerIntegrationTest {
                 .body("headers.authorization", nullValue())
                 .body("headers.x-amz-security-token", nullValue())
                 .body("headers.x-amz-date", equalTo("20260101T000000Z"));
+
+        // The platform writes its own Date in place of the app's, as on AWS. A lowercase date passes beside it.
+        String own = "Date: [A-Z][a-z]{2}, \\d{2} [A-Z][a-z]{2} \\d{4} \\d{2}:\\d{2}:\\d{2} GMT";
+        String stale = "Thu, 01 Jan 2015 00:00:00 GMT";
+
+        List<String> none = headerLines(domain, "/date/none", "date");
+        assertEquals(1, none.size(), none.toString());
+        assertTrue(none.getFirst().matches(own), none.toString());
+
+        List<String> replaced = headerLines(domain, "/date/stale", "date");
+        assertEquals(1, replaced.size(), replaced.toString());
+        assertTrue(replaced.getFirst().matches(own) && !replaced.getFirst().endsWith(stale), replaced.toString());
+
+        List<String> lowercase = headerLines(domain, "/date/lower", "date");
+        assertEquals(2, lowercase.size(), lowercase.toString());
+        assertTrue(lowercase.getFirst().matches(own), lowercase.toString());
+        assertEquals("date: " + stale, lowercase.get(1));
+
+        // An answer without a Content-Type gets text/plain unless its Content-Length is 0, as on AWS. An app's
+        // content-type goes out as Content-Type.
+        String plain = "Content-Type: text/plain; charset=utf-8";
+        assertEquals(List.of(plain), headerLines(domain, "/type/none", "content-type"));
+        assertEquals(List.of(plain), headerLines(domain, "/status/204", "content-type"));
+        assertEquals(List.of(), headerLines(domain, "/type/empty", "content-type"));
+        assertEquals(List.of("Content-Type: application/x-custom"), headerLines(domain, "/type/lower", "content-type"));
     }
 
     @Test
@@ -371,6 +403,14 @@ class LambdaWebDataPlaneDockerIntegrationTest {
                 .when().get(presigned.pathAndQuery())
                 .then().statusCode(200)
                 .body("url", equalTo(presigned.pathAndQuery()));
+
+        // SigV4a for a region set that covers the region passes, and loses its signature the same way.
+        LambdaWebRequestSigner.Signed asymmetric = new LambdaWebRequestSigner().sigV4a("us-*").sign("GET", domain, "/a");
+        given().header("Host", domain).headers(asymmetric.headers())
+                .when().get("/a")
+                .then().statusCode(200)
+                .body("headers.authorization", nullValue())
+                .body("headers.x-amz-region-set", equalTo("us-*"));
     }
 
     @Test
@@ -767,7 +807,8 @@ class LambdaWebDataPlaneDockerIntegrationTest {
 
         given().header("Host", domain).when().get("/").then().statusCode(200)
                 .body("execArgv", contains("--expose-gc", "--max-http-header-size", "135168",
-                        "--no-experimental-require-module", "--max-old-space-size=1536"));
+                        "--no-experimental-require-module", "--max-old-space-size=1536"))
+                .body("heapSizeLimit", equalTo(1811939328));
     }
 
     @Test
@@ -890,6 +931,15 @@ class LambdaWebDataPlaneDockerIntegrationTest {
             InputStream in = socket.getInputStream();
             return new String(in.readAllBytes(), StandardCharsets.UTF_8);
         }
+    }
+
+    /** The {@code name} header lines of the answer to {@code path}, in their case and order. */
+    private static List<String> headerLines(String domain, String path, String name) throws Exception {
+        String response = raw("GET " + path + " HTTP/1.1\r\nHost: " + domain + "\r\nConnection: close\r\n\r\n");
+        String head = response.substring(0, response.indexOf("\r\n\r\n"));
+        String prefix = name + ":";
+        return List.of(head.split("\r\n")).stream()
+                .filter(line -> line.regionMatches(true, 0, prefix, 0, prefix.length())).toList();
     }
 
     private static byte[] zip(String indexJs) throws IOException {
