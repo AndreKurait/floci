@@ -376,7 +376,6 @@ class EcsStablePortRolloutServiceTest {
     @Test
     void daemonStillReplacesItsTaskAfterStoppingItWithoutHostPublishing() {
         try (Harness harness = new Harness(PublicationMode.PRIVATE_AWSVPC)) {
-            harness.ecs.registerContainerInstance(CLUSTER, null, List.of(), REGION);
             harness.createService("web", Map.of("minimumHealthyPercent", 0), "DAEMON");
             harness.ecs.reconcileServices();
             EcsTask original = harness.runningTasks("web").getFirst();
@@ -467,6 +466,8 @@ class EcsStablePortRolloutServiceTest {
                     mock(EcsLoadBalancerRegistrar.class), new InMemoryStorageFactory("000000000000"), null);
             ecs.initializeStorage();
             ecs.createCluster(CLUSTER, REGION);
+            // EC2 tasks are placed on a registered container instance, as on ECS.
+            ecs.registerContainerInstance(CLUSTER, null, List.of(), REGION);
             registerTaskDefinition(publication == PublicationMode.BRIDGE_DYNAMIC
                     || publication == PublicationMode.STABLE_AWSVPC_IMPLICIT
                     ? List.of(new PortMapping(8080)) : List.of(new PortMapping(8080, 8080, "tcp")));
