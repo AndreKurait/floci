@@ -12,12 +12,17 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
+import java.nio.ByteBuffer;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
@@ -131,20 +136,77 @@ final class Ec2MetadataTestFixture implements AutoCloseable {
     static <T> HttpResponse<T> sendResponse(HttpClient client, HttpRequest request,
                                            HttpResponse.BodyHandler<T> bodyHandler) throws Exception {
         Duration timeout = request.timeout().orElseThrow();
-        CompletableFuture<HttpResponse<T>> response = client.sendAsync(request, bodyHandler);
+        ResponseProgress<T> progress = new ResponseProgress<>(bodyHandler);
+        CompletableFuture<HttpResponse<T>> response = client.sendAsync(request, progress);
         try {
             return response.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException expired) {
-            HttpTimeoutException failure = new HttpTimeoutException("IMDS response body did not complete within " + timeout);
+            HttpTimeoutException failure = new HttpTimeoutException("IMDS response did not complete within " + timeout
+                    + "; " + progress.describe());
             failure.initCause(expired);
             throw failure;
         } catch (ExecutionException failure) {
             if (failure.getCause() instanceof Exception cause) {
+                if (cause instanceof HttpTimeoutException) {
+                    cause.addSuppressed(new IllegalStateException(progress.describe()));
+                }
                 throw cause;
             }
             throw failure;
         } finally {
             response.cancel(true);
+        }
+    }
+
+    private static final class ResponseProgress<T> implements HttpResponse.BodyHandler<T> {
+        private final HttpResponse.BodyHandler<T> delegate;
+        private final AtomicLong bytesReceived = new AtomicLong();
+        private volatile int statusCode = -1;
+        private volatile boolean bodyCompleted;
+
+        private ResponseProgress(HttpResponse.BodyHandler<T> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public HttpResponse.BodySubscriber<T> apply(HttpResponse.ResponseInfo info) {
+            statusCode = info.statusCode();
+            HttpResponse.BodySubscriber<T> subscriber = delegate.apply(info);
+            return new HttpResponse.BodySubscriber<>() {
+                @Override
+                public CompletionStage<T> getBody() {
+                    return subscriber.getBody();
+                }
+
+                @Override
+                public void onSubscribe(Flow.Subscription subscription) {
+                    subscriber.onSubscribe(subscription);
+                }
+
+                @Override
+                public void onNext(List<ByteBuffer> buffers) {
+                    for (ByteBuffer buffer : buffers) {
+                        bytesReceived.addAndGet(buffer.remaining());
+                    }
+                    subscriber.onNext(buffers);
+                }
+
+                @Override
+                public void onError(Throwable failure) {
+                    subscriber.onError(failure);
+                }
+
+                @Override
+                public void onComplete() {
+                    bodyCompleted = true;
+                    subscriber.onComplete();
+                }
+            };
+        }
+
+        private String describe() {
+            return "IMDS response progress: statusCode=" + statusCode + ", bytesReceived=" + bytesReceived.get()
+                    + ", bodyCompleted=" + bodyCompleted;
         }
     }
 
