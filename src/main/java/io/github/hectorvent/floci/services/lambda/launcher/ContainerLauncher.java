@@ -309,7 +309,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
-                awsEnv.flociEndpoint(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
+                awsEnv.flociEndpointWithTls(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
         if (vpcNetwork != null && config.network().vpcRouting().enabled()
                 && config.network().vpcRouting().publicAwsApi()) {
             env.removeIf(value -> value.startsWith("AWS_ENDPOINT_URL="));

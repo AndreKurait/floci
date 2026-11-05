@@ -1522,14 +1522,16 @@ class ContainerLauncherTest {
                 eq("us-east-1"), eq("lambda:custom-logs-fn"), any());
     }
 
-    @Test
-    void launchFunction_endpointUsesListenPortNotAdvertisedBaseUrlPort() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void launchFunction_endpointUsesConfiguredTransportAndContainerPort(boolean tlsEnabled) throws Exception {
         // docker run -p 4811:4566 -e FLOCI_BASE_URL=http://localhost:4811: 4811 exists only on the
         // host. The function container reaches Floci over the Docker network, where it listens on
         // quarkus.http.port (4566, set in setUp), so that is the port AWS_ENDPOINT_URL must carry.
         Path codePath = Files.createDirectory(tempDir.resolve("endpoint-port"));
         // lenient: the fixed code never reads base-url here; the stub sets up the mismatch.
         lenient().when(config.baseUrl()).thenReturn("http://localhost:4811");
+        when(config.tls().enabled()).thenReturn(tlsEnabled);
 
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("endpoint-port-fn");
@@ -1540,7 +1542,8 @@ class ContainerLauncherTest {
         launcher.launch(fn);
 
         List<String> env = captureRealContainerSpec().env();
-        assertTrue(env.contains("AWS_ENDPOINT_URL=http://127.0.0.1:4566"), env.toString());
+        String scheme = tlsEnabled ? "https" : "http";
+        assertTrue(env.contains("AWS_ENDPOINT_URL=" + scheme + "://127.0.0.1:4566"), env.toString());
     }
 
     @Test
