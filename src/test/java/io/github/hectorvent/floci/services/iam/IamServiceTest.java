@@ -118,6 +118,13 @@ class IamServiceTest {
         assertFalse(service.isRoleSession("ASIAUSER", "user-token"));
         assertFalse(service.isRoleSession("ASIAFEDERATED", "federated-token"));
         assertFalse(service.isRoleSession("ASIAUNKNOWN", "token"));
+        // An EC2 instance-profile session is not role chaining: on AWS a process on the instance may
+        // assume a role for longer than an hour (an SDK config session may ask for 8 h).
+        SessionCredential instance = new SessionCredential("ASIAINSTANCE", "secret", "instance-token",
+                role.getArn(), clock.instant().plusSeconds(60), null, "000000000000");
+        instance.setEc2InstanceId("i-0abc000000000001");
+        service.registerEc2InstanceSession(instance);
+        assertFalse(service.isRoleSession("ASIAINSTANCE", "instance-token"));
         clock.advance(Duration.ofSeconds(60));
         assertFalse(service.isRoleSession("ASIACHAIN", "token"));
     }
@@ -2722,16 +2729,40 @@ class IamServiceTest {
                 accountId, accessKeyId, "secret", "token",
                 "arn:aws:iam::222233334444:role/R", Instant.now().plusSeconds(900), null);
 
-        assertTrue(service.spectrumScratchResourceArn(accessKeyId).isEmpty());
+        assertTrue(service.scratchResourceArn(accessKeyId).isEmpty());
 
         String scratchArn = "arn:aws:s3:::floci-internal-redshift-spectrum-scratch/spectrum-1234.csv";
-        service.registerSpectrumScratchResource(accessKeyId, scratchArn);
+        service.registerScratchResource(accessKeyId, scratchArn);
 
-        assertEquals(Optional.of(scratchArn), service.spectrumScratchResourceArn(accessKeyId));
+        assertEquals(Optional.of(scratchArn), service.scratchResourceArn(accessKeyId));
 
-        service.clearSpectrumScratchResource(accessKeyId);
+        service.clearScratchResource(accessKeyId);
 
-        assertTrue(service.spectrumScratchResourceArn(accessKeyId).isEmpty());
+        assertTrue(service.scratchResourceArn(accessKeyId).isEmpty());
+    }
+
+    @Test
+    void unloadScratchPrefixRegistrationAndClear() {
+        String accountId = "222233334444";
+        String accessKeyId = "ASIAUNLOAD";
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+
+        service.registerSessionForAccount(
+                accountId, accessKeyId, "secret", "token",
+                "arn:aws:iam::222233334444:role/R", Instant.now().plusSeconds(900), null);
+
+        assertTrue(service.scratchResourceArn(accessKeyId).isEmpty());
+
+        String scratchArn = "arn:aws:s3:::floci-internal-redshift-unload-staging/unload/123e4567-e89b-12d3-a456-426614174000/";
+        service.registerScratchResource(accessKeyId, scratchArn);
+
+        assertEquals(Optional.of(scratchArn), service.scratchResourceArn(accessKeyId));
+
+        service.registerScratchResource(accessKeyId, null);
+
+        assertTrue(service.scratchResourceArn(accessKeyId).isEmpty());
     }
 
     // =========================================================================

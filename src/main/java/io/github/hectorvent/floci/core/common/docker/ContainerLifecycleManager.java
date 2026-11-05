@@ -134,7 +134,7 @@ public class ContainerLifecycleManager {
 
     /** Starts a disposable container, reclaiming its anonymous volumes if startup fails. */
     public ContainerInfo createAndStartEphemeral(ContainerSpec spec) {
-        return createAndStart(spec, true);
+        return createAndStart(spec, null, true, containerId -> { });
     }
 
     /**
@@ -144,23 +144,31 @@ public class ContainerLifecycleManager {
      * @param platform Docker platform, such as {@code linux/amd64}, or null for the daemon's own
      */
     public ContainerInfo createAndStartEphemeral(ContainerSpec spec, String platform) {
-        return createAndStart(spec, platform, true);
+        return createAndStart(spec, platform, true, containerId -> { });
+    }
+
+    /**
+     * {@link #createAndStartEphemeral(ContainerSpec, String)} that runs {@code beforeStart} on the
+     * created container before it starts, e.g. to join it to additional networks. A failure there
+     * removes the container as a failed start does.
+     */
+    public ContainerInfo createAndStartEphemeral(ContainerSpec spec, String platform,
+                                                 java.util.function.Consumer<String> beforeStart) {
+        return createAndStart(spec, platform, true, beforeStart);
     }
 
     private ContainerInfo createAndStart(ContainerSpec spec, boolean removeAnonymousVolumes) {
-        String resolvedImage = imageCacheService.ensureImageExists(spec.image());
-        return createAndStart(spec, resolvedImage, null, removeAnonymousVolumes);
+        return createAndStart(spec, null, removeAnonymousVolumes, containerId -> { });
     }
 
-    private ContainerInfo createAndStart(ContainerSpec spec, String platform, boolean removeAnonymousVolumes) {
-        String resolvedImage = imageCacheService.ensureImageExists(spec.image(), platform);
-        return createAndStart(spec, resolvedImage, platform, removeAnonymousVolumes);
-    }
-
-    private ContainerInfo createAndStart(ContainerSpec spec, String resolvedImage, String platform,
-                                         boolean removeAnonymousVolumes) {
+    private ContainerInfo createAndStart(ContainerSpec spec, String platform, boolean removeAnonymousVolumes,
+                                         java.util.function.Consumer<String> beforeStart) {
+        String resolvedImage = platform == null
+                ? imageCacheService.ensureImageExists(spec.image())
+                : imageCacheService.ensureImageExists(spec.image(), platform);
         String containerId = create(spec, resolvedImage, platform, removeAnonymousVolumes);
         try {
+            beforeStart.accept(containerId);
             return withPublishedHostPorts(startCreated(containerId, spec), spec);
         } catch (RuntimeException failure) {
             removeFailedContainer(containerId, failure, removeAnonymousVolumes);
@@ -967,6 +975,51 @@ public class ContainerLifecycleManager {
             // Already gone — nothing to do.
         } catch (Exception e) {
             throw new IllegalStateException("Failed to remove volume " + volumeName, e);
+        }
+    }
+
+    /**
+     * Creates the bridge network {@code networkName} with {@code labels}, as {@link #ensureVolume(String, Map)} does a
+     * volume, when Docker has no network of that name; one that exists is used as it is. Containers on it reach each
+     * other, and containers on no other network reach them through it.
+     */
+    public void ensureNetwork(String networkName, Map<String, String> labels) {
+        try {
+            dockerClient.inspectNetworkCmd().withNetworkId(networkName).exec();
+            return;
+        } catch (NotFoundException e) {
+            // Made below.
+        }
+        dockerClient.createNetworkCmd()
+                .withName(networkName)
+                .withDriver("bridge")
+                .withLabels(mergedLabels(labels))
+                .exec();
+        LOG.debugv("Created network {0}", networkName);
+    }
+
+    /** Connects the created container {@code containerId} to {@code networkName} too, before it starts. */
+    public void connectToNetwork(String containerId, String networkName) {
+        dockerClient.connectToNetworkCmd()
+                .withContainerId(containerId)
+                .withNetworkId(networkName)
+                .exec();
+    }
+
+    /**
+     * Removes the network {@code networkName}: true once it is gone, false when Docker kept it, as
+     * {@link #removeVolume} says of a volume.
+     */
+    public boolean removeNetwork(String networkName) {
+        try {
+            dockerClient.removeNetworkCmd(networkName).exec();
+            LOG.debugv("Removed network {0}", networkName);
+            return true;
+        } catch (NotFoundException e) {
+            return true;
+        } catch (Exception e) {
+            LOG.warnv("Error removing network {0}: {1}", networkName, e.getMessage());
+            return false;
         }
     }
 

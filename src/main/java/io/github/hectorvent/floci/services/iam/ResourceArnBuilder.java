@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
@@ -1593,13 +1594,7 @@ public class ResourceArnBuilder {
             }
         }
         if (queueUrl != null && !queueUrl.isEmpty()) {
-            String queueName = queueUrl.substring(queueUrl.lastIndexOf('/') + 1);
-            String parent = queueUrl.substring(0, Math.max(0, queueUrl.lastIndexOf('/')));
-            String owner = parent.substring(parent.lastIndexOf('/') + 1);
-            if (owner.matches("[0-9]{12}")) {
-                accountId = owner;
-            }
-            return AwsArnUtils.Arn.of("sqs", region, accountId, queueName).toString();
+            return SqsService.queueArn(queueUrl, AwsRegions.partitionFor(region), region, accountId);
         }
         return AwsArnUtils.Arn.of("sqs", region, accountId, "*").toString();
     }

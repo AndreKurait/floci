@@ -45,6 +45,7 @@ import java.util.stream.Collectors;
 public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider, VpcDependencyProvider {
 
     private static final Logger LOG = Logger.getLogger(ElbV2Service.class);
+    private static final String DEFAULT_SSL_POLICY = "ELBSecurityPolicy-2016-08";
     /** {@code LoadBalancerTypeEnum}, in the model's order. */
     private static final List<String> LOAD_BALANCER_TYPES = List.of("application", "network", "gateway");
 
@@ -88,9 +89,47 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
 
+    /** The accounts of {@code floci.services.elbv2.single-zone-alb-accounts}; see {@link #minimumAlbZones}. */
+    private Set<String> singleZoneAlbAccounts = Set.of();
+
+    /**
+     * Reads {@code floci.services.elbv2.single-zone-alb-accounts} and refuses, at startup, a value that
+     * is not a 12-digit account id, so a typo cannot silently leave the exception off.
+     */
+    void readSingleZoneAlbAccounts() {
+        if (config == null) {
+            singleZoneAlbAccounts = Set.of();
+            return;
+        }
+        // Entries are trimmed, and a blank one (an empty value or a trailing comma) lists nothing, so
+        // "111111111111, 222222222222" lists both and blanking the setting turns it off.
+        List<String> accounts = config.services().elbv2().singleZoneAlbAccounts().orElse(List.of()).stream()
+                .filter(account -> account != null && !account.isBlank())
+                .map(String::trim)
+                .toList();
+        for (String account : accounts) {
+            if (!account.matches("[0-9]{12}")) {
+                throw new IllegalStateException("floci.services.elbv2.single-zone-alb-accounts must list 12-digit"
+                        + " account ids, not '" + account + "'");
+            }
+        }
+        singleZoneAlbAccounts = Set.copyOf(accounts);
+    }
+
+    /**
+     * The fewest Availability Zones an Application Load Balancer of the calling account takes. AWS
+     * requires two; Floci lowers that to one for the accounts
+     * {@code floci.services.elbv2.single-zone-alb-accounts} lists. Nothing is listed by default.
+     */
+    private int minimumAlbZones() {
+        return !singleZoneAlbAccounts.isEmpty() && singleZoneAlbAccounts.contains(regionResolver.getAccountId())
+                ? 1 : 2;
+    }
+
     @PostConstruct
     void initializeStorage()
     {
+        readSingleZoneAlbAccounts();
         if (storageFactory == null) {
             return;
         }
@@ -301,11 +340,12 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * a SetSubnets that names none, and {@link #setSubnets} on a list that names some, once it has the
      * balancer's type; whether the subnets span two Availability Zones is checked after they are looked
      * up. No public report shows what AWS answers a SetSubnets with one subnet, so it gets the create
-     * message and order.
+     * message and order. For an account granted single-zone ALBs ({@link #minimumAlbZones}) one subnet
+     * is enough, and none still gets the Application Load Balancer message.
      */
-    private static void requireSubnets(String lbType, List<String> subnets) {
+    private void requireSubnets(String lbType, List<String> subnets) {
         int count = subnets == null ? 0 : subnets.size();
-        if ("application".equals(lbType) && count < 2) {
+        if ("application".equals(lbType) && count < minimumAlbZones()) {
             throw new AwsException("ValidationError",
                     "At least two subnets in two different Availability Zones must be specified", 400);
         }
@@ -711,7 +751,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         listener.setLoadBalancerArn(lbArn);
         listener.setPort(port);
         listener.setProtocol(protocol != null ? protocol : ("gateway".equals(lbType) ? "GENEVE" : "HTTP"));
-        listener.setSslPolicy(sslPolicy);
+        listener.setSslPolicy(sslPolicy == null && servesCertificates(listener.getProtocol())
+                ? DEFAULT_SSL_POLICY : sslPolicy);
         listener.setCertificates(certificates != null ? new ArrayList<>(certificates) : new ArrayList<>());
         listener.setDefaultActions(defaultActions != null ? new ArrayList<>(defaultActions) : new ArrayList<>());
         listener.setAlpnPolicy(alpnPolicy != null ? new ArrayList<>(alpnPolicy) : new ArrayList<>());
@@ -856,9 +897,11 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             ListenerState initialState = listenerState(initial, initialLb);
             requireAvailableListenerPort(listeners.getOrDefault(region, Map.of()), initial.getLoadBalancerArn(),
                     listenerArn, port != null ? port : initialState.port());
-            if (validateExistingListener(region, initialState, initialLb, () ->
-                    requireListenerCertificates(region, protocol != null ? protocol : initialState.protocol(),
-                            certificates != null ? certificates : initialState.certificates()))) {
+            if (validateExistingListener(region, initialState, initialLb, () -> {
+                requireListenerProtocolTransition(initialState.protocol(), protocol, sslPolicy, certificates);
+                requireListenerCertificates(region, protocol != null ? protocol : initialState.protocol(),
+                        certificates != null ? certificates : initialState.certificates());
+            })) {
                 break;
             }
         }
@@ -867,9 +910,11 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             LoadBalancer lb = requireLoadBalancer(region, listener.getLoadBalancerArn());
             ListenerState expected = listenerState(listener, lb);
             Listener prospective = prospectiveListener(expected, protocol, port, certificates);
+            boolean clearSecuritySettings = clearsSecuritySettings(expected.protocol(), protocol);
             requireAvailableListenerPort(listeners.getOrDefault(region, Map.of()), listener.getLoadBalancerArn(),
                     listenerArn, prospective.getPort());
             if (!validateExistingListener(region, expected, lb, () -> {
+                requireListenerProtocolTransition(expected.protocol(), protocol, sslPolicy, certificates);
                 requireListenerCertificates(region, prospective.getProtocol(), prospective.getCertificates());
                 requireCompatibleListenerProtocol(listenerArn, prospective.getPort(), prospective.getProtocol());
             })) {
@@ -889,11 +934,13 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     if (protocol != null) {
                         listener.setProtocol(protocol);
                     }
-                    if (sslPolicy != null) {
+                    if (clearSecuritySettings) {
+                        listener.setSslPolicy(null);
+                    } else if (sslPolicy != null) {
                         listener.setSslPolicy(sslPolicy);
                     }
-                    if (certificates != null) {
-                        listener.setCertificates(new ArrayList<>(certificates));
+                    if (certificates != null || clearSecuritySettings) {
+                        listener.setCertificates(new ArrayList<>(prospective.getCertificates()));
                     }
                     if (alpnPolicy != null) {
                         listener.setAlpnPolicy(new ArrayList<>(alpnPolicy));
@@ -1315,8 +1362,32 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         prospective.setLoadBalancerArn(expected.listener().getLoadBalancerArn());
         prospective.setPort(port != null ? port : expected.port());
         prospective.setProtocol(protocol != null ? protocol : expected.protocol());
-        prospective.setCertificates(new ArrayList<>(certificates != null ? certificates : expected.certificates()));
+        prospective.setCertificates(clearsSecuritySettings(expected.protocol(), protocol) ? new ArrayList<>()
+                : new ArrayList<>(certificates != null ? certificates : expected.certificates()));
         return prospective;
+    }
+
+    private static boolean clearsSecuritySettings(String currentProtocol, String newProtocol) {
+        return ("HTTPS".equalsIgnoreCase(currentProtocol) && "HTTP".equalsIgnoreCase(newProtocol))
+                || ("TLS".equalsIgnoreCase(currentProtocol) && "TCP".equalsIgnoreCase(newProtocol));
+    }
+
+    private static void requireListenerProtocolTransition(String currentProtocol, String newProtocol,
+                                                          String sslPolicy, List<String> certificates) {
+        boolean requiresSecuritySettings =
+                ("HTTP".equalsIgnoreCase(currentProtocol) && "HTTPS".equalsIgnoreCase(newProtocol))
+                || ("TCP".equalsIgnoreCase(currentProtocol) && "TLS".equalsIgnoreCase(newProtocol));
+        if (!requiresSecuritySettings) {
+            return;
+        }
+        if (certificates == null || certificates.isEmpty()) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "A default certificate is required when changing the listener protocol to " + newProtocol + ".", 400);
+        }
+        if (sslPolicy == null) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "An SSL policy is required when changing the listener protocol to " + newProtocol + ".", 400);
+        }
     }
 
     private void requireCanonicalLoadBalancer(String region, LoadBalancer lb) {
@@ -1571,7 +1642,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     .map(Subnet::getAvailabilityZone)
                     .distinct()
                     .count();
-            if (distinctAvailabilityZones < 2) {
+            if (distinctAvailabilityZones < minimumAlbZones()) {
                 throw new AwsException("InvalidConfigurationRequest",
                         "Application Load Balancers must be attached to subnets in at least two Availability Zones.", 400);
             }

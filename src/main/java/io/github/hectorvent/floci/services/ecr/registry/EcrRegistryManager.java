@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.C
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerPresence;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerNetworks;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
@@ -366,14 +367,15 @@ public class EcrRegistryManager {
             existing = lifecycleManager.findByName(adoptedName);
         }
         if (existing.isPresent()) {
-            if (hasLoopbackBinding(existing.get())) {
+            if (!hasLoopbackBinding(existing.get())) {
+                LOG.infov("Recreating ECR backing registry {0} with a loopback-only port binding", adoptedName);
+            } else if (!onAnotherNetwork(existing.get())) {
                 this.activeContainerName = adoptedName;
                 adoptExisting(existing.get());
                 runReconcileOnce();
                 return;
             }
             // Recreated under the current name; the data volume is resolved by its own probe.
-            LOG.infov("Recreating ECR backing registry {0} with a loopback-only port binding", adoptedName);
             lifecycleManager.stopAndRemove(existing.get().getId(), null);
         }
         this.activeContainerName = name;
@@ -729,6 +731,12 @@ public class EcrRegistryManager {
     private void rememberRegistryAddress(ContainerInfo info) {
         EndpointInfo endpoint = info.getEndpoint(CONTAINER_INTERNAL_PORT);
         this.registryAddress = endpoint != null ? endpoint.toString() : null;
+    }
+
+    // Floci in a container reaches the registry over the Docker network; on the host it uses the loopback port.
+    private boolean onAnotherNetwork(Container survivor) {
+        return containerDetector.isRunningInContainer() && ContainerNetworks.onAnotherNetwork(
+                survivor, containerBuilder.resolveDockerNetwork(resolveRegistryDockerNetwork()).orElse(null));
     }
 
     private static boolean hasLoopbackBinding(Container container) {

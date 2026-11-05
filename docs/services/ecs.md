@@ -396,6 +396,14 @@ timestamps, `AvailabilityZone`, `LaunchType`, `ServiceName` for a service's task
 EC2 task, and, for Fargate, `ClockDrift` and `EphemeralStorageMetrics`. Floci has no clock drift to
 report and does not meter the disk, so those two report a synchronized clock and zero usage.
 
+Every task container carries the Docker labels the ECS agent sets: `com.amazonaws.ecs.task-arn`,
+`com.amazonaws.ecs.container-name`, `com.amazonaws.ecs.task-definition-family`,
+`com.amazonaws.ecs.task-definition-version` (the revision) and `com.amazonaws.ecs.cluster`, so
+`docker ps --filter label=com.amazonaws.ecs.task-arn=<task ARN>` finds a task's containers as on an
+ECS host. As on ECS they override the same keys in the definition's `dockerLabels`; Floci's own
+`io.floci.*` labels still win. The cluster label is the cluster ARN (the agent writes its configured
+`ECS_CLUSTER`, a name or an ARN). A container's metadata reports the same labels under `Labels`.
+
 An `awsvpc` container's `Networks` object describes the task ENI and the subnet it sits in:
 `NetworkMode`, `IPv4Addresses`, `AttachmentIndex`, `MACAddress`, `PrivateDNSName`,
 `IPv4SubnetCIDRBlock`, `SubnetGatewayIpv4Address`, `DomainNameServers` and `DomainNameSearchList`.
@@ -496,8 +504,11 @@ Known differences from AWS:
 
 - There is never a second `ACTIVE` deployment draining alongside the `PRIMARY` one.
   The running tasks *are* rolled onto a changed task definition (replacements on the new
-  revision start first, then the stale tasks are drained, one reconciler tick apart), but
+  revision normally start first, then the stale tasks are drained, one reconciler tick apart), but
   the deployments list reports only the single `PRIMARY` throughout.
+  A Docker-backed `REPLICA` service with an explicit `minimumHealthyPercent: 0` stops
+  stale tasks first when their fixed published ports conflict with the replacement's ports.
+  See [stable-port replacement](#stable-port-replacement) below.
 - `deployments` is reported for every service. AWS omits it for services that use the
   `CODE_DEPLOY` or `EXTERNAL` deployment controller; Floci records and echoes
   `deploymentController` (along with `schedulingStrategy` and
@@ -508,7 +519,7 @@ Known differences from AWS:
   `CODE_DEPLOY` / `EXTERNAL` controllers, as on AWS. Placement constraints are not evaluated.
 - `pendingCount` is always `0`, matching the top-level service field.
 - `forceNewDeployment` (with an unchanged task definition) mints a new deployment `id`
-  and rolls the running tasks: a replacement on the new deployment starts first, then
+  and rolls the running tasks: a replacement on the new deployment normally starts first, then
   the task from the previous deployment is drained one reconciler tick later. The
   `deployments` list still reports a single `PRIMARY` throughout.
 - `updatedAt` starts at `createdAt` and advances when the deployment status changes.
@@ -725,6 +736,12 @@ re-registered `containerInstanceArn` all round-trip. The agent version is report
 `versionInfo`, which is where the `ContainerInstance` shape puts it, not as a top-level
 `agentVersion`. An instance also reports `registeredAt` and a `version` counter that each state
 change increments.
+
+The emulator-specific `floci.iam-instance-profile` registration attribute names the
+EC2 instance profile used by the container instance's IMDS. It must be an IAM
+instance-profile ARN in the registering account and the request region's partition,
+with an empty ARN region. Registration validates that identity; IMDS checks that
+the profile exists in IAM when serving credentials.
 
 `DeregisterContainerInstance` leaves the instance in the cluster as `INACTIVE` rather than
 dropping it, so a later `DescribeContainerInstances` still answers for it, as on AWS. A cluster's
@@ -1115,6 +1132,33 @@ With dynamic allocation enabled, host-side clients must use each task's reported
 port. Load balancers inside Docker use the container's Docker-network address and
 container port; native load balancers use the published host port. Bridge/host-mode
 explicit bindings retain their existing fixed-port behavior.
+
+### Stable-port replacement
+
+A Docker-backed `REPLICA` service can reuse a stable published host port across
+deployments by explicitly setting `deploymentConfiguration.minimumHealthyPercent`
+to `0`. When a stale task holds a fixed port needed by the replacement, the scheduler
+stops that task before placing the replacement. This applies both to forced deployments
+of the same task definition and to task-definition changes that reuse the port.
+
+The task stays `STOPPING` until Docker confirms removal of every container and any
+security-group namespace helper that owns its published ports. Incomplete removal is
+retried on later ticks. Stops run in the background so a slow graceful stop
+does not hold up unrelated services. Task protection still applies: a protected stale
+task keeps its port and delays replacement until its protection expires or is disabled.
+
+For `awsvpc`, stable ports require `FLOCI_SERVICES_ECS_PUBLISH_AWSVPC_PORTS_TO_HOST=true`
+and `FLOCI_SERVICES_ECS_DYNAMIC_AWSVPC_HOST_PORTS=false`. An explicit non-zero
+`hostPort` is stable, and an omitted or zero `hostPort` uses `containerPort`. Explicit
+fixed bindings in bridge/host modes can also be reused this way. Dynamic ports and
+nonconflicting port changes keep the replacement-first behavior, as do services with
+positive or omitted minima. `DAEMON` scheduling is unchanged.
+Collision detection follows the actual Docker publisher, which currently publishes
+every mapping as TCP: changing a declared protocol alone does not free the host port.
+
+This permits an outage at the stable endpoint. Zero is a minimum healthy percentage,
+not a general requirement for AWS to stop tasks first. Floci does not implement the
+full percentage-based deployment scheduler.
 
 ## Examples
 

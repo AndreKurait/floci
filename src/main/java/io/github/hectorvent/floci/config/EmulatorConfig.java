@@ -2104,15 +2104,17 @@ public interface EmulatorConfig {
         /**
          * The image a {@code docker} step uses, with {@code %s} standing for the cluster's release label,
          * for example "registry.internal/emr-serverless/spark/%s:20250425". If omitted, Floci uses the
-         * release's public EMR Serverless image on Amazon ECR Public.
+         * release's public EMR Serverless image on Amazon ECR Public. Every cluster also runs its HDFS in
+         * {@link #hiveImageTemplate()}'s image, so a mirror names both.
          */
         Optional<String> imageTemplate();
 
         /**
-         * The EMR Serverless Hive image a {@code docker} cluster with Hive takes Hive from, into the image its
-         * bootstrap and steps run in, as {@link #imageTemplate()} names the image Hive is added to, for example
-         * "registry.internal/emr-serverless/hive/%s:20250425". If omitted, Floci uses the release's public EMR
-         * Serverless Hive image on Amazon ECR Public.
+         * The EMR Serverless Hive image every {@code docker} cluster runs its HDFS in, and a cluster with Hive takes
+         * Hive from, into the image its bootstrap and steps run in, as {@link #imageTemplate()} names the image Hive
+         * is added to, for example "registry.internal/emr-serverless/hive/%s:20250425". If omitted, Floci uses the
+         * release's public EMR Serverless Hive image on Amazon ECR Public. An emr-spark-* release has none, so its
+         * clusters run their HDFS in emr-7.5.0's.
          */
         Optional<String> hiveImageTemplate();
 
@@ -2526,6 +2528,27 @@ public interface EmulatorConfig {
         String hostPortBindAddress();
 
         Optional<String> dockerNetwork();
+
+        /**
+         * Additional Docker create flags applied to every ECS task container, with the grammar of
+         * {@code floci.services.lambda.docker-flags} ({@code --dns}, {@code --add-host},
+         * {@code -v}, {@code --env}, {@code --label}, ...). A {@code --dns} server replaces Floci's
+         * embedded DNS. When set, task containers are not given Floci's SDK endpoint variables
+         * ({@code AWS_ENDPOINT_URL}, {@code FLOCI_ENDPOINT}, {@code FLOCI_HOSTNAME}): they reach
+         * AWS by its real names through the configured DNS, as on ECS.
+         *
+         * Env var: FLOCI_SERVICES_ECS_DOCKER_FLAGS
+         */
+        Optional<String> dockerFlags();
+
+        /**
+         * Additional existing Docker networks an ECS task container joins before it starts. The
+         * primary network remains selected by docker-network or docker-flags. Not applied to
+         * awsvpc tasks, whose containers share their task's network namespace.
+         *
+         * Env var: FLOCI_SERVICES_ECS_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
 
         @WithDefault("512")
         int defaultMemoryMb();
@@ -3855,6 +3878,13 @@ public interface EmulatorConfig {
         /** Optional local probe interval ceiling; zero preserves each target group's interval. */
         @WithDefault("0")
         long maxHealthCheckIntervalMillis();
+
+        /**
+         * Accounts (12-digit ids) whose Application Load Balancers may be in a single Availability
+         * Zone, for local setups that model single-zone deployments. AWS refuses an ALB in fewer than
+         * two zones. Unset (the default) keeps the two-zone rule for every account.
+         */
+        Optional<List<String>> singleZoneAlbAccounts();
     }
 
     interface EksServiceConfig {
@@ -4103,6 +4133,9 @@ public interface EmulatorConfig {
 
         /** Path to PEM private key file. Env: FLOCI_TLS_KEY_PATH */
         Optional<String> keyPath();
+
+        /** PEM certificates appended to workload trust bundles. Env: FLOCI_TLS_EXTRA_CA_CERTS */
+        Optional<String> extraCaCerts();
 
         /**
          * Auto-generate a server certificate when no cert-path/key-path is provided. The leaf is

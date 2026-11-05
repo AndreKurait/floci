@@ -28,6 +28,9 @@ public class ChangeSet {
     private List<ResourceToImport> resourcesToImport = List.of();
     private Map<String, String> importPhysicalIds = Map.of();
     private Instant creationTime = Instant.now();
+    // AWS change sets carry no stack policy; this is the policy a CreateStack or UpdateStack
+    // applies with its change set.
+    private String stackPolicyBody;
 
     public String getChangeSetId() { return changeSetId; }
     public void setChangeSetId(String changeSetId) { this.changeSetId = changeSetId; }
@@ -65,4 +68,6 @@ public class ChangeSet {
     }
     public Instant getCreationTime() { return creationTime; }
     public void setCreationTime(Instant creationTime) { this.creationTime = creationTime; }
+    public String getStackPolicyBody() { return stackPolicyBody; }
+    public void setStackPolicyBody(String stackPolicyBody) { this.stackPolicyBody = stackPolicyBody; }
 }

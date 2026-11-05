@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.DockerFlags;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
@@ -58,7 +59,7 @@ public class LambdaVpcNetworkManager {
     }
 
     Optional<Attachment> prepare(LambdaFunction function, String resourceId, String runtimeHost, int runtimePort,
-                                 LambdaDockerFlags flags) {
+                                 DockerFlags flags) {
         if (!firewall.enabled()) {
             return Optional.empty();
         }

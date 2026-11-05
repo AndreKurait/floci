@@ -4501,6 +4501,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public boolean isRoleSession(String accessKeyId, String sessionToken) {
         return currentSession(accessKeyId)
                 .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                // An EC2 instance-profile session is the instance's own identity, not role chaining.
+                .filter(session -> session.getEc2InstanceId() == null)
                 .map(SessionCredential::getRoleArn)
                 .filter(AwsArnUtils::isArn)
                 .map(AwsArnUtils::parse)
@@ -5020,28 +5022,21 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                         session.getPresignedAction(), session.getPresignedResourceArn()));
     }
 
-    /** Binds a Redshift Spectrum scratch object ARN to an active transfer role session. */
-    public void registerSpectrumScratchResource(String accessKeyId, String resourceArn) {
+    /** Binds, or clears with null, an internal S3 scratch scope for this transfer session. */
+    public void registerScratchResource(String accessKeyId, String resourceArn) {
         currentSession(accessKeyId).ifPresent(session -> {
-            session.setSpectrumScratchResourceArn(resourceArn);
+            session.setScratchResourceArn(resourceArn);
             String accountId = session.getOriginAccountId() != null ? session.getOriginAccountId() : "000000000000";
             putSessionForAccount(accountId, accessKeyId, session);
         });
     }
 
-    /** Clears the Spectrum scratch object permission from the session when the transfer completes. */
-    public void clearSpectrumScratchResource(String accessKeyId) {
-        currentSession(accessKeyId).ifPresent(session -> {
-            session.setSpectrumScratchResourceArn(null);
-            String accountId = session.getOriginAccountId() != null ? session.getOriginAccountId() : "000000000000";
-            putSessionForAccount(accountId, accessKeyId, session);
-        });
+    public void clearScratchResource(String accessKeyId) {
+        registerScratchResource(accessKeyId, null);
     }
 
-    /** The exact scratch object ARN permitted for this session, if it is a Spectrum transfer session. */
-    public Optional<String> spectrumScratchResourceArn(String accessKeyId) {
-        return currentSession(accessKeyId)
-                .map(SessionCredential::getSpectrumScratchResourceArn)
+    public Optional<String> scratchResourceArn(String accessKeyId) {
+        return currentSession(accessKeyId).map(SessionCredential::getScratchResourceArn)
                 .filter(arn -> arn != null && !arn.isBlank());
     }
 
