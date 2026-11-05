@@ -72,6 +72,46 @@ class Ec2ImageResourceArnTest {
                         "eu-west-1", "aws"));
     }
 
+    @Test
+    void groupRuleOperationsAuthorizeTheTargetGroupWithItsAccount() {
+        for (String operation : List.of("AuthorizeSecurityGroupIngress", "AuthorizeSecurityGroupEgress",
+                "RevokeSecurityGroupIngress", "RevokeSecurityGroupEgress")) {
+            assertEquals(List.of("arn:aws:ec2:eu-west-1:111122223333:security-group/sg-12345678"),
+                    resources(operation, "GroupId=sg-12345678", "eu-west-1", "aws"), operation);
+        }
+    }
+
+    @Test
+    void aReferencedPeerGroupDoesNotBecomeTheAuthorizationTarget() {
+        assertEquals(List.of("arn:aws:ec2:eu-west-1:111122223333:security-group/sg-12345678"),
+                resources("AuthorizeSecurityGroupIngress",
+                        "IpPermissions.1.Groups.1.GroupId=sg-87654321&GroupId=sg-12345678",
+                        "eu-west-1", "aws"));
+    }
+
+    @Test
+    void mixedTagsKeepTheGroupAccountAndAccountlessImageFormat() {
+        for (String operation : List.of("CreateTags", "DeleteTags")) {
+            assertEquals(List.of("arn:aws-cn:ec2:cn-north-1:111122223333:security-group/sg-12345678",
+                            "arn:aws-cn:ec2:cn-north-1::image/ami-12345678"),
+                    resources(operation, "ResourceId.1=sg-12345678&ResourceId.2=ami-12345678",
+                            "cn-north-1", "aws-cn"), operation);
+        }
+    }
+
+    @Test
+    void groupRuleOperationsPreserveTheRequestPartition() {
+        assertEquals(List.of("arn:aws-us-gov:ec2:us-gov-west-1:111122223333:security-group/sg-12345678"),
+                resources("RevokeSecurityGroupIngress", "GroupId=sg-12345678",
+                        "us-gov-west-1", "aws-us-gov"));
+    }
+
+    @Test
+    void groupDescriptionsRemainUnscopedWithAGroupSelector() {
+        assertEquals(List.of("*"),
+                resources("DescribeSecurityGroups", "GroupId.1=sg-12345678", "eu-west-1", "aws"));
+    }
+
     private List<String> resources(String operation, String body, String region, String partition) {
         ContainerRequestContext context = mock(ContainerRequestContext.class);
         UriInfo uri = mock(UriInfo.class);
