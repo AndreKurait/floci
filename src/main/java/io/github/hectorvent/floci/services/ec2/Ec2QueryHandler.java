@@ -1130,7 +1130,7 @@ public class Ec2QueryHandler {
         if ((id == null || id.isBlank()) && (name == null || name.isBlank())) {
             return null;
         }
-        return service.resolveLaunchTemplateData(region, id, name, version, decodeUserData);
+        return service.resolveRunInstancesLaunchTemplateData(region, id, name, version, decodeUserData);
     }
 
     /**

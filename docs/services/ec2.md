@@ -2,6 +2,27 @@
 
 **Protocol:** EC2 Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 
+## Launch and cleanup IAM
+
+With IAM enforcement enabled, `RunInstances` checks the selected image, subnet,
+security groups and key pair, plus the instance, volume and network-interface
+resources it creates or uses. Request overrides replace inherited launch-template
+values. `ec2:LaunchTemplate` contains the selected template ARN, including when
+the request names the template instead of its ID.
+
+The caller needs `iam:PassRole` for the instance profile actually used, including
+a profile inherited from a numeric, default or latest template version.
+The launch uses the same template snapshot that passed authorization, so a
+concurrent change to the default or latest version cannot substitute another
+profile after the permission check. Repeating an authorized numeric-template
+request with the same client token returns the original instance.
+Requested launch tags also require `ec2:CreateTags`; `ec2:CreateAction=RunInstances`
+limits that permission to creation. `TerminateInstances` checks every instance
+ARN with its own resource tags before changing any instance in the batch.
+These checks support the [EC2 launch and lifecycle policy examples](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ExamplePolicies_EC2.html).
+They do not add the other EC2 launch condition keys, such as volume encryption
+or instance-type restrictions.
+
 ## Instance Execution Model
 
 `RunInstances` launches a **real Docker container** for each instance. By default, the `minimal` guest runtime overrides the image's CMD with `tail -f /dev/null`. Catalog entries can instead select `systemd`, which starts `/sbin/init` with the mounts needed for a systemd-based cloud-image guest, or `image`, which preserves the image's own ENTRYPOINT and CMD.
