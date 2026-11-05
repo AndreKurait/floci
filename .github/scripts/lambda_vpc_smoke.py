@@ -154,11 +154,12 @@ def exercise_lambda_vpc(smoke, docker):
 
     body = template(smoke)
     (smoke.output / "lambda-vpc-template.json").write_text(json.dumps(body, indent=2) + "\n")
-    stack = smoke.aws(
-        "cloudformation", "create-stack", StackName=smoke.owner + "-lambda",
-        TemplateBody=json.dumps(body), Capabilities=["CAPABILITY_IAM"])["StackId"]
+    stack = smoke.owner + "-lambda"
     result["stack"] = stack
     try:
+        result["stack_id"] = smoke.aws(
+            "cloudformation", "create-stack", StackName=stack,
+            TemplateBody=json.dumps(body), Capabilities=["CAPABILITY_IAM"])["StackId"]
         smoke.aws("cloudformation", "wait", "stack-create-complete", StackName=stack, timeout=150)
         outputs = {row["OutputKey"]: row["OutputValue"] for row in smoke.aws(
             "cloudformation", "describe-stacks", StackName=stack)["Stacks"][0]["Outputs"]}

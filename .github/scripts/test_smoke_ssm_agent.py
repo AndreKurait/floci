@@ -1,9 +1,13 @@
 """Readiness checks must survive registration latency without hiding API errors."""
+import hashlib
 import importlib.util
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
+
+import lambda_vpc_smoke
 
 
 spec = importlib.util.spec_from_file_location(
@@ -98,6 +102,84 @@ class NativeImageCliTest(unittest.TestCase):
                 self.subject.aws("iam", "create-role", RoleName="example")
         self.assertIs(error, observed.exception)
 
+
+
+class AllocationCleanupTest(unittest.TestCase):
+    def test_accepted_stack_with_lost_create_response_is_deleted_by_name(self):
+        self.check_stack_cleanup("create-stack", False)
+
+    def test_stack_wait_failure_still_deletes_by_known_name(self):
+        self.check_stack_cleanup("wait", False)
+
+    def test_cleanup_failure_preserves_the_original_create_error(self):
+        self.check_stack_cleanup("create-stack", True)
+
+    def check_stack_cleanup(self, failing_operation, cleanup_fails):
+        with tempfile.TemporaryDirectory() as directory:
+            subject = Mock(owner="owned-fixture", output=Path(directory), record={})
+            primary = RuntimeError("accepted request lost its response")
+            deleted = []
+
+            def aws(service, operation, *arguments, **parameters):
+                if operation == "delete-stack":
+                    deleted.append(parameters["StackName"])
+                    if cleanup_fails:
+                        raise RuntimeError("cleanup unavailable")
+                elif operation == "describe-stack-events":
+                    return {"StackEvents": []}
+                elif operation == failing_operation and arguments != ("stack-delete-complete",):
+                    raise primary
+                return {"StackId": "returned-stack-id"}
+
+            subject.aws.side_effect = aws
+            with patch.object(lambda_vpc_smoke, "template", return_value={}):
+                with self.assertRaises(RuntimeError) as observed:
+                    lambda_vpc_smoke.exercise_lambda_vpc(subject, Mock())
+            self.assertIs(primary, observed.exception)
+            self.assertEqual(["owned-fixture-lambda"], deleted)
+            result = subject.record["lambda_vpc"]
+            self.assertEqual(not cleanup_fails, result["stack_deleted"])
+            if cleanup_fails:
+                self.assertIn("cleanup unavailable", result["cleanup_error"])
+                self.assertIn("cleanup unavailable", primary.__notes__[0])
+
+    def test_build_log_failure_still_removes_the_created_guest_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subject = smoke.Smoke.__new__(smoke.Smoke)
+            subject.owner = "owned-fixture"
+            subject.image = subject.helper = "example@sha256:digest"
+            subject.work = Path(directory)
+            subject.output = Mock()
+            subject.output.__truediv__ = Mock(return_value=Mock())
+            subject.output.__truediv__.return_value.write_text.side_effect = OSError("disk full")
+            subject.guest_image = "owned-fixture-guest"
+            subject.guest = None
+            subject.cli, subject.server, subject.network = "cli", "server", "network"
+            subject.created = {}
+            subject.record = {"cleanup_errors": []}
+            subject.before, subject.daemon = {}, "daemon"
+            package = b"test package"
+            response = Mock()
+            response.__enter__ = Mock(return_value=Mock(read=Mock(return_value=package)))
+            response.__exit__ = Mock(return_value=False)
+
+            def docker(*arguments, **options):
+                if arguments[:2] == ("info", "--format"):
+                    return Mock(stdout="amd64" if arguments[2] == "{{.Architecture}}" else "daemon")
+                return Mock(stdout="", stderr="", returncode=1 if "inspect" in arguments else 0)
+
+            with patch.object(smoke, "docker", side_effect=docker) as commands, \
+                    patch.object(smoke, "footprint", return_value={}), \
+                    patch.object(smoke.os, "environ", {"DOCKER_HOST": "unix:///test.sock"}), \
+                    patch.object(smoke, "AGENT_SHA256", hashlib.sha256(package).hexdigest()), \
+                    patch.object(smoke.urllib.request, "urlopen", return_value=response):
+                try:
+                    with self.assertRaisesRegex(OSError, "disk full"):
+                        subject.prepare()
+                finally:
+                    subject.cleanup()
+                commands.assert_any_call("image", "rm", "owned-fixture-guest")
+            self.assertTrue(subject.record["cleanup_passed"])
 
 if __name__ == "__main__":
     unittest.main()

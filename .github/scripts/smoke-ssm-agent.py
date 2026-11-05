@@ -141,8 +141,8 @@ class Smoke:
         )
         built = docker("build", "--platform", "linux/amd64", "--tag", self.guest_image,
                        str(self.work), timeout=240)
-        (self.output / "guest-build.log").write_text(built.stdout + built.stderr)
         self.created["guest_image"] = True
+        (self.output / "guest-build.log").write_text(built.stdout + built.stderr)
         guest_image = json.loads(docker("image", "inspect", self.guest_image).stdout)[0]
         self.record["guest_image_id"] = guest_image["Id"]
         self.record["agent_rpm_sha256"] = AGENT_SHA256
