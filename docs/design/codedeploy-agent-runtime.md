@@ -12,8 +12,8 @@ The guest uses its own credentials and the configured emulator endpoints.
 The requested `DISALLOW`, `OVERWRITE` or `RETAIN` file behavior is included in
 the signed specification and applied by the agent.
 
-The initial implementation targets S3 zip, tar and tgz revisions and in-place
-deployment without load-balancer traffic control. It selects existing
+The runtime targets S3 zip, tar and tgz revisions and in-place deployments,
+with optional Classic load-balancer traffic control. It selects existing
 `InService` Auto Scaling members and EC2 instances matched by the group's tags,
 deduplicating instances selected both ways. Stopped EC2 instances remain targets;
 they must receive the command or encounter the normal agent-start deadline.
@@ -21,14 +21,43 @@ they must receive the command or encounter the normal agent-start deadline.
 `OneAtATime` sends work to one instance at a time, stops after an early failure,
 and permits the documented last-instance failure when preceding instances
 succeeded. `AllAtOnce` starts all selected hosts and requires at least one
-successful deployment. Half-at-a-time and custom health policies, traffic
-control, and automatic rollback are rejected before queuing agent commands.
+successful deployment. Half-at-a-time and custom health policies, target-group
+traffic control, blue/green Server deployments, and automatic rollback are
+rejected before queuing agent commands.
 Prior revision-health scheduling and Auto Scaling launch hooks are not
 implemented. Group membership cannot establish that newly launched instances
 received the last successful revision.
 Enabled deployment alarms, restart mode, outdated-instance filtering, ignored
 stop failures, and per-request rollback, alarm, target or EC2-process overrides
 are rejected rather than silently discarded.
+
+## Classic load-balancer traffic
+
+An `IN_PLACE` group with `WITH_TRAFFIC_CONTROL` names its Classic load balancers
+in `loadBalancerInfo.elbInfoList`. Each instance runs `BeforeBlockTraffic`,
+`BlockTraffic` and `AfterBlockTraffic` before the ordinary installation phases,
+then `BeforeAllowTraffic`, `AllowTraffic` and `AfterAllowTraffic` after
+`ValidateService`. The AWS agent executes the four surrounding hooks, including
+its normal selection of the previous successful revision for the blocking
+hooks. Floci performs the two reserved traffic operations.
+
+`BlockTraffic` deregisters the instance from each selected balancer and waits
+until its existing connections have drained. `AllowTraffic` registers it and
+waits for `InService` health from every selected balancer. These checks read the
+same membership, frontend connection and health state as the Classic APIs.
+They do not substitute a timer for application health or connection completion.
+The traffic deadline is one hour; a test may inject a shorter deadline.
+
+The deployment captures the owning account, Region, service role and balancer
+names before starting workers. Each operation uses that account's request
+scope and evaluates the configured CodeDeploy service role's trust, policies,
+permissions boundary and SCPs. Register/deregister permissions use the
+balancer ARN and current resource tags. `DescribeInstanceHealth` uses `*`,
+as required by its AWS authorization model. A missing permission fails the
+traffic phase and the deployment response names the denied action. A concurrent
+deployment failure or explicit stop releases other workers waiting for traffic
+state. Cancellation does not re-register an instance or report a stopped
+application healthy.
 
 ## Supported actions
 
@@ -99,6 +128,17 @@ blocked on a pipe, and subsequent recovery. The fixture launches the agent's
 foreground master in the background so user data can finish; it checks that
 bootstrap continued before deploying.
 
+`CodeDeployClassicTrafficIntegrationTest` checks the public SDK path in
+nondefault accounts and Regions, including current tag conditions and the
+unscoped health-read permission. Its mailbox replies simulate an agent.
+`CodeDeployClassicTrafficDockerIntegrationTest` instead uses the stock agent
+and a Classic frontend with actual connections: a held request blocks draining,
+missing HTTP health blocks registration, and an explicit stop prevents later
+hooks. Traffic control also applies to the first deployment, when no previous
+revision exists. A later deployment recovers both guests. Its private HTTP fixture
+does not establish production TLS, caller NAT routing or a native service rollout.
+The two Docker tests share the same agent image and ASG/S3 setup.
+
 The SDK compatibility suite's `CodeDeployAgentTest` verifies signed
 specifications and command completion against the standalone server, including
 native-image CI. It simulates the agent protocol and verifies the CMS signature;
@@ -106,5 +146,5 @@ the Docker fixture supplies the separate guest-installation evidence.
 
 Configuration-only API tests, a command-protocol simulator and a
 `CreateDeployment` success response are insufficient. Native AMI initialization,
-load-balancer admission and Auto Scaling launch hooks remain separate
+complete service rollouts and Auto Scaling launch hooks remain separate
 qualifications until their real paths execute.

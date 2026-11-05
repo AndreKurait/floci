@@ -34,6 +34,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 
 /** Coordinates real host-agent commands; the agent owns bundle download, AppSpec and script execution. */
 @ApplicationScoped
@@ -42,6 +43,9 @@ public class CodeDeployAgentDeployment {
     private static final Logger LOG = Logger.getLogger(CodeDeployAgentDeployment.class);
     private static final List<String> PHASES = List.of("ApplicationStop", "DownloadBundle", "BeforeInstall",
             "Install", "AfterInstall", "ApplicationStart", "ValidateService");
+    private static final List<String> TRAFFIC_PHASES = List.of("BeforeBlockTraffic", "BlockTraffic", "AfterBlockTraffic",
+            "ApplicationStop", "DownloadBundle", "BeforeInstall", "Install", "AfterInstall",
+            "ApplicationStart", "ValidateService", "BeforeAllowTraffic", "AllowTraffic", "AfterAllowTraffic");
     private static final String ONE_AT_A_TIME = "CodeDeployDefault.OneAtATime";
     private static final String ALL_AT_ONCE = "CodeDeployDefault.AllAtOnce";
     private static final List<String> DIAGNOSTIC_CODES = List.of("Success", "ScriptMissing",
@@ -52,23 +56,27 @@ public class CodeDeployAgentDeployment {
     private final Ec2Service ec2;
     private final RegionResolver regionResolver;
     private final ObjectMapper mapper;
+    private final CodeDeployClassicTraffic traffic;
     private final Duration startTimeout;
     private final Duration phaseTimeout;
 
     @Inject
     public CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
-                                     Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper) {
-        this(commands, autoScaling, ec2, regionResolver, mapper, Duration.ofMinutes(5), Duration.ofHours(1));
+                                     Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
+                                     CodeDeployClassicTraffic traffic) {
+        this(commands, autoScaling, ec2, regionResolver, mapper, traffic,
+                Duration.ofMinutes(5), Duration.ofHours(1));
     }
 
     CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
                               Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
-                              Duration startTimeout, Duration phaseTimeout) {
+                               CodeDeployClassicTraffic traffic, Duration startTimeout, Duration phaseTimeout) {
         this.commands = commands;
         this.autoScaling = autoScaling;
         this.ec2 = ec2;
         this.regionResolver = regionResolver;
         this.mapper = mapper;
+        this.traffic = traffic;
         this.startTimeout = startTimeout;
         this.phaseTimeout = phaseTimeout;
     }
@@ -89,10 +97,11 @@ public class CodeDeployAgentDeployment {
             throw unsupported("S3 agent deployments currently support OneAtATime and AllAtOnce");
         }
         Map<String, Object> style = group.getDeploymentStyle();
+        Object option = style == null ? "WITHOUT_TRAFFIC_CONTROL"
+                : style.getOrDefault("deploymentOption", "WITHOUT_TRAFFIC_CONTROL");
         if (style != null && (!"IN_PLACE".equals(style.getOrDefault("deploymentType", "IN_PLACE"))
-                || !"WITHOUT_TRAFFIC_CONTROL".equals(
-                        style.getOrDefault("deploymentOption", "WITHOUT_TRAFFIC_CONTROL")))) {
-            throw unsupported("S3 agent deployments require IN_PLACE without load balancer traffic control");
+                || (!"WITHOUT_TRAFFIC_CONTROL".equals(option) && !"WITH_TRAFFIC_CONTROL".equals(option)))) {
+            throw unsupported("S3 agent deployments require IN_PLACE deployment");
         }
         if (group.getAutoRollbackConfiguration() != null
                 && Boolean.TRUE.equals(group.getAutoRollbackConfiguration().get("enabled"))) {
@@ -131,11 +140,14 @@ public class CodeDeployAgentDeployment {
         }
 
         String account = regionResolver.getAccountId();
+        CodeDeployClassicTraffic.Plan trafficPlan = style != null
+                && "WITH_TRAFFIC_CONTROL".equals(style.get("deploymentOption"))
+                ? traffic.prepare(account, region, group) : null;
         List<String> ids = selectInstances(region, group);
         Map<String, String> hosts = new LinkedHashMap<>();
         ids.forEach(id -> hosts.put(id, AwsArnUtils.Arn.of("ec2", region, account, "instance/" + id).toString()));
         return new Prepared(account, region, group.getDeploymentGroupId(), effectiveConfig,
-                Map.copyOf(source), Map.copyOf(hosts), List.copyOf(ids), fileExistsBehavior);
+                Map.copyOf(source), Map.copyOf(hosts), List.copyOf(ids), fileExistsBehavior, trafficPlan);
     }
 
     private List<String> selectInstances(String region, DeploymentGroup group) {
@@ -215,6 +227,8 @@ public class CodeDeployAgentDeployment {
     public void run(Prepared prepared, CodeDeployAgentCommands.Session session, Deployment deployment,
                     List<Map<String, Object>> targets, AtomicBoolean stop) {
         List<CompletableFuture<Boolean>> workers = new ArrayList<>();
+        AtomicBoolean terminating = new AtomicBoolean();
+        BooleanSupplier cancelled = () -> stop.get() || terminating.get();
         try {
             deployment.setStartTime(now());
             deployment.setStatus("InProgress");
@@ -225,20 +239,27 @@ public class CodeDeployAgentDeployment {
                     workers.add(result);
                     Thread.ofVirtual().name("codedeploy-agent-" + target.get("targetId")).start(() -> {
                         try {
-                            result.complete(runHost(prepared, session, target, stop));
+                            result.complete(runHost(prepared, session, target, cancelled));
                         } catch (Throwable failure) {
                             result.completeExceptionally(failure);
                         }
                     });
                 }
-                for (CompletableFuture<Boolean> worker : workers) {
-                    if (worker.get()) {
-                        succeeded++;
+                List<CompletableFuture<Boolean>> pending = new ArrayList<>(workers);
+                while (!pending.isEmpty()) {
+                    CompletableFuture.anyOf(pending.toArray(CompletableFuture[]::new)).get();
+                    for (CompletableFuture<Boolean> worker : List.copyOf(pending)) {
+                        if (worker.isDone()) {
+                            if (worker.get()) {
+                                succeeded++;
+                            }
+                            pending.remove(worker);
+                        }
                     }
                 }
             } else {
                 for (Map<String, Object> target : targets) {
-                    if (!runHost(prepared, session, target, stop)) {
+                    if (!runHost(prepared, session, target, cancelled)) {
                         break;
                     }
                     succeeded++;
@@ -259,8 +280,13 @@ public class CodeDeployAgentDeployment {
             finish(deployment, "Stopped", null);
         } catch (Exception failure) {
             LOG.warnv("Agent deployment {0} failed: {1}", deployment.getDeploymentId(), failure.getMessage());
-            finish(deployment, stop.get() ? "Stopped" : "Failed", stop.get() ? null : "DeploymentFailed");
+            Throwable cause = failure instanceof ExecutionException ? failure.getCause() : failure;
+            String code = cause instanceof AwsException aws && "IAM_ROLE_PERMISSIONS".equals(aws.getErrorCode())
+                    ? aws.getErrorCode() : "DeploymentFailed";
+            finish(deployment, stop.get() ? "Stopped" : "Failed", stop.get() ? null : code,
+                    "IAM_ROLE_PERMISSIONS".equals(code) ? cause.getMessage() : null);
         } finally {
+            terminating.set(true);
             commands.close(session);
             for (CompletableFuture<Boolean> worker : workers) {
                 worker.handle((result, failure) -> null).join();
@@ -271,12 +297,12 @@ public class CodeDeployAgentDeployment {
     }
 
     private boolean runHost(Prepared prepared, CodeDeployAgentCommands.Session session,
-                             Map<String, Object> target, AtomicBoolean stop)
+                             Map<String, Object> target, BooleanSupplier cancelled)
             throws InterruptedException, ExecutionException {
         String host = prepared.hosts().get(target.get("targetId"));
         update(target, "InProgress");
-        for (String phase : PHASES) {
-            if (stop.get()) {
+        for (String phase : prepared.traffic() == null ? PHASES : TRAFFIC_PHASES) {
+            if (cancelled.getAsBoolean()) {
                 throw new CancellationException("Deployment was stopped");
             }
             Map<String, Object> event = new ConcurrentHashMap<>();
@@ -284,11 +310,20 @@ public class CodeDeployAgentDeployment {
             event.put("status", "Pending");
             events(target).add(event);
             try {
+                if ("BlockTraffic".equals(phase) || "AllowTraffic".equals(phase)) {
+                    event.put("startTime", now());
+                    event.put("status", "InProgress");
+                    traffic.change(prepared.traffic(), (String) target.get("targetId"),
+                            "AllowTraffic".equals(phase), phaseTimeout, cancelled);
+                    event.put("endTime", now());
+                    event.put("status", "Succeeded");
+                    continue;
+                }
                 CodeDeployAgentCommands.Ticket ticket = commands.enqueue(session, host, phase);
-                await(ticket.accepted(), startTimeout, stop);
+                await(ticket.accepted(), startTimeout, cancelled);
                 event.put("startTime", now());
                 event.put("status", "InProgress");
-                CodeDeployAgentCommands.Result result = await(ticket.result(), phaseTimeout, stop);
+                CodeDeployAgentCommands.Result result = await(ticket.result(), phaseTimeout, cancelled);
                 if (result.diagnostics() != null) {
                     event.put("diagnostics", diagnostics(result.diagnostics()));
                 }
@@ -313,6 +348,14 @@ public class CodeDeployAgentDeployment {
                 event.put("status", "Skipped");
                 update(target, "Skipped");
                 throw failure;
+            } catch (RuntimeException failure) {
+                commands.cancel(session, host);
+                event.put("endTime", now());
+                event.put("diagnostics", Map.of("errorCode", "UnknownError",
+                        "message", failure.getMessage() == null ? phase + " failed" : failure.getMessage()));
+                event.put("status", "Failed");
+                update(target, "Failed");
+                throw failure;
             }
         }
         update(target, "Succeeded");
@@ -332,11 +375,11 @@ public class CodeDeployAgentDeployment {
         }
     }
 
-    private static <T> T await(CompletionStage<T> stage, Duration timeout, AtomicBoolean stop)
+    private static <T> T await(CompletionStage<T> stage, Duration timeout, BooleanSupplier cancelled)
             throws InterruptedException, ExecutionException, TimeoutException {
         CompletableFuture<T> future = stage.toCompletableFuture();
         long deadline = System.nanoTime() + timeout.toNanos();
-        while (!stop.get()) {
+        while (!cancelled.getAsBoolean()) {
             long remaining = deadline - System.nanoTime();
             if (remaining <= 0) {
                 throw new TimeoutException();
@@ -362,8 +405,13 @@ public class CodeDeployAgentDeployment {
     }
 
     private static void finish(Deployment deployment, String status, String error) {
+        finish(deployment, status, error, null);
+    }
+
+    private static void finish(Deployment deployment, String status, String error, String message) {
         if (error != null) {
-            deployment.setErrorInformation(Map.of("code", error, "message", "A host-agent deployment failed"));
+            deployment.setErrorInformation(Map.of("code", error, "message",
+                    message == null ? "A host-agent deployment failed" : message));
         }
         deployment.setCompleteTime(now());
         deployment.setStatus(status);
@@ -379,5 +427,5 @@ public class CodeDeployAgentDeployment {
 
     public record Prepared(String account, String region, String groupId, String config,
                            Map<String, Object> source, Map<String, String> hosts, List<String> instanceIds,
-                           String fileExistsBehavior) {}
+                           String fileExistsBehavior, CodeDeployClassicTraffic.Plan traffic) {}
 }
