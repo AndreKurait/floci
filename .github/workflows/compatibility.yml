@@ -50,6 +50,9 @@ jobs:
       - name: Test Docker runner failure aggregation
         run: bash docker/test-run-docker-tests.sh
 
+      - name: Test Java SDK timeout and report collection
+        run: python3 -m unittest discover -s compatibility-tests/sdk-test-java -p test_runner.py -v
+
   compat-aws-cli-shim:
     name: compat / aws CLI endpoint resolution
     runs-on: ubuntu-24.04-arm
@@ -322,6 +325,12 @@ jobs:
             runner: ubuntu-latest
 
     steps:
+      - name: Reserve time for Java SDK failure reports
+        if: matrix.test == 'sdk-test-java'
+        # The job has 20 minutes. Include setup in the test budget and leave
+        # three minutes for termination, report upload and server diagnostics.
+        run: echo "SDK_TEST_DEADLINE=$(( $(date +%s) + 17 * 60 ))" >> "$GITHUB_ENV"
+
       - name: Download native floci image
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -446,6 +455,12 @@ jobs:
           if [ "${{ matrix.test }}" = "sdk-test-java" ]; then
             mkdir -p /tmp/floci-hot-reload
             EXTRA_ARGS="$EXTRA_ARGS -v /tmp/floci-hot-reload:/tmp/floci-hot-reload -e HOT_RELOAD_BASE_DIR=/tmp/floci-hot-reload"
+            remaining=$(( SDK_TEST_DEADLINE - $(date +%s) ))
+            if (( remaining <= 0 )); then
+              echo "::error::Java SDK test budget exhausted during setup"
+              exit 1
+            fi
+            EXTRA_ARGS="$EXTRA_ARGS -e SDK_TEST_TIMEOUT_SECONDS=$remaining"
           fi
 
           # --dns injects Floci's embedded DNS so *.floci wildcard subdomains
@@ -466,11 +481,8 @@ jobs:
         with:
           paths: test-results/*.xml
 
-      # The test body inside the container runs its build tool quietly, so the
-      # job log carries no per-class timings and the slow legs (sdk-test-java)
-      # are a black box. Surface the timings from the junit XMLs the
-      # suites already export, and upload the raw XMLs so the numbers are
-      # machine-readable across runs.
+      # Summarize completed test classes from the exported JUnit reports.
+      # Java also exports live Maven output and any Surefire timeout dumps.
       - name: Report slowest test classes
         if: always() && steps.tests.outcome != 'skipped'
         # Measurement-only: a reporting bug must never fail an otherwise-green leg.
