@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.auth.SigV4aSignature;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.context.ContextNotActiveException;
 import jakarta.enterprise.inject.Instance;
@@ -49,6 +50,8 @@ public class RegionResolver {
     @Inject
     Instance<RequestContext> requestContextInstance;
 
+    private volatile RequestContext requestContextProxy;
+
     @Inject
     public RegionResolver(EmulatorConfig config) {
         this(config.defaultRegion(), config.defaultAccountId(),
@@ -83,7 +86,12 @@ public class RegionResolver {
         if (headers == null) {
             return defaultRegion;
         }
-        return resolveRegionFromAuth(headers.getHeaderString("Authorization"));
+        String authorization = headers.getHeaderString("Authorization");
+        if (authorization != null
+                && authorization.trim().startsWith(SigV4aSignature.ALGORITHM + " ")) {
+            return resolveRegionFromRegionSet(headers.getHeaderString("X-Amz-Region-Set"));
+        }
+        return resolveRegionFromAuth(authorization);
     }
 
     /**
@@ -152,6 +160,27 @@ public class RegionResolver {
 
 
     /**
+     * The region a SigV4A ({@code AWS4-ECDSA-P256-SHA256}) request is served in. Its credential
+     * scope names no region; the signed {@code X-Amz-Region-Set} lists the ones the signature is
+     * good for. A set of exactly one concrete region selects it. A wildcard, a list, or no set
+     * leaves the choice to the server, which serves the default region.
+     */
+    public String resolveRegionFromRegionSet(String regionSet) {
+        if (regionSet == null || regionSet.isBlank()) {
+            return defaultRegion;
+        }
+        String[] regions = regionSet.split(",", -1);
+        if (regions.length != 1) {
+            return defaultRegion;
+        }
+        String only = regions[0].trim();
+        if (only.isEmpty() || only.contains("*")) {
+            return defaultRegion;
+        }
+        return withoutPseudoRegion(only);
+    }
+
+    /**
      * Resolves the region from a SigV4 Authorization credential scope, or
      * null when the header is absent or carries no parseable credential —
      * for callers that treat an unresolved region differently from the
@@ -217,6 +246,15 @@ public class RegionResolver {
         return AwsPartitions.forRegion(region).map(AwsPartition::id).orElse(defaultPartition);
     }
 
+    private RequestContext requestContext() {
+        RequestContext proxy = requestContextProxy;
+        if (proxy == null) {
+            proxy = requestContextInstance.get();
+            requestContextProxy = proxy;
+        }
+        return proxy;
+    }
+
     /**
      * The partition of the current request when called from a request context, or the
      * deployment's partition otherwise (async workers, startup, tests).
@@ -224,7 +262,7 @@ public class RegionResolver {
     public String getPartition() {
         if (requestContextInstance != null) {
             try {
-                String partition = requestContextInstance.get().getPartition();
+                String partition = requestContext().getPartition();
                 if (partition != null) {
                     return partition;
                 }
@@ -242,7 +280,7 @@ public class RegionResolver {
     public String getRegion() {
         if (requestContextInstance != null) {
             try {
-                String region = requestContextInstance.get().getRegion();
+                String region = requestContext().getRegion();
                 if (region != null) {
                     return region;
                 }
@@ -260,7 +298,7 @@ public class RegionResolver {
     public String getAccountId() {
         if (requestContextInstance != null) {
             try {
-                String accountId = requestContextInstance.get().getAccountId();
+                String accountId = requestContext().getAccountId();
                 if (accountId != null) {
                     return accountId;
                 }

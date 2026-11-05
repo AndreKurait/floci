@@ -1,7 +1,6 @@
 package io.github.hectorvent.floci.services.codepipeline;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
@@ -18,7 +17,6 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -171,18 +169,9 @@ public class CodePipelineEventPublisher {
 
     private void publish(CodePipelineExecution execution, String detailType, ObjectNode detail) {
         try {
-            Map<String, Object> entry = new HashMap<>();
-            entry.put("Source", "aws.codepipeline");
-            entry.put("DetailType", detailType);
-            entry.put("Detail", detail.toString());
-            entry.put("EventBusName", "default");
-            entry.put("Region", execution.getRegion());
-            // Always emit Resources (possibly empty): EventBridge pattern matching reads the
-            // key unconditionally for rules with a "resources" filter.
-            ArrayNode resources = mapper.createArrayNode();
-            resources.add(AwsArnUtils.Arn.of("codepipeline", execution.getRegion(),
-                    execution.getAccountId(), execution.getPipelineName()).toString());
-            entry.put("Resources", resources);
+            Map<String, Object> entry = EventBridgeService.serviceEventEntry("aws.codepipeline", detailType,
+                    detail.toString(), AwsArnUtils.Arn.of("codepipeline", execution.getRegion(),
+                            execution.getAccountId(), execution.getPipelineName()).toString());
             // This runs on a pipeline-execution worker thread with no request context, so the
             // two-argument overload would fall back to the default (management) account and a
             // member account's EventBridge rules would never see the event. Name the bus's

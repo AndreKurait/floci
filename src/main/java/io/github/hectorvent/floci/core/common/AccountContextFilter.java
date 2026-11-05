@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.auth.SigV4aSignature;
 import io.github.hectorvent.floci.services.s3.PreSignedUrlFilter;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -8,7 +9,10 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.Priorities;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ContainerRequestFilter;
+import jakarta.ws.rs.container.ResourceInfo;
+import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.ext.Provider;
 import org.jboss.logging.Logger;
 
@@ -43,6 +47,9 @@ public class AccountContextFilter implements ContainerRequestFilter {
     /** The signing names S3 answers to; an S3 client expects S3's XML error document. */
     private static final Set<String> S3_SIGNING_NAMES = Set.of("s3", "s3express");
 
+    @Context
+    ResourceInfo resourceInfo;
+
     private final AccountResolver accountResolver;
     private final RegionResolver regionResolver;
     private final RequestContext requestContext;
@@ -51,18 +58,41 @@ public class AccountContextFilter implements ContainerRequestFilter {
     // (the AwsProtocolClaimFilter pattern). jakarta.inject.Provider is qualified inline because
     // this class also carries the JAX-RS @Provider annotation.
     private final jakarta.inject.Provider<EmulatorConfig> configProvider;
+    private final jakarta.inject.Provider<ResolvedServiceCatalog> catalogProvider;
+    private volatile EmulatorConfig config;
+    private volatile ResolvedServiceCatalog catalog;
 
     @Inject
     public AccountContextFilter(AccountResolver accountResolver,
                                 RegionResolver regionResolver,
                                 RequestContext requestContext,
                                 SessionAccountLookup sessionAccountLookup,
-                                jakarta.inject.Provider<EmulatorConfig> configProvider) {
+                                jakarta.inject.Provider<EmulatorConfig> configProvider,
+                                jakarta.inject.Provider<ResolvedServiceCatalog> catalogProvider) {
         this.accountResolver = accountResolver;
         this.regionResolver = regionResolver;
         this.requestContext = requestContext;
         this.sessionAccountLookup = sessionAccountLookup;
         this.configProvider = configProvider;
+        this.catalogProvider = catalogProvider;
+    }
+
+    private EmulatorConfig config() {
+        EmulatorConfig resolved = config;
+        if (resolved == null) {
+            resolved = configProvider.get();
+            config = resolved;
+        }
+        return resolved;
+    }
+
+    private ResolvedServiceCatalog catalog() {
+        ResolvedServiceCatalog resolved = catalog;
+        if (resolved == null) {
+            resolved = catalogProvider.get();
+            catalog = resolved;
+        }
+        return resolved;
     }
 
     @Override
@@ -75,17 +105,25 @@ public class AccountContextFilter implements ContainerRequestFilter {
             applyRegion(regionResolver.resolveRegionFromAuth(null));
             return;
         }
-        String sessionToken = extractSessionToken(ctx);
+        MultivaluedMap<String, String> query = ctx.getUriInfo().getQueryParameters();
+        String sessionToken = extractSessionToken(ctx, query);
         String auth = ctx.getHeaderString("Authorization");
-        if (rejectAmbiguousRegion(ctx, auth)) {
+        if (rejectAmbiguousRegion(ctx, auth, query)) {
             return;
         }
-        String akid = auth != null && !auth.isEmpty() ? accountResolver.extractAccessKeyId(auth) : null;
+        String akid = resourceInfo != null && catalog().byResourceClass(resourceInfo.getResourceClass())
+                .map(ServiceDescriptor::acceptsLegacyAuthorization).orElse(false)
+                && !config().services().iam().enforcementEnabled()
+                ? accountResolver.extractS3AccessKeyId(auth) : accountResolver.extractAccessKeyId(auth);
         if (akid != null) {
             requestContext.setAccountId(resolveAccount(akid, accountResolver.resolve(auth)));
             requestContext.setAccessKeyId(akid);
             requestContext.setSessionToken(sessionToken);
-            String region = regionResolver.resolveRegionFromAuth(auth);
+            // A SigV4A scope has no region segment; the regions come from the signed region set.
+            boolean sigV4a = auth.trim().startsWith(SigV4aSignature.ALGORITHM + " ");
+            String region = sigV4a
+                    ? regionResolver.resolveRegionFromRegionSet(ctx.getHeaderString("X-Amz-Region-Set"))
+                    : regionResolver.resolveRegionFromAuth(auth);
             applyRegion(region);
             if (rejectUnknownRegion(ctx, region, SigV4CredentialScope.serviceName(auth))) {
                 return;
@@ -96,15 +134,20 @@ public class AccountContextFilter implements ContainerRequestFilter {
             // must not let the query string pick an account that IAM then never checks.
             boolean hasAuthHeader = auth != null && !auth.isBlank();
             String credential = hasAuthHeader
-                    ? null : ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential");
+                    ? null : query.getFirst("X-Amz-Credential");
             if (credential != null && !credential.isEmpty()
-                    && ctx.getUriInfo().getQueryParameters().containsKey("X-Amz-Algorithm")) {
+                    && query.containsKey("X-Amz-Algorithm")) {
                 String presignedAkid = accountResolver.extractPresignedAccessKeyId(credential);
                 requestContext.setAccountId(
                         resolveAccount(presignedAkid, accountResolver.resolveFromPresignedCredential(credential)));
                 requestContext.setAccessKeyId(presignedAkid);
                 requestContext.setSessionToken(sessionToken);
-                String region = regionResolver.resolveRegionFromPresignedCredential(credential);
+                boolean sigV4a = SigV4aSignature.ALGORITHM.equals(
+                        query.getFirst("X-Amz-Algorithm"));
+                String region = sigV4a
+                        ? regionResolver.resolveRegionFromRegionSet(
+                                query.getFirst("X-Amz-Region-Set"))
+                        : regionResolver.resolveRegionFromPresignedCredential(credential);
                 applyRegion(region);
                 if (rejectUnknownRegion(ctx, region, SigV4CredentialScope.serviceNameFromCredential(credential))) {
                     return;
@@ -120,12 +163,12 @@ public class AccountContextFilter implements ContainerRequestFilter {
         }
     }
 
-    private String extractSessionToken(ContainerRequestContext ctx) {
+    private String extractSessionToken(ContainerRequestContext ctx, MultivaluedMap<String, String> query) {
         String token = ctx.getHeaderString("X-Amz-Security-Token");
         if (token != null && !token.isBlank()) {
             return token.trim();
         }
-        token = ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Security-Token");
+        token = query.getFirst("X-Amz-Security-Token");
         if (token != null && !token.isBlank()) {
             return token.trim();
         }
@@ -143,11 +186,12 @@ public class AccountContextFilter implements ContainerRequestFilter {
     }
 
     /** Refuses delimiters in region interpretations used by request context or downstream dispatch. */
-    private boolean rejectAmbiguousRegion(ContainerRequestContext ctx, String authorization) {
+    private boolean rejectAmbiguousRegion(ContainerRequestContext ctx, String authorization,
+                                          MultivaluedMap<String, String> query) {
         String queryCredential = authorization == null || authorization.isBlank()
-                ? ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential") : null;
+                ? query.getFirst("X-Amz-Credential") : null;
         String parsedAuthorization = queryCredential == null ? authorization
-                : IamEnforcementFilter.requestAuthorization(null, ctx.getUriInfo().getQueryParameters());
+                : IamEnforcementFilter.requestAuthorization(null, query);
         // Some Query routes synthesize this header even without X-Amz-Algorithm. Inspect the
         // same region they use, in addition to the split credential used by request context.
         String region = regionResolver.resolveRegionFromAuthOrNull(parsedAuthorization);
@@ -174,7 +218,7 @@ public class AccountContextFilter implements ContainerRequestFilter {
     private boolean rejectUnknownRegion(ContainerRequestContext ctx, String region, Optional<String> signingName) {
         boolean ambiguous = RegionResolver.containsArnDelimiter(region);
         if (!ambiguous && (RegionResolver.isKnownRegion(region)
-                || configProvider.get().partitions().allowUnknownRegions())) {
+                || config().partitions().allowUnknownRegions())) {
             return false;
         }
         LOG.debugv("Refusing request signed for unknown region {0} (service {1}): {2} {3}",
@@ -226,7 +270,7 @@ public class AccountContextFilter implements ContainerRequestFilter {
      * service in every partition.
      */
     private void rejectPartitionAbsentService(ContainerRequestContext ctx, String signingName) {
-        if (signingName == null || !configProvider.get().partitions().strict()) {
+        if (signingName == null || !config().partitions().strict()) {
             return;
         }
         Optional<AwsPartition> partition = AwsPartitions.find(requestContext.getPartition());
@@ -248,12 +292,13 @@ public class AccountContextFilter implements ContainerRequestFilter {
     }
 
     /**
-     * Applies the account-resolution precedence. A 12-digit AKID is already reflected in
-     * {@code resolvedDefault} (the account or default returned by {@link AccountResolver});
-     * for any other key shape, an IAM or live-session lookup takes precedence before falling back.
+     * Applies account resolution to header and presigned credentials, including legacy S3 keys.
      */
     private String resolveAccount(String akid, String resolvedDefault) {
-        if (akid != null && !akid.matches("\\d{12}")) {
+        if (akid != null) {
+            if (akid.matches("\\d{12}")) {
+                return akid;
+            }
             Optional<String> credentialAccount = sessionAccountLookup.resolveAccountId(akid);
             if (credentialAccount.isPresent()) {
                 return credentialAccount.get();

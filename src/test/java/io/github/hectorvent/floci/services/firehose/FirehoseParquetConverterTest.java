@@ -27,10 +27,13 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.mockito.ArgumentMatchers;
+import org.mockito.Mockito;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -93,7 +96,7 @@ class FirehoseParquetConverterTest {
 
     private static Table table(Column... columns) {
         StorageDescriptor descriptor = new StorageDescriptor();
-        descriptor.setColumns(java.util.Arrays.asList(columns));
+        descriptor.setColumns(Arrays.asList(columns));
         Table table = new Table();
         table.setStorageDescriptor(descriptor);
         return table;
@@ -142,7 +145,7 @@ class FirehoseParquetConverterTest {
     private List<JsonNode> errorLines() throws Exception {
         ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<byte[]> body = ArgumentCaptor.forClass(byte[].class);
-        verify(s3Service, org.mockito.Mockito.atLeastOnce()).putObject(eq(BUCKET), key.capture(),
+        verify(s3Service, Mockito.atLeastOnce()).putObject(eq(BUCKET), key.capture(),
                 body.capture(), eq("application/octet-stream"), anyMap());
 
         List<Integer> errorWrites = new ArrayList<>();
@@ -169,6 +172,8 @@ class FirehoseParquetConverterTest {
                 record("{\"ticker\": \"MISSING_FIELDS\"}")), DELIVERY_TIME);
 
         assertEquals(2, outcome.convertedRecords());
+        verify(s3Service).createInternalBucket(STAGING, "us-east-1");
+        verify(s3Service, never()).createBucket(STAGING, "us-east-1");
         assertEquals(0, outcome.failedRecords());
         assertTrue(outcome.dataKey().startsWith("data/2026/01/01/00/stream-1-2026-01-01-00-00-00-"));
         assertTrue(outcome.dataKey().endsWith(".parquet"));
@@ -204,7 +209,7 @@ class FirehoseParquetConverterTest {
     }
 
     private static String endsWithSuffix(String suffix) {
-        return org.mockito.ArgumentMatchers.argThat(key -> key != null && key.endsWith(suffix));
+        return ArgumentMatchers.argThat(key -> key != null && key.endsWith(suffix));
     }
 
     @Test

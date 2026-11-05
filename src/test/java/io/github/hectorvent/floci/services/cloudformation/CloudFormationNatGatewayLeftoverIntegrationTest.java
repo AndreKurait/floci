@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.mockito.InjectSpy;
@@ -69,7 +70,7 @@ class CloudFormationNatGatewayLeftoverIntegrationTest {
             assertTrue(reason.contains("Nat"), reason);
             failNatDeletes.set(false);
 
-            request("ContinueUpdateRollback", "StackName", stack, "ResourcesToSkip.member.1", "Nat").statusCode(200);
+            CfnStackWaits.continueUpdateRollback(stack, CFN_AUTH, "Nat");
             CfnStackWaits.awaitStatus(stack, "UPDATE_ROLLBACK_COMPLETE");
             assertEquals(1, XmlParser.extractAll(ec2("DescribeNatGateways", "Filter.1.Name", "subnet-id",
                     "Filter.1.Value.1", created.get("Subnet")).statusCode(200).extract().asString(), "natGatewayId")

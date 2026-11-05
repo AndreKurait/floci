@@ -2,18 +2,21 @@ package io.github.hectorvent.floci.services.athena;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.github.hectorvent.floci.testing.PersistentStorageProfile;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
+import static io.github.hectorvent.floci.testing.PersistentStorageProfile.STORAGE_DIR;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -21,13 +24,23 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * CreateWorkGroup and UpdateWorkGroup write the workgroup, with its defaults filled in and its
+ * engine version resolved, to {@code workgroups.json}, and CreateWorkGroup does not write the
+ * primary workgroup there.
+ *
+ * <p>Persistent storage comes from {@link PersistentStorageProfile}, which this class shares with
+ * other classes that each read their own service's file, so it deletes the workgroups it creates.
+ */
 @QuarkusTest
-@TestProfile(AthenaCreateWorkGroupPersistenceIntegrationTest.PersistentStorageProfile.class)
+@TestProfile(PersistentStorageProfile.class)
 class AthenaCreateWorkGroupPersistenceIntegrationTest {
 
-    static final String STORAGE_DIR = "target/athena-workgroups-it";
     private static final Path WORKGROUPS_FILE = Path.of(STORAGE_DIR, "workgroups.json");
     private static final String CONTENT_TYPE = "application/x-amz-json-1.1";
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
 
     @BeforeAll
     static void setup() throws Exception {
@@ -67,6 +80,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        cleanup.register(() -> deleteWorkGroup("analytics"));
 
         assertTrue(Files.exists(WORKGROUPS_FILE), "CreateWorkGroup should create workgroups.json");
 
@@ -120,6 +134,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        cleanup.register(() -> deleteWorkGroup("defaulted-workgroup"));
 
         PersistentStorage<String, Map<String, Object>> store = new PersistentStorage<>(
                 WORKGROUPS_FILE,
@@ -136,11 +151,13 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
         @SuppressWarnings("unchecked")
         List<Map<String, String>> tags = (List<Map<String, String>>) persisted.get("Tags");
 
-        assertEquals("s3://floci-athena-results/results/", resultConfiguration.get("OutputLocation"));
+        // No result location is invented: a query names its own, as on AWS.
+        assertNull(resultConfiguration);
         assertEquals(false, configuration.get("EnforceWorkGroupConfiguration"));
         assertEquals(false, configuration.get("PublishCloudWatchMetricsEnabled"));
         assertEquals(false, configuration.get("RequesterPaysEnabled"));
-        assertEquals("Athena engine version 3", engineVersion.get("SelectedEngineVersion"));
+        assertEquals(false, configuration.get("EnableMinimumEncryptionConfiguration"));
+        assertEquals("AUTO", engineVersion.get("SelectedEngineVersion"));
         assertEquals("Athena engine version 3", engineVersion.get("EffectiveEngineVersion"));
         assertEquals(List.of(), tags);
     }
@@ -166,6 +183,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        cleanup.register(() -> deleteWorkGroup("engine-normalized"));
 
         PersistentStorage<String, Map<String, Object>> store = new PersistentStorage<>(
                 WORKGROUPS_FILE,
@@ -204,6 +222,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        cleanup.register(() -> deleteWorkGroup("engine-explicit"));
 
         PersistentStorage<String, Map<String, Object>> store = new PersistentStorage<>(
                 WORKGROUPS_FILE,
@@ -239,6 +258,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        cleanup.register(() -> deleteWorkGroup("engine-empty"));
 
         PersistentStorage<String, Map<String, Object>> store = new PersistentStorage<>(
                 WORKGROUPS_FILE,
@@ -251,7 +271,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> engineVersion = (Map<String, Object>) configuration.get("EngineVersion");
 
-        assertEquals("Athena engine version 3", engineVersion.get("SelectedEngineVersion"));
+        assertEquals("AUTO", engineVersion.get("SelectedEngineVersion"));
         assertEquals("Athena engine version 3", engineVersion.get("EffectiveEngineVersion"));
     }
 
@@ -276,6 +296,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        cleanup.register(() -> deleteWorkGroup("engine-blank-selected"));
 
         PersistentStorage<String, Map<String, Object>> store = new PersistentStorage<>(
                 WORKGROUPS_FILE,
@@ -288,7 +309,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> engineVersion = (Map<String, Object>) configuration.get("EngineVersion");
 
-        assertEquals("Athena engine version 3", engineVersion.get("SelectedEngineVersion"));
+        assertEquals("AUTO", engineVersion.get("SelectedEngineVersion"));
         assertEquals("Athena engine version 3", engineVersion.get("EffectiveEngineVersion"));
     }
 
@@ -312,6 +333,7 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        cleanup.register(() -> deleteWorkGroup("persistent-update"));
 
         given()
             .header("X-Amz-Target", "AmazonAthena.UpdateWorkGroup")
@@ -348,13 +370,14 @@ class AthenaCreateWorkGroupPersistenceIntegrationTest {
         assertNull(configuration.get("BytesScannedCutoffPerQuery"));
     }
 
-    public static final class PersistentStorageProfile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of(
-                    "floci.storage.mode", "persistent",
-                    "floci.storage.persistent-path", STORAGE_DIR
-            );
-        }
+    private static void deleteWorkGroup(String name) {
+        given()
+            .header("X-Amz-Target", "AmazonAthena.DeleteWorkGroup")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"WorkGroup\": \"" + name + "\", \"RecursiveDeleteOption\": true }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
     }
 }

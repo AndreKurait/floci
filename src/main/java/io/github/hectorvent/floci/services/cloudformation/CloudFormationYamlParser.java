@@ -30,7 +30,7 @@ public class CloudFormationYamlParser {
         this.objectMapper = objectMapper;
     }
 
-    public JsonNode parse(String yamlContent) throws Exception {
+    public JsonNode parse(String yamlContent) {
         LoaderOptions opts = new LoaderOptions();
         opts.setMaxAliasesForCollections(200);
         Yaml yaml = new Yaml(new CfnConstructor(opts));

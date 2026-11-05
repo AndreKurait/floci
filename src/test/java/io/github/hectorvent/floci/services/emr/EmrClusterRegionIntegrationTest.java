@@ -42,7 +42,8 @@ class EmrClusterRegionIntegrationTest {
         emr(OTHER, "AddJobFlowSteps", "{\"JobFlowId\":\"" + clusterId + "\",\"Steps\":[{\"Name\":\"s\","
                         + "\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\",\"Args\":[\"echo\"]}}]}")
             .then().statusCode(400)
-            .body("__type", equalTo("InvalidRequestException"));
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Specified job flow ID does not exist."));
         emr(OTHER, "ListClusters", "{}")
             .then().statusCode(200)
             .body("Clusters.Id", not(hasItem(clusterId)));

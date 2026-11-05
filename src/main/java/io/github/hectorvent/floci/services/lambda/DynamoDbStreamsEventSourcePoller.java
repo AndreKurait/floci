@@ -5,9 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbTtlIdentity;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbStreamReader;
@@ -16,26 +14,21 @@ import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.pipes.PipesFilterMatcher;
-import io.github.hectorvent.floci.services.s3.S3Service;
-import io.github.hectorvent.floci.services.sns.SnsService;
-import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.vertx.core.Vertx;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -46,14 +39,10 @@ import java.util.stream.Collectors;
 public class DynamoDbStreamsEventSourcePoller implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(DynamoDbStreamsEventSourcePoller.class);
-    private static final DateTimeFormatter S3_ON_FAILURE_PATH_DATE_FORMATTER =
-            DateTimeFormatter.ofPattern("yyyy/MM/dd").withZone(ZoneOffset.UTC);
-    private static final DateTimeFormatter S3_ON_FAILURE_FILE_TIME_FORMATTER =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH.mm.ss").withZone(ZoneOffset.UTC);
+    private static final String BATCH_INFO_NAME = "DDBStreamBatchInfo";
 
     /** Raised by the stream when a stored checkpoint has aged out of the retained window. */
     private static final String TRIMMED_DATA_ACCESS_EXCEPTION = "TrimmedDataAccessException";
-    static final long MAX_RETRY_BACKOFF_MS = 60_000;
 
     private final Vertx vertx;
     private final DynamoDbStreamReader streamReader;
@@ -62,10 +51,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     private final EsmStore esmStore;
     private final ObjectMapper objectMapper;
     private final PipesFilterMatcher filterMatcher;
-    private final SqsService sqsService;
-    private final SnsService snsService;
-    private final S3Service s3Service;
-    private final String baseUrl;
+    private final StreamBatchFailures batchFailures;
     private final long pollIntervalMs;
     private final LongSupplier clock;
     private final ConcurrentHashMap<String, Long> timerIds = new ConcurrentHashMap<>();
@@ -92,11 +78,9 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                                             ObjectMapper objectMapper,
                                             EmulatorConfig config,
                                             PipesFilterMatcher filterMatcher,
-                                            SqsService sqsService,
-                                            SnsService snsService,
-                                            S3Service s3Service) {
+                                            StreamBatchFailures batchFailures) {
         this(vertx, streamReader, executorService, targetResolver, esmStore, objectMapper, config,
-                filterMatcher, sqsService, snsService, s3Service, System::currentTimeMillis);
+                filterMatcher, batchFailures, System::currentTimeMillis);
     }
 
     DynamoDbStreamsEventSourcePoller(Vertx vertx, DynamoDbStreamReader streamReader,
@@ -106,9 +90,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                                      ObjectMapper objectMapper,
                                      EmulatorConfig config,
                                      PipesFilterMatcher filterMatcher,
-                                     SqsService sqsService,
-                                     SnsService snsService,
-                                     S3Service s3Service,
+                                     StreamBatchFailures batchFailures,
                                      LongSupplier clock) {
         this.vertx = vertx;
         this.streamReader = streamReader;
@@ -117,11 +99,8 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         this.esmStore = esmStore;
         this.objectMapper = objectMapper;
         this.pollIntervalMs = config.services().lambda().pollIntervalMs();
-        this.baseUrl = config.effectiveBaseUrl();
         this.filterMatcher = filterMatcher;
-        this.sqsService = sqsService;
-        this.snsService = snsService;
-        this.s3Service = s3Service;
+        this.batchFailures = batchFailures;
         this.clock = clock;
     }
 
@@ -294,13 +273,13 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     private void pollShard(EventSourceMapping esm, LambdaFunction fn, DynamoDbStreamReader.Stream stream,
                            String shardId) {
         String lastSeq = esm.getShardSequenceNumbers().get(shardId);
-        String persistedKey = batchStateKey(esm.getUuid(), shardId, lastSeq);
+        String persistedKey = StreamBatchFailures.batchStateKey(esm.getUuid(), shardId, lastSeq);
 
         boolean checkpointTrimmed = false;
         DynamoDbStreamReader.RecordsPage page;
         try {
             page = streamReader.readAfter(stream, shardId, lastSeq,
-                    Math.min(bisectLimit(esm, persistedKey), esm.getBatchSize()));
+                    Math.min(StreamBatchFailures.bisectLimit(esm, bisectLimits, persistedKey), esm.getBatchSize()));
         } catch (AwsException e) {
             if (!TRIMMED_DATA_ACCESS_EXCEPTION.equals(e.getErrorCode())) {
                 throw e;
@@ -317,7 +296,8 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                             + "trim horizon; records between were dropped from the stream",
                     esm.getUuid(), lastSeq);
             page = streamReader.readAfter(stream, shardId, null, Math.min(esm.getBatchSize(),
-                    bisectLimit(esm, batchStateKey(esm.getUuid(), shardId, null))));
+                    StreamBatchFailures.bisectLimit(esm, bisectLimits,
+                            StreamBatchFailures.batchStateKey(esm.getUuid(), shardId, null))));
         }
         List<DynamoDbStreamReader.Record> records = page.records();
 
@@ -353,7 +333,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                     records, filterNodes, filterMatcher.applyFilterCriteria(filterNodes, filterParams));
         }
 
-        String batchKey = batchStateKey(esm.getUuid(), shardId, checkpointTrimmed ? null : lastSeq);
+        String batchKey = StreamBatchFailures.batchStateKey(esm.getUuid(), shardId, checkpointTrimmed ? null : lastSeq);
         if (matched.isEmpty()) {
             clearBatchState(batchKey);
             advanceCheckpoint(esm, shardId, newestFetchedSeq);
@@ -371,7 +351,10 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         String eventJson = buildDynamoDbEvent(matched, esm);
         InvokeResult invokeResult;
         try {
-            invokeResult = executorService.invoke(fn, eventJson.getBytes(), InvocationType.RequestResponse);
+            String qualifier = LambdaTargetResolver.mappingQualifier(esm);
+            invokeResult = qualifier == null
+                    ? executorService.invoke(fn, eventJson.getBytes(), InvocationType.RequestResponse)
+                    : executorService.invoke(fn, eventJson.getBytes(), InvocationType.RequestResponse, 0, qualifier);
         } catch (AwsException e) {
             if ("TooManyRequestsException".equals(e.getErrorCode())) {
                 LOG.infov("DynamoDB Streams ESM {0}: function {1} throttled, shard iterator not advanced",
@@ -397,8 +380,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
             clearBatchState(batchKey);
 
             String nextCheckpoint = outcome.checkpoint();
-            String nextBatchKey = batchStateKey(esm.getUuid(), shardId, nextCheckpoint);
-            Integer maxRetries = esm.getMaximumRetryAttempts();
+            String nextBatchKey = StreamBatchFailures.batchStateKey(esm.getUuid(), shardId, nextCheckpoint);
             int currentRetries = retryCounts.merge(nextBatchKey, 1, Integer::sum);
             Set<String> deliveredSeqs = new HashSet<>();
             for (DynamoDbStreamReader.Record rec : matched) {
@@ -419,12 +401,12 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                 LOG.warnv("DynamoDB Streams ESM {0}: maximum record age exceeded for batch ending at {1}",
                         esm.getUuid(), newestFetchedSeq);
                 dispose(esm, shardId, nextBatchKey, new PendingFailure(failedRecords, invokeResult,
-                        currentRetries, "MaximumRecordAgeExceeded", newestFetchedSeq));
-            } else if (maxRetries != null && maxRetries >= 0 && currentRetries > maxRetries) {
+                        currentRetries, StreamBatchFailures.MAXIMUM_RECORD_AGE_EXCEEDED, newestFetchedSeq));
+            } else if (StreamBatchFailures.retryAttemptsExhausted(esm, currentRetries)) {
                 LOG.warnv("DynamoDB Streams ESM {0}: maximum retry attempts ({1}) exhausted for batch ending at {2}",
-                        esm.getUuid(), maxRetries, newestFetchedSeq);
+                        esm.getUuid(), esm.getMaximumRetryAttempts(), newestFetchedSeq);
                 dispose(esm, shardId, nextBatchKey, new PendingFailure(failedRecords, invokeResult,
-                        currentRetries, "RetryAttemptsExhausted", newestFetchedSeq));
+                        currentRetries, StreamBatchFailures.RETRY_ATTEMPTS_EXHAUSTED, newestFetchedSeq));
             } else {
                 retryNotBefore.put(nextBatchKey, now + retryBackoffMs(currentRetries));
                 LOG.warnv("DynamoDB Streams ESM {0}: Lambda returned error [batchItemFailures], retry {1}, records will be retried",
@@ -432,30 +414,28 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                 advanceCheckpoint(esm, shardId, nextCheckpoint);
             }
         } else {
-            Integer maxRetries = esm.getMaximumRetryAttempts();
             int currentRetries = retryCounts.getOrDefault(batchKey, 0) + 1;
             if (hasExceededMaximumRecordAge(esm, matched, now)) {
                 LOG.warnv("DynamoDB Streams ESM {0}: maximum record age exceeded for batch ending at {1}",
                         esm.getUuid(), newestFetchedSeq);
                 clearBatchState(batchKey);
                 dispose(esm, shardId, persistedKey, new PendingFailure(matched, invokeResult,
-                        currentRetries, "MaximumRecordAgeExceeded", newestFetchedSeq));
-            } else if (invokeResult.getFunctionError() != null
-                    && Boolean.TRUE.equals(esm.getBisectBatchOnFunctionError()) && matched.size() > 1) {
+                        currentRetries, StreamBatchFailures.MAXIMUM_RECORD_AGE_EXCEEDED, newestFetchedSeq));
+            } else if (StreamBatchFailures.splitsOnFunctionError(esm, invokeResult, matched.size())) {
                 // ponytail: the halved limit is keyed by checkpoint, so once a good half advances the
                 // rest is refetched at full batch size and split again. One window converges on the
                 // poison record in O(log n) invocations, a busy stream in O(log^2 n) worst case;
                 // carrying the right half's end sequence forward would match AWS exactly.
-                int limit = (records.size() + 1) / 2;
+                int limit = StreamBatchFailures.splitBatchSize(records.size());
                 bisectLimits.put(batchKey, limit);
                 LOG.infov("DynamoDB Streams ESM {0}: function error on {1} record(s), bisecting to {2}",
                         esm.getUuid(), records.size(), limit);
-            } else if (maxRetries != null && maxRetries >= 0 && currentRetries > maxRetries) {
+            } else if (StreamBatchFailures.retryAttemptsExhausted(esm, currentRetries)) {
                 LOG.warnv("DynamoDB Streams ESM {0}: maximum retry attempts ({1}) exhausted for batch ending at {2}",
-                        esm.getUuid(), maxRetries, newestFetchedSeq);
+                        esm.getUuid(), esm.getMaximumRetryAttempts(), newestFetchedSeq);
                 clearBatchState(batchKey);
                 dispose(esm, shardId, persistedKey, new PendingFailure(matched, invokeResult,
-                        currentRetries, "RetryAttemptsExhausted", newestFetchedSeq));
+                        currentRetries, StreamBatchFailures.RETRY_ATTEMPTS_EXHAUSTED, newestFetchedSeq));
             } else {
                 retryCounts.put(batchKey, currentRetries);
                 retryNotBefore.put(batchKey, now + retryBackoffMs(currentRetries));
@@ -479,8 +459,8 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
             clearBatchState(key);
             return;
         }
-        sendToOnFailureDestination(esm, shardId, failure.records(), failure.invokeResult(),
-                failure.invokeCount(), failure.condition());
+        batchFailures.sendToOnFailureDestination(esm, discardedBatch(esm, shardId, failure.records()),
+                failure.invokeResult(), failure.invokeCount(), failure.condition());
         clearBatchState(key);
         advanceCheckpoint(esm, shardId, failure.advanceTo());
     }
@@ -491,18 +471,8 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         bisectLimits.remove(key);
     }
 
-    private int bisectLimit(EventSourceMapping esm, String key) {
-        return Boolean.TRUE.equals(esm.getBisectBatchOnFunctionError())
-                ? bisectLimits.getOrDefault(key, Integer.MAX_VALUE)
-                : Integer.MAX_VALUE;
-    }
-
     private static String finishedShardKey(String uuid, String shardId) {
         return uuid + ":" + shardId;
-    }
-
-    private static String batchStateKey(String uuid, String shardId, String sequence) {
-        return uuid + ":" + shardId + ":" + (sequence == null ? "TRIM_HORIZON" : sequence);
     }
 
     /**
@@ -580,20 +550,12 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
 
     private boolean hasExceededMaximumRecordAge(EventSourceMapping esm, List<DynamoDbStreamReader.Record> records,
                                                 long now) {
-        Integer configuredAge = esm.getMaximumRecordAgeInSeconds();
-        if (configuredAge == null || configuredAge <= 0) {
-            return false;
-        }
-
-        long oldestRecordSeconds = records.stream()
+        OptionalLong oldestRecordSeconds = records.stream()
                 .mapToLong(DynamoDbStreamsEventSourcePoller::approximateCreationSeconds)
                 .filter(seconds -> seconds > 0)
-                .min()
-                .orElse(0);
-        if (oldestRecordSeconds == 0) {
-            return false;
-        }
-        return now - oldestRecordSeconds * 1_000 >= configuredAge * 1_000L;
+                .min();
+        return oldestRecordSeconds.isPresent() && StreamBatchFailures.maximumRecordAgeExceeded(
+                esm, Instant.ofEpochSecond(oldestRecordSeconds.getAsLong()), now);
     }
 
     private static long approximateCreationSeconds(DynamoDbStreamReader.Record rec) {
@@ -601,125 +563,22 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     }
 
     long retryBackoffMs(int retries) {
-        int doublings = Math.min(retries, 16);
-        return Math.min(pollIntervalMs * (1L << doublings), MAX_RETRY_BACKOFF_MS);
+        return StreamBatchFailures.retryBackoffMs(pollIntervalMs, retries);
     }
 
-    private void sendToOnFailureDestination(EventSourceMapping esm, String shardId,
-                                            List<DynamoDbStreamReader.Record> records,
-                                            InvokeResult invokeResult,
-                                            int invokeCount,
-                                            String condition) {
-        if (esm.getDestinationConfig() == null || esm.getDestinationConfig().getOnFailure() == null) {
-            return;
-        }
-        String destinationArn = esm.getDestinationConfig().getOnFailure().getDestination();
-        if (destinationArn == null || destinationArn.isBlank()) {
-            return;
-        }
-
-        try {
-            if (destinationArn.contains(":sqs:")) {
-                String region = AwsArnUtils.regionOrDefault(destinationArn, esm.getRegion());
-                String queueUrl = AwsArnUtils.arnToQueueUrl(destinationArn, baseUrl);
-                String payload = buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount, condition);
-                sqsService.sendMessage(queueUrl, payload, 0, region);
-                LOG.infov("DynamoDB Streams ESM {0}: sent failed batch to SQS DLQ {1}", esm.getUuid(), destinationArn);
-            } else if (destinationArn.contains(":sns:")) {
-                String region = AwsArnUtils.regionOrDefault(destinationArn, esm.getRegion());
-                String payload = buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount, condition);
-                snsService.publish(destinationArn, null, payload, "ESM OnFailure", region);
-                LOG.infov("DynamoDB Streams ESM {0}: sent failed batch to SNS DLQ {1}", esm.getUuid(), destinationArn);
-            } else if (destinationArn.contains(":s3:")) {
-                AwsArnUtils.Arn arn = AwsArnUtils.parse(destinationArn);
-                if (!"s3".equals(arn.service()) || arn.resource().isBlank()) {
-                    throw new IllegalArgumentException("Invalid S3 destination ARN: " + destinationArn);
-                }
-                String key = buildS3OnFailureKey(esm.getUuid(), shardId, Instant.now(), UUID.randomUUID());
-                String s3Payload = buildS3OnFailurePayload(esm, shardId, records, invokeResult, invokeCount, condition);
-                RequestScopes.runAs(esm.getAccountId(), () ->
-                        s3Service.putObject(arn.resource(), key,
-                                s3Payload.getBytes(StandardCharsets.UTF_8),
-                                "application/json", Map.of()));
-                LOG.infov("DynamoDB Streams ESM {0}: sent failed batch to S3 bucket {1} with key {2}",
-                        esm.getUuid(), arn.resource(), key);
-            } else {
-                LOG.warnv("DynamoDB Streams ESM {0}: unsupported OnFailure destination ARN {1}; discarding records",
-                        esm.getUuid(), destinationArn);
-            }
-        } catch (Exception e) {
-            LOG.errorv("DynamoDB Streams ESM {0}: failed to send to OnFailure destination {1}; discarding records: {2}",
-                    esm.getUuid(), destinationArn, e.getMessage());
-        }
+    private StreamBatchFailures.DiscardedBatch discardedBatch(EventSourceMapping esm, String shardId,
+                                                              List<DynamoDbStreamReader.Record> records) {
+        DynamoDbStreamReader.Record first = records.get(0);
+        DynamoDbStreamReader.Record last = records.get(records.size() - 1);
+        return new StreamBatchFailures.DiscardedBatch(BATCH_INFO_NAME, shardId,
+                first.sequenceNumber(), last.sequenceNumber(),
+                creationTime(first), creationTime(last),
+                records.size(), esm.getEventSourceArn(), () -> buildDynamoDbEvent(records, esm));
     }
 
-    private String buildS3OnFailurePayload(EventSourceMapping esm, String shardId,
-                                            List<DynamoDbStreamReader.Record> records,
-                                            InvokeResult invokeResult,
-                                            int invokeCount,
-                                            String condition) {
-        try {
-            ObjectNode root = (ObjectNode) objectMapper.readTree(
-                    buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount, condition));
-            root.put("payload", buildDynamoDbEvent(records, esm));
-            return objectMapper.writeValueAsString(root);
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to serialize S3 OnFailure payload", e);
-        }
-    }
-
-    static String buildS3OnFailureKey(String esmUuid, String shardId, Instant now, UUID randomId) {
-        return "aws/lambda/" + esmUuid + "/" + shardId + "/"
-                + S3_ON_FAILURE_PATH_DATE_FORMATTER.format(now) + "/"
-                + S3_ON_FAILURE_FILE_TIME_FORMATTER.format(now) + "-" + randomId;
-    }
-
-    private String buildOnFailurePayload(EventSourceMapping esm, String shardId,
-                                         List<DynamoDbStreamReader.Record> records,
-                                         InvokeResult invokeResult,
-                                         int invokeCount,
-                                         String condition) {
-        try {
-            ObjectNode root = objectMapper.createObjectNode();
-            root.put("version", "1.0");
-            root.put("timestamp", DateTimeFormatter.ISO_INSTANT.format(Instant.now()));
-
-            ObjectNode requestContext = root.putObject("requestContext");
-            requestContext.put("requestId", invokeResult.getRequestId() != null ? invokeResult.getRequestId() : "");
-            requestContext.put("functionArn", esm.getFunctionArn() != null ? esm.getFunctionArn() : "");
-            requestContext.put("condition", condition);
-            requestContext.put("approximateInvokeCount", invokeCount);
-
-            ObjectNode responseContext = root.putObject("responseContext");
-            responseContext.put("statusCode", invokeResult.getStatusCode() != 0 ? invokeResult.getStatusCode() : 200);
-            responseContext.put("executedVersion", invokeResult.getExecutedVersion() != null ? invokeResult.getExecutedVersion() : "$LATEST");
-            if (invokeResult.getFunctionError() != null) {
-                responseContext.put("functionError", invokeResult.getFunctionError());
-            }
-
-            ObjectNode batchInfo = root.putObject("DDBStreamBatchInfo");
-            batchInfo.put("shardId", shardId);
-            String startSeq = records.isEmpty() ? "" : records.get(0).sequenceNumber();
-            String endSeq = records.isEmpty() ? "" : records.get(records.size() - 1).sequenceNumber();
-            batchInfo.put("startSequenceNumber", startSeq);
-            batchInfo.put("endSequenceNumber", endSeq);
-
-            if (!records.isEmpty()) {
-                long firstArrival = approximateCreationSeconds(records.get(0));
-                long lastArrival = approximateCreationSeconds(records.get(records.size() - 1));
-                batchInfo.put("approximateArrivalOfFirstRecord",
-                        DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochSecond(firstArrival)));
-                batchInfo.put("approximateArrivalOfLastRecord",
-                        DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochSecond(lastArrival)));
-            }
-            batchInfo.put("batchSize", records.size());
-            batchInfo.put("streamArn", esm.getEventSourceArn());
-
-            return objectMapper.writeValueAsString(root);
-        } catch (Exception e) {
-            LOG.warnv("Failed to serialize OnFailure payload: {0}", e.getMessage());
-            return "{}";
-        }
+    /** A stream record's creation time is whole seconds, and AWS writes it without a fraction. */
+    private static String creationTime(DynamoDbStreamReader.Record rec) {
+        return DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochSecond(approximateCreationSeconds(rec)));
     }
 
     private String buildDynamoDbEvent(List<DynamoDbStreamReader.Record> records, EventSourceMapping esm) {

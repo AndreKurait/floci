@@ -14,9 +14,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Publishes AWS-shaped {@code aws.ecs} lifecycle events to the default EventBridge bus.
@@ -120,16 +118,8 @@ public class EcsEventPublisher {
 
     private void putEvent(String detailType, String resourceArn, ObjectNode detail, String region)
             throws Exception {
-        ArrayNode resources = objectMapper.createArrayNode();
-        if (resourceArn != null) {
-            resources.add(resourceArn);
-        }
-        Map<String, Object> entry = new HashMap<>();
-        entry.put("Source", SOURCE);
-        entry.put("DetailType", detailType);
-        entry.put("Detail", objectMapper.writeValueAsString(detail));
-        entry.put("Resources", resources);
-        eventBridgeService.putEvents(List.of(entry), effectiveRegion(region));
+        eventBridgeService.putEvents(List.of(EventBridgeService.serviceEventEntry(SOURCE, detailType,
+                objectMapper.writeValueAsString(detail), resourceArn)), effectiveRegion(region));
     }
 
     private String effectiveRegion(String region) {

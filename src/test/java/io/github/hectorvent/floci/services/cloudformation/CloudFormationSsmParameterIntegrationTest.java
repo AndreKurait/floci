@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
@@ -75,6 +76,7 @@ class CloudFormationSsmParameterIntegrationTest {
             .statusCode(200)
             .body(containsString("<StackId>"));
 
+        CfnStackWaits.awaitStatus("ssm-param-stack", "CREATE_COMPLETE");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -129,6 +131,7 @@ class CloudFormationSsmParameterIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus("ssm-missing-param-stack", "CREATE_FAILED");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -181,6 +184,7 @@ class CloudFormationSsmParameterIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus("ssm-secret-ref-param-stack", "CREATE_FAILED");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")

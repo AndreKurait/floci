@@ -238,7 +238,7 @@ public final class S3RequestSigner implements Filter {
         return query + "&X-Amz-Signature=" + signature;
     }
 
-    private static String host(URI uri) {
+    static String host(URI uri) {
         return uri.getPort() > 0 && uri.getPort() != 80 && uri.getPort() != 443
                 ? uri.getHost() + ":" + uri.getPort()
                 : uri.getHost();
@@ -251,7 +251,7 @@ public final class S3RequestSigner implements Filter {
         return hmacSha256(kService, "aws4_request");
     }
 
-    private static byte[] bodyBytes(Object body) {
+    static byte[] bodyBytes(Object body) {
         if (body == null) {
             return new byte[0];
         }

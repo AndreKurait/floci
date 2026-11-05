@@ -359,6 +359,25 @@ public final class LambdaUtils {
         return createZip("index.js", code);
     }
 
+    /**
+     * ZIP containing a Node.js Cognito CustomMessage handler that writes what its event carried into
+     * the email: the trigger source as the subject, and the code parameter, the user's email and
+     * name and the request's {@code source} metadata as the message.
+     */
+    public static byte[] cognitoCustomMessageZip() {
+        String code = """
+                exports.handler = async (event) => {
+                    const attributes = event.request.userAttributes;
+                    const metadata = event.request.clientMetadata || {};
+                    event.response.emailSubject = event.triggerSource;
+                    event.response.emailMessage = `${event.request.codeParameter} for ${attributes.email}, `
+                        + `${attributes.name}, from ${metadata.source}`;
+                    return event;
+                };
+                """;
+        return createZip("index.js", code);
+    }
+
     private static byte[] createZip(String filename, String content) {
         try {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();

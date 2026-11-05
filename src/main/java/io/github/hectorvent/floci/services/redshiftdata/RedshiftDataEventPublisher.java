@@ -9,7 +9,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -30,7 +29,7 @@ class RedshiftDataEventPublisher {
 
     void publish(RedshiftDataStatementStore.StoredStatement statement) {
         try {
-            if (!registry.isServiceEnabled("eventbridge")) {
+            if (!registry.isServiceEnabled("events")) {
                 LOG.warnv("EventBridge disabled for statement {0}, account {1}, region {2}",
                         statement.id, statement.accountId, statement.region);
                 return;
@@ -47,12 +46,8 @@ class RedshiftDataEventPublisher {
             detail.put("state", statement.status.name());
             detail.put("rows", statement.resultRows);
             detail.put("expireAt", statement.expiresAt.getEpochSecond());
-            Map<String, Object> entry = new HashMap<>();
-            entry.put("Source", "aws.redshift-data");
-            entry.put("DetailType", "Redshift Data Statement Status Change");
-            entry.put("Detail", detail.toString());
-            entry.put("EventBusName", "default");
-            entry.put("Resources", mapper.createArrayNode().add(statement.resourceArn));
+            Map<String, Object> entry = EventBridgeService.serviceEventEntry("aws.redshift-data",
+                    "Redshift Data Statement Status Change", detail.toString(), statement.resourceArn);
             EventBridgeService.PutEventsResult result = events.putEvents(List.of(entry), statement.region, statement.accountId);
             if (result.failedCount() > 0) {
                 LOG.warnv("EventBridge rejected event for statement {0}, account {1}, region {2}: {3}",

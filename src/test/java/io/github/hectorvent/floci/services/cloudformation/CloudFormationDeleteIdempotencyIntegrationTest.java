@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
@@ -64,8 +65,7 @@ class CloudFormationDeleteIdempotencyIntegrationTest {
             .formParam("TemplateBody", template)
         .when().post("/").then().statusCode(200);
 
-        // CloudFormationQueryHandler awaits executeChangeSet before CreateStack returns, so this
-        // one-shot assertion verifies the handler's synchronous completion contract.
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         assertStackStatus(stackName, "CREATE_COMPLETE");
 
         // Remove the table out-of-band — mimics a rollback having already deleted it.

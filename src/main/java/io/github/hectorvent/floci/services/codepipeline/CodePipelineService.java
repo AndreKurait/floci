@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.DeadlineCharSequence;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -80,7 +81,7 @@ public class CodePipelineService {
     private static final String DEFAULT_EXECUTION_MODE = "SUPERSEDED";
     private static final String DEFAULT_PIPELINE_TYPE = "V1";
     private static final int MAX_ACTIVE_EXECUTIONS = 50;
-    private static final long POLL_INTERVAL_MS = 100L;
+    private static final long DEFAULT_WORKER_POLL_INTERVAL_MS = 100L;
     private static final String SOURCE_POLL_TYPE = "source-poll";
     private static final String MISSING_SOURCE_REVISION = "missing";
     private static final long MAX_ARCHIVE_BYTES = 128L << 20;
@@ -126,7 +127,9 @@ public class CodePipelineService {
     // An execution's status turns Failed as soon as one action fails, while its runner is still waiting
     // on sibling actions. Retries check this set so they never overlap a runner that has not finished.
     final Set<String> activeRuns = ConcurrentHashMap.newKeySet();
-    private final long sourcePollIntervalMs;
+    // Package-private so tests can assert the resolved intervals instead of timing schedules and sleeps.
+    final long sourcePollIntervalMs;
+    final long workerPollIntervalMs;
     // Test hooks, set only through the package-private constructor: a shortened wait, and a probe
     // for the gap before the override timeout cleanup.
     private final long runFinishWaitNanos;
@@ -148,7 +151,7 @@ public class CodePipelineService {
                         CodeBuildService codeBuildService, CodeDeployService codeDeployService,
                         LambdaService lambdaService, S3Service s3Service) {
         this(storageFactory, mapper, codeBuildService, codeDeployService, lambdaService, s3Service,
-                detachedEventPublisher(mapper), DEFAULT_SOURCE_POLL_INTERVAL_MS,
+                detachedEventPublisher(mapper), DEFAULT_SOURCE_POLL_INTERVAL_MS, DEFAULT_WORKER_POLL_INTERVAL_MS,
                 DEFAULT_RUN_FINISH_WAIT_NANOS, () -> { });
     }
 
@@ -167,7 +170,8 @@ public class CodePipelineService {
                                EmulatorConfig config, CodePipelineEventPublisher eventPublisher) {
         this(storageFactory, mapper, codeBuildService, codeDeployService, lambdaService, s3Service,
                 eventPublisher,
-                resolveSourcePollInterval(config.services().codepipeline().sourcePollIntervalMs()),
+                config.services().codepipeline().sourcePollIntervalMs(),
+                config.services().codepipeline().workerPollIntervalMs(),
                 DEFAULT_RUN_FINISH_WAIT_NANOS, () -> { });
     }
 
@@ -184,20 +188,20 @@ public class CodePipelineService {
      * observer and stop the whole emulator becoming ready. A misconfigured value is not worth
      * failing every other service for, so it falls back with a warning.
      */
-    private static long resolveSourcePollInterval(long configured) {
+    static long resolvePollInterval(String kind, long configured, long fallback) {
         if (configured > 0) {
             return configured;
         }
-        LOG.warnv("Ignoring CodePipeline source poll interval {0}ms: must be a positive number of "
-                + "milliseconds, falling back to {1}ms", configured, DEFAULT_SOURCE_POLL_INTERVAL_MS);
-        return DEFAULT_SOURCE_POLL_INTERVAL_MS;
+        LOG.warnv("Ignoring CodePipeline {0} poll interval {1}ms: must be a positive number of "
+                + "milliseconds, falling back to {2}ms", kind, configured, fallback);
+        return fallback;
     }
 
     @SuppressWarnings("unchecked")
     CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
                         CodeBuildService codeBuildService, CodeDeployService codeDeployService,
                         LambdaService lambdaService, S3Service s3Service,
-                        CodePipelineEventPublisher eventPublisher, long sourcePollIntervalMs,
+                        CodePipelineEventPublisher eventPublisher, long sourcePollIntervalMs, long workerPollIntervalMs,
                         long runFinishWaitNanos, Runnable beforeOverrideTimeoutCleanup) {
         this.pipelineStore = storageFactory.create(
                 "codepipeline", "codepipeline-pipelines.json", new TypeReference<Map<String, CodePipelinePipeline>>() {});
@@ -211,7 +215,10 @@ public class CodePipelineService {
         this.lambdaService = lambdaService;
         this.s3Service = s3Service;
         this.eventPublisher = eventPublisher;
-        this.sourcePollIntervalMs = sourcePollIntervalMs;
+        this.sourcePollIntervalMs = resolvePollInterval("source", sourcePollIntervalMs,
+                DEFAULT_SOURCE_POLL_INTERVAL_MS);
+        this.workerPollIntervalMs = resolvePollInterval("worker", workerPollIntervalMs,
+                DEFAULT_WORKER_POLL_INTERVAL_MS);
         this.runFinishWaitNanos = runFinishWaitNanos;
         this.beforeOverrideTimeoutCleanup = beforeOverrideTimeoutCleanup;
     }
@@ -277,6 +284,7 @@ public class CodePipelineService {
                         execution.setStatusSummary("Pipeline execution resumed after restart.");
                         execution.setStopRequested(false);
                         execution.setAbandon(false);
+                        execution.setWaitingStage(null);
                         execution.setActionExecutions(new ArrayList<>());
                         execution.setStageExecutionStatuses(new LinkedHashMap<>());
                         putExecution(execution);
@@ -598,7 +606,6 @@ public class CodePipelineService {
             throw new AwsException("ConcurrentPipelineExecutionsLimitExceededException",
                     "The pipeline has reached the limit for concurrent pipeline executions", 400);
         }
-        applyExecutionMode(execution);
         eventPublisher.pipelineStateChange(execution, "STARTED");
         try {
             executor.submit(() -> runExecution(pipeline, execution));
@@ -614,14 +621,15 @@ public class CodePipelineService {
     }
 
     private boolean persistExecutionIfSlotAvailable(CodePipelineExecution execution) {
-        if (!List.of("QUEUED", "PARALLEL").contains(execution.getExecutionMode())) {
-            putExecution(execution);
-            return true;
-        }
         return startLocks.withLock(lockKey(execution), () -> {
-            if (activeExecutionCount(execution) >= MAX_ACTIVE_EXECUTIONS) {
+            if (List.of("QUEUED", "PARALLEL").contains(execution.getExecutionMode())
+                    && activeExecutionCount(execution) >= MAX_ACTIVE_EXECUTIONS) {
                 return false;
             }
+            long lastOrdinal = executions(execution.getAccountId(), execution.getRegion(), execution.getPipelineName())
+                    .stream().map(CodePipelineExecution::getAdmissionOrdinal)
+                    .filter(Objects::nonNull).mapToLong(Long::longValue).max().orElse(0L);
+            execution.setAdmissionOrdinal(Math.incrementExact(lastOrdinal));
             putExecution(execution);
             return true;
         });
@@ -1050,7 +1058,6 @@ public class CodePipelineService {
         if (!persistExecutionIfSlotAvailable(rollback)) {
             throw pipelineBusy();
         }
-        applyExecutionMode(rollback);
         eventPublisher.pipelineStateChange(rollback, "STARTED");
         try {
             executor.submit(() -> runExecution(pipeline, rollback));
@@ -1431,7 +1438,7 @@ public class CodePipelineService {
         ObjectNode item = mapper.createObjectNode();
         item.set("definition", webhook.deepCopy());
         item.put("url", "http://localhost:4566/codepipeline/webhooks/" + name);
-        item.put("arn", AwsArnUtils.Arn.of("codepipeline", region, account, "webhook/" + name).toString());
+        item.put("arn", AwsArnUtils.Arn.of("codepipeline", region, account, "webhook:" + name).toString());
         if (request.path("tags").isArray() && !request.path("tags").isEmpty()) {
             item.set("tags", request.path("tags").deepCopy());
         }
@@ -1527,11 +1534,7 @@ public class CodePipelineService {
             try {
                 runStagesFrom(pipeline, execution, 0, includeStagesFor(pipeline, execution));
             } catch (Exception e) {
-                if (execution.getCurrentStage() != null) {
-                    execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Failed");
-                }
-                execution.setStatus("Failed");
-                execution.setStatusSummary(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                failExecutionRun(execution, e);
                 LOG.errorf(e, "CodePipeline execution %s failed", execution.getPipelineExecutionId());
             } finally {
                 finishExecutionRun(execution);
@@ -1564,14 +1567,24 @@ public class CodePipelineService {
             }
             runStagesFrom(pipeline, execution, stageIndex + 1, includeStagesFor(pipeline, execution));
         } catch (Exception e) {
-            if (execution.getCurrentStage() != null) {
-                execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Failed");
-            }
-            execution.setStatus("Failed");
-            execution.setStatusSummary(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            failExecutionRun(execution, e);
             LOG.errorf(e, "CodePipeline retry for execution %s failed", execution.getPipelineExecutionId());
         } finally {
             finishExecutionRun(execution);
+        }
+    }
+
+    private void failExecutionRun(CodePipelineExecution execution, Exception exception) {
+        synchronized (execution) {
+            execution.setWaitingStage(null);
+            if (!isTerminal(execution.getStatus())) {
+                if (execution.getCurrentStage() != null) {
+                    execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Failed");
+                }
+                execution.setStatus("Failed");
+                execution.setStatusSummary(exception.getMessage() == null
+                        ? exception.getClass().getSimpleName() : exception.getMessage());
+            }
         }
     }
 
@@ -1585,15 +1598,19 @@ public class CodePipelineService {
                 continue;
             }
             waitForTransition(pipeline, execution, stageName);
-            if (finishIfStopped(execution)) {
+            if (isTerminal(execution.getStatus()) || finishIfStopped(execution)) {
                 return;
             }
             if (!runStageInRun(pipeline, execution, stage, "ALL_ACTIONS", Map.of())) {
                 return;
             }
         }
-        execution.setStatus("Succeeded");
-        execution.setStatusSummary("Pipeline execution succeeded.");
+        synchronized (execution) {
+            if (!isTerminal(execution.getStatus())) {
+                execution.setStatus("Succeeded");
+                execution.setStatusSummary("Pipeline execution succeeded.");
+            }
+        }
     }
 
     /**
@@ -1605,10 +1622,18 @@ public class CodePipelineService {
     private boolean runStageInRun(CodePipelinePipeline pipeline, CodePipelineExecution execution, JsonNode stage,
                                   String retryMode, Map<String, String> previousStatuses) {
         String stageName = stage.path("name").asText();
-        execution.setCurrentStage(stageName);
-        execution.getStageExecutionStatuses().put(stageName, "InProgress");
-        execution.setLastUpdateTime(now());
-        putExecution(execution);
+        synchronized (execution) {
+            // Wait clearing and stage entry share the supersession monitor: a newer arrival
+            // either supersedes this waiter first, or sees an active stage and leaves it alone.
+            execution.setWaitingStage(null);
+            if (isTerminal(execution.getStatus())) {
+                return false;
+            }
+            execution.setCurrentStage(stageName);
+            execution.getStageExecutionStatuses().put(stageName, "InProgress");
+            execution.setLastUpdateTime(now());
+            putExecution(execution);
+        }
 
         // Evaluated before STARTED is published: AWS documents no skipped-stage event, so a stage
         // skipped by its beforeEntry condition emits no stage events at all.
@@ -1811,7 +1836,10 @@ public class CodePipelineService {
     private void finishExecutionRun(CodePipelineExecution execution) {
         startLocks.withLock(lockKey(execution), () -> {
             try {
-                execution.setCurrentStage(null);
+                synchronized (execution) {
+                    execution.setWaitingStage(null);
+                    execution.setCurrentStage(null);
+                }
                 execution.setLastUpdateTime(now());
                 putExecution(execution);
                 boolean pipelineDeleted = pipelineStore.getForAccount(execution.getAccountId(),
@@ -2010,7 +2038,7 @@ public class CodePipelineService {
                 revision.put("revisionChangeIdentifier", unquoteETag(object.getETag()));
                 revision.put("revisionSummary", bucket + "/" + key);
                 revision.put("revisionUrl", "s3://" + bucket + "/" + key);
-                revision.put("created", object.getLastModified().toEpochMilli() / 1000.0);
+                revision.put("created", EpochSeconds.fromInstant(object.getLastModified()));
                 execution.getArtifactRevisions().add(revision);
                 upsertSourceRevision(execution, state.getActionName(), revisionId, bucket, key, object);
                 pinResolvedS3Version(execution, state.getActionName(), object.getVersionId());
@@ -2329,7 +2357,7 @@ public class CodePipelineService {
             if (abandonExternalActionIfRequested(execution, state)) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
             build = codeBuildService.getBuild(execution.getRegion(), execution.getAccountId(), build.getId());
         }
         if (abandonExternalActionIfRequested(execution, state)) {
@@ -2362,7 +2390,7 @@ public class CodePipelineService {
             if (abandonExternalActionIfRequested(execution, state)) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
             deployment = codeDeployService.getDeployment(execution.getRegion(), deploymentId);
         }
         if (abandonExternalActionIfRequested(execution, state)) {
@@ -2432,7 +2460,7 @@ public class CodePipelineService {
                     now() + TimeUnit.DAYS.toSeconds(7));
         }
         while ("InProgress".equals(state.getStatus()) && !execution.isStopRequested()) {
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
         }
         if (execution.isStopRequested()) {
             state.setStatus(execution.isAbandon() ? "Abandoned" : "Stopped");
@@ -2487,34 +2515,69 @@ public class CodePipelineService {
                 }
                 throw new AwsException("ActionExecutionFailed", message, 400);
             }
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
         }
         state.setStatus("Abandoned");
         state.setSummary("Action abandoned.");
     }
 
-    private void applyExecutionMode(CodePipelineExecution execution) {
-        if (!"SUPERSEDED".equals(execution.getExecutionMode())) {
+    private void supersedeOlderWaiters(CodePipelineExecution execution, String stageName) {
+        if (!"SUPERSEDED".equals(execution.getExecutionMode())
+                || !"InProgress".equals(execution.getStatus()) || execution.getStartTime() == null) {
             return;
         }
+        // Do not hold the arriving execution's monitor while acquiring another execution's monitor.
         executions(execution.getAccountId(), execution.getRegion(), execution.getPipelineName()).stream()
-                .filter(e -> !e.getPipelineExecutionId().equals(execution.getPipelineExecutionId()))
-                .filter(e -> "InProgress".equals(e.getStatus()) && e.getCurrentStage() == null)
+                .filter(e -> isOlderExecution(e, execution))
                 .forEach(e -> {
-                    e.setStatus("Superseded");
-                    e.setStatusSummary("Superseded by " + execution.getPipelineExecutionId());
-                    e.setLastUpdateTime(now());
-                    putExecution(e);
+                    synchronized (e) {
+                        if ("SUPERSEDED".equals(e.getExecutionMode())
+                                && "InProgress".equals(e.getStatus()) && e.getCurrentStage() == null
+                                && stageName.equals(e.getWaitingStage())) {
+                            e.setStatus("Superseded");
+                            e.setWaitingStage(null);
+                            e.setStatusSummary("Superseded by " + execution.getPipelineExecutionId());
+                            e.setLastUpdateTime(now());
+                            putExecution(e);
+                        }
+                    }
                 });
     }
 
-    private void waitForTransition(CodePipelinePipeline pipeline, CodePipelineExecution execution,
+    private boolean isOlderExecution(CodePipelineExecution candidate, CodePipelineExecution execution) {
+        if (candidate.getStartTime() == null || execution.getStartTime() == null) {
+            return false;
+        }
+        int timeOrder = Double.compare(candidate.getStartTime(), execution.getStartTime());
+        if (timeOrder != 0) {
+            return timeOrder < 0;
+        }
+        // Legacy equal-time executions have no reliable ordering. Do not guess from UUIDs or
+        // treat equality as older: either could otherwise supersede the other on worker arrival.
+        return candidate.getAdmissionOrdinal() != null && execution.getAdmissionOrdinal() != null
+                && candidate.getAdmissionOrdinal() < execution.getAdmissionOrdinal();
+    }
+
+    void waitForTransition(CodePipelinePipeline pipeline, CodePipelineExecution execution,
                                    String stageName) throws InterruptedException {
-        while (!pipeline.getTransitions().getOrDefault(stageName, enabledTransition()).isEnabled()) {
-            if (execution.isStopRequested()) {
+        while (true) {
+            boolean enabled = pipeline.getTransitions().getOrDefault(stageName, enabledTransition()).isEnabled();
+            synchronized (execution) {
+                if (isTerminal(execution.getStatus()) || execution.isStopRequested()) {
+                    execution.setWaitingStage(null);
+                    return;
+                }
+                if (!enabled && !stageName.equals(execution.getWaitingStage())) {
+                    execution.setWaitingStage(stageName);
+                    putExecution(execution);
+                }
+            }
+            // Arrival matters even when enabled: an older worker may still be polling its wait.
+            supersedeOlderWaiters(execution, stageName);
+            if (enabled) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
+            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
             pipeline = requirePipeline(execution.getAccountId(), execution.getRegion(), execution.getPipelineName());
         }
     }
@@ -2754,7 +2817,8 @@ public class CodePipelineService {
             node = mapper.valueToTree(execution);
         }
         node.remove(List.of("accountId", "region", "startTime", "lastUpdateTime",
-                "sourceRevisions", "sourceRevisionOverrides", "actionExecutions", "currentStage",
+                "sourceRevisions", "sourceRevisionOverrides", "actionExecutions", "currentStage", "waitingStage",
+                "admissionOrdinal",
                 "stopRequested", "abandon", "rollbackTargetPipelineExecutionId", "rollbackStageName",
                 "stageExecutionStatuses", "artifactsReleased", "ruleExecutions", "conditionOverrides"));
         if (execution.getRollbackTargetPipelineExecutionId() != null) {
@@ -3101,7 +3165,7 @@ public class CodePipelineService {
     }
 
     private static double now() {
-        return Instant.now().toEpochMilli() / 1000.0;
+        return EpochSeconds.fromInstant(Instant.now());
     }
 
     private static void putIfNotNull(ObjectNode node, String field, Object value) {

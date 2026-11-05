@@ -1,12 +1,22 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebCodeBuckets;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebRoles;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebZips;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
+import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -30,14 +40,22 @@ class CloudFormationLambdaWebIntegrationTest {
     private static final String CFN_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/cloudformation/aws4_request";
     private static final String BUCKET = "cfn-web-code";
+    private static final String PROBE_TOKEN = "arn:aws:lambda:us-east-1:000000000000:function:cfn-web-regional-probe";
+
+    @InjectMock
+    LambdaService lambdaService;
 
     @Inject
     S3Service s3Service;
 
+    @Inject
+    IamService iamService;
+
     @Test
     void stackProvisionsFunctionRevisionAndEndpoint() {
-        s3Service.createBucket(BUCKET, "us-east-1");
-        s3Service.putObject(BUCKET, "app.zip", "zip".getBytes(StandardCharsets.UTF_8), "application/zip", Map.of());
+        LambdaWebRoles.trustLambda(iamService, "arn:aws:iam::000000000000:role/cfn-web");
+        LambdaWebCodeBuckets.create(s3Service, BUCKET);
+        s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
         String suffix = Long.toString(System.nanoTime(), 36);
         String functionName = "cfn-web-" + suffix;
         String stackName = "cfn-web-stack-" + suffix;
@@ -97,6 +115,105 @@ class CloudFormationLambdaWebIntegrationTest {
         cloudFormation(stackName, "DeleteStack", null);
         await().untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
                 .then().statusCode(404));
+    }
+
+    @Test
+    void aRevisionOnCodeThatIsNotAZipFailsItsResource() {
+        LambdaWebRoles.trustLambda(iamService, "arn:aws:iam::000000000000:role/cfn-web");
+        LambdaWebCodeBuckets.create(s3Service, BUCKET);
+        s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
+        s3Service.putObject(BUCKET, "notzip.zip", "this is not a zip\n".getBytes(StandardCharsets.UTF_8),
+                "application/zip", Map.of());
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String functionName = "cfn-web-bad-" + suffix;
+        String stackName = "cfn-web-bad-stack-" + suffix;
+        String notZip = template(functionName, 30).replace("\"app.zip\"", "\"notzip.zip\"");
+
+        cloudFormation(stackName, "CreateStack", notZip);
+        await().untilAsserted(() -> describeStacks(stackName, "ROLLBACK_COMPLETE"));
+        stackEvents(stackName).body(containsString(
+                "<ResourceStatusReason>Failed to read zip file: zip: not a valid zip file</ResourceStatusReason>"));
+        given().when().get("/2025-03-07/web-functions/" + functionName).then().statusCode(404);
+        cloudFormation(stackName, "DeleteStack", null);
+
+        // A replacement on such code fails the update, and the rollback deletes it.
+        String updatedStack = stackName + "-update";
+        cloudFormation(updatedStack, "CreateStack", template(functionName, 30));
+        String revisionId = outputs(describeStacks(updatedStack, "CREATE_COMPLETE")).get("RevId");
+        cloudFormation(updatedStack, "UpdateStack", notZip);
+        await().untilAsserted(() -> describeStacks(updatedStack, "UPDATE_ROLLBACK_COMPLETE"));
+        given().contentType("application/json").body("{}")
+                .when().post("/2025-03-07/web-functions/" + functionName + "/list-revisions")
+                .then().statusCode(200)
+                .body("revisions", hasSize(1))
+                .body("revisions[0].revisionId", equalTo(revisionId));
+
+        cloudFormation(updatedStack, "DeleteStack", null);
+        await().untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
+                .then().statusCode(404));
+    }
+
+    @Test
+    void aCustomResourceIsGivenRegionalEndpointsAsAnObject() {
+        LambdaWebRoles.trustLambda(iamService, "arn:aws:iam::000000000000:role/cfn-web");
+        LambdaWebCodeBuckets.create(s3Service, BUCKET);
+        s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String functionName = "cfn-web-probe-" + suffix;
+        String stackName = "cfn-web-probe-stack-" + suffix;
+        CustomResourceProbe handler = CustomResourceProbe.stub(lambdaService, PROBE_TOKEN, "regional-probe");
+        String probe = """
+                "Probe": {
+                  "Type": "Custom::Probe",
+                  "Properties": {"ServiceToken": "%s", "Value": {"Fn::GetAtt": ["Ep", "RegionalEndpoints"]}}
+                },
+                """.formatted(PROBE_TOKEN);
+
+        cloudFormation(stackName, "CreateStack", template(functionName, 30, probe));
+        await().untilAsserted(() -> describeStacks(stackName, "CREATE_COMPLETE"));
+        String revisionId = outputs(describeStacks(stackName, "CREATE_COMPLETE")).get("RevId");
+        JsonNode value = handler.request("Create").path("ResourceProperties").path("Value");
+        assertEquals(List.of("us-east-1"), value.properties().stream().map(Map.Entry::getKey).toList());
+        JsonNode home = value.path("us-east-1");
+        assertEquals(List.of("AuthType", "RevisionWeights", "State", "StateReason"),
+                home.properties().stream().map(Map.Entry::getKey).toList());
+        assertEquals("ApplicationManaged", home.path("AuthType").asText());
+        assertEquals(revisionId, home.path("RevisionWeights").path(0).path("RevisionId").asText());
+        // The custom resource stringifies every scalar it is given, so the weight is compared as text.
+        assertEquals("100", home.path("RevisionWeights").path(0).path("Weight").asText());
+        assertEquals("Active", home.path("State").asText());
+        assertEquals("The endpoint is active in the region.", home.path("StateReason").asText());
+
+        cloudFormation(stackName, "DeleteStack", null);
+        await().untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
+                .then().statusCode(404));
+    }
+
+    @Test
+    void regionalEndpointsIsAnObjectThatAnOutputCannotHold() {
+        LambdaWebRoles.trustLambda(iamService, "arn:aws:iam::000000000000:role/cfn-web");
+        LambdaWebCodeBuckets.create(s3Service, BUCKET);
+        s3Service.putObject(BUCKET, "app.zip", LambdaWebZips.indexJs(""), "application/zip", Map.of());
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String functionName = "cfn-web-regional-" + suffix;
+        String stackName = "cfn-web-regional-stack-" + suffix;
+        String state = "\"EpState\": {\"Value\": {\"Fn::GetAtt\": [\"Ep\", \"State\"]}}";
+
+        cloudFormation(stackName, "CreateStack", template(functionName, 30).replace(state,
+                state + ", \"EpRegional\": {\"Value\": {\"Fn::GetAtt\": [\"Ep\", \"RegionalEndpoints\"]}}"));
+        await().untilAsserted(() -> describeStacks(stackName, "ROLLBACK_COMPLETE"));
+        stackEvents(stackName).body(containsString("Template format error: Every Value member must be a string."));
+        given().when().get("/2025-03-07/web-functions/" + functionName).then().statusCode(404);
+        cloudFormation(stackName, "DeleteStack", null);
+    }
+
+    private static ValidatableResponse stackEvents(String stackName) {
+        return given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when().post("/").then().statusCode(200);
     }
 
     /** A revision whose code object does not exist, created after the endpoint, so the update fails there. */
@@ -190,6 +307,7 @@ class CloudFormationLambdaWebIntegrationTest {
     }
 
     private static String describeStacks(String stackName, String expectedStatus) {
+        assertEquals(expectedStatus, CfnStackWaits.awaitTerminal(stackName, CFN_AUTH).status());
         return given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", CFN_AUTH)

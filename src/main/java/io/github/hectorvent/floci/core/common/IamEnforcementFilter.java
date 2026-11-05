@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
+import io.github.hectorvent.floci.services.iam.AccessDeniedMessages;
+import io.github.hectorvent.floci.services.iam.AccessDeniedMessages.PolicyType;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import io.github.hectorvent.floci.services.iam.IamAuthorizedActions;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
@@ -21,6 +23,8 @@ import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
+import io.github.hectorvent.floci.services.s3.S3ScratchSpace;
+import io.github.hectorvent.floci.services.s3.S3Service;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.ext.web.RoutingContext;
@@ -48,6 +52,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -67,6 +72,8 @@ import java.util.regex.Pattern;
  *   <li>The action cannot be resolved (unknown mapping → permissive)</li>
  *   <li>The action is {@code sts:GetCallerIdentity}, which AWS allows without permissions. The
  *       key itself is still checked.</li>
+ *   <li>The action is {@code sts:GetSessionToken}, which AWS also allows without permissions:
+ *       policies cannot control authentication operations. The key itself is still checked.</li>
  * </ul>
  *
  * <p>Authenticated temporary callers of {@code sts:GetFederationToken} are refused here with
@@ -87,10 +94,6 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     private static final Logger LOG = Logger.getLogger(IamEnforcementFilter.class);
 
-    /** Extracts the credential-scope service name (e.g. "s3", "lambda"). */
-    private static final Pattern SERVICE_PATTERN =
-            Pattern.compile("Credential=\\S+/\\d{8}/[^/]+/([^/]+)/");
-
     /** AWS's wording for a credential it does not recognise. */
     private static final String INVALID_SECURITY_TOKEN = "The security token included in the request is invalid.";
 
@@ -98,8 +101,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private static final String S3_INVALID_ACCESS_KEY_ID =
             "The AWS Access Key Id you provided does not exist in our records.";
 
-    /** AWS's wording for temporary credentials past their expiration. */
-    private static final String EXPIRED_TOKEN = "The security token included in the request has expired.";
+    /**
+     * AWS's wording for temporary credentials past their expiration, shared with an operation that
+     * finds the session gone after this filter has let the request through.
+     */
+    public static final String EXPIRED_TOKEN = "The security token included in the request has expired.";
 
     /** S3's wording for the same. */
     private static final String S3_EXPIRED_TOKEN = "The provided token has expired.";
@@ -209,6 +215,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     /** The clock {@link IamService} measures session expiry on, so both read the same time. */
     private final Clock clock;
     private final ResourceInfo resourceInfo;
+    private final Instance<S3Service> s3ServiceProvider;
 
     @Inject
     public IamEnforcementFilter(EmulatorConfig config,
@@ -228,7 +235,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                 Instance<ResourcePolicyProvider> resourcePolicyProviders,
                                 Instance<PassedRoleLookup> passedRoleLookups,
                                 Clock clock,
-                                @Context ResourceInfo resourceInfo) {
+                                @Context ResourceInfo resourceInfo,
+                                Instance<S3Service> s3ServiceProvider) {
         this.config = config;
         this.accountResolver = accountResolver;
         this.iamService = iamService;
@@ -247,6 +255,32 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         this.passedRoleLookups = passedRoleLookups;
         this.clock = clock;
         this.resourceInfo = resourceInfo;
+        this.s3ServiceProvider = s3ServiceProvider;
+    }
+
+    /** Package-private constructor for callers predating s3ServiceProvider. */
+    IamEnforcementFilter(EmulatorConfig config,
+                         AccountResolver accountResolver,
+                         IamService iamService,
+                         IamPolicyEvaluator evaluator,
+                         IamActionRegistry actionRegistry,
+                         AwsQueryServiceResolver queryServiceResolver,
+                         ResourceArnBuilder arnBuilder,
+                         RequestContext requestContext,
+                         IamConditionContextResolver conditionContextResolver,
+                         CloudTrailService cloudTrailService,
+                         CurrentVertxRequest currentVertxRequest,
+                         ResolvedServiceCatalog catalog,
+                         Instance<ScpProvider> scpProvider,
+                         SessionAccountLookup sessionAccountLookup,
+                         Instance<ResourcePolicyProvider> resourcePolicyProviders,
+                         Instance<PassedRoleLookup> passedRoleLookups,
+                         Clock clock,
+                         ResourceInfo resourceInfo) {
+        this(config, accountResolver, iamService, evaluator, actionRegistry,
+                queryServiceResolver, arnBuilder, requestContext,
+                conditionContextResolver, cloudTrailService, currentVertxRequest, catalog,
+                scpProvider, sessionAccountLookup, resourcePolicyProviders, passedRoleLookups, clock, resourceInfo, null);
     }
 
     /** Package-private constructor for callers predating Query dispatch-aware enforcement. */
@@ -267,7 +301,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         this(config, accountResolver, iamService, evaluator, actionRegistry,
                 new AwsQueryServiceResolver(catalog), arnBuilder, requestContext,
                 conditionContextResolver, cloudTrailService, currentVertxRequest, catalog,
-                scpProvider, sessionAccountLookup, resourcePolicyProviders, null, Clock.systemUTC(), null);
+                scpProvider, sessionAccountLookup, resourcePolicyProviders, null, Clock.systemUTC(), null, null);
     }
 
     /** Package-private constructor for callers predating resourcePolicyProviders. */
@@ -287,7 +321,29 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         this(config, accountResolver, iamService, evaluator, actionRegistry,
                 new AwsQueryServiceResolver(catalog), arnBuilder, requestContext,
                 conditionContextResolver, cloudTrailService, currentVertxRequest, catalog,
-                scpProvider, sessionAccountLookup, null, null, Clock.systemUTC(), null);
+                scpProvider, sessionAccountLookup, null, null, Clock.systemUTC(), null, null);
+    }
+
+    /** Package-private constructor for testing with S3Service. */
+    IamEnforcementFilter(EmulatorConfig config,
+                         AccountResolver accountResolver,
+                         IamService iamService,
+                         IamPolicyEvaluator evaluator,
+                         IamActionRegistry actionRegistry,
+                         ResourceArnBuilder arnBuilder,
+                         RequestContext requestContext,
+                         IamConditionContextResolver conditionContextResolver,
+                         CloudTrailService cloudTrailService,
+                         CurrentVertxRequest currentVertxRequest,
+                         ResolvedServiceCatalog catalog,
+                         Instance<ScpProvider> scpProvider,
+                         SessionAccountLookup sessionAccountLookup,
+                         Instance<ResourcePolicyProvider> resourcePolicyProviders,
+                         Instance<S3Service> s3ServiceProvider) {
+        this(config, accountResolver, iamService, evaluator, actionRegistry,
+                new AwsQueryServiceResolver(catalog), arnBuilder, requestContext,
+                conditionContextResolver, cloudTrailService, currentVertxRequest, catalog,
+                scpProvider, sessionAccountLookup, resourcePolicyProviders, null, Clock.systemUTC(), null, s3ServiceProvider);
     }
 
     @Override
@@ -383,6 +439,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if ("sts:GetCallerIdentity".equals(action)) {
             return; // AWS returns caller identity even when an identity policy explicitly denies it
         }
+        if ("sts:GetSessionToken".equals(action)) {
+            // AWS: "No permissions are required for users to perform this operation... You cannot
+            // use policies to control authentication operations." An explicit deny does not stop it.
+            return;
+        }
 
         if ("sts:GetFederationToken".equals(action) && IamService.isTemporaryAccessKey(akid)) {
             ctx.abortWith(queryXmlAccessDenied(IamService.FEDERATION_TOKEN_SESSION_MESSAGE));
@@ -423,7 +484,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         }
 
         List<String> resources = resolveResourceArns(credentialScope,
-                targetResources(credentialScope, action, ctx, region, accountId));
+                targetResources(credentialScope, action, resolvedAuthorization.operation(), ctx, region, accountId));
 
         Optional<PresignedScope> presignedScope = iamService.presignedScope(akid);
         if (presignedScope.isPresent()) {
@@ -475,6 +536,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
         }
 
+        // A policy on the encryption keys would refuse this for keys it cannot have: the handler answers it.
+        if (conditionContextResolver.namesUploadNotHeld(action, ctx)) {
+            return;
+        }
+
         Map<String, List<String>> conditionContext = conditionContextResolver.resolve(credentialScope, action, ctx);
         // A request naming several resources is authorized once per resource, as on AWS, so a
         // permitted first target cannot carry later targets that the policy does not allow.
@@ -497,12 +563,20 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
             callerArns.get().putPrincipalKeys(conditionContext);
         }
-        List<Map<String, List<String>>> targetContexts = new ArrayList<>();
-        targetContexts.add(conditionContext);
+        // Internal transfers bypass customer policies only for a registered session scope in a tagged bucket.
+        if (isScratchTransfer(ctx, credentialScope, action, resources, akid, callerArns.orElse(null))) {
+            return;
+        }
+        // A create that carries tags is checked with them where its own action takes them, as the tagging
+        // action it also needs is (see TagOnCreate); keys the service's own resolver gives are kept.
+        Optional<TagOnCreate.Tagging> tagOnCreate = TagOnCreate.of(resolvedAuthorization.operation(), ctx);
+        List<Map<String, List<String>>> requestTags = tagOnCreate.filter(TagOnCreate.Tagging::requestTags)
+                .map(TagOnCreate::requestTagContexts).orElse(List.of());
+        List<Map<String, List<String>>> targetContexts = withRequestTags(conditionContext, requestTags);
         for (Map<String, List<String>> target : remainingTargets) {
             Map<String, List<String>> targetContext = new HashMap<>(target);
             callerArns.ifPresent(arns -> arns.putPrincipalKeys(targetContext));
-            targetContexts.add(targetContext);
+            targetContexts.addAll(withRequestTags(targetContext, requestTags));
         }
 
         RequestPrincipal principal = RequestPrincipal.caller(callerArns.orElse(null));
@@ -530,6 +604,15 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 region, accountId, akid)) {
             return;
         }
+        if (abortIfConnectorPassDenied(ctx, caller, callerArns.orElse(null), resolvedAuthorization.operation(),
+                region, accountId, akid)) {
+            return;
+        }
+        if (tagOnCreate.isPresent() && abortIfTagOnCreateDenied(ctx, caller, principal, callerArns.orElse(null),
+                action, resolvedAuthorization.operation(), tagOnCreate.get(), credentialScope, resources, region,
+                accountId, akid)) {
+            return;
+        }
 
         // Tagged group creation requires either tagging permission, using the same resolved
         // caller (including session, boundary and SCP ceilings) as the primary operation.
@@ -550,10 +633,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
         }
 
-        // PutAccountPolicy also needs the action for the type of policy it creates, as its API
-        // reference says. An unknown type needs nothing more: the handler refuses it.
-        if ("logs:PutAccountPolicy".equals(action)) {
-            String typeAction = accountPolicyTypeAction(arnBuilder.readJsonBody(ctx));
+        // PutAccountPolicy also needs the action for the type of policy it creates, and
+        // DescribeAccountPolicies the one for the type it lists, as their API references say. An
+        // unknown type needs nothing more: the handler refuses it.
+        if ("logs:PutAccountPolicy".equals(action) || "logs:DescribeAccountPolicies".equals(action)) {
+            String typeAction = accountPolicyTypeAction(action, arnBuilder.readJsonBody(ctx));
             if (typeAction != null && abortIfDenied(ctx, caller, principal, typeAction, action, credentialScope,
                     resources, targetContexts, region, accountId, akid)) {
                 return;
@@ -638,11 +722,22 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private static final Set<String> GOVERNANCE_BYPASS_ACTIONS =
             Set.of("s3:PutObjectRetention", "s3:DeleteObject", "s3:DeleteObjectVersion");
 
-    private static String accountPolicyTypeAction(JsonNode body) {
+    private static String accountPolicyTypeAction(String action, JsonNode body) {
         if (body == null) {
             return null;
         }
-        return switch (body.path("policyType").asText()) {
+        String policyType = body.path("policyType").asText();
+        if ("logs:DescribeAccountPolicies".equals(action)) {
+            // The reference names no read action for metric extraction policies.
+            return switch (policyType) {
+                case "DATA_PROTECTION_POLICY" -> "logs:GetDataProtectionPolicy";
+                case "SUBSCRIPTION_FILTER_POLICY" -> "logs:DescribeSubscriptionFilters";
+                case "TRANSFORMER_POLICY" -> "logs:GetTransformer";
+                case "FIELD_INDEX_POLICY" -> "logs:DescribeIndexPolicies";
+                default -> null;
+            };
+        }
+        return switch (policyType) {
             case "DATA_PROTECTION_POLICY" -> "logs:PutDataProtectionPolicy";
             case "SUBSCRIPTION_FILTER_POLICY" -> "logs:PutSubscriptionFilter";
             case "TRANSFORMER_POLICY" -> "logs:PutTransformer";
@@ -662,6 +757,27 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             return !(namesUpload && params.containsKey("partNumber"));
         }
         return "POST".equalsIgnoreCase(ctx.getMethod()) && namesUpload && !params.containsKey("uploads");
+    }
+
+    private boolean isScratchTransfer(ContainerRequestContext ctx, String credentialScope, String action,
+                                      List<String> resources, String akid, CallerArns callerArns) {
+        if (!"s3".equals(credentialScope) || akid == null || callerArns == null
+                || !CallerArns.TYPE_ASSUMED_ROLE.equals(callerArns.principalType())
+                || resources.isEmpty() || s3ServiceProvider == null || !s3ServiceProvider.isResolvable()) {
+            return false;
+        }
+        Optional<String> allowed = iamService.scratchResourceArn(akid);
+        if (allowed.isEmpty()) {
+            return false;
+        }
+        String prefix = "s3:ListBucket".equals(action) ? ctx.getUriInfo().getQueryParameters().getFirst("prefix") : null;
+        for (S3ScratchSpace space : S3ScratchSpace.values()) {
+            if (space.permits(action, allowed.get(), resources, prefix)
+                    && s3ServiceProvider.get().isScratchBucket(space.bucketName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -717,7 +833,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                     .map(descriptor -> iamServiceScope(descriptor, claimedScope))
                     .orElseGet(() -> catalog.canonicalCredentialScope(service));
             return new ResolvedAuthorization(servingScope,
-                    IamAuthorizedActions.actionFor(servingScope, queryAction));
+                    IamAuthorizedActions.actionFor(servingScope, queryAction), servingScope + ":" + queryAction);
         }
 
         // Read from the route rather than the claim: a path the claim filter takes for RPC v2 can
@@ -729,7 +845,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
             String servingScope = iamServiceScope(rpcV2Route.service(), claimedScope);
             return new ResolvedAuthorization(servingScope,
-                    IamAuthorizedActions.actionFor(servingScope, rpcV2Route.operation()));
+                    actionRegistry.resolveOperation(servingScope, rpcV2Route.operation(), ctx),
+                    servingScope + ":" + rpcV2Route.operation());
         }
 
         ResolvedAuthorization routeAuthorization = restRouteAuthorization(ctx);
@@ -740,9 +857,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         // A REST request is authorized by its route alone, never by an X-Amz-Target it carries.
         boolean rest = claimValue instanceof ProtocolClaim claim && claim.protocol() == WireProtocol.REST;
         String servingScope = servingCredentialScope(claimedScope, ctx);
-        return new ResolvedAuthorization(servingScope, rest
-                ? actionRegistry.resolveRoute(servingScope, ctx)
-                : actionRegistry.resolve(servingScope, ctx));
+        if (rest) {
+            return new ResolvedAuthorization(servingScope, routeAction(servingScope, ctx));
+        }
+        String targetOperation = IamActionRegistry.targetOperation(ctx);
+        String action = actionRegistry.resolve(servingScope, ctx);
+        return targetOperation == null ? new ResolvedAuthorization(servingScope, action)
+                : new ResolvedAuthorization(servingScope, action, servingScope + ":" + targetOperation);
     }
 
     /**
@@ -754,14 +875,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (resourceInfo == null || !AwsJsonCborController.class.equals(resourceInfo.getResourceClass())) {
             return null;
         }
-        MultivaluedMap<String, String> parameters = ctx.getUriInfo().getPathParameters();
-        String serviceId = parameters.getFirst(AwsJsonCborController.RPC_V2_SERVICE_PARAMETER);
-        String operation = parameters.getFirst(AwsJsonCborController.RPC_V2_OPERATION_PARAMETER);
-        if (serviceId == null || operation == null) {
-            return null;
-        }
-        return new ProtocolClaim(WireProtocol.RPCV2_CBOR, catalog.byCborSdkServiceId(serviceId).orElse(null),
-                operation, null);
+        return ProtocolClaimer.rpcV2RouteClaim(catalog, ctx.getUriInfo().getPathParameters());
     }
 
     /**
@@ -774,8 +888,34 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 || resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
-        return catalog.byResourceClass(resourceInfo.getResourceClass())
+        Class<?> resourceClass = resourceInfo.getResourceClass();
+        if (SharedTagsController.class.equals(resourceClass) || V1TagsController.class.equals(resourceClass)) {
+            return taggedServiceAuthorization(ctx);
+        }
+        return catalog.byResourceClass(resourceClass)
                 .map(descriptor -> resolveRestAuthorization(descriptor, ctx))
+                .orElse(null);
+    }
+
+    /**
+     * A shared tagging route hands the request to the service its ARN names, so it is checked as that
+     * service whatever scope it is signed with. A service with no rule for the route leaves it unchecked, as
+     * any route no rule maps; an ARN naming no service Floci serves, which the controller refuses, is left
+     * to the signing scope.
+     */
+    private ResolvedAuthorization taggedServiceAuthorization(ContainerRequestContext ctx) {
+        String arn = arnBuilder.taggedArn(ctx);
+        if (!AwsArnUtils.isArn(arn)) {
+            return null;
+        }
+        String service = AwsArnUtils.parse(arn).service();
+        return catalog.byCredentialScope(service)
+                .map(descriptor -> {
+                    ResolvedAuthorization authorization = resolveRestAuthorization(descriptor, ctx);
+                    return authorization != null
+                            ? authorization
+                            : new ResolvedAuthorization(catalog.canonicalCredentialScope(service), null);
+                })
                 .orElse(null);
     }
 
@@ -796,9 +936,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * maps to an action: AppSync, CodeArtifact's package endpoints, Identity Store's SCIM endpoint
      * and API Gateway's authorizers take Bearer and Basic tokens of their own, and this filter
      * cannot tell the API Gateway execute path, Lambda function URLs and the other paths it sees
-     * that are unsigned by design from the rest. A SigV4a scope, which has no region segment, does
-     * not get here: {@link AccountContextFilter} reads its service name as the region and refuses
-     * it, unless unknown regions are allowed.
+     * that are unsigned by design from the rest. A SigV4a scope has no region segment; every
+     * service takes its region from the signed set (see {@link AccountContextFilter}), and the
+     * shared {@link SigV4HeaderSignatureFilter} turns non-S3 ones away when signature validation is on.
      */
     private void refuseUnreadableCredential(ContainerRequestContext ctx, String auth) {
         if (ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim
@@ -849,19 +989,32 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                         && claim.protocol() != WireProtocol.REST;
     }
 
+    private String routeAction(String scope, ContainerRequestContext ctx) {
+        String matched = actionRegistry.resolveMatchedRoute(scope, resourceInfo);
+        return matched != null ? matched : actionRegistry.resolveRoute(scope, ctx);
+    }
+
     private ResolvedAuthorization resolveRestAuthorization(ServiceDescriptor descriptor,
                                                             ContainerRequestContext ctx) {
         return descriptor.credentialScopes().stream()
                 .map(catalog::canonicalCredentialScope)
                 .distinct()
                 .sorted()
-                .map(scope -> new ResolvedAuthorization(scope, actionRegistry.resolveRoute(scope, ctx)))
+                .map(scope -> new ResolvedAuthorization(scope, routeAction(scope, ctx)))
                 .filter(authorization -> authorization.action() != null)
                 .findFirst()
                 .orElse(null);
     }
 
-    private record ResolvedAuthorization(String credentialScope, String action) {
+    /**
+     * The scope and action a request is authorized as, and the operation it calls as
+     * {@code <namespace>:<Operation>}, which differs from the action for one AWS authorizes under another name.
+     * A REST route maps straight to its action, which names the operation.
+     */
+    private record ResolvedAuthorization(String credentialScope, String action, String operation) {
+        ResolvedAuthorization(String credentialScope, String action) {
+            this(credentialScope, action, action);
+        }
     }
 
     /** Floci's account-root principal, which is both the caller and the request's aws:PrincipalArn. */
@@ -873,10 +1026,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     /**
      * A request that passes a role to a service also needs {@code iam:PassRole} on that role (see
      * {@link PassedRoles}), checked as the caller with {@code iam:PassedToService} naming the
-     * service and the keys that say who is calling, which {@code callerArns} writes when it is known.
-     * What a request names that holds roles, an instance profile or a task definition, is looked up
-     * in the request's account, as the service resolves it; one that does not exist passes nothing,
-     * and the operation reports it. Returns true when the request was aborted.
+     * service, when AWS's Service Reference names one, and the keys that say who is calling, which
+     * {@code callerArns} writes when it is known. What a request names that holds roles, an instance
+     * profile, a launch template or a task definition, is looked up in the request's account, as the
+     * service resolves it; one that does not exist passes nothing, and the operation reports it. Returns
+     * true when the request was aborted.
      */
     private boolean abortIfRolePassDenied(ContainerRequestContext ctx, CallerContext caller, RequestPrincipal principal,
                                           CallerArns callerArns, String action, String credentialScope,
@@ -886,9 +1040,95 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if (callerArns != null) {
                 callerArns.putPrincipalKeys(context);
             }
-            context.put("iam:PassedToService", List.of(passed.passedToService()));
+            if (passed.passedToService() != null) {
+                context.put("iam:PassedToService", List.of(passed.passedToService()));
+            }
             if (abortIfDenied(ctx, caller, principal, "iam:PassRole", action, credentialScope,
                     List.of(passed.roleArn()), List.of(context), region, accountId, akid)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A request that names a Lambda network connector also needs {@code lambda:PassNetworkConnector} on it (see
+     * {@link PassedNetworkConnectors}), checked as the caller on the connector as the request names it, with the
+     * keys that say who is calling. A connector has no resource policy. The refusal is Lambda's, which names the
+     * policy type that refused it and the ARN of a managed policy or boundary that denies. Returns true when the
+     * request was aborted.
+     */
+    private boolean abortIfConnectorPassDenied(ContainerRequestContext ctx, CallerContext caller,
+                                               CallerArns callerArns, String operation, String region,
+                                               String accountId, String akid) {
+        String action = PassedNetworkConnectors.ACTION;
+        for (String connector : PassedNetworkConnectors.of(operation, ctx, region)) {
+            Map<String, List<String>> context = new HashMap<>();
+            if (callerArns != null) {
+                callerArns.putPrincipalKeys(context);
+            }
+            Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+                    context, connector, region, accountId, accountId);
+            if (evaluator.evaluate(caller, null, action, connector, effectiveContext) != Decision.DENY) {
+                continue;
+            }
+            LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, connector);
+            String user = callerArns != null ? callerArns.callerArn()
+                    : AwsArnUtils.Arn.global(requestPartition(), "iam", accountId, "user/" + akid).toString();
+            String reason = AccessDeniedMessages.firstRefusal(evaluator, caller,
+                    iamService.heldPolicies(akid).orElse(null), action, connector, effectiveContext);
+            ctx.abortWith(Response.status(403).type(MediaType.APPLICATION_JSON)
+                    .header("X-Amzn-Errortype", "AccessDeniedException")
+                    .entity(Map.of("Message", AccessDeniedMessages.notAuthorized(user, action, connector, reason)))
+                    .build());
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * The context once for each set of tags the request carries, with that set's keys where the context has
+     * none of its own, so each resource's tags are checked apart; the context alone when it carries none.
+     */
+    private static List<Map<String, List<String>>> withRequestTags(Map<String, List<String>> context,
+                                                                  List<Map<String, List<String>>> requestTags) {
+        List<Map<String, List<String>>> contexts = new ArrayList<>();
+        if (requestTags.isEmpty()) {
+            contexts.add(context);
+        }
+        for (Map<String, List<String>> tags : requestTags) {
+            Map<String, List<String>> withTags = context == null ? new HashMap<>() : new HashMap<>(context);
+            tags.forEach(withTags::putIfAbsent);
+            contexts.add(withTags);
+        }
+        return contexts;
+    }
+
+    /**
+     * A request that tags what it creates also needs the service's tagging action (see {@link TagOnCreate}),
+     * checked as the caller for each set of tags, under any spelling a handler might read: on the resource a
+     * tag specification names, else on the resource a create makes, under a parent its action acts on or of the type
+     * it is named after where it names others too, else on the resources the operation is checked on, with the set's tags as {@code aws:RequestTag/<key>} and
+     * {@code aws:TagKeys}, the operation as the namespace's {@code CreateAction} key where the tagging action
+     * takes one, and the keys that say who is calling. Returns true when the request was aborted.
+     */
+    private boolean abortIfTagOnCreateDenied(ContainerRequestContext ctx, CallerContext caller,
+                                             RequestPrincipal principal, CallerArns callerArns, String action,
+                                             String operation, TagOnCreate.Tagging tagging,
+                                             String credentialScope, List<String> resources,
+                                             String region, String accountId, String akid) {
+        // A create tags the resource it makes, not the parent it makes it in (see RequestResources.created).
+        List<String> created = RequestResources.created(operation, ctx, AwsRegions.partitionFor(region), region,
+                accountId, IamActionRegistry.pathLabels(credentialScope, ctx));
+        List<String> made = created.isEmpty() ? resources : created;
+        for (TagOnCreate.TagSet set : tagging.checked()) {
+            Map<String, List<String>> context = TagOnCreate.conditionContext(tagging, set, operation);
+            if (callerArns != null) {
+                callerArns.putPrincipalKeys(context);
+            }
+            List<String> tagged = TagOnCreate.resources(operation, set, requestPartition(), region, accountId, made);
+            if (abortIfDenied(ctx, caller, principal, tagging.action(), action, credentialScope, tagged,
+                    List.of(context), region, accountId, akid)) {
                 return true;
             }
         }
@@ -914,24 +1154,58 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
             @Override
             public Optional<String> stackSetPermissionModel(String stackSetName) {
-                for (PassedRoleLookup lookup : roleLookups()) {
-                    Optional<String> model = lookup.stackSetPermissionModel(stackSetName);
-                    if (model.isPresent()) {
-                        return model;
-                    }
-                }
-                return Optional.empty();
+                return firstFound(lookup -> lookup.stackSetPermissionModel(stackSetName));
+            }
+
+            @Override
+            public Optional<String> launchTemplateInstanceProfile(String templateId, String templateName,
+                                                                  String version) {
+                return firstFound(lookup -> lookup.launchTemplateInstanceProfile(templateId, templateName, version,
+                        region));
+            }
+
+            @Override
+            public Optional<String> launchConfigurationInstanceProfile(String instanceId) {
+                return firstFound(lookup -> lookup.launchConfigurationInstanceProfile(instanceId, region));
+            }
+
+            @Override
+            public Optional<String> instanceRefreshInstanceProfile(String groupName, String templateId,
+                                                                   String templateName, String version) {
+                return firstFound(lookup -> lookup.instanceRefreshInstanceProfile(groupName, templateId, templateName,
+                        version, region));
             }
 
             @Override
             public String roleArn(String roleName) {
                 return AwsArnUtils.Arn.global(requestPartition(), "iam", accountId, "role/" + roleName).toString();
             }
+
+            @Override
+            public Optional<String> heldRoleArn(String roleName) {
+                return iamService.findRole(accountId, roleName).map(IamRole::getArn);
+            }
+
+            @Override
+            public Optional<String> serviceCatalogConstraintType(String constraintId) {
+                return firstFound(lookup -> lookup.serviceCatalogConstraintType(constraintId));
+            }
         };
     }
 
     private Iterable<PassedRoleLookup> roleLookups() {
         return passedRoleLookups == null || passedRoleLookups.isUnsatisfied() ? List.of() : passedRoleLookups;
+    }
+
+    /** The first answer a {@link PassedRoleLookup} gives, each answering only for what its service owns. */
+    private Optional<String> firstFound(Function<PassedRoleLookup, Optional<String>> question) {
+        for (PassedRoleLookup lookup : roleLookups()) {
+            Optional<String> answer = question.apply(lookup);
+            if (answer.isPresent()) {
+                return answer;
+            }
+        }
+        return Optional.empty();
     }
 
     /** The ARNs of the roles the instance profile, named by {@code name} or {@code arn}, holds. */
@@ -968,7 +1242,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                   List<String> resources, List<Map<String, List<String>>> targetContexts,
                                   String region, String accountId, String akid) {
         for (String resource : resources) {
-            List<ResourcePolicyProvider.ResourcePolicy> resourcePolicies = resolveResourcePolicies(credentialScope, resource);
+            List<ResourcePolicyProvider.ResourcePolicy> resourcePolicies =
+                    resolveResourcePolicies(credentialScope, operationAction, resource);
             String resourceOwnerAccountId = resourcePolicies.isEmpty() ? null : resourcePolicies.getFirst().ownerAccountId();
             List<String> policyDocs = resourcePolicies.stream()
                     .map(ResourcePolicyProvider.ResourcePolicy::policyDocument)
@@ -981,19 +1256,26 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                     ? ResourceAccountRelationship.SAME_ACCOUNT
                     : ResourceAccountRelationship.CROSS_ACCOUNT;
 
-            for (Map<String, List<String>> targetContext : targetContexts) {
-                Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
-                        targetContext, resource, region, accountId, resourceOwnerAccountId);
-                if ("dynamodb".equals(credentialScope)) {
-                    Map<String, List<String>> batchContext =
-                            conditionContextResolver.dynamoDbBatchConditionContext(action, ctx, resource);
-                    if (batchContext != null) {
-                        effectiveContext.remove("dynamodb:LeadingKeys");
-                        effectiveContext.remove("dynamodb:Attributes");
-                        effectiveContext.remove("dynamodb:Select");
-                        effectiveContext.putAll(batchContext);
+            List<Map<String, List<String>>> batchContexts = "dynamodb".equals(credentialScope)
+                    ? conditionContextResolver.dynamoDbBatchConditionContexts(action, ctx, resource) : null;
+            List<Map<String, List<String>>> resourceContexts = targetContexts;
+            if (batchContexts != null && !batchContexts.isEmpty()) {
+                resourceContexts = new ArrayList<>();
+                for (Map<String, List<String>> targetContext : targetContexts) {
+                    for (Map<String, List<String>> batchContext : batchContexts) {
+                        Map<String, List<String>> entryContext = targetContext == null
+                                ? new HashMap<>() : new HashMap<>(targetContext);
+                        entryContext.remove("dynamodb:LeadingKeys");
+                        entryContext.remove("dynamodb:Attributes");
+                        entryContext.remove("dynamodb:Select");
+                        entryContext.putAll(batchContext);
+                        resourceContexts.add(entryContext);
                     }
                 }
+            }
+            for (Map<String, List<String>> targetContext : resourceContexts) {
+                Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+                        targetContext, resource, region, accountId, resourceOwnerAccountId, action);
                 ResourcePolicyDecision resourcePolicyDecision = evaluator.evaluateResourcePolicyFor(
                         effectiveResourcePolicies, principal, action, resource, effectiveContext);
                 Decision decision = evaluator.evaluateResolvedResourcePolicy(
@@ -1005,7 +1287,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 String denyMessage = "User: " + AwsArnUtils.Arn.global(requestPartition(), "iam", accountId, "user/" + akid)
                         + " is not authorized to perform: " + action
                         + " on resource: \"" + resource + "\""
-                        + " because no identity-based policy allows the " + action + " action";
+                        + " " + PolicyType.IDENTITY_BASED_POLICY.noAllow(action);
                 emitS3DenialIfApplicable(akid, operationAction, resource, ctx, region, denyMessage);
                 ctx.abortWith(accessDeniedForRequest(action, credentialScope, ctx, resource));
                 return true;
@@ -1054,7 +1336,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 .filter(scope -> scope.equals(catalog.canonicalCredentialScope(scope)))
                 .sorted()
                 .findFirst()
-                .orElse(descriptor.externalKey());
+                .orElse(catalog.canonicalCredentialScope(descriptor.externalKey()));
     }
 
     /** The same contexts with every object-tag key removed, keeping the principal and global keys. */
@@ -1147,7 +1429,21 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             ResourcePolicyDecision resourcePolicyDecision,
             String resourceOwnerAccountId) {
         authorizeAdditionalResource(authorizationHeader, action, resource, resourcePolicyDecision,
-                resourceOwnerAccountId, null);
+                resourceOwnerAccountId, null, null);
+    }
+
+    /**
+     * Authorizes a secondary resource with the condition keys {@code requestConditions} gives, values its
+     * handler reads from the request {@link #filter} has authorized: GetClusterCredentials checks
+     * {@code redshift:CreateClusterUser} with the {@code redshift:DbUser} of its own {@code DbUser}, so a
+     * policy can scope it to {@code dbuser:<cluster>/${redshift:DbUser}}.
+     */
+    public void authorizeAdditionalResource(
+            String authorizationHeader,
+            String action,
+            String resource,
+            Map<String, List<String>> requestConditions) {
+        authorizeAdditionalResource(authorizationHeader, action, resource, null, null, null, requestConditions);
     }
 
     /**
@@ -1161,21 +1457,25 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      */
     public void authorizePostObject(String authorizationHeader, String resource, String region) {
         authorizeAdditionalResource(authorizationHeader, "s3:PutObject", resource, null, null,
-                new DeniedEvent("PostObject", region));
+                new DeniedEvent("PostObject", region), null);
     }
 
     /** A CloudTrail record to write when IAM refuses a request: its event name and its Region. */
     private record DeniedEvent(String name, String region) {
     }
 
-    /** As the public overload; a denial is also recorded in CloudTrail when {@code deniedEvent} is given. */
+    /**
+     * As the public overloads; a denial is also recorded in CloudTrail when {@code deniedEvent} is given, and
+     * {@code requestConditions}, when given, joins the condition context.
+     */
     private void authorizeAdditionalResource(
             String authorizationHeader,
             String action,
             String resource,
             ResourcePolicyDecision resourcePolicyDecision,
             String resourceOwnerAccountId,
-            DeniedEvent deniedEvent) {
+            DeniedEvent deniedEvent,
+            Map<String, List<String>> requestConditions) {
         if (!config.services().iam().enforcementEnabled()) {
             return;
         }
@@ -1250,6 +1550,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 conditionContext = new HashMap<>();
                 callerArns.get().putPrincipalKeys(conditionContext);
             }
+            if (requestConditions != null && !requestConditions.isEmpty()) {
+                if (conditionContext == null) {
+                    conditionContext = new HashMap<>();
+                }
+                conditionContext.putAll(requestConditions);
+            }
 
             ResourcePolicyDecision effectiveDecision = resourcePolicyDecision;
             String effectiveOwnerAccountId = resourceOwnerAccountId;
@@ -1261,7 +1567,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 // signing alias such as s3express, would otherwise see no bucket policy at all.
                 String resourcePolicyScope = catalog.canonicalCredentialScope(action.split(":", 2)[0]);
                 List<ResourcePolicyProvider.ResourcePolicy> resourcePolicies = resolveResourcePolicies(
-                        resourcePolicyScope, resource);
+                        resourcePolicyScope, action, resource);
                 effectiveOwnerAccountId = resourcePolicies.isEmpty()
                         ? null : resourcePolicies.getFirst().ownerAccountId();
                 policyDocs = resourcePolicies.stream()
@@ -1272,7 +1578,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String region = requestContext.getRegion() == null
                     ? config.defaultRegion() : requestContext.getRegion();
             Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
-                    conditionContext, resource, region, accountId, effectiveOwnerAccountId);
+                    conditionContext, resource, region, accountId, effectiveOwnerAccountId, action);
             if (effectiveDecision == null) {
                 effectiveDecision = evaluator.evaluateResourcePolicyFor(
                         policyDocs.isEmpty() ? null : policyDocs,
@@ -1293,7 +1599,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String denyMessage = "User: " + AwsArnUtils.Arn.global(requestPartition(), "iam", accountId, "user/" + akid)
                     + " is not authorized to perform: " + action
                     + " on resource: \"" + resource + "\""
-                    + " because no identity-based policy allows the " + action + " action";
+                    + " " + PolicyType.IDENTITY_BASED_POLICY.noAllow(action);
             if (deniedEvent != null) {
                 emitS3Denial(akid, deniedEvent.name(), resource, deniedEvent.region(), denyMessage);
             }
@@ -1440,16 +1746,34 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         };
     }
 
-    /** Logs and Secrets Manager targets depend on the serving operation and the request's partition. */
-    private List<String> targetResources(String credentialScope, String action, ContainerRequestContext ctx,
-                                         String region, String accountId) {
+    /**
+     * Logs, Secrets Manager and KMS targets depend on the serving operation and the request's partition, STS
+     * targets on the serving operation;
+     * Scheduler and Pipes targets on the request's partition, which those services mint their ARNs in, as are
+     * API Gateway's path ARNs; and the
+     * targets of a namespace the table of request resources reads on {@code operation}, the one the request is
+     * dispatched as (see {@link RequestResources}).
+     */
+    private List<String> targetResources(String credentialScope, String action, String operation,
+                                         ContainerRequestContext ctx, String region, String accountId) {
         if ("logs".equals(credentialScope)) {
             return arnBuilder.buildLogResources(action, ctx, region, accountId, requestPartition());
         }
         if ("secretsmanager".equals(credentialScope)) {
             return arnBuilder.buildSecretsManagerResources(action, ctx, region, accountId, requestPartition());
         }
-        return arnBuilder.buildResources(credentialScope, ctx, region, accountId);
+        if ("kms".equals(credentialScope)) {
+            return arnBuilder.buildKmsResources(action, ctx, region, accountId, requestPartition());
+        }
+        if ("sts".equals(credentialScope)) {
+            return arnBuilder.buildStsResources(action, ctx);
+        }
+        if ("scheduler".equals(credentialScope) || "pipes".equals(credentialScope) || "dsql".equals(credentialScope)
+                || "apigateway".equals(credentialScope)) {
+            return arnBuilder.buildResources(credentialScope, ctx, region, accountId, requestPartition());
+        }
+        String partition = "route53".equals(credentialScope) ? requestPartition() : AwsRegions.partitionFor(region);
+        return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, partition);
     }
 
     /**
@@ -1480,8 +1804,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     }
 
     private String extractCredentialScope(String auth) {
-        Matcher m = SERVICE_PATTERN.matcher(auth);
-        return m.find() ? m.group(1) : null;
+        return SigV4CredentialScope.serviceName(auth).orElse(null);
     }
 
     /**
@@ -1533,8 +1856,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return resolved;
     }
 
-    private List<ResourcePolicyProvider.ResourcePolicy> resolveResourcePolicies(String credentialScope, String resourceArn) {
-        return ResourcePolicyProviders.policiesFor(resourcePolicyProviders, credentialScope, resourceArn);
+    private List<ResourcePolicyProvider.ResourcePolicy> resolveResourcePolicies(
+            String credentialScope, String action, String resourceArn) {
+        return ResourcePolicyProviders.policiesFor(resourcePolicyProviders, credentialScope, action, resourceArn);
     }
 
     /**
@@ -1546,7 +1870,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * <ul>
      *   <li>S3 → S3-flavored XML {@code <Error>...</Error>}</li>
      *   <li>{@code application/x-www-form-urlencoded} body → AWS Query
-     *       {@code <ErrorResponse>...</ErrorResponse>} (IAM/STS/EC2/SQS/SNS/...)</li>
+     *       {@code <ErrorResponse>...</ErrorResponse>} (IAM/STS/EC2/SQS/SNS/...), with the code
+     *       {@link #queryAccessDeniedCode} gives the service that serves the request</li>
      *   <li>JSON 1.x: JSON with HTTP 400; REST-JSON: JSON with HTTP 403</li>
      *   <li>CBOR: the request's own encoding with HTTP 403, from {@link #accessDeniedForRequest},
      *       which has the request to read it from</li>
@@ -1561,18 +1886,26 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return accessDeniedResponse(action, credentialScope, requestMediaType, resourceArn, WireProtocol.REST);
     }
 
-    private static Response accessDeniedForRequest(String action, String credentialScope, ContainerRequestContext ctx) {
+    private Response accessDeniedForRequest(String action, String credentialScope, ContainerRequestContext ctx) {
         return accessDeniedForRequest(action, credentialScope, ctx, null);
     }
 
-    private static Response accessDeniedForRequest(String action, String credentialScope,
+    private Response accessDeniedForRequest(String action, String credentialScope,
                                                  ContainerRequestContext ctx, String resourceArn) {
         WireProtocol protocol = claimedProtocol(ctx);
         if (isCbor(protocol)) {
             // 403, the status the Kinesis and CloudWatch common errors give AccessDeniedException.
             return cborError(ctx, "AccessDeniedException", accessDeniedMessage(action), 403);
         }
-        return accessDeniedResponse(action, credentialScope, ctx.getMediaType(), resourceArn, protocol);
+        // The route decides the envelope, not the resolved action: a request on an S3 Control
+        // route is S3 Control's however its action reads, and only its ErrorResponse wrapper
+        // reaches the s3control SDK deserializers (issue #557).
+        if (IamActionRegistry.isS3ControlRequest(credentialScope, ctx)) {
+            return s3ControlXmlAccessDenied(accessDeniedMessage(action));
+        }
+        boolean restXml = catalog.byCredentialScope(credentialScope)
+                .filter(descriptor -> descriptor.supportsProtocol(ServiceProtocol.REST_XML)).isPresent();
+        return accessDeniedResponse(action, credentialScope, ctx.getMediaType(), resourceArn, protocol, restXml);
     }
 
     private static String accessDeniedMessage(String action) {
@@ -1581,16 +1914,31 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     static Response accessDeniedResponse(String action, String credentialScope, MediaType requestMediaType,
                                          String resourceArn, WireProtocol protocol) {
+        return accessDeniedResponse(action, credentialScope, requestMediaType, resourceArn, protocol, false);
+    }
+
+    private static Response accessDeniedResponse(String action, String credentialScope, MediaType requestMediaType,
+                                                 String resourceArn, WireProtocol protocol, boolean restXml) {
         String message = accessDeniedMessage(action);
         if ("s3".equals(credentialScope)) {
             String resourcePath = formatS3ResourcePath(resourceArn);
             return s3XmlAccessDenied(message, resourcePath);
         }
-        if (protocol == WireProtocol.AWS_QUERY || isFormEncoded(requestMediaType)) {
-            return queryXmlAccessDenied(message);
+        if (restXml || protocol == WireProtocol.AWS_QUERY || isFormEncoded(requestMediaType)) {
+            return queryXmlError(queryAccessDeniedCode(credentialScope), message);
         }
         int status = protocol == WireProtocol.AWS_JSON_1_0 || protocol == WireProtocol.AWS_JSON_1_1 ? 400 : 403;
         return jsonAccessDenied(message, status);
+    }
+
+    /**
+     * The code a Query service refuses a request it does not authorize with, whichever action was denied:
+     * SNS's {@code AuthorizationError}, a 403 every SNS operation lists ("Indicates that the user has been
+     * denied access to the requested resource") and the one SDKs raise as {@code AuthorizationErrorException},
+     * and {@code AccessDenied} for every other service.
+     */
+    private static String queryAccessDeniedCode(String credentialScope) {
+        return "sns".equals(credentialScope) ? "AuthorizationError" : "AccessDenied";
     }
 
     private static String formatS3ResourcePath(String resourceArn) {
@@ -1639,6 +1987,31 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     private static Response s3XmlAccessDenied(String message, String resourcePath) {
         return s3Xml("AccessDenied", message, resourcePath, 403);
+    }
+
+    /**
+     * S3 Control's own access-denied answer, which unlike S3's error body wraps the error in an
+     * {@code <ErrorResponse>} the s3control SDK deserializers read (issue #557): the bare
+     * {@code <Error>} S3 answers with collapses to {@code UnknownError} there, hiding the message
+     * that names the action a caller is missing, which Terraform's AWS provider matches to fall
+     * back from {@code ListTagsForResource} to {@code GetBucketTagging}. The same envelope as
+     * {@code S3ControlController}'s, and no {@code Resource} element: the ARN a tagging route
+     * names is the resource, not a bucket and key.
+     */
+    private static Response s3ControlXmlAccessDenied(String message) {
+        String requestId = UUID.randomUUID().toString();
+        String xml = new XmlBuilder()
+                .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+                .start("ErrorResponse", AwsNamespaces.S3_CONTROL)
+                .start("Error")
+                .elem("Code", "AccessDenied")
+                .elem("Message", message)
+                .elem("RequestId", requestId)
+                .end("Error")
+                .elem("RequestId", requestId)
+                .end("ErrorResponse")
+                .build();
+        return Response.status(403).type(MediaType.APPLICATION_XML).entity(xml).build();
     }
 
     private static Response s3Xml(String code, String message, String resourcePath, int status) {

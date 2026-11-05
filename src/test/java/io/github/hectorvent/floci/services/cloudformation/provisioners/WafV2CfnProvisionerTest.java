@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -19,6 +20,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -37,6 +39,7 @@ class WafV2CfnProvisionerTest {
 
     private static final String ASSOCIATION = "AWS::WAFv2::WebACLAssociation";
     private static final String IP_SET_TYPE = "AWS::WAFv2::IPSet";
+    private static final String LOGGING_CONFIGURATION = "AWS::WAFv2::LoggingConfiguration";
     private static final String POOL = "arn:aws:cognito-idp:us-east-1:111122223333:userpool/us-east-1_pool";
     private static final String POOL_2 = "arn:aws:cognito-idp:us-east-1:111122223333:userpool/us-east-1_pool2";
     private static final String ACL_A = "arn:aws:wafv2:us-east-1:111122223333:regional/webacl/a/acl-a";
@@ -135,7 +138,7 @@ class WafV2CfnProvisionerTest {
         props.set("DefaultAction", mapper.createObjectNode());
         ObjectNode resolved = requiredProps("portal");
         resolved.set("DefaultAction",
-                com.fasterxml.jackson.databind.node.TextNode.valueOf("{\"Allow\":{}}"));
+                TextNode.valueOf("{\"Allow\":{}}"));
         WebAcl created = acl("portal", "acl-1", "REGIONAL", "lock-1");
         when(wafV2.createWebAcl(any(), eq("REGIONAL"), eq("portal"), eq("us-east-1"))).thenReturn(created);
         StackResource resource = resource();
@@ -572,6 +575,189 @@ class WafV2CfnProvisionerTest {
         resource.setPhysicalId("blocklist|ip-123|REGIONAL");
 
         assertFalse(provisioner.rollbackUpdate(resource));
+    }
+
+    @Test
+    void loggingConfigurationCreatesWithResourceArnAsRef() {
+        StackResource resource = loggingResource();
+        ObjectNode props = loggingProps(ACL_A, "arn:logs:a");
+
+        provisioner.provision(resource, props, context());
+
+        verify(wafV2).putLoggingConfiguration(ACL_A, props.toString());
+        assertEquals(ACL_A, resource.getPhysicalId());
+        assertEquals("false", resource.getAttributes().get("ManagedByFirewallManager"));
+    }
+
+    @Test
+    void loggingConfigurationRequiresResourceArnAndDestinations() {
+        ObjectNode withoutArn = loggingProps(ACL_A, "arn:logs:a");
+        withoutArn.remove("ResourceArn");
+        AwsException missingArn = assertThrows(AwsException.class,
+                () -> provisioner.provision(loggingResource(), withoutArn, context()));
+        assertEquals("AWS::WAFv2::LoggingConfiguration requires ResourceArn", missingArn.getMessage());
+
+        ObjectNode withoutDestinations = loggingProps(ACL_A, "arn:logs:a");
+        withoutDestinations.remove("LogDestinationConfigs");
+        AwsException missingDestinations = assertThrows(AwsException.class,
+                () -> provisioner.provision(loggingResource(), withoutDestinations, context()));
+        assertEquals("AWS::WAFv2::LoggingConfiguration requires LogDestinationConfigs",
+                missingDestinations.getMessage());
+        verifyNoInteractions(wafV2);
+    }
+
+    @Test
+    void loggingConfigurationCreateDoesNotOverwriteExistingConfiguration() {
+        String existing = loggingProps(ACL_A, "arn:logs:external").toString();
+        when(wafV2.getLoggingConfiguration(ACL_A)).thenReturn(existing);
+        StackResource resource = loggingResource();
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> provisioner.provision(resource, loggingProps(ACL_A, "arn:logs:new"), context()));
+
+        assertEquals("WAFDuplicateItemException", failure.getErrorCode());
+        assertNull(resource.getPhysicalId());
+        verify(wafV2, never()).putLoggingConfiguration(anyString(), anyString());
+        verify(wafV2, never()).deleteLoggingConfiguration(anyString());
+    }
+
+    @Test
+    void loggingConfigurationSameArnUpdateRestoresPreviousSettingsOnRollback() {
+        String previous = loggingProps(ACL_A, "arn:logs:old").toString();
+        when(wafV2.getLoggingConfiguration(ACL_A)).thenReturn(previous);
+        StackResource resource = loggingResource();
+        resource.setPhysicalId(ACL_A);
+        ObjectNode updated = loggingProps(ACL_A, "arn:logs:new");
+
+        provisioner.provision(resource, updated, updateContext(ACL_A));
+
+        assertEquals(ACL_A, resource.getPhysicalId());
+        assertFalse(provisioner.hasReplacementUpdate(resource));
+        assertEquals(previous, resource.getAttributes().get(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        InOrder order = inOrder(wafV2);
+        order.verify(wafV2).putLoggingConfiguration(ACL_A, updated.toString());
+        order.verify(wafV2).putLoggingConfiguration(ACL_A, previous);
+        assertFalse(resource.getAttributes().containsKey(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void loggingConfigurationSameArnUpdateAfterExternalDeletionRemovesRecreatedConfigOnRollback() {
+        when(wafV2.getLoggingConfiguration(ACL_A)).thenThrow(
+                new AwsException("WAFNonexistentItemException", "No logging configuration", 400));
+        StackResource resource = loggingResource();
+        resource.setPhysicalId(ACL_A);
+        ObjectNode updated = loggingProps(ACL_A, "arn:logs:new");
+
+        provisioner.provision(resource, updated, updateContext(ACL_A));
+
+        assertEquals(ACL_A, resource.getPhysicalId());
+        assertFalse(provisioner.hasReplacementUpdate(resource));
+        assertEquals("true", resource.getAttributes().get(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        verify(wafV2).putLoggingConfiguration(ACL_A, updated.toString());
+        verify(wafV2).deleteLoggingConfiguration(ACL_A);
+        assertFalse(resource.getAttributes().containsKey(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR));
+    }
+
+    @Test
+    void loggingConfigurationSameArnUpdateAfterExternalDeletionClearsMarkerOnCommit() {
+        when(wafV2.getLoggingConfiguration(ACL_A)).thenThrow(
+                new AwsException("WAFNonexistentItemException", "No logging configuration", 400));
+        StackResource resource = loggingResource();
+        resource.setPhysicalId(ACL_A);
+
+        provisioner.provision(resource, loggingProps(ACL_A, "arn:logs:new"), updateContext(ACL_A));
+
+        assertTrue(provisioner.completeUpdate(resource).applicable());
+        provisioner.clearUpdate(resource);
+        assertFalse(resource.getAttributes().containsKey(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR));
+        verify(wafV2, never()).deleteLoggingConfiguration(anyString());
+    }
+
+    @Test
+    void loggingConfigurationSameArnUpdateClearsSnapshotAfterCommit() {
+        String previous = loggingProps(ACL_A, "arn:logs:old").toString();
+        when(wafV2.getLoggingConfiguration(ACL_A)).thenReturn(previous);
+        StackResource resource = loggingResource();
+        resource.setPhysicalId(ACL_A);
+
+        provisioner.provision(resource, loggingProps(ACL_A, "arn:logs:new"), updateContext(ACL_A));
+
+        assertTrue(provisioner.completeUpdate(resource).applicable());
+        provisioner.clearUpdate(resource);
+        assertFalse(resource.getAttributes().containsKey(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void loggingConfigurationReplacementDoesNotOverwriteExistingTarget() {
+        String existing = loggingProps(ACL_B, "arn:logs:external").toString();
+        when(wafV2.getLoggingConfiguration(ACL_B)).thenReturn(existing);
+        StackResource resource = loggingResource();
+        resource.setPhysicalId(ACL_A);
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> provisioner.provision(resource, loggingProps(ACL_B, "arn:logs:new"), updateContext(ACL_A)));
+
+        assertEquals("WAFDuplicateItemException", failure.getErrorCode());
+        assertEquals(ACL_A, resource.getPhysicalId());
+        assertFalse(provisioner.hasReplacementUpdate(resource));
+        verify(wafV2, never()).putLoggingConfiguration(anyString(), anyString());
+        verify(wafV2, never()).deleteLoggingConfiguration(anyString());
+    }
+
+    @Test
+    void loggingConfigurationReplacementDeletesOldArnOnlyAfterCommit() {
+        StackResource resource = loggingResource();
+        resource.setPhysicalId(ACL_A);
+
+        provisioner.provision(resource, loggingProps(ACL_B, "arn:logs:b"), updateContext(ACL_A));
+
+        assertEquals(ACL_B, resource.getPhysicalId());
+        assertTrue(provisioner.hasReplacementUpdate(resource));
+        assertEquals(ACL_A, provisioner.updateCleanupPhysicalId(resource));
+        verify(wafV2, never()).deleteLoggingConfiguration(anyString());
+
+        assertTrue(provisioner.completeUpdate(resource).complete());
+        verify(wafV2).deleteLoggingConfiguration(ACL_A);
+        verify(wafV2, never()).deleteLoggingConfiguration(ACL_B);
+    }
+
+    @Test
+    void loggingConfigurationReplacementRollbackKeepsOldArn() {
+        StackResource resource = loggingResource();
+        resource.setPhysicalId(ACL_A);
+        resource.getAttributes().put("ManagedByFirewallManager", "false");
+
+        provisioner.provision(resource, loggingProps(ACL_B, "arn:logs:b"), updateContext(ACL_A));
+        assertTrue(provisioner.rollbackUpdate(resource));
+
+        assertEquals(ACL_A, resource.getPhysicalId());
+        assertEquals("false", resource.getAttributes().get("ManagedByFirewallManager"));
+        assertFalse(provisioner.hasReplacementUpdate(resource));
+        verify(wafV2).deleteLoggingConfiguration(ACL_B);
+        verify(wafV2, never()).deleteLoggingConfiguration(ACL_A);
+    }
+
+    @Test
+    void loggingConfigurationDeleteRemovesStoredConfiguration() {
+        provisioner.delete(LOGGING_CONFIGURATION, ACL_A, "us-east-1");
+
+        verify(wafV2).deleteLoggingConfiguration(ACL_A);
+    }
+
+    private ObjectNode loggingProps(String resourceArn, String destinationArn) {
+        ObjectNode props = mapper.createObjectNode().put("ResourceArn", resourceArn);
+        props.set("LogDestinationConfigs", mapper.createArrayNode().add(destinationArn));
+        return props;
+    }
+
+    private StackResource loggingResource() {
+        StackResource resource = new StackResource();
+        resource.setLogicalId("Logging");
+        resource.setResourceType(LOGGING_CONFIGURATION);
+        resource.setAttributes(new HashMap<>());
+        return resource;
     }
 
     private void assertMissingIpSetPropertyFails(String property) {

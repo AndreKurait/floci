@@ -6,7 +6,12 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.SignedMarkers;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.stepfunctions.model.Activity;
 import io.github.hectorvent.floci.services.stepfunctions.model.ActivityTask;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
@@ -20,6 +25,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -30,13 +37,20 @@ import java.util.Set;
 @ApplicationScoped
 public class StepFunctionsJsonHandler {
 
+    private static final Duration HISTORY_TOKEN_LIFETIME = Duration.ofHours(24);
+    private static final Duration LIST_TOKEN_LIFETIME = Duration.ofHours(24);
+
     private final StepFunctionsService service;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
+    private final SignedMarkers historyTokens = new SignedMarkers();
+    private final SignedMarkers listTokens = new SignedMarkers();
 
     @Inject
-    public StepFunctionsJsonHandler(StepFunctionsService service, ObjectMapper objectMapper) {
+    public StepFunctionsJsonHandler(StepFunctionsService service, ObjectMapper objectMapper, Clock clock) {
         this.service = service;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     public Response handle(String action, JsonNode request, String region) {
@@ -278,17 +292,45 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleListStateMachines(JsonNode request, String region) {
-        List<StateMachine> list = service.listStateMachines(region);
+        Integer maxResults = parseOptionalInt(request, "maxResults");
+        String nextToken = optionalText(request, "nextToken");
+        StepFunctionsPaging.pageSize(maxResults, nextToken);
+        PaginatedResult<StateMachine> page = service.listStateMachines(region, maxResults,
+                nextToken == null ? null : listTokenPosition(nextToken, region));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("stateMachines");
-        for (StateMachine sm : list) {
+        for (StateMachine sm : page.items()) {
             ObjectNode item = array.addObject();
             item.put("stateMachineArn", sm.getStateMachineArn());
             item.put("name", sm.getName());
             item.put("type", sm.getType());
             item.put("creationDate", sm.getCreationDate());
         }
+        if (page.nextToken() != null) {
+            response.put("nextToken", listTokens.issue(
+                    clock.millis() + ":" + Digests.sha256Hex(region) + ":" + page.nextToken()));
+        }
         return Response.ok(response).build();
+    }
+
+    private String listTokenPosition(String nextToken, String region) {
+        String issued = listTokens.cursorOf(nextToken);
+        if (issued == null) {
+            throw new AwsException("InvalidToken", "The provided token is not valid.", 400);
+        }
+        String[] fields = issued.split(":", 3);
+        long now = clock.millis();
+        long issuedAt;
+        try {
+            issuedAt = Long.parseLong(fields[0]);
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidToken", "The provided token is not valid.", 400);
+        }
+        if (fields.length != 3 || !fields[1].equals(Digests.sha256Hex(region))
+                || issuedAt > now || now - issuedAt > LIST_TOKEN_LIFETIME.toMillis()) {
+            throw new AwsException("InvalidToken", "The provided token is not valid.", 400);
+        }
+        return fields[2];
     }
 
     private Response handleDeleteStateMachine(JsonNode request) {
@@ -432,10 +474,24 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleListExecutions(JsonNode request) {
-        List<Execution> list = service.listExecutions(request.path("stateMachineArn").asText());
+        String statusFilter = optionalText(request, "statusFilter");
+        if (statusFilter != null && !EXECUTION_STATUSES.contains(statusFilter)) {
+            throw SmithyValidationErrors.validationException(
+                    SmithyValidationErrors.notInEnum(statusFilter, "statusFilter", EXECUTION_STATUSES));
+        }
+        if ("PENDING_REDRIVE".equals(statusFilter)) {
+            throw new AwsException("ValidationException",
+                    "PENDING_REDRIVE execution listing is not supported.", 400);
+        }
+        String stateMachineArn = request.path("stateMachineArn").asText();
+        Integer maxResults = parseOptionalInt(request, "maxResults");
+        String nextToken = optionalText(request, "nextToken");
+        PaginatedResult<StepFunctionsService.ExecutionSnapshot> page = service.listExecutions(
+                stateMachineArn, statusFilter, maxResults, nextToken);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("executions");
-        for (Execution e : list) {
+        for (StepFunctionsService.ExecutionSnapshot snapshot : page.items()) {
+            Execution e = snapshot.execution();
             ObjectNode item = array.addObject();
             item.put("executionArn", e.getExecutionArn());
             item.put("stateMachineArn", e.getStateMachineArn());
@@ -446,9 +502,12 @@ public class StepFunctionsJsonHandler {
                 item.put("stateMachineAliasArn", e.getStateMachineAliasArn());
             }
             item.put("name", e.getName());
-            item.put("status", e.getStatus());
+            item.put("status", snapshot.status());
             item.put("startDate", e.getStartDate());
             if (e.getStopDate() != null) item.put("stopDate", e.getStopDate());
+        }
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
         }
         return Response.ok(response).build();
     }
@@ -460,23 +519,31 @@ public class StepFunctionsJsonHandler {
                 request.path("error").asText(null)
         );
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("stopDate", System.currentTimeMillis() / 1000.0);
+        response.put("stopDate", EpochSeconds.fromMillis(System.currentTimeMillis()));
         return Response.ok(response).build();
     }
 
     private Response handleGetExecutionHistory(JsonNode request) {
         String arn = request.path("executionArn").asText();
         boolean includeExecutionData = request.path("includeExecutionData").asBoolean(true);
+        boolean reverseOrder = parseOptionalBoolean(request, "reverseOrder", false);
+        Integer maxResults = parseOptionalInt(request, "maxResults");
+        String nextToken = optionalText(request, "nextToken");
+        int pageSize = StepFunctionsPaging.pageSize(maxResults, nextToken);
 
-        List<HistoryEvent> live = service.getExecutionHistory(arn);
-        List<HistoryEvent> events;
-        // Branch and iteration threads append under the history's own monitor while a client reads.
-        synchronized (live) {
-            events = new ArrayList<>(live);
-        }
+        PaginatedResult<HistoryEvent> page = Pagination.paginateExpiring(() -> {
+            List<HistoryEvent> live = service.getExecutionHistory(arn);
+            // Branch and iteration threads append under the history's own monitor while a client reads.
+            synchronized (live) {
+                return new ArrayList<>(live);
+            }
+        },
+                event -> historyEventCursor(event, reverseOrder), pageSize, nextToken,
+                historyTokenScope(arn, reverseOrder), clock, HISTORY_TOKEN_LIFETIME, historyTokens,
+                token -> invalidHistoryToken());
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("events");
-        for (HistoryEvent e : events) {
+        for (HistoryEvent e : page.items()) {
             ObjectNode item = array.addObject();
             item.put("id", e.getId());
             item.put("timestamp", e.getTimestamp());
@@ -492,11 +559,29 @@ public class StepFunctionsJsonHandler {
                 item.set(historyEventDetailsField(e.getType()), objectMapper.valueToTree(details));
             }
         }
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
+        }
         return Response.ok(response).build();
+    }
+
+    private static String historyEventCursor(HistoryEvent event, boolean reverseOrder) {
+        long position = reverseOrder ? Long.MAX_VALUE - event.getId() : event.getId();
+        return String.format("%019d", position);
+    }
+
+    private static String historyTokenScope(String arn, boolean reverseOrder) {
+        return Digests.sha256Hex(arn) + (reverseOrder ? "-reverse" : "-forward");
+    }
+
+    private static AwsException invalidHistoryToken() {
+        return new AwsException("InvalidToken", "The provided token is not valid.", 400);
     }
 
     private static final Set<String> EXECUTION_DATA_FIELDS =
             Set.of("input", "inputDetails", "output", "outputDetails");
+    private static final List<String> EXECUTION_STATUSES =
+            List.of("SUCCEEDED", "TIMED_OUT", "PENDING_REDRIVE", "ABORTED", "FAILED", "RUNNING");
 
     static String historyEventDetailsField(String type) {
         if (type.endsWith("StateEntered")) {
@@ -552,14 +637,18 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleListActivities(JsonNode request, String region) {
-        List<Activity> list = service.listActivities(region);
+        PaginatedResult<Activity> page = service.listActivities(region,
+                parseOptionalInt(request, "maxResults"), optionalText(request, "nextToken"));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("activities");
-        for (Activity a : list) {
+        for (Activity a : page.items()) {
             ObjectNode item = array.addObject();
             item.put("activityArn", a.getActivityArn());
             item.put("name", a.getName());
             item.put("creationDate", a.getCreationDate());
+        }
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
         }
         return Response.ok(response).build();
     }
@@ -696,9 +785,9 @@ public class StepFunctionsJsonHandler {
 
     /**
      * Reads an optional integer field from the JSON request, rejecting wrong types
-     * with a typed ValidationException. JsonNode.asInt() silently coerces strings,
-     * fractional numbers, and explicit nulls to 0, which would let invalid payloads
-     * slip through as 0 (and thus be treated as "use default" by the service).
+     * with a typed ValidationException. JsonNode.intValue() silently truncates
+     * out-of-range integers, while asInt() also coerces wrong types to 0; either
+     * can make an invalid value look like "use default" to the service.
      * Returns null when the field is absent or explicitly null in the JSON.
      */
     private static Integer parseOptionalInt(JsonNode request, String fieldName) {
@@ -706,7 +795,7 @@ public class StepFunctionsJsonHandler {
         if (node == null || node.isNull()) {
             return null;
         }
-        if (!node.isIntegralNumber()) {
+        if (!node.isIntegralNumber() || !node.canConvertToInt()) {
             throw new AwsException("ValidationException",
                     "Value '" + node + "' at '" + fieldName
                             + "' failed to satisfy constraint: Member must be an integer.", 400);

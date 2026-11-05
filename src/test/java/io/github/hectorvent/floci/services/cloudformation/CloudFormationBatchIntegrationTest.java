@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
@@ -87,6 +89,7 @@ class CloudFormationBatchIntegrationTest {
             .statusCode(200)
             .body(containsString("<StackId>"));
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -169,6 +172,7 @@ class CloudFormationBatchIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -243,6 +247,7 @@ class CloudFormationBatchIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         // The update changes only updatable properties, so the entities must be mutated, not
         // replaced: the physical ids the outputs carry have to survive it.
         given()
@@ -255,6 +260,7 @@ class CloudFormationBatchIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -390,6 +396,7 @@ class CloudFormationBatchIntegrationTest {
     }
 
     private static void assertStackStatus(String stackName, String status) {
+        CfnStackWaits.awaitStatus(stackName, status);
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -401,7 +408,7 @@ class CloudFormationBatchIntegrationTest {
             .body(containsString("<StackStatus>" + status + "</StackStatus>"));
     }
 
-    private static io.restassured.specification.RequestSpecification givenBatchJson(String body) {
+    private static RequestSpecification givenBatchJson(String body) {
         return given()
                 .header("Authorization", BATCH_AUTH)
                 .contentType("application/json")

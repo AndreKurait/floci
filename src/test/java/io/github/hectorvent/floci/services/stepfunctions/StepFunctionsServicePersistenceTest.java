@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
@@ -29,6 +30,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -38,6 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -111,7 +114,7 @@ class StepFunctionsServicePersistenceTest {
             history.add(succeeded);
             execution.setStatus("SUCCEEDED");
             execution.setOutput("{\"result\":true}");
-            invocation.<java.util.function.BiConsumer<Execution, List<HistoryEvent>>>getArgument(4)
+            invocation.<BiConsumer<Execution, List<HistoryEvent>>>getArgument(4)
                     .accept(execution, history);
             return null;
         }).when(aslExecutor).executeAsync(any(StateMachine.class), any(Execution.class), anyList(),
@@ -173,7 +176,8 @@ class StepFunctionsServicePersistenceTest {
             List<HistoryEvent> actualHistory = afterRestart.getExecutionHistory(started.getExecutionArn());
             aborted.setTimestamp(actualHistory.getLast().getTimestamp());
             assertHistoryEquals(expectedHistory, actualHistory);
-            assertFalse(afterRestart.sendTaskSuccess(taskToken, "{\"done\":true}"));
+            assertEquals("InvalidToken", assertThrows(AwsException.class,
+                    () -> afterRestart.sendTaskSuccess(taskToken, "{\"done\":true}")).getErrorCode());
         } finally {
             beforeRestart.abortAbandonedExecutions();
             beforeRestart.clear();
@@ -395,7 +399,7 @@ class StepFunctionsServicePersistenceTest {
         @Override
         public void executeAsync(StateMachine stateMachine, Execution execution,
                                  List<HistoryEvent> history, MockedTestCase mockedTestCase,
-                                 java.util.function.BiConsumer<Execution, List<HistoryEvent>> onUpdate) {
+                                 BiConsumer<Execution, List<HistoryEvent>> onUpdate) {
             super.executeAsync(stateMachine, execution, history, mockedTestCase,
                     (updatedExecution, updatedHistory) -> {
                         try {

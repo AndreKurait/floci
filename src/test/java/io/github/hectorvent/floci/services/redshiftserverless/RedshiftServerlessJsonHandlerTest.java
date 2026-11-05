@@ -14,9 +14,12 @@ import io.github.hectorvent.floci.services.redshift.TempCredential;
 import io.github.hectorvent.floci.services.redshift.model.Endpoint;
 import io.github.hectorvent.floci.services.redshiftserverless.model.Namespace;
 import io.github.hectorvent.floci.services.redshiftserverless.model.Workgroup;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -41,6 +44,34 @@ import static org.mockito.Mockito.when;
  * strict SDKs rejected the response.
  */
 class RedshiftServerlessJsonHandlerTest {
+    @Test
+    void managedNamespaceReturnsItsSecretArn() throws Exception {
+        JsonNode response = (JsonNode) handler.handle("CreateNamespace", mapper.readTree(
+                "{\"namespaceName\":\"managed-admin\",\"manageAdminPassword\":true}"), REGION).getEntity();
+        assertTrue(response.path("namespace").path("adminPasswordSecretArn").isTextual(), response.toString());
+    }
+
+    @Test
+    void restoreFromSnapshotEnablesManagedCredentialsWhenRequested() {
+        body(handler.handle("CreateNamespace", parse(
+                "{\"namespaceName\":\"restore-managed-ns\",\"adminUsername\":\"admin\","
+                        + "\"adminUserPassword\":\"Initial123\"}"), REGION));
+        body(handler.handle("CreateSnapshot", parse(
+                "{\"snapshotName\":\"restore-managed-snap\",\"namespaceName\":\"restore-managed-ns\"}"), REGION));
+        body(handler.handle("CreateWorkgroup", parse(
+                "{\"workgroupName\":\"restore-managed-wg\",\"namespaceName\":\"restore-managed-ns\"}"), REGION));
+
+        JsonNode restored = body(handler.handle("RestoreFromSnapshot", parse(
+                "{\"namespaceName\":\"restore-managed-ns\",\"workgroupName\":\"restore-managed-wg\","
+                        + "\"snapshotName\":\"restore-managed-snap\",\"manageAdminPassword\":true,"
+                        + "\"adminPasswordSecretKmsKeyId\":\"arn:aws:kms:us-east-1:123456789012:key/managed\"}"),
+                REGION));
+
+        assertTrue(restored.path("namespace").path("adminPasswordSecretArn").isTextual(), restored.toString());
+        assertEquals("arn:aws:kms:us-east-1:123456789012:key/managed",
+                restored.path("namespace").path("adminPasswordSecretKmsKeyId").textValue());
+    }
+
     private static final String REGION = "us-east-1";
     private static final String ACCOUNT_ID = "123456789012";
 
@@ -76,7 +107,7 @@ class RedshiftServerlessJsonHandlerTest {
                         Instant.ofEpochSecond(1_800_000_000L), List.of()));
         iamDbUserResolver = mock(RedshiftIamDbUserResolver.class);
         when(iamDbUserResolver.resolveDbUser("AUTH")).thenReturn("IAM:alice");
-        EmulatorConfig config = mock(EmulatorConfig.class, org.mockito.Mockito.RETURNS_DEEP_STUBS);
+        EmulatorConfig config = mock(EmulatorConfig.class, Mockito.RETURNS_DEEP_STUBS);
         when(storageFactory.create(eq("redshiftserverless"), eq("redshiftserverless-snapshots.json"),
                 any(TypeReference.class))).thenReturn((AccountAwareStorageBackend)
                 AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
@@ -85,8 +116,12 @@ class RedshiftServerlessJsonHandlerTest {
                 any(TypeReference.class))).thenReturn((AccountAwareStorageBackend)
                 AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
         stubAdministrationStores(storageFactory);
-        RedshiftServerlessService service =
-                new RedshiftServerlessService(storageFactory, regionResolver, endpoints, runtime, config);
+        SecretsManagerService secrets = mock(SecretsManagerService.class);
+        Secret secret = new Secret();
+        secret.setArn("arn:aws:secretsmanager:us-east-1:" + ACCOUNT_ID + ":secret:managed-admin-abcdef");
+        when(secrets.createSecret(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(secret);
+        RedshiftServerlessService service = new RedshiftServerlessService(storageFactory, regionResolver,
+                endpoints, runtime, config, new RedshiftServerlessAdminSecrets(secrets, mapper));
         AcmService acmService = mock(AcmService.class);
         RedshiftServerlessCustomDomainService customDomains =
                 new RedshiftServerlessCustomDomainService(storageFactory, service, acmService);
@@ -97,7 +132,8 @@ class RedshiftServerlessJsonHandlerTest {
                         new RedshiftServerlessEndpointAccessService(storageFactory, regionResolver, service),
                         customDomains,
                         new RedshiftServerlessSnapshotCopyService(storageFactory, regionResolver, service),
-                        new RedshiftServerlessScheduledActionService(storageFactory, service)),
+                        new RedshiftServerlessScheduledActionService(storageFactory, service,
+                                mock(RedshiftServerlessScheduledActionAuthorizer.class), regionResolver)),
                 customDomains);
     }
 

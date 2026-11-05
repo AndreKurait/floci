@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -36,6 +37,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 @ApplicationScoped
 public class EksAddonService {
@@ -133,7 +135,7 @@ public class EksAddonService {
 
         List<String> associationArns = createOrLinkPodIdentityAssociations(cluster, addonName, request.podIdentityAssociations());
 
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        double now = EpochSeconds.fromInstant(Instant.now());
         String addonArn = generateAddonArn(cluster, addonName);
         Optional<AddonInfo> addonInfo = catalog.findAddon(addonName);
         String owner = addonInfo.map(AddonInfo::owner).orElse("aws");
@@ -256,7 +258,7 @@ public class EksAddonService {
             params.add(new UpdateParam("PodIdentityAssociations", serializeAssociations(request.podIdentityAssociations())));
         }
 
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        double now = EpochSeconds.fromInstant(Instant.now());
         Addon updatedAddon = new Addon(
                 current.addonArn(),
                 current.addonName(),
@@ -323,7 +325,7 @@ public class EksAddonService {
                 "DELETING",
                 current.health(),
                 current.createdAt(),
-                Instant.now().toEpochMilli() / 1000.0,
+                EpochSeconds.fromInstant(Instant.now()),
                 current.serviceAccountRoleArn(),
                 current.configurationValues(),
                 current.tags(),
@@ -343,19 +345,31 @@ public class EksAddonService {
     }
 
     public Update describeUpdate(Cluster cluster, String updateId, String addonName) {
-        requireActiveCluster(cluster);
-        if (updateId == null || updateId.isBlank()) {
-            throw new AwsException("InvalidParameterException", "updateId is required", 400);
-        }
-        StoredUpdate stored = updatesStorage.get(prefix(cluster) + updateId)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "No update: " + updateId + " found for cluster: " + cluster.getName(), 404));
+        StoredUpdate stored = storedUpdate(cluster, updateId);
         if (addonName != null && !addonName.isBlank()
                 && stored.addonName() != null && !stored.addonName().equalsIgnoreCase(addonName.trim())) {
             throw new AwsException("ResourceNotFoundException",
                     "No update: " + updateId + " found for addon: " + addonName, 404);
         }
         return stored.update();
+    }
+
+    /**
+     * The name of the add-on the update {@code updateId} was made to, looked up as {@link #describeUpdate} looks
+     * it up, which returns the update whether or not the request names its add-on.
+     */
+    public String updateAddonName(Cluster cluster, String updateId) {
+        return storedUpdate(cluster, updateId).addonName();
+    }
+
+    private StoredUpdate storedUpdate(Cluster cluster, String updateId) {
+        requireActiveCluster(cluster);
+        if (updateId == null || updateId.isBlank()) {
+            throw new AwsException("InvalidParameterException", "updateId is required", 400);
+        }
+        return updatesStorage.get(prefix(cluster) + updateId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "No update: " + updateId + " found for cluster: " + cluster.getName(), 404));
     }
 
     public AddonVersionsPage describeAddonVersions(String addonName, String kubernetesVersion,
@@ -424,11 +438,8 @@ public class EksAddonService {
                 PodIdentityAssociation created = podIdentityAssociations.create(cluster, req);
                 arns.add(created.associationArn());
             } else {
-                String[] clusterArn = cluster.getArn().split(":", 6);
                 String assocId = "a-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
-                String arn = "arn:" + clusterArn[1] + ":eks:" + clusterArn[3] + ":"
-                        + clusterArn[4] + ":podidentityassociation/" + cluster.getName() + "/" + assocId;
-                arns.add(arn);
+                arns.add(childArn(cluster, "podidentityassociation/" + cluster.getName() + "/" + assocId));
             }
         }
         return arns;
@@ -450,14 +461,44 @@ public class EksAddonService {
         return "kube-system";
     }
 
+    /**
+     * Applies {@code change} to the tags of the add-on {@code addonArn} names on {@code cluster} and
+     * returns them, or empty when the cluster has no add-on with that ARN. This is how TagResource,
+     * UntagResource and ListTagsForResource reach an add-on.
+     */
+    public synchronized Optional<Map<String, String>> retag(Cluster cluster, String addonName, String addonArn,
+                                                            UnaryOperator<Map<String, String>> change) {
+        String storageKey = prefix(cluster) + addonName.toLowerCase(Locale.ROOT);
+        Optional<StoredAddon> found = storage.get(storageKey)
+                .filter(stored -> addonArn.equals(stored.addon().addonArn()));
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        Addon current = found.get().addon();
+        Map<String, String> tags = Map.copyOf(change.apply(current.tags() == null ? Map.of() : current.tags()));
+        if (!tags.equals(current.tags())) {
+            Addon retagged = new Addon(current.addonArn(), current.addonName(), current.addonVersion(),
+                    current.clusterName(), current.status(), current.health(), current.createdAt(),
+                    current.modifiedAt(), current.serviceAccountRoleArn(), current.configurationValues(), tags,
+                    current.podIdentityAssociations(), current.owner(), current.publisher());
+            storage.put(storageKey, new StoredAddon(retagged, found.get().clientRequestToken()));
+        }
+        return Optional.of(tags);
+    }
+
     private static String prefix(Cluster cluster) {
         return cluster.getArn() + "/" + Objects.toString(cluster.getCreatedAt()) + "/";
     }
 
     private static String generateAddonArn(Cluster cluster, String addonName) {
-        String[] clusterArn = cluster.getArn().split(":", 6);
-        return "arn:" + clusterArn[1] + ":eks:" + clusterArn[3] + ":"
-                + clusterArn[4] + ":addon/" + cluster.getName() + "/" + addonName + "/" + UUID.randomUUID();
+        return childArn(cluster, "addon/" + cluster.getName() + "/" + addonName + "/" + UUID.randomUUID());
+    }
+
+    /** An EKS resource in the cluster's partition, region and account. */
+    private static String childArn(Cluster cluster, String resource) {
+        AwsArnUtils.Arn clusterArn = AwsArnUtils.parse(cluster.getArn());
+        return new AwsArnUtils.Arn(clusterArn.partition(), "eks", clusterArn.region(), clusterArn.accountId(), resource)
+                .toString();
     }
 
     private static void requireActiveCluster(Cluster cluster) {
@@ -474,16 +515,16 @@ public class EksAddonService {
         if (roleArn == null || roleArn.isBlank()) {
             throw new AwsException("InvalidParameterException", fieldName + " is required", 400);
         }
-        String[] arn = roleArn.split(":", 6);
-        if (arn.length != 6 || !"arn".equals(arn[0]) || !arn[1].matches(AwsArnUtils.PARTITION_REGEX)
-                || !"iam".equals(arn[2]) || !arn[3].isEmpty() || !arn[4].matches("[0-9]{12}")
-                || !arn[5].startsWith("role/") || arn[5].startsWith("role/aws-service-role/")
+        AwsArnUtils.Arn arn = AwsArnUtils.isArn(roleArn) ? AwsArnUtils.parse(roleArn) : null;
+        if (arn == null || !arn.partition().matches(AwsArnUtils.PARTITION_REGEX)
+                || !"iam".equals(arn.service()) || !arn.region().isEmpty() || !arn.accountId().matches("[0-9]{12}")
+                || !arn.resource().startsWith("role/") || arn.resource().startsWith("role/aws-service-role/")
                 || roleArn.endsWith("/")) {
             throw new AwsException("InvalidParameterException", fieldName + " must identify an IAM role", 400);
         }
         if (iam != null) {
             String roleName = roleArn.substring(roleArn.lastIndexOf('/') + 1);
-            iam.findRole(arn[4], roleName)
+            iam.findRole(arn.accountId(), roleName)
                     .filter(role -> IamService.roleArnMatches(roleArn, role))
                     .orElseThrow(() -> new AwsException("InvalidParameterException", "Role not found: " + roleArn, 400));
         }

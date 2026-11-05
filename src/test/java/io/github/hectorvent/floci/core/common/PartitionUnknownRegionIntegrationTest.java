@@ -1,19 +1,26 @@
 package io.github.hectorvent.floci.core.common;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testing.PartitionMatrix;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * A SigV4 scope region that no partition publishes or admits by its region pattern is refused,
@@ -62,6 +69,27 @@ class PartitionUnknownRegionIntegrationTest {
     }
 
     /** A presigned POST's credential sits in the form body, out of the ingress filter's sight. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void anUnclaimedCborRequestSignedForAnUnknownRegionGetsTheCborSignatureError(boolean rpcV2) throws Exception {
+        // An unrecognised Smithy-Protocol leaves it to its route to claim, which has to happen before
+        // the Region check picks the error format.
+        ObjectMapper cbor = new ObjectMapper(new CBORFactory());
+        String mediaType = rpcV2 ? "application/cbor" : "application/x-amz-cbor-1.1";
+        RequestSpecification request = given().contentType(mediaType).accept(mediaType)
+                .header("Authorization", PartitionMatrix.sigV4Auth(UNKNOWN, "monitoring"))
+                .header("smithy-protocol", "unrecognised")
+                .body(cbor.writeValueAsBytes(Map.of()));
+        if (!rpcV2) {
+            request.header("X-Amz-Target", "GraniteServiceVersion20100801.ListMetrics");
+        }
+        byte[] response = request.when().post(rpcV2
+                ? "/service/GraniteServiceVersion20100801/operation/ListMetrics" : "/").then().statusCode(400)
+                .contentType(mediaType).header("x-amzn-query-error", equalTo("InvalidSignatureException;Sender"))
+                .extract().asByteArray();
+        assertEquals("InvalidSignatureException", cbor.readTree(response).path("__type").asText());
+    }
+
     @Test
     void aPresignedPostSignedForAnUnknownRegionGetsS3sMalformedHeaderError() {
         given()

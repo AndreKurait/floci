@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.JsonPath;
@@ -123,6 +124,7 @@ class CloudFormationDynamoDbGlobalTableIntegrationTest {
     }
 
     private void assertStackStatus(String stackName, String status) {
+        CfnStackWaits.awaitStatus(stackName, status, CFN_AUTH);
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", CFN_AUTH)

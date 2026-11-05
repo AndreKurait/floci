@@ -14,7 +14,9 @@ import javax.xml.stream.XMLStreamConstants;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,15 +44,13 @@ public class CloudFrontController {
 
     /**
      * Origin timeout constraints from the CloudFront {@code CustomOriginConfig} and
-     * {@code Origin} API references. {@code OriginKeepaliveTimeout} accepts 1-300 seconds,
-     * default 5. {@code ResponseCompletionTimeout} has no enforced maximum when unset
-     * (represented here as 0), but when set must be at least {@code OriginReadTimeout}.
-     * The read and connection timeouts live in {@link CloudFrontOriginTimeouts}, shared with
-     * the serving layer that applies them.
+     * {@code Origin} API references. The range checks for the origin timeout settings live in
+     * {@link CloudFrontService#createDistribution} so the CloudFormation path shares one copy;
+     * the parser only rejects non-numeric values. {@code ResponseCompletionTimeout} has no
+     * enforced maximum when unset (represented here as 0), but when set must be at least
+     * {@code OriginReadTimeout}. The timeout bounds live in {@link CloudFrontOriginTimeouts},
+     * shared with the serving layer that applies them.
      */
-    private static final int DEFAULT_ORIGIN_KEEPALIVE_TIMEOUT_SECONDS = 5;
-    private static final int MIN_ORIGIN_KEEPALIVE_TIMEOUT_SECONDS = 1;
-    private static final int MAX_ORIGIN_KEEPALIVE_TIMEOUT_SECONDS = 300;
     private static final int DEFAULT_RESPONSE_COMPLETION_TIMEOUT_SECONDS = 0;
 
     private final CloudFrontService service;
@@ -68,7 +68,7 @@ public class CloudFrontController {
         try {
             DistributionConfig config = parseDistributionConfig(body);
             Map<String, String> tags = new LinkedHashMap<>();
-            if (withTags != null) {
+            if (withTags != null || "DistributionConfigWithTags".equals(XmlParser.rootElementName(body))) {
                 tags = parseTags(body);
             }
             Distribution dist = new Distribution();
@@ -353,7 +353,7 @@ public class CloudFrontController {
                                       @QueryParam("Type") String type) {
         try {
             Page<CachePolicy> page = page(
-                    service.listCachePolicies(marker, paginationFetchLimit(maxItems)),
+                    service.listCachePolicies(marker, paginationFetchLimit(maxItems), type),
                     maxItems, CachePolicy::getId);
 
             XmlBuilder xml = new XmlBuilder()
@@ -364,7 +364,8 @@ public class CloudFrontController {
                     .start("Items");
             for (CachePolicy p : page.items()) {
                 xml.start("CachePolicySummary")
-                        .elem("Type", "custom")
+                        .elem("Type", CloudFrontService.isManagedCachePolicy(p.getId())
+                                ? "managed" : "custom")
                         .raw(xmlCachePolicyResponse(p))
                         .end("CachePolicySummary");
             }
@@ -863,11 +864,37 @@ public class CloudFrontController {
                                 @QueryParam("Stage") String stage) {
         try {
             CloudFrontFunction fn = service.describeFunction(name, stage);
-            return Response.ok(fn.getFunctionCode() != null ? fn.getFunctionCode() : "", OCTET_STREAM)
+            return Response.ok(functionCodeBytes(fn), OCTET_STREAM)
                     .header("ETag", fn.getEtag())
                     .build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
+        }
+    }
+
+    /**
+     * GetFunction serves the function code as the response body. The code reached this emulator
+     * as the base64 text of the CreateFunction or UpdateFunction FunctionCode element, so it is
+     * decoded back to the bytes the caller originally encoded. The ETag header carries the
+     * function's version identifier, and the media type is application/octet-stream, matching
+     * the GetFunction response contract in the CloudFront API reference.
+     *
+     * <p>Records persisted by older Floci versions may hold plain code instead: the
+     * CloudFormation provisioner once wrote the template's raw body. Those still read back
+     * as their stored bytes rather than failing, and the next UpdateFunction rewrites them
+     * into the uniform base64 form.
+     */
+    private byte[] functionCodeBytes(CloudFrontFunction fn) {
+        String encoded = fn.getFunctionCode();
+        if (encoded == null || encoded.isBlank()) {
+            return new byte[0];
+        }
+        try {
+            return Base64.getDecoder().decode(encoded.trim());
+        } catch (IllegalArgumentException e) {
+            LOG.warnv("Function {0} holds non-base64 code persisted by an older Floci version; serving it as stored",
+                    fn.getName());
+            return encoded.getBytes(StandardCharsets.UTF_8);
         }
     }
 
@@ -895,7 +922,7 @@ public class CloudFrontController {
             }
             CloudFrontFunction fn = parseFunction(body);
             fn = service.updateFunction(name, ifMatch, fn);
-            return Response.ok(xmlFunctionResponse(fn), XML).header("ETag", fn.getEtag()).build();
+            return Response.ok(xmlFunctionResponse(fn), XML).header("ETtag", fn.getEtag()).build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);
         }
@@ -1962,7 +1989,8 @@ public class CloudFrontController {
                     .elem("OriginReadTimeout", coc.getOrDefault("OriginReadTimeout",
                             CloudFrontOriginTimeouts.DEFAULT_ORIGIN_READ_TIMEOUT_SECONDS).toString())
                     .elem("OriginKeepaliveTimeout",
-                            coc.getOrDefault("OriginKeepaliveTimeout", DEFAULT_ORIGIN_KEEPALIVE_TIMEOUT_SECONDS)
+                            coc.getOrDefault("OriginKeepaliveTimeout",
+                                    CloudFrontOriginTimeouts.DEFAULT_ORIGIN_KEEPALIVE_TIMEOUT_SECONDS)
                                     .toString())
                     .raw(xmlOriginSslProtocols(coc.get("OriginSslProtocols")))
                     .end("CustomOriginConfig");
@@ -2784,20 +2812,14 @@ public class CloudFrontController {
                         }
                         case "ConnectionAttempts" -> {
                             if (inOrigin && !inS3OriginConfig && !inCustomOriginConfig && current != null) {
-                                try {
-                                    current.setConnectionAttempts(Integer.parseInt(r.getElementText()));
-                                } catch (NumberFormatException e) {
-                                    LOG.debugv("Ignoring malformed ConnectionAttempts during parse: {0}", e.getMessage());
-                                }
+                                current.setConnectionAttempts(parseNonNegativeTimeout(
+                                        "ConnectionAttempts", r.getElementText()));
                             }
                         }
                         case "ConnectionTimeout" -> {
                             if (inOrigin && !inS3OriginConfig && !inCustomOriginConfig && current != null) {
-                                try {
-                                    current.setConnectionTimeout(Integer.parseInt(r.getElementText()));
-                                } catch (NumberFormatException e) {
-                                    LOG.debugv("Ignoring malformed ConnectionTimeout during parse: {0}", e.getMessage());
-                                }
+                                current.setConnectionTimeout(parseNonNegativeTimeout(
+                                        "ConnectionTimeout", r.getElementText()));
                             }
                         }
                         case "ResponseCompletionTimeout" -> {
@@ -2828,18 +2850,16 @@ public class CloudFrontController {
                         }
                         case "OriginKeepaliveTimeout" -> {
                             if (inCustomOriginConfig && customConfig != null) {
-                                customConfig.put("OriginKeepaliveTimeout", parseBoundedTimeout(
+                                customConfig.put("OriginKeepaliveTimeout", parseNonNegativeTimeout(
                                         "InvalidOriginKeepaliveTimeout", "OriginKeepaliveTimeout",
-                                        r.getElementText(), MIN_ORIGIN_KEEPALIVE_TIMEOUT_SECONDS,
-                                        MAX_ORIGIN_KEEPALIVE_TIMEOUT_SECONDS));
+                                        r.getElementText()));
                             }
                         }
                         case "OriginReadTimeout" -> {
                             if (inCustomOriginConfig && customConfig != null) {
-                                originReadTimeoutSeconds = parseBoundedTimeout(
+                                originReadTimeoutSeconds = parseNonNegativeTimeout(
                                         "InvalidOriginReadTimeout", "OriginReadTimeout",
-                                        r.getElementText(), CloudFrontOriginTimeouts.MIN_ORIGIN_READ_TIMEOUT_SECONDS,
-                                        CloudFrontOriginTimeouts.MAX_ORIGIN_READ_TIMEOUT_SECONDS);
+                                        r.getElementText());
                                 customConfig.put("OriginReadTimeout", originReadTimeoutSeconds);
                             }
                         }
@@ -2951,18 +2971,6 @@ public class CloudFrontController {
                         }
                         case "Origin" -> {
                             if (inOrigin && current != null) {
-                                Integer completionTimeout = current.getResponseCompletionTimeout();
-                                int effectiveReadTimeout = originReadTimeoutSeconds != null
-                                        ? originReadTimeoutSeconds
-                                        : CloudFrontOriginTimeouts.DEFAULT_ORIGIN_READ_TIMEOUT_SECONDS;
-                                if (completionTimeout != null && completionTimeout > 0
-                                        && completionTimeout < effectiveReadTimeout) {
-                                    throw new AwsException(
-                                            "InvalidArgument",
-                                            "The parameter ResponseCompletionTimeout must be greater than or "
-                                                    + "equal to OriginReadTimeout.",
-                                            400);
-                                }
                                 result.add(current);
                             }
                             inOrigin = false;
@@ -3000,17 +3008,6 @@ public class CloudFrontController {
                 "InvalidArgument",
                 "The origin custom headers structure is invalid.",
                 400);
-    }
-
-    private static int parseBoundedTimeout(String errorCode, String field, String rawValue, int min, int max) {
-        int value = parseNonNegativeTimeout(errorCode, field, rawValue);
-        if (value < min || value > max) {
-            throw new AwsException(
-                    errorCode,
-                    "The parameter " + field + " must be between " + min + " and " + max + " seconds.",
-                    400);
-        }
-        return value;
     }
 
     private static int parseNonNegativeTimeout(String field, String rawValue) {
@@ -3532,26 +3529,38 @@ public class CloudFrontController {
         return inv;
     }
 
+    /**
+     * Text of a direct child of the config root. Policy configs nest other {@code Name} elements
+     * (cookie, header and query-string items) that a flat first-match lookup would pick up.
+     */
+    private static String directChildText(XmlParser.XmlElement root, String name) {
+        XmlParser.XmlElement child = root == null ? null : root.child(name);
+        return child == null ? null : child.rawText();
+    }
+
     private CachePolicy parseCachePolicy(String body) {
         CachePolicy policy = new CachePolicy();
-        policy.setName(XmlParser.extractFirst(body, "Name", null));
-        policy.setComment(XmlParser.extractFirst(body, "Comment", null));
+        XmlParser.XmlElement root = XmlParser.parseDocumentElementTree(body);
+        policy.setName(directChildText(root, "Name"));
+        policy.setComment(directChildText(root, "Comment"));
         policy.setConfig(CloudFrontPolicyConfigCodec.parseCachePolicy(body));
         return policy;
     }
 
     private OriginRequestPolicy parseOriginRequestPolicy(String body) {
         OriginRequestPolicy policy = new OriginRequestPolicy();
-        policy.setName(XmlParser.extractFirst(body, "Name", null));
-        policy.setComment(XmlParser.extractFirst(body, "Comment", null));
+        XmlParser.XmlElement root = XmlParser.parseDocumentElementTree(body);
+        policy.setName(directChildText(root, "Name"));
+        policy.setComment(directChildText(root, "Comment"));
         policy.setConfig(CloudFrontPolicyConfigCodec.parseOriginRequestPolicy(body));
         return policy;
     }
 
     private ResponseHeadersPolicy parseResponseHeadersPolicy(String body) {
         ResponseHeadersPolicy policy = new ResponseHeadersPolicy();
-        policy.setName(XmlParser.extractFirst(body, "Name", null));
-        policy.setComment(XmlParser.extractFirst(body, "Comment", null));
+        XmlParser.XmlElement root = XmlParser.parseDocumentElementTree(body);
+        policy.setName(directChildText(root, "Name"));
+        policy.setComment(directChildText(root, "Comment"));
         policy.setConfig(ResponseHeadersPolicyConfigCodec.parse(body));
         return policy;
     }

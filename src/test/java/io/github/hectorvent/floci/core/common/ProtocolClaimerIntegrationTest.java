@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.s3.S3Controller;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -220,5 +221,56 @@ class ProtocolClaimerIntegrationTest {
                 "application/x-www-form-urlencoded", null, null, null).orElseThrow();
 
         assertEquals(WireProtocol.REST, claim.protocol());
+    }
+
+    @Test
+    void anUnclaimedRequestIsClaimedAsTheEndpointItReachedServesIt() {
+        ClaimSignals signals = new ClaimSignals("POST", "/", "application/x-amz-json-1.0", "unrecognised",
+                "AmazonSQS.ListQueues", SQS_AUTH, null, new MultivaluedHashMap<>());
+        MultivaluedHashMap<String, String> noPathParameters = new MultivaluedHashMap<>();
+
+        ProtocolClaim json = claimer.routeClaim(AwsJsonController.class, signals, noPathParameters);
+        assertEquals(WireProtocol.AWS_JSON_1_0, json.protocol());
+        assertEquals("sqs", json.service().externalKey());
+        assertEquals("ListQueues", json.operation());
+
+        assertEquals(WireProtocol.AWS_JSON_1_1,
+                claimer.routeClaim(AwsJson11Controller.class, signals, noPathParameters).protocol());
+        assertEquals(WireProtocol.AWS_CBOR_TARGET,
+                claimer.routeClaim(AwsJsonCborController.class, signals, noPathParameters).protocol());
+
+        ProtocolClaim query = claimer.routeClaim(AwsQueryController.class, signals, noPathParameters);
+        assertEquals(WireProtocol.AWS_QUERY, query.protocol());
+        assertEquals("sqs", query.service().externalKey());
+    }
+
+    @Test
+    void anUnclaimedRequestOnTheRpcV2RouteIsClaimedByThePathItDispatches() {
+        MultivaluedHashMap<String, String> pathParameters = new MultivaluedHashMap<>();
+        pathParameters.putSingle(AwsJsonCborController.RPC_V2_SERVICE_PARAMETER, "DynamoDB_20120810");
+        pathParameters.putSingle(AwsJsonCborController.RPC_V2_OPERATION_PARAMETER, "ListTables");
+
+        ProtocolClaim claim = claimer.routeClaim(AwsJsonCborController.class,
+                new ClaimSignals("POST", "/service/DynamoDB_20120810/operation/ListTables", "application/cbor",
+                        "unrecognised", "AmazonSQS.ListQueues", null, null, new MultivaluedHashMap<>()),
+                pathParameters);
+
+        assertEquals(WireProtocol.RPCV2_CBOR, claim.protocol());
+        assertEquals("dynamodb", claim.service().externalKey());
+        assertEquals("ListTables", claim.operation());
+    }
+
+    @Test
+    void anUnclaimedRequestOnAnyOtherRouteIsRest() {
+        MultivaluedHashMap<String, String> noPathParameters = new MultivaluedHashMap<>();
+        ClaimSignals delete = new ClaimSignals("DELETE", "/bucket/key", null, "unrecognised",
+                "AmazonS3.GetObject", null, null, new MultivaluedHashMap<>());
+        assertEquals(WireProtocol.REST, claimer.routeClaim(S3Controller.class, delete, noPathParameters).protocol());
+
+        // The Query endpoint's GET route is reached as a Query call only through the Query GET
+        // rewrite, which only a claimed request gets.
+        ClaimSignals get = new ClaimSignals("GET", AwsQueryController.QUERY_GET_PATH, null, "unrecognised",
+                null, null, null, new MultivaluedHashMap<>());
+        assertEquals(WireProtocol.REST, claimer.routeClaim(AwsQueryController.class, get, noPathParameters).protocol());
     }
 }

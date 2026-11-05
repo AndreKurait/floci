@@ -18,6 +18,8 @@ import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -25,9 +27,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
 /**
- * Covers the connection bounds (handshake timeout, backend-connect deferral, permit pool) added
- * to {@link RdsAuthProxy} for the POSTGRES engine, mirroring the equivalent coverage in
- * {@code RedshiftAuthProxyTest}.
+ * Covers the connection bounds (handshake timeout, backend-connect deferral, permit pool,
+ * accept backlog) added to {@link RdsAuthProxy} for the POSTGRES engine, mirroring the
+ * equivalent coverage in {@code RedshiftAuthProxyTest}.
  */
 class RdsAuthProxyBoundsTest {
 
@@ -104,17 +106,27 @@ class RdsAuthProxyBoundsTest {
     }
 
     @Test
+    void rejectsMissingBackendRuntimeIdentity() {
+        for (String runtimeId : new String[] {null, "", " "}) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> newProxy(runtimeId, 5000, 5000, 100));
+        }
+    }
+
+    @Test
     void holdsTheClientUntilTheBackendGateAdmitsItAndReleasesTheLeaseWhenItLeaves() throws Exception {
         fakeBackend = new ServerSocket(0);
         fakeBackend.setSoTimeout(300);
         CountDownLatch admit = new CountDownLatch(1);
         CountDownLatch released = new CountDownLatch(1);
-        RdsBackendGate gate = (host, port) -> {
+        AtomicReference<String> enteredRuntime = new AtomicReference<>();
+        RdsBackendGate gate = runtimeId -> {
+            enteredRuntime.set(runtimeId);
             admit.await();
             return released::countDown;
         };
         int proxyPort = FreePorts.anyInterfacePort();
-        proxy = new RdsAuthProxy("db-1", "localhost", fakeBackend.getLocalPort(),
+        proxy = new RdsAuthProxy("db-1", "localhost", fakeBackend.getLocalPort(), "runtime:db-1",
                 DatabaseEngine.SQLSERVER, false, "sa", "Secret123", null,
                 mock(RdsSigV4Validator.class), realTls(), (user, pw) -> true,
                 5000, 5000, 100, null, gate);
@@ -131,12 +143,37 @@ class RdsAuthProxyBoundsTest {
                 assertEquals('x', client.getInputStream().read(), "the held client is served once admitted");
             }
         }
+        assertEquals("runtime:db-1", enteredRuntime.get());
         assertTrue(released.await(5, TimeUnit.SECONDS), "the lease is released when the connection ends");
+    }
+
+    @Test
+    void bindsWithABurstTolerantAcceptBacklog() throws Exception {
+        AtomicInteger acceptBacklog = new AtomicInteger();
+        proxy = new RdsAuthProxy("db-1", "localhost", 1, "runtime:db-1",
+                DatabaseEngine.POSTGRES, false, "admin", "Secret123", "dev",
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> true,
+                5000, 5000, 100) {
+            @Override
+            ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
+                acceptBacklog.set(backlog);
+                return super.listenSocket(proxyPort, backlog);
+            }
+        };
+        proxy.start(0);
+        assertEquals(4096, acceptBacklog.get(),
+                "a connection burst must not overflow the proxy's accept queue");
     }
 
     private RdsAuthProxy newProxy(int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
                                   int maxConnections) {
-        return new RdsAuthProxy("db-1", "localhost", fakeBackend.getLocalPort(),
+        return newProxy("runtime:db-1", handshakeTimeoutMillis, backendConnectTimeoutMillis, maxConnections);
+    }
+
+    private RdsAuthProxy newProxy(String runtimeId, int handshakeTimeoutMillis,
+                                  int backendConnectTimeoutMillis, int maxConnections) {
+        int backendPort = fakeBackend != null ? fakeBackend.getLocalPort() : 1;
+        return new RdsAuthProxy("db-1", "localhost", backendPort, runtimeId,
                 DatabaseEngine.POSTGRES, false,
                 "admin", "Secret123", "dev",
                 mock(RdsSigV4Validator.class), realTls(), (user, pw) -> true,

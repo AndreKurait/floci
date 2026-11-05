@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class SshPublicKeysTest {
+public class SshPublicKeysTest {
 
     private static final RSAPublicKey KEY = rsaKeyQuietly();
 
@@ -245,7 +245,8 @@ class SshPublicKeysTest {
                 blob("sk-ssh-ed25519@openssh.com", new byte[32], ascii("ssh:"), ascii("extra"))));
     }
 
-    private static byte[] withTrailing(byte[] blob, byte[] trailing) {
+    /** The bytes of {@code blob} and then {@code trailing}. The EC2 key pair tests use it too. */
+    public static byte[] withTrailing(byte[] blob, byte[] trailing) {
         return ByteBuffer.allocate(blob.length + trailing.length).put(blob).put(trailing).array();
     }
 
@@ -260,8 +261,11 @@ class SshPublicKeysTest {
         return value.getBytes(StandardCharsets.US_ASCII);
     }
 
-    /** An OpenSSH blob of the given type followed by the given fields, each length-prefixed. */
-    private static byte[] blob(String type, byte[]... fields) {
+    /**
+     * An OpenSSH blob of the given type followed by the given fields, each length-prefixed. The EC2
+     * key pair tests use it too.
+     */
+    public static byte[] blob(String type, byte[]... fields) {
         byte[] typeBytes = type.getBytes(StandardCharsets.US_ASCII);
         int length = Integer.BYTES + typeBytes.length;
         for (byte[] field : fields) {

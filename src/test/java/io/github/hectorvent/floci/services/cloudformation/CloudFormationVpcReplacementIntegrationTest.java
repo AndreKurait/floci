@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.specification.RequestSpecification;
@@ -186,6 +187,7 @@ class CloudFormationVpcReplacementIntegrationTest {
     }
 
     private static String describeStacks(String stack, String expectedStatus) {
+        CfnStackWaits.awaitStatus(stack, expectedStatus, CFN_AUTH);
         return given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", CFN_AUTH)

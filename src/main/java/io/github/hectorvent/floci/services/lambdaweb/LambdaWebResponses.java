@@ -13,7 +13,7 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /** The wire shapes of Lambda Web responses. AWS emits members in alphabetical order with microsecond timestamps. */
-final class LambdaWebResponses {
+public final class LambdaWebResponses {
 
     private static final DateTimeFormatter TIMESTAMP =
             DateTimeFormatter.ofPattern("uuuu-MM-dd'T'HH:mm:ss.SSSSSS'Z'").withZone(ZoneOffset.UTC);
@@ -52,7 +52,7 @@ final class LambdaWebResponses {
         out.put("revisionArn", revision.revisionArn);
         out.put("revisionId", revision.revisionId);
         putIfPresent(out, "description", revision.description);
-        putRevisionState(out, view);
+        putRevisionState(out, revision, view);
         out.put("createdAt", timestamp(revision.createdAt));
         return out;
     }
@@ -87,10 +87,13 @@ final class LambdaWebResponses {
         return out;
     }
 
-    private static void putRevisionState(Map<String, Object> out, View view) {
+    private static void putRevisionState(Map<String, Object> out, WebFunctionRevision revision, View view) {
         if (view == View.CREATED) {
             out.put("state", "Pending");
             out.put("stateReason", "The revision is being activated.");
+        } else if (revision.failureReason != null) {
+            out.put("state", "Failed");
+            out.put("stateReason", revision.failureReason);
         } else {
             out.put("state", "Active");
             out.put("stateReason", "The revision is active.");
@@ -120,6 +123,17 @@ final class LambdaWebResponses {
     static Map<String, Object> endpoint(WebFunctionEndpoint endpoint, WebFunctionEndpoint regionalSource, View view) {
         Map<String, Object> out = endpointSummary(endpoint, view);
         out.put("functionArn", endpoint.functionArn);
+        out.put("regionalEndpoints", regionalEndpoints(endpoint, regionalSource, view));
+        return out;
+    }
+
+    /** The per-region block of a stored endpoint, which CloudFormation's RegionalEndpoints gives too. */
+    public static Map<String, Object> regionalEndpoints(WebFunctionEndpoint endpoint) {
+        return regionalEndpoints(endpoint, endpoint, View.STORED);
+    }
+
+    private static Map<String, Object> regionalEndpoints(WebFunctionEndpoint endpoint, WebFunctionEndpoint regionalSource,
+                                                         View view) {
         Map<String, Object> regional = node();
         for (String region : endpoint.regions) {
             Map<String, Object> entry = node();
@@ -133,8 +147,7 @@ final class LambdaWebResponses {
             putEndpointState(entry, regionalSource, view, true);
             regional.put(region, entry);
         }
-        out.put("regionalEndpoints", regional);
-        return out;
+        return regional;
     }
 
     private static void putConfigs(Map<String, Object> out, WebFunctionEndpoint endpoint) {
@@ -157,6 +170,15 @@ final class LambdaWebResponses {
             out.put("stateReason", regional
                     ? "The endpoint is being activated in the region."
                     : "The endpoint is being activated and is not yet invokable in any region.");
+            return;
+        }
+        if (endpoint.failed) {
+            out.put("state", "Failed");
+            out.put("stateReason", regional
+                    ? "The endpoint activation failed because of an internal error."
+                    : "The endpoint activation failed in " + endpoint.regions + ". The endpoint is not invokable in"
+                    + " any region. For details, see the stateReason for those regions in regionalEndpoints."
+                    + " To retry, delete the endpoint and create it again.");
             return;
         }
         out.put("state", "Active");

@@ -2,7 +2,6 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -12,7 +11,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -56,16 +54,8 @@ public class StepFunctionsEventPublisher {
     public void emitStatusChange(Execution exec) {
         String executionArn = exec.getExecutionArn();
         try {
-            ObjectNode detail = buildDetail(exec);
-            ArrayNode resources = objectMapper.createArrayNode();
-            if (executionArn != null) {
-                resources.add(executionArn);
-            }
-            Map<String, Object> entry = new HashMap<>();
-            entry.put("Source", SOURCE);
-            entry.put("DetailType", DETAIL_TYPE);
-            entry.put("Detail", objectMapper.writeValueAsString(detail));
-            entry.put("Resources", resources);
+            Map<String, Object> entry = EventBridgeService.serviceEventEntry(SOURCE, DETAIL_TYPE,
+                    objectMapper.writeValueAsString(buildDetail(exec)), executionArn);
             EventBridgeService.PutEventsResult result = eventBridgeService.putEvents(List.of(entry),
                     AwsArnUtils.regionOrDefault(executionArn, regionResolver.getDefaultRegion()));
             if (result != null && result.failedCount() > 0) {

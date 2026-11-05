@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 
@@ -94,7 +95,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DeleteStack").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200);
-        CfnStackWaits.awaitStackDeleted(stackName);
+        CfnStackWaits.awaitStackDeleted(stackName, CFN_AUTH);
     }
 
     /**
@@ -113,6 +114,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("TemplateBody", stackWith(body, "probe-q-a-" + suffix))
         .when().post("/").then().statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200)
@@ -126,6 +128,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("TemplateBody", stackWith(body, "probe-q-b-" + suffix))
         .when().post("/").then().statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200)
@@ -149,6 +152,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("TemplateBody", stackWith(createBody.replace("SUFFIX", suffix), "probe-q-a-" + suffix))
         .when().post("/").then().statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
         String before = namedPhysicalId(stackName);
         assertNotNull(before, "no PhysicalResourceId for Named after create");
 
@@ -157,6 +161,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("TemplateBody", stackWith(updateBody.replace("SUFFIX", suffix), "probe-q-b-" + suffix))
         .when().post("/").then().statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200)
@@ -332,6 +337,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("Action", "CreateStack").formParam("StackName", stackName)
             .formParam("TemplateBody", initialTemplate)
         .when().post("/").then().statusCode(200);
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
@@ -348,6 +354,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("Action", "UpdateStack").formParam("StackName", stackName)
             .formParam("TemplateBody", updatedTemplate)
         .when().post("/").then().statusCode(200);
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200).body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"));
@@ -378,6 +385,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("Action", "CreateStack").formParam("StackName", stackName)
             .formParam("TemplateBody", initialTemplate)
         .when().post("/").then().statusCode(200);
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
@@ -446,6 +454,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("Action", "CreateStack").formParam("StackName", stackName)
             .formParam("TemplateBody", initialTemplate)
         .when().post("/").then().statusCode(200);
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
@@ -466,6 +475,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
             .formParam("Action", "UpdateStack").formParam("StackName", stackName)
             .formParam("TemplateBody", updatedTemplate)
         .when().post("/").then().statusCode(200);
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
         .when().post("/").then().statusCode(200).body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"));
@@ -598,6 +608,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
                 .formParam("TemplateBody", initialTemplate)
                 .when().post("/").then().statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
                 .when().post("/").then().statusCode(200)
@@ -608,6 +619,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
                 .formParam("TemplateBody", updatedTemplate)
                 .when().post("/").then().statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
                 .when().post("/").then().statusCode(200)
@@ -812,6 +824,7 @@ class CfnUnchangedResourceUpdateIntegrationTest {
                 .formParam("TemplateBody", initialTemplate)
                 .when().post("/").then().statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
         given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks").formParam("StackName", stackName)
                 .when().post("/").then().statusCode(200)

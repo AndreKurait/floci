@@ -27,6 +27,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -85,7 +86,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
     void cleanup() {
         for (String volId : volumesToClean) {
             try {
-                Volume vol = ec2Service.describeVolumes("us-east-1", List.of(volId), null).getFirst();
+                Volume vol = ec2Service.describeVolumes("us-east-1", List.of(volId), Map.of()).getFirst();
                 if (vol != null && vol.getAttachments() != null) {
                     for (VolumeAttachment att : vol.getAttachments()) {
                         try {
@@ -580,7 +581,7 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
 
         ec2Service.stopInstances("us-east-1", List.of(instance.getInstanceId()));
         await().atMost(Duration.ofSeconds(35)).until(() ->
-                "stopped".equals(ec2Service.describeInstances("us-east-1", List.of(instance.getInstanceId()), null)
+                "stopped".equals(ec2Service.describeInstances("us-east-1", List.of(instance.getInstanceId()), Map.of())
                         .getFirst().getInstances().getFirst().getState().getName()));
         ec2Service.detachVolume("us-east-1", rootVolId, instance.getInstanceId(), instance.getRootDeviceName(), true);
 

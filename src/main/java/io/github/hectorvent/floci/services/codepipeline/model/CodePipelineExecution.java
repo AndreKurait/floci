@@ -19,11 +19,12 @@ public class CodePipelineExecution {
     private String pipelineExecutionId;
     private String pipelineName;
     private Integer pipelineVersion;
-    private String status;
+    private volatile String status;
     private String statusSummary;
     private String executionMode;
     private String executionType;
     private Double startTime;
+    private Long admissionOrdinal;
     private Double lastUpdateTime;
     private List<Map<String, Object>> artifactRevisions = new ArrayList<>();
     private List<Map<String, Object>> sourceRevisions = new ArrayList<>();
@@ -32,7 +33,8 @@ public class CodePipelineExecution {
     private Map<String, String> trigger = new LinkedHashMap<>();
     private List<ActionExecution> actionExecutions = new ArrayList<>();
     private Map<String, String> stageExecutionStatuses = new LinkedHashMap<>();
-    private String currentStage;
+    private volatile String currentStage;
+    private volatile String waitingStage;
     private volatile boolean stopRequested;
     private volatile boolean abandon;
     private volatile boolean artifactsReleased;
@@ -122,6 +124,14 @@ public class CodePipelineExecution {
         this.startTime = startTime;
     }
 
+    public Long getAdmissionOrdinal() {
+        return admissionOrdinal;
+    }
+
+    public void setAdmissionOrdinal(Long admissionOrdinal) {
+        this.admissionOrdinal = admissionOrdinal;
+    }
+
     public Double getLastUpdateTime() {
         return lastUpdateTime;
     }
@@ -193,6 +203,14 @@ public class CodePipelineExecution {
 
     public void setCurrentStage(String currentStage) {
         this.currentStage = currentStage;
+    }
+
+    public String getWaitingStage() {
+        return waitingStage;
+    }
+
+    public void setWaitingStage(String waitingStage) {
+        this.waitingStage = waitingStage;
     }
 
     public boolean isStopRequested() {

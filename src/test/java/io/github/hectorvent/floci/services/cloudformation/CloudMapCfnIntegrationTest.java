@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
@@ -142,7 +143,8 @@ class CloudMapCfnIntegrationTest {
                 .then().statusCode(200)
                 .extract().asString())
             .path("Namespace").path("Properties").path("DnsProperties").path("HostedZoneId").asText(null);
-        assertThat(hostedZoneId, matchesPattern("Z[A-Z0-9]{13}"));
+        // A bare Route 53 zone id (no /hostedzone/ prefix); AWS ids vary in length, so none is pinned.
+        assertThat(hostedZoneId, matchesPattern("Z[A-Z0-9]+"));
         assertEquals(hostedZoneId, outputValue(outputs, "NsHz"));
         assertEquals("main", outputValue(outputs, "SvcName"));
         assertThat(outputValue(outputs, "NoNameName"), matchesPattern("SvcNoName-[0-9a-f]{12}"));

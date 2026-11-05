@@ -18,12 +18,16 @@ import io.github.hectorvent.floci.services.cloudfront.model.PublicKey;
 import io.github.hectorvent.floci.services.cloudfront.model.ResponseHeadersPolicy;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -94,6 +98,10 @@ class CloudFrontCfnProvisionerTest {
         return mapper.readTree(json);
     }
 
+    private static String wireCode(String code) {
+        return Base64.getEncoder().encodeToString(code.getBytes(StandardCharsets.UTF_8));
+    }
+
     private static ResponseHeadersPolicy responseHeadersPolicy(String id, String etag) {
         ResponseHeadersPolicy p = new ResponseHeadersPolicy();
         p.setId(id);
@@ -102,7 +110,7 @@ class CloudFrontCfnProvisionerTest {
         return p;
     }
 
-    private static <T> T withIdentity(T model, java.util.function.Consumer<T> set) {
+    private static <T> T withIdentity(T model, Consumer<T> set) {
         set.accept(model);
         return model;
     }
@@ -169,7 +177,56 @@ class CloudFrontCfnProvisionerTest {
         assertEquals("b.s3.amazonaws.com", origin.getDomainName());
         // No CustomOriginConfig means an S3 origin.
         assertNull(origin.getCustomOriginConfig());
+        // Settings the template never mentions stay on the model's own AWS defaults.
+        assertEquals(3, origin.getConnectionAttempts());
+        assertEquals(10, origin.getConnectionTimeout());
         assertEquals("redirect-to-https", config.getDefaultCacheBehavior().getViewerProtocolPolicy());
+    }
+
+    @Test
+    void copiesTheOriginConnectionSettingsTheTemplateDeclares() throws Exception {
+        when(cloudFront.createDistribution(any(), any())).thenReturn(distribution("E1DIST", "d111.cloudfront.net"));
+        StackResource r = resource(DISTRIBUTION);
+
+        provisioner.provision(r, json("""
+                {"DistributionConfig": {
+                   "Origins": [{"Id": "o1", "DomainName": "origin.example.com",
+                                "ConnectionAttempts": 2, "ConnectionTimeout": 5,
+                                "ResponseCompletionTimeout": 90,
+                                "CustomOriginConfig": {"OriginProtocolPolicy": "https-only",
+                                                       "OriginReadTimeout": 45,
+                                                       "OriginKeepaliveTimeout": 120}}],
+                   "DefaultCacheBehavior": {"TargetOriginId": "o1", "ViewerProtocolPolicy": "redirect-to-https"}
+                }}
+                """), distributionCtx(null));
+
+        ArgumentCaptor<Distribution> sent = ArgumentCaptor.forClass(Distribution.class);
+        verify(cloudFront).createDistribution(sent.capture(), any());
+        Origin origin = sent.getValue().getConfig().getOrigins().getFirst();
+        assertEquals(2, origin.getConnectionAttempts());
+        assertEquals(5, origin.getConnectionTimeout());
+        // ResponseCompletionTimeout lives on the origin, where the serving layer reads it.
+        assertEquals(Integer.valueOf(90), origin.getResponseCompletionTimeout());
+        // OriginReadTimeout lives on CustomOriginConfig, where the serving layer reads it.
+        assertEquals(Integer.valueOf(45), origin.getCustomOriginConfig().get("OriginReadTimeout"));
+        assertEquals(Integer.valueOf(120), origin.getCustomOriginConfig().get("OriginKeepaliveTimeout"));
+    }
+
+    @Test
+    void aNonNumericOriginConnectionSettingFailsTheStackInsteadOfAServerError() {
+        StackResource r = resource(DISTRIBUTION);
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, json("""
+                {"DistributionConfig": {
+                   "Origins": [{"Id": "o1", "DomainName": "origin.example.com", "ConnectionTimeout": "lots"}],
+                   "DefaultCacheBehavior": {"TargetOriginId": "o1", "ViewerProtocolPolicy": "redirect-to-https"}
+                }}
+                """), distributionCtx(null)));
+
+        assertEquals("ValidationError", e.getErrorCode());
+        assertEquals("AWS::CloudFront::Distribution origin ConnectionTimeout must be an integer, but was 'lots'",
+                e.getMessage());
+        verify(cloudFront, never()).createDistribution(any(), any());
     }
 
     @Test
@@ -412,7 +469,7 @@ class CloudFrontCfnProvisionerTest {
         when(cloudFront.getResponseHeadersPolicy(ID)).thenReturn(responseHeadersPolicy(ID, ETAG));
         AwsException inUse = new AwsException("ResponseHeadersPolicyInUse",
                 "The response headers policy is attached to one or more distributions.", 409);
-        org.mockito.Mockito.doThrow(inUse).when(cloudFront).deleteResponseHeadersPolicy(ID, ETAG);
+        Mockito.doThrow(inUse).when(cloudFront).deleteResponseHeadersPolicy(ID, ETAG);
 
         AwsException e = assertThrows(AwsException.class,
                 () -> provisioner.delete(RESPONSE_HEADERS_POLICY, ID, REGION));
@@ -780,7 +837,8 @@ class CloudFrontCfnProvisionerTest {
         ArgumentCaptor<CloudFrontFunction> captor = ArgumentCaptor.forClass(CloudFrontFunction.class);
         verify(cloudFront).createFunction(captor.capture());
         assertEquals("my-function", captor.getValue().getName());
-        assertEquals("function handler(event) { return event.request; }", captor.getValue().getFunctionCode());
+        assertEquals(wireCode("function handler(event) { return event.request; }"),
+                captor.getValue().getFunctionCode());
         assertEquals("example", captor.getValue().getComment());
         assertEquals("cloudfront-js-2.0", captor.getValue().getRuntime());
         verify(cloudFront).publishFunction("my-function", ETAG);
@@ -824,7 +882,7 @@ class CloudFrontCfnProvisionerTest {
 
         ArgumentCaptor<CloudFrontFunction> captor = ArgumentCaptor.forClass(CloudFrontFunction.class);
         verify(cloudFront).updateFunction(eq("my-function"), eq(ETAG), captor.capture());
-        assertEquals("new code", captor.getValue().getFunctionCode());
+        assertEquals(wireCode("new code"), captor.getValue().getFunctionCode());
         verify(cloudFront, never()).createFunction(any());
         verify(cloudFront).publishFunction("my-function", NEW_ETAG);
         verify(cloudFront).untagResource(FUNCTION_ARN, List.of("Old"));

@@ -18,6 +18,7 @@ class LambdaWebErrorPagesTest {
         assertEquals(230, length(LambdaWebErrorPages.FORBIDDEN));
         assertEquals(225, length(LambdaWebErrorPages.INVALID_ENDPOINT));
         assertEquals(264, length(LambdaWebErrorPages.UNSUPPORTED_HTTP_VERSION));
+        assertEquals(225, length(LambdaWebErrorPages.ENDPOINT_NOT_ACTIVE));
         assertEquals(274, length(LambdaWebErrorPages.ENDPOINT_DISABLED));
         assertEquals(249, length(LambdaWebErrorPages.REQUEST_TIMEOUT));
         assertEquals(236, length(LambdaWebErrorPages.ORIGIN_REQUEST_ERROR));
@@ -43,6 +44,12 @@ class LambdaWebErrorPagesTest {
     @Test
     void edgeDateHasATwoDigitYear() {
         assertEquals("Thu, 15 Oct 26 23:32:32 GMT", LambdaWebErrorPages.edgeDate(Instant.parse("2026-10-15T23:32:32Z")));
+    }
+
+    @Test
+    void platformDateHasATwoDigitDay() {
+        assertEquals("Sun, 01 Nov 2026 02:33:33 GMT",
+                LambdaWebErrorPages.platformDate(Instant.parse("2026-11-01T02:33:33Z")));
     }
 
     private static int length(LambdaWebErrorPages.Page page) {

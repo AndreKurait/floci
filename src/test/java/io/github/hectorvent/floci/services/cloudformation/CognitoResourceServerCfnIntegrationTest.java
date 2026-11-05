@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
 import io.github.hectorvent.floci.services.cognito.CognitoService;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.mockito.InjectSpy;
@@ -181,11 +182,8 @@ class CognitoResourceServerCfnIntegrationTest {
     @ValueSource(booleans = {false, true})
     void nullScopesFailCreationWithoutCreatingABackingServer(boolean conditional) throws Exception {
         String pool = createPool();
-        cloudFormation("CreateStack", nullScopesTemplate(pool, "Invalid API", conditional));
-        createdStack = true;
 
-        assertEquals("ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
-        assertScopeValidationFailure();
+        assertNullScopesRefused("CreateStack", nullScopesTemplate(pool, "Invalid API", conditional), conditional);
         assertServerGone(pool, IDENTIFIER);
     }
 
@@ -195,9 +193,9 @@ class CognitoResourceServerCfnIntegrationTest {
         String pool = createPool();
         createStack(template(pool, IDENTIFIER, "Original API", "read"));
 
-        updateStack(nullScopesTemplate(pool, "Changed API", conditional), "UPDATE_ROLLBACK_COMPLETE");
+        assertNullScopesRefused("UpdateStack", nullScopesTemplate(pool, "Changed API", conditional), conditional);
 
-        assertScopeValidationFailure();
+        assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
         assertEquals(IDENTIFIER, output("ServerRef"));
         assertServer(pool, IDENTIFIER, "Original API", "read");
         updateStack(template(pool, IDENTIFIER, "Recovered API", "write"), "UPDATE_COMPLETE");
@@ -718,15 +716,7 @@ class CognitoResourceServerCfnIntegrationTest {
     }
 
     private void continueUpdateRollback(String expectedStatus, String... resourcesToSkip) {
-        RequestSpecification request = given()
-                .contentType("application/x-www-form-urlencoded")
-                .header("Authorization", CFN_AUTH)
-                .formParam("Action", "ContinueUpdateRollback")
-                .formParam("StackName", stack);
-        for (int i = 0; i < resourcesToSkip.length; i++) {
-            request.formParam("ResourcesToSkip.member." + (i + 1), resourcesToSkip[i]);
-        }
-        request.when().post("/").then().statusCode(200);
+        CfnStackWaits.continueUpdateRollback(stack, CFN_AUTH, resourcesToSkip);
         assertEquals(expectedStatus, CfnStackWaits.awaitTerminal(stack).status());
     }
 
@@ -823,11 +813,14 @@ class CognitoResourceServerCfnIntegrationTest {
         return template;
     }
 
-    private void assertScopeValidationFailure() {
-        String events = given().contentType("application/x-www-form-urlencoded")
-                .header("Authorization", CFN_AUTH).formParam("Action", "DescribeStackEvents")
-                .formParam("StackName", stack).post("/").then().statusCode(200).extract().asString();
-        assertTrue(events.contains("Scopes must be a list"));
+    /** As on AWS, a template holding a null is refused when the operation is requested. */
+    private void assertNullScopesRefused(String action, ObjectNode template, boolean conditional) {
+        String path = conditional ? "/Resources/Server/Type/Scopes/Fn::If/1" : "/Resources/Server/Type/Scopes";
+        given().contentType("application/x-www-form-urlencoded")
+                .header("Authorization", CFN_AUTH).formParam("Action", action)
+                .formParam("StackName", stack).formParam("TemplateBody", template.toString())
+                .post("/").then().statusCode(400)
+                .body("ErrorResponse.Error.Message", equalTo("[" + path + "] 'null' values are not allowed in templates"));
     }
 
     private static void addFailingDependentResource(ObjectNode template) {

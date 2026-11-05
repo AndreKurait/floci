@@ -1,7 +1,6 @@
 package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -27,7 +26,6 @@ import org.jboss.logging.Logger;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -248,21 +246,9 @@ public class SesEventPublisher {
         }
         String region = AwsArnUtils.regionOrDefault(busArn, defaultRegion);
         try {
-            Map<String, Object> entry = new HashMap<>();
-            entry.put("Source", "aws.ses");
-            entry.put("DetailType", SesEventPayload.eventBridgeDetailType(eventType));
-            entry.put("Detail", payloadJson);
+            Map<String, Object> entry = EventBridgeService.serviceEventEntry("aws.ses",
+                    SesEventPayload.eventBridgeDetailType(eventType), payloadJson, sourceArn);
             entry.put("EventBusName", busName);
-            entry.put("Region", region);
-            // Always emit Resources (possibly empty) — EventBridgeService.matchesPattern
-            // casts entry.get("Resources") to ArrayNode unconditionally for any rule with
-            // a "resources" filter; an absent key NPEs and silently turns the rule into
-            // a no-match.
-            ArrayNode resources = objectMapper.createArrayNode();
-            if (sourceArn != null && !sourceArn.isBlank()) {
-                resources.add(sourceArn);
-            }
-            entry.put("Resources", resources);
             EventBridgeService.PutEventsResult result =
                     eventBridgeService.putEvents(List.of(entry), region);
             if (result.failedCount() > 0) {

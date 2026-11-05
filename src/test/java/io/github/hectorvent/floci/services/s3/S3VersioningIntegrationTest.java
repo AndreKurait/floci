@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import java.util.List;
+import java.util.regex.Pattern;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -626,8 +627,7 @@ class S3VersioningIntegrationTest {
         given().queryParam("versionId", "null").header("x-amz-acl", "private")
                 .when().put(added + "?acl").then().statusCode(404).body(noSuchVersion);
         given().queryParam("versionId", "null").queryParam("annotationName", "labels").body("x")
-                .when().put(added + "?annotation").then().statusCode(404)
-                .body(containsString("<Code>NoSuchKey</Code>"));
+                .when().put(added + "?annotation").then().statusCode(404).body(noSuchVersion);
         given().header("x-amz-copy-source", "/" + bucket + "/new?versionId=null")
                 .when().put("/" + bucket + "/copy-of-new").then().statusCode(404).body(noSuchVersion);
         given().when().get(added).then().statusCode(200).body(equalTo("new"));
@@ -650,12 +650,15 @@ class S3VersioningIntegrationTest {
         String legalHold = "<LegalHold><Status>OFF</Status></LegalHold>";
 
         String old = "/" + bucket + "/old";
+        given().body("replacement").when().put(old).then().statusCode(200);
         given().queryParam("versionId", "null").body(retention).when().put(old + "?retention").then().statusCode(200);
         given().queryParam("versionId", "null").when().get(old + "?retention")
                 .then().statusCode(200).body(containsString("<Mode>GOVERNANCE</Mode>"));
         given().queryParam("versionId", "null").body(legalHold).when().put(old + "?legal-hold").then().statusCode(200);
         given().queryParam("versionId", "null").when().get(old + "?legal-hold")
                 .then().statusCode(200).body(containsString("<Status>OFF</Status>"));
+        given().queryParam("versionId", "null").when().delete(old)
+                .then().statusCode(403).body(containsString("<Code>AccessDenied</Code>"));
 
         String added = "/" + bucket + "/new";
         Matcher<String> noSuchVersion = containsString("<Code>NoSuchVersion</Code>");
@@ -672,8 +675,78 @@ class S3VersioningIntegrationTest {
                 .when().delete(old).then().statusCode(204);
     }
 
+    @Test
+    @Order(26)
+    void aVersionedOverwritePreservesAndPromotesTheNullVersion() {
+        String bucket = "versioned-archived-null-test";
+        String key = "/" + bucket + "/key";
+        given().when().put("/" + bucket).then().statusCode(200);
+        given().body("null body").when().put(key).then().statusCode(200);
+        given().queryParam("annotationName", "labels").body("kept")
+                .when().put(key + "?annotation").then().statusCode(200);
+        given().body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+                .when().put("/" + bucket + "?versioning").then().statusCode(200);
+        String currentVersion = given().body("versioned body").when().put(key)
+                .then().statusCode(200).extract().header("x-amz-version-id");
+
+        String versions = given().when().get("/" + bucket + "?versions&prefix=key")
+                .then().statusCode(200).extract().asString();
+        assertEquals(1, occurrences(versions, "<VersionId>null</VersionId>"));
+        assertEquals(1, occurrences(versions, "<VersionId>" + currentVersion + "</VersionId>"));
+        given().queryParam("versionId", "null").when().get(key)
+                .then().statusCode(200).body(equalTo("null body"));
+        given().queryParam("versionId", "null").queryParam("annotationName", "labels")
+                .when().get(key + "?annotation").then().statusCode(200).body(equalTo("kept"));
+        given().header("x-amz-copy-source", "/" + bucket + "/key?versionId=null")
+                .when().put("/" + bucket + "/copy").then().statusCode(200);
+        given().when().get("/" + bucket + "/copy").then().statusCode(200).body(equalTo("null body"));
+
+        given().when().delete(key + "?versionId=" + currentVersion).then().statusCode(204);
+        given().when().get(key).then().statusCode(200).body(equalTo("null body"));
+        versions = given().when().get("/" + bucket + "?versions&prefix=key")
+                .then().statusCode(200).extract().asString();
+        assertEquals(1, occurrences(versions, "<VersionId>null</VersionId>"));
+        assertEquals(1, occurrences(versions, "<IsLatest>true</IsLatest>"));
+
+        given().when().delete(key + "?versionId=null").then().statusCode(204);
+        given().when().get(key).then().statusCode(404);
+        given().queryParam("versionId", "null").queryParam("annotationName", "labels")
+                .when().get(key + "?annotation").then().statusCode(404);
+    }
+
+    @Test
+    @Order(27)
+    void aDeleteMarkerPreservesTheCurrentNullVersion() {
+        String bucket = "versioned-null-marker-test";
+        String key = "/" + bucket + "/key";
+        given().when().put("/" + bucket).then().statusCode(200);
+        given().body("null body").when().put(key).then().statusCode(200);
+        given().queryParam("annotationName", "labels").body("kept")
+                .when().put(key + "?annotation").then().statusCode(200);
+        given().body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+                .when().put("/" + bucket + "?versioning").then().statusCode(200);
+
+        String markerId = given().when().delete(key)
+                .then().statusCode(204).extract().header("x-amz-version-id");
+        given().when().get(key).then().statusCode(404);
+        given().queryParam("versionId", "null").when().get(key)
+                .then().statusCode(200).body(equalTo("null body"));
+        given().queryParam("versionId", "null").queryParam("annotationName", "labels")
+                .when().get(key + "?annotation").then().statusCode(200).body(equalTo("kept"));
+
+        given().when().delete(key + "?versionId=" + markerId).then().statusCode(204);
+        given().when().get(key).then().statusCode(200).body(equalTo("null body"));
+        String versions = given().when().get("/" + bucket + "?versions&prefix=key")
+                .then().statusCode(200).extract().asString();
+        assertEquals(1, occurrences(versions, "<VersionId>null</VersionId>"));
+    }
+
     private static String tagging(String value) {
         return "<Tagging><TagSet><Tag><Key>version</Key><Value>" + value + "</Value></Tag></TagSet></Tagging>";
+    }
+
+    private static int occurrences(String value, String needle) {
+        return value.split(Pattern.quote(needle), -1).length - 1;
     }
 
     private static Matcher<String> deleteMarkerRefused(String method) {
@@ -681,4 +754,124 @@ class S3VersioningIntegrationTest {
                 containsString("<Method>" + method + "</Method>"),
                 containsString("<ResourceType>DeleteMarker</ResourceType>"));
     }
+    @Test
+    @Order(28)
+    void versionedWritesAndMarkersPreserveComplianceLockedNullVersions() {
+        String bucket = "versioned-locked-null-preservation";
+        given().when().put("/" + bucket).then().statusCode(200);
+        for (String key : List.of("put", "copy", "marker")) {
+            given().body("original").when().put("/" + bucket + "/" + key).then().statusCode(200);
+        }
+        given().body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+                .when().put("/" + bucket + "?versioning").then().statusCode(200);
+        given().body("<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>")
+                .when().put("/" + bucket + "?object-lock").then().statusCode(200);
+        for (String key : List.of("put", "copy", "marker")) {
+            given().queryParam("versionId", "null")
+                    .body("<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2031-01-01T00:00:00Z</RetainUntilDate></Retention>")
+                    .when().put("/" + bucket + "/" + key + "?retention").then().statusCode(200);
+        }
+
+        given().body("replacement").when().put("/" + bucket + "/put").then().statusCode(200);
+        given().header("x-amz-copy-source", "/" + bucket + "/put")
+                .when().put("/" + bucket + "/copy").then().statusCode(200);
+        given().when().delete("/" + bucket + "/marker").then().statusCode(204)
+                .header("x-amz-delete-marker", "true");
+
+        for (String key : List.of("put", "copy", "marker")) {
+            String path = "/" + bucket + "/" + key;
+            given().queryParam("versionId", "null").when().get(path)
+                    .then().statusCode(200).body(equalTo("original"));
+            given().queryParam("versionId", "null").when().get(path + "?retention")
+                    .then().statusCode(200).body(containsString("<Mode>COMPLIANCE</Mode>"));
+            given().queryParam("versionId", "null").header("x-amz-bypass-governance-retention", "true")
+                    .when().delete(path).then().statusCode(403).body(containsString("<Code>AccessDenied</Code>"));
+        }
+    }
+
+    @Test
+    @Order(29)
+    void aSuspendedDeleteLeavesANullDeleteMarker() {
+        String bucket = "suspended-null-marker";
+        given().when().put("/" + bucket).then().statusCode(200);
+        given().body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+                .when().put("/" + bucket + "?versioning").then().statusCode(200);
+        String older = given().body("older").when().put("/" + bucket + "/key")
+                .then().statusCode(200).extract().header("x-amz-version-id");
+        given().body("<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>")
+                .when().put("/" + bucket + "?versioning").then().statusCode(200);
+
+        given().when().delete("/" + bucket + "/key").then().statusCode(204)
+                .header("x-amz-delete-marker", "true")
+                .header("x-amz-version-id", "null");
+        given().when().delete("/" + bucket + "/key").then().statusCode(204)
+                .header("x-amz-delete-marker", "true")
+                .header("x-amz-version-id", "null");
+        given().when().get("/" + bucket + "/key").then().statusCode(404);
+        given().queryParam("versions", "").queryParam("prefix", "key").when().get("/" + bucket)
+                .then().statusCode(200)
+                .body("ListVersionsResult.DeleteMarker.VersionId", equalTo("null"))
+                .body("ListVersionsResult.DeleteMarker.IsLatest", equalTo("true"))
+                .body("ListVersionsResult.Version.VersionId", equalTo(older))
+                .body("ListVersionsResult.Version.IsLatest", equalTo("false"));
+
+        given().contentType("application/xml")
+                .body("<Delete><Object><Key>missing</Key></Object></Delete>")
+                .when().post("/" + bucket + "?delete")
+                .then().statusCode(200)
+                .body("DeleteResult.Deleted.Key", equalTo("missing"))
+                .body("DeleteResult.Deleted.DeleteMarker", equalTo("true"))
+                .body("DeleteResult.Deleted.DeleteMarkerVersionId", equalTo("null"));
+
+        given().queryParam("versionId", "null").when().delete("/" + bucket + "/key").then().statusCode(204)
+                .header("x-amz-delete-marker", "true")
+                .header("x-amz-version-id", "null");
+        given().when().get("/" + bucket + "/key").then().statusCode(200)
+                .header("x-amz-version-id", older)
+                .body(equalTo("older"));
+    }
+
+    @Test
+    @Order(30)
+    void aSuspendedWriteMakesTheVersionItReplacesNoncurrent() {
+        String bucket = "suspended-null-write";
+        given().when().put("/" + bucket).then().statusCode(200);
+        given().body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+                .when().put("/" + bucket + "?versioning").then().statusCode(200);
+        List<String> keys = List.of("put", "copy", "upload");
+        List<String> older = keys.stream()
+                .map(key -> given().body("older").when().put("/" + bucket + "/" + key)
+                        .then().statusCode(200).extract().header("x-amz-version-id"))
+                .toList();
+        given().body("<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>")
+                .when().put("/" + bucket + "?versioning").then().statusCode(200);
+
+        given().body("null").when().put("/" + bucket + "/put").then().statusCode(200);
+        given().header("x-amz-copy-source", "/" + bucket + "/put")
+                .when().put("/" + bucket + "/copy").then().statusCode(200);
+        String uploadId = given().when().post("/" + bucket + "/upload?uploads").then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        String partETag = given().body("null").when().put("/" + bucket + "/upload?uploadId=" + uploadId
+                + "&partNumber=1").then().statusCode(200).extract().header("ETag");
+        given().contentType("application/xml")
+                .body("""
+                        <CompleteMultipartUpload>
+                            <Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part>
+                        </CompleteMultipartUpload>""".formatted(partETag))
+                .when().post("/" + bucket + "/upload?uploadId=" + uploadId).then().statusCode(200);
+
+        for (int i = 0; i < keys.size(); i++) {
+            given().queryParam("versions", "").queryParam("prefix", keys.get(i)).when().get("/" + bucket)
+                    .then().statusCode(200)
+                    .body("ListVersionsResult.Version.VersionId", contains("null", older.get(i)))
+                    .body("ListVersionsResult.Version.IsLatest", contains("true", "false"));
+        }
+
+        given().queryParam("versionId", "null").when().delete("/" + bucket + "/put").then().statusCode(204)
+                .header("x-amz-version-id", "null");
+        given().when().get("/" + bucket + "/put").then().statusCode(200)
+                .header("x-amz-version-id", older.get(0))
+                .body(equalTo("older"));
+    }
+
 }

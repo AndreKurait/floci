@@ -11,6 +11,7 @@ import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalanci
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.Action;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.ActionTypeEnum;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.AddTagsRequest;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.AvailabilityZone;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.CreateListenerRequest;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.CreateListenerResponse;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.CreateLoadBalancerRequest;
@@ -228,6 +229,29 @@ class ElbV2Test {
     }
 
     @Test
+    @Order(8)
+    @DisplayName("SetSubnets - neither Subnets nor SubnetMappings is a ValidationError")
+    void setSubnetsWithoutSubnets() {
+        List<String> subnets = TestFixtures.defaultVpcSubnets();
+        String arn = elb.createLoadBalancer(r -> r.name(TestFixtures.uniqueName("sdk-set-none"))
+                .type(LoadBalancerTypeEnum.NETWORK).subnets(subnets))
+                .loadBalancers().get(0).loadBalancerArn();
+        try {
+            assertThatThrownBy(() -> elb.setSubnets(r -> r.loadBalancerArn(arn)))
+                    .isInstanceOfSatisfying(ElasticLoadBalancingV2Exception.class, e -> {
+                        assertThat(e.statusCode()).isEqualTo(400);
+                        assertThat(e.awsErrorDetails().errorCode()).isEqualTo("ValidationError");
+                        assertThat(e.awsErrorDetails().errorMessage()).isEqualTo("At least one subnet must be specified");
+                    });
+            assertThat(elb.describeLoadBalancers(r -> r.loadBalancerArns(arn)).loadBalancers().get(0).availabilityZones())
+                    .extracting(AvailabilityZone::subnetId)
+                    .containsExactlyInAnyOrderElementsOf(subnets);
+        } finally {
+            elb.deleteLoadBalancer(r -> r.loadBalancerArn(arn));
+        }
+    }
+
+    @Test
     @Order(6)
     @DisplayName("CreateLoadBalancer - neither Subnets nor SubnetMappings is a ValidationError")
     void createLoadBalancerWithoutSubnets() {
@@ -240,6 +264,48 @@ class ElbV2Test {
                 });
         assertThatThrownBy(() -> elb.describeLoadBalancers(r -> r.names(name)))
                 .isInstanceOf(LoadBalancerNotFoundException.class);
+    }
+
+    @Test
+    @Order(7)
+    @DisplayName("CreateLoadBalancer - an Application Load Balancer on one subnet is a ValidationError")
+    void createApplicationLoadBalancerOnOneSubnet() {
+        String name = TestFixtures.uniqueName("sdk-one-subnet");
+        String subnet = TestFixtures.defaultVpcSubnets().get(0);
+        assertThatThrownBy(() -> elb.createLoadBalancer(r -> r.name(name).type(LoadBalancerTypeEnum.APPLICATION)
+                        .subnets(subnet)))
+                .isInstanceOfSatisfying(ElasticLoadBalancingV2Exception.class, e -> {
+                    assertThat(e.statusCode()).isEqualTo(400);
+                    assertThat(e.awsErrorDetails().errorCode()).isEqualTo("ValidationError");
+                    assertThat(e.awsErrorDetails().errorMessage())
+                            .isEqualTo("At least two subnets in two different Availability Zones must be specified");
+                });
+        assertThatThrownBy(() -> elb.describeLoadBalancers(r -> r.names(name)))
+                .isInstanceOf(LoadBalancerNotFoundException.class);
+    }
+
+    @Test
+    @Order(9)
+    @DisplayName("SetSubnets - an Application Load Balancer moved onto one subnet is a ValidationError")
+    void setApplicationLoadBalancerOntoOneSubnet() {
+        List<String> subnets = TestFixtures.defaultVpcSubnets();
+        String arn = elb.createLoadBalancer(r -> r.name(TestFixtures.uniqueName("sdk-set-one"))
+                .type(LoadBalancerTypeEnum.APPLICATION).subnets(subnets))
+                .loadBalancers().get(0).loadBalancerArn();
+        try {
+            assertThatThrownBy(() -> elb.setSubnets(r -> r.loadBalancerArn(arn).subnets(subnets.get(0))))
+                    .isInstanceOfSatisfying(ElasticLoadBalancingV2Exception.class, e -> {
+                        assertThat(e.statusCode()).isEqualTo(400);
+                        assertThat(e.awsErrorDetails().errorCode()).isEqualTo("ValidationError");
+                        assertThat(e.awsErrorDetails().errorMessage())
+                                .isEqualTo("At least two subnets in two different Availability Zones must be specified");
+                    });
+            assertThat(elb.describeLoadBalancers(r -> r.loadBalancerArns(arn)).loadBalancers().get(0).availabilityZones())
+                    .extracting(zone -> zone.subnetId())
+                    .containsExactlyInAnyOrderElementsOf(subnets);
+        } finally {
+            elb.deleteLoadBalancer(r -> r.loadBalancerArn(arn));
+        }
     }
 
     // ─── Target Groups ───────────────────────────────────────────────────────

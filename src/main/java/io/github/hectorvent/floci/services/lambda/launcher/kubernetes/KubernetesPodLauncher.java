@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerLauncher;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageResolver;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeEnv;
 import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
@@ -180,20 +181,12 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
             String cwLogStream = logStreamer.logStreamName(fn, shortId);
 
             String codeDownloadUrl = imagePackage ? null : codeDownloadUrl(fn, region);
-            List<String> layerUrls = imagePackage ? List.of() : layerDownloadUrls(fn, region);
+            List<String> layerUrls = imagePackage ? List.of() : layerDownloadUrls(fn, accountId, region);
 
             Optional<String> caConfigMap = ContainerCaBundle.hostPath(config).map(bundle -> ensureCaConfigMap(namespace, bundle));
 
-            ArrayList<String> env = new ArrayList<>();
-            env.add("AWS_LAMBDA_RUNTIME_API=" + addressResolver.resolve() + ":" + runtimeApiServer.getPort());
-            env.add("AWS_LAMBDA_FUNCTION_NAME=" + fn.getFunctionName());
-            env.add("AWS_LAMBDA_FUNCTION_MEMORY_SIZE=" + fn.getMemorySize());
-            env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
-            env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
-            env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
-            if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
-                env.add("_HANDLER=" + fn.getHandler());
-            }
+            List<String> env = LambdaRuntimeEnv.of(fn,
+                    addressResolver.resolve() + ":" + runtimeApiServer.getPort(), cwLogGroup, cwLogStream);
             env.addAll(awsEnv.sdkBaselineEnv(region, Optional.empty(), addressResolver.flociBaseUrl(),
                     Optional.empty(), AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId())));
             if (fn.getEnvironment() != null) {
@@ -229,6 +222,7 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
             LOG.infov("Created pod {0} for function {1}", podName, fn.getFunctionName());
 
             awaitRunning(namespace, podName, fn.getFunctionName());
+            runtimeApiServer.markContainerStarted();
 
             ContainerHandle handle = new ContainerHandle(podName, fn.getFunctionName(),
                     runtimeApiServer, ContainerState.WARM, false);
@@ -401,13 +395,13 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
         return downloadUrl(bucket, key, account, region);
     }
 
-    private List<String> layerDownloadUrls(LambdaFunction fn, String functionRegion) {
+    private List<String> layerDownloadUrls(LambdaFunction fn, String accountId, String functionRegion) {
         if (fn.getLayers() == null || fn.getLayers().isEmpty()) {
             return List.of();
         }
         ArrayList<String> urls = new ArrayList<>();
         for (String layerArn : fn.getLayers()) {
-            LambdaLayerVersion layer = layerService.resolveLayerByArn(layerArn);
+            LambdaLayerVersion layer = layerService.resolveLayerByArnForAccount(layerArn, accountId, functionRegion);
             if (layer == null) {
                 LOG.warnv("Could not resolve layer ARN {0} for function {1}", layerArn, fn.getFunctionName());
                 continue;

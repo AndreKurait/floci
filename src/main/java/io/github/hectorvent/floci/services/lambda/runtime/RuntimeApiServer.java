@@ -15,6 +15,7 @@ import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -24,6 +25,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
@@ -71,6 +73,9 @@ public class RuntimeApiServer {
 
     private static final Logger LOG = Logger.getLogger(RuntimeApiServer.class);
 
+    // The Go runtime sends X-Ray error causes below 1 MiB, in addition to normal request headers.
+    private static final int MAX_RUNTIME_API_HEADER_SIZE = 1024 * 1024 + 16 * 1024;
+
     private static final String RUNTIME_API_VERSION = "2018-06-01";
     private static final String NEXT_PATH = "/" + RUNTIME_API_VERSION + "/runtime/invocation/next";
     private static final String RESPONSE_PATH = "/" + RUNTIME_API_VERSION + "/runtime/invocation/:requestId/response";
@@ -111,6 +116,10 @@ public class RuntimeApiServer {
     // Guards stopped, pendingQueue, waitingContexts, extensions, closeFuture, and every
     // RegisteredExtension's pendingEvents/waitingContext. See class doc for the discipline.
     private final Object lock = new Object();
+    private final CompletableFuture<Void> initialization = new CompletableFuture<>();
+    private boolean runtimeNextReceived;
+    // When the launcher started this runtime's container, in epoch millis; 0 until then.
+    private volatile long containerStartedAtMs;
 
     // Invocations queued before a /next poller arrived. Guarded by lock.
     private final ArrayDeque<PendingInvocation> pendingQueue = new ArrayDeque<>();
@@ -170,6 +179,12 @@ public class RuntimeApiServer {
      * but for the synchronous handler-thread dispatch path.
      */
     protected void beforeNextPathDispatchGuard() { }
+
+    /**
+     * Test-only: signals that a stopped guard suppressed a runtime dispatch or INVOKE fan-out.
+     * May run under the server lock, so overrides must not block.
+     */
+    protected void onStoppedDispatchSkipped() { }
 
     /**
      * Test-only: called inside quiesce() immediately after the lock has been
@@ -290,6 +305,52 @@ public class RuntimeApiServer {
         return faulted;
     }
 
+    /** Waits for runtime and extension initialization, without enqueuing an invocation. */
+    public void awaitInitialization(long timeoutMs) throws Exception {
+        initialization.get(timeoutMs, TimeUnit.MILLISECONDS);
+        synchronized (lock) {
+            if (stopped || faulted) {
+                throw new IllegalStateException("Lambda execution environment is no longer ready");
+            }
+        }
+    }
+
+    public boolean isInitialized() {
+        synchronized (lock) {
+            return initialization.isDone() && !initialization.isCompletedExceptionally() && !stopped && !faulted;
+        }
+    }
+
+    /** Records that the container running this runtime has started, which opens its Init phase. */
+    public void markContainerStarted() {
+        containerStartedAtMs = System.currentTimeMillis();
+    }
+
+    /** Epoch millis at which the container started, or 0 when no launcher has recorded it. */
+    public long getContainerStartedAtMs() {
+        return containerStartedAtMs;
+    }
+
+    /**
+     * Whether the runtime has polled {@code /next} at least once, which ends its Init phase.
+     * Unlike {@link #isInitialized()} this does not wait for extensions.
+     */
+    public boolean hasRuntimePolled() {
+        synchronized (lock) {
+            return runtimeNextReceived;
+        }
+    }
+
+    private void completeInitializationIfReady() {
+        synchronized (lock) {
+            CountDownLatch latch = extensionsReady;
+            if (runtimeNextReceived && !stopped && !faulted && latch != null && latch.getCount() == 0
+                    && extensions.values().stream().allMatch(RegisteredExtension::hasReceivedFirstNext)) {
+                initialization.complete(null);
+            }
+        }
+    }
+
     /**
      * Declares how many extension binaries were launched for this container, arming the
      * init-readiness barrier that {@link #awaitExtensionsReady(long)} waits on.
@@ -299,7 +360,10 @@ public class RuntimeApiServer {
      * no {@code /opt/extensions} directory) leaves the barrier permanently open.
      */
     public void expectExtensions(int count) {
-        extensionsReady = new CountDownLatch(Math.max(0, count));
+        synchronized (lock) {
+            extensionsReady = new CountDownLatch(Math.max(0, count));
+            completeInitializationIfReady();
+        }
     }
 
     /**
@@ -316,7 +380,7 @@ public class RuntimeApiServer {
         if (latch == null) {
             return true;
         }
-        return latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        return latch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -363,6 +427,8 @@ public class RuntimeApiServer {
                     // AWS Lambda tears an environment down.
                     waitingContexts.add(ctx);
                 } else {
+                    runtimeNextReceived = true;
+                    completeInitializationIfReady();
                     toDispatch = pendingQueue.poll();
                     if (toDispatch == null) {
                         waitingContexts.add(ctx);
@@ -387,6 +453,8 @@ public class RuntimeApiServer {
                 }
                 if (!alreadyHandled) {
                     sendInvocation(ctx, toDispatch);
+                } else {
+                    onStoppedDispatchSkipped();
                 }
             }
             // else: parked — enqueue() or the httpServer close will dispatch/end this ctx.
@@ -525,6 +593,7 @@ public class RuntimeApiServer {
             if (readyLatch != null) {
                 readyLatch.countDown();
             }
+            completeInitializationIfReady();
             if (unknownExtension) {
                 ctx.response().setStatusCode(403)
                         .putHeader("Content-Type", "application/json")
@@ -555,6 +624,7 @@ public class RuntimeApiServer {
         if (started.isDone()) return;
         httpServer = vertx.createHttpServer(new HttpServerOptions()
                 .setMaxFormAttributeSize(-1)
+                .setMaxHeaderSize(MAX_RUNTIME_API_HEADER_SIZE)
                 // Real AWS's Runtime/Extensions API is plain HTTP/1.1. Vert.x defaults to
                 // accepting an h2c upgrade, which the JDK HttpClient used in tests and by some
                 // language runtimes opts into unless told otherwise. That multiplexes every
@@ -606,6 +676,7 @@ public class RuntimeApiServer {
                 return;
             }
             stopped = true;
+            initialization.completeExceptionally(new IllegalStateException("Lambda execution environment stopped"));
             extensionWritesFlushed = writesFuture;
 
             ExtensionEvent shutdownEvent = ExtensionEvent.shutdown(System.currentTimeMillis() + 2000, "SPINDOWN");
@@ -744,7 +815,11 @@ public class RuntimeApiServer {
     private void notifyExtensionsOfInvoke(PendingInvocation invocation) {
         List<Runnable> dispatches = new ArrayList<>();
         synchronized (lock) {
-            if (stopped || extensions.isEmpty()) {
+            if (stopped) {
+                onStoppedDispatchSkipped();
+                return;
+            }
+            if (extensions.isEmpty()) {
                 return;
             }
             ExtensionEvent event = ExtensionEvent.invoke(
@@ -834,6 +909,7 @@ public class RuntimeApiServer {
                 boolean shouldDispatch;
                 synchronized (lock) {
                     if (stopped) {
+                        onStoppedDispatchSkipped();
                         return;
                     }
                     if (waitingCtx.response().ended()) {
@@ -911,6 +987,7 @@ public class RuntimeApiServer {
         List<PendingInvocation> stranded;
         synchronized (lock) {
             faulted = true;
+            initialization.completeExceptionally(new IllegalStateException("Lambda runtime initialization failed"));
             // Retained for a possible later enqueue(): the invocation that triggered this cold
             // start may not exist yet (see fatalRuntimeErrorPayload's doc), in which case
             // `stranded` below is empty and this is the only place the real error survives.
@@ -1037,6 +1114,7 @@ public class RuntimeApiServer {
                 return;
             }
             faulted = true;
+            initialization.completeExceptionally(new IllegalStateException("Lambda runtime exited: " + exitCode));
             // Retained for a possible later enqueue(): the invocation that would have hit this
             // container may not exist yet (see fatalRuntimeErrorPayload's doc), so this generic,
             // requestId-free payload is built here rather than only per-stranded-invocation below.
@@ -1065,7 +1143,7 @@ public class RuntimeApiServer {
                 .put("errorType", "Runtime.ExitError")
                 .put("errorMessage", message)
                 .encode()
-                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                .getBytes(StandardCharsets.UTF_8);
     }
 
     private void handleExtensionFatalError(RoutingContext ctx, String phase) {
@@ -1105,6 +1183,7 @@ public class RuntimeApiServer {
                 // Set under the lock alongside the unregistration so both land as one atomic
                 // change.
                 faulted = true;
+                initialization.completeExceptionally(new IllegalStateException("Lambda extension initialization failed"));
 
                 // Anything already queued or parked would otherwise wait forever, since the guards
                 // in enqueue()/NEXT_PATH now refuse to move work through a condemned environment.

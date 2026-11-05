@@ -40,6 +40,7 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -48,6 +49,10 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class ApiGatewayTaskInvoker {
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static final Set<String> RESERVED_HEADERS = Set.of(
+            "authorization", "connection", "content-md5", "expect", "host", "max-forwards",
+            "proxy-authenticate", "server", "te", "transfer-encoding", "trailer", "upgrade", "via",
+            "www-authenticate");
     private static final DateTimeFormatter AMZ_DATE =
             DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
     private final ApiGatewayService apiGateway;
@@ -230,10 +235,7 @@ public class ApiGatewayTaskInvoker {
         input.properties().forEach(entry -> {
             String name = entry.getKey().toLowerCase(Locale.ROOT);
             JsonNode values = entry.getValue();
-            if (!entry.getKey().matches("[!#$%&'*+.^_`|~0-9A-Za-z-]+") || name.startsWith("x-amz") || name.startsWith("x-forwarded")
-                    || List.of("authorization", "connection", "content-md5", "expect", "host", "max-forwards",
-                            "proxy-authenticate", "server", "te", "transfer-encoding", "trailer", "upgrade", "via",
-                            "www-authenticate").contains(name)
+            if (!entry.getKey().matches("[!#$%&'*+.^_`|~0-9A-Za-z-]+") || isReservedDefinitionHeader(name)
                     || !values.isArray() || values.isEmpty() || result.containsKey(name)) {
                 throw unsupported("header name or value is not supported");
             }
@@ -247,6 +249,11 @@ public class ApiGatewayTaskInvoker {
             result.put(name, strings);
         });
         return result;
+    }
+
+    static boolean isReservedDefinitionHeader(String lowerName) {
+        return RESERVED_HEADERS.contains(lowerName) || lowerName.startsWith("x-amz-")
+                || lowerName.startsWith("x-amzn-") || lowerName.startsWith("x-forwarded-");
     }
 
     private static void sign(TreeMap<String, List<String>> headers, URI uri, byte[] payload, String region,

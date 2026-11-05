@@ -14,15 +14,19 @@ import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
@@ -273,9 +277,63 @@ class BagetterSidecarClientTest {
         assertTrue(result.isEmpty());
     }
 
+    /**
+     * BaGetter's flat container (what {@link #respondWithVersions} fakes) always returns
+     * normalized, lowercased version strings, but its registration resource's {@code
+     * catalogEntry.version} keeps the original publish casing. A mixed-case prerelease like
+     * {@code 1.0.0-Beta} must still have its published time found when looked up by the
+     * flat-container's normalized {@code 1.0.0-beta}.
+     */
+    @Test
+    void listPackageVersionsFindsAPublishedTimeForAMixedCasePrereleaseVersion() throws Exception {
+        BagetterSidecarManager manager = manager();
+        seedPooledContainer(manager, "nuget-repo-1", "tracked-bagetter-1", backendUrl);
+        respondWithVersions("demo-pkg", "1.0.0-beta");
+        respondWithRegistration("demo-pkg", "1.0.0-Beta", "2026-01-15T10:00:00.0000000+00:00");
+
+        List<RepositorySidecarManager.PackageVersionTimestamp> result = client(manager)
+                .listPackageVersions("nuget-repo-1", "dom", "repo", null, "demo-pkg");
+
+        assertEquals(1, result.size());
+        assertEquals("1.0.0-beta", result.get(0).version());
+        assertEquals(Instant.parse("2026-01-15T10:00:00Z"), result.get(0).publishedTime());
+    }
+
+    /**
+     * {@code getJsonAbsolute}'s 404-only "nothing there" handling must not also swallow a real
+     * upstream failure: an auth or server error on the registration resource must surface as an
+     * error, the same way a non-404 failure on the flat container already does elsewhere in this
+     * client, rather than silently reporting every version as having no publish time.
+     */
+    @Test
+    void listPackageVersionsThrowsWhenTheRegistrationResourceFailsWithARealError() throws Exception {
+        BagetterSidecarManager manager = manager();
+        seedPooledContainer(manager, "nuget-repo-1", "tracked-bagetter-1", backendUrl);
+        respondWithVersions("demo-pkg", "1.0.0");
+        backend.createContext("/v3/registration/demo-pkg/index.json", exchange -> {
+            exchange.sendResponseHeaders(500, -1);
+            exchange.close();
+        });
+
+        assertThrows(IllegalStateException.class, () -> client(manager)
+                .listPackageVersions("nuget-repo-1", "dom", "repo", null, "demo-pkg"));
+    }
+
+    private void respondWithRegistration(String packageName, String version, String published) {
+        String json = "{\"items\":[{\"items\":[{\"catalogEntry\":{\"version\":\"" + version + "\",\"published\":\""
+                + published + "\"}}]}]}";
+        backend.createContext("/v3/registration/" + packageName + "/index.json", exchange -> {
+            byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+    }
+
     private void respondWithVersions(String packageName, String... versions) {
         String json = "{\"versions\":[" + String.join(",",
-                java.util.Arrays.stream(versions).map(v -> "\"" + v + "\"").toArray(String[]::new)) + "]}";
+                Arrays.stream(versions).map(v -> "\"" + v + "\"").toArray(String[]::new)) + "]}";
         backend.createContext("/v3/package/" + packageName + "/index.json", exchange -> {
             byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json");
@@ -283,6 +341,53 @@ class BagetterSidecarClientTest {
             exchange.getResponseBody().write(bytes);
             exchange.close();
         });
+    }
+
+    /**
+     * Raised by Greptile's review: the real NuGet V3 Search resource excludes prerelease versions
+     * whenever {@code prerelease} is omitted, so a package whose only published version is a
+     * prerelease would never come back from {@link BagetterSidecarClient#listPackages} without it.
+     */
+    @Test
+    void listPackagesIncludesAPackageWhoseOnlyVersionIsAPrerelease() throws Exception {
+        BagetterSidecarManager manager = manager();
+        seedPooledContainer(manager, "nuget-repo-1", "tracked-bagetter-1", backendUrl);
+        AtomicReference<String> requestedQuery = new AtomicReference<>();
+        backend.createContext("/v3/search", exchange -> {
+            String query = exchange.getRequestURI().getQuery();
+            requestedQuery.set(query);
+            boolean firstPage = query.contains("skip=0");
+            byte[] body = (firstPage ? "{\"data\":[{\"id\":\"demo-pkg\"}]}" : "{\"data\":[]}")
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+
+        List<RepositorySidecarManager.PackageIdentifier> packages = client(manager).listPackages("nuget-repo-1",
+                "dom", "repo");
+
+        assertEquals(1, packages.size());
+        assertEquals("demo-pkg", packages.get(0).packageName());
+        assertTrue(requestedQuery.get().contains("prerelease=true"));
+    }
+
+    /**
+     * Raised by hectorvent's review: every CodeArtifact repository gets a nuget sidecar id at
+     * creation regardless of whether it is ever actually used through nuget, so {@code
+     * ListPackages} with no format filter must not start this repository's own BaGetter
+     * container just to find out it was never used. No context is registered on {@code backend}
+     * at all here: a real container start would have nothing to connect to and throw.
+     */
+    @Test
+    void listPackagesReturnsEmptyWithoutStartingAContainerThatWasNeverUsed() {
+        BagetterSidecarManager manager = manager();
+
+        List<RepositorySidecarManager.PackageIdentifier> packages = client(manager).listPackages("nuget-repo-1",
+                "dom", "repo");
+
+        assertTrue(packages.isEmpty());
     }
 
     private BagetterSidecarManager manager() {

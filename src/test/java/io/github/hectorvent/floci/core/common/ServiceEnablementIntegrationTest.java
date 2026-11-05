@@ -44,6 +44,23 @@ class ServiceEnablementIntegrationTest {
     }
 
     @Test
+    void aTargetedRequestWithAnUnrecognisedSmithyProtocolIsStillRejected() {
+        // No protocol claims it, so it is served as its route is: as a call to acm, which is disabled.
+        given()
+            .contentType("application/x-amz-json-1.1")
+            .header("X-Amz-Target", "CertificateManager.ListCertificates")
+            .header("smithy-protocol", "unrecognised")
+            .body("{}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .contentType("application/json")
+            .body("__type", equalTo("ServiceNotAvailableException"))
+            .body("message", equalTo("Service acm is not enabled."));
+    }
+
+    @Test
     void ecsTargetedRequestsAreRejected() {
         given()
             .contentType("application/x-amz-json-1.1")
@@ -141,6 +158,27 @@ class ServiceEnablementIntegrationTest {
                     .contentType("application/cbor")
                     .accept("application/cbor")
                     .header("Authorization", authorization("dynamodb"))
+                    .body(CBOR_MAPPER.writeValueAsBytes(Map.of()))
+                .when()
+                    .post("/service/DynamoDB/operation/ListTables")
+                .then()
+                    .statusCode(400)
+                    .contentType("application/cbor")
+                    .extract().asByteArray()
+        );
+
+        assertEquals("ServiceNotAvailableException", body.get("__type").asText());
+        assertEquals("Service dynamodb is not enabled.", body.get("message").asText());
+    }
+
+    @Test
+    void anRpcV2CallWithAnUnrecognisedSmithyProtocolIsStillRejected() throws Exception {
+        // Unsigned, so only the path it is routed by names the service.
+        JsonNode body = cborBody(
+                given()
+                    .contentType("application/cbor")
+                    .accept("application/cbor")
+                    .header("smithy-protocol", "unrecognised")
                     .body(CBOR_MAPPER.writeValueAsBytes(Map.of()))
                 .when()
                     .post("/service/DynamoDB/operation/ListTables")

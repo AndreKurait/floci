@@ -1,15 +1,19 @@
 package io.github.hectorvent.floci.services.lambda;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * Wraps the storage backend for Lambda Layer Versions.
@@ -35,6 +39,16 @@ public class LambdaLayerStore {
     }
 
     public Optional<LambdaLayerVersion> get(String region, String layerName, long version) {
+        return backend.get(key(region, layerName, version));
+    }
+
+    /** Resolves an owned layer from an async worker without a request account context. */
+    public Optional<LambdaLayerVersion> getForAccount(
+            String accountId, String region, String layerName, long version) {
+        if (backend instanceof AccountAwareStorageBackend<LambdaLayerVersion> aware) {
+            return aware.getForAccountMigratingLegacy(accountId, key(region, layerName, version),
+                    layer -> accountId.equals(AwsArnUtils.accountOrDefault(layer.getLayerVersionArn(), "")));
+        }
         return backend.get(key(region, layerName, version));
     }
 
@@ -67,7 +81,7 @@ public class LambdaLayerStore {
     public List<LambdaLayerVersion> listAllVersions(String region) {
         String prefix = "layer::" + region + "::";
         return backend.scan(k -> k.startsWith(prefix)).stream()
-                .sorted(java.util.Comparator.comparing(LambdaLayerVersion::getLayerName)
+                .sorted(Comparator.comparing(LambdaLayerVersion::getLayerName)
                         .thenComparingLong(LambdaLayerVersion::getVersion))
                 .toList();
     }
@@ -80,7 +94,7 @@ public class LambdaLayerStore {
         List<LambdaLayerVersion> all = backend.scan(k -> k.startsWith(prefix));
         // Group by layer name and return the latest version of each
         return all.stream()
-                .collect(java.util.stream.Collectors.groupingBy(LambdaLayerVersion::getLayerName))
+                .collect(Collectors.groupingBy(LambdaLayerVersion::getLayerName))
                 .values().stream()
                 .map(versions -> versions.stream()
                         .max((a, b) -> Long.compare(a.getVersion(), b.getVersion()))

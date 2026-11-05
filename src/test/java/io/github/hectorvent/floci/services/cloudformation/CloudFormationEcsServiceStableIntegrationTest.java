@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
@@ -16,6 +17,7 @@ import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.everyItem;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.startsWith;
 
 /**
  * CloudFormation reports an {@code AWS::ECS::Service} complete only once the service is stable,
@@ -93,6 +95,63 @@ class CloudFormationEcsServiceStableIntegrationTest {
             }
             """;
 
+    private static final String LIST_PARAMETER_TEMPLATE = """
+            {
+              "Parameters": {
+                "SubnetIds": { "Type": "List<AWS::EC2::Subnet::Id>" },
+                "Private": { "Type": "String", "Default": "true" }
+              },
+              "Conditions": { "IsPrivate": { "Fn::Equals": [{ "Ref": "Private" }, "true"] } },
+              "Resources": {
+                "Cluster": {
+                  "Type": "AWS::ECS::Cluster",
+                  "Properties": { "ClusterName": "%1$s" }
+                },
+                "TaskSg": {
+                  "Type": "AWS::EC2::SecurityGroup",
+                  "Properties": { "GroupDescription": "%1$s tasks" }
+                },
+                "TaskDef": {
+                  "Type": "AWS::ECS::TaskDefinition",
+                  "Properties": {
+                    "Family": "%1$s-td",
+                    "NetworkMode": "awsvpc",
+                    "RequiresCompatibilities": ["FARGATE"],
+                    "Cpu": "256",
+                    "Memory": "512",
+                    "ContainerDefinitions": [
+                      { "Name": "app", "Image": "app:v1", "Essential": true }
+                    ]
+                  }
+                },
+                "Service": {
+                  "Type": "AWS::ECS::Service",
+                  "Properties": {
+                    "ServiceName": "%1$s-svc",
+                    "Cluster": { "Ref": "Cluster" },
+                    "TaskDefinition": { "Ref": "TaskDef" },
+                    "DesiredCount": 1,
+                    "LaunchType": "FARGATE",
+                    "NetworkConfiguration": {
+                      "AwsvpcConfiguration": { "Fn::If": ["IsPrivate",
+                        {
+                          "AssignPublicIp": "DISABLED",
+                          "SecurityGroups": [{ "Fn::GetAtt": ["TaskSg", "GroupId"] }],
+                          "Subnets": { "Ref": "SubnetIds" }
+                        },
+                        {
+                          "AssignPublicIp": "ENABLED",
+                          "SecurityGroups": [{ "Fn::GetAtt": ["TaskSg", "GroupId"] }],
+                          "Subnets": { "Ref": "SubnetIds" }
+                        }
+                      ] }
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
@@ -103,6 +162,7 @@ class CloudFormationEcsServiceStableIntegrationTest {
         String name = "cfn-stable-" + Long.toString(System.nanoTime(), 36);
 
         stackCall("CreateStack", name, TEMPLATE.formatted(name, "app:v1", 1));
+        CfnStackWaits.awaitStatus(name, "CREATE_COMPLETE");
 
         assertThat(stackStatus(name), equalTo("CREATE_COMPLETE"));
         Response service = describeService(name);
@@ -118,8 +178,10 @@ class CloudFormationEcsServiceStableIntegrationTest {
     void updateStack_ecsService_runsOnlyTheNewRevisionWhenTheUpdateCompletes() {
         String name = "cfn-stable-upd-" + Long.toString(System.nanoTime(), 36);
         stackCall("CreateStack", name, TEMPLATE.formatted(name, "app:v1", 1));
+        CfnStackWaits.awaitStatus(name, "CREATE_COMPLETE");
 
         stackCall("UpdateStack", name, TEMPLATE.formatted(name, "app:v2", 2));
+        CfnStackWaits.awaitStatus(name, "UPDATE_COMPLETE");
 
         assertThat(stackStatus(name), equalTo("UPDATE_COMPLETE"));
         Response service = describeService(name);
@@ -137,9 +199,11 @@ class CloudFormationEcsServiceStableIntegrationTest {
         String name = "cfn-stable-rb-" + Long.toString(System.nanoTime(), 36);
         String subnet = Ec2Service.defaultSubnetId("us-east-1", "a");
         stackCall("CreateStack", name, AWSVPC_TEMPLATE.formatted(name, 1, subnet));
+        CfnStackWaits.awaitStatus(name, "CREATE_COMPLETE");
         assertThat(stackStatus(name), equalTo("CREATE_COMPLETE"));
 
         stackCall("UpdateStack", name, AWSVPC_TEMPLATE.formatted(name, 2, "subnet-does-not-exist"));
+        CfnStackWaits.awaitStatus(name, "UPDATE_ROLLBACK_COMPLETE");
 
         assertThat(stackStatus(name), equalTo("UPDATE_ROLLBACK_COMPLETE"));
         Response service = describeService(name);
@@ -147,6 +211,37 @@ class CloudFormationEcsServiceStableIntegrationTest {
                 service.path("services[0].desiredCount"), equalTo(1));
         assertThat(service.path("services[0].networkConfiguration.awsvpcConfiguration.subnets"),
                 equalTo(List.of(subnet)));
+    }
+
+    @Test
+    void createStack_awsvpcServiceWithSubnetListParameterUnderFnIf_usesEverySubnet() {
+        String name = "cfn-stable-list-" + Long.toString(System.nanoTime(), 36);
+        String subnetA = Ec2Service.defaultSubnetId("us-east-1", "a");
+        String subnetB = Ec2Service.defaultSubnetId("us-east-1", "b");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", name)
+            .formParam("TemplateBody", LIST_PARAMETER_TEMPLATE.formatted(name))
+            .formParam("Parameters.member.1.ParameterKey", "SubnetIds")
+            .formParam("Parameters.member.1.ParameterValue", subnetA + "," + subnetB)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        CfnStackWaits.awaitStatus(name, "CREATE_COMPLETE");
+        assertThat(stackStatus(name), equalTo("CREATE_COMPLETE"));
+        Response service = describeService(name);
+        assertThat(service.path("services[0].networkConfiguration.awsvpcConfiguration.subnets"),
+                equalTo(List.of(subnetA, subnetB)));
+        List<String> groups = service.path("services[0].networkConfiguration.awsvpcConfiguration.securityGroups");
+        assertThat(groups, hasSize(1));
+        assertThat(groups.get(0), startsWith("sg-"));
+        assertThat(service.path("services[0].networkConfiguration.awsvpcConfiguration.assignPublicIp"),
+                equalTo("DISABLED"));
     }
 
     private static void stackCall(String action, String stackName, String template) {

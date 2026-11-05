@@ -17,7 +17,8 @@ import java.util.regex.Pattern;
  * <p>ARN formats: {@code arn:aws:apigateway:<region>::/restapis/<apiId>} for a REST API,
  * {@code arn:aws:apigateway:<region>::/domainnames/<domainName>} for a custom domain,
  * {@code arn:aws:apigateway:<region>::/apikeys/<apiKeyId>} for an API key and
- * {@code arn:aws:apigateway:<region>::/usageplans/<usagePlanId>} for a usage plan. The
+ * {@code arn:aws:apigateway:<region>::/usageplans/<usagePlanId>} for a usage plan and
+ * {@code arn:aws:apigateway:<region>::/vpclinks/<vpcLinkId>} for a REST VPC link. The
  * {@code apiId}, domain name, key id or plan id is the canonical identifier the underlying
  * {@link ApiGatewayService} uses for its tag store.
  */
@@ -28,6 +29,7 @@ public class ApiGatewayTagHandler implements TagHandler {
     private static final String DOMAIN_NAMES = "/domainnames/";
     private static final String REST_APIS = "/restapis/";
     private static final String USAGE_PLANS = "/usageplans/";
+    private static final String VPC_LINKS = "/vpclinks/";
     private static final Pattern STAGE_RESOURCE = Pattern.compile("/restapis/[^/]+/stages/([^/]+)");
 
     private final ApiGatewayService service;
@@ -62,6 +64,10 @@ public class ApiGatewayTagHandler implements TagHandler {
         if (usagePlanId != null) {
             return service.getUsagePlan(region, usagePlanId).getTags();
         }
+        String vpcLinkId = topLevelIdFromArn(arn, VPC_LINKS);
+        if (vpcLinkId != null) {
+            return service.getVpcLink(region, vpcLinkId).getTags();
+        }
         String stageName = stageNameFromArn(arn);
         return stageName != null
                 ? service.getStageTags(region, apiIdFromArn(arn), stageName)
@@ -74,6 +80,7 @@ public class ApiGatewayTagHandler implements TagHandler {
         String domainName = topLevelIdFromArn(arn, DOMAIN_NAMES);
         String apiKeyId = topLevelIdFromArn(arn, API_KEYS);
         String usagePlanId = topLevelIdFromArn(arn, USAGE_PLANS);
+        String vpcLinkId = topLevelIdFromArn(arn, VPC_LINKS);
         String stageName = stageNameFromArn(arn);
         if (domainName != null) {
             service.tagDomainName(region, domainName, tags);
@@ -81,6 +88,8 @@ public class ApiGatewayTagHandler implements TagHandler {
             service.tagApiKey(region, apiKeyId, tags);
         } else if (usagePlanId != null) {
             service.tagUsagePlan(region, usagePlanId, tags);
+        } else if (vpcLinkId != null) {
+            service.tagVpcLink(region, vpcLinkId, tags);
         } else if (stageName != null) {
             service.tagStage(region, apiIdFromArn(arn), stageName, tags);
         } else {
@@ -94,6 +103,7 @@ public class ApiGatewayTagHandler implements TagHandler {
         String domainName = topLevelIdFromArn(arn, DOMAIN_NAMES);
         String apiKeyId = topLevelIdFromArn(arn, API_KEYS);
         String usagePlanId = topLevelIdFromArn(arn, USAGE_PLANS);
+        String vpcLinkId = topLevelIdFromArn(arn, VPC_LINKS);
         String stageName = stageNameFromArn(arn);
         if (domainName != null) {
             service.untagDomainName(region, domainName, tagKeys);
@@ -101,6 +111,8 @@ public class ApiGatewayTagHandler implements TagHandler {
             service.untagApiKey(region, apiKeyId, tagKeys);
         } else if (usagePlanId != null) {
             service.untagUsagePlan(region, usagePlanId, tagKeys);
+        } else if (vpcLinkId != null) {
+            service.untagVpcLink(region, vpcLinkId, tagKeys);
         } else if (stageName != null) {
             service.untagStage(region, apiIdFromArn(arn), stageName, tagKeys);
         } else {

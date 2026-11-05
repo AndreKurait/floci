@@ -84,7 +84,7 @@ class EmrTransientIntegrationTest {
     }
 
     @Test
-    void addingStepsAfterUserTerminationPreservesReasonAndEndTime() {
+    void addingStepsAfterUserTerminationIsRejectedWithoutChangingCluster() {
         String clusterId = emr("RunJobFlow", "{\"Name\":\"manually-ended-transient\",\"Instances\":{}}")
                 .then().statusCode(200).extract().path("JobFlowId");
         String clusterRequest = "{\"ClusterId\":\"" + clusterId + "\"}";
@@ -97,12 +97,40 @@ class EmrTransientIntegrationTest {
         emr("AddJobFlowSteps",
                 "{\"JobFlowId\":\"" + clusterId + "\",\"Steps\":[{\"Name\":\"late\","
                         + "\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}}]}")
-                .then().statusCode(200);
-        emr("ListSteps", clusterRequest).then().statusCode(200).body("Steps", hasSize(1));
+                .then().statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo(
+                        "A job flow that is shutting down, terminated, or finished may not be modified."));
+        emr("ListSteps", clusterRequest).then().statusCode(200).body("Steps", hasSize(0));
         emr("DescribeCluster", clusterRequest).then().statusCode(200)
                 .body("Cluster.Status.State", equalTo("TERMINATED"))
                 .body("Cluster.Status.StateChangeReason.Code", equalTo("USER_REQUEST"))
                 .body("Cluster.Status.Timeline.EndDateTime", equalTo(endTime));
+    }
+
+    @Test
+    void addingStepsAfterAutomaticTerminationIsRejected() {
+        String clusterId = emr("RunJobFlow",
+                "{\"Name\":\"auto-ended\",\"Instances\":{},"
+                        + "\"Steps\":[{\"Name\":\"initial\","
+                        + "\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}}]}")
+                .then().statusCode(200).extract().path("JobFlowId");
+        String clusterRequest = "{\"ClusterId\":\"" + clusterId + "\"}";
+        emr("DescribeCluster", clusterRequest).then().statusCode(200)
+                .body("Cluster.Status.State", equalTo("TERMINATED"))
+                .body("Cluster.Status.StateChangeReason.Code", equalTo("ALL_STEPS_COMPLETED"));
+
+        emr("AddJobFlowSteps",
+                "{\"JobFlowId\":\"" + clusterId + "\",\"Steps\":[{\"Name\":\"late\","
+                        + "\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}}]}")
+                .then().statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo(
+                        "A job flow that is shutting down, terminated, or finished may not be modified."));
+        emr("ListSteps", clusterRequest).then().statusCode(200).body("Steps", hasSize(1));
+        emr("DescribeCluster", clusterRequest).then().statusCode(200)
+                .body("Cluster.Status.State", equalTo("TERMINATED"))
+                .body("Cluster.Status.StateChangeReason.Code", equalTo("ALL_STEPS_COMPLETED"));
     }
 
     @Test

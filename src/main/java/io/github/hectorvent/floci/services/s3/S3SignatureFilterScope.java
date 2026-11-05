@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.s3;
 
+import io.github.hectorvent.floci.core.common.RoutedResource;
 import jakarta.ws.rs.container.ResourceInfo;
 
 final class S3SignatureFilterScope {
@@ -12,7 +13,8 @@ final class S3SignatureFilterScope {
                 || (presignGenerator != null && presignGenerator.shouldValidateSignatures());
     }
 
+    /** Safe from a response filter too, which also sees requests routing turned away. */
     static boolean routedToS3(ResourceInfo resourceInfo) {
-        return resourceInfo != null && S3Controller.class.equals(resourceInfo.getResourceClass());
+        return S3Controller.class.equals(RoutedResource.resourceClass(resourceInfo));
     }
 }

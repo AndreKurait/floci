@@ -8,16 +8,23 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.containsStringIgnoringCase;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
 
 /**
- * End to end check of how an HTTP API answers a payload format 2.0 Lambda proxy integration whose
- * function returns no {@code statusCode} or throws. AWS infers a 200 JSON response whose body is
- * the function's result, and answers a function error with {@code {"message":"Internal Server
- * Error"}}. An integration configured with format 1.0 keeps the 1.0 response rules.
+ * End to end check of how an HTTP API answers a Lambda proxy integration whose function returns
+ * no {@code statusCode} or throws. AWS infers a 200 JSON response whose body is the function's
+ * result, and answers a function error with {@code {"message":"Internal Server Error"}}. An
+ * integration configured with format 1.0 keeps the 1.0 response rules.
+ *
+ * <p>A result that carries a {@code statusCode} and a {@code body} and leaves the
+ * {@code Content-Type} header out is answered {@code text/plain; charset=utf-8}, in both payload
+ * formats (measured on AWS, eu-west-1, 2026-10-19). A result that names a {@code Content-Type}
+ * keeps it.
  */
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -27,6 +34,9 @@ class HttpApiLambdaProxyResponseInferenceIntegrationTest {
     private static final String STRING_FUNCTION = "httpv2-inference-string-fn";
     private static final String THROW_FUNCTION = "httpv2-inference-throw-fn";
     private static final String V1_FUNCTION = "httpv2-inference-v1-fn";
+    private static final String PLAIN_FUNCTION = "httpv2-inference-plain-fn";
+    private static final String PLAIN_V1_FUNCTION = "httpv2-inference-plain-v1-fn";
+    private static final String JSON_FUNCTION = "httpv2-inference-json-fn";
 
     private static String apiId;
 
@@ -60,6 +70,12 @@ class HttpApiLambdaProxyResponseInferenceIntegrationTest {
                 "exports.handler = async () => { throw new Error('boom'); };");
         createProxyRoute(V1_FUNCTION, "/v1", "1.0",
                 "exports.handler = async () => ({ headers: { 'X-Trace': 'value' }, body: 'inner' });");
+        createProxyRoute(PLAIN_FUNCTION, "/plain", "2.0",
+                "exports.handler = async () => ({ statusCode: 200, body: 'hello' });");
+        createProxyRoute(PLAIN_V1_FUNCTION, "/plain-v1", "1.0",
+                "exports.handler = async () => ({ statusCode: 200, body: 'hello' });");
+        createProxyRoute(JSON_FUNCTION, "/json", "2.0",
+                "exports.handler = async () => ({ statusCode: 200, headers: { 'Content-Type': 'application/json' }, body: '{\"a\":1}' });");
     }
 
     private static void createProxyRoute(String functionName, String path, String handlerCode) throws Exception {
@@ -146,11 +162,45 @@ class HttpApiLambdaProxyResponseInferenceIntegrationTest {
     }
 
     @Test
+    @Order(14)
+    void aResultWithoutAContentTypeIsAnsweredAsTextPlain() {
+        given()
+                .when().get("/execute-api/" + apiId + "/test/plain")
+                .then()
+                .statusCode(200)
+                .contentType(allOf(startsWith("text/plain"), containsStringIgnoringCase("charset=utf-8")))
+                .body(equalTo("hello"));
+    }
+
+    @Test
+    @Order(15)
+    void aResultWithoutAContentTypeIsAnsweredAsTextPlainInPayloadFormatOne() {
+        given()
+                .when().get("/execute-api/" + apiId + "/test/plain-v1")
+                .then()
+                .statusCode(200)
+                .contentType(allOf(startsWith("text/plain"), containsStringIgnoringCase("charset=utf-8")))
+                .body(equalTo("hello"));
+    }
+
+    @Test
+    @Order(16)
+    void aResultThatNamesAContentTypeKeepsIt() {
+        given()
+                .when().get("/execute-api/" + apiId + "/test/json")
+                .then()
+                .statusCode(200)
+                .contentType(startsWith("application/json"))
+                .body(equalTo("{\"a\":1}"));
+    }
+
+    @Test
     @Order(999)
     void cleanup() throws Exception {
         if (apiId != null) {
             given().when().delete("/v2/apis/" + apiId);
         }
-        WebSocketTestSupport.deleteFunctions(BARE_FUNCTION, STRING_FUNCTION, THROW_FUNCTION, V1_FUNCTION);
+        WebSocketTestSupport.deleteFunctions(BARE_FUNCTION, STRING_FUNCTION, THROW_FUNCTION, V1_FUNCTION,
+                PLAIN_FUNCTION, PLAIN_V1_FUNCTION, JSON_FUNCTION);
     }
 }

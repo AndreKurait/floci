@@ -1,11 +1,16 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.ClusterSetting;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
 import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
@@ -43,6 +48,8 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
     private static final String CLUSTER = "AWS::ECS::Cluster";
     private static final String TASK_DEFINITION = "AWS::ECS::TaskDefinition";
     private static final String SERVICE = "AWS::ECS::Service";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final TypeReference<List<ClusterSetting>> SETTINGS = new TypeReference<>() { };
 
     private final EcsService ecsService;
 
@@ -101,6 +108,7 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR);
         return ReplacementCleanup.complete(resource, this::delete);
     }
 
@@ -110,31 +118,125 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * A replacement is undone through the cleanup record. Without one, a cluster has nothing to put
-     * back: its only property is the create-only name, so an update that kept it re-issued the
-     * idempotent create and changed nothing. A service without a record was updated in place, and
-     * putting that back needs a snapshot this provisioner does not keep, so the engine reports it as
-     * not rolled back, as it did for the switch.
+     * When a settings update and its own restore both failed, the snapshot is left on the attempted
+     * resource only, and the engine puts back the resource it held before. Carried over, it lets
+     * ContinueUpdateRollback retry the restore through {@link #rollbackUpdate} instead of finding
+     * nothing to put back. A restore that succeeded removed it, so it is here only after a failed one.
+     */
+    @Override
+    public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
+        String snapshot = attempted.getAttributes().get(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR);
+        if (snapshot != null) {
+            previous.getAttributes().put(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR, snapshot);
+        }
+    }
+
+    /**
+     * A replacement is undone through the cleanup record. Without one, a cluster puts back the
+     * settings snapshot its update took; with no snapshot the update changed no settings, and the
+     * name is create-only, so the idempotent create changed nothing. A service without a record was
+     * updated in place, and putting that back needs a snapshot this provisioner does not keep, so the
+     * engine reports it as not rolled back, as it did for the switch.
      */
     @Override
     public boolean rollbackUpdate(StackResource resource) {
         if (ReplacementCleanup.rollback(resource, this::delete)) {
             return true;
         }
+        restoreSettingsSnapshot(resource);
         return CLUSTER.equals(resource.getResourceType());
+    }
+
+    private void restoreSettingsSnapshot(StackResource resource) {
+        String rawSnapshot = resource.getAttributes().get(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR);
+        if (rawSnapshot == null) {
+            return;
+        }
+        JsonNode snapshot;
+        try {
+            snapshot = MAPPER.readTree(rawSnapshot);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Unreadable ECS cluster settings snapshot for "
+                    + resource.getLogicalId(), e);
+        }
+        ecsService.updateClusterSettings(resource.getPhysicalId(),
+                MAPPER.convertValue(snapshot.get("settings"), SETTINGS), snapshot.get("region").asText());
+        resource.getAttributes().remove(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR);
     }
 
     /**
      * The cluster name is create-only and the physical id, so an unnamed cluster keeps the name its
      * first execution generated. createCluster is idempotent, which is what makes an unchanged
-     * update a no-op here.
+     * update a no-op here. A new cluster is created with its declared {@code ClusterSettings}; an
+     * existing one has them applied when they differ, and an update snapshots the prior ones for
+     * its rollback.
      */
     private void provisionCluster(StackResource r, JsonNode props, ProvisionContext ctx) {
+        r.getAttributes().remove(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR);
         String clusterName = ctx.stablePhysicalName(ctx.resolveOptional(props, "ClusterName"),
                 r.getLogicalId(), 255, false);
-        EcsCluster cluster = ecsService.createCluster(clusterName, ctx.region());
+        List<ClusterSetting> settings = new ArrayList<>();
+        JsonNode declared = props != null ? props.get("ClusterSettings") : null;
+        JsonNode resolved = declared != null ? ctx.engine().resolveNode(declared) : null;
+        if (resolved != null && resolved.isArray()) {
+            for (JsonNode item : resolved) {
+                // An entry that resolved to AWS::NoValue is not an object.
+                if (item.isObject()) {
+                    settings.add(new ClusterSetting(item.path("Name").asText(null), item.path("Value").asText(null)));
+                }
+            }
+        }
+        // A new cluster takes its settings at creation, so no later call can fail and leave it
+        // behind; an existing one (this resource's own on an update, or one the idempotent create
+        // returned) has them applied below.
+        EcsCluster cluster = ecsService.createCluster(clusterName, null, settings, ctx.region());
+        if (!settings.isEmpty() && !settings.equals(cluster.getSettings())) {
+            List<ClusterSetting> prior = cluster.getSettings() == null ? null : List.copyOf(cluster.getSettings());
+            if (ctx.reusesPriorEntity(clusterName)) {
+                ObjectNode snapshot = MAPPER.createObjectNode().put("region", ctx.region());
+                snapshot.set("settings", MAPPER.valueToTree(prior));
+                r.getAttributes().put(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR, snapshot.toString());
+            }
+            // Before the id is set: a cluster the idempotent create returned for a resource this
+            // update adds was not created by the stack, and a failed update deletes an added
+            // resource that carries an id. An update of this resource's own cluster keeps its id.
+            try {
+                ecsService.updateClusterSettings(clusterName, settings, ctx.region());
+            } catch (RuntimeException failure) {
+                unwindSettings(r, clusterName, prior, ctx.region(), failure);
+                throw failure;
+            }
+        }
         r.setPhysicalId(cluster.getClusterName());
         r.getAttributes().put("Arn", cluster.getClusterArn());
+    }
+
+    /**
+     * Puts back the settings an existing cluster had before a settings call that failed, which may
+     * have changed them before failing. For this resource's own cluster the engine restores the
+     * resource it held before the attempt, which never carried the snapshot, so the rollback walker
+     * would skip {@link #rollbackUpdate}; a cluster the stack found rather than created is not
+     * restored by anything else. A restore that fails too is recorded as a rollback failure, which
+     * ends an update in UPDATE_ROLLBACK_FAILED for the resource's own cluster, and is attached to
+     * the original failure. The restore repeats the call that just failed, so it can come back
+     * with that very exception, which cannot be suppressed under itself.
+     */
+    private void unwindSettings(StackResource r, String clusterName, List<ClusterSetting> prior, String region,
+                                RuntimeException failure) {
+        try {
+            ecsService.updateClusterSettings(clusterName, prior, region);
+            r.getAttributes().remove(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR);
+        } catch (RuntimeException unwindFailure) {
+            String reason = "Could not restore the settings of ECS cluster " + clusterName + ": "
+                    + unwindFailure.getMessage();
+            // ponytail: a cluster the stack found has no id here, so the engine drops the resource
+            // and nothing retries this; carrying it would need engine-side tracking for added resources.
+            LOG.warnv("{0}", reason);
+            r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, reason);
+            if (unwindFailure != failure) {
+                failure.addSuppressed(unwindFailure);
+            }
+        }
     }
 
     /**
@@ -287,7 +389,7 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
             return "default";
         }
         int slash = clusterRef.lastIndexOf('/');
-        return clusterRef.startsWith("arn:") && slash >= 0 ? clusterRef.substring(slash + 1) : clusterRef;
+        return AwsArnUtils.looksLikeArn(clusterRef) && slash >= 0 ? clusterRef.substring(slash + 1) : clusterRef;
     }
 
     /** The cluster segment of {@code service/<cluster>/<name>}; the legacy {@code service/<name>} form is the default. */
@@ -526,12 +628,13 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
         if (resolved == null || !resolved.isObject() || !resolved.hasNonNull("AwsvpcConfiguration")) {
             return null;
         }
-        JsonNode awsvpc = resolved.path("AwsvpcConfiguration");
+        JsonNode awsvpc = ctx.engine().omitNoValue(node).path("AwsvpcConfiguration");
         AwsVpcConfiguration awsvpcConfig = new AwsVpcConfiguration();
-        awsvpcConfig.setSubnets(toStringList(awsvpc.path("Subnets")));
-        awsvpcConfig.setSecurityGroups(toStringList(awsvpc.path("SecurityGroups")));
-        if (awsvpc.hasNonNull("AssignPublicIp")) {
-            awsvpcConfig.setAssignPublicIp(awsvpc.path("AssignPublicIp").asText());
+        awsvpcConfig.setSubnets(ctx.engine().resolveStringList(awsvpc.get("Subnets")));
+        awsvpcConfig.setSecurityGroups(ctx.engine().resolveStringList(awsvpc.get("SecurityGroups")));
+        JsonNode assignPublicIp = resolved.path("AwsvpcConfiguration").path("AssignPublicIp");
+        if (!assignPublicIp.isMissingNode() && !assignPublicIp.isNull()) {
+            awsvpcConfig.setAssignPublicIp(assignPublicIp.asText());
         }
         NetworkConfiguration networkConfiguration = new NetworkConfiguration();
         networkConfiguration.setAwsvpcConfiguration(awsvpcConfig);

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.dynamodb;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.JsonResponseBytes;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
@@ -59,18 +60,9 @@ public final class DynamoDbResponses {
         if (response == null) {
             return null;
         }
-        Object entity = response.getEntity();
-        byte[] bodyBytes;
-        try {
-            if (entity == null) {
-                bodyBytes = new byte[0];
-            } else if (entity instanceof byte[] b) {
-                bodyBytes = b;
-            } else {
-                bodyBytes = objectMapper.writeValueAsBytes(entity);
-            }
-        } catch (Exception e) {
-            LOG.warn("Failed to serialize DynamoDB response for CRC32 computation", e);
+        byte[] bodyBytes = JsonResponseBytes.serializeOrNull(response.getEntity(), objectMapper,
+                LOG, "Failed to serialize DynamoDB response for CRC32 computation");
+        if (bodyBytes == null) {
             return response;
         }
 

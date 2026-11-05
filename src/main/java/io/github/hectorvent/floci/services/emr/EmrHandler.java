@@ -8,8 +8,11 @@ import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsJson11Controller;
+import io.github.hectorvent.floci.core.common.AwsJsonTimestamp;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.JsonErrorResponseUtils;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.services.emr.model.EmrBlockPublicAccess;
 import io.github.hectorvent.floci.services.emr.model.EmrCluster;
 import io.github.hectorvent.floci.services.emr.model.EmrInstanceFleet;
@@ -21,7 +24,9 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -95,6 +100,10 @@ public class EmrHandler {
                         .build();
             };
         } catch (AwsException e) {
+            if (e.getExtendedData() != null) {
+                // Members an error adds to its message, such as InvalidRequestException's ErrorCode.
+                return JsonErrorResponseUtils.createErrorResponse(e);
+            }
             return Response.status(e.getHttpStatus())
                     .entity(new AwsErrorResponse(e.jsonType(), e.getMessage()))
                     .build();
@@ -166,38 +175,45 @@ public class EmrHandler {
 
     private Response handleListClusters(JsonNode request, String region) {
         List<String> states = stringList(request.path("ClusterStates"));
+        Instant createdAfter = AwsJsonTimestamp.epochSeconds(request, "CreatedAfter", "InvalidRequestException");
+        Instant createdBefore = AwsJsonTimestamp.epochSeconds(request, "CreatedBefore", "InvalidRequestException");
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode arr = response.putArray("Clusters");
-        for (EmrCluster c : service.listClusters(region, states)) {
+        for (EmrCluster c : service.listClusters(region, states, createdAfter, createdBefore)) {
             arr.add(clusterSummaryNode(c));
         }
         return Response.ok(response).build();
     }
 
     private Response handleTerminateJobFlows(JsonNode request) {
+        requireMembers(request, "JobFlowIds");
         service.terminateJobFlows(stringList(request.path("JobFlowIds")));
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private Response handleSetTerminationProtection(JsonNode request) {
+        requireMembers(request, "JobFlowIds", "TerminationProtected");
         service.setTerminationProtection(stringList(request.path("JobFlowIds")),
                 request.path("TerminationProtected").asBoolean(false));
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private Response handleSetVisibleToAllUsers(JsonNode request) {
+        requireMembers(request, "JobFlowIds", "VisibleToAllUsers");
         service.setVisibleToAllUsers(stringList(request.path("JobFlowIds")),
                 request.path("VisibleToAllUsers").asBoolean(true));
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private Response handleSetKeepAlive(JsonNode request) {
+        requireMembers(request, "JobFlowIds", "KeepJobFlowAliveWhenNoSteps");
         service.setKeepJobFlowAliveWhenNoSteps(stringList(request.path("JobFlowIds")),
                 request.path("KeepJobFlowAliveWhenNoSteps").asBoolean(false));
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private Response handleSetUnhealthyNodeReplacement(JsonNode request) {
+        requireMembers(request, "JobFlowIds", "UnhealthyNodeReplacement");
         service.setUnhealthyNodeReplacement(stringList(request.path("JobFlowIds")),
                 request.path("UnhealthyNodeReplacement").asBoolean(false));
         return Response.ok(objectMapper.createObjectNode()).build();
@@ -239,6 +255,7 @@ public class EmrHandler {
     }
 
     private Response handleCancelSteps(JsonNode request) {
+        requireMembers(request, "StepIds");
         List<EmrService.CancelStepInfo> infos = service.cancelSteps(
                 text(request, "ClusterId"), stringList(request.path("StepIds")));
         ObjectNode response = objectMapper.createObjectNode();
@@ -300,13 +317,40 @@ public class EmrHandler {
         EmrCluster cluster = service.getClusterForInstances(text(request, "ClusterId"));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode arr = response.putArray("Instances");
-        int n = 1;
+        boolean terminated = EmrClusterLifecycle.isTerminated(cluster.getState());
+        List<String> states = stringList(request.path("InstanceStates"));
+        if ((!states.isEmpty() && !states.contains(terminated ? "TERMINATED" : "RUNNING"))
+                || (terminated && !withinTerminatedInstanceRetention(cluster.getEndDateTime(), Instant.now()))) {
+            return Response.ok(response).build();
+        }
+        // Listed in their groups' order, the first MASTER group's instances numbered first, so the primary node keeps
+        // its id and address, DescribeCluster's MasterPublicDnsName, while the other groups resize, as an instance
+        // does; any other group's follow, each after those before it.
+        EmrInstanceGroup primary = cluster.getInstanceGroups().stream().filter(EmrService::isMasterGroup)
+                .findFirst().orElse(null);
+        int next = primary == null ? 1 : 1 + listedInstanceCount(primary, terminated);
         for (EmrInstanceGroup group : cluster.getInstanceGroups()) {
-            for (int i = 0; i < group.getRunningInstanceCount(); i++) {
-                arr.add(syntheticInstanceNode(cluster, group, n++));
+            int count = listedInstanceCount(group, terminated);
+            int first = group == primary ? 1 : next;
+            for (int i = 0; i < count; i++) {
+                arr.add(syntheticInstanceNode(cluster, group, first + i, terminated));
+            }
+            if (group != primary) {
+                next += count;
             }
         }
         return Response.ok(response).build();
+    }
+
+    static boolean withinTerminatedInstanceRetention(Instant endedAt, Instant now) {
+        return endedAt != null && !endedAt.isBefore(now.minus(30, ChronoUnit.DAYS));
+    }
+
+    static int listedInstanceCount(EmrInstanceGroup group, boolean terminated) {
+        if (terminated && group.getTerminatedInstanceCount() > 0) {
+            return group.getTerminatedInstanceCount();
+        }
+        return group.getRunningInstanceCount();
     }
 
     // ──────────────────────────── Security configurations ────────────────────────────
@@ -427,13 +471,18 @@ public class EmrHandler {
 
     private Response handleModifyInstanceGroups(JsonNode request, String region) {
         List<EmrService.InstanceGroupModification> modifications = new ArrayList<>();
-        for (JsonNode g : request.path("InstanceGroups")) {
-            JsonNode count = g.path("InstanceCount");
-            JsonNode configurations = g.path("Configurations");
-            modifications.add(new EmrService.InstanceGroupModification(
-                    g.path("InstanceGroupId").asText(null),
-                    count.isMissingNode() || count.isNull() ? null : count.asInt(),
-                    configurations.isArray() ? configurations.toString() : null));
+        // Only a list names groups, as the other list members here and the IAM check read one: any other
+        // InstanceGroups names none, which the service refuses.
+        JsonNode groups = request.path("InstanceGroups");
+        if (groups.isArray()) {
+            for (JsonNode g : groups) {
+                JsonNode count = g.path("InstanceCount");
+                JsonNode configurations = g.path("Configurations");
+                modifications.add(new EmrService.InstanceGroupModification(
+                        g.path("InstanceGroupId").asText(null),
+                        count.isMissingNode() || count.isNull() ? null : count.asInt(),
+                        configurations.isArray() ? configurations.toString() : null));
+            }
         }
         service.modifyInstanceGroups(text(request, "ClusterId"), region, modifications);
         return Response.ok(objectMapper.createObjectNode()).build();
@@ -631,6 +680,12 @@ public class EmrHandler {
         if (step.getStateChangeReason() != null) {
             status.putObject("StateChangeReason").put("Message", step.getStateChangeReason());
         }
+        if (step.getFailureReason() != null) {
+            ObjectNode failure = status.putObject("FailureDetails").put("Reason", step.getFailureReason());
+            if (step.getFailureMessage() != null) {
+                failure.put("Message", step.getFailureMessage());
+            }
+        }
         ObjectNode timeline = status.putObject("Timeline");
         putEpoch(timeline, "CreationDateTime", step.getCreationDateTime());
         putEpoch(timeline, "StartDateTime", step.getStartDateTime());
@@ -697,12 +752,13 @@ public class EmrHandler {
         return node;
     }
 
-    private ObjectNode syntheticInstanceNode(EmrCluster cluster, EmrInstanceGroup group, int index) {
+    private ObjectNode syntheticInstanceNode(EmrCluster cluster, EmrInstanceGroup group, int index,
+                                             boolean terminated) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("Id", "ci-" + index + cluster.getId());
-        node.put("Ec2InstanceId", "i-" + String.format("%017d", index));
+        node.put("Ec2InstanceId", EmrService.ec2InstanceId(index));
         node.put("PublicDnsName", AwsEndpoints.ec2PublicDns("203.0.113." + index, cluster.getRegion()));
-        String privateIp = "10.0.0." + index;
+        String privateIp = EmrService.privateIpAddress(index);
         node.put("PrivateDnsName", AwsRegions.ec2PrivateIpDnsName(privateIp, cluster.getRegion()));
         node.put("PrivateIpAddress", privateIp);
         node.put("InstanceGroupId", group.getId());
@@ -710,7 +766,7 @@ public class EmrHandler {
             node.put("Market", group.getMarket());
         }
         node.put("InstanceType", group.getInstanceType());
-        node.putObject("Status").put("State", "RUNNING");
+        node.putObject("Status").put("State", terminated ? "TERMINATED" : "RUNNING");
         return node;
     }
 
@@ -836,6 +892,25 @@ public class EmrHandler {
         return values;
     }
 
+    /**
+     * Refuses a request that leaves out members its model requires, which would otherwise read as an
+     * empty list or a default flag and succeed on nothing. The wording is AWS's framework validation, as
+     * for RunJobFlow's Name; an explicitly empty JobFlowIds is still a valid list.
+     */
+    private static void requireMembers(JsonNode request, String... members) {
+        List<String> violations = new ArrayList<>();
+        for (String member : members) {
+            JsonNode value = request.path(member);
+            if (value.isMissingNode() || value.isNull()) {
+                violations.add(SmithyValidationErrors.notNull(
+                        Character.toLowerCase(member.charAt(0)) + member.substring(1)));
+            }
+        }
+        if (!violations.isEmpty()) {
+            throw SmithyValidationErrors.validationException(violations);
+        }
+    }
+
     private String text(JsonNode request, String field) {
         JsonNode node = request.path(field);
         return node.isMissingNode() || node.isNull() ? null : node.asText(null);
@@ -856,13 +931,13 @@ public class EmrHandler {
         }
     }
 
-    private long epoch(Instant instant) {
-        return instant == null ? 0L : instant.getEpochSecond();
+    private BigDecimal epoch(Instant instant) {
+        return instant == null ? BigDecimal.ZERO : BigDecimal.valueOf(instant.toEpochMilli(), 3);
     }
 
     private void putEpoch(ObjectNode node, String field, Instant instant) {
         if (instant != null) {
-            node.put(field, instant.getEpochSecond());
+            node.put(field, epoch(instant));
         }
     }
 }

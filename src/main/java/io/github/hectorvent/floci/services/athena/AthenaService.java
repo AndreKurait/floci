@@ -5,11 +5,16 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CsvParser;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.athena.model.CreateWorkGroupConfigurationRequest;
 import io.github.hectorvent.floci.services.athena.model.CreateWorkGroupRequest;
 import io.github.hectorvent.floci.services.athena.model.DataCatalog;
+import io.github.hectorvent.floci.services.athena.model.ManagedQueryResultsConfiguration;
+import io.github.hectorvent.floci.services.athena.model.ManagedQueryResultsConfigurationUpdates;
 import io.github.hectorvent.floci.services.athena.model.QueryExecution;
 import io.github.hectorvent.floci.services.athena.model.QueryExecutionContext;
 import io.github.hectorvent.floci.services.athena.model.QueryExecutionState;
@@ -61,6 +66,8 @@ public class AthenaService {
     private static final String DEFAULT_OUTPUT_BUCKET = "floci-athena-results";
     private static final String DEFAULT_WORKGROUP = "primary";
     private static final String DEFAULT_ENGINE_VERSION = "Athena engine version 3";
+    /** The engine version a workgroup selects when its request names none: AWS picks the version. */
+    private static final String AUTO_ENGINE_VERSION = "AUTO";
     private static final long MIN_BYTES_SCANNED_CUTOFF_PER_QUERY = 10_000_000L;
     private static final String WORKGROUP_RESOURCE = "workgroup/";
     private static final String DATA_CATALOG_RESOURCE = "datacatalog/";
@@ -96,6 +103,7 @@ public class AthenaService {
     private final EmulatorConfig config;
     private final Vertx vertx;
     private final GlueViewDdlBuilder ddlBuilder;
+    private final RegionResolver regionResolver;
 
     @Inject
     public AthenaService(StorageFactory storageFactory,
@@ -104,7 +112,8 @@ public class AthenaService {
                          S3Service s3Service,
                          EmulatorConfig config,
                          Vertx vertx,
-                         GlueViewDdlBuilder ddlBuilder) {
+                         GlueViewDdlBuilder ddlBuilder,
+                         RegionResolver regionResolver) {
         this.queryStore = storageFactory.create("athena", "queries.json",
                 new TypeReference<>() {});
         this.workGroupStore = storageFactory.create("athena", "workgroups.json",
@@ -117,6 +126,7 @@ public class AthenaService {
         this.config = config;
         this.vertx = vertx;
         this.ddlBuilder = ddlBuilder;
+        this.regionResolver = regionResolver;
     }
 
     public String startQueryExecution(String query,
@@ -213,6 +223,26 @@ public class AthenaService {
 
     public List<QueryExecution> listQueryExecutions() {
         return queryStore.scan(k -> true);
+    }
+
+    public PaginatedResult<QueryExecution> listQueryExecutionsPage(String region, String workGroup,
+                                                                   Integer maxResults, String nextToken) {
+        if (maxResults != null && (maxResults < 0 || maxResults > 50)) {
+            throw new AwsException("InvalidRequestException", "MaxResults must be between 0 and 50.", 400);
+        }
+        if (nextToken != null && (nextToken.isEmpty() || nextToken.length() > 1024)) {
+            throw new AwsException("InvalidRequestException", "NextToken must contain 1 to 1024 characters.", 400);
+        }
+        String group = workGroup == null ? DEFAULT_WORKGROUP : workGroup;
+        validateWorkGroupName(group);
+        getWorkGroup(group, region);
+        List<QueryExecution> executions = listQueryExecutions().stream()
+                .filter(execution -> group.equals(Objects.requireNonNullElse(execution.getWorkGroup(), DEFAULT_WORKGROUP)))
+                .toList();
+        int limit = maxResults == null || maxResults == 0 ? 50 : maxResults;
+        return Pagination.paginate(executions, QueryExecution::getQueryExecutionId, limit, nextToken,
+                "ListQueryExecutions:" + regionResolver.getAccountId() + ":" + region + ":" + group,
+                token -> new AwsException("InvalidRequestException", "Invalid NextToken.", 400));
     }
 
     public void stopQueryExecution(String id) {
@@ -363,6 +393,20 @@ public class AthenaService {
         return workGroups;
     }
 
+    public PaginatedResult<Map<String, Object>> listWorkGroupsPage(String region, int maxResults, String nextToken) {
+        if (maxResults < 1 || maxResults > 50) {
+            throw new AwsException("InvalidRequestException", "MaxResults must be between 1 and 50", 400);
+        }
+        if (nextToken != null && nextToken.isEmpty()) {
+            throw new AwsException("InvalidRequestException", "Invalid NextToken", 400);
+        }
+        return Pagination.paginate(listWorkGroups(region), workGroup -> {
+            String name = (String) workGroup.get("Name");
+            return DEFAULT_WORKGROUP.equals(name) ? "0" : "1" + name;
+        }, maxResults, nextToken, "ListWorkGroups:" + region,
+                token -> new AwsException("InvalidRequestException", "Invalid NextToken", 400));
+    }
+
     /**
      * The account's built-in Glue catalog first, then the catalogs registered through
      * {@code CreateDataCatalog}, sorted by name.
@@ -375,6 +419,21 @@ public class AthenaService {
                 .map(this::toCatalogSummary)
                 .toList());
         return summaries;
+    }
+
+    public PaginatedResult<Map<String, Object>> listDataCatalogsPage(String region, Integer maxResults, String nextToken) {
+        int limit = maxResults == null ? 50 : maxResults;
+        if (limit < 2 || limit > 50) {
+            throw new AwsException("InvalidRequestException", "MaxResults must be between 2 and 50.", 400);
+        }
+        if (nextToken != null && (nextToken.isEmpty() || nextToken.length() > 1024)) {
+            throw new AwsException("InvalidRequestException", "NextToken must contain 1 to 1024 characters.", 400);
+        }
+        return Pagination.paginate(listDataCatalogs(region), catalog -> {
+            String name = (String) catalog.get("CatalogName");
+            return DEFAULT_CATALOG.equals(name) ? "0" : "1" + name;
+        }, limit, nextToken, "ListDataCatalogs:" + regionResolver.getAccountId() + ":" + region,
+                token -> new AwsException("InvalidRequestException", "Invalid NextToken.", 400));
     }
 
     public Map<String, Object> getDataCatalog(String region, String name) {
@@ -638,6 +697,16 @@ public class AthenaService {
         if (configuration.getBytesScannedCutoffPerQuery() != null) {
             normalized.setBytesScannedCutoffPerQuery(configuration.getBytesScannedCutoffPerQuery());
         }
+        if (configuration.getManagedQueryResultsConfiguration() != null) {
+            ManagedQueryResultsConfiguration requested = configuration.getManagedQueryResultsConfiguration();
+            ManagedQueryResultsConfiguration managed = new ManagedQueryResultsConfiguration();
+            managed.setEnabled(Boolean.TRUE.equals(requested.getEnabled()));
+            managed.setEncryptionConfiguration(copyOf(requested.getEncryptionConfiguration()));
+            normalized.setManagedQueryResultsConfiguration(managed);
+        }
+        if (configuration.getEnableMinimumEncryptionConfiguration() != null) {
+            normalized.setEnableMinimumEncryptionConfiguration(configuration.getEnableMinimumEncryptionConfiguration());
+        }
         if (configuration.getEngineVersion() != null) {
             String selectedEngineVersion = configuration.getEngineVersion().getSelectedEngineVersion();
             boolean hasSelectedEngineVersion = selectedEngineVersion != null && !selectedEngineVersion.isBlank();
@@ -680,6 +749,10 @@ public class AthenaService {
         } else if (updates.getBytesScannedCutoffPerQuery() != null) {
             configuration.setBytesScannedCutoffPerQuery(updates.getBytesScannedCutoffPerQuery());
         }
+        mergeManagedQueryResults(configuration, updates.getManagedQueryResultsConfigurationUpdates());
+        if (updates.getEnableMinimumEncryptionConfiguration() != null) {
+            configuration.setEnableMinimumEncryptionConfiguration(updates.getEnableMinimumEncryptionConfiguration());
+        }
         if (updates.getEngineVersion() != null) {
             String selectedEngineVersion = updates.getEngineVersion().getSelectedEngineVersion();
             if (selectedEngineVersion != null) {
@@ -691,6 +764,33 @@ public class AthenaService {
         }
     }
 
+    private static void mergeManagedQueryResults(WorkGroupConfiguration configuration,
+                                                 ManagedQueryResultsConfigurationUpdates updates) {
+        if (updates == null) {
+            return;
+        }
+        ManagedQueryResultsConfiguration managed = configuration.getManagedQueryResultsConfiguration();
+        if (managed == null) {
+            managed = new ManagedQueryResultsConfiguration();
+            managed.setEnabled(false);
+        }
+        if (updates.getEnabled() != null) {
+            managed.setEnabled(updates.getEnabled());
+        }
+        if (Boolean.TRUE.equals(updates.getRemoveEncryptionConfiguration())) {
+            managed.setEncryptionConfiguration(null);
+        } else if (updates.getEncryptionConfiguration() != null) {
+            managed.setEncryptionConfiguration(copyOf(updates.getEncryptionConfiguration()));
+        }
+        configuration.setManagedQueryResultsConfiguration(managed);
+    }
+
+    private static ManagedQueryResultsConfiguration.EncryptionConfiguration copyOf(
+            ManagedQueryResultsConfiguration.EncryptionConfiguration encryption) {
+        return encryption == null ? null : new ManagedQueryResultsConfiguration.EncryptionConfiguration(
+                encryption.getKmsKey());
+    }
+
     private String resolveEffectiveEngineVersion(String selectedEngineVersion) {
         if (selectedEngineVersion == null || selectedEngineVersion.isBlank() || "AUTO".equals(selectedEngineVersion)) {
             return DEFAULT_ENGINE_VERSION;
@@ -698,19 +798,24 @@ public class AthenaService {
         return selectedEngineVersion;
     }
 
+    /**
+     * What a workgroup reports for the members its request leaves out, as AWS does: no result
+     * location (a query names its own, or the workgroup uses managed results), the engine version
+     * {@code AUTO} resolved to the current one, and minimum encryption off.
+     */
     private WorkGroupConfiguration defaultWorkGroupConfiguration() {
         WorkGroupConfiguration configuration = new WorkGroupConfiguration();
-        configuration.setResultConfiguration(new ResultConfiguration("s3://" + DEFAULT_OUTPUT_BUCKET + "/results/"));
         configuration.setEnforceWorkGroupConfiguration(false);
         configuration.setPublishCloudWatchMetricsEnabled(false);
         configuration.setRequesterPaysEnabled(false);
         configuration.setEngineVersion(defaultEngineVersion());
+        configuration.setEnableMinimumEncryptionConfiguration(false);
         return configuration;
     }
 
     private QueryExecution.EngineVersion defaultEngineVersion() {
         QueryExecution.EngineVersion engineVersion = new QueryExecution.EngineVersion();
-        engineVersion.setSelectedEngineVersion(DEFAULT_ENGINE_VERSION);
+        engineVersion.setSelectedEngineVersion(AUTO_ENGINE_VERSION);
         engineVersion.setEffectiveEngineVersion(DEFAULT_ENGINE_VERSION);
         return engineVersion;
     }
@@ -720,7 +825,10 @@ public class AthenaService {
             WorkGroup workGroup = new WorkGroup();
             workGroup.setName(DEFAULT_WORKGROUP);
             workGroup.setState("ENABLED");
-            workGroup.setConfiguration(defaultWorkGroupConfiguration());
+            WorkGroupConfiguration configuration = defaultWorkGroupConfiguration();
+            // AWS reports primary's result configuration as an empty object until a location is set.
+            configuration.setResultConfiguration(new ResultConfiguration());
+            workGroup.setConfiguration(configuration);
             return workGroup;
         });
     }

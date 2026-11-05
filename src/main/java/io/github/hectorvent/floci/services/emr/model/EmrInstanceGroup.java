@@ -14,6 +14,7 @@ public class EmrInstanceGroup {
     private String bidPrice;
     private int requestedInstanceCount;
     private int runningInstanceCount;
+    private int terminatedInstanceCount;
     private String state;
     /** The AutoScalingPolicy as given (Constraints and Rules), raw JSON; null when none is attached. */
     private String autoScalingPolicy;
@@ -55,6 +56,11 @@ public class EmrInstanceGroup {
     public int getRunningInstanceCount() { return runningInstanceCount; }
     public void setRunningInstanceCount(int runningInstanceCount) {
         this.runningInstanceCount = runningInstanceCount;
+    }
+
+    public int getTerminatedInstanceCount() { return terminatedInstanceCount; }
+    public void setTerminatedInstanceCount(int terminatedInstanceCount) {
+        this.terminatedInstanceCount = terminatedInstanceCount;
     }
 
     public String getState() { return state; }

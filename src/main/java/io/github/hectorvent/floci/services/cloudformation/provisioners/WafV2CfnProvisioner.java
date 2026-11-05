@@ -24,6 +24,7 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
     private static final String WEB_ACL = "AWS::WAFv2::WebACL";
     private static final String WEB_ACL_ASSOCIATION = "AWS::WAFv2::WebACLAssociation";
     private static final String IP_SET = "AWS::WAFv2::IPSet";
+    private static final String LOGGING_CONFIGURATION = "AWS::WAFv2::LoggingConfiguration";
 
     private final WafV2Service wafV2Service;
 
@@ -34,7 +35,7 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public Set<String> resourceTypes() {
-        return Set.of(WEB_ACL, WEB_ACL_ASSOCIATION, IP_SET);
+        return Set.of(WEB_ACL, WEB_ACL_ASSOCIATION, IP_SET, LOGGING_CONFIGURATION);
     }
 
     /**
@@ -54,6 +55,10 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         }
         if (IP_SET.equals(resource.getResourceType())) {
             provisionIpSet(resource, props, ctx);
+            return;
+        }
+        if (LOGGING_CONFIGURATION.equals(resource.getResourceType())) {
+            provisionLoggingConfiguration(resource, props, ctx);
             return;
         }
         JsonNode resolved = ctx.engine().resolveNode(props);
@@ -147,6 +152,54 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         ReplacementCleanup.record(resource, ctx, attributesBefore);
     }
 
+    private void provisionLoggingConfiguration(StackResource resource, JsonNode props, ProvisionContext ctx) {
+        resource.getAttributes().remove(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR);
+        resource.getAttributes().remove(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR);
+        JsonNode resolved = ctx.engine().resolveNode(props);
+        String resourceArn = required(text(resolved, "ResourceArn"), LOGGING_CONFIGURATION, "ResourceArn");
+        JsonNode destinations = resolved.path("LogDestinationConfigs");
+        if (!destinations.isArray() || destinations.isEmpty()) {
+            throw new AwsException("ValidationError", LOGGING_CONFIGURATION + " requires LogDestinationConfigs", 400);
+        }
+        Map<String, String> attributesBefore = new HashMap<>(resource.getAttributes());
+        if (ctx.isUpdate() && resourceArn.equals(ctx.priorPhysicalId())) {
+            try {
+                String previous = wafV2Service.getLoggingConfiguration(resourceArn);
+                if (previous == null) {
+                    resource.getAttributes().put(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR, "true");
+                } else {
+                    resource.getAttributes().put(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR, previous);
+                }
+            } catch (AwsException e) {
+                if (!"WAFNonexistentItemException".equals(e.getErrorCode())) {
+                    throw e;
+                }
+                resource.getAttributes().put(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR, "true");
+            }
+        } else {
+            rejectExistingLoggingConfiguration(resourceArn);
+        }
+        wafV2Service.putLoggingConfiguration(resourceArn, resolved.toString());
+        resource.setPhysicalId(resourceArn);
+        resource.getAttributes().put("ManagedByFirewallManager", "false");
+        ReplacementCleanup.record(resource, ctx, attributesBefore);
+    }
+
+    private void rejectExistingLoggingConfiguration(String resourceArn) {
+        try {
+            if (wafV2Service.getLoggingConfiguration(resourceArn) == null) {
+                return;
+            }
+        } catch (AwsException e) {
+            if ("WAFNonexistentItemException".equals(e.getErrorCode())) {
+                return;
+            }
+            throw e;
+        }
+        throw new AwsException("WAFDuplicateItemException",
+                "Logging configuration already exists for " + resourceArn, 400);
+    }
+
     @Override
     public void delete(String resourceType, String physicalId, String region) {
         if (WEB_ACL_ASSOCIATION.equals(resourceType)) {
@@ -155,6 +208,10 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         }
         if (IP_SET.equals(resourceType)) {
             deleteIpSet(physicalId);
+            return;
+        }
+        if (LOGGING_CONFIGURATION.equals(resourceType)) {
+            wafV2Service.deleteLoggingConfiguration(physicalId);
             return;
         }
         WebAcl existing = findExisting(physicalId);
@@ -203,11 +260,18 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
-        return ReplacementCleanup.complete(resource, this::delete);
+        UpdateCleanupResult cleanup = ReplacementCleanup.complete(resource, this::delete);
+        if (!cleanup.applicable() && (resource.getAttributes().containsKey(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR)
+                || resource.getAttributes().containsKey(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR))) {
+            return new UpdateCleanupResult(true, true, null, 0, null);
+        }
+        return cleanup;
     }
 
     @Override
     public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR);
+        resource.getAttributes().remove(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR);
         ReplacementCleanup.clear(resource);
     }
 
@@ -225,6 +289,22 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         }
         if (IP_SET.equals(resource.getResourceType())) {
             return ReplacementCleanup.rollback(resource, this::delete);
+        }
+        if (LOGGING_CONFIGURATION.equals(resource.getResourceType())) {
+            if (ReplacementCleanup.rollback(resource, this::delete)) {
+                return true;
+            }
+            if (resource.getAttributes().containsKey(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR)) {
+                wafV2Service.deleteLoggingConfiguration(resource.getPhysicalId());
+                resource.getAttributes().remove(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR);
+                return true;
+            }
+            String previous = resource.getAttributes().get(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR);
+            if (previous != null) {
+                wafV2Service.putLoggingConfiguration(resource.getPhysicalId(), previous);
+                resource.getAttributes().remove(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR);
+            }
+            return true;
         }
         return false;
     }

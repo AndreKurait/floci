@@ -102,6 +102,13 @@ class RegionScopedListsIntegrationTest {
                     """.formatted(table))
             .when().post("/").then().statusCode(200)
             .extract().path("TableDescription.TableArn");
+        given().header("Authorization", auth(HOME, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.UpdateContinuousBackups")
+                .contentType(DYNAMODB_JSON)
+                .body("""
+                    {"TableName": "%s", "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": true}}
+                    """.formatted(table))
+            .when().post("/").then().statusCode(200);
         // The bucket is never created: the export job is recorded before it writes anything, and a
         // missing bucket only fails the job later. Export jobs have no delete API.
         String exportArn = given().header("Authorization", auth(HOME, "dynamodb"))

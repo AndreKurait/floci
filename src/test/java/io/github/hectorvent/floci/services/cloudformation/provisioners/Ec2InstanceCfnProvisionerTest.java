@@ -31,10 +31,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -78,7 +80,8 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-1", r.getPhysicalId());
         assertEquals(Set.of("InstanceId", "PrivateIp", "PublicIp", "PrivateDnsName", "PublicDnsName",
-                "AvailabilityZone", "VpcId", "State.Code", "State.Name"), r.getAttributes().keySet());
+                "AvailabilityZone", "VpcId", "State.Code", "State.Name",
+                Ec2InstanceCfnProvisioner.DECLARED_TAG_KEYS_ATTR), r.getAttributes().keySet());
         assertEquals("10.0.0.5", r.getAttributes().get("PrivateIp"));
         assertEquals("us-east-1a", r.getAttributes().get("AvailabilityZone"));
         assertEquals("vpc-1", r.getAttributes().get("VpcId"));
@@ -117,7 +120,41 @@ class Ec2InstanceCfnProvisionerTest {
 
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\"}"), ctx());
 
-        assertEquals(Set.of("InstanceId"), r.getAttributes().keySet());
+        assertEquals(Set.of("InstanceId", Ec2InstanceCfnProvisioner.DECLARED_TAG_KEYS_ATTR),
+                r.getAttributes().keySet());
+    }
+
+    @Test
+    void launchAppliesTheDeclaredPrivateIpAddress() throws Exception {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        stubLaunch(instance);
+
+        provisioner.provision(resource("Server"), props("""
+                {"ImageId": "ami-1", "SubnetId": "subnet-1", "UserData": "boot",
+                 "PrivateIpAddress": "10.0.1.50"}
+                """), ctx());
+
+        // Every other launch option keeps the value the shorter overloads default it to.
+        ArgumentCaptor<String> privateIp = ArgumentCaptor.forClass(String.class);
+        verify(ec2).runInstances(eq("us-east-1"), eq("ami-1"), eq("t3.micro"), eq(1), eq(1), isNull(),
+                anyList(), eq("subnet-1"), isNull(), anyList(), eq("boot"), isNull(), isNull(), isNull(),
+                eq(0), isNull(), isNull(), isNull(), eq("Ym9vdA=="), eq(false), isNull(), isNull(), isNull(),
+                eq(false), privateIp.capture());
+        assertEquals("10.0.1.50", privateIp.getValue());
+    }
+
+    @Test
+    void launchWithoutAPrivateIpAddressLeavesItToTheSubnet() throws Exception {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        stubLaunch(instance);
+
+        provisioner.provision(resource("Server"), props("{\"ImageId\": \"ami-1\"}"), ctx());
+
+        verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any(), any(), any(),
+                anyBoolean(), any(), any(), any(), anyBoolean(), isNull());
     }
 
     @Test
@@ -136,7 +173,8 @@ class Ec2InstanceCfnProvisionerTest {
                 """), ctx());
 
         verify(ec2).runInstances(eq("us-east-1"), eq("ami-from-template"), eq("m5.large"), eq(1), eq(1),
-                eq("template-key"), anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                eq("template-key"), anyList(), any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
@@ -167,7 +205,8 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-nolt", r.getPhysicalId());
         verify(ec2).runInstances(eq("us-east-1"), any(), eq("t3.micro"), eq(1), eq(1), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
@@ -271,7 +310,8 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-1", r.getPhysicalId());
         verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
@@ -380,7 +420,8 @@ class Ec2InstanceCfnProvisionerTest {
 
         ArgumentCaptor<String> profile = ArgumentCaptor.forClass(String.class);
         verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), profile.capture(), any(), any(), anyInt(), any(), any());
+                any(), any(), anyList(), any(), profile.capture(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
         assertEquals(PROFILE_A, profile.getValue());
         assertEquals(PROFILE_A, r.getAttributes().get("__FlociDeclaredIamInstanceProfile"));
     }
@@ -404,7 +445,8 @@ class Ec2InstanceCfnProvisionerTest {
         i2.setInstanceId("i-2");
         i2.setImageId("ami-2");
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any()))
                 .thenReturn(reservationOf(i1), reservationOf(i2));
         StackResource r = resource("Server");
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\"}"), ctx(null));
@@ -428,7 +470,8 @@ class Ec2InstanceCfnProvisionerTest {
         i2.setInstanceId("i-2");
         i2.setImageId("ami-1");
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any()))
                 .thenReturn(reservationOf(i1), reservationOf(i2));
         StackResource r = resource("Server");
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\", \"PrivateIpAddress\": \"10.0.0.5\"}"), ctx(null));
@@ -452,7 +495,8 @@ class Ec2InstanceCfnProvisionerTest {
         i2.setInstanceId("i-2");
         i2.setImageId("ami-1");
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any()))
                 .thenReturn(reservationOf(i1), reservationOf(i2));
         StackResource r = resource("Server");
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\", \"AvailabilityZone\": \"us-east-1a\"}"), ctx(null));
@@ -482,7 +526,8 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-1", r.getPhysicalId());
         verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
@@ -502,24 +547,26 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-1", r.getPhysicalId());
         verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
-    void reusedInstanceReconcilesTagsInPlace() throws Exception {
+    void reusedInstanceRemovesOnlyTheTagKeysItOwns() throws Exception {
         Instance i1 = new Instance();
         i1.setInstanceId("i-1");
         i1.setImageId("ami-1");
         stubLaunch(i1);
         StackResource r = resource("Server");
         provisioner.provision(r, props("""
-                {"ImageId": "ami-1", "Tags": [{"Key": "env", "Value": "prod"}]}
+                {"ImageId": "ami-1", "Tags": [{"Key": "env", "Value": "prod"}, {"Key": "old", "Value": "stale"}]}
                 """), ctx(null));
 
         when(ec2.describeInstances("us-east-1", List.of("i-1"), null))
                 .thenReturn(List.of(reservationOf(i1)));
+        // team was added through EC2, outside the stack, so AWS keeps it.
         when(ec2.describeTags(eq("us-east-1"), any())).thenReturn(List.of(
-                tagEntry("i-1", "env", "prod"), tagEntry("i-1", "old", "stale"),
+                tagEntry("i-1", "env", "prod"), tagEntry("i-1", "old", "stale"), tagEntry("i-1", "team", "core"),
                 tagEntry("i-1", "aws:autoscaling:groupName", "group"),
                 tagEntry("i-1", "AWS:cloudformation:stack-id", "stack")));
         provisioner.provision(r, props("""
@@ -531,6 +578,7 @@ class Ec2InstanceCfnProvisionerTest {
         verify(ec2).deleteTags(eq("us-east-1"), eq(List.of("i-1")), removed.capture());
         assertEquals(1, removed.getValue().size());
         assertEquals("old", removed.getValue().get(0).getKey());
+        assertEquals("[\"env\"]", r.getAttributes().get(Ec2InstanceCfnProvisioner.DECLARED_TAG_KEYS_ATTR));
     }
 
     @Test
@@ -546,7 +594,8 @@ class Ec2InstanceCfnProvisionerTest {
         ArgumentCaptor<LaunchTemplateData.MetadataOptions> launched =
                 ArgumentCaptor.forClass(LaunchTemplateData.MetadataOptions.class);
         verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), launched.capture());
+                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), launched.capture(),
+                any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
         assertEquals("required", launched.getValue().getHttpTokens());
 
         LaunchTemplateData.MetadataOptions applied = LaunchTemplateData.MetadataOptions.launchDefaults();
@@ -567,7 +616,8 @@ class Ec2InstanceCfnProvisionerTest {
         verify(ec2).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), modified.capture());
         assertEquals("optional", modified.getValue().getHttpTokens());
         verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
@@ -634,7 +684,8 @@ class Ec2InstanceCfnProvisionerTest {
         verify(ec2).modifyInstanceMetadataOptions(eq("us-east-1"), eq("i-1"), reset.capture());
         assertEquals("optional", reset.getValue().getHttpTokens());
         verify(ec2, times(1)).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     /**
@@ -653,7 +704,7 @@ class Ec2InstanceCfnProvisionerTest {
         assertTrue(provisioner.rollbackUpdate(r));
 
         assertEquals("i-1", r.getPhysicalId());
-        assertEquals(Map.of("__FlociDeclaredMetadataOptions", "HttpTokens"), declarations(r));
+        assertEquals(Map.of("__FlociDeclaredMetadataOptions", "HttpTokens", "__FlociDeclaredTagKeys", "[]"), declarations(r));
         assertFalse(r.getAttributes().containsKey("__FlociPriorDeclarations"));
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\"}"), ctx("i-1"));
         assertEquals("i-1", r.getPhysicalId());
@@ -677,7 +728,7 @@ class Ec2InstanceCfnProvisionerTest {
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
 
         assertEquals("i-1", r.getPhysicalId());
-        assertEquals(Map.of("__FlociDeclaredMetadataOptions", "HttpTokens"), declarations(r));
+        assertEquals(Map.of("__FlociDeclaredMetadataOptions", "HttpTokens", "__FlociDeclaredTagKeys", "[]"), declarations(r));
         assertFalse(r.getAttributes().containsKey("__FlociPriorDeclarations"));
     }
 
@@ -693,7 +744,7 @@ class Ec2InstanceCfnProvisionerTest {
                 .thenThrow(new AwsException("InternalError", "terminate failed", 500))
                 .thenThrow(new AwsException("InternalError", "terminate failed", 500))
                 .thenReturn(List.of());
-        Map<String, String> declared = Map.of("__FlociDeclaredMetadataOptions", "HttpTokens");
+        Map<String, String> declared = Map.of("__FlociDeclaredMetadataOptions", "HttpTokens", "__FlociDeclaredTagKeys", "[]");
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
 
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
@@ -912,7 +963,8 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("InvalidParameterValue", failure.getErrorCode());
         verify(ec2, never()).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
@@ -982,7 +1034,7 @@ class Ec2InstanceCfnProvisionerTest {
         first.setMetadataOptions(applied);
         provisioner.provision(r, props("{\"ImageId\": \"ami-2\"}"), ctx(first.getInstanceId()));
         assertTrue(provisioner.hasReplacementUpdate(r));
-        assertEquals(Map.of(), declarations(r));
+        assertEquals(Map.of(Ec2InstanceCfnProvisioner.DECLARED_TAG_KEYS_ATTR, "[]"), declarations(r));
         return r;
     }
 
@@ -1069,7 +1121,7 @@ class Ec2InstanceCfnProvisionerTest {
 
     @Test
     void tagReconciliationValidatesBeforeDeletingStaleTags() {
-        assertThrows(AwsException.class, () -> Ec2Tags.reconcile(ec2, "us-east-1", "i-1",
+        assertThrows(AwsException.class, () -> Ec2Tags.reconcileOwned(ec2, "us-east-1", "i-1", Set.of("env"),
                 Map.of("env", "new", "aWs:reserved", "invalid")));
 
         verifyNoInteractions(ec2);
@@ -1145,7 +1197,8 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-9", r.getPhysicalId());
         verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
@@ -1166,7 +1219,8 @@ class Ec2InstanceCfnProvisionerTest {
 
         assertEquals("i-9", r.getPhysicalId());
         verify(ec2).runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(),
-                anyList(), any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any());
+                anyList(), any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any());
     }
 
     @Test
@@ -1179,7 +1233,8 @@ class Ec2InstanceCfnProvisionerTest {
         withoutPublicIp.setInstanceId("i-2");
         withoutPublicIp.setImageId("ami-2");
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any()))
                 .thenReturn(reservationOf(withPublicIp), reservationOf(withoutPublicIp));
         StackResource r = resource("Server");
         provisioner.provision(r, props("{\"ImageId\": \"ami-1\"}"), ctx(null));
@@ -1219,7 +1274,8 @@ class Ec2InstanceCfnProvisionerTest {
                     .thenReturn(List.of(reservationOf(instance)));
         }
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any()))
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any()))
                 .thenReturn(reservations.get(0), reservations.subList(1, reservations.size()).toArray(Reservation[]::new));
         return instances;
     }
@@ -1236,7 +1292,9 @@ class Ec2InstanceCfnProvisionerTest {
         Reservation reservation = new Reservation();
         reservation.getInstances().add(instance);
         when(ec2.runInstances(anyString(), any(), anyString(), anyInt(), anyInt(), any(), anyList(),
-                any(), any(), anyList(), any(), any(), any(), any(), anyInt(), any(), any())).thenReturn(reservation);
+                any(), any(), anyList(), any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyBoolean(), any(), any(), any(), anyBoolean(), any()))
+                .thenReturn(reservation);
     }
 
     private ProvisionContext ctx() {

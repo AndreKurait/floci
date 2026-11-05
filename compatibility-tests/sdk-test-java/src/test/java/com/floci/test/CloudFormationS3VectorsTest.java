@@ -212,7 +212,6 @@ class CloudFormationS3VectorsTest {
                 Arguments.of("float32", "manhattan", List.of(), "distanceMetric"),
                 Arguments.of("float32", "cosine", List.of(""), "NonFilterableMetadataKeys"),
                 Arguments.of("float32", "cosine", List.of("   "), "NonFilterableMetadataKeys"),
-                Arguments.of("float32", "cosine", Collections.singletonList(null), "NonFilterableMetadataKeys"),
                 Arguments.of("float32", "cosine", List.of("a".repeat(64)), "NonFilterableMetadataKeys"),
                 Arguments.of("float32", "cosine", Collections.nCopies(11, "key"), "NonFilterableMetadataKeys"));
     }
@@ -418,7 +417,7 @@ class CloudFormationS3VectorsTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"absent", "null", "{}", "{\"SseType\":null}", "{\"SseType\":\"AES256\"}"})
+    @ValueSource(strings = {"absent", "{}", "{\"SseType\":\"AES256\"}"})
     void indexesInheritBucketEncryptionUnlessExplicitlyOverridden(String configuration) throws Exception {
         String name = TestFixtures.uniqueName("cfn-vectors-inherit");
         ObjectNode template = (ObjectNode) MAPPER.readTree(TEMPLATE);

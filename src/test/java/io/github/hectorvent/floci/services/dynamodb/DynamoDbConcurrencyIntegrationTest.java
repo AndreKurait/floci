@@ -18,10 +18,12 @@ import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisStream;
+import io.github.hectorvent.floci.testing.StartGate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -30,10 +32,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -45,7 +43,7 @@ import static org.mockito.Mockito.when;
 /**
  * Concurrency compatibility suite for {@link DynamoDbService}.
  *
- * <p>All scenarios use a {@link CountDownLatch} starting gate so threads release
+ * <p>All scenarios use a {@link StartGate} so threads release
  * simultaneously, maximising contention. Wrapped in {@code @RepeatedTest(5)} so a
  * regression that surfaces intermittently has a real chance of being observed in a
  * single CI run.
@@ -106,32 +104,10 @@ class DynamoDbConcurrencyIntegrationTest {
 
     /** Run {@code work} in {@code threadCount} threads, released together. */
     private List<Throwable> runConcurrently(int threadCount, Runnable work) throws InterruptedException {
-        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
-        CountDownLatch startGate = new CountDownLatch(1);
-        CountDownLatch doneGate = new CountDownLatch(threadCount);
-        List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
-        try {
-            for (int i = 0; i < threadCount; i++) {
-                pool.submit(() -> {
-                    try {
-                        startGate.await();
-                        work.run();
-                    } catch (Throwable t) {
-                        errors.add(t);
-                    } finally {
-                        doneGate.countDown();
-                    }
-                });
-            }
-            startGate.countDown();
-            assertTrue(doneGate.await(30, TimeUnit.SECONDS),
-                    "concurrent tasks did not complete within 30s");
-            return errors;
-        } finally {
-            pool.shutdownNow();
-            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS),
-                    "thread pool did not terminate");
-        }
+        return StartGate.runConcurrently(threadCount, i -> {
+            work.run();
+            return null;
+        }).errors();
     }
 
     @RepeatedTest(REPEATS)
@@ -545,7 +521,7 @@ class DynamoDbConcurrencyIntegrationTest {
 
         // CDC delivery is asynchronous (bounded best-effort retry queue): wait for the background drain to
         // flush every buffered record before reading the shard, otherwise this reads a partial stream.
-        assertTrue(forwarder.awaitIdle(java.time.Duration.ofSeconds(10)),
+        assertTrue(forwarder.awaitIdle(Duration.ofSeconds(10)),
                 "the CDC drain must flush all buffered records");
 
         // Paginated drain of the single shard.

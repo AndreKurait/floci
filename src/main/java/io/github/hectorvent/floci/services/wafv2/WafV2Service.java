@@ -274,11 +274,8 @@ public class WafV2Service {
     // ──────────────────────────── Association ────────────────────────────
 
     public void associateWebAcl(String webAclArn, String resourceArn) {
-        boolean known = webAclStore.scan(k -> true).stream()
-                .anyMatch(a -> a.getArn().equals(webAclArn));
-        if (!known) {
-            throw new AwsException("WAFNonexistentItemException",
-                    "AWS WAF couldn't perform the operation because your resource doesn't exist.", 400);
+        if (scanArn(webAclStore, webAclArn) == null) {
+            throw nonexistentItem();
         }
         associationStore.put(resourceArn, webAclArn);
     }
@@ -310,6 +307,9 @@ public class WafV2Service {
     // ──────────────────────────── Logging ────────────────────────────
 
     public String putLoggingConfiguration(String resourceArn, String loggingConfigJson) {
+        if (scanArn(webAclStore, resourceArn) == null) {
+            throw nonexistentItem();
+        }
         loggingStore.put(resourceArn, loggingConfigJson);
         return loggingConfigJson;
     }
@@ -438,14 +438,16 @@ public class WafV2Service {
         if (name == null || name.isBlank()) {
             throw new AwsException("WAFInvalidParameterException", "Name is required.", 400);
         }
-        V resource = store.get(key(scope, id)).orElseThrow(() -> new AwsException(
-                "WAFNonexistentItemException",
-                "AWS WAF couldn't perform the operation because your resource doesn't exist.", 400));
+        V resource = store.get(key(scope, id)).orElseThrow(WafV2Service::nonexistentItem);
         if (!name.equals(nameOf(resource))) {
-            throw new AwsException("WAFNonexistentItemException",
-                    "AWS WAF couldn't perform the operation because your resource doesn't exist.", 400);
+            throw nonexistentItem();
         }
         return resource;
+    }
+
+    private static AwsException nonexistentItem() {
+        return new AwsException("WAFNonexistentItemException",
+                "AWS WAF couldn't perform the operation because your resource doesn't exist.", 400);
     }
 
     private <V> V findByName(StorageBackend<String, V> store, String scope, String name) {

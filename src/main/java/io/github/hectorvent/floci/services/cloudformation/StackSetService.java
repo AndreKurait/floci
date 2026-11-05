@@ -26,6 +26,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -133,6 +134,7 @@ public class StackSetService implements PassedRoleLookup {
         if ("SELF_MANAGED".equals(resolvedPermissionModel) && (autoDeploymentEnabled || retainStacksOnAccountRemoval)) {
             throw new AwsException("ValidationError", "AutoDeployment is valid only for SERVICE_MANAGED StackSets.", 400);
         }
+        requireValidTemplate(templateBody);
         // Every instance is deployed with these parameters, so a template parameter left without a
         // value would fail each one; refuse the stack set instead.
         cfnService.requireParameterValues(templateBody, parameters);
@@ -210,8 +212,9 @@ public class StackSetService implements PassedRoleLookup {
         StackSet ss = getStackSetOrThrow(name);
         // Checked against the template and parameters the update leaves the stack set with, before
         // either is changed or an operation is recorded.
-        cfnService.requireParameterValues(
-                templateBody != null && !templateBody.isBlank() ? templateBody : ss.getTemplateBody(),
+        String keptTemplate = templateBody != null && !templateBody.isBlank() ? templateBody : ss.getTemplateBody();
+        requireValidTemplate(keptTemplate);
+        cfnService.requireParameterValues(keptTemplate,
                 parameters != null && !parameters.isEmpty() ? parameters : ss.getParameters());
         String operationId = reserveOperation(name, "UPDATE", requestedOperationId).getOperationId();
         if (templateBody != null && !templateBody.isBlank()) {
@@ -225,8 +228,7 @@ public class StackSetService implements PassedRoleLookup {
             ss.getCapabilities().addAll(capabilities);
         }
         if (tags != null && !tags.isEmpty()) {
-            ss.getTags().clear();
-            ss.getTags().putAll(tags);
+            ss.setTags(new LinkedHashMap<>(tags));
         }
         if (description != null) {
             ss.setDescription(description);
@@ -372,7 +374,18 @@ public class StackSetService implements PassedRoleLookup {
         getStackSetOrThrow(name);
         String prefix = name + "::";
         return autoDeploymentTargets.scan(key -> key.startsWith(prefix)).stream()
-                .sorted(java.util.Comparator.comparing(StackSetAutoDeploymentTarget::getOrganizationalUnitId))
+                .sorted(Comparator.comparing(StackSetAutoDeploymentTarget::getOrganizationalUnitId))
+                .toList();
+    }
+
+    /**
+     * The organization root and OU ids a service-managed stack set targets, as DescribeStackSet's
+     * {@code OrganizationalUnitIds} lists them: every target {@code CreateStackInstances} named that still
+     * has a Region.
+     */
+    public List<String> organizationalUnitIds(String name) {
+        return listStackSetAutoDeploymentTargets(name).stream()
+                .map(StackSetAutoDeploymentTarget::getOrganizationalUnitId)
                 .toList();
     }
 
@@ -719,6 +732,21 @@ public class StackSetService implements PassedRoleLookup {
         boolean anyFailed = deployedInstances.stream()
                 .anyMatch(i -> "FAILED".equals(i.getDetailedStatus()));
         return anyFailed ? "FAILED" : "SUCCEEDED";
+    }
+
+    /**
+     * Refuses a body that is no template, or a template holding a null value, before the stack set
+     * stores it, as CreateStackSet and UpdateStackSet do (measured, eu-west-1, 2026-10-20 and
+     * 2026-10-21). StackSets passes CloudFormation's message on with the details of the service
+     * exception it came in.
+     */
+    private void requireValidTemplate(String templateBody) {
+        try {
+            cfnService.requireValidTemplate(templateBody);
+        } catch (AwsException e) {
+            throw new AwsException(e.getErrorCode(), CloudFormationTemplateEngine.sdkErrorMessage(
+                    e.getMessage(), "AmazonCloudFormation", e.getHttpStatus(), e.getErrorCode()), e.getHttpStatus());
+        }
     }
 
     private StackSet getStackSetOrThrow(String name) {

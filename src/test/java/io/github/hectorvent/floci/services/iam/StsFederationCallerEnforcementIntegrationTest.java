@@ -36,6 +36,11 @@ class StsFederationCallerEnforcementIntegrationTest {
     private static final String ACCOUNT = "000000000000";
     private static final String ALLOW_STS = "{\"Version\":\"2012-10-17\",\"Statement\":["
             + "{\"Effect\":\"Allow\",\"Action\":\"sts:*\",\"Resource\":\"*\"}]}";
+    private static final String DENY_SESSION_TOKEN = "{\"Version\":\"2012-10-17\",\"Statement\":["
+            + "{\"Effect\":\"Deny\",\"Action\":\"sts:GetSessionToken\",\"Resource\":\"*\"}]}";
+    private static final String ALLOW_STS_DENY_FEDERATION_TOKEN = "{\"Version\":\"2012-10-17\",\"Statement\":["
+            + "{\"Effect\":\"Allow\",\"Action\":\"sts:*\",\"Resource\":\"*\"},"
+            + "{\"Effect\":\"Deny\",\"Action\":\"sts:GetFederationToken\",\"Resource\":\"*\"}]}";
 
     @Inject IamService iam;
     @RegisterExtension final PartitionCleanup cleanup = new PartitionCleanup();
@@ -91,6 +96,27 @@ class StsFederationCallerEnforcementIntegrationTest {
     }
 
     @Test
+    void getSessionTokenIsIssuedEvenWhenAPolicyExplicitlyDeniesIt() throws Exception {
+        Credentials user = userWithPolicy(DENY_SESSION_TOKEN);
+        remember(request(user, "GetSessionToken", Map.of()), "GetSessionToken");
+    }
+
+    @Test
+    void getSessionTokenIsIssuedWithoutAPolicyThatAllowsIt() throws Exception {
+        Credentials user = user(false);
+        remember(request(user, "GetSessionToken", Map.of()), "GetSessionToken");
+    }
+
+    @Test
+    void otherStsActionsStayDecidedByPolicies() throws Exception {
+        Credentials user = userWithPolicy(ALLOW_STS_DENY_FEDERATION_TOKEN);
+        request(user, "GetFederationToken", Map.of("Name", "still-denied")).then().statusCode(403)
+                .body("ErrorResponse.Error.Code", equalTo("AccessDenied"))
+                .body("ErrorResponse.Error.Message",
+                        equalTo("User is not authorized to perform: sts:GetFederationToken"));
+    }
+
+    @Test
     void federationSessionKeepsOtherIamAndStsRestrictions() throws Exception {
         Credentials issued = issue("GetFederationToken");
         request(issued, "ListUsers", Map.of()).then().statusCode(403)
@@ -118,13 +144,17 @@ class StsFederationCallerEnforcementIntegrationTest {
     }
 
     private Credentials user(boolean allowed) {
+        return userWithPolicy(allowed ? ALLOW_STS : null);
+    }
+
+    private Credentials userWithPolicy(String policyDocument) {
         String name = "fed-enforced-" + UUID.randomUUID();
         iam.createUser(name, "/");
         cleanup.register(() -> iam.deleteUser(name));
         AccessKey key = iam.createAccessKey(name);
         cleanup.register(() -> iam.deleteAccessKey(name, key.getAccessKeyId()));
-        if (allowed) {
-            iam.putUserPolicy(name, "sts", ALLOW_STS);
+        if (policyDocument != null) {
+            iam.putUserPolicy(name, "sts", policyDocument);
             cleanup.register(() -> iam.deleteUserPolicy(name, "sts"));
         }
         return new Credentials(key.getAccessKeyId(), key.getSecretAccessKey(), null);

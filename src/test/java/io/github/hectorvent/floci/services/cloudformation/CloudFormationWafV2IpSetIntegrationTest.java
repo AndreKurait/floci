@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.testing.CfnRequests;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
@@ -8,7 +10,7 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
-import static io.restassured.RestAssured.given;
+import static io.github.hectorvent.floci.testing.WafV2Requests.waf;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -29,8 +31,6 @@ class CloudFormationWafV2IpSetIntegrationTest {
 
     private static final String CFN_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/cloudformation/aws4_request";
-    private static final String WAF_JSON = "application/x-amz-json-1.1";
-    private static final String WAF_TARGET_PREFIX = "AWSWAF_20190729.";
 
     @BeforeAll
     static void configureRestAssured() {
@@ -45,6 +45,7 @@ class CloudFormationWafV2IpSetIntegrationTest {
         String nameB = "cfn-ipset-b-" + suffix;
 
         cfn("CreateStack", stackName, template(nameA, "\"192.0.2.1/32\""));
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         String created = describeStack(stackName)
             .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"))
             .extract().asString();
@@ -59,6 +60,7 @@ class CloudFormationWafV2IpSetIntegrationTest {
             .body("IPSet.Addresses", contains("192.0.2.1/32"));
 
         cfn("UpdateStack", stackName, template(nameA, "\"198.51.100.0/24\""));
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         String addressesUpdated = describeStack(stackName)
             .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
             .extract().asString();
@@ -68,6 +70,7 @@ class CloudFormationWafV2IpSetIntegrationTest {
         ipSet(nameA, id).body("IPSet.Addresses", contains("198.51.100.0/24"));
 
         cfn("UpdateStack", stackName, template(nameB, "\"198.51.100.0/24\""));
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         String replaced = describeStack(stackName)
             .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
             .body(not(containsString("ROLLBACK")))
@@ -108,6 +111,7 @@ class CloudFormationWafV2IpSetIntegrationTest {
 
         cfn("CreateStack", stackName, template);
 
+        CfnStackWaits.awaitStatus(stackName, "ROLLBACK_COMPLETE");
         describeStackEvents(stackName)
             .body(containsString("<ResourceStatus>CREATE_FAILED</ResourceStatus>"))
             .body(containsString(
@@ -139,6 +143,7 @@ class CloudFormationWafV2IpSetIntegrationTest {
                 """;
 
         cfn("CreateStack", stackName, template);
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         String created = describeStack(stackName)
             .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"))
             .extract().asString();
@@ -184,11 +189,7 @@ class CloudFormationWafV2IpSetIntegrationTest {
     }
 
     private void cfn(String action, String stackName, String template) {
-        RequestSpecification request = given()
-            .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", CFN_AUTH)
-            .formParam("Action", action)
-            .formParam("StackName", stackName);
+        RequestSpecification request = CfnRequests.cfn(action, stackName).header("Authorization", CFN_AUTH);
         if (template != null) {
             request.formParam("TemplateBody", template);
         }
@@ -196,11 +197,8 @@ class CloudFormationWafV2IpSetIntegrationTest {
     }
 
     private ValidatableResponse describeStack(String stackName) {
-        return given()
-            .contentType("application/x-www-form-urlencoded")
+        return CfnRequests.cfn("DescribeStacks", stackName)
             .header("Authorization", CFN_AUTH)
-            .formParam("Action", "DescribeStacks")
-            .formParam("StackName", stackName)
         .when()
             .post("/")
         .then()
@@ -208,11 +206,8 @@ class CloudFormationWafV2IpSetIntegrationTest {
     }
 
     private ValidatableResponse describeStackEvents(String stackName) {
-        return given()
-            .contentType("application/x-www-form-urlencoded")
+        return CfnRequests.cfn("DescribeStackEvents", stackName)
             .header("Authorization", CFN_AUTH)
-            .formParam("Action", "DescribeStackEvents")
-            .formParam("StackName", stackName)
         .when()
             .post("/")
         .then()
@@ -226,15 +221,5 @@ class CloudFormationWafV2IpSetIntegrationTest {
 
     private ValidatableResponse listIpSets() {
         return waf("ListIPSets", "{\"Scope\":\"REGIONAL\"}").statusCode(200);
-    }
-
-    private ValidatableResponse waf(String action, String body) {
-        return given()
-            .contentType(WAF_JSON)
-            .header("X-Amz-Target", WAF_TARGET_PREFIX + action)
-            .body(body)
-        .when()
-            .post("/")
-        .then();
     }
 }

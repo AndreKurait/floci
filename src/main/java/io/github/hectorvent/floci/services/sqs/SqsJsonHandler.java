@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
@@ -151,11 +152,16 @@ public class SqsJsonHandler {
 
     private Response handleListQueues(JsonNode request, String region) {
         String prefix = request.path("QueueNamePrefix").asText(null);
-        List<Queue> queues = sqsService.listQueues(prefix, region);
+        Integer maxResults = getOptionalIntField(request, "MaxResults");
+        String nextToken = request.path("NextToken").asText(null);
+        PaginatedResult<Queue> page = sqsService.listQueues(prefix, maxResults, nextToken, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode queueUrls = response.putArray("QueueUrls");
-        for (Queue q : queues) {
+        for (Queue q : page.items()) {
             queueUrls.add(q.getQueueUrl());
+        }
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
         }
         return Response.ok(response).build();
     }
@@ -253,7 +259,8 @@ public class SqsJsonHandler {
 
     private Response handleReceiveMessage(JsonNode request, String region) {
         String queueUrl = request.path("QueueUrl").asText(null);
-        int maxMessages = request.path("MaxNumberOfMessages").asInt(1);
+        Integer requestedMax = getOptionalIntField(request, "MaxNumberOfMessages");
+        int maxMessages = requestedMax == null ? 1 : requestedMax;
         int visibilityTimeout = request.path("VisibilityTimeout").asInt(-1);
         Integer waitTimeSeconds = getOptionalIntField(request, "WaitTimeSeconds");
 
@@ -606,7 +613,8 @@ public class SqsJsonHandler {
         if (node.isMissingNode() || node.isNull()) {
             return null;
         }
-        if (!node.isIntegralNumber()) {
+        // asInt() wraps a value outside the int range, so 4294967296 would read as 0.
+        if (!node.isIntegralNumber() || !node.canConvertToInt()) {
             throw new AwsException("InvalidParameterValue",
                     "Value for parameter " + paramName + " is invalid. Reason: Must be an integer.", 400);
         }

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.mockito.InjectSpy;
@@ -89,8 +90,7 @@ class CloudFormationNestedStackLeftoverIntegrationTest {
             assertTrue(reason.contains("Network"), reason);
             failSubnetDeletes.set(false);
 
-            request("ContinueUpdateRollback", "StackName", stack, "ResourcesToSkip.member.1", "Network")
-                    .statusCode(200);
+            CfnStackWaits.continueUpdateRollback(stack, CFN_AUTH, "Network");
             CfnStackWaits.awaitStatus(stack, "UPDATE_ROLLBACK_COMPLETE");
             assertEquals(1, XmlParser.extractAll(ec2("DescribeSubnets", "Filter.1.Name", "vpc-id",
                     "Filter.1.Value.1", created.get("Vpc")).statusCode(200).extract().asString(), "subnetId")

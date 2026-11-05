@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
@@ -18,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -47,12 +49,45 @@ import static org.mockito.Mockito.when;
 class ApiGatewayExecuteControllerTest {
 
     private static ApiGatewayExecuteController controller(ObjectMapper objectMapper) {
+        return controller(objectMapper, new ApiGatewayExecuteRouteContext());
+    }
+
+    private static ApiGatewayExecuteController controller(ObjectMapper objectMapper,
+                                                         ApiGatewayExecuteRouteContext routeContext) {
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
         return new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, objectMapper, null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null);
+                null, null, null, null, routeContext, null, null, null, null, null, null);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "/index/a%25b", "/index/a%2Fb", "/index/a%252Fb", "/index/a//b", "/index/a/./b", "/index/a/../b"
+    })
+    void recordedRewritePathTakesPrecedenceOverTheEscapedRoutingUri(String resourcePath) {
+        ApiGatewayExecuteRouteContext routeContext = new ApiGatewayExecuteRouteContext();
+        String intendedPath = "/execute-api/api1/prod" + resourcePath;
+        routeContext.recordSignedRequestPath("/public" + resourcePath);
+        routeContext.recordRewrittenRequestPath(intendedPath);
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566"
+                + intendedPath.replace("%", "%25")));
+        ApiGatewayExecuteController controller = controller(new ObjectMapper(), routeContext);
+
+        assertEquals(intendedPath, controller.rawRequestPath(uriInfo));
+        assertEquals(resourcePath,
+                ApiGatewayExecuteController.rawStagelessPath(resourcePath, controller.rawRequestPath(uriInfo)));
+        assertEquals("/public" + resourcePath, routeContext.signedRequestPath());
+    }
+
+    @Test
+    void pathStyleRequestsUseTheRawUriPathWhenNoRewriteWasRecorded() {
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost:4566/execute-api/api1/prod/a%2525b"));
+
+        assertEquals("/execute-api/api1/prod/a%2525b", controller(new ObjectMapper()).rawRequestPath(uriInfo));
     }
 
     @Test
@@ -372,6 +407,19 @@ class ApiGatewayExecuteControllerTest {
         assertEquals("application/json", response.getMediaType().toString());
     }
 
+    @ParameterizedTest(name = "payload format {0}")
+    @ValueSource(strings = {"1.0", "2.0"})
+    void buildProxyResponseAnswersTextPlainWhenAnHttpApiResultHasNoContentType(String format) {
+        // Measured on HTTP APIs (eu-west-1, 2026-10-19): a result with a statusCode and a body but
+        // no Content-Type header of its own is answered text/plain; charset=utf-8, in both payload
+        // formats. A REST API keeps answering application/json.
+        ApiGatewayExecuteController controller = controller(new ObjectMapper());
+        Response response = controller.buildProxyResponse(proxyPayload("""
+                {"statusCode":200,"headers":{"X-Other":"value"},"body":"hello"}
+                """), true, "2.0".equals(format));
+        assertEquals(MediaType.valueOf("text/plain; charset=utf-8"), response.getMediaType());
+    }
+
     @Test
     void buildProxyResponseDefaultsToJsonWhenContentTypeIsJsonNull() {
         // A JSON-null Content-Type must fall back to the default, the same as a missing header —
@@ -442,7 +490,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null);
 
         Response response = controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -474,7 +522,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null, null);
 
         controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -509,7 +557,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null);
 
         controller.dispatch("GET", "restapi1", "prod", "hello", headers, null, null);
 
@@ -752,7 +800,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = controller(new ObjectMapper());
         assertEnglishUtcTimeUnderNonUtcHost(() -> controller.buildRequestAuthorizerEventV2("GET", "/items",
                 "GET /items", "api1", "$default", "us-east-1", emptyHeaders(),
-                uriInfoFor("http://localhost/items"), null));
+                uriInfoFor("http://localhost/items"), null).toString());
     }
 
     private static HttpHeaders emptyHeaders() {

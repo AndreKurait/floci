@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
+import io.github.hectorvent.floci.services.elasticache.ElastiCacheTagResourceArn.TagResourceRef;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerHandle;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
 import io.github.hectorvent.floci.services.elasticache.container.ValkeyClusterFormation;
@@ -31,6 +32,7 @@ import io.github.hectorvent.floci.services.elasticache.model.Endpoint;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupSettings;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupStatus;
+import io.github.hectorvent.floci.services.elasticache.model.TransitEncryption;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheAuthProxy;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheProxyManager;
 import io.github.hectorvent.floci.services.kms.KmsService;
@@ -70,6 +72,8 @@ public class ElastiCacheService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(ElastiCacheService.class);
 
+    private static final Pattern USER_ID_PATTERN =
+            Pattern.compile("^[a-zA-Z][a-zA-Z0-9-]{0,127}$");
     private final AccountAwareStorageBackend<ReplicationGroup> groups;
     private final AccountAwareStorageBackend<CacheCluster> cacheClusters;
     /**
@@ -79,6 +83,7 @@ public class ElastiCacheService implements ResourceProvider {
      * is one namespace whatever engine claims it, and only a reader of both can say it is free.
      */
     private final StorageBackend<String, CacheCluster> memcachedClusters;
+    private static final String DEFAULT_USER_ID = "default";
     private final AccountAwareStorageBackend<ElastiCacheUser> users;
     private final AccountAwareStorageBackend<ElastiCacheUserGroup> userGroups;
     private final AccountAwareStorageBackend<CacheParameterGroup> parameterGroups;
@@ -221,6 +226,11 @@ public class ElastiCacheService implements ResourceProvider {
         ReplicationGroupSettings settings = request.settings() != null
                 ? request.settings() : ReplicationGroupSettings.defaults();
         settings.validate();
+        // In AWS ElastiCache, auth tokens require in-transit encryption.
+        // Issue #4502: Reject upfront before provisioning rather than creating plaintext cache.
+        requireTransitEncryptionWithAuthToken(request.authMode(), request.authToken(),
+                settings.transitEncryptionEnabled());
+        settings.validateTransitEncryption(effectiveTransitEncryption(request));
         // resolved with the other validations, before a port is taken or a container started
         ReplicationGroupSettings resolvedSettings =
                 settings.withKmsKeyId(resolveKmsKeyArn(settings.kmsKeyId(), request.region()));
@@ -232,6 +242,30 @@ public class ElastiCacheService implements ResourceProvider {
         }
     }
 
+    static boolean isEngineVersionAtLeast(String version, String required) {
+        if (version == null || version.isBlank()) {
+            return true;
+        }
+        String[] vParts = version.split("\\.");
+        String[] rParts = required.split("\\.");
+        int max = Math.max(vParts.length, rParts.length);
+        for (int i = 0; i < max; i++) {
+            int v = i < vParts.length ? parseVersionPart(vParts[i]) : 0;
+            int r = i < rParts.length ? parseVersionPart(rParts[i]) : 0;
+            if (v != r) {
+                return v > r;
+            }
+        }
+        return true;
+    }
+
+    private static int parseVersionPart(String s) {
+        try {
+            return Integer.parseInt(s.replaceAll("\\D.*", ""));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
     /**
      * Checks the user groups a create names and marks them in use until the create finishes,
      * under {@link #userGroupLock} so the check and the claim cannot straddle a DeleteUserGroup.
@@ -241,11 +275,13 @@ public class ElastiCacheService implements ResourceProvider {
             return List.of();
         }
         String engine = engineFor(request);
+        String engineVersion = request.engineVersion() != null ? request.engineVersion() : defaultEngineVersion(engine);
+        boolean transitEncrypted = effectiveTransitEncryption(request);
         synchronized (userGroupLock) {
             List<String> reserved = new ArrayList<>();
             for (String userGroupId : request.userGroupIds()) {
                 ElastiCacheUserGroup userGroup = getUserGroup(userGroupId);
-                requireAssociable(userGroup, request.authMode() != null && request.authMode() != AuthMode.NO_AUTH, engine);
+                requireAssociable(userGroup, transitEncrypted, engine, engineVersion);
                 reserved.add(userGroupReservationKey(userGroup.getUserGroupId()));
             }
             reserved.forEach(key -> reservedUserGroups.merge(key, 1, Integer::sum));
@@ -286,6 +322,15 @@ public class ElastiCacheService implements ResourceProvider {
             }
 
             try {
+                String engine = engineFor(request);
+                String engineVersion = request.engineVersion() != null ? request.engineVersion() : defaultEngineVersion(engine);
+                if (request.authMode() == AuthMode.IAM) {
+                    requireIamEngineVersionCompatible(engine, engineVersion);
+                    if (!isTransitEncryptionRequested(request)) {
+                        throw new AwsException("InvalidParameterCombination",
+                                "Transit encryption must be enabled to use IAM authentication.", 400);
+                    }
+                }
                 if (resolveClusterEnabled(request)) {
                     return provisionClusterModeGroup(request, resolvedSettings);
                 }
@@ -373,7 +418,16 @@ public class ElastiCacheService implements ResourceProvider {
             }
 
             synchronized (lockFor("rg:" + groupId)) {
-                groups.put(groupId, group);
+                // Re-verify under userGroupLock immediately before publishing to close race window (#4502)
+                synchronized (userGroupLock) {
+                    if (group.getUserGroupIds() != null) {
+                        for (String userGroupId : group.getUserGroupIds()) {
+                            ElastiCacheUserGroup userGroup = getUserGroup(userGroupId);
+                            requireAssociable(userGroup, group.isEncryptedInTransit(), group.getEngine(), group.getEngineVersion());
+                        }
+                    }
+                    groups.put(groupId, group);
+                }
                 if (handle != null) {
                     proxyManager.startProxy(groupId, authMode, proxyPort,
                             handle.getHost(), handle.getPort(),
@@ -474,7 +528,16 @@ public class ElastiCacheService implements ResourceProvider {
             group.setClusterNodes(nodes);
             applyCommonAttributes(group, request, resolvedSettings);
 
-            groups.put(groupId, group);
+            // Re-verify under userGroupLock immediately before publishing to close race window (#4502)
+            synchronized (userGroupLock) {
+                if (group.getUserGroupIds() != null) {
+                    for (String userGroupId : group.getUserGroupIds()) {
+                        ElastiCacheUserGroup userGroup = getUserGroup(userGroupId);
+                        requireAssociable(userGroup, group.isEncryptedInTransit(), group.getEngine(), group.getEngineVersion());
+                    }
+                }
+                groups.put(groupId, group);
+            }
             LOG.infov("Cluster-mode replication group {0} created, configuration endpoint={1}:{2}",
                     groupId, endpointHost, String.valueOf(configurationEndpoint.port()));
             return group;
@@ -509,6 +572,28 @@ public class ElastiCacheService implements ResourceProvider {
         if (request.tags() != null && !request.tags().isEmpty()) {
             group.setTags(new LinkedHashMap<>(request.tags()));
         }
+    }
+
+    private static boolean isTransitEncryptionRequested(CreateReplicationGroupRequest request) {
+        return request.settings() != null && Boolean.TRUE.equals(request.settings().transitEncryptionEnabled());
+    }
+
+    private static void requireTransitEncryptionWithAuthToken(AuthMode authMode, String authToken,
+                                                              Boolean transitEncryptionEnabled) {
+        boolean hasAuthToken = (authToken != null && !authToken.isBlank())
+                || authMode == AuthMode.PASSWORD;
+        if (hasAuthToken && Boolean.FALSE.equals(transitEncryptionEnabled)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Transit encryption must be enabled to use an auth token.", 400);
+        }
+    }
+
+    private static boolean effectiveTransitEncryption(CreateReplicationGroupRequest request) {
+        if (request.settings() != null && request.settings().transitEncryptionEnabled() != null) {
+            return request.settings().transitEncryptionEnabled();
+        }
+        return request.authMode() == AuthMode.PASSWORD
+                || (request.authToken() != null && !request.authToken().isBlank());
     }
 
     private String engineFor(CreateReplicationGroupRequest request) {
@@ -1267,7 +1352,66 @@ public class ElastiCacheService implements ResourceProvider {
             String ipDiscovery,
             Boolean atRestEncryptionEnabled,
             String region,
-            Map<String, String> tags) {
+            Map<String, String> tags,
+            Boolean autoMinorVersionUpgrade,
+            Boolean transitEncryptionEnabled) {
+
+        public CreateCacheClusterRequest(
+                String cacheClusterId,
+                String engine,
+                String engineVersion,
+                String cacheNodeType,
+                Integer numCacheNodes,
+                Integer port,
+                AuthMode authMode,
+                String authToken,
+                String cacheParameterGroupName,
+                String cacheSubnetGroupName,
+                Integer snapshotRetentionLimit,
+                String snapshotWindow,
+                String preferredMaintenanceWindow,
+                String preferredAvailabilityZone,
+                List<String> securityGroupIds,
+                String networkType,
+                String ipDiscovery,
+                Boolean atRestEncryptionEnabled,
+                String region,
+                Map<String, String> tags) {
+            this(cacheClusterId, engine, engineVersion, cacheNodeType, numCacheNodes, port,
+                    authMode, authToken, cacheParameterGroupName, cacheSubnetGroupName,
+                    snapshotRetentionLimit, snapshotWindow, preferredMaintenanceWindow,
+                    preferredAvailabilityZone, securityGroupIds, networkType, ipDiscovery,
+                    atRestEncryptionEnabled, region, tags, null, null);
+        }
+
+        public CreateCacheClusterRequest(
+                String cacheClusterId,
+                String engine,
+                String engineVersion,
+                String cacheNodeType,
+                Integer numCacheNodes,
+                Integer port,
+                AuthMode authMode,
+                String authToken,
+                String cacheParameterGroupName,
+                String cacheSubnetGroupName,
+                Integer snapshotRetentionLimit,
+                String snapshotWindow,
+                String preferredMaintenanceWindow,
+                String preferredAvailabilityZone,
+                List<String> securityGroupIds,
+                String networkType,
+                String ipDiscovery,
+                Boolean atRestEncryptionEnabled,
+                String region,
+                Map<String, String> tags,
+                Boolean autoMinorVersionUpgrade) {
+            this(cacheClusterId, engine, engineVersion, cacheNodeType, numCacheNodes, port,
+                    authMode, authToken, cacheParameterGroupName, cacheSubnetGroupName,
+                    snapshotRetentionLimit, snapshotWindow, preferredMaintenanceWindow,
+                    preferredAvailabilityZone, securityGroupIds, networkType, ipDiscovery,
+                    atRestEncryptionEnabled, region, tags, autoMinorVersionUpgrade, null);
+        }
     }
 
     public CacheCluster createCacheCluster(CreateCacheClusterRequest request) {
@@ -1333,6 +1477,10 @@ public class ElastiCacheService implements ResourceProvider {
             throw new AwsException("InvalidParameterValue",
                     "NumCacheNodes should be 1 if engine is " + engine, 400);
         }
+        // In AWS ElastiCache, auth tokens require in-transit encryption.
+        // Issue #4502: Reject upfront before provisioning rather than creating plaintext cache.
+        requireTransitEncryptionWithAuthToken(request.authMode(), request.authToken(),
+                request.transitEncryptionEnabled());
         // The snapshot members take the replication group's checks, so one request worded one way
         // is refused the same way whichever action carries it.
         cacheClusterSettings(request).validate();
@@ -1497,6 +1645,8 @@ public class ElastiCacheService implements ResourceProvider {
         cluster.setIpDiscovery(request.ipDiscovery() != null && !request.ipDiscovery().isBlank()
                 ? request.ipDiscovery() : "ipv4");
         cluster.setAtRestEncryptionEnabled(Boolean.TRUE.equals(request.atRestEncryptionEnabled()));
+        cluster.setTransitEncryptionEnabled(request.transitEncryptionEnabled());
+        cluster.setAutoMinorVersionUpgrade(request.autoMinorVersionUpgrade());
         if (request.securityGroupIds() != null && !request.securityGroupIds().isEmpty()) {
             cluster.setSecurityGroupIds(new ArrayList<>(request.securityGroupIds()));
         }
@@ -1628,8 +1778,18 @@ public class ElastiCacheService implements ResourceProvider {
         if (cluster.getServerlessCacheName() == null) {
             proxyManager.startProxy(cluster.getCacheClusterId(), cluster.getAuthMode(),
                     cluster.getConfigurationEndpoint().port(), handle.getHost(), handle.getPort(),
-                    (username, password) -> validateCacheClusterPassword(
-                            accountId, cluster.getCacheClusterId(), username, password));
+                    new ElastiCacheAuthProxy.PasswordValidator() {
+                        @Override
+                        public boolean validatePassword(String username, String password) {
+                            return validateCacheClusterPassword(accountId, cluster.getCacheClusterId(), username, password);
+                        }
+
+                        @Override
+                        public TransitEncryption transitEncryption() {
+                            return cluster.isEncryptedInTransit()
+                                    ? TransitEncryption.REQUIRED : TransitEncryption.NONE;
+                        }
+                    });
         } else {
             proxyManager.startProxy(cluster.getCacheClusterId(), AuthMode.NO_AUTH,
                     cluster.getConfigurationEndpoint().port(), handle.getHost(), handle.getPort(),
@@ -1641,7 +1801,7 @@ public class ElastiCacheService implements ResourceProvider {
         String id = original.getCacheClusterId();
         String account = original.getOwnerAccountId();
         return new ElastiCacheAuthProxy.PasswordValidator() {
-            private ElastiCacheUser member(String username) {
+            private ElastiCacheUser member(String username, boolean requireEnabled) {
                 String name = username == null || username.isEmpty() ? "default" : username;
                 synchronized (users) {
                     CacheCluster cluster = cacheClusters.getForAccount(account, id).orElse(null);
@@ -1653,14 +1813,14 @@ public class ElastiCacheService implements ResourceProvider {
                         return null;
                     }
                     return group.getUserIds().stream().map(userId -> users.getForAccount(account, userId).orElse(null))
-                            .filter(user -> user != null && name.equals(user.getUserName()) && user.isEnabled())
+                            .filter(user -> user != null && name.equals(user.getUserName()) && (!requireEnabled || user.isEnabled()))
                             .findFirst().orElse(null);
                 }
             }
 
             @Override
             public boolean validatePassword(String username, String password) {
-                ElastiCacheUser user = member(username);
+                ElastiCacheUser user = member(username, true);
                 return user != null && (user.getAuthMode() == AuthMode.NO_AUTH
                         || user.getAuthMode() == AuthMode.PASSWORD && user.getPasswords().contains(password));
             }
@@ -1673,8 +1833,19 @@ public class ElastiCacheService implements ResourceProvider {
 
             @Override
             public AuthMode memberAuthMode(String username) {
-                ElastiCacheUser user = member(username);
+                ElastiCacheUser user = member(username, true);
                 return user == null ? null : user.getAuthMode();
+            }
+
+            @Override
+            public TransitEncryption transitEncryption() {
+                return TransitEncryption.REQUIRED;
+            }
+
+            @Override
+            public String accessString(String username) {
+                ElastiCacheUser user = member(username, false);
+                return user == null ? null : user.getAccessString();
             }
 
             @Override
@@ -1736,7 +1907,7 @@ public class ElastiCacheService implements ResourceProvider {
     public ReplicationGroup modifyReplicationGroup(String groupId, List<String> userGroupIdsToAdd,
                                                     List<String> userGroupIdsToRemove,
                                                     ReplicationGroupSettings settings) {
-        return modifyReplicationGroup(groupId, userGroupIdsToAdd, userGroupIdsToRemove, false, false, settings);
+        return modifyReplicationGroup(groupId, userGroupIdsToAdd, userGroupIdsToRemove, false, false, settings, null);
     }
 
     /**
@@ -1744,14 +1915,28 @@ public class ElastiCacheService implements ResourceProvider {
      * {@code deleteAuthToken} is AuthTokenUpdateStrategy DELETE, which AWS allows only when the
      * cache moves to user groups. A cache whose last user group goes has no access control, as
      * on AWS, unless it kept an auth token by joining user groups without the DELETE.
+     * {@code securityGroupIds} replaces the whole stored list; a null leaves the memberships
+     * untouched, which is what a request that names none means.
      */
     public ReplicationGroup modifyReplicationGroup(String groupId, List<String> userGroupIdsToAdd,
                                                     List<String> userGroupIdsToRemove,
                                                     boolean removeUserGroups, boolean deleteAuthToken,
-                                                    ReplicationGroupSettings settings) {
+                                                    ReplicationGroupSettings settings,
+                                                    List<String> securityGroupIds) {
         settings.validate();
         synchronized (lockFor("rg:" + groupId)) {
             ReplicationGroup group = getReplicationGroup(groupId);
+            boolean encryptedInTransit = settings.transitEncryptionEnabled() != null
+                    ? settings.transitEncryptionEnabled() : group.isEncryptedInTransit();
+            settings.validateTransitEncryption(encryptedInTransit);
+            if (!group.isEncryptedInTransit() && encryptedInTransit
+                    && !"preferred".equals(settings.transitEncryptionMode())) {
+                throw new AwsException("InvalidParameterCombination",
+                        "TransitEncryptionMode must be preferred when enabling transit encryption.", 400);
+            }
+            if (group.isEncryptedInTransit() && !encryptedInTransit) {
+                throw new AwsException("InvalidParameterCombination", "Transit encryption cannot be disabled.", 400);
+            }
             // every check before any change: the store hands out its own object, so a mutation
             // made before a later refusal would stay visible
             synchronized (userGroupLock) {
@@ -1761,9 +1946,17 @@ public class ElastiCacheService implements ResourceProvider {
                     for (String id : userGroupIdsToAdd) {
                         Optional<ElastiCacheUserGroup> userGroup = userGroups.get(normalizeUserGroupId(id));
                         if (userGroup.isPresent()) {
-                            requireAssociable(userGroup.get(), group.isEncryptedInTransit(), group.getEngine());
+                            requireAssociable(userGroup.get(), encryptedInTransit, group.getEngine(), group.getEngineVersion());
                             userGroupsToAdd.add(userGroup.get().getUserGroupId());
-                        } else if (users.get(id).isPresent()) {
+                        } else if (findUser(id).isPresent()) {
+                            ElastiCacheUser u = findUser(id).get();
+                            if (u.getAuthMode() == AuthMode.IAM) {
+                                if (!encryptedInTransit) {
+                                    throw new AwsException("InvalidParameterCombination",
+                                            "Transit encryption must be enabled to use IAM authentication.", 400);
+                                }
+                                requireIamEngineVersionCompatible(group.getEngine(), group.getEngineVersion());
+                            }
                             directUsersToAdd.add(id);
                         } else {
                             throw userGroupNotFound(id);
@@ -1789,7 +1982,7 @@ public class ElastiCacheService implements ResourceProvider {
                 }
                 Set<String> seenUserNames = new HashSet<>();
                 for (String userId : nextUserIds) {
-                    ElastiCacheUser u = users.get(userId).orElse(null);
+                    ElastiCacheUser u = findUser(userId).orElse(null);
                     if (u != null && !seenUserNames.add(u.getUserName())) {
                         throw new AwsException("DuplicateUserName",
                                 "Duplicate user name " + u.getUserName() + " in user group.", 400);
@@ -1797,6 +1990,7 @@ public class ElastiCacheService implements ResourceProvider {
                 }
 
                 boolean hadUserGroups = !group.getUserGroupIds().isEmpty();
+                boolean tookUnencrypted = group.transitEncryption() != TransitEncryption.REQUIRED;
                 settings.applyTo(group);
                 group.setUserGroupIds(nextUserGroupIds);
                 group.getAssociatedUserIds().addAll(directUsersToAdd);
@@ -1806,14 +2000,28 @@ public class ElastiCacheService implements ResourceProvider {
                 if (deleteAuthToken) {
                     group.setAuthToken(null);
                 }
+                if (securityGroupIds != null) {
+                    group.setSecurityGroupIds(securityGroupIds);
+                }
                 if (hadUserGroups && nextUserGroupIds.isEmpty()) {
                     group.setTransitEncryptionEnabled(group.isEncryptedInTransit());
                     group.setAuthMode(group.getAuthToken() != null ? AuthMode.PASSWORD : AuthMode.NO_AUTH);
                 }
 
                 groups.put(groupId, group);
+                if (tookUnencrypted && group.transitEncryption() == TransitEncryption.REQUIRED) {
+                    dropUnencryptedConnections(group);
+                }
                 return group;
             }
+        }
+    }
+
+    /** Required transit encryption drops every unencrypted connection, the node endpoints' included. */
+    private void dropUnencryptedConnections(ReplicationGroup group) {
+        proxyManager.dropUnencryptedConnections(group.getReplicationGroupId());
+        for (ClusterNode node : group.getClusterNodes()) {
+            proxyManager.dropUnencryptedConnections(node.getMemberClusterId());
         }
     }
 
@@ -1848,7 +2056,16 @@ public class ElastiCacheService implements ResourceProvider {
 
     public ElastiCacheUser createUser(String userId, String userName, AuthMode authMode,
                                       List<String> passwords, String accessString, String engine) {
-        if (users.get(userId).isPresent()) {
+        return createUser(userId, userName, authMode, passwords, accessString, engine, Map.of());
+    }
+
+    public ElastiCacheUser createUser(String userId, String userName, AuthMode authMode,
+                                      List<String> passwords, String accessString, String engine,
+                                      Map<String, String> tags) {
+        if (authMode == AuthMode.IAM) {
+            validateIamUser(userId, userName);
+        }
+        if (findUser(userId).isPresent()) {
             throw new AwsException("UserAlreadyExists",
                     "User " + userId + " already exists.", 400);
         }
@@ -1862,25 +2079,243 @@ public class ElastiCacheService implements ResourceProvider {
                 accessString != null ? accessString : "on ~* +@all",
                 normalizedEngine, "active", Instant.now());
         user.setArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(), "user:" + userId));
+        user.setTags(tags);
 
         users.put(userId, user);
         LOG.infov("ElastiCache user {0} created with authMode={1}", userId, authMode);
         return user;
     }
 
+    public Map<String, String> addTagsToResource(String resourceArn, Map<String, String> tags,
+                                                  String region) {
+        TagResourceRef ref = ElastiCacheTagResourceArn.parse(resourceArn, region, regionResolver);
+        return switch (ref.type()) {
+            case "user" -> updateUserTags(ref, tags);
+            case "usergroup" -> updateUserGroupTags(ref, tags);
+            case "replicationgroup" -> updateReplicationGroupTags(ref, tags);
+            case "cluster" -> updateCacheClusterTags(ref, tags);
+            case "subnetgroup" -> updateCacheSubnetGroupTags(ref, tags);
+            case "parametergroup" -> updateCacheParameterGroupTags(ref, tags);
+            default -> throw ElastiCacheTagResourceArn.invalid(resourceArn);
+        };
+    }
+
+    public Map<String, String> removeTagsFromResource(String resourceArn, List<String> tagKeys,
+                                                       String region) {
+        TagResourceRef ref = ElastiCacheTagResourceArn.parse(resourceArn, region, regionResolver);
+        return switch (ref.type()) {
+            case "user" -> removeUserTags(ref, tagKeys);
+            case "usergroup" -> removeUserGroupTags(ref, tagKeys);
+            case "replicationgroup" -> removeReplicationGroupTags(ref, tagKeys);
+            case "cluster" -> removeCacheClusterTags(ref, tagKeys);
+            case "subnetgroup" -> removeCacheSubnetGroupTags(ref, tagKeys);
+            case "parametergroup" -> removeCacheParameterGroupTags(ref, tagKeys);
+            default -> throw ElastiCacheTagResourceArn.invalid(resourceArn);
+        };
+    }
+
+    private Map<String, String> updateUserTags(TagResourceRef ref, Map<String, String> tags) {
+        synchronized (userGroupLock) {
+            ElastiCacheUser user = getUser(ref.id());
+            requireResourceArn(user.getArn(), ref.resourceArn(), "UserNotFound", ref.id());
+            user.getTags().putAll(tags);
+            users.put(ref.id(), user);
+            return new LinkedHashMap<>(user.getTags());
+        }
+    }
+
+    private Map<String, String> removeUserTags(TagResourceRef ref, List<String> tagKeys) {
+        synchronized (userGroupLock) {
+            ElastiCacheUser user = getUser(ref.id());
+            requireResourceArn(user.getArn(), ref.resourceArn(), "UserNotFound", ref.id());
+            tagKeys.forEach(user.getTags()::remove);
+            users.put(ref.id(), user);
+            return new LinkedHashMap<>(user.getTags());
+        }
+    }
+
+    private Map<String, String> updateUserGroupTags(TagResourceRef ref, Map<String, String> tags) {
+        synchronized (userGroupLock) {
+            ElastiCacheUserGroup userGroup = getUserGroup(ref.id());
+            requireResourceArn(userGroup.getArn(), ref.resourceArn(), "UserGroupNotFound", ref.id());
+            userGroup.getTags().putAll(tags);
+            userGroups.put(userGroup.getUserGroupId(), userGroup);
+            return new LinkedHashMap<>(userGroup.getTags());
+        }
+    }
+
+    private Map<String, String> removeUserGroupTags(TagResourceRef ref, List<String> tagKeys) {
+        synchronized (userGroupLock) {
+            ElastiCacheUserGroup userGroup = getUserGroup(ref.id());
+            requireResourceArn(userGroup.getArn(), ref.resourceArn(), "UserGroupNotFound", ref.id());
+            tagKeys.forEach(userGroup.getTags()::remove);
+            userGroups.put(userGroup.getUserGroupId(), userGroup);
+            return new LinkedHashMap<>(userGroup.getTags());
+        }
+    }
+
+    private Map<String, String> updateReplicationGroupTags(TagResourceRef ref, Map<String, String> tags) {
+        synchronized (lockFor("rg:" + ref.id())) {
+            ReplicationGroup group = getReplicationGroup(ref.id());
+            requireResourceArn(group.getArn(), ref.resourceArn(), "ReplicationGroupNotFoundFault", ref.id());
+            group.getTags().putAll(tags);
+            groups.put(ref.id(), group);
+            return new LinkedHashMap<>(group.getTags());
+        }
+    }
+
+    private Map<String, String> removeReplicationGroupTags(TagResourceRef ref, List<String> tagKeys) {
+        synchronized (lockFor("rg:" + ref.id())) {
+            ReplicationGroup group = getReplicationGroup(ref.id());
+            requireResourceArn(group.getArn(), ref.resourceArn(), "ReplicationGroupNotFoundFault", ref.id());
+            tagKeys.forEach(group.getTags()::remove);
+            groups.put(ref.id(), group);
+            return new LinkedHashMap<>(group.getTags());
+        }
+    }
+
+    private Map<String, String> updateCacheClusterTags(TagResourceRef ref, Map<String, String> tags) {
+        synchronized (lockFor("cc:" + ref.id())) {
+            StorageBackend<String, CacheCluster> store = cacheClusters.get(ref.id()).isPresent()
+                    ? cacheClusters : memcachedClusters;
+            CacheCluster cluster = store.get(ref.id())
+                    .filter(value -> value.getServerlessCacheName() == null)
+                    .orElseThrow(() -> new AwsException("CacheClusterNotFound",
+                            "Cache cluster " + ref.id() + " not found.", 404));
+            requireResourceArn(cluster.getArn(), ref.resourceArn(), "CacheClusterNotFound", ref.id());
+            cluster.getTags().putAll(tags);
+            store.put(ref.id(), cluster);
+            return new LinkedHashMap<>(cluster.getTags());
+        }
+    }
+
+    private Map<String, String> removeCacheClusterTags(TagResourceRef ref, List<String> tagKeys) {
+        synchronized (lockFor("cc:" + ref.id())) {
+            StorageBackend<String, CacheCluster> store = cacheClusters.get(ref.id()).isPresent()
+                    ? cacheClusters : memcachedClusters;
+            CacheCluster cluster = store.get(ref.id())
+                    .filter(value -> value.getServerlessCacheName() == null)
+                    .orElseThrow(() -> new AwsException("CacheClusterNotFound",
+                            "Cache cluster " + ref.id() + " not found.", 404));
+            requireResourceArn(cluster.getArn(), ref.resourceArn(), "CacheClusterNotFound", ref.id());
+            tagKeys.forEach(cluster.getTags()::remove);
+            store.put(ref.id(), cluster);
+            return new LinkedHashMap<>(cluster.getTags());
+        }
+    }
+
+    private Map<String, String> updateCacheSubnetGroupTags(TagResourceRef ref, Map<String, String> tags) {
+        synchronized (lockFor("sng:" + ref.id())) {
+            CacheSubnetGroup group = subnetGroups.get(ref.id()).orElseThrow(() ->
+                    new AwsException("CacheSubnetGroupNotFoundFault", "Cache subnet group " + ref.id() + " not found.", 400));
+            requireResourceArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(),
+                    "subnetgroup:" + ref.id()).toString(), ref.resourceArn(),
+                    "CacheSubnetGroupNotFoundFault", ref.id(), 400);
+            group.getTags().putAll(tags);
+            subnetGroups.put(ref.id(), group);
+            return new LinkedHashMap<>(group.getTags());
+        }
+    }
+
+    private Map<String, String> removeCacheSubnetGroupTags(TagResourceRef ref, List<String> tagKeys) {
+        synchronized (lockFor("sng:" + ref.id())) {
+            CacheSubnetGroup group = subnetGroups.get(ref.id()).orElseThrow(() ->
+                    new AwsException("CacheSubnetGroupNotFoundFault", "Cache subnet group " + ref.id() + " not found.", 400));
+            requireResourceArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(),
+                    "subnetgroup:" + ref.id()).toString(), ref.resourceArn(),
+                    "CacheSubnetGroupNotFoundFault", ref.id(), 400);
+            tagKeys.forEach(group.getTags()::remove);
+            subnetGroups.put(ref.id(), group);
+            return new LinkedHashMap<>(group.getTags());
+        }
+    }
+
+    private Map<String, String> updateCacheParameterGroupTags(TagResourceRef ref, Map<String, String> tags) {
+        synchronized (lockFor(ref.id())) {
+            CacheParameterGroup group = parameterGroups.get(ref.id()).orElseThrow(() ->
+                    new AwsException("CacheParameterGroupNotFound", "Cache parameter group " + ref.id() + " not found.", 404));
+            requireResourceArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(),
+                    "parametergroup:" + ref.id()).toString(), ref.resourceArn(),
+                    "CacheParameterGroupNotFound", ref.id());
+            group.getTags().putAll(tags);
+            parameterGroups.put(ref.id(), group);
+            return new LinkedHashMap<>(group.getTags());
+        }
+    }
+
+    private Map<String, String> removeCacheParameterGroupTags(TagResourceRef ref, List<String> tagKeys) {
+        synchronized (lockFor(ref.id())) {
+            CacheParameterGroup group = parameterGroups.get(ref.id()).orElseThrow(() ->
+                    new AwsException("CacheParameterGroupNotFound", "Cache parameter group " + ref.id() + " not found.", 404));
+            requireResourceArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(),
+                    "parametergroup:" + ref.id()).toString(), ref.resourceArn(),
+                    "CacheParameterGroupNotFound", ref.id());
+            tagKeys.forEach(group.getTags()::remove);
+            parameterGroups.put(ref.id(), group);
+            return new LinkedHashMap<>(group.getTags());
+        }
+    }
+
+    private static void requireResourceArn(String actualArn, String requestedArn, String errorCode, String id) {
+        requireResourceArn(actualArn, requestedArn, errorCode, id, 404);
+    }
+
+    private static void requireResourceArn(String actualArn, String requestedArn, String errorCode, String id,
+                                           int httpStatus) {
+        if (actualArn == null || !actualArn.equalsIgnoreCase(requestedArn)) {
+            throw new AwsException(errorCode, "Resource " + id + " not found.", httpStatus);
+        }
+    }
+
+    /**
+     * AWS provisions a built-in user with id and name {@code default} in every account; redis
+     * user groups must contain a user named default. Seeded on first touch of the user store.
+     *
+     * ponytail: users are keyed per account, not per region, so the ARN carries the region of the
+     * first request that seeded it; region-scope the user store if per-region ARNs matter.
+     */
+    private void ensureDefaultUser() {
+        if (users.get(DEFAULT_USER_ID).isPresent()) {
+            return;
+        }
+        // re-checked under the lock tag updates hold, so a racing seed cannot overwrite a tag just added
+        synchronized (userGroupLock) {
+            if (users.get(DEFAULT_USER_ID).isEmpty()) {
+                ElastiCacheUser user = new ElastiCacheUser(DEFAULT_USER_ID, DEFAULT_USER_ID, AuthMode.NO_AUTH,
+                        List.of(), "on ~* +@all", "redis", "active", Instant.now());
+                user.setArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(),
+                        "user:" + DEFAULT_USER_ID));
+                users.put(DEFAULT_USER_ID, user);
+            }
+        }
+    }
+
+    /** AWS: the built-in default user cannot be modified or deleted; a custom user named default can. */
+    private static void requireNotBuiltInDefault(String userId, String action) {
+        if (DEFAULT_USER_ID.equals(userId)) {
+            throw new AwsException("InvalidParameterValue", "The default user cannot be " + action + ".", 400);
+        }
+    }
+
+    private Optional<ElastiCacheUser> findUser(String userId) {
+        ensureDefaultUser();
+        return users.get(userId);
+    }
+
     public ElastiCacheUser getUser(String userId) {
-        return users.get(userId).orElseThrow(() ->
+        return findUser(userId).orElseThrow(() ->
                 new AwsException("UserNotFound", "User " + userId + " not found.", 404));
     }
 
     public Collection<ElastiCacheUser> listUsers(String filterUserId, String filterEngine) {
         // UserId wins when both filters are sent; AWS documents no interaction between them.
         if (filterUserId != null && !filterUserId.isBlank()) {
-            return users.get(filterUserId)
+            return findUser(filterUserId)
                     .map(List::of)
                     .orElseThrow(() -> new AwsException("UserNotFound",
                             "User " + filterUserId + " not found.", 404));
         }
+        ensureDefaultUser();
         if (filterEngine != null && !filterEngine.isBlank()) {
             return users.scan(k -> true).stream()
                     .filter(u -> filterEngine.equalsIgnoreCase(u.getEngine()))
@@ -1897,12 +2332,67 @@ public class ElastiCacheService implements ResourceProvider {
     public ElastiCacheUser modifyUser(String userId, AuthMode authMode, List<String> passwords,
                                       String accessString, String appendAccessString, String engine) {
         ElastiCacheUser user = getUser(userId);
+        requireNotBuiltInDefault(userId, "modified");
         // Storage backends hand back the live stored object, so validate everything
         // before the first setter — a rejected request must not leave changes behind.
         String normalizedEngine = (engine == null || engine.isBlank()) ? null : normalizeEngine(engine);
+        ElastiCacheUser modified = applyUserModification(userId, user, authMode, passwords, accessString,
+                appendAccessString, normalizedEngine);
+        if (accessString != null || appendAccessString != null) {
+            reapplyAccessString(userId, modified);
+        }
+        return modified;
+    }
+
+    /** Lets the open sessions of every cache the user can sign in to pick up its new access string. */
+    private void reapplyAccessString(String userId, ElastiCacheUser user) {
+        for (ReplicationGroup group : groups.scan(k -> true)) {
+            if (effectiveUserIds(groups.accountId(), group).contains(userId)) {
+                proxyManager.refreshUser(group.getReplicationGroupId(), user.getUserName());
+            }
+        }
+        for (CacheCluster cluster : cacheClusters.scan(k -> true)) {
+            if (cluster.getServerlessCacheName() != null && cluster.getUserGroupId() != null) {
+                String account = cluster.getOwnerAccountId() != null ? cluster.getOwnerAccountId() : cacheClusters.accountId();
+                ElastiCacheUserGroup group = userGroups.getForAccount(account,
+                        normalizeUserGroupId(cluster.getUserGroupId())).orElse(null);
+                if (group != null && group.getUserIds().contains(userId)) {
+                    proxyManager.refreshUser(cluster.getCacheClusterId(), user.getUserName());
+                }
+            }
+        }
+    }
+
+    private ElastiCacheUser applyUserModification(String userId, ElastiCacheUser user, AuthMode authMode,
+                                                  List<String> passwords, String accessString,
+                                                  String appendAccessString, String normalizedEngine) {
         synchronized (userGroupLock) {
             String nextEngine = normalizedEngine != null ? normalizedEngine : user.getEngine();
             AuthMode nextAuthMode = authMode != null ? authMode : user.getAuthMode();
+            if (nextAuthMode == AuthMode.IAM) {
+                validateIamUser(userId, user.getUserName());
+                for (ElastiCacheUserGroup userGroup : userGroups.scan(k -> true)) {
+                    if (userGroup.getUserIds().contains(userId)) {
+                        for (ReplicationGroup group : replicationGroupsUsing(userGroup.getUserGroupId())) {
+                            if (!group.isEncryptedInTransit()) {
+                                throw new AwsException("InvalidParameterCombination",
+                                        "Transit encryption must be enabled to use IAM authentication.", 400);
+                            }
+                            requireIamEngineVersionCompatible(group.getEngine(), group.getEngineVersion());
+                        }
+                    }
+                }
+                // Validate replication groups where user is directly associated (#4502)
+                for (ReplicationGroup group : groups.scan(k -> true)) {
+                    if (group.getAssociatedUserIds() != null && group.getAssociatedUserIds().contains(userId)) {
+                        if (!group.isEncryptedInTransit()) {
+                            throw new AwsException("InvalidParameterCombination",
+                                    "Transit encryption must be enabled to use IAM authentication.", 400);
+                        }
+                        requireIamEngineVersionCompatible(group.getEngine(), group.getEngineVersion());
+                    }
+                }
+            }
             if (!nextEngine.equals(user.getEngine()) || nextAuthMode != user.getAuthMode()) {
                 // the user must still satisfy every user group that holds it
                 for (ElastiCacheUserGroup userGroup : userGroups.scan(k -> true)) {
@@ -1932,9 +2422,10 @@ public class ElastiCacheService implements ResourceProvider {
     }
 
     public void deleteUser(String userId) {
-        if (users.get(userId).isEmpty()) {
+        if (findUser(userId).isEmpty()) {
             throw new AwsException("UserNotFound", "User " + userId + " not found.", 404);
         }
+        requireNotBuiltInDefault(userId, "deleted");
         synchronized (userGroupLock) {
             users.delete(userId);
             // AWS removes a deleted user from every user group it belongs to
@@ -1958,6 +2449,11 @@ public class ElastiCacheService implements ResourceProvider {
 
     public ElastiCacheUserGroup createUserGroup(String userGroupId, String engine, List<String> userIds,
                                                 String region) {
+        return createUserGroup(userGroupId, engine, userIds, region, Map.of());
+    }
+
+    public ElastiCacheUserGroup createUserGroup(String userGroupId, String engine, List<String> userIds,
+                                                String region, Map<String, String> tags) {
         String id = normalizeUserGroupId(userGroupId);
         // Engine is required on AWS; a missing value defaults to redis as CreateUser does.
         String normalizedEngine = (engine == null || engine.isBlank()) ? "redis" : normalizeEngine(engine);
@@ -1971,6 +2467,7 @@ public class ElastiCacheService implements ResourceProvider {
             ElastiCacheUserGroup userGroup = new ElastiCacheUserGroup(
                     id, normalizedEngine, members, "active", Instant.now());
             userGroup.setArn(regionResolver.buildArn("elasticache", region, "usergroup:" + id));
+            userGroup.setTags(tags);
             userGroups.put(id, userGroup);
             LOG.infov("ElastiCache user group {0} created with {1} users", id, members.size());
             return userGroup;
@@ -2022,6 +2519,15 @@ public class ElastiCacheService implements ResourceProvider {
                 }
                 for (String cacheEngine : userGroup.getServerlessCacheEngines().values()) {
                     requireEngineCompatible(newEngine, id, cacheEngine);
+                }
+            }
+            if (hasIamUser(members)) {
+                for (ReplicationGroup group : replicationGroupsUsing(id)) {
+                    if (!group.isEncryptedInTransit()) {
+                        throw new AwsException("InvalidParameterCombination",
+                                "Transit encryption must be enabled to use IAM authentication.", 400);
+                    }
+                    requireIamEngineVersionCompatible(group.getEngine(), group.getEngineVersion());
                 }
             }
             userGroup.setEngine(newEngine);
@@ -2144,13 +2650,63 @@ public class ElastiCacheService implements ResourceProvider {
     }
 
     /** RBAC needs in-transit encryption, and a valkey user group only serves valkey caches. */
-    private static void requireAssociable(ElastiCacheUserGroup userGroup, boolean encryptedInTransit, String engine) {
+    private void requireAssociable(ElastiCacheUserGroup userGroup, boolean encryptedInTransit, String engine, String engineVersion) {
+        if (hasIamUser(userGroup)) {
+            if (!encryptedInTransit) {
+                throw new AwsException("InvalidParameterCombination",
+                        "Transit encryption must be enabled to use IAM authentication.", 400);
+            }
+            requireIamEngineVersionCompatible(engine, engineVersion);
+        }
         if (!encryptedInTransit) {
             throw new AwsException("InvalidParameterCombination",
                     "User group " + userGroup.getUserGroupId()
                             + " can only be associated with a replication group that has in-transit encryption enabled.", 400);
         }
         requireEngineCompatible(userGroup.getEngine(), userGroup.getUserGroupId(), engine);
+    }
+
+    private boolean hasIamUser(Collection<String> userIds) {
+        if (userIds == null) {
+            return false;
+        }
+        for (String uid : userIds) {
+            ElastiCacheUser u = users.get(uid).orElse(null);
+            if (u != null && u.getAuthMode() == AuthMode.IAM) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasIamUser(ElastiCacheUserGroup userGroup) {
+        return userGroup != null && hasIamUser(userGroup.getUserIds());
+    }
+
+    private static void validateIamUser(String userId, String userName) {
+        if (!USER_ID_PATTERN.matcher(userId).matches()) {
+            throw new AwsException("InvalidParameterValue",
+                    "The parameter UserId must be between 1 and 128 characters long, must contain only letters, numbers, and hyphens, and must start with a letter.", 400);
+        }
+        if ("default".equalsIgnoreCase(userName)) {
+            throw new AwsException("InvalidParameterValue",
+                    "The default user cannot be configured to use IAM authentication.", 400);
+        }
+        if (!userId.equals(userName)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "UserId must be equal to UserName when AuthenticationMode Type is IAM.", 400);
+        }
+    }
+
+    private static void requireIamEngineVersionCompatible(String engine, String engineVersion) {
+        if ("redis".equalsIgnoreCase(engine) && !isEngineVersionAtLeast(engineVersion, "7.0")) {
+            throw new AwsException("InvalidParameterCombination",
+                    "IAM authentication is only supported for Redis version 7.0 and above.", 400);
+        }
+        if ("valkey".equalsIgnoreCase(engine) && !isEngineVersionAtLeast(engineVersion, "7.2")) {
+            throw new AwsException("InvalidParameterCombination",
+                    "IAM authentication is only supported for Valkey version 7.2 and above.", 400);
+        }
     }
 
     private static void requireEngineCompatible(String userGroupEngine, String userGroupId, String replicationGroupEngine) {
@@ -2300,6 +2856,29 @@ public class ElastiCacheService implements ResourceProvider {
             @Override
             public AuthMode authMode() {
                 return groups.getForAccount(accountId, groupId).map(ReplicationGroup::getAuthMode).orElse(null);
+            }
+
+            @Override
+            public TransitEncryption transitEncryption() {
+                return groups.getForAccount(accountId, groupId)
+                        .map(ReplicationGroup::transitEncryption).orElse(TransitEncryption.REQUIRED);
+            }
+
+            @Override
+            public String accessString(String username) {
+                ReplicationGroup group = groups.getForAccount(accountId, groupId).orElse(null);
+                if (group == null) {
+                    return null;
+                }
+                return effectiveUserIds(accountId, group).stream()
+                        .map(id -> users.getForAccount(accountId, id).orElse(null))
+                        .filter(user -> user != null && username.equals(user.getUserName()))
+                        .map(ElastiCacheUser::getAccessString).findFirst().orElse(null);
+            }
+
+            @Override
+            public boolean clusterMode() {
+                return groups.getForAccount(accountId, groupId).map(ReplicationGroup::isClusterEnabled).orElse(false);
             }
 
             @Override

@@ -6,7 +6,6 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.redshiftserverless.model.CustomDomainAssociation;
 
-import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -92,18 +91,6 @@ final class ServerlessSupport {
             throw validation(field + " must be a boolean.");
         }
         return node.asBoolean();
-    }
-
-    /** A timestamp member, which awsJson1.1 sends as epoch seconds unless the model says otherwise. */
-    static Instant epochSeconds(JsonNode request, String field) {
-        JsonNode node = request.path(field);
-        if (node.isMissingNode() || node.isNull()) {
-            return null;
-        }
-        if (!node.isNumber()) {
-            throw validation(field + " must be a timestamp.");
-        }
-        return Instant.ofEpochMilli(Math.round(node.asDouble() * 1000));
     }
 
     static List<String> stringList(JsonNode request, String field) {

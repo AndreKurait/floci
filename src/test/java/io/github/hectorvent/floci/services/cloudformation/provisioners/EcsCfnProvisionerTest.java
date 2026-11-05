@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ecs.EcsService;
+import io.github.hectorvent.floci.services.ecs.model.ClusterSetting;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
 import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
@@ -17,8 +18,13 @@ import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
+import org.mockito.Mockito;
+import org.mockito.invocation.InvocationOnMock;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -30,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -116,7 +123,7 @@ class EcsCfnProvisionerTest {
 
     @Test
     void clusterUsesTheDeclaredNameAndExposesArn() {
-        when(ecs.createCluster("web", REGION)).thenReturn(cluster("web"));
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(cluster("web"));
         StackResource r = resource("AWS::ECS::Cluster", "Cluster");
 
         provisioner.provision(r, mapper.createObjectNode().put("ClusterName", "web"), ctx());
@@ -128,7 +135,7 @@ class EcsCfnProvisionerTest {
 
     @Test
     void anUnnamedClusterGeneratesANameOnCreateAndKeepsItOnUpdate() {
-        when(ecs.createCluster(anyString(), eq(REGION))).thenAnswer(inv -> cluster(inv.getArgument(0)));
+        when(ecs.createCluster(anyString(), isNull(), anyList(), eq(REGION))).thenAnswer(inv -> cluster(inv.getArgument(0)));
         StackResource created = resource("AWS::ECS::Cluster", "Cluster");
         provisioner.provision(created, mapper.createObjectNode(), ctx());
         String generated = created.getPhysicalId();
@@ -140,7 +147,7 @@ class EcsCfnProvisionerTest {
         // createCluster is idempotent, so the update re-issues it under the same name instead of
         // minting a second cluster.
         assertEquals(generated, updated.getPhysicalId());
-        verify(ecs, times(2)).createCluster(generated, REGION);
+        verify(ecs, times(2)).createCluster(eq(generated), isNull(), anyList(), eq(REGION));
     }
 
     @Test
@@ -665,7 +672,7 @@ class EcsCfnProvisionerTest {
         assertEquals("busy", third.failureReason());
         UpdateCleanupResult givenUp = provisioner.completeUpdate(failing);
         assertEquals(3, givenUp.attempts(), "no fourth attempt");
-        verify(ecs, org.mockito.Mockito.times(3)).deregisterTaskDefinition(TASK_DEF_ARN, REGION);
+        verify(ecs, Mockito.times(3)).deregisterTaskDefinition(TASK_DEF_ARN, REGION);
     }
 
     @Test
@@ -696,7 +703,7 @@ class EcsCfnProvisionerTest {
 
     @Test
     void anUnchangedClusterHasNothingToRollBack() {
-        when(ecs.createCluster("web", REGION)).thenReturn(cluster("web"));
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(cluster("web"));
         StackResource r = resource("AWS::ECS::Cluster", "Cluster");
         provisioner.provision(r, mapper.createObjectNode().put("ClusterName", "web"), ctx("web"));
 
@@ -704,6 +711,246 @@ class EcsCfnProvisionerTest {
         assertTrue(provisioner.rollbackUpdate(r));
         assertEquals("web", r.getPhysicalId());
         verify(ecs, never()).deleteCluster(anyString(), anyString());
+    }
+
+    @Test
+    void clusterSettingsAreAppliedOnCreate() {
+        List<ClusterSetting> enabled = List.of(new ClusterSetting("containerInsights", "enabled"));
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenAnswer(inv -> created(inv));
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+
+        provisioner.provision(r, clusterWithInsights("enabled"), ctx());
+
+        // In the create itself, so no later call can fail and leave a cluster the rollback misses.
+        verify(ecs).createCluster("web", null, enabled, REGION);
+        verify(ecs, never()).updateClusterSettings(anyString(), any(), anyString());
+        assertEquals(Set.of("Arn"), r.getAttributes().keySet());
+    }
+
+    @Test
+    void aRenamedClusterTakesItsSettingsAtCreation() {
+        List<ClusterSetting> enabled = List.of(new ClusterSetting("containerInsights", "enabled"));
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenAnswer(inv -> created(inv));
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+
+        provisioner.provision(r, clusterWithInsights("enabled"), ctx("old"));
+
+        verify(ecs).createCluster("web", null, enabled, REGION);
+        verify(ecs, never()).updateClusterSettings(anyString(), any(), anyString());
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void aClusterThatAlreadyExistedGetsItsSettingsBackAndIsNotDeleted() {
+        // The idempotent create hands back a cluster the stack did not create, without the settings.
+        List<ClusterSetting> priorSettings = List.of(new ClusterSetting("containerInsights", "disabled"));
+        EcsCluster existing = cluster("web");
+        existing.setSettings(priorSettings);
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(existing);
+        AwsException failure = new AwsException("ServerException", "write failed", 500);
+        when(ecs.updateClusterSettings("web", List.of(new ClusterSetting("containerInsights", "enabled")), REGION))
+                .thenThrow(failure);
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+
+        AwsException thrown = assertThrows(AwsException.class,
+                () -> provisioner.provision(r, clusterWithInsights("enabled"), ctx()));
+
+        assertSame(failure, thrown);
+        // The failed call may have changed them, and nothing else puts back a cluster the stack found.
+        verify(ecs).updateClusterSettings("web", priorSettings, REGION);
+        // Without an id, neither a create rollback nor an update that added this resource deletes it.
+        assertNull(r.getPhysicalId());
+        verify(ecs, never()).deleteCluster(anyString(), anyString());
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ROLLBACK_OWNED_ATTR));
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR));
+    }
+
+    private EcsCluster created(InvocationOnMock inv) {
+        EcsCluster c = cluster(inv.getArgument(0));
+        List<ClusterSetting> settings = inv.getArgument(2);
+        c.setSettings(settings.isEmpty() ? null : settings);
+        return c;
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = "disabled")
+    void aFailedStackUpdateRestoresThePriorClusterSettings(String priorValue) {
+        List<ClusterSetting> priorSettings = priorValue == null ? null : List.of(new ClusterSetting("containerInsights", priorValue));
+        EcsCluster prior = cluster("web");
+        prior.setSettings(priorSettings);
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(prior);
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+
+        provisioner.provision(r, clusterWithInsights("enhanced"), ctx("web"));
+        verify(ecs).updateClusterSettings("web", List.of(new ClusterSetting("containerInsights", "enhanced")), REGION);
+
+        assertTrue(provisioner.rollbackUpdate(r));
+        verify(ecs).updateClusterSettings("web", priorSettings, REGION);
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void aSettingsUpdateThatFailsPutsThePriorSettingsBackItself() {
+        List<ClusterSetting> priorSettings = List.of(new ClusterSetting("containerInsights", "disabled"));
+        EcsCluster prior = cluster("web");
+        prior.setSettings(priorSettings);
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(prior);
+        AwsException failure = new AwsException("ServerException", "write failed", 500);
+        when(ecs.updateClusterSettings("web", List.of(new ClusterSetting("containerInsights", "enhanced")), REGION))
+                .thenThrow(failure);
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+        // An update hands the provisioner the resource with its prior physical id.
+        r.setPhysicalId("web");
+
+        AwsException thrown = assertThrows(AwsException.class,
+                () -> provisioner.provision(r, clusterWithInsights("enhanced"), ctx("web")));
+
+        // The engine restores the resource it held before this attempt, which never carried the
+        // snapshot, so the rollback walker would not put these settings back.
+        assertSame(failure, thrown);
+        verify(ecs).updateClusterSettings("web", priorSettings, REGION);
+        assertFalse(r.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void aSettingsRestoreThatAlsoFailsIsRecordedAsARollbackFailure() {
+        EcsCluster prior = cluster("web");
+        prior.setSettings(List.of(new ClusterSetting("containerInsights", "disabled")));
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(prior);
+        AwsException failure = new AwsException("ServerException", "write failed", 500);
+        AwsException restoreFailure = new AwsException("ServerException", "still failing", 500);
+        when(ecs.updateClusterSettings(eq("web"), any(), eq(REGION))).thenThrow(failure, restoreFailure);
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+        // An update hands the provisioner the resource with its prior physical id.
+        r.setPhysicalId("web");
+
+        AwsException thrown = assertThrows(AwsException.class,
+                () -> provisioner.provision(r, clusterWithInsights("enhanced"), ctx("web")));
+
+        assertSame(failure, thrown);
+        assertEquals(List.of(restoreFailure), List.of(thrown.getSuppressed()));
+        assertEquals("Could not restore the settings of ECS cluster web: still failing",
+                r.getAttributes().get(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+    }
+
+    @Test
+    void aRestoreThatFailedIsRetriedWhenTheRollbackIsContinued() {
+        List<ClusterSetting> priorSettings = List.of(new ClusterSetting("containerInsights", "disabled"));
+        EcsCluster prior = cluster("web");
+        prior.setSettings(priorSettings);
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(prior);
+        when(ecs.updateClusterSettings(eq("web"), any(), eq(REGION)))
+                .thenThrow(new AwsException("ServerException", "write failed", 500))
+                .thenThrow(new AwsException("ServerException", "still failing", 500))
+                .thenReturn(prior);
+        StackResource previous = resource("AWS::ECS::Cluster", "Cluster");
+        previous.setPhysicalId("web");
+        StackResource attempted = resource("AWS::ECS::Cluster", "Cluster");
+        attempted.setPhysicalId("web");
+        assertThrows(AwsException.class,
+                () -> provisioner.provision(attempted, clusterWithInsights("enhanced"), ctx("web")));
+
+        // The engine puts the previous resource back after the failed provision, and the first
+        // rollback walk reports the recorded failure without calling rollbackUpdate.
+        provisioner.mergeFailedUpdateResourceTracking(previous, attempted);
+        // ContinueUpdateRollback then asks for the restore again.
+        assertTrue(provisioner.rollbackUpdate(previous));
+
+        verify(ecs, times(2)).updateClusterSettings("web", priorSettings, REGION);
+        assertFalse(previous.getAttributes().containsKey(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void aRestoreThatSucceededLeavesNothingToCarryOver() {
+        EcsCluster prior = cluster("web");
+        prior.setSettings(List.of(new ClusterSetting("containerInsights", "disabled")));
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(prior);
+        when(ecs.updateClusterSettings("web", List.of(new ClusterSetting("containerInsights", "enhanced")), REGION))
+                .thenThrow(new AwsException("ServerException", "write failed", 500));
+        StackResource previous = resource("AWS::ECS::Cluster", "Cluster");
+        StackResource attempted = resource("AWS::ECS::Cluster", "Cluster");
+        assertThrows(AwsException.class,
+                () -> provisioner.provision(attempted, clusterWithInsights("enhanced"), ctx("web")));
+
+        provisioner.mergeFailedUpdateResourceTracking(previous, attempted);
+
+        assertFalse(previous.getAttributes().containsKey(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void aCommittedSettingsUpdateDropsItsSnapshot() {
+        EcsCluster prior = cluster("web");
+        prior.setSettings(List.of(new ClusterSetting("containerInsights", "disabled")));
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(prior);
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+        provisioner.provision(r, clusterWithInsights("enabled"), ctx("web"));
+
+        assertEquals(UpdateCleanupResult.notApplicable(), provisioner.completeUpdate(r));
+
+        assertFalse(r.getAttributes().containsKey(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void anUnchangedSettingIsNotReappliedAndDropsAnEarlierSnapshot() {
+        EcsCluster current = cluster("web");
+        current.setSettings(List.of(new ClusterSetting("containerInsights", "enabled")));
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(current);
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+        r.getAttributes().put(CfnRollback.ECS_CLUSTER_SETTINGS_SNAPSHOT_ATTR,
+                "{\"region\":\"us-east-1\",\"settings\":null}");
+
+        provisioner.provision(r, clusterWithInsights("enabled"), ctx("web"));
+
+        assertTrue(provisioner.rollbackUpdate(r));
+        verify(ecs, never()).updateClusterSettings(anyString(), any(), anyString());
+    }
+
+    @Test
+    void conditionalClusterSettingsAreResolvedBeforeTheyAreRead() {
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(cluster("web"));
+        StackResource r = resource("AWS::ECS::Cluster", "Cluster");
+        ObjectNode props = clusterWithInsights("enabled");
+        JsonNode resolved = props.get("ClusterSettings");
+        ObjectNode conditional = mapper.createObjectNode();
+        conditional.putArray("Fn::If").add("Insights").add(resolved).addObject().put("Ref", "AWS::NoValue");
+        props.set("ClusterSettings", conditional);
+        ProvisionContext ctx = ctx();
+        when(ctx.engine().resolveNode(conditional)).thenReturn(resolved);
+
+        provisioner.provision(r, props, ctx);
+
+        verify(ecs).updateClusterSettings("web", List.of(new ClusterSetting("containerInsights", "enabled")), REGION);
+    }
+
+    @Test
+    void clusterSettingsThatFailToResolveCreateNoCluster() {
+        ObjectNode props = clusterWithInsights("enabled");
+        ProvisionContext ctx = ctx();
+        when(ctx.engine().resolveNode(props.get("ClusterSettings"))).thenThrow(new IllegalStateException("unresolvable"));
+
+        assertThrows(IllegalStateException.class,
+                () -> provisioner.provision(resource("AWS::ECS::Cluster", "Cluster"), props, ctx));
+
+        verify(ecs, never()).createCluster(anyString(), any(), any(), anyString());
+    }
+
+    @Test
+    void aClusterSettingResolvedToNoValueIsDropped() {
+        when(ecs.createCluster(eq("web"), isNull(), anyList(), eq(REGION))).thenReturn(cluster("web"));
+        ObjectNode props = clusterWithInsights("enabled");
+        ((ArrayNode) props.get("ClusterSettings")).add("");
+
+        provisioner.provision(resource("AWS::ECS::Cluster", "Cluster"), props, ctx());
+
+        verify(ecs).updateClusterSettings("web", List.of(new ClusterSetting("containerInsights", "enabled")), REGION);
+    }
+
+    private ObjectNode clusterWithInsights(String value) {
+        ObjectNode props = mapper.createObjectNode().put("ClusterName", "web");
+        props.putArray("ClusterSettings").addObject().put("Name", "containerInsights").put("Value", value);
+        return props;
     }
 
     @Test
@@ -740,7 +987,7 @@ class EcsCfnProvisionerTest {
         // The replacement the failed update created stays owed a delete; the restored prior does not.
         assertTrue(provisioner.hasReplacementUpdate(r));
         assertEquals(next.getTaskDefinitionArn(), provisioner.updateCleanupPhysicalId(r));
-        org.mockito.Mockito.reset(ecs);
+        Mockito.reset(ecs);
         assertEquals(new UpdateCleanupResult(true, true, next.getTaskDefinitionArn(), 0, null), provisioner.completeUpdate(r));
         verify(ecs).deregisterTaskDefinition(next.getTaskDefinitionArn(), REGION);
         verify(ecs, never()).deregisterTaskDefinition(TASK_DEF_ARN, REGION);
@@ -772,7 +1019,7 @@ class EcsCfnProvisionerTest {
         when(ecs.registerTaskDefinition(eq("web"), anyList(), isNull(), isNull(), isNull(), isNull(), isNull(), anyList(),
                 eq(REGION))).thenReturn(fifth);
         provisioner.provision(r, mapper.createObjectNode().put("Family", "web"), ctx(TASK_DEF_ARN));
-        org.mockito.Mockito.reset(ecs);
+        Mockito.reset(ecs);
         UpdateCleanupResult cleanup = provisioner.completeUpdate(r);
         assertTrue(cleanup.complete(), cleanup.toString());
         verify(ecs).deregisterTaskDefinition(orphan, REGION);
@@ -816,7 +1063,7 @@ class EcsCfnProvisionerTest {
 
         // The engine gives up once the lowest count reaches three and clears; only the exhausted
         // entries go, and an entry that succeeded meanwhile is gone already.
-        org.mockito.Mockito.doReturn(new TaskDefinition()).when(ecs).deregisterTaskDefinition(TASK_DEF_ARN, REGION);
+        Mockito.doReturn(new TaskDefinition()).when(ecs).deregisterTaskDefinition(TASK_DEF_ARN, REGION);
         UpdateCleanupResult second = provisioner.completeUpdate(r);
         assertFalse(second.complete(), "the exhausted orphan is still listed");
         assertEquals(3, second.attempts());
@@ -824,7 +1071,7 @@ class EcsCfnProvisionerTest {
         provisioner.clearUpdate(r);
         assertFalse(provisioner.hasReplacementUpdate(r), "nothing with attempts left remains");
         // One delete during the failed rollback, then the three cleanup attempts, never a fifth.
-        verify(ecs, org.mockito.Mockito.times(4)).deregisterTaskDefinition(orphan, REGION);
+        verify(ecs, Mockito.times(4)).deregisterTaskDefinition(orphan, REGION);
     }
 
     @Test

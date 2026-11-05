@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.auth.CredentialScope;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.core.common.auth.SigV4aSignature;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayAwsExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayUserRequestController;
@@ -124,6 +125,7 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     // Lazily resolved: JAX-RS providers are instantiated before runtime config mappings exist
     // (the AwsProtocolClaimFilter pattern).
     private final jakarta.inject.Provider<EmulatorConfig> configProvider;
+    private volatile EmulatorConfig config;
     private final IamService iamService;
     private final ResolvedServiceCatalog catalog;
     private final CurrentVertxRequest currentVertxRequest;
@@ -141,9 +143,18 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         this.currentVertxRequest = currentVertxRequest;
     }
 
+    private EmulatorConfig config() {
+        EmulatorConfig resolved = config;
+        if (resolved == null) {
+            resolved = configProvider.get();
+            config = resolved;
+        }
+        return resolved;
+    }
+
     @Override
     public void filter(ContainerRequestContext ctx) throws IOException {
-        if (!configProvider.get().auth().validateSignatures()) {
+        if (!config().auth().validateSignatures()) {
             return;
         }
         Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
@@ -162,6 +173,10 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             signed = new SigV4AuthorizationHeader(query.getFirst("X-Amz-Credential"),
                     query.getFirst("X-Amz-SignedHeaders"), query.getFirst("X-Amz-Signature"), false);
         } else {
+            if (authorization != null && authorization.trim().startsWith(SigV4aSignature.ALGORITHM + " ")) {
+                incompleteSignature(ctx, resource, "The authorization mechanism you have provided is not supported.");
+                return;
+            }
             signed = SigV4AuthorizationHeader.parse(authorization);
             if (signed == null) {
                 return;

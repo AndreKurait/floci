@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
@@ -8,6 +9,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -23,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * subnet fails its stack, as on AWS, rather than the balancer being created with no subnets, while a
  * mapping an {@code Fn::If} drops with {@code AWS::NoValue} is left out. {@code Subnets} and
  * {@code SubnetMappings} together fail it too, as ELBv2 takes one or the other, and so does a
- * balancer with neither.
+ * balancer with neither, or an Application Load Balancer on one subnet.
  */
 @QuarkusTest
 class CloudFormationElbV2SubnetMappingsIntegrationTest {
@@ -117,6 +119,40 @@ class CloudFormationElbV2SubnetMappingsIntegrationTest {
                     .extract().asString();
             List<String> reasons = XmlParser.extractAll(events, "ResourceStatusReason");
             assertTrue(reasons.stream().anyMatch(r -> r.contains(reason)), String.join(" | ", reasons));
+            request(ELB_AUTH, "DescribeLoadBalancers", "Names.member.1", name).statusCode(400)
+                    .body(containsString("LoadBalancerNotFound"));
+        } finally {
+            request(CFN_AUTH, "DeleteStack", "StackName", stack);
+        }
+    }
+
+    /**
+     * An Application Load Balancer on one subnet, in {@code Subnets} or in {@code SubnetMappings},
+     * fails the stack with CreateLoadBalancer's error and leaves no balancer.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"Subnets", "SubnetMappings"})
+    void anApplicationLoadBalancerOnOneSubnetFailsTheStack(String property) {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stack = "alb-one-subnet-" + suffix;
+        String name = "alb-one-" + suffix;
+        String template = template(name, "{\"SubnetId\": {\"Ref\": \"SubnetA\"}}")
+                .replace("\"Type\": \"network\"", "\"Type\": \"application\"");
+        if ("Subnets".equals(property)) {
+            template = template.replace("\"SubnetMappings\": [{\"SubnetId\": {\"Ref\": \"SubnetA\"}}]",
+                    "\"Subnets\": [{\"Ref\": \"SubnetA\"}]");
+        }
+        assertTrue(template.contains("\"" + property + "\": [{"), template);
+        assertTrue(template.contains("\"Type\": \"application\""), template);
+        try {
+            request(CFN_AUTH, "CreateStack", "StackName", stack, "TemplateBody", template).statusCode(200);
+            CfnStackWaits.awaitStatus(stack, "ROLLBACK_COMPLETE");
+            String events = request(CFN_AUTH, "DescribeStackEvents", "StackName", stack).statusCode(200)
+                    .extract().asString();
+            List<String> reasons = XmlParser.extractAll(events, "ResourceStatusReason");
+            assertTrue(reasons.stream().anyMatch(
+                    r -> r.contains("At least two subnets in two different Availability Zones must be specified")),
+                    String.join(" | ", reasons));
             request(ELB_AUTH, "DescribeLoadBalancers", "Names.member.1", name).statusCode(400)
                     .body(containsString("LoadBalancerNotFound"));
         } finally {

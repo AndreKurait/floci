@@ -117,6 +117,29 @@ public final class SigV4TokenTestHelper {
     }
 
     /**
+     * An Aurora DSQL token, shaped as the SDKs' DSQL signers shape it:
+     * {@code <endpoint>/?Action=DbConnectAdmin&...}, signing the endpoint's host without a port.
+     */
+    public static String createDsqlToken(
+            String endpoint,
+            String region,
+            String action,
+            String accessKeyId,
+            String secretKey,
+            Instant timestamp,
+            long expiresSeconds,
+            String sessionToken
+    ) throws Exception {
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("Action", action);
+        if (sessionToken != null) {
+            params.put("X-Amz-Security-Token", sessionToken);
+        }
+        return signToken(endpoint, null, accessKeyId, secretKey, region, "dsql", timestamp, expiresSeconds,
+                params, Map.of("host", endpoint));
+    }
+
+    /**
      * An RDS token that carries the signer's credential under a percent-encoded parameter name
      * ({@code X-Amz%2DCredential}) and, after it, a second {@code X-Amz-Credential} naming
      * {@code otherAccessKeyId}: a token that tries to have one key's signature verified and another
@@ -208,7 +231,7 @@ public final class SigV4TokenTestHelper {
             String region,
             String service,
             Instant timestamp,
-            int expiresSeconds,
+            long expiresSeconds,
             Map<String, String> params,
             Map<String, String> signedHeaders
     ) throws Exception {
@@ -220,7 +243,7 @@ public final class SigV4TokenTestHelper {
         queryParams.put("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
         queryParams.put("X-Amz-Credential", accessKeyId + "/" + credentialScope);
         queryParams.put("X-Amz-Date", dateTime);
-        queryParams.put("X-Amz-Expires", Integer.toString(expiresSeconds));
+        queryParams.put("X-Amz-Expires", Long.toString(expiresSeconds));
         String signedHeaderNames = signedHeaders.keySet().stream()
                 .sorted()
                 .reduce((left, right) -> left + ";" + right)

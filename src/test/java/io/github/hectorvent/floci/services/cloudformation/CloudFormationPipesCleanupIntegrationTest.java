@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.services.pipes.PipesService;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.mockito.InjectSpy;
@@ -53,6 +54,7 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         updateStack(stackName, template(newName, suffix));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -104,6 +106,7 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         updateStack(stackName, template(newName, suffix));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -161,6 +164,7 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         updateStack(stackName, template(newName, suffix));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -174,6 +178,7 @@ class CloudFormationPipesCleanupIntegrationTest {
         assertPipe(oldName);
         assertPipe(newName);
 
+        verify(pipesService, Mockito.timeout(5_000)).deletePipe(eq(oldName), anyString());
         Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(oldName), anyString());
 
         given()
@@ -231,6 +236,8 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         updateStack(stackName, template(newName, suffix));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS");
+        verify(pipesService, Mockito.timeout(5_000)).deletePipe(eq(oldName), anyString());
         Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(oldName), anyString());
 
         given()
@@ -285,6 +292,7 @@ class CloudFormationPipesCleanupIntegrationTest {
                       }
                     }""".formatted(suffix)));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_ROLLBACK_COMPLETE");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -368,6 +376,7 @@ class CloudFormationPipesCleanupIntegrationTest {
                       }
                     }""".formatted(suffix)));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_ROLLBACK_FAILED");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -398,15 +407,7 @@ class CloudFormationPipesCleanupIntegrationTest {
         // AWS refuses an update over UPDATE_ROLLBACK_FAILED. The pipe's rollback already restored
         // the prior pipe and only failed to delete the replacement, so skipping it finishes the
         // rollback and the stack takes updates again.
-        given()
-            .contentType("application/x-www-form-urlencoded")
-            .formParam("Action", "ContinueUpdateRollback")
-            .formParam("StackName", stackName)
-            .formParam("ResourcesToSkip.member.1", "MyPipe")
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200);
+        CfnStackWaits.continueUpdateRollback(stackName, null, "MyPipe");
         assertEquals("UPDATE_ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stackName).status());
 
         Mockito.doCallRealMethod().when(pipesService).deletePipe(eq(replacementName), anyString());
@@ -414,6 +415,7 @@ class CloudFormationPipesCleanupIntegrationTest {
         // "No updates are to be performed.": a new output makes it an update.
         updateStack(stackName, CfnUpdates.forceUpdate(renameRollbackTemplate(priorName, "")));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         given()
             .contentType("application/json")
         .when()
@@ -454,6 +456,7 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         updateStack(stackName, tagReconcileTemplate(pipeName, "after", "team", "after"));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_ROLLBACK_COMPLETE");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -499,6 +502,7 @@ class CloudFormationPipesCleanupIntegrationTest {
 
         updateStack(stackName, tagReconcileTemplate(pipeName, "after", "team", "after"));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_ROLLBACK_FAILED");
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
@@ -586,6 +590,7 @@ class CloudFormationPipesCleanupIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
     }
 
     private static void updateStack(String stackName, String templateBody) {

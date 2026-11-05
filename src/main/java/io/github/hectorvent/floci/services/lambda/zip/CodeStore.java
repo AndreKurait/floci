@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda.zip;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.FileTrees;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -10,7 +11,6 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.Comparator;
 import java.util.stream.Stream;
 
 /**
@@ -156,17 +156,10 @@ public class CodeStore {
         if (!Files.exists(path)) {
             return;
         }
-        try (Stream<Path> walk = Files.walk(path)) {
-            walk.sorted(Comparator.reverseOrder())
-                    .forEach(p -> {
-                        try {
-                            Files.delete(p);
-                        } catch (IOException e) {
-                            LOG.warnv("Failed to delete {0}: {1}", p, e.getMessage());
-                        }
-                    });
+        try {
+            FileTrees.delete(path);
             LOG.debugv("Deleted code for function: {0}", functionName);
-        } catch (IOException | UncheckedIOException e) {
+        } catch (IOException e) {
             LOG.warnv("Failed to delete code directory for {0}: {1}", functionName, e.getMessage());
         }
     }

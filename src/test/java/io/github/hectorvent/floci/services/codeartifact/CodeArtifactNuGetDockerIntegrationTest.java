@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.testing.SidecarContainersProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.json.JsonPath;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -14,17 +15,20 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import static io.github.hectorvent.floci.testing.CodeArtifactRequests.putPackageOriginConfiguration;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Runs a real NuGet V3 push/install round trip against a live, per-repository BaGetter container,
@@ -109,7 +113,7 @@ class CodeArtifactNuGetDockerIntegrationTest {
         given().header("Authorization", "Bearer " + bearerToken)
                 .get("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/v3/package/" + LOWER_ID + "/index.json")
                 .then().statusCode(200)
-                .body("versions", org.hamcrest.Matchers.hasItem(VERSION));
+                .body("versions", Matchers.hasItem(VERSION));
 
         byte[] fetchedNupkg = given().header("Authorization", "Bearer " + bearerToken)
                 .get("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/v3/package/" + LOWER_ID + "/" + VERSION + "/"
@@ -459,6 +463,150 @@ class CodeArtifactNuGetDockerIntegrationTest {
                 .extract().jsonPath();
         Map<String, String> hashes = body.getMap("assets[0].hashes");
         assertEquals(Digests.sha256Hex(nupkg), hashes.get("SHA-256"));
+    }
+
+    /**
+     * Bridges to the same real BaGetter sidecar {@link #listPackageVersionAssetsBridgesToTheRealBagetterSidecar}
+     * already pushed {@code ListAssets.Package}'s {@link #VERSION} to, reading the flat
+     * container's {@code index.json} version list plus the NuGet V3 Registration resource's
+     * {@code catalogEntry.published} for ordering, instead of one version's own asset.
+     */
+    @Test
+    @Order(16)
+    void listPackageVersionsBridgesToTheRealBagetterSidecar() {
+        given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=nuget"
+                        + "&package=ListAssets.Package")
+                .then().statusCode(200)
+                .body("package", equalTo("ListAssets.Package"))
+                .body("defaultDisplayVersion", equalTo(VERSION))
+                .body("versions.size()", equalTo(1))
+                .body("versions[0].version", equalTo(VERSION))
+                .body("versions[0].status", equalTo("Published"))
+                .body("versions[0].origin.originType", equalTo("INTERNAL"));
+    }
+
+    /**
+     * Bridges to BaGetter's own NuGet V3 Search resource, confirmed live: {@code
+     * BagetterSidecarClient#listPackages} presses it into service purely for this admin listing
+     * (this class's own class-level documentation explains why the native NuGet client protocol
+     * never gets a Search endpoint of its own). A mixed-case id, confirmed back lowercased, since
+     * a live search response returns the id real-cased exactly as pushed, and {@code
+     * CodeArtifactService}'s own {@code accountingPackageName} normalizes every NuGet name to
+     * lowercase (AWS's own documented NuGet normalization).
+     */
+    @Test
+    @Order(17)
+    void listPackagesBridgesToTheRealBagetterSearchResource() {
+        String packageId = "ListPackages.Probe";
+        byte[] nupkg = buildNupkg(packageId, VERSION, "list packages description", null, null);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(pushBody("boundary123", nupkg))
+                .put("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/api/v2/package")
+                .then().statusCode(201);
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/packages?domain=" + DOMAIN + "&repository=" + REPO + "&format=nuget")
+                .then().statusCode(200)
+                .extract().jsonPath();
+        List<String> names = body.getList("packages.package", String.class);
+        assertTrue(names.contains(packageId.toLowerCase(Locale.ROOT)), "expected "
+                + packageId.toLowerCase(Locale.ROOT) + " among " + names);
+    }
+
+    /**
+     * Closes 10-NATIVE-STATUS for nuget: a plain {@code dotnet restore}/{@code nuget install}
+     * download of an Archived version's real {@code .nupkg} must 404 against the live BaGetter
+     * sidecar, even though the file itself is still sitting there untouched. Its own package, not
+     * {@link #PACKAGE_ID}, so archiving it can't disturb any other ordered test in this class.
+     */
+    @Test
+    @Order(17)
+    void archivingAVersionBlocksItsRealBagetterContentDownloadWhileLeavingTheBytesInPlace() {
+        String packageId = "Archive.Download.Package";
+        String lowerId = packageId.toLowerCase(Locale.ROOT);
+        byte[] nupkg = buildNupkg(packageId, VERSION, "Archive download throwaway.", null, null);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(pushBody("boundary123", nupkg))
+                .put("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/api/v2/package")
+                .then().statusCode(201);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"" + VERSION + "\"],\"targetStatus\":\"Archived\"}")
+                .post("/v1/package/versions/update_status?domain=" + DOMAIN + "&repository=" + REPO
+                        + "&format=nuget&package=" + packageId)
+                .then().statusCode(200)
+                .body("successfulVersions['" + VERSION + "'].status", equalTo("Archived"));
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/v3/package/" + lowerId + "/" + VERSION + "/"
+                        + lowerId + "." + VERSION + ".nupkg")
+                .then().statusCode(404);
+
+        // Proves the block above is this check's own override, not BaGetter having genuinely
+        // lost the file: un-archiving must make the exact same bytes fetchable again, with
+        // nothing re-pushed in between.
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"" + VERSION + "\"],\"targetStatus\":\"Published\"}")
+                .post("/v1/package/versions/update_status?domain=" + DOMAIN + "&repository=" + REPO
+                        + "&format=nuget&package=" + packageId)
+                .then().statusCode(200)
+                .body("successfulVersions['" + VERSION + "'].status", equalTo("Published"));
+        byte[] fetchedAfterUnarchive = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/v3/package/" + lowerId + "/" + VERSION + "/"
+                        + lowerId + "." + VERSION + ".nupkg")
+                .then().statusCode(200)
+                .extract().asByteArray();
+        assertArrayEquals(nupkg, fetchedAfterUnarchive);
+    }
+
+    /**
+     * Issue #7116: publish:BLOCK set through the real PutPackageOriginConfiguration route used to
+     * stop only the generic format's PublishPackageVersion, never a real dotnet nuget push. Set
+     * under the nuspec id's own mixed-case spelling (the push path lowercases it), it now refuses
+     * a byte-identical re-push and a new version alike before BaGetter sees either, and lifting it
+     * lets the new version through. Its own package, so no other ordered test is disturbed.
+     */
+    @Test
+    @Order(18)
+    void publishBlockedByOriginConfigurationRefusesARealPushUntilItIsLifted() {
+        String packageId = "Origin.Blocked.Package";
+        byte[] published = buildNupkg(packageId, VERSION, "Origin block throwaway.", null, null);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(pushBody("boundary123", published))
+                .put("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/api/v2/package")
+                .then().statusCode(201);
+
+        putPackageOriginConfiguration(AUTH, DOMAIN, REPO, "nuget", null, packageId, "BLOCK", "BLOCK");
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(pushBody("boundary123", published))
+                .put("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/api/v2/package")
+                .then().statusCode(409)
+                .body(containsString("blocks direct publish"));
+        byte[] nextVersion = buildNupkg(packageId, "2.0.0", "Origin block throwaway.", null, null);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(pushBody("boundary123", nextVersion))
+                .put("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/api/v2/package")
+                .then().statusCode(409);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/v3/package/"
+                        + packageId.toLowerCase(Locale.ROOT) + "/index.json")
+                .then().statusCode(200)
+                .body("versions", equalTo(List.of(VERSION)));
+
+        putPackageOriginConfiguration(AUTH, DOMAIN, REPO, "nuget", null, packageId, "ALLOW", "BLOCK");
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(pushBody("boundary123", nextVersion))
+                .put("/codeartifact/nuget/" + DOMAIN + "/" + REPO + "/api/v2/package")
+                .then().statusCode(201);
     }
 
     private static long describeDomainAssetSizeBytes() {

@@ -13,8 +13,14 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -73,6 +79,21 @@ public class BagetterSidecarClient implements RepositorySidecarManager {
         manager.release(repositoryContainerId);
     }
 
+    @Override
+    public void registerRepository(String repositoryContainerId) {
+        manager.registerRepository(repositoryContainerId);
+    }
+
+    @Override
+    public void beginUse(String repositoryContainerId) {
+        manager.beginUse(repositoryContainerId);
+    }
+
+    @Override
+    public void endUse(String repositoryContainerId) {
+        manager.endUse(repositoryContainerId);
+    }
+
     /**
      * NuGet packages have no namespace (AWS: "Python, NuGet, Ruby, and Cargo package versions do
      * not contain a corresponding component") and exactly one real asset per version, the
@@ -115,6 +136,159 @@ public class BagetterSidecarClient implements RepositorySidecarManager {
     public boolean packageVersionExists(String repositoryContainerId, String domain, String repository,
             String namespace, String packageName, String version) {
         return matchVersion(repositoryContainerId, packageName.toLowerCase(Locale.ROOT), version).isPresent();
+    }
+
+    /**
+     * {@link #listVersions} already gives every version BaGetter holds for this package; the only
+     * new work is a publish timestamp for each. BaGetter's flat container has none of its own
+     * (confirmed: {@code index.json} carries only the version strings), but its NuGet V3
+     * Registration resource's {@code catalogEntry.published} does, confirmed live against a real
+     * container — read here purely as an internal data source for this one field, not by
+     * standing up a registration endpoint of Floci's own the way {@code CodeArtifactNuGetController}
+     * would (this class's own class-level documentation explains why that's deliberately never
+     * built for real NuGet clients to use).
+     */
+    @Override
+    public List<PackageVersionTimestamp> listPackageVersions(String repositoryContainerId, String domain,
+            String repository, String namespace, String packageName) {
+        String lowerId = packageName.toLowerCase(Locale.ROOT);
+        List<String> versions = listVersions(repositoryContainerId, lowerId);
+        if (versions.isEmpty()) {
+            return List.of();
+        }
+        Map<String, Instant> published = registrationPublishedTimes(repositoryContainerId, lowerId);
+        List<PackageVersionTimestamp> result = new ArrayList<>();
+        for (String version : versions) {
+            result.add(new PackageVersionTimestamp(version, published.get(version)));
+        }
+        return result;
+    }
+
+    /**
+     * Every version's {@code catalogEntry.published}, keyed by version string. The real NuGet V3
+     * Registration resource splits a package with many versions across separate pages (each
+     * {@code items} entry carrying its own {@code @id} to fetch instead of an inline {@code
+     * items} array once a package has enough versions), so a page missing an inline {@code items}
+     * array is followed to its own {@code @id} rather than assumed to mean "no more versions" —
+     * even though BaGetter, a single small self-hosted feed, was never observed paginating this
+     * way for the handful of versions any test here publishes.
+     *
+     * <p>Keyed by {@link NuGetVersions#normalize}, not the raw {@code catalogEntry.version} text:
+     * {@link #listPackageVersions}'s caller looks entries up by the version {@link #listVersions}
+     * returns, which is itself normalized (lowercased, no leading zeros) from BaGetter's flat
+     * container resource. A raw-cased or non-normalized key here (e.g. {@code 1.0.0-Beta} instead
+     * of {@code 1.0.0-beta}) would simply never be found, losing that version's timestamp.
+     */
+    private Map<String, Instant> registrationPublishedTimes(String repositoryContainerId, String lowerId) {
+        Optional<JsonNode> index = getJson(repositoryContainerId, "/v3/registration/"
+                + SidecarUriUtils.encodeSegment(lowerId) + "/index.json");
+        if (index.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Instant> result = new LinkedHashMap<>();
+        for (JsonNode page : index.get().path("items")) {
+            JsonNode items = page.path("items");
+            if (!items.isArray()) {
+                String pageId = page.path("@id").asText("");
+                items = pageId.isEmpty() ? null : getJsonAbsolute(pageId).map(p -> p.path("items")).orElse(null);
+                if (items == null) {
+                    continue;
+                }
+            }
+            for (JsonNode entry : items) {
+                JsonNode catalogEntry = entry.path("catalogEntry");
+                String version = catalogEntry.path("version").asText("");
+                String publishedText = catalogEntry.path("published").asText("");
+                if (version.isEmpty() || publishedText.isEmpty()) {
+                    continue;
+                }
+                try {
+                    result.put(NuGetVersions.normalize(version), OffsetDateTime.parse(publishedText).toInstant());
+                } catch (DateTimeParseException e) {
+                    // Leave unmapped: CodeArtifactService falls back to a deterministic tie-break
+                    // rather than guessing a time from text that didn't parse.
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * BaGetter's NuGet V3 Search resource ({@code /v3/search}), pressed into service purely as an
+     * admin-side enumeration for this management API, a different purpose from the native NuGet
+     * client protocol this class's own class-level documentation explains it deliberately never
+     * stands up Search to serve. An empty {@code q} matches every package (confirmed live); {@code
+     * data} empties out once every page has been read, the loop's own termination signal rather
+     * than {@code totalHits}, which was confirmed live to report results *remaining from the
+     * current skip*, not a stable grand total, so trusting it as a loop bound would stop one page
+     * early. {@code id} is returned real-cased by BaGetter (confirmed live), lowercased here to
+     * match what {@code CodeArtifactService}'s own {@code accountingPackageName} already
+     * normalizes every NuGet package name to (AWS's own documented NuGet normalization). NuGet
+     * packages have no namespace.
+     *
+     * <p>Raised by Greptile's review: the real NuGet V3 Search resource excludes prerelease
+     * versions whenever {@code prerelease} is omitted (the official API's own documented default),
+     * so a package whose only published version is a prerelease (e.g. {@code 1.0.0-beta}) would
+     * never appear here without it. {@code prerelease=true} is passed explicitly since this call
+     * enumerates every package a repository holds, regardless of what any one version's own
+     * stability looks like, not a client-facing search that should default to stable results.
+     *
+     * <p>Raised by hectorvent's review: every CodeArtifact repository gets a nuget sidecar id at
+     * creation regardless of whether it is ever actually used through nuget, so without checking
+     * {@link BagetterSidecarManager#isRunning} first, a {@code ListPackages} call with no format
+     * filter would start this repository's own BaGetter container just to find it empty, every
+     * time, for a repository that has never published anything through nuget.
+     */
+    @Override
+    public List<PackageIdentifier> listPackages(String repositoryContainerId, String domain, String repository) {
+        if (!manager.isRunning(repositoryContainerId)) {
+            return List.of();
+        }
+        List<PackageIdentifier> result = new ArrayList<>();
+        int skip = 0;
+        int take = 100;
+        while (true) {
+            JsonNode page = getJson(repositoryContainerId, "/v3/search?q=&prerelease=true&skip=" + skip + "&take="
+                    + take).orElseThrow(() -> new IllegalStateException("Could not list packages on the BaGetter "
+                            + "sidecar"));
+            JsonNode data = page.path("data");
+            if (!data.isArray() || data.isEmpty()) {
+                return result;
+            }
+            for (JsonNode entry : data) {
+                result.add(new PackageIdentifier(null, entry.path("id").asText("").toLowerCase(Locale.ROOT)));
+            }
+            skip += data.size();
+        }
+    }
+
+    private Optional<JsonNode> getJson(String repositoryContainerId, String encodedPath) {
+        String baseUrl = ensureReady(repositoryContainerId, null);
+        return getJsonAbsolute(baseUrl + encodedPath);
+    }
+
+    private Optional<JsonNode> getJsonAbsolute(String absoluteUrl) {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(absoluteUrl)).timeout(Duration.ofSeconds(10))
+                .GET().build();
+        HttpResponse<String> response;
+        try {
+            response = httpClient.send(request, BodyHandlers.ofString());
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not reach the BaGetter sidecar at " + absoluteUrl, e);
+        }
+        if (response.statusCode() == 404) {
+            return Optional.empty();
+        }
+        if (response.statusCode() != 200) {
+            throw new IllegalStateException("Could not reach the BaGetter sidecar at " + absoluteUrl
+                    + ": upstream returned " + response.statusCode());
+        }
+        try {
+            return Optional.of(mapper.readTree(response.body()));
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not parse the BaGetter sidecar's response from " + absoluteUrl,
+                    e);
+        }
     }
 
     /**

@@ -47,6 +47,7 @@ public class AwsProtocolClaimFilter implements ContainerRequestFilter {
     // Lazily resolved: JAX-RS providers are instantiated before runtime config
     // mappings exist (same pattern as GlobalCorsFilter).
     private final jakarta.inject.Provider<EmulatorConfig> configProvider;
+    private volatile EmulatorConfig config;
 
     @Inject
     public AwsProtocolClaimFilter(ProtocolClaimer claimer, ResolvedServiceCatalog catalog,
@@ -54,6 +55,15 @@ public class AwsProtocolClaimFilter implements ContainerRequestFilter {
         this.claimer = claimer;
         this.catalog = catalog;
         this.configProvider = configProvider;
+    }
+
+    private EmulatorConfig config() {
+        EmulatorConfig resolved = config;
+        if (resolved == null) {
+            resolved = configProvider.get();
+            config = resolved;
+        }
+        return resolved;
     }
 
     @Override
@@ -64,10 +74,11 @@ public class AwsProtocolClaimFilter implements ContainerRequestFilter {
         if (claim.isEmpty()) {
             LOG.warnv("Unclaimable RPC-signaled request: {0} {1} Content-Type={2} Smithy-Protocol={3}",
                     signals.method(), signals.path(), signals.contentType(), signals.smithyProtocol());
-            if (configProvider.get().protocols().strictClaiming()) {
+            if (config().protocols().strictClaiming()) {
                 ctx.abortWith(unknownOperationResponse(404,
                         "Unable to determine the wire protocol for this request"));
             }
+            // Otherwise the route it reaches claims it: see AwsRouteClaimFilter.
             return;
         }
 
@@ -78,28 +89,14 @@ public class AwsProtocolClaimFilter implements ContainerRequestFilter {
                     .replacePath(AwsQueryController.QUERY_GET_PATH).build());
         }
         if (resolved.protocol() == WireProtocol.REST) {
-            Optional<String> scope = SigV4CredentialScope.serviceName(signals.authorization());
-            if (scope.isPresent() && catalog.byCredentialScope(scope.get()).isEmpty()) {
-                // Gated like the other rejections in this filter. The guard is only as good as
-                // the catalog's scope list: if Floci serves a route whose signing scope is not
-                // enumerated, rejecting is a 404 with no workaround, so leave users a switch.
-                if (!configProvider.get().protocols().rejectUnknownServiceScope()) {
-                    LOG.debugv("Unsupported service scope {0} on {1} {2}, rejection disabled by config",
-                            scope.get(), signals.method(), signals.path());
-                    return;
-                }
-                LOG.infov("Rejecting request signed for unsupported service scope {0}: {1} {2}",
-                        scope.get(), signals.method(), signals.path());
-                ctx.abortWith(unknownOperationResponse(404,
-                        "Unknown operation: " + signals.method() + " " + signals.path()));
-                return;
-            }
+            refuseUnknownServiceScope(ctx, signals, catalog, config());
+            return;
         }
         if (resolved.protocol() == WireProtocol.RPCV2_JSON) {
             LOG.warnv("Received rpc-v2-json request for service {0} operation {1} — protocol not implemented",
                     resolved.service() != null ? resolved.service().externalKey() : "unknown",
                     resolved.operation());
-            if (configProvider.get().protocols().strictClaiming()) {
+            if (config().protocols().strictClaiming()) {
                 ctx.abortWith(unknownOperationResponse(400,
                         "The rpc-v2-json protocol is not supported"));
             }
@@ -109,6 +106,32 @@ public class AwsProtocolClaimFilter implements ContainerRequestFilter {
                     resolved.service() != null ? resolved.service().externalKey() : null,
                     resolved.operation());
         }
+    }
+
+    /**
+     * Refuses a REST request whose SigV4 credential scope names a service absent from the catalog,
+     * which would otherwise fall through to S3's path-style routes. {@link AwsRouteClaimFilter} also
+     * applies it to a request it claims as REST. Returns whether it refused the request.
+     */
+    static boolean refuseUnknownServiceScope(ContainerRequestContext ctx, ClaimSignals signals,
+                                             ResolvedServiceCatalog catalog, EmulatorConfig config) {
+        Optional<String> scope = SigV4CredentialScope.serviceName(signals.authorization());
+        if (scope.isEmpty() || catalog.byCredentialScope(scope.get()).isPresent()) {
+            return false;
+        }
+        // Gated like the other rejections in this filter. The guard is only as good as the
+        // catalog's scope list: if Floci serves a route whose signing scope is not enumerated,
+        // rejecting is a 404 with no workaround, so leave users a switch.
+        if (!config.protocols().rejectUnknownServiceScope()) {
+            LOG.debugv("Unsupported service scope {0} on {1} {2}, rejection disabled by config",
+                    scope.get(), signals.method(), signals.path());
+            return false;
+        }
+        LOG.infov("Rejecting request signed for unsupported service scope {0}: {1} {2}",
+                scope.get(), signals.method(), signals.path());
+        ctx.abortWith(unknownOperationResponse(404,
+                "Unknown operation: " + signals.method() + " " + signals.path()));
+        return true;
     }
 
     static Response unknownOperationResponse(int status, String message) {

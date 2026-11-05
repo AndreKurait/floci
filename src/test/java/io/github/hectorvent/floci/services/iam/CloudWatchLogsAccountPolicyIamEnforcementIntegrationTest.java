@@ -24,7 +24,8 @@ import static org.hamcrest.Matchers.equalTo;
 /**
  * PutAccountPolicy also needs the action for the type of policy it creates, as its API reference
  * says: "To use this operation, you must be signed on with the correct permissions depending on the
- * type of policy that you are creating."
+ * type of policy that you are creating." DescribeAccountPolicies likewise needs the read action of the
+ * type it lists, for the four types its reference names.
  */
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
@@ -94,6 +95,45 @@ class CloudWatchLogsAccountPolicyIamEnforcementIntegrationTest {
         putAccountPolicy(caller, REGION, policyName(), "UNKNOWN_POLICY")
                 .statusCode(400)
                 .body("__type", equalTo("InvalidParameterException"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "DATA_PROTECTION_POLICY, GetDataProtectionPolicy",
+            "SUBSCRIPTION_FILTER_POLICY, DescribeSubscriptionFilters",
+            "TRANSFORMER_POLICY, GetTransformer",
+            "FIELD_INDEX_POLICY, DescribeIndexPolicies"})
+    void callerAllowedOnlyDescribeAccountPoliciesIsRefusedThePolicyType(String policyType, String typeAction) {
+        String caller = user(allow("DescribeAccountPolicies"));
+
+        describeAccountPolicies(caller, policyType)
+                .statusCode(400)
+                .body("__type", equalTo("AccessDeniedException"))
+                .body("message", containsString("logs:" + typeAction));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "DATA_PROTECTION_POLICY, GetDataProtectionPolicy",
+            "SUBSCRIPTION_FILTER_POLICY, DescribeSubscriptionFilters",
+            "TRANSFORMER_POLICY, GetTransformer",
+            "FIELD_INDEX_POLICY, DescribeIndexPolicies"})
+    void callerAllowedThePolicyTypeReadActionDescribesThePolicies(String policyType, String typeAction) {
+        String caller = user(allow("DescribeAccountPolicies") + "," + allow(typeAction));
+
+        describeAccountPolicies(caller, policyType).statusCode(200);
+    }
+
+    @Test
+    void metricExtractionPoliciesNeedOnlyDescribeAccountPolicies() {
+        String caller = user(allow("DescribeAccountPolicies"));
+
+        describeAccountPolicies(caller, "METRIC_EXTRACTION_POLICY").statusCode(200);
+    }
+
+    private ValidatableResponse describeAccountPolicies(String caller, String policyType) {
+        return LogsAuthorizationFixtures.call(endpoint.getPort(), caller, REGION, "DescribeAccountPolicies",
+                Map.of("policyType", policyType)).then();
     }
 
     private ValidatableResponse putAccountPolicy(String caller, String region, String policyName,

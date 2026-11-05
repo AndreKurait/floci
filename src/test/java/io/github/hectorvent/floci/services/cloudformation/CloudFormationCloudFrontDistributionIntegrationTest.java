@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.services.cloudfront.model.KeyGroup;
 import io.github.hectorvent.floci.services.cloudfront.model.OriginAccessControl;
 import io.github.hectorvent.floci.services.cloudfront.model.PublicKey;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
@@ -112,6 +113,7 @@ class CloudFormationCloudFrontDistributionIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         // Stack completes and Fn::GetAtt(Dist, DomainName) resolves to a real *.cloudfront.net domain
         // (not the unresolved "Dist.DomainName" token).
         given()
@@ -172,6 +174,7 @@ class CloudFormationCloudFrontDistributionIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         Distribution original = distributionsWithAlias(alias).getFirst();
 
         given()
@@ -185,6 +188,7 @@ class CloudFormationCloudFrontDistributionIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         List<Distribution> matching = distributionsWithAlias(alias);
         assertEquals(1, matching.size(), "UpdateStack must not leak a second distribution");
         Distribution updated = matching.getFirst();
@@ -257,11 +261,81 @@ class CloudFormationCloudFrontDistributionIntegrationTest {
         .then()
             .statusCode(200);
 
+        CfnStackWaits.awaitStatus("cfn-cloudfront-private-" + suffix, "CREATE_COMPLETE");
         Distribution distribution = distributionsWithAlias(alias).getFirst();
         assertEquals(List.of(defaultKeyGroup.getId()),
                 distribution.getConfig().getDefaultCacheBehavior().getTrustedKeyGroups());
         assertEquals(List.of(orderedKeyGroupA.getId(), orderedKeyGroupB.getId()),
                 distribution.getConfig().getCacheBehaviors().getFirst().getTrustedKeyGroups());
+    }
+
+    @Test
+    void createStackWithAnOutOfRangeOriginConnectionSettingFailsTheStack() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-cloudfront-bad-attempts-" + suffix;
+
+        String template = """
+                {
+                  "Resources": {
+                    "Dist": {
+                      "Type": "AWS::CloudFront::Distribution",
+                      "Properties": {
+                        "DistributionConfig": {
+                          "Enabled": true,
+                          "Origins": [{
+                            "Id": "o1",
+                            "DomainName": "origin.example.com",
+                            "ConnectionAttempts": 4,
+                            "CustomOriginConfig": {"OriginProtocolPolicy": "https-only"}
+                          }],
+                          "DefaultCacheBehavior": {
+                            "TargetOriginId": "o1",
+                            "ViewerProtocolPolicy": "allow-all"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        CfnStackWaits.awaitStatus(stackName, "ROLLBACK_COMPLETE");
+        // On AWS the stack fails because CloudFront rejects the out-of-range value; the
+        // service-level check makes the CloudFormation path share that one copy.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"))
+            .body(containsString("failed to create: [Dist]"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString(
+                    "The parameter ConnectionAttempts must be between 1 and 3."));
     }
 
     private KeyGroup createKeyGroup(String name, String publicKeyId) {

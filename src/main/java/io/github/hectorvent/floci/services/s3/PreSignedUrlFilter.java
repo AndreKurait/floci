@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.s3;
 
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.core.common.auth.SigV4aSignature;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import jakarta.annotation.Priority;
@@ -118,7 +119,8 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             return;
         }
 
-        if (!"AWS4-HMAC-SHA256".equals(algorithm)) {
+        boolean asymmetric = SigV4aSignature.ALGORITHM.equals(algorithm);
+        if (!asymmetric && !"AWS4-HMAC-SHA256".equals(algorithm)) {
             requestContext.abortWith(
                 errorResponse(
                     400,
@@ -178,7 +180,7 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             String credential = queryParams.getFirst("X-Amz-Credential");
             String decodedCredential = URLDecoder.decode(credential, StandardCharsets.UTF_8);
             String[] credParts = decodedCredential.split("/");
-            if (credParts.length < 5) {
+            if (credParts.length < (asymmetric ? 4 : 5)) {
                 if (authEnforced || generatedCredential) {
                     requestContext.abortWith(errorResponse(403, "InvalidAccessKeyId",
                             "The AWS Access Key Id you provided does not exist in our records."));
@@ -209,7 +211,7 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
                 }
             }
 
-            if (authEnforced || generatedCredential) {
+            if (authEnforced || generatedCredential || asymmetric) {
                 requestContext.abortWith(errorResponse(403, "InvalidAccessKeyId",
                         "The AWS Access Key Id you provided does not exist in our records."));
                 return;
@@ -255,13 +257,17 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
 
             String decodedCredential = URLDecoder.decode(credential, StandardCharsets.UTF_8);
             String[] credParts = decodedCredential.split("/");
-            if (credParts.length < 5) {
+            boolean asymmetric = SigV4aSignature.ALGORITHM.equals(queryParams.getFirst("X-Amz-Algorithm"));
+            if (credParts.length < (asymmetric ? 4 : 5)) {
                 return false;
             }
+            // A SigV4A scope is <akid>/<date>/<service>/aws4_request, with no region segment.
             String date = credParts[1];
-            String region = credParts[2];
-            String service = credParts[3];
-            String credentialScope = date + "/" + region + "/" + service + "/aws4_request";
+            String region = asymmetric ? null : credParts[2];
+            String service = asymmetric ? credParts[2] : credParts[3];
+            String credentialScope = asymmetric
+                    ? date + "/" + service + "/aws4_request"
+                    : date + "/" + region + "/" + service + "/aws4_request";
 
             // Build canonical headers from signed headers
             URI requestUri = requestContext.getProperty(S3VirtualHostFilter.ORIGINAL_REQUEST_URI_PROPERTY) instanceof URI uri
@@ -285,6 +291,12 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
                     requestContext.getMethod(), path, canonicalQueryString, signedHeaders,
                     header -> "host".equals(header) ? authority : requestContext.getHeaderString(header),
                     payloadHash);
+            if (asymmetric) {
+                return SigV4aSignature.verify(secretKey, credParts[0],
+                        S3PresignedCanonicalRequest.stringToSign(
+                                SigV4aSignature.ALGORITHM, amzDate, credentialScope, canonicalRequest),
+                        signature);
+            }
             String stringToSign = S3PresignedCanonicalRequest.stringToSign(
                     amzDate, credentialScope, canonicalRequest);
 

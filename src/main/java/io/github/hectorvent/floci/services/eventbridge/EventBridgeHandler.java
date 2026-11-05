@@ -7,6 +7,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsJson11Controller;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.eventbridge.model.ApiDestination;
 import io.github.hectorvent.floci.services.eventbridge.model.Archive;
 import io.github.hectorvent.floci.services.eventbridge.model.ArchiveState;
@@ -17,6 +19,7 @@ import io.github.hectorvent.floci.services.eventbridge.model.EcsParameters;
 import io.github.hectorvent.floci.services.eventbridge.model.EventBus;
 import io.github.hectorvent.floci.services.eventbridge.model.HttpParameters;
 import io.github.hectorvent.floci.services.eventbridge.model.InputTransformer;
+import io.github.hectorvent.floci.services.eventbridge.model.RedshiftDataParameters;
 import io.github.hectorvent.floci.services.eventbridge.model.Replay;
 import io.github.hectorvent.floci.services.eventbridge.model.ReplayState;
 import io.github.hectorvent.floci.services.eventbridge.model.Rule;
@@ -115,10 +118,16 @@ public class EventBridgeHandler {
     private Response handleCreateEventBus(JsonNode request, String region) {
         String name = request.path("Name").asText(null);
         String description = request.path("Description").asText(null);
+        String kmsKey = request.path("KmsKeyIdentifier").asText(null);
         Map<String, String> tags = parseTagsArray(request.path("Tags"));
-        EventBus bus = eventBridgeService.createEventBus(name, description, tags, region);
+        EventBus bus = eventBridgeService.createEventBus(name, description, kmsKey,
+                configJson(request.path("DeadLetterConfig")), configJson(request.path("LogConfig")), tags, region);
+        // CreateEventBus answers with the bus's ARN and the configuration it was given.
+        ObjectNode configuration = buildBusNode(bus);
+        configuration.remove(List.of("Name", "Arn", "CreationTime", "Policy"));
         ObjectNode response = objectMapper.createObjectNode();
         response.put("EventBusArn", bus.getArn());
+        response.setAll(configuration);
         return Response.ok(response).build();
     }
 
@@ -140,13 +149,14 @@ public class EventBridgeHandler {
         String kmsKey = request.path("KmsKeyIdentifier").asText(null);
         // Empty {} is treated as "no change", matching how omitted/null inputs flow.
         // Only a populated object triggers a write to the bus's nested config field.
-        JsonNode dlqNode = request.path("DeadLetterConfig");
-        String dlq = (dlqNode.isObject() && !dlqNode.isEmpty()) ? dlqNode.toString() : null;
-        JsonNode logNode = request.path("LogConfig");
-        String logCfg = (logNode.isObject() && !logNode.isEmpty()) ? logNode.toString() : null;
-        EventBus bus = eventBridgeService.updateEventBus(
-                name, description, kmsKey, dlq, logCfg, region);
+        EventBus bus = eventBridgeService.updateEventBus(name, description, kmsKey,
+                configJson(request.path("DeadLetterConfig")), configJson(request.path("LogConfig")), region);
         return Response.ok(buildBusNode(bus)).build();
+    }
+
+    /** A nested configuration object as its JSON; empty {} or absent means not given. */
+    private static String configJson(JsonNode node) {
+        return node.isObject() && !node.isEmpty() ? node.toString() : null;
     }
 
     private Response handleListEventBuses(JsonNode request, String region) {
@@ -193,13 +203,37 @@ public class EventBridgeHandler {
     private Response handleListRules(JsonNode request, String region) {
         String busName = request.path("EventBusName").asText(null);
         String namePrefix = request.path("NamePrefix").asText(null);
-        List<Rule> rules = eventBridgeService.listRules(busName, namePrefix, region);
+        Integer limit = readLimit(request.path("Limit"));
+        String nextToken = request.path("NextToken").asText(null);
+        PaginatedResult<Rule> page = eventBridgeService.listRules(busName, namePrefix, limit, nextToken, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode rulesArray = response.putArray("Rules");
-        for (Rule rule : rules) {
+        for (Rule rule : page.items()) {
             rulesArray.add(buildRuleNode(rule));
         }
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
+        }
         return Response.ok(response).build();
+    }
+
+    /**
+     * Reads an integer {@code Limit} without coercion: a string, boolean or fractional value is
+     * a SerializationException, and an integral value wider than an int fails the range check
+     * instead of being truncated into it.
+     */
+    private static Integer readLimit(JsonNode limit) {
+        if (limit.isMissingNode() || limit.isNull()) {
+            return null;
+        }
+        if (!limit.isIntegralNumber()) {
+            throw new AwsException("SerializationException",
+                    "'" + limit.asText() + "' can not be converted to Integer", 400);
+        }
+        if (!limit.canConvertToInt()) {
+            throw EventBridgeService.limitOutOfRange(limit.asText(), limit.bigIntegerValue().signum() < 0);
+        }
+        return limit.intValue();
     }
 
     private Response handleEnableRule(JsonNode request, String region) {
@@ -250,6 +284,11 @@ public class EventBridgeHandler {
                 if (!ecsParamsNode.isMissingNode() && ecsParamsNode.isObject()) {
                     target.setEcsParameters(objectMapper.convertValue(ecsParamsNode, EcsParameters.class));
                 }
+                JsonNode redshiftParamsNode = t.path("RedshiftDataParameters");
+                if (!redshiftParamsNode.isMissingNode() && redshiftParamsNode.isObject()) {
+                    target.setRedshiftDataParameters(
+                            objectMapper.convertValue(redshiftParamsNode, RedshiftDataParameters.class));
+                }
                 JsonNode retryPolicyNode = t.path("RetryPolicy");
                 if (retryPolicyNode.isObject()) {
                     target.setRetryPolicy(objectMapper.convertValue(retryPolicyNode, Target.RetryPolicy.class));
@@ -262,6 +301,10 @@ public class EventBridgeHandler {
                 JsonNode httpParamsNode = t.path("HttpParameters");
                 if (!httpParamsNode.isMissingNode() && httpParamsNode.isObject()) {
                     target.setHttpParameters(objectMapper.convertValue(httpParamsNode, HttpParameters.class));
+                }
+                JsonNode appSyncParamsNode = t.path("AppSyncParameters");
+                if (appSyncParamsNode.isObject()) {
+                    target.setAppSyncParameters(objectMapper.convertValue(appSyncParamsNode, Target.AppSyncParameters.class));
                 }
                 targets.add(target);
             }
@@ -326,6 +369,9 @@ public class EventBridgeHandler {
             if (t.getEcsParameters() != null) {
                 node.set("EcsParameters", objectMapper.valueToTree(t.getEcsParameters()));
             }
+            if (t.getRedshiftDataParameters() != null) {
+                node.set("RedshiftDataParameters", objectMapper.valueToTree(t.getRedshiftDataParameters()));
+            }
             if (t.getRetryPolicy() != null) {
                 node.set("RetryPolicy", objectMapper.valueToTree(t.getRetryPolicy()));
             }
@@ -337,6 +383,9 @@ public class EventBridgeHandler {
             }
             if (t.getHttpParameters() != null) {
                 node.set("HttpParameters", objectMapper.valueToTree(t.getHttpParameters()));
+            }
+            if (t.getAppSyncParameters() != null) {
+                node.set("AppSyncParameters", objectMapper.valueToTree(t.getAppSyncParameters()));
             }
             targetsArray.add(node);
         }
@@ -367,7 +416,7 @@ public class EventBridgeHandler {
                 entries.add(entry);
             }
         }
-        EventBridgeService.PutEventsResult result = eventBridgeService.putEvents(entries, region);
+        EventBridgeService.PutEventsResult result = eventBridgeService.putEventsFromRequest(entries, region);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("FailedEntryCount", result.failedCount());
         ArrayNode resultEntries = response.putArray("Entries");
@@ -563,11 +612,16 @@ public class EventBridgeHandler {
     private Response handleListConnections(JsonNode request, String region) {
         String namePrefix = request.path("NamePrefix").asText(null);
         ConnectionState state = parseConnectionState(request.path("ConnectionState").asText(null));
-        List<Connection> connections = eventBridgeService.listConnections(namePrefix, state, region);
+        Integer limit = readLimit(request.path("Limit"));
+        String nextToken = Pagination.parseNextToken(request, "NextToken", "SerializationException");
+        PaginatedResult<Connection> page = eventBridgeService.listConnections(namePrefix, state, limit, nextToken, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode connectionsArray = response.putArray("Connections");
-        for (Connection connection : connections) {
+        for (Connection connection : page.items()) {
             connectionsArray.add(buildConnectionNode(connection, false));
+        }
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
         }
         return Response.ok(response).build();
     }

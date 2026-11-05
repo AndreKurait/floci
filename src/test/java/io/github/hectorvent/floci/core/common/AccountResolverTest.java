@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.core.common;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -58,6 +60,30 @@ class AccountResolverTest {
         String auth = "AWS4-ECDSA-P256-SHA256 Credential=000000000001/20260617/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc";
         assertEquals("000000000001", resolver.extractAccessKeyId(auth));
         assertEquals("000000000001", resolver.resolve(auth));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"000000000001", "AKIAEXAMPLE", "ASIAEXAMPLE"})
+    void legacyS3ExtractionDoesNotChangeSharedAuthenticationParsing(String accessKeyId) {
+        String header = "AWS " + accessKeyId + ":signature=";
+        assertEquals(accessKeyId, resolver.extractS3AccessKeyId(header));
+        assertNull(resolver.extractAccessKeyId(header));
+        assertEquals(DEFAULT_ACCOUNT, resolver.resolve(header));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "AWS key:", "AWS :signature", "AWS key:signature extra",
+            "AWS key:signature:extra", "AWS key :signature", "Basic key:signature", "aws key:signature"})
+    void malformedLegacyHeadersDoNotSelectAnAccount(String header) {
+        assertNull(resolver.extractS3AccessKeyId(header));
+    }
+
+    @Test
+    void legacyS3ExtractionRetainsModernAndAbsentHeaders() {
+        String header = "AWS4-HMAC-SHA256 Credential=ASIAEXAMPLE/20260617/us-west-2/s3/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+        assertEquals("ASIAEXAMPLE", resolver.extractS3AccessKeyId(header));
+        assertNull(resolver.extractS3AccessKeyId(null));
     }
 
     // --- resolveFromPresignedCredential(String credentialValue) tests ---

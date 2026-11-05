@@ -50,17 +50,19 @@ class Ec2DescribeSubnetsNotFoundTest {
     /**
      * describeSubnets is shared with the services that build on it, and each reports a missing
      * subnet in its own words. ELBv2 owes its callers SubnetNotFound, so the EC2 error must not
-     * reach through.
+     * reach through. An Application Load Balancer takes at least two subnets, and one alone is refused
+     * before it is looked up, so the missing subnet is sent alongside an existing one.
      */
     @Test
     @DisplayName("ELBv2 still reports its own SubnetNotFound for a missing subnet")
     void elbV2KeepsItsOwnSubnetError() {
+        String existing = TestFixtures.defaultVpcSubnets().get(0);
         try (ElasticLoadBalancingV2Client elb = TestFixtures.elbV2Client()) {
             ElasticLoadBalancingV2Exception error = assertThrows(
                     ElasticLoadBalancingV2Exception.class,
                     () -> elb.createLoadBalancer(r -> r.name("lb-" + UUID.randomUUID().toString().substring(0, 8))
                             .type("application")
-                            .subnets(MISSING)));
+                            .subnets(existing, MISSING)));
             assertThat(error.awsErrorDetails().errorCode()).isEqualTo("SubnetNotFound");
         }
     }

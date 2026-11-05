@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
+import org.hamcrest.Matchers;
 import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
@@ -121,13 +123,14 @@ class SnsFifoThroughputScopeCfnIntegrationTest {
     }
 
     private static String describeStacks(String expectedStatus) {
+        CfnStackWaits.awaitStatus(STACK, expectedStatus, CFN_AUTH);
         return given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", CFN_AUTH)
             .formParam("Action", "DescribeStacks")
             .formParam("StackName", STACK)
         .when().post("/").then().statusCode(200)
-            .body(org.hamcrest.Matchers.containsString("<StackStatus>" + expectedStatus + "</StackStatus>"))
+            .body(Matchers.containsString("<StackStatus>" + expectedStatus + "</StackStatus>"))
             .extract().asString();
     }
 

@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.cloudfront.model.Distribution;
 import io.github.hectorvent.floci.services.cloudfront.model.OriginAccessControl;
 import io.github.hectorvent.floci.services.cloudfront.model.OriginRequestPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.ResponseHeadersPolicy;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
@@ -237,10 +238,12 @@ class CloudFormationCloudFrontPoliciesIntegrationTest {
 
     private static void createStack(String stackName, String template) {
         stackCall("CreateStack", stackName, template);
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
     }
 
     private static void updateStack(String stackName, String template) {
         stackCall("UpdateStack", stackName, template);
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE", CFN_AUTH);
     }
 
     private static void stackCall(String action, String stackName, String template) {

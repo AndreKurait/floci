@@ -80,6 +80,14 @@ public class Cluster {
     private String podCidr;
 
     /**
+     * In-memory marker that the k3s container was replaced while the cluster stayed ACTIVE, as a
+     * first node group changing the node's capacity does, so the readiness poller still has to
+     * verify the new API server and finalize the cluster against it.
+     */
+    @JsonIgnore
+    private boolean finalizePending;
+
+    /**
      * Internal flag indicating whether the Kubernetes version was explicitly requested by
      * the caller (true) or defaulted (false). Persisted to storage so that clusters explicitly
      * pinned to the default version (e.g. 1.29) resolve to their pinned image across restarts
@@ -222,6 +230,9 @@ public class Cluster {
     public boolean isExplicitVersion() { return explicitVersion; }
     public void setExplicitVersion(boolean explicitVersion) { this.explicitVersion = explicitVersion; }
 
+    public boolean isFinalizePending() { return finalizePending; }
+    public void setFinalizePending(boolean finalizePending) { this.finalizePending = finalizePending; }
+
     public Boolean getDefaultStorageClass() { return defaultStorageClass; }
     public void setDefaultStorageClass(Boolean defaultStorageClass) { this.defaultStorageClass = defaultStorageClass; }
 
@@ -247,6 +258,7 @@ public class Cluster {
         c.internalEndpoint = this.internalEndpoint;
         c.hostPort = this.hostPort;
         c.podCidr = this.podCidr;
+        c.finalizePending = this.finalizePending;
         c.explicitVersion = this.explicitVersion;
         c.dockerName = this.dockerName;
         c.nodeInstanceType = this.nodeInstanceType;

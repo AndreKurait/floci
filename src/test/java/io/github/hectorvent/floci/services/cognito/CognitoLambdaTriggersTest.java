@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClient;
 import io.github.hectorvent.floci.services.cognito.verification.CognitoMessageDispatcher;
 import io.github.hectorvent.floci.services.cognito.verification.VerificationCode;
+import io.github.hectorvent.floci.services.cognito.verification.VerificationCodeException;
 import io.github.hectorvent.floci.services.cognito.verification.VerificationCodeService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -39,6 +40,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -53,6 +55,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.github.hectorvent.floci.testing.InlineMocks.inlineMock;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -64,8 +67,10 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -105,10 +110,17 @@ class CognitoLambdaTriggersTest {
      */
     private CognitoService createServiceWithMessaging(SesService ses, SnsService sns,
                                                        VerificationCodeService verificationCodeService) {
+        return createServiceWithMessaging(ses, sns, verificationCodeService, new InMemoryStorage<>());
+    }
+
+    /** The same, keeping its users in {@code users}. */
+    private CognitoService createServiceWithMessaging(SesService ses, SnsService sns,
+                                                       VerificationCodeService verificationCodeService,
+                                                       InMemoryStorage<String, CognitoUser> users) {
         return new CognitoService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                users, new InMemoryStorage<>(), new InMemoryStorage<>(),
                 "http://localhost:4566", regionResolver, lambdaService, mock(AcmService.class),
                 verificationCodeService, new CognitoMessageDispatcher(ses, sns, "us-east-1"),
                 mock(TlsCertificateManager.class));
@@ -684,7 +696,7 @@ class CognitoLambdaTriggersTest {
                         "autoConfirmUser", true,
                         "autoVerifyEmail", true)));
 
-        var user = service.signUp(client.getClientId(), "alice", "Perm1234!",
+        CognitoUser user = service.signUp(client.getClientId(), "alice", "Perm1234!",
                 Map.of("email", "alice@example.com"), Map.of(), Map.of());
 
         assertEquals("CONFIRMED", user.getUserStatus(),
@@ -702,7 +714,7 @@ class CognitoLambdaTriggersTest {
                 any(byte[].class), any()))
                 .thenReturn(ok(Map.of("autoVerifyPhone", true)));
 
-        var user = service.signUp(client.getClientId(), "alice", "Perm1234!",
+        CognitoUser user = service.signUp(client.getClientId(), "alice", "Perm1234!",
                 Map.of("phone_number", "+15551234567"), Map.of(), Map.of());
 
         assertEquals("true", user.getAttributes().get("phone_number_verified"),
@@ -1319,7 +1331,7 @@ class CognitoLambdaTriggersTest {
         seedUser(pool, "alice", "Perm1234!");
         UserPoolClient client = createClient(pool);
 
-        org.mockito.ArgumentCaptor<byte[]> payloadCap = org.mockito.ArgumentCaptor.forClass(byte[].class);
+        ArgumentCaptor<byte[]> payloadCap = ArgumentCaptor.forClass(byte[].class);
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::pre-token"), payloadCap.capture(), any()))
                 .thenReturn(ok(Map.of()));
 
@@ -1836,7 +1848,7 @@ class CognitoLambdaTriggersTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void verifyAuthChallengeLambdaDecidesCorrectness() {
+    void verifyAuthChallengeLambdaDecidesCorrectness() throws Exception {
         UserPool pool = createPoolWithLambdaConfig(Map.of(
                 "DefineAuthChallenge", "arn:aws:lambda:::define",
                         "CreateAuthChallenge", "arn:aws:lambda:::create",
@@ -1854,7 +1866,7 @@ class CognitoLambdaTriggersTest {
                                         ok(Map.of("publicChallengeParameters",
                                                         Map.of("question", "favourite-colour"),
                                                         "privateChallengeParameters",
-                                                        Map.of("answer", "blue"))));
+                                                        Map.of("answer", "blue"), "challengeMetadata", "QA-V1")));
         when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::verify"), any(byte[].class), any()))
                 .thenReturn(ok(Map.of("answerCorrect", true)));
 
@@ -1867,7 +1879,109 @@ class CognitoLambdaTriggersTest {
                 Map.of("USERNAME", "alice", "ANSWER", "anything"));
 
         assertNotNull(((Map<String, Object>) tokens.get("AuthenticationResult")).get("AccessToken"));
-        verify(lambdaService).invoke(anyString(), eq("arn:aws:lambda:::verify"), any(byte[].class), any());
+        ArgumentCaptor<byte[]> payload = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService).invoke(anyString(), eq("arn:aws:lambda:::verify"), payload.capture(), any());
+        assertEquals("blue", MAPPER.readTree(payload.getValue()).path("request")
+                .path("privateChallengeParameters").path("answer").asText());
+        verify(lambdaService, times(2)).invoke(anyString(), eq("arn:aws:lambda:::define"), payload.capture(), any());
+        assertEquals("QA-V1", MAPPER.readTree(payload.getValue()).path("request")
+                .path("session").get(0).path("challengeMetadata").asText());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void customAuthWithoutCreateMatchesNoOpCreate(boolean configureCreate) throws Exception {
+        Map<String, Object> config = new HashMap<>(Map.of(
+                "DefineAuthChallenge", "arn:aws:lambda:::define",
+                "VerifyAuthChallengeResponse", "arn:aws:lambda:::verify"));
+        if (configureCreate) {
+            config.put("CreateAuthChallenge", "arn:aws:lambda:::create");
+            when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::create"), any(byte[].class), any()))
+                    .thenReturn(ok(Map.of()));
+        }
+        UserPool pool = createPoolWithLambdaConfig(config);
+        seedUser(pool, "alice", "Perm1234!");
+        UserPoolClient client = createClient(pool);
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::define"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("challengeName", "CUSTOM_CHALLENGE")))
+                .thenReturn(ok(Map.of("issueTokens", true)));
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::verify"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("answerCorrect", true)));
+
+        Map<String, Object> started = service.initiateAuth(client.getClientId(), "CUSTOM_AUTH",
+                Map.of("USERNAME", "alice"));
+        assertEquals("CUSTOM_CHALLENGE", started.get("ChallengeName"));
+        assertEquals(Map.of("USERNAME", "alice"), started.get("ChallengeParameters"));
+        assertFalse(((String) started.get("Session")).isBlank());
+        Map<String, Object> completed = service.respondToAuthChallenge(client.getClientId(),
+                "CUSTOM_CHALLENGE", (String) started.get("Session"), Map.of("USERNAME", "alice", "ANSWER", "blue"));
+        assertTrue(completed.containsKey("AuthenticationResult"));
+        ArgumentCaptor<byte[]> payload = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService).invoke(anyString(), eq("arn:aws:lambda:::verify"), payload.capture(), any());
+        JsonNode request = MAPPER.readTree(payload.getValue()).path("request");
+        assertEquals("blue", request.path("challengeAnswer").asText());
+        assertEquals(MAPPER.createObjectNode(), request.path("privateChallengeParameters"));
+        verify(lambdaService, times(configureCreate ? 1 : 0))
+                .invoke(anyString(), eq("arn:aws:lambda:::create"), any(byte[].class), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"lambdaError", "malformed", "invocation"})
+    void configuredCreateAuthChallengeFailuresRemainErrors(String failure) {
+        UserPool pool = createPoolWithLambdaConfig(Map.of(
+                "DefineAuthChallenge", "arn:aws:lambda:::define",
+                "CreateAuthChallenge", "arn:aws:lambda:::create"));
+        seedUser(pool, "alice", "Perm1234!");
+        UserPoolClient client = createClient(pool);
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::define"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("challengeName", "CUSTOM_CHALLENGE")));
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::create"), any(byte[].class), any()))
+                .thenAnswer(invocation -> switch (failure) {
+                    case "lambdaError" -> lambdaError("Unhandled");
+                    case "malformed" -> rawPayload("{\"response\":\"invalid\"}");
+                    default -> throw new IllegalStateException("invocation failed");
+                });
+        AwsException error = assertThrows(AwsException.class, () -> service.initiateAuth(
+                client.getClientId(), "CUSTOM_AUTH", Map.of("USERNAME", "alice")));
+        assertEquals(switch (failure) {
+            case "lambdaError" -> "UserLambdaValidationException";
+            case "malformed" -> "InvalidLambdaResponseException";
+            default -> "UnexpectedLambdaException";
+        }, error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"issueTokens", "failAuthentication", "missingDefine", "missingVerify"})
+    void customAuthWithoutCreateRetainsRequiredDecisions(String decision) {
+        UserPool pool = createPoolWithLambdaConfig("missingDefine".equals(decision)
+                ? Map.of() : Map.of("DefineAuthChallenge", "arn:aws:lambda:::define"));
+        seedUser(pool, "alice", "Perm1234!");
+        UserPoolClient client = createClient(pool);
+        if (!"missingDefine".equals(decision)) {
+            when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::define"), any(byte[].class), any()))
+                    .thenReturn(ok("missingVerify".equals(decision)
+                            ? Map.of("challengeName", "CUSTOM_CHALLENGE") : Map.of(decision, true)))
+                    .thenReturn(ok(Map.of("issueTokens", true)));
+        }
+        if ("issueTokens".equals(decision)) {
+            assertTrue(service.initiateAuth(client.getClientId(), "CUSTOM_AUTH", Map.of("USERNAME", "alice"))
+                    .containsKey("AuthenticationResult"));
+        } else if ("missingVerify".equals(decision)) {
+            Map<String, Object> started = service.initiateAuth(client.getClientId(), "CUSTOM_AUTH",
+                    Map.of("USERNAME", "alice"));
+            AwsException error = assertThrows(AwsException.class, () -> service.respondToAuthChallenge(
+                    client.getClientId(), "CUSTOM_CHALLENGE", (String) started.get("Session"),
+                    Map.of("USERNAME", "alice", "ANSWER", "blue")));
+            assertEquals("InvalidUserPoolConfigurationException", error.getErrorCode());
+            verify(lambdaService, times(1)).invoke(anyString(), eq("arn:aws:lambda:::define"),
+                    any(byte[].class), any());
+        } else {
+            AwsException error = assertThrows(AwsException.class, () -> service.initiateAuth(
+                    client.getClientId(), "CUSTOM_AUTH", Map.of("USERNAME", "alice")));
+            assertEquals("missingDefine".equals(decision)
+                    ? "InvalidUserPoolConfigurationException" : "NotAuthorizedException", error.getErrorCode());
+        }
     }
 
     private CognitoService serviceWithClock(MutableClock clock) {
@@ -2209,25 +2323,91 @@ class CognitoLambdaTriggersTest {
     // CustomMessage
     // =========================================================================
 
+    private static final String CUSTOM_MESSAGE = "arn:aws:lambda:::custom-message";
+
+    /** A service that delivers through {@code ses} and issues {@code code} for every {@code purpose} code. */
+    private CognitoService customMessageService(SesService ses, VerificationCode.Purpose purpose, String code) {
+        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
+        if (purpose != null) {
+            when(verificationCodeService.issue(any(), any(), eq(purpose), any())).thenReturn(code);
+            when(verificationCodeService.issueTracked(any(), any(), eq(purpose), any()))
+                    .thenReturn(new VerificationCodeService.IssuedCode(code, "test-hash"));
+        }
+        return createServiceWithMessaging(ses, mock(SnsService.class), verificationCodeService);
+    }
+
+    /** A pool with {@code settings} whose CustomMessage trigger is {@link #CUSTOM_MESSAGE}. */
+    private static UserPool customMessagePool(CognitoService svc, Map<String, Object> settings) {
+        Map<String, Object> request = new HashMap<>(settings);
+        request.put("PoolName", "trigger-pool");
+        request.put("LambdaConfig", Map.of("CustomMessage", CUSTOM_MESSAGE));
+        return svc.createUserPool(request, "us-east-1");
+    }
+
+    private static UserPoolClient customMessageClient(CognitoService svc, UserPool pool) {
+        return svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of(),
+                null, List.of(), null, AUTH_FLOWS, null, null, List.of(), null, List.of(), null,
+                null, null, List.of(), null, null);
+    }
+
+    /** Signs in a confirmed user {@code spike} with a verified email and a name; returns the access token. */
+    @SuppressWarnings("unchecked")
+    private static String customMessageUser(CognitoService svc, UserPool pool, UserPoolClient client) {
+        svc.adminCreateUser(pool.getId(), "spike",
+                Map.of("email", "spike@example.com", "email_verified", "true", "name", "Spike"), null);
+        svc.adminSetUserPassword(pool.getId(), "spike", "Spike@Test1", true);
+        Map<String, Object> result = svc.initiateAuth(client.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "spike", "PASSWORD", "Spike@Test1"));
+        return (String) ((Map<String, Object>) result.get("AuthenticationResult")).get("AccessToken");
+    }
+
+    /** Issues 777888 for an email's verification and 555666 for a phone number's. */
+    private static VerificationCodeService attributeCodes() {
+        VerificationCodeService codes = inlineMock(VerificationCodeService.class);
+        when(codes.issue(any(), any(), eq(VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION), any()))
+                .thenReturn("777888");
+        when(codes.issueTracked(any(), any(), eq(VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION), any()))
+                .thenReturn(new VerificationCodeService.IssuedCode("777888", "email-hash"));
+        when(codes.issue(any(), any(), eq(VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION), any()))
+                .thenReturn("555666");
+        when(codes.issueTracked(any(), any(), eq(VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION), any()))
+                .thenReturn(new VerificationCodeService.IssuedCode("555666", "phone-hash"));
+        return codes;
+    }
+
+    /** A new email, then a phone number: two codes, the email's issued first. */
+    private static Map<String, String> newEmailAndPhoneNumber() {
+        Map<String, String> attributes = new LinkedHashMap<>();
+        attributes.put("email", "spike@example.org");
+        attributes.put("phone_number", "+12025550123");
+        return attributes;
+    }
+
+    /** The email first, so a code sent as soon as the email is read would miss the name. */
+    private static Map<String, String> newEmailAndName() {
+        Map<String, String> attributes = new LinkedHashMap<>();
+        attributes.put("email", "spike@example.org");
+        attributes.put("name", "Renamed");
+        return attributes;
+    }
+
+    /** Answers the CustomMessage function with {@code response} and captures the events it is sent. */
+    private ArgumentCaptor<byte[]> customMessageAnswers(Map<String, Object> response) {
+        ArgumentCaptor<byte[]> events = ArgumentCaptor.forClass(byte[].class);
+        when(lambdaService.invoke(anyString(), eq(CUSTOM_MESSAGE), events.capture(),
+                eq(InvocationType.RequestResponse))).thenReturn(ok(response));
+        return events;
+    }
+
     @Test
     void customMessageOverridesSignUpVerificationEmail() {
         SesService ses = mock(SesService.class);
-        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
-        when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
-                .thenReturn("246962");
-        CognitoService svc = createServiceWithMessaging(ses, mock(SnsService.class), verificationCodeService);
-
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "AutoVerifiedAttributes", List.of("email"),
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
-        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
-
-        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),
-                any(byte[].class), eq(InvocationType.RequestResponse)))
-                .thenReturn(ok(Map.of(
-                        "emailSubject", "TRIGGER-FIRED",
-                        "emailMessage", "TRIGGER-FIRED code={####}")));
+        CognitoService svc = customMessageService(ses, VerificationCode.Purpose.SIGNUP_CONFIRMATION, "246962");
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
+        customMessageAnswers(Map.of(
+                "emailSubject", "TRIGGER-FIRED",
+                "emailMessage", "TRIGGER-FIRED code={####}"));
 
         svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
 
@@ -2236,56 +2416,34 @@ class CognitoLambdaTriggersTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void customMessageSignUpTriggerReceivesCodeParameterAndUsername() throws Exception {
-        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
-        when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
-                .thenReturn("246962");
-        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class),
-                verificationCodeService);
-
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "AutoVerifiedAttributes", List.of("email"),
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
-        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
-
-        ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
-        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),
-                payloadCaptor.capture(), eq(InvocationType.RequestResponse)))
-                .thenReturn(ok(Map.of()));
+    void customMessageSignUpTriggerReceivesCodeParameterAndNullUsername() throws Exception {
+        CognitoService svc = customMessageService(mock(SesService.class),
+                VerificationCode.Purpose.SIGNUP_CONFIRMATION, "246962");
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
 
         svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
 
-        Map<String, Object> event = MAPPER.readValue(payloadCaptor.getValue(), new TypeReference<>() {});
+        Map<String, Object> event = MAPPER.readValue(events.getValue(), new TypeReference<>() {});
         assertEquals("CustomMessage_SignUp", event.get("triggerSource"));
         Map<String, Object> request = (Map<String, Object>) event.get("request");
         assertEquals("{####}", request.get("codeParameter"));
-        assertEquals("spike", request.get("usernameParameter"));
+        assertCustomMessageShape(events.getValue(), "UNCONFIRMED", null);
     }
 
     @Test
     void customMessageSignUpTriggerCarriesClientMetadata() throws Exception {
-        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
-        when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
-                .thenReturn("246962");
-        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class),
-                verificationCodeService);
-
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "AutoVerifiedAttributes", List.of("email"),
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
-        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
-
-        ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
-        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),
-                payloadCaptor.capture(), eq(InvocationType.RequestResponse)))
-                .thenReturn(ok(Map.of()));
+        CognitoService svc = customMessageService(mock(SesService.class),
+                VerificationCode.Purpose.SIGNUP_CONFIRMATION, "246962");
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
 
         svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"),
                 Map.of(), Map.of("source", "signup-form"));
 
-        JsonNode event = MAPPER.readTree(payloadCaptor.getValue());
+        JsonNode event = MAPPER.readTree(events.getValue());
         assertEquals("CustomMessage_SignUp", event.path("triggerSource").asText());
         assertEquals("signup-form", event.path("request").path("clientMetadata").path("source").asText());
     }
@@ -2293,18 +2451,10 @@ class CognitoLambdaTriggersTest {
     @Test
     void customMessageLambdaErrorFallsBackToDefaultSignUpMessage() {
         SesService ses = mock(SesService.class);
-        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
-        when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
-                .thenReturn("246962");
-        CognitoService svc = createServiceWithMessaging(ses, mock(SnsService.class), verificationCodeService);
-
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "AutoVerifiedAttributes", List.of("email"),
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
-        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
-
-        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"), any(byte[].class), any()))
+        CognitoService svc = customMessageService(ses, VerificationCode.Purpose.SIGNUP_CONFIRMATION, "246962");
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
+        when(lambdaService.invoke(anyString(), eq(CUSTOM_MESSAGE), any(byte[].class), any()))
                 .thenReturn(lambdaError("Unhandled"));
 
         // SignUp must still succeed and deliver the default message when CustomMessage errors.
@@ -2315,17 +2465,34 @@ class CognitoLambdaTriggersTest {
     }
 
     @Test
+    void customMessageEchoKeepsTheDefaultSignUpMessage() throws Exception {
+        SesService ses = mock(SesService.class);
+        CognitoService svc = customMessageService(ses, VerificationCode.Purpose.SIGNUP_CONFIRMATION, "246962");
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
+        when(lambdaService.invoke(anyString(), eq(CUSTOM_MESSAGE), any(byte[].class),
+                eq(InvocationType.RequestResponse))).thenAnswer(invocation -> {
+                    byte[] payload = invocation.getArgument(2);
+                    assertCustomMessageShape(payload, "UNCONFIRMED", null);
+                    return new InvokeResult(200, null, payload, null, "req-id");
+                });
+
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
+
+        assertVerificationEmail(ses, "spike@example.com", "Your verification code",
+                "Your verification code is 246962.");
+        verify(lambdaService).invoke(anyString(), eq(CUSTOM_MESSAGE), any(byte[].class),
+                eq(InvocationType.RequestResponse));
+    }
+
+    @Test
     void customMessageDoesNotFireWhenNotConfigured() {
         SesService ses = mock(SesService.class);
-        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
-        when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
-                .thenReturn("246962");
-        CognitoService svc = createServiceWithMessaging(ses, mock(SnsService.class), verificationCodeService);
-
+        CognitoService svc = customMessageService(ses, VerificationCode.Purpose.SIGNUP_CONFIRMATION, "246962");
         UserPool pool = svc.createUserPool(Map.of(
                 "PoolName", "trigger-pool",
                 "AutoVerifiedAttributes", List.of("email")), "us-east-1");
-        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
+        UserPoolClient client = customMessageClient(svc, pool);
 
         svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
 
@@ -2336,72 +2503,378 @@ class CognitoLambdaTriggersTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void customMessageFiresWithResendCodeTriggerSourceOnResendConfirmationCode() throws Exception {
-        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
-        when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
-                .thenReturn("111222");
-        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class),
-                verificationCodeService);
-
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "AutoVerifiedAttributes", List.of("email"),
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
-        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
+    void customMessageFiresWithResendCodeTriggerSourceAndClientMetadataOnResendConfirmationCode() throws Exception {
+        CognitoService svc = customMessageService(mock(SesService.class),
+                VerificationCode.Purpose.SIGNUP_CONFIRMATION, "111222");
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
         svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), Map.of());
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
 
-        ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
-        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),
-                payloadCaptor.capture(), eq(InvocationType.RequestResponse)))
-                .thenReturn(ok(Map.of()));
+        svc.resendConfirmationCode(client.getClientId(), "spike", Map.of("source", "resend"));
 
-        svc.resendConfirmationCode(client.getClientId(), "spike");
-
-        Map<String, Object> event = MAPPER.readValue(payloadCaptor.getValue(), new TypeReference<>() {});
+        Map<String, Object> event = MAPPER.readValue(events.getValue(), new TypeReference<>() {});
         assertEquals("CustomMessage_ResendCode", event.get("triggerSource"));
+        assertEquals(Map.of("source", "resend"), ((Map<String, Object>) event.get("request")).get("clientMetadata"));
+        assertCustomMessageShape(events.getValue(), "UNCONFIRMED", null);
     }
 
     @Test
     @SuppressWarnings("unchecked")
-    void customMessageFiresWithForgotPasswordTriggerSourceOnForgotPassword() throws Exception {
-        VerificationCodeService verificationCodeService = inlineMock(VerificationCodeService.class);
-        when(verificationCodeService.issue(any(), any(), eq(VerificationCode.Purpose.PASSWORD_RESET), any()))
-                .thenReturn("333444");
-        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class),
-                verificationCodeService);
-
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
-        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of());
+    void customMessageFiresWithForgotPasswordTriggerSourceAndClientMetadataOnForgotPassword() throws Exception {
+        CognitoService svc = customMessageService(mock(SesService.class),
+                VerificationCode.Purpose.PASSWORD_RESET, "333444");
+        UserPool pool = customMessagePool(svc, Map.of());
+        UserPoolClient client = customMessageClient(svc, pool);
         svc.adminCreateUser(pool.getId(), "spike",
                 Map.of("email", "spike@example.com", "email_verified", "true"), null);
         svc.adminSetUserPassword(pool.getId(), "spike", "Spike@Test1", true);
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
 
-        ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
-        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),
-                payloadCaptor.capture(), eq(InvocationType.RequestResponse)))
-                .thenReturn(ok(Map.of()));
+        svc.forgotPassword(client.getClientId(), "spike", Map.of("source", "forgot"));
 
-        svc.forgotPassword(client.getClientId(), "spike");
-
-        Map<String, Object> event = MAPPER.readValue(payloadCaptor.getValue(), new TypeReference<>() {});
+        Map<String, Object> event = MAPPER.readValue(events.getValue(), new TypeReference<>() {});
         assertEquals("CustomMessage_ForgotPassword", event.get("triggerSource"));
+        assertEquals(Map.of("source", "forgot"), ((Map<String, Object>) event.get("request")).get("clientMetadata"));
+        assertCustomMessageShape(events.getValue(), "CONFIRMED", null);
+    }
+
+    /** Measured (eu-west-1, 2026-10-21): the event carries the user as the whole update leaves them. */
+    @Test
+    void customMessageFiresWithUpdateUserAttributeTriggerSourceOnUpdateUserAttributes() throws Exception {
+        SesService ses = mock(SesService.class);
+        CognitoService svc = customMessageService(ses, VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION, "777888");
+        UserPool pool = customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email")));
+        UserPoolClient client = customMessageClient(svc, pool);
+        String accessToken = customMessageUser(svc, pool, client);
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of(
+                "emailSubject", "Confirm your address",
+                "emailMessage", "Your code is {####}"));
+
+        svc.updateUserAttributes(accessToken, newEmailAndName(), Map.of("source", "profile"));
+
+        JsonNode event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_UpdateUserAttribute", event.path("triggerSource").asText());
+        assertCustomMessageShape(events.getValue(), "CONFIRMED", null);
+        assertEquals(client.getClientId(), event.path("callerContext").path("clientId").asText());
+        JsonNode request = event.path("request");
+        assertEquals("{####}", request.path("codeParameter").asText());
+        assertEquals("profile", request.path("clientMetadata").path("source").asText());
+        assertEquals("spike@example.org", request.path("userAttributes").path("email").asText());
+        assertEquals("false", request.path("userAttributes").path("email_verified").asText());
+        assertEquals("Renamed", request.path("userAttributes").path("name").asText());
+        assertVerificationEmail(ses, "spike@example.org", "Confirm your address", "Your code is 777888");
+    }
+
+    @Test
+    void customMessageFiresWithVerifyUserAttributeTriggerSourceOnGetUserAttributeVerificationCode() throws Exception {
+        SesService ses = mock(SesService.class);
+        CognitoService svc = customMessageService(ses, VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION, "777888");
+        UserPool pool = customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email")));
+        UserPoolClient client = customMessageClient(svc, pool);
+        String accessToken = customMessageUser(svc, pool, client);
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of(
+                "emailSubject", "Verify your address",
+                "emailMessage", "Your code is {####}"));
+
+        svc.getUserAttributeVerificationCode(accessToken, "email", Map.of("source", "settings"));
+
+        JsonNode event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_VerifyUserAttribute", event.path("triggerSource").asText());
+        assertCustomMessageShape(events.getValue(), "CONFIRMED", null);
+        assertEquals(client.getClientId(), event.path("callerContext").path("clientId").asText());
+        JsonNode request = event.path("request");
+        assertEquals("{####}", request.path("codeParameter").asText());
+        assertEquals("settings", request.path("clientMetadata").path("source").asText());
+        assertEquals("spike@example.com", request.path("userAttributes").path("email").asText());
+        assertVerificationEmail(ses, "spike@example.com", "Verify your address", "Your code is 777888");
+    }
+
+    /**
+     * Measured (eu-west-1, 2026-10-21 and 2026-10-22): with an email that must be verified before it
+     * changes, both events carry the address still in place, and both codes go to the new one; a
+     * request without ClientMetadata leaves the key out.
+     */
+    @Test
+    void customMessageForAnEmailAwaitingVerificationCarriesTheAddressStillInPlace() throws Exception {
+        SesService ses = mock(SesService.class);
+        CognitoService svc = customMessageService(ses, VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION, "777888");
+        UserPool pool = customMessagePool(svc, Map.of(
+                "AutoVerifiedAttributes", List.of("email"),
+                "UserAttributeUpdateSettings", Map.of("AttributesRequireVerificationBeforeUpdate", List.of("email"))));
+        UserPoolClient client = customMessageClient(svc, pool);
+        String accessToken = customMessageUser(svc, pool, client);
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
+
+        svc.updateUserAttributes(accessToken, newEmailAndName(), Map.of());
+        svc.getUserAttributeVerificationCode(accessToken, "email", Map.of());
+
+        List<byte[]> sent = events.getAllValues();
+        assertEquals(2, sent.size());
+        for (byte[] payload : sent) {
+            JsonNode request = MAPPER.readTree(payload).path("request");
+            assertFalse(request.has("clientMetadata"));
+            JsonNode userAttributes = request.path("userAttributes");
+            assertEquals("spike@example.com", userAttributes.path("email").asText());
+            assertEquals("true", userAttributes.path("email_verified").asText());
+            assertEquals("Renamed", userAttributes.path("name").asText());
+        }
+        ArgumentCaptor<SendEmailRequest> emails = ArgumentCaptor.forClass(SendEmailRequest.class);
+        verify(ses, times(2)).sendServiceEmail(emails.capture());
+        assertEquals(List.of(List.of("spike@example.org"), List.of("spike@example.org")),
+                emails.getAllValues().stream().map(SendEmailRequest::toAddresses).toList());
+    }
+
+    /**
+     * Measured (eu-west-1, 2026-10-22): Cognito keeps an update whose code it cannot deliver, and
+     * answers CodeDeliveryFailureException.
+     */
+    @Test
+    void anUpdateWhoseCodeCannotBeSentIsKept() {
+        SesService ses = mock(SesService.class);
+        when(ses.sendServiceEmail(any())).thenThrow(new IllegalStateException("SES unavailable"));
+        CognitoService svc = customMessageService(ses, VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION, "777888");
+        UserPool pool = customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email")));
+        UserPoolClient client = customMessageClient(svc, pool);
+        String accessToken = customMessageUser(svc, pool, client);
+        customMessageAnswers(Map.of());
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> svc.updateUserAttributes(accessToken, newEmailAndName(), Map.of()));
+
+        assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
+        Map<String, String> attributes = svc.adminGetUser(pool.getId(), "spike").getAttributes();
+        assertEquals("spike@example.org", attributes.get("email"));
+        assertEquals("false", attributes.get("email_verified"));
+        assertEquals("Renamed", attributes.get("name"));
+    }
+
+    /**
+     * An update that cannot issue a later attribute's code stores nothing, and withdraws the codes it
+     * issued before it, which no message carried, so they can be asked for again at once.
+     */
+    @Test
+    void anUpdateThatCannotIssueALaterCodeWithdrawsTheCodesBeforeIt() {
+        SesService ses = mock(SesService.class);
+        VerificationCodeService codes = attributeCodes();
+        when(codes.issueTracked(any(), any(), eq(VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION), any()))
+                .thenThrow(new VerificationCodeException(VerificationCodeException.Kind.RATE_LIMIT,
+                        "Attempt limit exceeded, please try again later"));
+        CognitoService svc = createServiceWithMessaging(ses, mock(SnsService.class), codes);
+        UserPool pool = customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email")));
+        String accessToken = customMessageUser(svc, pool, customMessageClient(svc, pool));
+        customMessageAnswers(Map.of());
+        clearInvocations(codes);
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> svc.updateUserAttributes(accessToken, newEmailAndPhoneNumber(), Map.of()));
+
+        assertEquals("LimitExceededException", refused.getErrorCode());
+        verify(codes).invalidateIfCurrent(eq(pool.getId()), eq("spike"),
+                eq(VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION), any());
+        verify(ses, never()).sendServiceEmail(any());
+        assertEquals("spike@example.com", svc.adminGetUser(pool.getId(), "spike").getAttributes().get("email"));
+    }
+
+    /** One message that cannot be sent holds back no other code of the update, and its own is withdrawn. */
+    @Test
+    void aCodeThatCannotBeSentHoldsBackNoOther() {
+        SesService ses = mock(SesService.class);
+        when(ses.sendServiceEmail(any())).thenThrow(new IllegalStateException("SES unavailable"));
+        SnsService sns = mock(SnsService.class);
+        VerificationCodeService codes = attributeCodes();
+        CognitoService svc = createServiceWithMessaging(ses, sns, codes);
+        UserPool pool = customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email")));
+        String accessToken = customMessageUser(svc, pool, customMessageClient(svc, pool));
+        customMessageAnswers(Map.of());
+        clearInvocations(codes);
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> svc.updateUserAttributes(accessToken, newEmailAndPhoneNumber(), Map.of()));
+
+        assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
+        verify(sns).publish(any(), any(), eq("+12025550123"), contains("555666"), any(), any(), any());
+        verify(codes).invalidateIfCurrent(eq(pool.getId()), eq("spike"),
+                eq(VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION), any());
+        verify(codes, never()).invalidateIfCurrent(eq(pool.getId()), eq("spike"),
+                eq(VerificationCode.Purpose.PHONE_ATTRIBUTE_VERIFICATION), any());
+    }
+
+    @Test
+    void aVerificationCodeThatCannotBeSentIsWithdrawn() {
+        SesService ses = mock(SesService.class);
+        when(ses.sendServiceEmail(any())).thenThrow(new IllegalStateException("SES unavailable"));
+        VerificationCodeService codes = attributeCodes();
+        CognitoService svc = createServiceWithMessaging(ses, mock(SnsService.class), codes);
+        UserPool pool = customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email")));
+        String accessToken = customMessageUser(svc, pool, customMessageClient(svc, pool));
+        customMessageAnswers(Map.of());
+        clearInvocations(codes);
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> svc.getUserAttributeVerificationCode(accessToken, "email", Map.of()));
+
+        assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
+        verify(codes).invalidateIfCurrent(eq(pool.getId()), eq("spike"),
+                eq(VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION), any());
+    }
+
+    /** What the message goes out with is read before the update is stored: a client deleted after does not stop it. */
+    @Test
+    void anUpdatesCodeGoesOutThoughItsClientIsDeletedOnceTheUpdateIsStored() throws Exception {
+        SesService ses = mock(SesService.class);
+        AtomicReference<CognitoService> service = new AtomicReference<>();
+        AtomicReference<String> clientId = new AtomicReference<>();
+        InMemoryStorage<String, CognitoUser> users = new InMemoryStorage<>() {
+            @Override
+            public void put(String key, CognitoUser user) {
+                super.put(key, user);
+                if ("spike@example.org".equals(user.getAttributes().get("email"))) {
+                    service.get().deleteUserPoolClient(user.getUserPoolId(), clientId.get());
+                }
+            }
+        };
+        CognitoService svc = createServiceWithMessaging(ses, mock(SnsService.class), attributeCodes(), users);
+        service.set(svc);
+        UserPool pool = customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email")));
+        UserPoolClient client = customMessageClient(svc, pool);
+        clientId.set(client.getClientId());
+        String accessToken = customMessageUser(svc, pool, client);
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of(
+                "emailSubject", "Confirm your address",
+                "emailMessage", "Your code is {####}"));
+
+        svc.updateUserAttributes(accessToken, Map.of("email", "spike@example.org"), Map.of());
+
+        assertEquals(client.getClientId(),
+                MAPPER.readTree(events.getValue()).path("callerContext").path("clientId").asText());
+        assertVerificationEmail(ses, "spike@example.org", "Confirm your address", "Your code is 777888");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void customMessageFunctionCallingBackForTheUserOfAnAttributeCodeIsNotBlocked(boolean update) {
+        CognitoService svc = customMessageService(mock(SesService.class),
+                VerificationCode.Purpose.EMAIL_ATTRIBUTE_VERIFICATION, "777888");
+        UserPool pool = customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email")));
+        UserPoolClient client = customMessageClient(svc, pool);
+        String accessToken = customMessageUser(svc, pool, client);
+        when(lambdaService.invoke(anyString(), eq(CUSTOM_MESSAGE), any(byte[].class),
+                eq(InvocationType.RequestResponse))).thenAnswer(invocation -> {
+                    callFromFunction(() -> {
+                        svc.adminUpdateUserAttributes(pool.getId(), "spike", Map.of("name", "Set by the function"));
+                        return null;
+                    });
+                    return ok(Map.of());
+                });
+
+        // The function's call is for the user the request sends a code to. It would wait out the
+        // invocation if the request held that user's lock stripe while the function ran.
+        assertTimeoutPreemptively(Duration.ofSeconds(10), () -> {
+            if (update) {
+                svc.updateUserAttributes(accessToken, Map.of("email", "spike@example.org"), Map.of());
+            } else {
+                svc.getUserAttributeVerificationCode(accessToken, "email", Map.of());
+            }
+        });
+
+        assertEquals("Set by the function", svc.adminGetUser(pool.getId(), "spike").getAttributes().get("name"));
+    }
+
+    /** Measured (eu-west-1, 2026-10-21): no ClientMetadata omits the key, including an empty map. */
+    @Test
+    void customMessageSignUpOmitsMissingOrEmptyClientMetadata() throws Exception {
+        CognitoService svc = customMessageService(mock(SesService.class),
+                VerificationCode.Purpose.SIGNUP_CONFIRMATION, "246962");
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
+
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"), Map.of(), null);
+
+        JsonNode request = MAPPER.readTree(events.getValue()).path("request");
+        assertFalse(request.has("clientMetadata"));
+
+        svc.signUp(client.getClientId(), "spike2", "Spike@Test1", Map.of("email", "spike2@example.com"),
+                Map.of(), Map.of());
+        request = MAPPER.readTree(events.getValue()).path("request");
+        assertFalse(request.has("clientMetadata"));
+    }
+
+    @Test
+    void customMessageResendAndForgotPasswordOmitMissingClientMetadata() throws Exception {
+        VerificationCodeService codes = inlineMock(VerificationCodeService.class);
+        when(codes.issue(any(), any(), eq(VerificationCode.Purpose.SIGNUP_CONFIRMATION), any()))
+                .thenReturn("111222");
+        when(codes.issue(any(), any(), eq(VerificationCode.Purpose.PASSWORD_RESET), any()))
+                .thenReturn("333444");
+        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class), codes);
+        UserPoolClient client = customMessageClient(svc,
+                customMessagePool(svc, Map.of("AutoVerifiedAttributes", List.of("email"))));
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
+        svc.signUp(client.getClientId(), "spike", "Spike@Test1", Map.of("email", "spike@example.com"),
+                Map.of(), Map.of());
+
+        svc.resendConfirmationCode(client.getClientId(), "spike");
+        JsonNode event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_ResendCode", event.path("triggerSource").asText());
+        assertFalse(event.path("request").has("clientMetadata"));
+
+        svc.confirmSignUp(client.getClientId(), "spike", "111222");
+        svc.forgotPassword(client.getClientId(), "spike");
+        event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_ForgotPassword", event.path("triggerSource").asText());
+        assertFalse(event.path("request").has("clientMetadata"));
+    }
+
+    @Test
+    void customMessageAdminCreateUserOmitsMissingClientMetadata() throws Exception {
+        CognitoService svc = customMessageService(mock(SesService.class), null, null);
+        UserPool pool = customMessagePool(svc, Map.of());
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
+
+        svc.adminCreateUser(pool.getId(), "spike", Map.of("email", "spike@example.com"), "Spike@Test1", null,
+                false, List.of("EMAIL"), Map.of(), null);
+
+        JsonNode event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_AdminCreateUser", event.path("triggerSource").asText());
+        assertFalse(event.path("request").has("clientMetadata"));
+    }
+
+    /** The raw-event measurement in #6190 distinguishes an absent key from a null value. */
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = "web")
+    void customMessageForASignInCodeOmitsClientMetadata(String metadataValue) throws Exception {
+        CognitoService svc = customMessageService(mock(SesService.class), VerificationCode.Purpose.EMAIL_OTP, "555666");
+        UserPool pool = customMessagePool(svc, Map.of("Policies", Map.of("SignInPolicy",
+                Map.of("AllowedFirstAuthFactors", List.of("PASSWORD", "EMAIL_OTP")))));
+        UserPoolClient client = svc.createUserPoolClient(pool.getId(), "c", false, false, List.of(), List.of(),
+                null, List.of(), null, List.of("ALLOW_USER_AUTH"), null, null, List.of(), null, List.of(), null,
+                null, null, List.of(), null, null);
+        svc.adminCreateUser(pool.getId(), "spike", Map.of("email", "spike@example.com", "email_verified", "true"), null);
+        svc.adminSetUserPassword(pool.getId(), "spike", "Spike@Test1", true);
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
+
+        Map<String, String> metadata = metadataValue == null ? null
+                : metadataValue.isEmpty() ? Map.of() : Map.of("app", metadataValue);
+        svc.initiateAuth(client.getClientId(), "USER_AUTH",
+                Map.of("USERNAME", "spike", "PREFERRED_CHALLENGE", "EMAIL_OTP"), metadata);
+
+        JsonNode event = MAPPER.readTree(events.getValue());
+        assertEquals("CustomMessage_Authentication", event.path("triggerSource").asText());
+        assertFalse(event.path("request").has("clientMetadata"));
+        assertCustomMessageShape(events.getValue(), "CONFIRMED", null);
     }
 
     @Test
     void customMessageOverridesTheAdminCreateUserInvitation() {
         SesService ses = mock(SesService.class);
-        CognitoService svc = createServiceWithMessaging(ses, mock(SnsService.class),
-                inlineMock(VerificationCodeService.class));
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
-        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),
-                any(byte[].class), eq(InvocationType.RequestResponse)))
-                .thenReturn(ok(Map.of(
-                        "emailSubject", "Welcome",
-                        "emailMessage", "Sign in as {username} with {####}")));
+        CognitoService svc = customMessageService(ses, null, null);
+        UserPool pool = customMessagePool(svc, Map.of());
+        customMessageAnswers(Map.of(
+                "emailSubject", "Welcome",
+                "emailMessage", "Sign in as {username} with {####}"));
 
         svc.adminCreateUser(pool.getId(), "spike", Map.of("email", "spike@example.com"), "Spike@Test1", null,
                 false, List.of("EMAIL"), Map.of(), Map.of());
@@ -2412,35 +2885,42 @@ class CognitoLambdaTriggersTest {
     @Test
     @SuppressWarnings("unchecked")
     void customMessageAdminCreateUserTriggerReceivesPlaceholdersAndClientMetadata() throws Exception {
-        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class),
-                inlineMock(VerificationCodeService.class));
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
-        ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
-        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::custom-message"),
-                payloadCaptor.capture(), eq(InvocationType.RequestResponse)))
-                .thenReturn(ok(Map.of()));
+        CognitoService svc = customMessageService(mock(SesService.class), null, null);
+        UserPool pool = customMessagePool(svc, Map.of());
+        ArgumentCaptor<byte[]> events = customMessageAnswers(Map.of());
 
         svc.adminCreateUser(pool.getId(), "spike", Map.of("email", "spike@example.com"), "Spike@Test1", null,
                 false, List.of("EMAIL"), Map.of(), Map.of("source", "admin"));
 
-        Map<String, Object> event = MAPPER.readValue(payloadCaptor.getValue(), new TypeReference<>() {});
+        Map<String, Object> event = MAPPER.readValue(events.getValue(), new TypeReference<>() {});
         assertEquals("CustomMessage_AdminCreateUser", event.get("triggerSource"));
         assertEquals("CLIENT_ID_NOT_APPLICABLE", ((Map<String, Object>) event.get("callerContext")).get("clientId"));
         Map<String, Object> request = (Map<String, Object>) event.get("request");
         assertEquals("{####}", request.get("codeParameter"));
         assertEquals("{username}", request.get("usernameParameter"));
         assertEquals(Map.of("source", "admin"), request.get("clientMetadata"));
+        assertCustomMessageShape(events.getValue(), "FORCE_CHANGE_PASSWORD", "{username}");
+    }
+
+    private static void assertCustomMessageShape(byte[] payload, String status, String usernameParameter)
+            throws Exception {
+        JsonNode event = MAPPER.readTree(payload);
+        JsonNode request = event.path("request");
+        JsonNode expectedUsername = usernameParameter == null ? MAPPER.nullNode()
+                : MAPPER.getNodeFactory().textNode(usernameParameter);
+        ObjectNode response = MAPPER.createObjectNode().putNull("emailMessage")
+                .putNull("emailSubject").putNull("smsMessage");
+        assertAll(event.path("triggerSource").asText(),
+                () -> assertEquals(expectedUsername, request.get("usernameParameter")),
+                () -> assertEquals("{##Click Here##}", request.path("linkParameter").asText()),
+                () -> assertEquals(status, request.path("userAttributes").path("cognito:user_status").asText()),
+                () -> assertEquals(response, event.path("response")));
     }
 
     @Test
     void customMessageDoesNotFireForAnInvitationWithNowhereToGo() {
-        CognitoService svc = createServiceWithMessaging(mock(SesService.class), mock(SnsService.class),
-                inlineMock(VerificationCodeService.class));
-        UserPool pool = svc.createUserPool(Map.of(
-                "PoolName", "trigger-pool",
-                "LambdaConfig", Map.of("CustomMessage", "arn:aws:lambda:::custom-message")), "us-east-1");
+        CognitoService svc = customMessageService(mock(SesService.class), null, null);
+        UserPool pool = customMessagePool(svc, Map.of());
 
         // SMS, the default medium, and no phone number.
         svc.adminCreateUser(pool.getId(), "spike", Map.of("email", "spike@example.com"), "Spike@Test1");

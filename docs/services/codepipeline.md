@@ -25,6 +25,11 @@ Stages execute in declaration order. Actions with the same `runOrder` execute in
 A `QUEUED` or `PARALLEL` pipeline holds at most 50 active executions, as on AWS;
 `StartPipelineExecution` beyond that returns `ConcurrentPipelineExecutionsLimitExceededException`.
 
+In `SUPERSEDED` mode, a newer execution supersedes an older execution waiting at the same stage
+transition only when it catches up to that transition, not when it starts. If the newer execution
+fails before reaching that transition, the older execution can continue when the transition is enabled.
+Enabling the transition lets the newer execution proceed. Already-running stages are not interrupted.
+
 S3 source actions poll for source changes by default, matching AWS when `PollForSourceChanges` is
 omitted or set to `true`. Floci establishes a baseline for the configured object and starts one new
 execution when its version ID or ETag changes, recording `PollForSourceChanges` as the execution
@@ -108,6 +113,9 @@ the approval token, `expires` as an ISO-8601 timestamp, `consoleLink`, `approval
 | `FLOCI_STORAGE_SERVICES_CODEPIPELINE_MODE` | global mode | Overrides CodePipeline storage mode |
 | `FLOCI_STORAGE_SERVICES_CODEPIPELINE_FLUSH_INTERVAL_MS` | `5000` | Hybrid storage flush interval |
 | `FLOCI_SERVICES_CODEPIPELINE_SOURCE_POLL_INTERVAL_MS` | `500` | How often (ms) S3 sources are polled for a new object revision |
+| `FLOCI_SERVICES_CODEPIPELINE_WORKER_POLL_INTERVAL_MS` | `100` | How often (ms) execution workers check for progress, independently of S3 source polling |
+
+A zero or negative worker polling interval logs a warning and falls back to 100 ms.
 
 ## Example
 

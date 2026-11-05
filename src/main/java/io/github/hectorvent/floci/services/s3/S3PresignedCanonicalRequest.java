@@ -23,7 +23,12 @@ final class S3PresignedCanonicalRequest {
     }
 
     static String stringToSign(String amzDate, String credentialScope, String canonicalRequest) throws Exception {
-        return "AWS4-HMAC-SHA256\n" + amzDate + "\n" + credentialScope + "\n"
+        return stringToSign("AWS4-HMAC-SHA256", amzDate, credentialScope, canonicalRequest);
+    }
+
+    static String stringToSign(String algorithm, String amzDate, String credentialScope,
+                               String canonicalRequest) throws Exception {
+        return algorithm + "\n" + amzDate + "\n" + credentialScope + "\n"
                 + Digests.sha256Hex(canonicalRequest);
     }
 }

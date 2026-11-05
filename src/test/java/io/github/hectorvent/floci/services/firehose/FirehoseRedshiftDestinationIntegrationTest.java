@@ -233,7 +233,7 @@ class FirehoseRedshiftDestinationIntegrationTest {
     }
 
     @Test
-    void flushStagesTheBatchInTheIntermediateBucket() {
+    void flushWithAMissingClusterKeepsTheStagedObject() {
         post("CreateDeliveryStream", createBody("rs-flush", "rs-flush-stage")).statusCode(200);
         String data = Base64.getEncoder().encodeToString("{\"id\":1}".getBytes(StandardCharsets.UTF_8));
         post("PutRecord", "{\"DeliveryStreamName\": \"rs-flush\", \"Record\": {\"Data\": \"" + data + "\"}}")

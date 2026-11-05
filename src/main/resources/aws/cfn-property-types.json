@@ -7,6 +7,7 @@
   },
   "operations": {
     "AWS::AutoScaling::LaunchConfiguration": "AWS::AutoScaling::LaunchConfiguration",
+    "AWS::DSQL::Cluster": "AWS::DSQL::Cluster",
     "AWS::EC2::Instance": "AWS::EC2::Instance",
     "AWS::EC2::LaunchTemplate": "AWS::EC2::LaunchTemplate",
     "AWS::ECS::TaskDefinition": "AWS::ECS::TaskDefinition",
@@ -86,6 +87,59 @@
         "HttpTokens": "String",
         "HttpEndpoint": "String"
       }
+    },
+    "AWS::DSQL::Cluster": {
+      "type": "structure",
+      "members": {
+        "DeletionProtectionEnabled": "Boolean",
+        "Tags": "AWS::DSQL::Cluster.Tags",
+        "ResourceArn": "String",
+        "Identifier": "String",
+        "CreationTime": "String",
+        "Status": "String",
+        "VpcEndpointServiceName": "String",
+        "MultiRegionProperties": "AWS::DSQL::Cluster.MultiRegionProperties",
+        "KmsEncryptionKey": "String",
+        "EncryptionDetails": "AWS::DSQL::Cluster.EncryptionDetails",
+        "Endpoint": "String",
+        "VpcEndpoint": "String",
+        "PolicyVersion": "String",
+        "PolicyDocument": "String"
+      }
+    },
+    "AWS::DSQL::Cluster.EncryptionDetails": {
+      "type": "structure",
+      "members": {
+        "EncryptionStatus": "String",
+        "EncryptionType": "String",
+        "KmsKeyArn": "String"
+      }
+    },
+    "AWS::DSQL::Cluster.MultiRegionProperties": {
+      "type": "structure",
+      "members": {
+        "WitnessRegion": "String",
+        "Clusters": "AWS::DSQL::Cluster.MultiRegionProperties.Clusters"
+      }
+    },
+    "AWS::DSQL::Cluster.MultiRegionProperties.Clusters": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::DSQL::Cluster.Tags": {
+      "type": "list",
+      "member": "AWS::DSQL::Cluster/Tag"
+    },
+    "AWS::DSQL::Cluster/Tag": {
+      "type": "structure",
+      "members": {
+        "Key": "String",
+        "Value": "String"
+      },
+      "required": [
+        "Key",
+        "Value"
+      ]
     },
     "AWS::EC2::Instance": {
       "type": "structure",

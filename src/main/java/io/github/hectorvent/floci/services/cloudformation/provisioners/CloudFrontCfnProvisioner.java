@@ -21,8 +21,10 @@ import io.github.hectorvent.floci.services.cloudfront.model.ResponseHeadersPolic
 import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -286,6 +288,9 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
      * one after the update. Any other change updates the DEVELOPMENT stage in place, and
      * {@code AutoPublish: true} then publishes it to LIVE, which {@code Fn::GetAtt Stage} reports.
      * Floci has no Key Value Store, so {@code FunctionConfig.KeyValueStoreAssociations} is ignored.
+     * The template's {@code FunctionCode} is the raw code text, as in the CloudFormation example
+     * templates, and it is stored in the base64 form the CreateFunction API carries on the wire, so
+     * {@code GetFunction} serves the template text back.
      *
      * <p>When publishing or tagging fails, a function this call created is deleted again. An
      * in-place update is not reverted, the same limit as the policy types above.
@@ -305,7 +310,7 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
         Map<String, String> tags = ctx.resolveTags(props, "Tags");
         CloudFrontFunction fn = new CloudFrontFunction();
         fn.setName(name);
-        fn.setFunctionCode(code);
+        fn.setFunctionCode(Base64.getEncoder().encodeToString(code.getBytes(StandardCharsets.UTF_8)));
         fn.setComment(text(config, "Comment"));
         fn.setRuntime(runtime);
 
@@ -557,6 +562,18 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
                 if (!originAccessControlId.isEmpty()) {
                     origin.setOriginAccessControlId(originAccessControlId);
                 }
+                Integer connectionAttempts = cfnInt(node, "ConnectionAttempts", engine);
+                if (connectionAttempts != null) {
+                    origin.setConnectionAttempts(connectionAttempts);
+                }
+                Integer connectionTimeout = cfnInt(node, "ConnectionTimeout", engine);
+                if (connectionTimeout != null) {
+                    origin.setConnectionTimeout(connectionTimeout);
+                }
+                Integer responseCompletionTimeout = cfnInt(node, "ResponseCompletionTimeout", engine);
+                if (responseCompletionTimeout != null) {
+                    origin.setResponseCompletionTimeout(responseCompletionTimeout);
+                }
                 JsonNode originCustomHeaders = node.path("OriginCustomHeaders");
                 if (originCustomHeaders.isArray()) {
                     List<Map<String, String>> customHeaders = new ArrayList<>();
@@ -576,6 +593,14 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
                     coc.put("HTTPSPort", cfnTextOrDefault(custom, "HTTPSPort", engine, "443"));
                     coc.put("OriginProtocolPolicy",
                             cfnTextOrDefault(custom, "OriginProtocolPolicy", engine, "https-only"));
+                    Integer originReadTimeout = cfnInt(custom, "OriginReadTimeout", engine);
+                    if (originReadTimeout != null) {
+                        coc.put("OriginReadTimeout", originReadTimeout);
+                    }
+                    Integer originKeepaliveTimeout = cfnInt(custom, "OriginKeepaliveTimeout", engine);
+                    if (originKeepaliveTimeout != null) {
+                        coc.put("OriginKeepaliveTimeout", originKeepaliveTimeout);
+                    }
                     origin.setCustomOriginConfig(coc);
                 } else {
                     // No CustomOriginConfig => S3 origin (S3OriginConfig may be present or defaulted).
@@ -664,5 +689,24 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
     private boolean cfnBool(JsonNode parent, String field, CloudFormationTemplateEngine engine, boolean dflt) {
         String value = cfnText(parent, field, engine);
         return value.isEmpty() ? dflt : "true".equalsIgnoreCase(value);
+    }
+
+    /**
+     * A template value the registry schema types as an integer. Template properties arrive as text,
+     * and an uncaught {@link NumberFormatException} would surface as a 500 instead of the failed
+     * validation it is. A missing or null property stays unset so the model's own default stands.
+     */
+    private Integer cfnInt(JsonNode parent, String field, CloudFormationTemplateEngine engine) {
+        String value = cfnText(parent, field, engine);
+        if (value.isEmpty()) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value.trim());
+        } catch (NumberFormatException notAnInteger) {
+            throw new AwsException("ValidationError",
+                    "AWS::CloudFront::Distribution origin " + field + " must be an integer, but was '"
+                            + value + "'", 400);
+        }
     }
 }

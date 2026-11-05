@@ -1,9 +1,12 @@
 package io.github.hectorvent.floci.services.codebuild;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.codebuild.model.Build;
@@ -20,8 +23,10 @@ import jakarta.inject.Inject;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -30,6 +35,9 @@ import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class CodeBuildService {
+
+    private static final int LIST_PROJECTS_PAGE_SIZE = 100;
+    private static final int LIST_BUILDS_PAGE_SIZE = 100;
 
     // key: region -> name -> project
     private Map<String, Map<String, Project>> projects = new ConcurrentHashMap<>();
@@ -152,7 +160,7 @@ public class CodeBuildService {
             throw new AwsException("InvalidInputException", "artifacts.type is required", 400);
         }
 
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        double now = EpochSeconds.fromInstant(Instant.now());
         Project project = new Project();
         project.setName(name);
         project.setArn(AwsArnUtils.Arn.of("codebuild", region, account, "project/" + name).toString());
@@ -214,7 +222,7 @@ public class CodeBuildService {
         if (logsConfig != null) { project.setLogsConfig(logsConfig); }
         if (vpcConfig != null) { project.setVpcConfig(vpcConfig); }
         if (concurrentBuildLimit != null) { project.setConcurrentBuildLimit(concurrentBuildLimit); }
-        project.setLastModified(Instant.now().toEpochMilli() / 1000.0);
+        project.setLastModified(EpochSeconds.fromInstant(Instant.now()));
 
         persistRegion(projects, region);
         return project;
@@ -249,6 +257,39 @@ public class CodeBuildService {
         return new ArrayList<>(projectsFor(region).keySet());
     }
 
+    public List<String> listProjects(String region, String sortBy, String sortOrder) {
+        if (sortBy == null && sortOrder == null) {
+            return listProjects(region);
+        }
+        return projectSortKeys(region).stream()
+                .sorted(listComparator(sortBy, sortOrder))
+                .map(ListSortKey::name)
+                .toList();
+    }
+
+    public ProjectPage listProjectsPage(String region, String sortBy, String sortOrder, String nextToken) {
+        if (sortBy == null && sortOrder == null && nextToken == null) {
+            List<String> names = listProjects(region);
+            if (names.size() <= LIST_PROJECTS_PAGE_SIZE) {
+                return new ProjectPage(names, null);
+            }
+        }
+
+        CodeBuildPagination.Page<ListSortKey> page = paginateList(projectSortKeys(region), region, sortBy, sortOrder,
+                LIST_PROJECTS_PAGE_SIZE, nextToken, "ListProjects", null);
+        return new ProjectPage(page.items().stream().map(ListSortKey::name).toList(), page.nextToken());
+    }
+
+    public record ProjectPage(List<String> projects, String nextToken) {
+    }
+
+    private List<ListSortKey> projectSortKeys(String region) {
+        return projectsFor(region).values().stream()
+                .map(project -> new ListSortKey(project.getCreated(), project.getLastModified(),
+                        project.getName(), project.getName()))
+                .toList();
+    }
+
     // ---- Report Groups ----
 
     public ReportGroup createReportGroup(String region, String account,
@@ -268,7 +309,7 @@ public class CodeBuildService {
             throw new AwsException("InvalidInputException", "type is required", 400);
         }
 
-        double now = Instant.now().toEpochMilli() / 1000.0;
+        double now = EpochSeconds.fromInstant(Instant.now());
         ReportGroup rg = new ReportGroup();
         rg.setArn(arn);
         rg.setName(name);
@@ -294,7 +335,7 @@ public class CodeBuildService {
         }
         if (exportConfig != null) { rg.setExportConfig(exportConfig); }
         if (tags != null) { rg.setTags(tags); }
-        rg.setLastModified(Instant.now().toEpochMilli() / 1000.0);
+        rg.setLastModified(EpochSeconds.fromInstant(Instant.now()));
         persistRegion(reportGroups, region);
         return rg;
     }
@@ -317,6 +358,97 @@ public class CodeBuildService {
 
     public List<String> listReportGroups(String region) {
         return new ArrayList<>(reportGroupsFor(region).keySet());
+    }
+
+    public ReportGroupPage listReportGroupsPage(String region, String sortBy, String sortOrder,
+                                                int maxResults, String nextToken) {
+        if (maxResults < 1 || maxResults > 100) {
+            throw new AwsException("InvalidInputException", "maxResults must be between 1 and 100", 400);
+        }
+        String criterion = sortBy == null ? "NAME" : sortBy;
+        String order = sortOrder == null ? "ASCENDING" : sortOrder;
+        List<ListSortKey> keys = reportGroupsFor(region).values().stream()
+                .map(group -> new ListSortKey(group.getCreated(), group.getLastModified(),
+                        group.getName(), group.getArn()))
+                .toList();
+        CodeBuildPagination.Page<ListSortKey> page = paginateList(keys, region, criterion, order, maxResults, nextToken,
+                "ListReportGroups", "lastArn");
+        return new ReportGroupPage(page.items().stream().map(ListSortKey::id).toList(), page.nextToken());
+    }
+
+    private CodeBuildPagination.Page<ListSortKey> paginateList(List<ListSortKey> keys, String region, String sortBy,
+                                                                String sortOrder, int pageSize, String nextToken,
+                                                                String action, String idField) {
+        Comparator<ListSortKey> comparator = listComparator(sortBy, sortOrder);
+        List<ListSortKey> sorted = keys.stream().sorted(comparator).toList();
+        return CodeBuildPagination.page(sorted, comparator, pageSize, nextToken,
+                token -> decodeListToken(token, region, sortBy, sortOrder, action, idField),
+                last -> encodeListToken(last, region, sortBy, sortOrder, action, idField));
+    }
+
+    private Comparator<ListSortKey> listComparator(String sortBy, String sortOrder) {
+        Comparator<ListSortKey> comparator = switch (sortBy == null ? "NAME" : sortBy) {
+            case "NAME" -> Comparator.comparing(ListSortKey::name);
+            case "CREATED_TIME" -> Comparator.comparing(ListSortKey::created,
+                    Comparator.nullsFirst(Comparator.naturalOrder()));
+            case "LAST_MODIFIED_TIME" -> Comparator.comparing(ListSortKey::lastModified,
+                    Comparator.nullsFirst(Comparator.naturalOrder()));
+            default -> throw new AwsException("InvalidInputException", "Invalid sortBy: " + sortBy, 400);
+        };
+        if (isDescendingSortOrder(sortOrder, false)) {
+            comparator = comparator.reversed();
+        }
+        return comparator.thenComparing(ListSortKey::name).thenComparing(ListSortKey::id);
+    }
+
+    private ListSortKey decodeListToken(String token, String region, String sortBy,
+                                        String sortOrder, String action, String idField) {
+        JsonNode cursor = CodeBuildPagination.readToken(token);
+        JsonNode lastName = cursor == null ? null : cursor.path("lastName");
+        JsonNode sortValue = cursor == null ? null : cursor.path("sortValue");
+        JsonNode lastId = cursor == null || idField == null ? null : cursor.path(idField);
+        if (cursor == null || !action.equals(cursor.path("action").asText(null))
+                || !region.equals(cursor.path("region").asText(null))
+                || !cursor.has("sortBy") || !Objects.equals(sortBy, cursor.path("sortBy").asText(null))
+                || !cursor.has("sortOrder") || !Objects.equals(sortOrder, cursor.path("sortOrder").asText(null))
+                || !lastName.isTextual() || lastName.asText().isEmpty()
+                || idField != null && (!lastId.isTextual() || lastId.asText().isEmpty())
+                || (sortBy == null || "NAME".equals(sortBy)) && !sortValue.isNull()
+                || !sortValue.isNull() && !sortValue.isNumber()) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        Double value = sortValue.isNull() ? null : sortValue.asDouble();
+        if (value != null && !Double.isFinite(value)) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        String name = lastName.asText();
+        return new ListSortKey(value, value, name, idField == null ? name : lastId.asText());
+    }
+
+    private String encodeListToken(ListSortKey last, String region, String sortBy,
+                                    String sortOrder, String action, String idField) {
+        Double value = switch (sortBy == null ? "NAME" : sortBy) {
+            case "CREATED_TIME" -> last.created();
+            case "LAST_MODIFIED_TIME" -> last.lastModified();
+            default -> null;
+        };
+        ObjectNode cursor = CodeBuildPagination.newToken();
+        cursor.put("action", action);
+        cursor.put("region", region);
+        cursor.put("sortBy", sortBy);
+        cursor.put("sortOrder", sortOrder);
+        if (idField != null) {
+            cursor.put(idField, last.id());
+        }
+        cursor.put("lastName", last.name());
+        cursor.put("sortValue", value);
+        return CodeBuildPagination.writeToken(cursor);
+    }
+
+    public record ReportGroupPage(List<String> reportGroups, String nextToken) {
+    }
+
+    private record ListSortKey(Double created, Double lastModified, String name, String id) {
     }
 
     // ---- Source Credentials ----
@@ -448,7 +580,7 @@ public class CodeBuildService {
         build.setCurrentPhase("SUBMITTED");
         build.setProjectName(projectName);
         build.setInitiator("user");
-        build.setStartTime(Instant.now().toEpochMilli() / 1000.0);
+        build.setStartTime(EpochSeconds.fromInstant(Instant.now()));
         build.setSource(project.getSource());
         build.setArtifacts(artifactsOverride != null ? artifactsOverride : project.getArtifacts());
         build.setTimeoutInMinutes(timeoutOverride != null ? timeoutOverride : project.getTimeoutInMinutes());
@@ -497,23 +629,114 @@ public class CodeBuildService {
                 .collect(Collectors.toList());
     }
 
-    public List<String> listBuilds(String region, String account) {
-        return buildsFor(account, region).values().stream()
-                .sorted((a, b) -> Double.compare(
-                        b.getStartTime() != null ? b.getStartTime() : 0,
-                        a.getStartTime() != null ? a.getStartTime() : 0))
-                .map(Build::getId)
-                .collect(Collectors.toList());
+    public List<String> listBuilds(String region, String account, String sortOrder) {
+        Comparator<String> comparator = Comparator.naturalOrder();
+        if (isDescendingSortOrder(sortOrder, true)) {
+            comparator = comparator.reversed();
+        }
+        return buildsFor(account, region).keySet().stream()
+                .sorted(comparator)
+                .toList();
     }
 
-    public List<String> listBuildsForProject(String region, String account, String projectName) {
+    public List<String> listBuildsForProject(String region, String account, String projectName,
+                                             String sortOrder) {
+        Comparator<Build> comparator = Comparator.comparing(Build::getBuildNumber)
+                .thenComparing(Build::getId);
+        if (isDescendingSortOrder(sortOrder, true)) {
+            comparator = comparator.reversed();
+        }
         return buildsFor(account, region).values().stream()
                 .filter(b -> projectName.equals(b.getProjectName()))
-                .sorted((a, b) -> Double.compare(
-                        b.getStartTime() != null ? b.getStartTime() : 0,
-                        a.getStartTime() != null ? a.getStartTime() : 0))
+                .sorted(comparator)
                 .map(Build::getId)
-                .collect(Collectors.toList());
+                .toList();
+    }
+
+    public BuildPage listBuildsPage(String region, String account, String sortOrder, String nextToken) {
+        return paginateBuilds(region, account, null, sortOrder, nextToken, false);
+    }
+
+    public BuildPage listBuildsForProjectPage(String region, String account, String projectName,
+                                              String sortOrder, String nextToken) {
+        if (projectName == null || projectName.isEmpty()) {
+            throw new AwsException("InvalidInputException", "projectName is required", 400);
+        }
+        return paginateBuilds(region, account, projectName, sortOrder, nextToken, true);
+    }
+
+    private BuildPage paginateBuilds(String region, String account, String projectName,
+                                     String sortOrder, String nextToken, boolean forProject) {
+        Comparator<Build> comparator = forProject
+                ? Comparator.comparing(Build::getBuildNumber).thenComparing(Build::getId)
+                : Comparator.comparing(Build::getId);
+        if (isDescendingSortOrder(sortOrder, true)) {
+            comparator = comparator.reversed();
+        }
+        List<Build> sorted = buildsFor(account, region).values().stream()
+                .filter(build -> !forProject || projectName.equals(build.getProjectName()))
+                .sorted(comparator)
+                .toList();
+        if (forProject && sortOrder != null && sorted.size() > LIST_BUILDS_PAGE_SIZE) {
+            throw new AwsException("InvalidInputException",
+                    "sortOrder cannot be set when a project has more than 100 builds", 400);
+        }
+
+        String action = forProject ? "ListBuildsForProject" : "ListBuilds";
+        CodeBuildPagination.Page<Build> page = CodeBuildPagination.page(sorted, comparator, LIST_BUILDS_PAGE_SIZE,
+                nextToken,
+                token -> decodeBuildToken(token, action, region, account, projectName, sortOrder, forProject),
+                last -> encodeBuildToken(last, action, region, account, projectName, sortOrder, forProject));
+        return new BuildPage(page.items().stream().map(Build::getId).toList(), page.nextToken());
+    }
+
+    private Build decodeBuildToken(String token, String action, String region, String account,
+                                   String projectName, String sortOrder, boolean forProject) {
+        JsonNode cursor = CodeBuildPagination.readToken(token);
+        if (cursor == null || !cursor.isObject()
+                || !action.equals(cursor.path("action").asText(null))
+                || !region.equals(cursor.path("region").asText(null))
+                || !account.equals(cursor.path("account").asText(null))
+                || !cursor.has("projectName")
+                || !Objects.equals(projectName, cursor.path("projectName").asText(null))
+                || !cursor.has("sortOrder")
+                || !Objects.equals(sortOrder, cursor.path("sortOrder").asText(null))
+                || !cursor.path("lastId").isTextual() || cursor.path("lastId").asText().isEmpty()
+                || forProject && (!cursor.path("buildNumber").isIntegralNumber()
+                        || !cursor.path("buildNumber").canConvertToLong())) {
+            throw new AwsException("InvalidInputException", "Invalid nextToken", 400);
+        }
+        Build anchor = new Build();
+        anchor.setId(cursor.path("lastId").asText());
+        if (forProject) {
+            anchor.setBuildNumber(cursor.path("buildNumber").longValue());
+        }
+        return anchor;
+    }
+
+    private String encodeBuildToken(Build last, String action, String region, String account,
+                                    String projectName, String sortOrder, boolean forProject) {
+        ObjectNode cursor = CodeBuildPagination.newToken();
+        cursor.put("action", action);
+        cursor.put("region", region);
+        cursor.put("account", account);
+        cursor.put("projectName", projectName);
+        cursor.put("sortOrder", sortOrder);
+        cursor.put("lastId", last.getId());
+        if (forProject) {
+            cursor.put("buildNumber", last.getBuildNumber());
+        }
+        return CodeBuildPagination.writeToken(cursor);
+    }
+
+    public record BuildPage(List<String> ids, String nextToken) {
+    }
+
+    private boolean isDescendingSortOrder(String sortOrder, boolean defaultDescending) {
+        if (sortOrder != null && !"ASCENDING".equals(sortOrder) && !"DESCENDING".equals(sortOrder)) {
+            throw new AwsException("InvalidInputException", "Invalid sortOrder: " + sortOrder, 400);
+        }
+        return sortOrder == null ? defaultDescending : "DESCENDING".equals(sortOrder);
     }
 
     public void stopBuild(String region, String account, String buildId) {

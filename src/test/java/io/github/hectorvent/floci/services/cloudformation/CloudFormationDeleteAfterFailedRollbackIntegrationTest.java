@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.config.EncoderConfig;
@@ -116,7 +117,7 @@ class CloudFormationDeleteAfterFailedRollbackIntegrationTest {
 
     /** The role and log group, changed and joined by a colliding log group when outsideGroup is set. */
     private static String template(String roleName, String logGroup, String outsideGroup) {
-        String roleExtra = outsideGroup == null ? "" : ", \"Description\": \"updated\"";
+        String rolePrincipal = outsideGroup == null ? "lambda.amazonaws.com" : "events.amazonaws.com";
         String groupExtra = outsideGroup == null ? "" : ", \"RetentionInDays\": 7";
         String dup = outsideGroup == null ? "" : """
                 ,
@@ -136,10 +137,10 @@ class CloudFormationDeleteAfterFailedRollbackIntegrationTest {
                           "Version": "2012-10-17",
                           "Statement": [{
                             "Effect": "Allow",
-                            "Principal": {"Service": "lambda.amazonaws.com"},
+                            "Principal": {"Service": "%s"},
                             "Action": "sts:AssumeRole"
                           }]
-                        }%s
+                        }
                       }
                     },
                     "LogGroup": {
@@ -148,7 +149,7 @@ class CloudFormationDeleteAfterFailedRollbackIntegrationTest {
                     }%s
                   }
                 }
-                """.formatted(roleName, roleExtra, logGroup, groupExtra, dup);
+                """.formatted(roleName, rolePrincipal, logGroup, groupExtra, dup);
     }
 
     private static Response cfn(String action, String stackName, String templateBody) {

@@ -207,6 +207,20 @@ class ContainerLifecycleManagerVolumeTest {
         manager.stopAndRemoveStrict("container-id", () -> operations.add("logs"));
 
         assertEquals(List.of("stop", "remove", "logs"), operations);
+        verify(stop).withTimeout(5);
+    }
+
+    @Test
+    void strictContainerCleanupUsesTheCallersStopTimeout() {
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.stopContainerCmd("container-id")).thenReturn(stop);
+        when(dockerClient.removeContainerCmd("container-id")).thenReturn(remove);
+
+        manager.stopAndRemoveStrict("container-id", null, 2);
+
+        verify(stop).withTimeout(2);
+        verify(remove).exec();
     }
 
     @Test
@@ -334,7 +348,7 @@ class ContainerLifecycleManagerVolumeTest {
         InspectVolumeResponse second = mock(InspectVolumeResponse.class);
         when(dockerClient.listVolumesCmd()).thenReturn(cmd);
         when(cmd.exec()).thenReturn(response);
-        when(response.getVolumes()).thenReturn(java.util.List.of(first, second));
+        when(response.getVolumes()).thenReturn(List.of(first, second));
         when(first.getName()).thenReturn("floci-code-first");
         when(second.getName()).thenReturn("shared-data");
 
@@ -348,7 +362,7 @@ class ContainerLifecycleManagerVolumeTest {
         ListVolumesResponse response = mock(ListVolumesResponse.class);
         when(dockerClient.listVolumesCmd()).thenReturn(cmd);
         when(cmd.exec()).thenReturn(response);
-        when(response.getVolumes()).thenReturn(java.util.List.of());
+        when(response.getVolumes()).thenReturn(List.of());
 
         assertEquals(Optional.of(Set.of()), manager.tryListVolumeNames());
     }

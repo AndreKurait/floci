@@ -15,6 +15,7 @@ import jakarta.ws.rs.core.Response;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 @ApplicationScoped
@@ -66,11 +67,11 @@ public class FirehoseJsonHandler {
                     dropExtendedOnlyMembersFromLegacyShape(redshift.getS3Backup());
                     RedshiftDestinationValidator.validateConfiguration(redshift, "redshiftDestinationConfiguration");
                 }
-                List<io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.Tag> tags = new ArrayList<>();
+                List<DeliveryStreamDescription.Tag> tags = new ArrayList<>();
                 if (request.has("Tags")) {
                     requireListSize(request.get("Tags"), "Tags", 1, 50);
                     for (JsonNode tNode : request.get("Tags")) {
-                        tags.add(mapper.treeToValue(tNode, io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.Tag.class));
+                        tags.add(mapper.treeToValue(tNode, DeliveryStreamDescription.Tag.class));
                     }
                 }
                 String deliveryStreamType = request.has("DeliveryStreamType")
@@ -146,9 +147,25 @@ public class FirehoseJsonHandler {
                 yield Response.ok(Map.of("DeliveryStreamDescription", withoutSecrets(desc))).build();
             }
             case "ListDeliveryStreams" -> {
+                JsonNode limitNode = request.get("Limit");
+                int limit = limitNode == null || limitNode.isNull() ? 10 : limitNode.asInt();
+                if (limitNode != null && !limitNode.isNull()
+                        && (!limitNode.isIntegralNumber() || !limitNode.canConvertToInt()
+                        || limit < 1 || limit > 10000)) {
+                    throw new AwsException("ValidationException", "Limit must be between 1 and 10000.", 400);
+                }
+                JsonNode startNode = request.get("ExclusiveStartDeliveryStreamName");
+                String startName = startNode == null || startNode.isNull() ? null : startNode.asText();
+                if (startNode != null && !startNode.isNull()
+                        && (!startNode.isTextual() || startName.length() < 1 || startName.length() > 64
+                        || !startName.matches("[a-zA-Z0-9_.-]+"))) {
+                    throw new AwsException("ValidationException",
+                            "ExclusiveStartDeliveryStreamName must be a valid delivery stream name.", 400);
+                }
+                FirehoseService.DeliveryStreamPage page = firehoseService.listDeliveryStreams(limit, startName);
                 yield Response.ok(Map.of(
-                        "DeliveryStreamNames", firehoseService.listDeliveryStreams(),
-                        "HasMoreDeliveryStreams", false)).build();
+                        "DeliveryStreamNames", page.names(),
+                        "HasMoreDeliveryStreams", page.hasMore())).build();
             }
             case "DeleteDeliveryStream" -> {
                 String name = getDeliveryStreamName(request);
@@ -176,10 +193,10 @@ public class FirehoseJsonHandler {
             }
             case "TagDeliveryStream" -> {
                 String name = getDeliveryStreamName(request);
-                List<io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.Tag> tags = new ArrayList<>();
+                List<DeliveryStreamDescription.Tag> tags = new ArrayList<>();
                 requireListSize(request.get("Tags"), "Tags", 1, 50);
                 for (JsonNode tNode : request.get("Tags")) {
-                    tags.add(mapper.treeToValue(tNode, io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.Tag.class));
+                    tags.add(mapper.treeToValue(tNode, DeliveryStreamDescription.Tag.class));
                 }
                 firehoseService.tagDeliveryStream(name, tags);
                 yield Response.ok(Map.of()).build();
@@ -199,7 +216,7 @@ public class FirehoseJsonHandler {
                 String exclusiveStartTagKey = request.has("ExclusiveStartTagKey") ? request.get("ExclusiveStartTagKey").asText() : null;
                 Integer limit = request.has("Limit") ? request.get("Limit").asInt() : null;
 
-                List<io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.Tag> tags = firehoseService.listTagsForDeliveryStream(name, exclusiveStartTagKey, limit);
+                List<DeliveryStreamDescription.Tag> tags = firehoseService.listTagsForDeliveryStream(name, exclusiveStartTagKey, limit);
                 boolean hasMore = false;
                 List<DeliveryStreamDescription.Tag> allTags = firehoseService.describeDeliveryStream(name).getTags();
                 if (!tags.isEmpty() && !allTags.isEmpty()) {
@@ -271,7 +288,7 @@ public class FirehoseJsonHandler {
     }
 
     /** DeliveryStreamType values the 2015-08-04 model enumerates. */
-    private static final java.util.Set<String> DELIVERY_STREAM_TYPES = java.util.Set.of(
+    private static final Set<String> DELIVERY_STREAM_TYPES = Set.of(
             "DirectPut", "KinesisStreamAsSource", "MSKAsSource", "DatabaseAsSource");
 
     /**

@@ -3,11 +3,14 @@ package io.github.hectorvent.floci.services.wafv2;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+
+import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
@@ -28,6 +31,8 @@ class WafV2IntegrationTest {
     private static final String PREFIX = "AWSWAF_20190729.";
     private static final String API_RESOURCE_ARN =
             "arn:aws:apigateway:us-east-1::/restapis/floci-waf-test/stages/prod";
+    private static final String LOG_DESTINATION_ARN =
+            "arn:aws:firehose:us-east-1:000000000000:deliverystream/aws-waf-logs-test";
 
     private static String ipSetId;
     private static String ipSetArn;
@@ -162,7 +167,7 @@ class WafV2IntegrationTest {
                         + "\"CloudWatchMetricsEnabled\":true,\"MetricName\":\"acl\"}}");
         resp.then().statusCode(200).body("NextLockToken", notNullValue());
         String next = resp.jsonPath().getString("NextLockToken");
-        org.junit.jupiter.api.Assertions.assertNotEquals(webAclLockToken, next);
+        Assertions.assertNotEquals(webAclLockToken, next);
     }
 
     @Test
@@ -419,6 +424,24 @@ class WafV2IntegrationTest {
 
     @Test
     @Order(19)
+    void putLoggingConfigurationForExistingWebAclSucceeds() {
+        call("PutLoggingConfiguration",
+                "{\"LoggingConfiguration\":{\"ResourceArn\":\"" + webAclArn + "\","
+                        + "\"LogDestinationConfigs\":[\"" + LOG_DESTINATION_ARN + "\"]}}")
+                .then().statusCode(200)
+                .body("LoggingConfiguration.ResourceArn", equalTo(webAclArn))
+                .body("LoggingConfiguration.LogDestinationConfigs[0]", equalTo(LOG_DESTINATION_ARN));
+
+        call("GetLoggingConfiguration", "{\"ResourceArn\":\"" + webAclArn + "\"}")
+                .then().statusCode(200)
+                .body("LoggingConfiguration.ResourceArn", equalTo(webAclArn));
+
+        call("DeleteLoggingConfiguration", "{\"ResourceArn\":\"" + webAclArn + "\"}")
+                .then().statusCode(200);
+    }
+
+    @Test
+    @Order(20)
     void teardown() {
         call("DisassociateWebACL", "{\"ResourceArn\":\"" + API_RESOURCE_ARN + "\"}")
                 .then().statusCode(200);
@@ -440,7 +463,7 @@ class WafV2IntegrationTest {
     }
 
     @Test
-    @Order(20)
+    @Order(21)
     void getMissingWebAclReturnsNonexistentItem() {
         call("GetWebACL",
                 "{\"Name\":\"nope\",\"Scope\":\"REGIONAL\",\"Id\":\"00000000-0000-0000-0000-000000000000\"}")
@@ -449,7 +472,7 @@ class WafV2IntegrationTest {
     }
 
     @Test
-    @Order(21)
+    @Order(22)
     void arnLookupsOnMissingResourcesReturnNonexistentItemAs400() {
         String missingArn = "arn:aws:wafv2:us-east-1:000000000000:regional/webacl/nope/"
                 + "00000000-0000-0000-0000-000000000000";
@@ -468,6 +491,22 @@ class WafV2IntegrationTest {
 
         call("AssociateWebACL", "{\"WebACLArn\":\"" + missingArn + "\","
                 + "\"ResourceArn\":\"arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/x/y\"}")
+                .then().statusCode(400)
+                .body("__type", equalTo("WAFNonexistentItemException"));
+    }
+
+    @Test
+    @Order(23)
+    void putLoggingConfigurationForMissingWebAclDoesNotPersist() {
+        String missingArn = "arn:aws:wafv2:us-east-1:000000000000:regional/webacl/nope/" + UUID.randomUUID();
+
+        call("PutLoggingConfiguration",
+                "{\"LoggingConfiguration\":{\"ResourceArn\":\"" + missingArn + "\","
+                        + "\"LogDestinationConfigs\":[\"" + LOG_DESTINATION_ARN + "\"]}}")
+                .then().statusCode(400)
+                .body("__type", equalTo("WAFNonexistentItemException"));
+
+        call("GetLoggingConfiguration", "{\"ResourceArn\":\"" + missingArn + "\"}")
                 .then().statusCode(400)
                 .body("__type", equalTo("WAFNonexistentItemException"));
     }

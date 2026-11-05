@@ -7,6 +7,7 @@ import software.amazon.awssdk.services.eventbridge.model.ResourceNotFoundExcepti
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.*;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -234,6 +235,24 @@ class EventBridgeTest {
         }
     }
 
+    @Test
+    @Order(26)
+    void putEventsToAnEventBusThatDoesNotExistIsAnsweredAsPublished() {
+        PutEventsResponse response = eb.putEvents(PutEventsRequest.builder()
+                .entries(PutEventsRequestEntry.builder()
+                        .eventBusName(TestFixtures.uniqueName("eb-missing-bus"))
+                        .source("com.myapp")
+                        .detailType("OrderPlaced")
+                        .detail("{}")
+                        .build())
+                .build());
+
+        assertThat(response.failedEntryCount()).isZero();
+        assertThat(response.entries()).hasSize(1);
+        assertThat(response.entries().get(0).eventId()).isNotBlank();
+        assertThat(response.entries().get(0).errorCode()).isNull();
+    }
+
     // ──────────────────────────── InputTransformer ────────────────────────────
 
     @Test
@@ -378,6 +397,61 @@ class EventBridgeTest {
                     assertThat(e.statusCode()).isEqualTo(400);
                     assertThat(e.awsErrorDetails().errorCode()).isEqualTo("ValidationException");
                     assertThat(e.getMessage()).contains("targets.1.member.retryPolicy.maximumEventAgeInSeconds");
+                });
+    }
+
+    @Test
+    @Order(37)
+    void listRulesPagesWithLimitAndNextToken() {
+        String prefix = TestFixtures.uniqueName("eb-page") + "-";
+        List<String> names = List.of(prefix + "a", prefix + "b", prefix + "c");
+        try {
+            for (String name : names) {
+                eb.putRule(PutRuleRequest.builder()
+                        .name(name)
+                        .eventBusName(busName)
+                        .eventPattern("{\"source\":[\"paging\"]}")
+                        .build());
+            }
+
+            List<String> seen = new ArrayList<>();
+            String token = null;
+            do {
+                ListRulesResponse page = eb.listRules(ListRulesRequest.builder()
+                        .eventBusName(busName)
+                        .namePrefix(prefix)
+                        .limit(1)
+                        .nextToken(token)
+                        .build());
+                assertThat(page.rules()).hasSize(1);
+                seen.add(page.rules().get(0).name());
+                token = page.nextToken();
+            } while (token != null);
+
+            assertThat(seen).containsExactlyElementsOf(names);
+        } finally {
+            for (String name : names) {
+                try {
+                    eb.deleteRule(DeleteRuleRequest.builder().name(name).eventBusName(busName).build());
+                } catch (ResourceNotFoundException ignored) {
+                    // The rule was never created because an earlier putRule failed; nothing to clean up.
+                }
+            }
+        }
+    }
+
+    @Test
+    @Order(38)
+    void listRulesRejectsOutOfRangeLimitAndUnknownToken() {
+        assertThatThrownBy(() -> eb.listRules(ListRulesRequest.builder().limit(101).build()))
+                .isInstanceOfSatisfying(EventBridgeException.class, e -> {
+                    assertThat(e.statusCode()).isEqualTo(400);
+                    assertThat(e.awsErrorDetails().errorCode()).isEqualTo("ValidationException");
+                });
+        assertThatThrownBy(() -> eb.listRules(ListRulesRequest.builder().limit(1).nextToken("not-a-token!").build()))
+                .isInstanceOfSatisfying(EventBridgeException.class, e -> {
+                    assertThat(e.statusCode()).isEqualTo(400);
+                    assertThat(e.awsErrorDetails().errorCode()).isEqualTo("InvalidToken");
                 });
     }
 

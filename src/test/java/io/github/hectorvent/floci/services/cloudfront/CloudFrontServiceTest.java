@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.cloudfront.model.ResponseHeadersPolic
 import io.github.hectorvent.floci.services.cloudfront.model.StreamingDistribution;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.mockito.Mockito;
 
 import java.security.KeyPairGenerator;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -325,6 +327,31 @@ class CloudFrontServiceTest {
         Distribution dist = china.createDistribution(new Distribution(), Map.of());
 
         assertEquals("arn:aws-cn:cloudfront::" + ACCOUNT + ":distribution/" + dist.getId(), dist.getArn());
+    }
+
+    @Test
+    void distributionTagsAreReadAndUpdatedByArn() {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+        Distribution dist = service.createDistribution(new Distribution(), Map.of("env", "dev"));
+
+        assertEquals(Map.of("env", "dev"), service.listTagsForResource(dist.getArn()));
+
+        service.tagResource(dist.getArn(), Map.of("team", "infra"));
+        assertEquals(Map.of("env", "dev", "team", "infra"), service.listTagsForResource(dist.getArn()));
+
+        service.untagResource(dist.getArn(), List.of("env"));
+        assertEquals(Map.of("team", "infra"), service.listTagsForResource(dist.getArn()));
+    }
+
+    @Test
+    void deletingDistributionRemovesTagsStoredUnderItsArn() {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+        Distribution dist = service.createDistribution(new Distribution(), Map.of());
+        service.tagResource(dist.getArn(), Map.of("env", "dev"));
+
+        service.deleteDistribution(dist.getId(), dist.getEtag());
+
+        assertEquals(Map.of(), service.listTagsForResource(dist.getArn()));
     }
 
     @Test
@@ -708,6 +735,175 @@ class CloudFrontServiceTest {
                 existing.getEtag(), distributionWithOrigin("example.com", "E0000000000000", null)));
         assertNull(service.getDistribution(existing.getId()).getConfig().getOrigins().getFirst()
                 .getOriginAccessControlId());
+    }
+
+    @Test
+    void createDistributionRejectsConnectionAttemptsOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException above = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionAttempts(4);
+                }), Map.of()));
+        assertEquals("The parameter ConnectionAttempts must be between 1 and 3.", above.getMessage());
+        assertEquals(400, above.getHttpStatus());
+
+        assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionAttempts(0);
+                }), Map.of()));
+    }
+
+    @Test
+    void createDistributionRejectsConnectionTimeoutOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException above = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionTimeout(11);
+                }), Map.of()));
+        assertEquals("The parameter ConnectionTimeout must be between 1 and 10 seconds.", above.getMessage());
+        assertEquals(400, above.getHttpStatus());
+
+        AwsException below = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionTimeout(0);
+                }), Map.of()));
+        assertEquals("The parameter ConnectionTimeout must be between 1 and 10 seconds.", below.getMessage());
+    }
+
+    @Test
+    void createDistributionRejectsOriginReadTimeoutOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException error = assertAws("InvalidOriginReadTimeout",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 121);
+                }), Map.of()));
+        assertEquals("The parameter OriginReadTimeout must be between 1 and 120 seconds.", error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+
+        assertAws("InvalidOriginReadTimeout",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 0);
+                }), Map.of()));
+    }
+
+    @Test
+    void createDistributionRejectsOriginKeepaliveTimeoutOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException below = assertAws("InvalidOriginKeepaliveTimeout",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginKeepaliveTimeout", 0);
+                }), Map.of()));
+        assertEquals("The parameter OriginKeepaliveTimeout must be between 1 and 300 seconds.", below.getMessage());
+        assertEquals(400, below.getHttpStatus());
+
+        assertAws("InvalidOriginKeepaliveTimeout",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginKeepaliveTimeout", 301);
+                }), Map.of()));
+    }
+
+    @Test
+    void createDistributionRejectsAResponseCompletionTimeoutShorterThanTheReadTimeout() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException below = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 30);
+                    origin.setResponseCompletionTimeout(29);
+                }), Map.of()));
+        assertEquals("The parameter ResponseCompletionTimeout must be greater than or equal to"
+                + " OriginReadTimeout.", below.getMessage());
+        assertEquals(400, below.getHttpStatus());
+
+        AwsException negative = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin ->
+                        origin.setResponseCompletionTimeout(-1)), Map.of()));
+        assertEquals("The parameter ResponseCompletionTimeout must be a non-negative integer.",
+                negative.getMessage());
+        assertEquals(400, negative.getHttpStatus());
+
+        // A completion timeout as long as the read timeout, and none at all, are both accepted.
+        assertDoesNotThrow(() -> service.createDistribution(distributionWithCustomOrigin(origin -> {
+            origin.getCustomOriginConfig().put("OriginReadTimeout", 30);
+            origin.setResponseCompletionTimeout(30);
+        }), Map.of()));
+        assertDoesNotThrow(() -> service.createDistribution(distributionWithCustomOrigin(origin ->
+                origin.setResponseCompletionTimeout(0)), Map.of()));
+
+        // No OriginReadTimeout means the 30 s default, which a shorter completion timeout breaks.
+        AwsException belowDefault = assertAws("InvalidArgument",
+                () -> service.createDistribution(distributionWithCustomOrigin(origin ->
+                        origin.setResponseCompletionTimeout(10)), Map.of()));
+        assertEquals("The parameter ResponseCompletionTimeout must be greater than or equal to"
+                + " OriginReadTimeout.", belowDefault.getMessage());
+    }
+
+    @Test
+    void updateDistributionRejectsOriginSettingsOutsideTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution existing = service.createDistribution(
+                distributionWithCustomOrigin(origin -> { }), Map.of());
+
+        AwsException error = assertAws("InvalidArgument", () -> service.updateDistribution(
+                existing.getId(), existing.getEtag(),
+                distributionWithCustomOrigin(origin -> origin.setConnectionAttempts(4))));
+        assertEquals("The parameter ConnectionAttempts must be between 1 and 3.", error.getMessage());
+
+        assertAws("InvalidOriginReadTimeout", () -> service.updateDistribution(
+                existing.getId(), existing.getEtag(),
+                distributionWithCustomOrigin(origin ->
+                        origin.getCustomOriginConfig().put("OriginReadTimeout", 121))));
+    }
+
+    @Test
+    void updateDistributionRejectsAResponseCompletionTimeoutShorterThanTheReadTimeout() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution existing = service.createDistribution(
+                distributionWithCustomOrigin(origin -> { }), Map.of());
+
+        AwsException below = assertAws("InvalidArgument", () -> service.updateDistribution(
+                existing.getId(), existing.getEtag(),
+                distributionWithCustomOrigin(origin -> {
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 30);
+                    origin.setResponseCompletionTimeout(29);
+                })));
+        assertEquals("The parameter ResponseCompletionTimeout must be greater than or equal to"
+                + " OriginReadTimeout.", below.getMessage());
+        assertEquals(400, below.getHttpStatus());
+
+        AwsException negative = assertAws("InvalidArgument", () -> service.updateDistribution(
+                existing.getId(), existing.getEtag(),
+                distributionWithCustomOrigin(origin -> origin.setResponseCompletionTimeout(-1))));
+        assertEquals("The parameter ResponseCompletionTimeout must be a non-negative integer.",
+                negative.getMessage());
+        assertEquals(400, negative.getHttpStatus());
+
+        // The rejected updates left the distribution as it was.
+        Origin origin = service.getDistribution(existing.getId()).getConfig().getOrigins().getFirst();
+        assertNull(origin.getResponseCompletionTimeout());
+    }
+
+    @Test
+    void createDistributionAcceptsOriginSettingsWithinTheAwsRange() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        Distribution created = assertDoesNotThrow(() -> service.createDistribution(
+                distributionWithCustomOrigin(origin -> {
+                    origin.setConnectionAttempts(2);
+                    origin.setConnectionTimeout(5);
+                    origin.getCustomOriginConfig().put("OriginReadTimeout", 45);
+                    origin.getCustomOriginConfig().put("OriginKeepaliveTimeout", 300);
+                }), Map.of()));
+
+        Origin origin = created.getConfig().getOrigins().getFirst();
+        assertEquals(2, origin.getConnectionAttempts());
+        assertEquals(5, origin.getConnectionTimeout());
+        assertEquals(45, origin.getCustomOriginConfig().get("OriginReadTimeout"));
+        assertEquals(300, origin.getCustomOriginConfig().get("OriginKeepaliveTimeout"));
     }
 
     @Test
@@ -1368,6 +1564,131 @@ class CloudFrontServiceTest {
     }
 
     @Test
+    void exposesTheSevenAwsManagedCachePolicies() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        List<String> originOverrideHeaders = List.of(
+                "Host", "Origin", "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override");
+        Map<String, Object> noHeaders = Map.of("HeaderBehavior", "none");
+        Map<String, Object> noCookies = Map.of("CookieBehavior", "none");
+        Map<String, Object> allCookies = Map.of("CookieBehavior", "all");
+        Map<String, Object> noQueryStrings = Map.of("QueryStringBehavior", "none");
+        Map<String, Object> allQueryStrings = Map.of("QueryStringBehavior", "all");
+        Map<String, Object> originOverrideHeaderSelection =
+                Map.of("HeaderBehavior", "whitelist", "Headers", originOverrideHeaders);
+
+        assertManagedCachePolicy(service, "2e54312d-136d-493c-8eb9-b001f22f67d2", "Managed-Amplify",
+                "2", "2", "600", "true", "true",
+                Map.of("HeaderBehavior", "whitelist", "Headers",
+                        List.of("Authorization", "CloudFront-Viewer-Country", "Host")),
+                allCookies, allQueryStrings);
+        assertManagedCachePolicy(service, "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+                "Managed-CachingDisabled", "0", "0", "0", "false", "false",
+                noHeaders, noCookies, noQueryStrings);
+        assertManagedCachePolicy(service, "658327ea-f89d-4fab-a63d-7e88639e58f6",
+                "Managed-CachingOptimized", "1", "86400", "31536000", "true", "true",
+                noHeaders, noCookies, noQueryStrings);
+        assertManagedCachePolicy(service, "b2884449-e4de-46a7-ac36-70bc7f1ddd6d",
+                "Managed-CachingOptimizedForUncompressedObjects", "1", "86400", "31536000",
+                "false", "false", noHeaders, noCookies, noQueryStrings);
+        assertManagedCachePolicy(service, "08627262-05a9-4f76-9ded-b50ca2e3a84f",
+                "Managed-Elemental-MediaPackage", "0", "86400", "31536000", "true", "false",
+                Map.of("HeaderBehavior", "whitelist", "Headers", List.of("Origin")), noCookies,
+                Map.of("QueryStringBehavior", "whitelist", "QueryStrings",
+                        List.of("aws.manifestfilter", "start", "end", "m")));
+        assertManagedCachePolicy(service, "83da9c7e-98b4-4e11-a168-04f0df8e2c65",
+                "Managed-UseOriginCacheControlHeaders", "0", "0", "31536000", "true", "true",
+                originOverrideHeaderSelection, allCookies, noQueryStrings);
+        assertManagedCachePolicy(service, "4cc15a8a-d715-48a4-82b8-cc0b614638fe",
+                "Managed-UseOriginCacheControlHeaders-QueryStrings", "0", "0", "31536000",
+                "true", "true", originOverrideHeaderSelection, allCookies, allQueryStrings);
+
+        assertAws("NoSuchCachePolicy",
+                () -> service.getCachePolicy("4d1d2f1d-3a71-49ad-9e08-7ea5d843a556"));
+    }
+
+    @Test
+    void listsManagedAndCustomCachePoliciesByType() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CachePolicy custom = service.createCachePolicy(namedCachePolicy("custom-cache-policy"));
+
+        assertEquals(7, service.listCachePolicies(null, 100, "managed").size());
+        assertTrue(service.listCachePolicies(null, 100, "managed").stream()
+                .allMatch(policy -> CloudFrontService.isManagedCachePolicy(policy.getId())));
+        assertEquals(List.of(custom.getId()), service.listCachePolicies(null, 100, "custom")
+                .stream().map(CachePolicy::getId).toList());
+        assertEquals(8, service.listCachePolicies(null, 100, null).size());
+        assertEquals(8, service.listCachePolicies(null, 100).size());
+        assertAws("InvalidArgument", () -> service.listCachePolicies(null, 100, "MANAGED"));
+    }
+
+    @Test
+    void listCachePolicies_badType_rejectsWithCachePolicyMessage() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException error = assertAws("InvalidArgument",
+                () -> service.listCachePolicies(null, 100, "unsupported"));
+
+        assertEquals("Cache policy Type must be managed or custom.", error.getMessage());
+    }
+
+    @Test
+    void listOriginRequestPolicies_badType_rejectsWithOriginRequestPolicyMessage() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException error = assertAws("InvalidArgument",
+                () -> service.listOriginRequestPolicies(null, 100, "unsupported"));
+
+        assertEquals("Origin request policy Type must be managed or custom.", error.getMessage());
+    }
+
+    @Test
+    void listResponseHeadersPolicies_badTypeAndUnknownMarker_rejectWithOwnMessages() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+
+        AwsException badType = assertAws("InvalidArgument",
+                () -> service.listResponseHeadersPolicies(null, 100, "unsupported"));
+        AwsException badMarker = assertAws("InvalidArgument",
+                () -> service.listResponseHeadersPolicies("missing-marker", 100, null));
+
+        assertEquals("Response headers policy Type must be managed or custom.", badType.getMessage());
+        assertEquals("The specified marker is invalid.", badMarker.getMessage());
+    }
+
+    @Test
+    void refusesToUpdateOrDeleteAManagedCachePolicy() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        CachePolicy managed = service.getCachePolicy("658327ea-f89d-4fab-a63d-7e88639e58f6");
+
+        assertAws("IllegalUpdate", () -> service.updateCachePolicy(managed.getId(),
+                managed.getEtag(), namedCachePolicy("replacement")));
+        assertAws("IllegalDelete",
+                () -> service.deleteCachePolicy(managed.getId(), managed.getEtag()));
+
+        CachePolicy after = service.getCachePolicy(managed.getId());
+        assertEquals("Managed-CachingOptimized", after.getName());
+        assertEquals(managed.getEtag(), after.getEtag());
+    }
+
+    private static void assertManagedCachePolicy(
+            CloudFrontService service, String id, String name, String minTtl, String defaultTtl,
+            String maxTtl, String gzip, String brotli, Map<String, Object> headers,
+            Map<String, Object> cookies, Map<String, Object> queryStrings) {
+        CachePolicy policy = service.getCachePolicy(id);
+        assertEquals(id, policy.getId());
+        assertEquals(name, policy.getName());
+        Map<String, Object> config = policy.getConfig();
+        assertEquals(minTtl, config.get("MinTTL"), name + " MinTTL");
+        assertEquals(defaultTtl, config.get("DefaultTTL"), name + " DefaultTTL");
+        assertEquals(maxTtl, config.get("MaxTTL"), name + " MaxTTL");
+        Map<?, ?> parameters = (Map<?, ?>) config.get("ParametersInCacheKeyAndForwardedToOrigin");
+        assertEquals(gzip, parameters.get("EnableAcceptEncodingGzip"), name + " Gzip");
+        assertEquals(brotli, parameters.get("EnableAcceptEncodingBrotli"), name + " Brotli");
+        assertEquals(headers, parameters.get("HeadersConfig"), name + " headers");
+        assertEquals(cookies, parameters.get("CookiesConfig"), name + " cookies");
+        assertEquals(queryStrings, parameters.get("QueryStringsConfig"), name + " query strings");
+    }
+
+    @Test
     void deletesAnUnattachedCachePolicy() {
         CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
         CachePolicy policy = service.createCachePolicy(namedCachePolicy("free-cache-policy"));
@@ -1445,7 +1766,7 @@ class CloudFrontServiceTest {
     }
 
     private static AwsException assertAws(
-            String code, org.junit.jupiter.api.function.Executable action) {
+            String code, Executable action) {
         AwsException error = assertThrows(AwsException.class, action);
         assertEquals(code, error.getErrorCode());
         return error;
@@ -1489,6 +1810,25 @@ class CloudFrontServiceTest {
             behavior.setLambdaFunctionAssociations(List.of(Map.<String, Object>of("LambdaFunctionARN",
                     "arn:aws:lambda:us-east-1:000000000000:function:edge:1", "EventType", edgeEventType)));
         }
+        Distribution distribution = distribution(false, List.of());
+        distribution.getConfig().setOrigins(List.of(origin));
+        distribution.getConfig().setDefaultCacheBehavior(behavior);
+        return distribution;
+    }
+
+    /** A distribution with one custom (HTTP/HTTPS) origin, customized through {@code originCustomizer}. */
+    private static Distribution distributionWithCustomOrigin(Consumer<Origin> originCustomizer) {
+        Origin origin = new Origin();
+        origin.setId("o");
+        origin.setDomainName("example.com");
+        Map<String, Object> customOriginConfig = new LinkedHashMap<>();
+        customOriginConfig.put("HTTPPort", "80");
+        customOriginConfig.put("HTTPSPort", "443");
+        customOriginConfig.put("OriginProtocolPolicy", "https-only");
+        origin.setCustomOriginConfig(customOriginConfig);
+        originCustomizer.accept(origin);
+        DefaultCacheBehavior behavior = new DefaultCacheBehavior();
+        behavior.setTargetOriginId("o");
         Distribution distribution = distribution(false, List.of());
         distribution.getConfig().setOrigins(List.of(origin));
         distribution.getConfig().setDefaultCacheBehavior(behavior);

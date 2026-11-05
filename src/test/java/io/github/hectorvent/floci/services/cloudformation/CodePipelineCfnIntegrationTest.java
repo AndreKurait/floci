@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
@@ -80,6 +81,7 @@ class CodePipelineCfnIntegrationTest {
             .formParam("TemplateBody", TEMPLATE)
         .when().post("/").then().statusCode(200);
 
+        CfnStackWaits.awaitStatus(STACK, "CREATE_COMPLETE");
         String stacks = given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", CFN_AUTH)

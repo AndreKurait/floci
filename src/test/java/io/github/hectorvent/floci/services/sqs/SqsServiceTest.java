@@ -2,10 +2,12 @@ package io.github.hectorvent.floci.services.sqs;
 
 import io.github.hectorvent.floci.config.EmulatorConfig.SqsServiceConfig.EndpointStrategy;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
@@ -253,6 +255,43 @@ class SqsServiceTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"901", "-1", "abc", " 5"})
+    void delaySecondsAttributeOutsideAwsRangeIsRejected(String invalid) {
+        String region = "eu-west-1";
+        AwsException onCreate = assertThrows(AwsException.class,
+                () -> sqsService.createQueue("delay-range", Map.of("DelaySeconds", invalid), region));
+        assertEquals("InvalidAttributeValue", onCreate.getErrorCode());
+        assertEquals("Invalid value for the parameter DelaySeconds.", onCreate.getMessage());
+
+        Queue queue = sqsService.createQueue("delay-range", null, region);
+        AwsException onSet = assertThrows(AwsException.class,
+                () -> sqsService.setQueueAttributes(queue.getQueueUrl(), Map.of("DelaySeconds", invalid), region));
+        assertEquals("InvalidAttributeValue", onSet.getErrorCode());
+        assertEquals("Invalid value for the parameter DelaySeconds.", onSet.getMessage());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {901, -1})
+    void sendMessageRejectsDelaySecondsOutsideAwsRange(int delay) {
+        String region = "eu-west-1";
+        Queue queue = sqsService.createQueue("delay-send", null, region);
+        AwsException e = assertThrows(AwsException.class,
+                () -> sqsService.sendMessage(queue.getQueueUrl(), "x", delay, region));
+        assertEquals("InvalidParameterValue", e.getErrorCode());
+        assertEquals("Value " + delay + " for parameter DelaySeconds is invalid. Reason: Must be >= 0 and <= 900.",
+                e.getMessage());
+    }
+
+    @Test
+    void delaySecondsAcceptsAwsRangeBounds() {
+        String region = "eu-west-1";
+        Queue queue = sqsService.createQueue("delay-bounds", Map.of("DelaySeconds", "900"), region);
+        sqsService.setQueueAttributes(queue.getQueueUrl(), Map.of("DelaySeconds", "0"), region);
+        sqsService.sendMessage(queue.getQueueUrl(), "x", 0, region);
+        sqsService.sendMessage(queue.getQueueUrl(), "x", 900, region);
+    }
+
+    @ParameterizedTest
     @CsvSource({"60, 60", "1209600, 1209600", "060, 60", "+60, 60"})
     void messageRetentionPeriodIsStoredInCanonicalForm(String value, String stored) {
         String region = "eu-west-1";
@@ -264,6 +303,69 @@ class SqsServiceTest {
         sqsService.setQueueAttributes(updated.getQueueUrl(), Map.of("MessageRetentionPeriod", value), region);
         assertEquals(stored, sqsService.getQueueAttributes(updated.getQueueUrl(),
                 List.of("MessageRetentionPeriod"), region).get("MessageRetentionPeriod"));
+    }
+
+    @Test
+    void redrivePolicyIsStoredAsCompactJson() {
+        String region = "eu-west-1";
+        Queue dlq = sqsService.createQueue("redrive-compact-dlq", null, region);
+        String dlqArn = sqsService.getQueueAttributes(dlq.getQueueUrl(), List.of("QueueArn"), region).get("QueueArn");
+        String spaced = "{\n  \"deadLetterTargetArn\": \"" + dlqArn + "\",\n  \"maxReceiveCount\": 3\n}\n";
+        String compact = "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":3}";
+
+        Queue created = sqsService.createQueue("redrive-compact-created", Map.of("RedrivePolicy", spaced), region);
+        assertEquals(compact, sqsService.getQueueAttributes(created.getQueueUrl(),
+                List.of("RedrivePolicy"), region).get("RedrivePolicy"));
+
+        Queue updated = sqsService.createQueue("redrive-compact-updated", null, region);
+        sqsService.setQueueAttributes(updated.getQueueUrl(), Map.of("RedrivePolicy", spaced), region);
+        assertEquals(compact, sqsService.getQueueAttributes(updated.getQueueUrl(),
+                List.of("RedrivePolicy"), region).get("RedrivePolicy"));
+    }
+
+    @Test
+    void redriveAllowPolicyIsStoredAsCompactJson() {
+        String region = "eu-west-1";
+        Queue queue = sqsService.createQueue("redrive-allow-compact", null, region);
+        sqsService.setQueueAttributes(queue.getQueueUrl(),
+                Map.of("RedriveAllowPolicy", "{ \"redrivePermission\": \"allowAll\" }\n"), region);
+        assertEquals("{\"redrivePermission\":\"allowAll\"}", sqsService.getQueueAttributes(queue.getQueueUrl(),
+                List.of("RedriveAllowPolicy"), region).get("RedriveAllowPolicy"));
+    }
+
+    @Test
+    void createQueue_recreateWithSameRedrivePolicyInOtherWhitespaceIsNotAConflict() {
+        String region = "eu-west-1";
+        Queue dlq = sqsService.createQueue("redrive-recreate-dlq", null, region);
+        String dlqArn = sqsService.getQueueAttributes(dlq.getQueueUrl(), List.of("QueueArn"), region).get("QueueArn");
+        String compact = "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":3}";
+        Queue queue = sqsService.createQueue("redrive-recreate", Map.of("RedrivePolicy", compact), region);
+
+        Queue same = sqsService.createQueue("redrive-recreate", Map.of("RedrivePolicy", compact + "\n"), region);
+        assertEquals(queue.getQueueUrl(), same.getQueueUrl());
+    }
+
+    @Test
+    void createQueue_recreateMatchesASavedNonCompactRedrivePolicy() {
+        String region = "eu-west-1";
+        InMemoryStorage<String, Queue> store = new InMemoryStorage<>();
+        SqsService service = new SqsService(store, 30, 1048576, BASE_URL, clock);
+        Queue dlq = service.createQueue("saved-redrive-dlq", null, region);
+        String dlqArn = service.getQueueAttributes(dlq.getQueueUrl(), List.of("QueueArn"), region).get("QueueArn");
+        String original = "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":3}\n";
+        Queue queue = service.createQueue("saved-redrive", Map.of("RedrivePolicy", original), region);
+
+        // A queue persisted by a build that stored the policy as sent, whitespace included.
+        String storageKey = store.keys().stream()
+                .filter(key -> key.endsWith("/saved-redrive"))
+                .findFirst().orElseThrow();
+        Queue stored = store.get(storageKey).orElseThrow();
+        stored.getAttributes().put("RedrivePolicy", original);
+        store.put(storageKey, stored);
+
+        Queue same = service.createQueue("saved-redrive", Map.of("RedrivePolicy", original), region);
+        assertEquals(queue.getQueueUrl(), same.getQueueUrl(),
+                "Resending the original CreateQueue request must not conflict with the saved queue");
     }
 
     @Test
@@ -385,6 +487,120 @@ class SqsServiceTest {
     }
 
     @Test
+    void listQueuesPagesEveryQueueExactlyOnce() {
+        String region = "eu-west-1";
+        sqsService.createQueue("page-c", null, region);
+        sqsService.createQueue("page-a", null, region);
+        sqsService.createQueue("page-b", null, region);
+
+        List<String> names = new ArrayList<>();
+        String token = null;
+        int pages = 0;
+        do {
+            PaginatedResult<Queue> page = sqsService.listQueues(null, 1, token, region);
+            assertEquals(1, page.items().size());
+            names.add(page.items().getFirst().getQueueName());
+            token = page.nextToken();
+            pages++;
+        } while (token != null);
+
+        assertEquals(3, pages);
+        assertEquals(List.of("page-a", "page-b", "page-c"), names);
+    }
+
+    @Test
+    void listQueuesOmitsNextTokenOnLastPage() {
+        String region = "eu-west-1";
+        sqsService.createQueue("last-a", null, region);
+        sqsService.createQueue("last-b", null, region);
+
+        PaginatedResult<Queue> first = sqsService.listQueues(null, 1, null, region);
+        assertNotNull(first.nextToken());
+        PaginatedResult<Queue> second = sqsService.listQueues(null, 1, first.nextToken(), region);
+        assertEquals("last-b", second.items().getFirst().getQueueName());
+        assertNull(second.nextToken());
+
+        assertNull(sqsService.listQueues(null, 2, null, region).nextToken());
+    }
+
+    @Test
+    void listQueuesWithoutMaxResultsNeverReturnsNextToken() {
+        String region = "eu-west-1";
+        sqsService.createQueue("nomax-a", null, region);
+        sqsService.createQueue("nomax-b", null, region);
+
+        PaginatedResult<Queue> page = sqsService.listQueues(null, null, null, region);
+        assertEquals(2, page.items().size());
+        assertNull(page.nextToken());
+    }
+
+    @Test
+    void listQueuesResumesAfterCursorQueueIsDeleted() {
+        String region = "eu-west-1";
+        sqsService.createQueue("gone-a", null, region);
+        Queue cursorQueue = sqsService.createQueue("gone-b", null, region);
+        sqsService.createQueue("gone-c", null, region);
+        sqsService.createQueue("gone-d", null, region);
+
+        PaginatedResult<Queue> first = sqsService.listQueues(null, 2, null, region);
+        assertEquals(List.of("gone-a", "gone-b"), first.items().stream().map(Queue::getQueueName).toList());
+
+        sqsService.deleteQueue(cursorQueue.getQueueUrl(), region);
+
+        PaginatedResult<Queue> second = sqsService.listQueues(null, 2, first.nextToken(), region);
+        assertEquals(List.of("gone-c", "gone-d"), second.items().stream().map(Queue::getQueueName).toList());
+        assertNull(second.nextToken());
+    }
+
+    @Test
+    void listQueuesWithoutMaxResultsCapsAtOneThousand() {
+        String region = "eu-west-1";
+        for (int i = 0; i < 1001; i++) {
+            sqsService.createQueue(String.format("cap-%04d", i), null, region);
+        }
+
+        PaginatedResult<Queue> page = sqsService.listQueues(null, null, null, region);
+
+        assertEquals(1000, page.items().size());
+        assertEquals("cap-0000", page.items().getFirst().getQueueName());
+        assertEquals("cap-0999", page.items().getLast().getQueueName());
+        assertNull(page.nextToken());
+    }
+
+    @Test
+    void listQueuesPagesWithinPrefix() {
+        String region = "eu-west-1";
+        sqsService.createQueue("pfx-one", null, region);
+        sqsService.createQueue("other-queue", null, region);
+        sqsService.createQueue("pfx-two", null, region);
+
+        PaginatedResult<Queue> first = sqsService.listQueues("pfx-", 1, null, region);
+        PaginatedResult<Queue> second = sqsService.listQueues("pfx-", 1, first.nextToken(), region);
+
+        assertEquals("pfx-one", first.items().getFirst().getQueueName());
+        assertEquals("pfx-two", second.items().getFirst().getQueueName());
+        assertNull(second.nextToken());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, -1, 1001})
+    void listQueuesRejectsOutOfRangeMaxResults(int maxResults) {
+        AwsException e = assertThrows(AwsException.class,
+                () -> sqsService.listQueues(null, maxResults, null, "eu-west-1"));
+        assertEquals("InvalidParameterValue", e.getErrorCode());
+        assertEquals(400, e.getHttpStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"not-a-token!", "Z2FyYmFnZQ"})
+    void listQueuesRejectsInvalidNextToken(String token) {
+        sqsService.createQueue("token-queue", null, "eu-west-1");
+        AwsException e = assertThrows(AwsException.class,
+                () -> sqsService.listQueues(null, 1, token, "eu-west-1"));
+        assertEquals("InvalidParameterValue", e.getErrorCode());
+    }
+
+    @Test
     void getQueueUrl() {
         String region = "eu-west-1";
         sqsService.createQueue("my-queue", null, region);
@@ -392,7 +608,7 @@ class SqsServiceTest {
         assertEquals(BASE_URL + "/000000000000/my-queue", url);
     }
 
-    private SqsService serviceWithStrategy(InMemoryStorage<String, Queue> store, RegionResolver resolver,
+    private SqsService serviceWithStrategy(StorageBackend<String, Queue> store, RegionResolver resolver,
                                            EndpointStrategy strategy) {
         return new SqsService(store, null, null, null, 30, 1048576, BASE_URL, resolver, false, null, clock,
                 ReceiptHandle.DEFAULT_SECRET, null, null, strategy);
@@ -518,6 +734,91 @@ class SqsServiceTest {
 
         assertEquals(expectedUrl, service.listQueues(null, region).getFirst().getQueueUrl());
         assertEquals(expectedUrl, service.getQueueUrl("legacy-queue", region));
+    }
+
+    @Test
+    void aBaseUrlPathKeepsTheSameQueueAcrossAStrategySwitch() {
+        String region = "eu-west-1";
+        String prefixedBase = "http://localhost:4566/sqs";
+        RegionResolver resolver = new RegionResolver("us-east-1", "000000000000");
+        InMemoryStorage<String, Queue> store = new InMemoryStorage<>();
+        SqsService floci = new SqsService(store, null, null, null, 30, 1048576, prefixedBase, resolver, false,
+                null, clock, ReceiptHandle.DEFAULT_SECRET, null, null, EndpointStrategy.FLOCI);
+        assertEquals(prefixedBase + "/000000000000/kept", floci.createQueue("kept", null, region).getQueueUrl());
+
+        SqsService aws = new SqsService(store, null, null, null, 30, 1048576, prefixedBase, resolver, false,
+                null, clock, ReceiptHandle.DEFAULT_SECRET, null, null, EndpointStrategy.AWS);
+        String awsUrl = "https://sqs.eu-west-1.amazonaws.com/000000000000/kept";
+        assertEquals(awsUrl, aws.getQueueUrl("kept", region));
+        assertEquals(awsUrl, aws.createQueue("kept", null, region).getQueueUrl());
+        assertEquals(1, aws.listQueues(null, region).size());
+    }
+
+    @Test
+    void aQueueStoredUnderABaseUrlPathIsRekeyedByAccountAndName() {
+        String region = "eu-west-1";
+        AccountAwareStorageBackend<Queue> store = AccountAwareStorageBackend.inMemory("000000000000");
+        store.putForAccount("000000000000", region + "::/sqs/000000000000/prefixed",
+                prefixedQueue("000000000000", "prefixed"));
+
+        SqsService service = serviceWithStrategy(store, new RegionResolver("us-east-1", "000000000000"),
+                EndpointStrategy.FLOCI);
+
+        assertEquals(List.of("000000000000/" + region + "::/000000000000/prefixed"),
+                List.copyOf(store.scanAllAccountsWithRawKeys().keySet()));
+        assertEquals(BASE_URL + "/000000000000/prefixed", service.getQueueUrl("prefixed", region));
+    }
+
+    @Test
+    void anUnprefixedLegacyEntryMovesToTheAccountInItsQueuePath() {
+        String region = "eu-west-1";
+        InMemoryStorage<String, Queue> raw = new InMemoryStorage<>();
+        Queue stored = prefixedQueue("111111111111", "legacy");
+        raw.put(region + "::/sqs/111111111111/legacy", stored);
+        AccountAwareStorageBackend<Queue> store = new AccountAwareStorageBackend<>(raw, null, "000000000000");
+
+        serviceWithStrategy(store, new RegionResolver("us-east-1", "000000000000"), EndpointStrategy.FLOCI);
+
+        assertEquals(List.of("111111111111/" + region + "::/111111111111/legacy"),
+                List.copyOf(store.scanAllAccountsWithRawKeys().keySet()));
+        assertEquals(Optional.of(stored), store.getForAccount("111111111111", region + "::/111111111111/legacy"));
+    }
+
+    @Test
+    void anEntryWhoseDestinationHoldsADifferentValueStaysInPlace() {
+        String region = "eu-west-1";
+        AccountAwareStorageBackend<Queue> store = AccountAwareStorageBackend.inMemory("000000000000");
+        Queue current = prefixedQueue("000000000000", "kept");
+        Queue older = prefixedQueue("000000000000", "kept");
+        older.setAttributes(Map.of("VisibilityTimeout", "99"));
+        store.putForAccount("000000000000", region + "::/000000000000/kept", current);
+        store.putForAccount("000000000000", region + "::/sqs/000000000000/kept", older);
+
+        serviceWithStrategy(store, new RegionResolver("us-east-1", "000000000000"), EndpointStrategy.FLOCI);
+
+        assertEquals(Optional.of(current), store.getForAccount("000000000000", region + "::/000000000000/kept"));
+        assertEquals(Optional.of(older), store.getForAccount("000000000000", region + "::/sqs/000000000000/kept"));
+    }
+
+    @Test
+    void anEntryWhoseDestinationHoldsTheSameValueIsRemoved() {
+        String region = "eu-west-1";
+        AccountAwareStorageBackend<Queue> store = AccountAwareStorageBackend.inMemory("000000000000");
+        store.putForAccount("000000000000", region + "::/000000000000/kept", prefixedQueue("000000000000", "kept"));
+        store.putForAccount("000000000000", region + "::/sqs/000000000000/kept", prefixedQueue("000000000000", "kept"));
+
+        serviceWithStrategy(store, new RegionResolver("us-east-1", "000000000000"), EndpointStrategy.FLOCI);
+
+        assertEquals(List.of("000000000000/" + region + "::/000000000000/kept"),
+                List.copyOf(store.scanAllAccountsWithRawKeys().keySet()));
+    }
+
+    private static Queue prefixedQueue(String accountId, String name) {
+        Queue queue = new Queue(name, "http://localhost:4566/sqs/" + accountId + "/" + name);
+        queue.setAccountId(accountId);
+        queue.setCreatedTimestamp(Instant.EPOCH);
+        queue.setLastModifiedTimestamp(Instant.EPOCH);
+        return queue;
     }
 
     @Test

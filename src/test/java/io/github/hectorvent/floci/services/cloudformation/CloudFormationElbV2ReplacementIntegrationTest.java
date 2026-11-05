@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
@@ -48,6 +49,7 @@ class CloudFormationElbV2ReplacementIntegrationTest {
         String oldTg = output(describeBefore, "TgRef");
 
         updateStack(stackName, template(suffix, "AlbB", "tg-b-" + suffix, ""));
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         String describeAfter = describeStack(stackName);
         assertStatus(describeAfter, "UPDATE_COMPLETE");
         String newListener = output(describeAfter, "ListenerRef");
@@ -91,6 +93,7 @@ class CloudFormationElbV2ReplacementIntegrationTest {
                 }""".formatted(suffix);
         updateStack(stackName, template(suffix, "AlbB", "tg-" + suffix, failingSecret));
 
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_ROLLBACK_COMPLETE");
         String describe = describeStack(stackName);
         assertStatus(describe, "UPDATE_ROLLBACK_COMPLETE");
         assertEquals(oldListener, output(describe, "ListenerRef"));
@@ -121,12 +124,14 @@ class CloudFormationElbV2ReplacementIntegrationTest {
 
         createStack(stackName, fixedResponseTemplate(suffix));
         updateStack(stackName, template(suffix, "AlbA", "tg-a-" + suffix, ""));
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         String describeBefore = describeStack(stackName);
         assertStatus(describeBefore, "UPDATE_COMPLETE");
         String oldListener = output(describeBefore, "ListenerRef");
         String oldTg = output(describeBefore, "TgRef");
 
         updateStack(stackName, template(suffix, "AlbB", "tg-b-" + suffix, ""));
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
         String describeAfter = describeStack(stackName);
         assertStatus(describeAfter, "UPDATE_COMPLETE");
         assertNotEquals(oldListener, output(describeAfter, "ListenerRef"));
@@ -137,6 +142,50 @@ class CloudFormationElbV2ReplacementIntegrationTest {
         String events = describeEvents(stackName);
         assertEvent(events, "DELETE_COMPLETE", oldListener);
         assertEvent(events, "DELETE_COMPLETE", oldTg);
+
+        deleteStack(stackName);
+    }
+
+    /**
+     * A new name replaces the load balancer, and the replacement is created the way CreateLoadBalancer
+     * creates one: an Application Load Balancer renamed onto one subnet fails the update with that
+     * call's error, no balancer has the new name, and the one it was to replace keeps both subnets.
+     */
+    @Test
+    void aReplacementOnOneSubnetFailsTheUpdateAndKeepsTheBalancer() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "elb-replace-one-" + suffix;
+        String subnetA = Ec2Service.defaultSubnetId(REGION, "a");
+        String subnetB = Ec2Service.defaultSubnetId(REGION, "b");
+        String template = """
+            {
+              "Resources": {
+                "Alb": {
+                  "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                  "Properties": {"Name": "%s", "Type": "application", "Subnets": [%s]}
+                }
+              },
+              "Outputs": {"AlbRef": {"Value": {"Ref": "Alb"}}}
+            }
+            """;
+        createStack(stackName, template.formatted("alb-kept-" + suffix, "\"" + subnetA + "\", \"" + subnetB + "\""));
+        String kept = output(describeStack(stackName), "AlbRef");
+
+        updateStack(stackName, template.formatted("alb-renamed-" + suffix, "\"" + subnetA + "\""));
+
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_ROLLBACK_COMPLETE");
+        assertEquals(kept, output(describeStack(stackName), "AlbRef"));
+        assertEquals(true, describeEvents(stackName)
+                .contains("At least two subnets in two different Availability Zones must be specified"),
+                "the replacement fails with CreateLoadBalancer's error: " + describeEvents(stackName));
+        given().formParam("Action", "DescribeLoadBalancers").formParam("Version", "2015-12-01")
+            .formParam("LoadBalancerArns.member.1", kept)
+        .when().post("/").then().statusCode(200)
+            .body(containsString("<SubnetId>" + subnetA + "</SubnetId>"))
+            .body(containsString("<SubnetId>" + subnetB + "</SubnetId>"));
+        given().formParam("Action", "DescribeLoadBalancers").formParam("Version", "2015-12-01")
+            .formParam("Names.member.1", "alb-renamed-" + suffix)
+        .when().post("/").then().statusCode(400).body(containsString("LoadBalancerNotFound"));
 
         deleteStack(stackName);
     }
@@ -214,6 +263,7 @@ class CloudFormationElbV2ReplacementIntegrationTest {
         given().formParam("Action", "CreateStack").formParam("Version", "2010-05-15")
             .formParam("StackName", stackName).formParam("TemplateBody", body)
         .when().post("/").then().statusCode(200);
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
         assertStatus(describeStack(stackName), "CREATE_COMPLETE");
     }
 
@@ -270,11 +320,13 @@ class CloudFormationElbV2ReplacementIntegrationTest {
         return m.group(1);
     }
 
-    /** DescribeListeners filters by ARN and answers an empty list for one that is gone. */
+    /** An explicit ARN for a deleted listener reports the modeled not-found error. */
     private static void assertListenerMissing(String listenerArn) {
         given().formParam("Action", "DescribeListeners").formParam("Version", "2015-12-01")
             .formParam("ListenerArns.member.1", listenerArn)
-        .when().post("/").then().statusCode(200).body(not(containsString(listenerArn)));
+        .when().post("/").then().statusCode(400)
+            .body(containsString("<Code>ListenerNotFound</Code>"))
+            .body(not(containsString("<ListenerArn>" + listenerArn + "</ListenerArn>")));
     }
 
     private static void assertListenerPresent(String listenerArn) {

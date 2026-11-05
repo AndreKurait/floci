@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebResponses;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
 import io.github.hectorvent.floci.services.lambdaweb.model.WebFunction;
 import io.github.hectorvent.floci.services.lambdaweb.model.WebFunctionEndpoint;
@@ -120,7 +121,9 @@ public class LambdaWebCfnProvisioner implements CfnResourceProvisioner {
         String region = snapshot.path("region").asText();
         String functionArn = snapshot.path("functionArn").asText();
         if ("endpoint".equals(snapshot.path("type").asText())) {
-            service.updateEndpoint(region, functionArn, snapshot.path("endpointName").asText(), snapshot.get("patch"));
+            WebFunctionEndpoint restored = service.updateEndpoint(region, functionArn,
+                    snapshot.path("endpointName").asText(), snapshot.get("patch")).after();
+            resource.getAttributes().put("RegionalEndpoints", regionalEndpoints(restored));
         } else {
             service.replaceTags(region, functionArn,
                     MAPPER.convertValue(snapshot.get("tags"), new TypeReference<Map<String, String>>() {}));
@@ -169,6 +172,14 @@ public class LambdaWebCfnProvisioner implements CfnResourceProvisioner {
             revision = service.createRevision(ctx.region(), functionName, request);
         }
         r.setPhysicalId(revision.revisionArn);
+        if (revision.failureReason != null) {
+            // The AWS handler waits for Active, so a Failed revision fails the resource as NotStabilized.
+            AwsException failure = new AwsException("NotStabilized", revision.failureReason, 400);
+            CfnRollback.guarded(r, ctx, true, () -> delete(REVISION, r.getPhysicalId(), ctx.region()), () -> { },
+                    () -> {
+                        throw failure;
+                    });
+        }
         ReplacementCleanup.record(r, ctx, attributesBefore);
         r.getAttributes().put("FunctionArn", revision.functionArn);
         r.getAttributes().put("RevisionArn", revision.revisionArn);
@@ -211,6 +222,7 @@ public class LambdaWebCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("FunctionArn", endpoint.functionArn);
         r.getAttributes().put("EndpointArn", endpoint.endpointArn);
         r.getAttributes().put("DomainName", endpoint.domainName);
+        r.getAttributes().put("RegionalEndpoints", regionalEndpoints(endpoint));
         r.getAttributes().put("State", "Active");
         r.getAttributes().put("StateReason", "The endpoint is active and invokable.");
         if (endpoint.updateStatus != null) {
@@ -334,6 +346,32 @@ public class LambdaWebCfnProvisioner implements CfnResourceProvisioner {
             out.set(key, "EnvironmentVariables".equals(entry.getKey()) ? value : lowerKeys(value));
         });
         return out;
+    }
+
+    @Override
+    public Map<String, Set<String>> jsonAttributes() {
+        return Map.of(ENDPOINT, Set.of("RegionalEndpoints"));
+    }
+
+    private static String regionalEndpoints(WebFunctionEndpoint endpoint) {
+        return upperKeys(MAPPER.valueToTree(LambdaWebResponses.regionalEndpoints(endpoint)), false).toString();
+    }
+
+    /** The API's members in PascalCase. The region names that key RegionalEndpoints stay as they are. */
+    private static JsonNode upperKeys(JsonNode node, boolean member) {
+        if (node.isObject()) {
+            ObjectNode out = MAPPER.createObjectNode();
+            node.properties().forEach(entry -> out.set(member
+                    ? Character.toUpperCase(entry.getKey().charAt(0)) + entry.getKey().substring(1)
+                    : entry.getKey(), upperKeys(entry.getValue(), true)));
+            return out;
+        }
+        if (node.isArray()) {
+            ArrayNode out = MAPPER.createArrayNode();
+            node.forEach(item -> out.add(upperKeys(item, true)));
+            return out;
+        }
+        return node;
     }
 
     private static JsonNode lowerKeys(JsonNode node) {

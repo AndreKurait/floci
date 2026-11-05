@@ -1,10 +1,10 @@
 package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
 import io.github.hectorvent.floci.core.common.AwsRegions;
-import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.iam.model.DelegationPermission;
@@ -17,6 +17,7 @@ import jakarta.inject.Inject;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
@@ -42,7 +43,17 @@ import java.util.regex.Pattern;
  * {@code ValidationError}, which the reference's common errors publish for exactly that across
  * every IAM operation and which the rest of IAM answers in the same shape. The modeled
  * {@code InvalidInput} is kept for a value that cannot be read as the member's type at all, the
- * way the shared pagination already answers a {@code MaxItems} that is not a number.
+ * way the shared pagination already answers a {@code MaxItems} that is not a number, and that is
+ * what a {@code NotificationChannel} naming no topic gets: the member's declared shape is looser
+ * than an ARN, so the shape alone would let through a channel nothing could be published to.
+ *
+ * <p>Every state the service writes is announced on the partner's topic through
+ * {@link DelegationNotifier}, which is the only channel this family has outwards. A notice is
+ * taken wherever a state is written, so an expiry noticed on a read announces itself the same way
+ * a claim does, and they are published once the lock is released: delivery reaches SNS and its
+ * subscribers, which is not work to hold a lock over, and a notification that cannot be delivered
+ * must not undo the transition that earned it. A call that fails after expiring a request still
+ * announces the expiry, which is why they are published in a finally rather than on the way out.
  */
 @ApplicationScoped
 public class DelegationRequestService {
@@ -53,6 +64,8 @@ public class DelegationRequestService {
     /** {@code tradeInTokenType} publishes no length and no pattern, so this is simply unguessable. */
     private static final int TOKEN_BYTES = 32;
     private static final Pattern ID_PATTERN = Pattern.compile("[\\w-]+");
+    private static final int ID_MIN = 16;
+    private static final int ID_MAX = 128;
     private static final Pattern ACCOUNT_PATTERN = Pattern.compile("\\d{12}");
     private static final Pattern NOTIFICATION_CHANNEL_PATTERN = Pattern.compile("^[a-zA-Z0-9:_.-]+$");
     /**
@@ -77,6 +90,32 @@ public class DelegationRequestService {
     private static final int SESSION_DURATION_MAX = 43200;
 
     /**
+     * The longest delegation the account root may approve. Not a declared constraint but a
+     * documented one, and it belongs to the approval rather than to the request: the user guide's
+     * own note reads "The maximum duration for delegated access is 12 hours. However, root users
+     * can only approve delegation requests with a duration of 4 hours or less. If a request
+     * specifies more than 4 hours, you must use a non-root identity to approve the request."
+     */
+    private static final int ROOT_APPROVAL_DURATION_MAX = 14400;
+
+    /**
+     * {@code summaryStateType}, of which {@code FAILED} is unreachable here: it reports a
+     * generation that ran and did not finish, and nothing is generated asynchronously.
+     */
+    private static final String SUMMARY_AVAILABLE = "AVAILABLE";
+    private static final String SUMMARY_NOT_AVAILABLE = "NOT_AVAILABLE";
+    private static final String SUMMARY_NOT_SUPPORTED = "NOT_SUPPORTED";
+    /** {@code summaryContentType} holds the content to 10000 characters. */
+    private static final int SUMMARY_MAX_CONTENT = 10000;
+    /** "At this time, the only supported entity type is delegation-request". */
+    private static final String SUMMARY_ENTITY_TYPE = "delegation-request";
+
+    /** The service that registers one, which is the only service whose ARN names a request. */
+    private static final String SUMMARY_ENTITY_SERVICE = "iam";
+    /** The locale the reference's own example answers, and the one language Floci writes. */
+    private static final String SUMMARY_LOCALE = "en";
+
+    /**
      * The path the console deep link points at. AWS publishes the field's purpose and its length
      * but no format, so this follows the console URL the tree already uses for CodePipeline
      * events: the host of the request's own partition, with the commercial console's path, which
@@ -88,6 +127,7 @@ public class DelegationRequestService {
     private final SecureRandom random = new SecureRandom();
     private final AccountAwareStorageBackend<DelegationRequest> requests;
     private final Clock clock;
+    private final DelegationNotifier notifier;
     /**
      * Serializes the read, check and write every lifecycle call makes, the way the sibling IAM
      * services guard theirs. Without it two callers can both claim the same unassigned request, or
@@ -96,13 +136,17 @@ public class DelegationRequestService {
     private final Object requestLock = new Object();
 
     @Inject
-    public DelegationRequestService(StorageFactory storageFactory, Clock clock) {
-        this(storageFactory.create("iam", "iam-delegation-requests.json", new TypeReference<>() {}), clock);
+    public DelegationRequestService(StorageFactory storageFactory, Clock clock,
+                                    DelegationNotifier notifier) {
+        this(storageFactory.create("iam", "iam-delegation-requests.json", new TypeReference<>() {}),
+                clock, notifier);
     }
 
-    DelegationRequestService(AccountAwareStorageBackend<DelegationRequest> requests, Clock clock) {
+    DelegationRequestService(AccountAwareStorageBackend<DelegationRequest> requests, Clock clock,
+                             DelegationNotifier notifier) {
         this.requests = requests;
         this.clock = clock;
+        this.notifier = notifier;
     }
 
     /** The {@code CreateDelegationRequest} request, as the handler parsed it. */
@@ -159,6 +203,15 @@ public class DelegationRequestService {
             throw constraintViolation(command.ownerAccountId(), "ownerAccountId",
                     "Member must satisfy regular expression pattern: " + ACCOUNT_PATTERN.pattern());
         }
+        // Last, because every check above enforces a declared constraint and this one enforces a
+        // documented one: notificationChannelType is looser than an ARN, while the member's own
+        // documentation says "At this time, only SNS topic ARNs are accepted for notification".
+        // A value inside the shape that names no topic cannot be read as the member's type, which
+        // is what InvalidInput is for here.
+        if (!DelegationNotifier.namesATopic(command.notificationChannel())) {
+            throw new AwsException("InvalidInput",
+                    "NotificationChannel must be an Amazon SNS topic ARN.", 400);
+        }
         synchronized (requestLock) {
             return fileNewRequest(requestorAccountId, region, command);
         }
@@ -208,24 +261,36 @@ public class DelegationRequestService {
      * another account answers {@code NoSuchEntity} rather than a refusal that names it.
      */
     public DelegationRequest associate(String callerAccountId, String callerArn, String id) {
-        synchronized (requestLock) {
-            Instant now = clock.instant();
-            DelegationRequest request = visible(callerAccountId, id, now);
-            requireState(request, DelegationRequestState.UNASSIGNED);
-            request.setOwnerAccountId(callerAccountId);
-            request.setOwnerId(callerArn);
-            return moveTo(request, DelegationRequestState.ASSIGNED, now);
+        List<DelegationNotifier.Notice> notices = new ArrayList<>();
+        try {
+            synchronized (requestLock) {
+                Instant now = clock.instant();
+                DelegationRequest request = visible(callerAccountId, id, now, notices);
+                requireState(request, DelegationRequestState.UNASSIGNED);
+                request.setOwnerAccountId(callerAccountId);
+                request.setOwnerId(callerArn);
+                return moveTo(request, DelegationRequestState.ASSIGNED, now, notices);
+            }
+        } finally {
+            notifier.publish(notices);
         }
     }
 
     /** Approves a request, from {@code ASSIGNED} or from an administrator's review. */
     public DelegationRequest accept(String callerAccountId, String callerArn, String id) {
-        synchronized (requestLock) {
-            Instant now = clock.instant();
-            DelegationRequest request = visible(callerAccountId, id, now);
-            requireState(request, DelegationRequestState.ASSIGNED, DelegationRequestState.PENDING_APPROVAL);
-            request.setApproverId(callerArn);
-            return moveTo(request, DelegationRequestState.ACCEPTED, now);
+        List<DelegationNotifier.Notice> notices = new ArrayList<>();
+        try {
+            synchronized (requestLock) {
+                Instant now = clock.instant();
+                DelegationRequest request = visible(callerAccountId, id, now, notices);
+                requireState(request, DelegationRequestState.ASSIGNED,
+                        DelegationRequestState.PENDING_APPROVAL);
+                requireApproverMayHoldItThatLong(request, callerArn);
+                request.setApproverId(callerArn);
+                return moveTo(request, DelegationRequestState.ACCEPTED, now, notices);
+            }
+        } finally {
+            notifier.publish(notices);
         }
     }
 
@@ -235,13 +300,18 @@ public class DelegationRequestService {
      */
     public DelegationRequest reject(String callerAccountId, String id, String notes) {
         checkText(notes, "notes", 0, 500, TEXT_PATTERN);
-        synchronized (requestLock) {
-            Instant now = clock.instant();
-            DelegationRequest request = visible(callerAccountId, id, now);
-            requireState(request, DelegationRequestState.ASSIGNED,
-                    DelegationRequestState.PENDING_APPROVAL, DelegationRequestState.ACCEPTED);
-            request.setRejectionReason(notes);
-            return moveTo(request, DelegationRequestState.REJECTED, now);
+        List<DelegationNotifier.Notice> notices = new ArrayList<>();
+        try {
+            synchronized (requestLock) {
+                Instant now = clock.instant();
+                DelegationRequest request = visible(callerAccountId, id, now, notices);
+                requireState(request, DelegationRequestState.ASSIGNED,
+                        DelegationRequestState.PENDING_APPROVAL, DelegationRequestState.ACCEPTED);
+                request.setRejectionReason(notes);
+                return moveTo(request, DelegationRequestState.REJECTED, now, notices);
+            }
+        } finally {
+            notifier.publish(notices);
         }
     }
 
@@ -252,12 +322,18 @@ public class DelegationRequestService {
      */
     public DelegationRequest update(String callerAccountId, String id, String notes) {
         checkText(notes, "notes", 0, 500, TEXT_PATTERN);
-        synchronized (requestLock) {
-            Instant now = clock.instant();
-            DelegationRequest request = visible(callerAccountId, id, now);
-            requireState(request, DelegationRequestState.ASSIGNED, DelegationRequestState.PENDING_APPROVAL);
-            request.setNotes(notes);
-            return moveTo(request, DelegationRequestState.PENDING_APPROVAL, now);
+        List<DelegationNotifier.Notice> notices = new ArrayList<>();
+        try {
+            synchronized (requestLock) {
+                Instant now = clock.instant();
+                DelegationRequest request = visible(callerAccountId, id, now, notices);
+                requireState(request, DelegationRequestState.ASSIGNED,
+                        DelegationRequestState.PENDING_APPROVAL);
+                request.setNotes(notes);
+                return moveTo(request, DelegationRequestState.PENDING_APPROVAL, now, notices);
+            }
+        } finally {
+            notifier.publish(notices);
         }
     }
 
@@ -278,24 +354,32 @@ public class DelegationRequestService {
      * who accepted the request is a different ARN from the owner who claimed it, and with the flag
      * set only the second of them may release.
      *
-     * <p>Nothing hands the token back. AWS publishes it only in the {@code ExchangeToken}
-     * notification on the partner's SNS topic, and no operation on the family answers it, so it
-     * stays on the record until there is a notification to carry it.
+     * <p>No operation on the family answers the token. AWS publishes it only in the
+     * {@code ExchangeToken} notification on the partner's topic, which is sent here beside the
+     * state change rather than instead of it, the guide listing both for {@code FINALIZED}.
      */
     public DelegationRequest release(String callerAccountId, String callerArn, String id) {
-        synchronized (requestLock) {
-            Instant now = clock.instant();
-            DelegationRequest request = visible(callerAccountId, id, now);
-            requireState(request, DelegationRequestState.ACCEPTED);
-            if (Boolean.TRUE.equals(request.getOnlySendByOwner())
-                    && !request.getOwnerId().equals(callerArn)) {
-                throw new AwsException("AccessDenied", "User is not authorized to perform: "
-                        + "iam:SendDelegationToken on " + request.getDelegationRequestId()
-                        + ", which is marked to be sent only by its owner.", 403);
+        List<DelegationNotifier.Notice> notices = new ArrayList<>();
+        try {
+            synchronized (requestLock) {
+                Instant now = clock.instant();
+                DelegationRequest request = visible(callerAccountId, id, now, notices);
+                requireState(request, DelegationRequestState.ACCEPTED);
+                if (Boolean.TRUE.equals(request.getOnlySendByOwner())
+                        && !request.getOwnerId().equals(callerArn)) {
+                    throw new AwsException("AccessDenied", "User is not authorized to perform: "
+                            + "iam:SendDelegationToken on " + request.getDelegationRequestId()
+                            + ", which is marked to be sent only by its owner.", 403);
+                }
+                request.setExchangeToken(newToken());
+                request.setTokenReleasedAt(now);
+                DelegationRequest finalized =
+                        moveTo(request, DelegationRequestState.FINALIZED, now, notices);
+                notices.add(DelegationNotifier.Notice.exchangeToken(finalized));
+                return finalized;
             }
-            request.setExchangeToken(newToken());
-            request.setTokenReleasedAt(now);
-            return moveTo(request, DelegationRequestState.FINALIZED, now);
+        } finally {
+            notifier.publish(notices);
         }
     }
 
@@ -345,8 +429,13 @@ public class DelegationRequestService {
 
     /** One request, by id, as the calling account is allowed to see it. */
     public DelegationRequest get(String callerAccountId, String id) {
-        synchronized (requestLock) {
-            return visible(callerAccountId, id, clock.instant());
+        List<DelegationNotifier.Notice> notices = new ArrayList<>();
+        try {
+            synchronized (requestLock) {
+                return visible(callerAccountId, id, clock.instant(), notices);
+            }
+        } finally {
+            notifier.publish(notices);
         }
     }
 
@@ -362,14 +451,76 @@ public class DelegationRequestService {
     public List<DelegationRequest> list(String callerAccountId, String ownerId) {
         checkText(ownerId, "ownerId", 20, 2048, OWNER_ID_PATTERN);
         Instant now = clock.instant();
-        synchronized (requestLock) {
-            return visibleToOwner(callerAccountId, ownerId, now);
+        List<DelegationNotifier.Notice> notices = new ArrayList<>();
+        try {
+            synchronized (requestLock) {
+                return visibleToOwner(callerAccountId, ownerId, now, notices);
+            }
+        } finally {
+            notifier.publish(notices);
         }
     }
 
-    private List<DelegationRequest> visibleToOwner(String callerAccountId, String ownerId, Instant now) {
+    /** The answer {@code GetHumanReadableSummary} gives: content, its locale, and how it went. */
+    public record Summary(String content, String locale, String state) {}
+
+    /**
+     * The summary of an entity, which is only ever a delegation request.
+     *
+     * <p>Who may read it is the question {@link #get} answers: "these rules are identical to
+     * GetDelegationRequest API behavior, such that a party who has permissions to call
+     * GetDelegationRequest for a given delegation request will always be able to retrieve the
+     * human readable summary for that request", so the lookup is the same one and a request this
+     * account cannot see is {@code NoSuchEntity} here too.
+     *
+     * <p>The answers here that are chosen rather than read. An ARN naming any other entity type
+     * is {@code NOT_SUPPORTED}, which is the state the model publishes and the only thing a type
+     * AWS says it does not support can mean. A locale Floci does not write is
+     * {@code NOT_AVAILABLE} with no content, because "summary content is non-empty only if the
+     * SummaryState is AVAILABLE" and answering English text under another locale would be a claim
+     * the response itself contradicts. And a request id inside a well-formed ARN that no id could
+     * ever match is {@code NoSuchEntity} rather than a constraint failure: the operation declares
+     * the ARN's length and nothing about what is inside it, so the id is not a member to validate,
+     * and an unmatchable id names no request, which is what that error says.
+     *
+     * <p>The ARN's own account is not matched against the request. The id is what resolves across
+     * accounts, which is how the whole family reads one, and Floci mints these ARNs under the
+     * calling account rather than the owner's, so holding a caller to the account in the ARN would
+     * refuse the ARN Floci itself hands out.
+     */
+    public Summary summarize(String callerAccountId, String entityArn, String locale) {
+        requirePresent(entityArn, "entityArn");
+        checkText(entityArn, "entityArn", 20, 2048, null);
+        checkText(locale, "locale", 2, 12, null);
+        String answeredLocale = locale == null ? SUMMARY_LOCALE : locale;
+        String id = summarizedRequestId(entityArn);
+        if (id == null) {
+            return new Summary(null, answeredLocale, SUMMARY_NOT_SUPPORTED);
+        }
+        if (!namesARequest(id)) {
+            throw new AwsException("NoSuchEntity", "The delegation request named by " + entityArn
+                    + " cannot be found.", 404);
+        }
+        List<DelegationNotifier.Notice> notices = new ArrayList<>();
+        try {
+            synchronized (requestLock) {
+                DelegationRequest request = visible(callerAccountId, id, clock.instant(), notices);
+                if (!writtenIn(answeredLocale)) {
+                    return new Summary(null, answeredLocale, SUMMARY_NOT_AVAILABLE);
+                }
+                return new Summary(DelegationRequestSummary.markdown(request, SUMMARY_MAX_CONTENT),
+                        answeredLocale, SUMMARY_AVAILABLE);
+            }
+        } finally {
+            notifier.publish(notices);
+        }
+    }
+
+    private List<DelegationRequest> visibleToOwner(String callerAccountId, String ownerId,
+                                                   Instant now,
+                                                   List<DelegationNotifier.Notice> notices) {
         return requests.scanAllAccounts().stream()
-                .map(request -> expireIfDue(request, now))
+                .map(request -> expireIfDue(request, now, notices))
                 .filter(request -> request.getOwnerId() != null
                         && callerAccountId.equals(request.getOwnerAccountId()))
                 .filter(request -> ownerId == null || ownerId.equals(request.getOwnerId()))
@@ -389,9 +540,10 @@ public class DelegationRequestService {
      * being no per-identity permission on a delegation request to consult, so the last two collapse
      * into the same answer.
      */
-    private DelegationRequest visible(String callerAccountId, String id, Instant now) {
+    private DelegationRequest visible(String callerAccountId, String id, Instant now,
+                                      List<DelegationNotifier.Notice> notices) {
         requirePresent(id, "delegationRequestId");
-        checkText(id, "delegationRequestId", 16, 128, ID_PATTERN);
+        checkText(id, "delegationRequestId", ID_MIN, ID_MAX, ID_PATTERN);
         DelegationRequest request = requests.scanAllAccounts().stream()
                 .filter(candidate -> id.equals(candidate.getDelegationRequestId()))
                 .findFirst()
@@ -400,7 +552,44 @@ public class DelegationRequestService {
                 && !request.getOwnerAccountId().equals(callerAccountId)) {
             throw noSuchRequest(id);
         }
-        return expireIfDue(request, now);
+        return expireIfDue(request, now, notices);
+    }
+
+    /**
+     * The request id an entity ARN names, or null when the ARN names another type of entity.
+     *
+     * <p>A value that is not an ARN at all is the modeled {@code InvalidInput}: {@code arnType}
+     * declares a length and no pattern, so this cannot be a constraint failure, and it is the
+     * same split the rest of this family makes between a member that breaks its constraints and
+     * one that cannot be read as its type.
+     *
+     * <p>Another service's ARN is read as another type of entity rather than as a request of
+     * IAM's that happens to be spelled oddly. Only IAM registers a delegation request, so an ARN
+     * naming any other service names nothing this can summarize, however its resource reads.
+     */
+    private static String summarizedRequestId(String entityArn) {
+        if (!AwsArnUtils.isArn(entityArn)) {
+            throw new AwsException("InvalidInput", "The value '" + entityArn + "' at 'entityArn' "
+                    + "is not an Amazon Resource Name.", 400);
+        }
+        return AwsArnUtils.resourceIfArnFor(entityArn, SUMMARY_ENTITY_SERVICE)
+                .filter(resource -> resource.startsWith(SUMMARY_ENTITY_TYPE + "/"))
+                .map(resource -> resource.substring(SUMMARY_ENTITY_TYPE.length() + 1))
+                .orElse(null);
+    }
+
+    /** Whether an id is inside {@code delegationRequestIdType} at all. */
+    private static boolean namesARequest(String id) {
+        return id.length() >= ID_MIN && id.length() <= ID_MAX && ID_PATTERN.matcher(id).matches();
+    }
+
+    /**
+     * Whether Floci writes the summary in this locale. The supported strings are the console's
+     * languages, and Floci writes one of them, so the language subtag decides and the region
+     * inside {@code en-GB} does not.
+     */
+    private static boolean writtenIn(String locale) {
+        return locale.split("[-_]", 2)[0].equalsIgnoreCase(SUMMARY_LOCALE);
     }
 
     private Optional<DelegationRequest> findByWorkflowId(String requestorAccountId, String workflowId) {
@@ -412,8 +601,11 @@ public class DelegationRequestService {
     /**
      * Applies the state's own window. A request sitting past it is {@code EXPIRED} from the next
      * read onwards, and the transition is written back so the answer does not depend on who asks.
+     * It is a transition like any other, so it notifies: the guide lists {@code EXPIRED} among the
+     * states a partner hears about, and the read that notices it is the only moment Floci has.
      */
-    private DelegationRequest expireIfDue(DelegationRequest request, Instant now) {
+    private DelegationRequest expireIfDue(DelegationRequest request, Instant now,
+                                          List<DelegationNotifier.Notice> notices) {
         if (request.getState() == DelegationRequestState.EXPIRED
                 || request.getExpirationTime() == null
                 || now.isBefore(request.getExpirationTime())) {
@@ -422,19 +614,28 @@ public class DelegationRequestService {
         request.setState(DelegationRequestState.EXPIRED);
         request.setUpdatedTime(now);
         put(request);
+        notices.add(DelegationNotifier.Notice.stateChange(request));
         return request;
     }
 
     /**
-     * Commits a transition. It takes the same instant the lookup expired against, so the deadline
-     * cannot fall between the two and let a request that is already past its window move on
-     * instead of expiring.
+     * Commits a transition and takes the notice for it. It is given the same instant the lookup
+     * expired against, so the deadline cannot fall between the two and let a request that is
+     * already past its window move on instead of expiring.
      */
-    private DelegationRequest moveTo(DelegationRequest request, DelegationRequestState state, Instant now) {
+    private DelegationRequest moveTo(DelegationRequest request, DelegationRequestState state,
+                                     Instant now, List<DelegationNotifier.Notice> notices) {
+        // A StateChange is sent "when a delegation request transitions to a new state", so a
+        // second UpdateDelegationRequest on a request already under review writes the notes it
+        // carries, refreshes the expiry window and tells the partner nothing.
+        boolean moved = request.getState() != state;
         request.setState(state);
         request.setUpdatedTime(now);
         request.setExpirationTime(state.window() == null ? null : now.plus(state.window()));
         put(request);
+        if (moved) {
+            notices.add(DelegationNotifier.Notice.stateChange(request));
+        }
         return request;
     }
 
@@ -454,6 +655,35 @@ public class DelegationRequestService {
         throw new AwsException("ConcurrentModification", "Delegation request "
                 + request.getDelegationRequestId() + " is " + request.getState()
                 + " and cannot be changed from that state.", 409);
+    }
+
+    /**
+     * The four-hour cap on what the account root may approve, which {@code create} cannot apply:
+     * the twelve hours it enforces belong to the request, and this one belongs to whoever
+     * approves it, so it is read here where the approver is known.
+     *
+     * <p>Root is the caller whose ARN ends in {@code :root}, which is what this family already
+     * names an approver by, and covers a root credential itself as well as a key resolving to no
+     * IAM user, which this service answers with the account-root stand-in.
+     *
+     * <p>{@code AcceptDelegationRequest} models {@code NoSuchEntity}, {@code ServiceFailure} and
+     * {@code ConcurrentModification} and nothing for this, and no source gives the code AWS
+     * answers, so the code is chosen: the guide states the rule as which identity may approve,
+     * which is what {@code SendDelegationToken}'s own owner rule answers {@code AccessDenied}
+     * for. A duration the record does not carry is nothing to hold to a cap.
+     */
+    private static void requireApproverMayHoldItThatLong(DelegationRequest request,
+                                                         String callerArn) {
+        if (callerArn == null || !callerArn.endsWith(":root")
+                || request.getSessionDuration() == null
+                || request.getSessionDuration() <= ROOT_APPROVAL_DURATION_MAX) {
+            return;
+        }
+        throw new AwsException("AccessDenied", "User is not authorized to perform: "
+                + "iam:AcceptDelegationRequest on " + request.getDelegationRequestId()
+                + ", which asks for " + request.getSessionDuration() + " seconds: the root user may"
+                + " only approve a delegation of " + ROOT_APPROVAL_DURATION_MAX / 3600
+                + " hours or less. Approve it as an IAM user or role instead.", 403);
     }
 
     private void put(DelegationRequest request) {
@@ -516,12 +746,15 @@ public class DelegationRequestService {
      * A member that does not meet the format or the constraints it declares. The reference's
      * common errors publish {@code ValidationError} for exactly that, "the input doesn't meet the
      * required format or constraints", for every IAM operation and without listing it on any of
-     * them, which is why it appears in no operation's error table and in none of these.
+     * them, which is why it appears in no operation's error table and in none of these. The member
+     * is named without the value, as {@link IamValidationErrors} reads it, and a member the request
+     * never sent keeps the one word that still stands where a value would.
      */
     private static AwsException constraintViolation(String value, String member, String constraint) {
-        return SmithyValidationErrors.validationError("Value "
-                + (value == null ? "null" : "'" + value + "'") + " at '" + member
-                + "' failed to satisfy constraint: " + constraint);
+        if (value == null) {
+            return IamValidationErrors.notNull(member);
+        }
+        return IamValidationErrors.validationError(member, value, constraint);
     }
 
     private static AwsException noSuchRequest(String id) {

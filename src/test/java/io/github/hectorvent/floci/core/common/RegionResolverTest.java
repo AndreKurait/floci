@@ -29,6 +29,32 @@ class RegionResolverTest {
     }
 
     @Test
+    void sigV4aRegionSetOfOneRegionSelectsIt() {
+        assertEquals("eu-west-1", resolver.resolveRegionFromRegionSet("eu-west-1"));
+        assertEquals("eu-west-1", resolver.resolveRegionFromRegionSet(" eu-west-1 "));
+    }
+
+    @Test
+    void sigV4aWildcardListOrMissingRegionSetServesTheDefaultRegion() {
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet("*"));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet("eu-*"));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet("eu-west-1,us-west-2"));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(""));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(null));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(","));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(",,"));
+        assertEquals("us-east-1", resolver.resolveRegionFromRegionSet(" , , "));
+    }
+
+    @Test
+    void sigV4aAuthorizationResolvesFromRegionSet() {
+        HttpHeaders headers = stubHeaders(
+                "AWS4-ECDSA-P256-SHA256 Credential=AKID/20260215/sqs/aws4_request, SignedHeaders=host, Signature=abc",
+                "eu-west-1");
+        assertEquals("eu-west-1", resolver.resolveRegion(headers));
+    }
+
+    @Test
     void resolveRegionFromDifferentRegion() {
         HttpHeaders headers = stubHeaders(
                 "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260215/eu-west-1/sqs/aws4_request, " +
@@ -291,15 +317,23 @@ class RegionResolverTest {
     }
 
     private static HttpHeaders stubHeaders(String authorizationValue) {
+        return stubHeaders(authorizationValue, null);
+    }
+
+    private static HttpHeaders stubHeaders(String authorizationValue, String regionSetValue) {
         return new HttpHeaders() {
             @Override public List<String> getRequestHeader(String name) {
                 if ("Authorization".equalsIgnoreCase(name) && authorizationValue != null) {
                     return List.of(authorizationValue);
                 }
+                if ("X-Amz-Region-Set".equalsIgnoreCase(name) && regionSetValue != null) {
+                    return List.of(regionSetValue);
+                }
                 return List.of();
             }
             @Override public String getHeaderString(String name) {
                 if ("Authorization".equalsIgnoreCase(name)) return authorizationValue;
+                if ("X-Amz-Region-Set".equalsIgnoreCase(name)) return regionSetValue;
                 return null;
             }
             @Override public MultivaluedMap<String, String> getRequestHeaders() { return new MultivaluedHashMap<>(); }

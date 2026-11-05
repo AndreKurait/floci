@@ -5,6 +5,8 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.math.BigDecimal;
+
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -35,13 +37,16 @@ public class ExportDescription {
     private String exportType;
 
     @JsonProperty("ExportTime")
-    private Long exportTime;
+    private BigDecimal exportTime;
+
+    @JsonProperty("IncrementalExportSpecification")
+    private IncrementalExportSpecification incrementalExportSpecification;
 
     @JsonProperty("StartTime")
-    private Long startTime;
+    private BigDecimal startTime;
 
     @JsonProperty("EndTime")
-    private Long endTime;
+    private BigDecimal endTime;
 
     @JsonProperty("ItemCount")
     private Long itemCount;
@@ -67,6 +72,9 @@ public class ExportDescription {
     @JsonProperty("FailureMessage")
     private String failureMessage;
 
+    @JsonProperty("DestinationType")
+    private String destinationType = "S3";
+
     public String getExportArn() { return exportArn; }
     public void setExportArn(String exportArn) { this.exportArn = exportArn; }
 
@@ -91,14 +99,19 @@ public class ExportDescription {
     public String getExportType() { return exportType; }
     public void setExportType(String exportType) { this.exportType = exportType; }
 
-    public Long getExportTime() { return exportTime; }
-    public void setExportTime(Long exportTime) { this.exportTime = exportTime; }
+    public BigDecimal getExportTime() { return exportTime; }
+    public void setExportTime(BigDecimal exportTime) { this.exportTime = exportTime; }
 
-    public Long getStartTime() { return startTime; }
-    public void setStartTime(Long startTime) { this.startTime = startTime; }
+    public IncrementalExportSpecification getIncrementalExportSpecification() { return incrementalExportSpecification; }
+    public void setIncrementalExportSpecification(IncrementalExportSpecification incrementalExportSpecification) {
+        this.incrementalExportSpecification = incrementalExportSpecification;
+    }
 
-    public Long getEndTime() { return endTime; }
-    public void setEndTime(Long endTime) { this.endTime = endTime; }
+    public BigDecimal getStartTime() { return startTime; }
+    public void setStartTime(BigDecimal startTime) { this.startTime = startTime; }
+
+    public BigDecimal getEndTime() { return endTime; }
+    public void setEndTime(BigDecimal endTime) { this.endTime = endTime; }
 
     public Long getItemCount() { return itemCount; }
     public void setItemCount(Long itemCount) { this.itemCount = itemCount; }
@@ -123,4 +136,7 @@ public class ExportDescription {
 
     public String getFailureMessage() { return failureMessage; }
     public void setFailureMessage(String failureMessage) { this.failureMessage = failureMessage; }
+
+    public String getDestinationType() { return destinationType; }
+    public void setDestinationType(String destinationType) { this.destinationType = destinationType; }
 }

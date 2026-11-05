@@ -4,16 +4,19 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
-import software.amazon.awssdk.services.ec2.model.DescribeSubnetsResponse;
 import software.amazon.awssdk.services.rds.RdsClient;
+import software.amazon.awssdk.services.rds.model.Certificate;
+import software.amazon.awssdk.services.rds.model.CertificateNotFoundException;
 import software.amazon.awssdk.services.rds.model.ConnectionPoolConfigurationInfo;
 import software.amazon.awssdk.services.rds.model.CreateDbClusterEndpointResponse;
 import software.amazon.awssdk.services.rds.model.CreateDbClusterResponse;
 import software.amazon.awssdk.services.rds.model.CreateDbInstanceResponse;
+import software.amazon.awssdk.services.rds.model.CreateDbProxyEndpointResponse;
 import software.amazon.awssdk.services.rds.model.CreateDbProxyResponse;
 import software.amazon.awssdk.services.rds.model.CreateDbSubnetGroupResponse;
 import software.amazon.awssdk.services.rds.model.CreateOptionGroupResponse;
@@ -24,7 +27,10 @@ import software.amazon.awssdk.services.rds.model.DBClusterRole;
 import software.amazon.awssdk.services.rds.model.DBClusterSnapshot;
 import software.amazon.awssdk.services.rds.model.DBEngineVersion;
 import software.amazon.awssdk.services.rds.model.DBInstance;
+import software.amazon.awssdk.services.rds.model.DBInstanceAutomatedBackup;
+import software.amazon.awssdk.services.rds.model.DBInstanceAutomatedBackupsReplication;
 import software.amazon.awssdk.services.rds.model.DBInstanceRole;
+import software.amazon.awssdk.services.rds.model.DBProxyEndpointTargetRole;
 import software.amazon.awssdk.services.rds.model.DBProxyTarget;
 import software.amazon.awssdk.services.rds.model.DBSnapshot;
 import software.amazon.awssdk.services.rds.model.DbClusterEndpointAlreadyExistsException;
@@ -32,13 +38,17 @@ import software.amazon.awssdk.services.rds.model.DbClusterEndpointNotFoundExcept
 import software.amazon.awssdk.services.rds.model.DbClusterRoleAlreadyExistsException;
 import software.amazon.awssdk.services.rds.model.DbClusterRoleNotFoundException;
 import software.amazon.awssdk.services.rds.model.DbClusterSnapshotNotFoundException;
+import software.amazon.awssdk.services.rds.model.DbInstanceAutomatedBackupNotFoundException;
 import software.amazon.awssdk.services.rds.model.DbInstanceRoleAlreadyExistsException;
 import software.amazon.awssdk.services.rds.model.DbInstanceRoleNotFoundException;
 import software.amazon.awssdk.services.rds.model.DbLogFileNotFoundException;
+import software.amazon.awssdk.services.rds.model.DbProxyEndpointNotFoundException;
 import software.amazon.awssdk.services.rds.model.DbSnapshotAlreadyExistsException;
 import software.amazon.awssdk.services.rds.model.DbSnapshotNotFoundException;
+import software.amazon.awssdk.services.rds.model.DescribeCertificatesResponse;
 import software.amazon.awssdk.services.rds.model.DescribeDBLogFilesDetails;
 import software.amazon.awssdk.services.rds.model.DescribeDbProxiesResponse;
+import software.amazon.awssdk.services.rds.model.DescribeDbProxyEndpointsResponse;
 import software.amazon.awssdk.services.rds.model.DescribeDbProxyTargetGroupsResponse;
 import software.amazon.awssdk.services.rds.model.DescribeDbProxyTargetsResponse;
 import software.amazon.awssdk.services.rds.model.DescribeDbSubnetGroupsResponse;
@@ -46,12 +56,15 @@ import software.amazon.awssdk.services.rds.model.DescribeOptionGroupsResponse;
 import software.amazon.awssdk.services.rds.model.DescribeOrderableDbInstanceOptionsResponse;
 import software.amazon.awssdk.services.rds.model.DownloadDbLogFilePortionResponse;
 import software.amazon.awssdk.services.rds.model.EngineDefaults;
+import software.amazon.awssdk.services.rds.model.InvalidDbInstanceAutomatedBackupStateException;
 import software.amazon.awssdk.services.rds.model.InvalidDbInstanceStateException;
+import software.amazon.awssdk.services.rds.model.InvalidDbProxyEndpointStateException;
 import software.amazon.awssdk.services.rds.model.InvalidOptionGroupStateException;
 import software.amazon.awssdk.services.rds.model.InvalidRestoreException;
 import software.amazon.awssdk.services.rds.model.ListTagsForResourceResponse;
 import software.amazon.awssdk.services.rds.model.ModifyDbClusterEndpointResponse;
 import software.amazon.awssdk.services.rds.model.ModifyDbClusterResponse;
+import software.amazon.awssdk.services.rds.model.ModifyDbProxyEndpointResponse;
 import software.amazon.awssdk.services.rds.model.ModifyDbProxyResponse;
 import software.amazon.awssdk.services.rds.model.ModifyDbProxyTargetGroupResponse;
 import software.amazon.awssdk.services.rds.model.ModifyOptionGroupResponse;
@@ -75,10 +88,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
 @DisplayName("RDS Control Plane")
+@ResourceLock("port-5432")
 class RdsControlPlaneTest {
 
     private static final Logger LOG = Logger.getLogger(RdsControlPlaneTest.class.getName());
     private static RdsClient rds;
+    private static Ec2Client ec2;
+    private static Ec2TestNetwork network;
     private static String subnetGroupName;
     private static String proxyName;
     private static String serverlessClusterName;
@@ -90,39 +106,39 @@ class RdsControlPlaneTest {
         subnetGroupName = TestFixtures.uniqueName("rds-subnets");
         proxyName = TestFixtures.uniqueName("rds-proxy");
         serverlessClusterName = TestFixtures.uniqueName("rds-serverless");
-        try (Ec2Client ec2 = TestFixtures.ec2Client()) {
-            DescribeSubnetsResponse response = ec2.describeSubnets();
-            subnetIds = response.subnets().stream()
-                    .map(subnet -> subnet.subnetId())
-                    .sorted()
-                    .limit(2)
-                    .toList();
-        }
+        network = null;
+        ec2 = TestFixtures.ec2Client();
+        network = Ec2TestNetwork.create(ec2, List.of(
+                TestFixtures.region().id() + "a", TestFixtures.region().id() + "b"));
+        subnetIds = network.subnetIds();
         assertThat(subnetIds).hasSizeGreaterThanOrEqualTo(2);
     }
 
     @AfterAll
     static void cleanup() {
-        if (rds != null) {
-            try {
-                rds.deleteDBCluster(b -> b
-                        .dbClusterIdentifier(serverlessClusterName)
-                        .skipFinalSnapshot(true));
-            } catch (Exception e) {
-                LOG.log(Level.FINE, "RDS Serverless v2 cluster already absent during cleanup "
-                        + serverlessClusterName, e);
+        try (Ec2Client ownedClient = ec2;
+             Ec2TestNetwork ownedNetwork = network;
+             RdsClient ownedRds = rds) {
+            if (rds != null) {
+                try {
+                    rds.deleteDBCluster(b -> b
+                            .dbClusterIdentifier(serverlessClusterName)
+                            .skipFinalSnapshot(true));
+                } catch (Exception e) {
+                    LOG.log(Level.FINE, "RDS Serverless v2 cluster already absent during cleanup "
+                            + serverlessClusterName, e);
+                }
+                try {
+                    rds.deleteDBProxy(b -> b.dbProxyName(proxyName));
+                } catch (Exception e) {
+                    LOG.log(Level.WARNING, "Failed to clean up RDS DB proxy " + proxyName, e);
+                }
+                try {
+                    rds.deleteDBSubnetGroup(b -> b.dbSubnetGroupName(subnetGroupName));
+                } catch (Exception e) {
+                    LOG.log(Level.WARNING, "Failed to clean up RDS subnet group " + subnetGroupName, e);
+                }
             }
-            try {
-                rds.deleteDBProxy(b -> b.dbProxyName(proxyName));
-            } catch (Exception e) {
-                LOG.log(Level.WARNING, "Failed to clean up RDS DB proxy " + proxyName, e);
-            }
-            try {
-                rds.deleteDBSubnetGroup(b -> b.dbSubnetGroupName(subnetGroupName));
-            } catch (Exception e) {
-                LOG.log(Level.WARNING, "Failed to clean up RDS subnet group " + subnetGroupName, e);
-            }
-            rds.close();
         }
     }
 
@@ -137,6 +153,7 @@ class RdsControlPlaneTest {
                         .minCapacity(0.0)
                         .maxCapacity(16.0)));
 
+        assertThat(created.dbCluster().hostedZoneId()).isEqualTo("Z2R2ITUGPM61AM");
         assertThat(created.dbCluster().engine()).isEqualTo("aurora-postgresql");
         assertThat(created.dbCluster().serverlessV2ScalingConfiguration().minCapacity())
                 .isEqualTo(0.0);
@@ -158,6 +175,7 @@ class RdsControlPlaneTest {
 
         DBCluster described = rds.describeDBClusters(b -> b
                 .dbClusterIdentifier(serverlessClusterName)).dbClusters().get(0);
+        assertThat(described.hostedZoneId()).isEqualTo("Z2R2ITUGPM61AM");
         assertThat(described.serverlessV2ScalingConfiguration().minCapacity()).isEqualTo(0.0);
         assertThat(described.serverlessV2ScalingConfiguration().maxCapacity()).isEqualTo(16.0);
         assertThat(described.serverlessV2ScalingConfiguration().secondsUntilAutoPause())
@@ -318,28 +336,83 @@ class RdsControlPlaneTest {
     }
 
     @Test
+    void sdkRoundTripsDbProxyEndpoints() {
+        String proxyName = TestFixtures.uniqueName("rds-proxy-endpoints");
+        String endpointName = TestFixtures.uniqueName("reader");
+        String renamed = TestFixtures.uniqueName("analytics");
+        try {
+            CreateDbProxyResponse proxy = rds.createDBProxy(b -> b
+                    .dbProxyName(proxyName)
+                    .engineFamily("POSTGRESQL")
+                    .roleArn("arn:aws:iam::000000000000:role/rds-proxy")
+                    .vpcSubnetIds(subnetIds)
+                    .auth(a -> a.authScheme("SECRETS")
+                            .secretArn("arn:aws:secretsmanager:us-east-1:000000000000:secret:db-AbCdEf")));
+
+            CreateDbProxyEndpointResponse created = rds.createDBProxyEndpoint(b -> b
+                    .dbProxyName(proxyName)
+                    .dbProxyEndpointName(endpointName)
+                    .vpcSubnetIds(subnetIds)
+                    .vpcSecurityGroupIds("sg-endpoint")
+                    .targetRole(DBProxyEndpointTargetRole.READ_ONLY)
+                    .tags(t -> t.key("team").value("data")));
+            assertThat(created.dbProxyEndpoint().targetRole()).isEqualTo(DBProxyEndpointTargetRole.READ_ONLY);
+            assertThat(created.dbProxyEndpoint().isDefault()).isFalse();
+            assertThat(created.dbProxyEndpoint().endpoint()).isEqualTo(proxy.dbProxy().endpoint());
+            assertThat(created.dbProxyEndpoint().createdDate()).isNotNull();
+            assertThat(rds.listTagsForResource(b -> b.resourceName(created.dbProxyEndpoint().dbProxyEndpointArn()))
+                    .tagList()).extracting("key").containsExactly("team");
+
+            DescribeDbProxyEndpointsResponse described = rds.describeDBProxyEndpoints(b -> b.dbProxyName(proxyName));
+            assertThat(described.dbProxyEndpoints()).extracting("dbProxyEndpointName")
+                    .containsExactly("default", endpointName);
+            assertThat(described.dbProxyEndpoints().get(0).isDefault()).isTrue();
+
+            ModifyDbProxyEndpointResponse modified = rds.modifyDBProxyEndpoint(b -> b
+                    .dbProxyEndpointName(endpointName)
+                    .newDBProxyEndpointName(renamed)
+                    .vpcSecurityGroupIds("sg-other"));
+            assertThat(modified.dbProxyEndpoint().dbProxyEndpointName()).isEqualTo(renamed);
+            assertThat(modified.dbProxyEndpoint().vpcSecurityGroupIds()).containsExactly("sg-other");
+
+            assertThatThrownBy(() -> rds.deleteDBProxyEndpoint(b -> b.dbProxyEndpointName("default")))
+                    .isInstanceOf(InvalidDbProxyEndpointStateException.class);
+            rds.deleteDBProxyEndpoint(b -> b.dbProxyEndpointName(renamed));
+            assertThatThrownBy(() -> rds.describeDBProxyEndpoints(b -> b.dbProxyEndpointName(renamed)))
+                    .isInstanceOf(DbProxyEndpointNotFoundException.class);
+        } finally {
+            deleteProxy(rds, proxyName);
+        }
+    }
+
+    @Test
     void sdkScopesTheSameDbProxyNameBySignedRegion() {
         String regionalProxyName = TestFixtures.uniqueName("rds-proxy-regional");
         try (RdsClient east = rdsClient(Region.US_EAST_1);
-             RdsClient west = rdsClient(Region.US_WEST_2)) {
-            // Subnet ids are region-scoped on real AWS (and on floci, since #21), so each proxy
-            // needs subnets from its own signed region rather than the shared us-east-1 subnetIds.
-            CreateDbProxyResponse eastProxy = createIamProxy(east, regionalProxyName, subnetIdsFor(Region.US_EAST_1));
-            CreateDbProxyResponse westProxy = createIamProxy(west, regionalProxyName, subnetIdsFor(Region.US_WEST_2));
+             RdsClient west = rdsClient(Region.US_WEST_2);
+             Ec2Client eastEc2 = ec2Client(Region.US_EAST_1);
+             Ec2Client westEc2 = ec2Client(Region.US_WEST_2);
+             Ec2TestNetwork eastNetwork = Ec2TestNetwork.create(eastEc2,
+                     List.of("us-east-1a", "us-east-1b"));
+             Ec2TestNetwork westNetwork = Ec2TestNetwork.create(westEc2,
+                     List.of("us-west-2a", "us-west-2b"))) {
+            try {
+                assertThat(eastNetwork.subnetIds()).hasSizeGreaterThanOrEqualTo(2);
+                assertThat(westNetwork.subnetIds()).hasSizeGreaterThanOrEqualTo(2);
+                CreateDbProxyResponse eastProxy = createIamProxy(east, regionalProxyName, eastNetwork.subnetIds());
+                CreateDbProxyResponse westProxy = createIamProxy(west, regionalProxyName, westNetwork.subnetIds());
 
-            assertThat(eastProxy.dbProxy().dbProxyArn()).contains(":rds:us-east-1:");
-            assertThat(westProxy.dbProxy().dbProxyArn()).contains(":rds:us-west-2:");
-            assertThat(westProxy.dbProxy().dbProxyArn()).isNotEqualTo(eastProxy.dbProxy().dbProxyArn());
+                assertThat(eastProxy.dbProxy().dbProxyArn()).contains(":rds:us-east-1:");
+                assertThat(westProxy.dbProxy().dbProxyArn()).contains(":rds:us-west-2:");
+                assertThat(westProxy.dbProxy().dbProxyArn()).isNotEqualTo(eastProxy.dbProxy().dbProxyArn());
 
-            assertThat(east.describeDBProxies(b -> b.dbProxyName(regionalProxyName)).dbProxies())
-                    .singleElement()
-                    .satisfies(proxy -> assertThat(proxy.dbProxyArn()).contains(":rds:us-east-1:"));
-            assertThat(west.describeDBProxies(b -> b.dbProxyName(regionalProxyName)).dbProxies())
-                    .singleElement()
-                    .satisfies(proxy -> assertThat(proxy.dbProxyArn()).contains(":rds:us-west-2:"));
-        } finally {
-            try (RdsClient east = rdsClient(Region.US_EAST_1);
-                 RdsClient west = rdsClient(Region.US_WEST_2)) {
+                assertThat(east.describeDBProxies(b -> b.dbProxyName(regionalProxyName)).dbProxies())
+                        .singleElement()
+                        .satisfies(proxy -> assertThat(proxy.dbProxyArn()).contains(":rds:us-east-1:"));
+                assertThat(west.describeDBProxies(b -> b.dbProxyName(regionalProxyName)).dbProxies())
+                        .singleElement()
+                        .satisfies(proxy -> assertThat(proxy.dbProxyArn()).contains(":rds:us-west-2:"));
+            } finally {
                 deleteProxy(east, regionalProxyName);
                 deleteProxy(west, regionalProxyName);
             }
@@ -822,6 +895,95 @@ class RdsControlPlaneTest {
     }
 
     @Test
+    @DisplayName("Certificates: list the CAs, override the default and set an instance's CA")
+    void sdkRoundTripsCertificates() {
+        String instanceName = TestFixtures.uniqueName("rds-ca");
+        try {
+            DescribeCertificatesResponse listed = rds.describeCertificates(b -> {});
+            assertThat(listed.defaultCertificateForNewLaunches()).isEqualTo("rds-ca-rsa2048-g1");
+            assertThat(listed.certificates()).extracting(Certificate::certificateIdentifier)
+                    .containsExactly("rds-ca-ecc384-g1", "rds-ca-rsa2048-g1", "rds-ca-rsa4096-g1");
+            assertThat(listed.certificates()).allSatisfy(c -> {
+                assertThat(c.certificateType()).isEqualTo("CA");
+                assertThat(c.thumbprint()).matches("[0-9a-f]{40}");
+                assertThat(c.validTill()).isAfter(c.validFrom());
+                assertThat(c.certificateArn()).endsWith("::cert:" + c.certificateIdentifier());
+            });
+            assertThatThrownBy(() -> rds.describeCertificates(b -> b.certificateIdentifier("rds-ca-2019")))
+                    .isInstanceOf(CertificateNotFoundException.class);
+
+            Certificate override = rds.modifyCertificates(b -> b.certificateIdentifier("rds-ca-ecc384-g1"))
+                    .certificate();
+            assertThat(override.customerOverride()).isTrue();
+            assertThat(override.customerOverrideValidTill()).isEqualTo(override.validTill());
+            DBInstance created = createDbInstance(rds, instanceName, "ca-secret").dbInstance();
+            assertThat(created.caCertificateIdentifier()).isEqualTo("rds-ca-ecc384-g1");
+            assertThat(created.certificateDetails().caIdentifier()).isEqualTo("rds-ca-ecc384-g1");
+            assertThat(created.certificateDetails().validTill()).isEqualTo(override.validTill());
+
+            rds.modifyDBInstance(b -> b.dbInstanceIdentifier(instanceName)
+                    .caCertificateIdentifier("rds-ca-rsa4096-g1").applyImmediately(true));
+            assertThat(rds.describeDBInstances(b -> b.dbInstanceIdentifier(instanceName)).dbInstances().get(0)
+                    .caCertificateIdentifier()).isEqualTo("rds-ca-rsa4096-g1");
+        } finally {
+            rds.modifyCertificates(b -> b.removeCustomerOverride(true));
+            deleteDbInstance(rds, instanceName);
+        }
+        assertThat(rds.describeCertificates(b -> {}).defaultCertificateForNewLaunches())
+                .isEqualTo("rds-ca-rsa2048-g1");
+    }
+
+    @Test
+    @DisplayName("Automated backups: active, retained after a delete, restored from, replicated and deleted")
+    void sdkRoundTripsAutomatedBackups() {
+        String instanceName = TestFixtures.uniqueName("rds-ab");
+        String restoredName = TestFixtures.uniqueName("rds-ab-restored");
+        Region destination = Region.US_WEST_2;
+        try (RdsClient west = rdsClient(destination)) {
+            DBInstance created = createDbInstance(rds, instanceName, "ab-secret").dbInstance();
+            String dbi = created.dbiResourceId();
+            DBInstanceAutomatedBackup active = rds.describeDBInstanceAutomatedBackups(b -> b.dbiResourceId(dbi))
+                    .dbInstanceAutomatedBackups().get(0);
+            assertThat(active.status()).isEqualTo("active");
+            assertThat(active.dbInstanceAutomatedBackupsArn()).endsWith(":auto-backup:ab-" + dbi.substring(3));
+            assertThat(active.restoreWindow().earliestTime()).isBeforeOrEqualTo(active.restoreWindow().latestTime());
+            assertThatThrownBy(() -> rds.deleteDBInstanceAutomatedBackup(b -> b.dbiResourceId(dbi)))
+                    .isInstanceOf(InvalidDbInstanceAutomatedBackupStateException.class);
+
+            DBInstanceAutomatedBackup replica = west.startDBInstanceAutomatedBackupsReplication(b -> b
+                    .sourceDBInstanceArn(created.dbInstanceArn()).backupRetentionPeriod(5))
+                    .dbInstanceAutomatedBackup();
+            assertThat(replica.status()).isEqualTo("replicating");
+            assertThat(replica.backupRetentionPeriod()).isEqualTo(5);
+            assertThat(rds.describeDBInstances(b -> b.dbInstanceIdentifier(instanceName)).dbInstances().get(0)
+                    .dbInstanceAutomatedBackupsReplications())
+                    .extracting(DBInstanceAutomatedBackupsReplication::dbInstanceAutomatedBackupsArn)
+                    .containsExactly(replica.dbInstanceAutomatedBackupsArn());
+            assertThat(west.stopDBInstanceAutomatedBackupsReplication(b -> b
+                    .sourceDBInstanceArn(created.dbInstanceArn())).dbInstanceAutomatedBackup().status())
+                    .isEqualTo("retained");
+            west.deleteDBInstanceAutomatedBackup(b -> b
+                    .dbInstanceAutomatedBackupsArn(replica.dbInstanceAutomatedBackupsArn()));
+
+            rds.deleteDBInstance(b -> b.dbInstanceIdentifier(instanceName).skipFinalSnapshot(true)
+                    .deleteAutomatedBackups(false));
+            assertThat(rds.describeDBInstanceAutomatedBackups(b -> b.dbiResourceId(dbi))
+                    .dbInstanceAutomatedBackups().get(0).status()).isEqualTo("retained");
+            assertThat(rds.restoreDBInstanceToPointInTime(b -> b.sourceDbiResourceId(dbi)
+                    .targetDBInstanceIdentifier(restoredName).useLatestRestorableTime(true))
+                    .dbInstance().dbInstanceIdentifier()).isEqualTo(restoredName);
+
+            assertThat(rds.deleteDBInstanceAutomatedBackup(b -> b.dbiResourceId(dbi))
+                    .dbInstanceAutomatedBackup().status()).isEqualTo("deleting");
+            assertThatThrownBy(() -> rds.describeDBInstanceAutomatedBackups(b -> b.dbiResourceId(dbi)))
+                    .isInstanceOf(DbInstanceAutomatedBackupNotFoundException.class);
+        } finally {
+            deleteDbInstance(rds, restoredName);
+            deleteDbInstance(rds, instanceName);
+        }
+    }
+
+    @Test
     @DisplayName("IAM role associations: add, describe and remove for a cluster and an instance")
     void sdkRoundTripsIamRoleAssociations() {
         String clusterName = TestFixtures.uniqueName("rds-roles-cluster");
@@ -936,16 +1098,6 @@ class RdsControlPlaneTest {
                 .defaultAuthScheme("IAM_AUTH"));
     }
 
-    private static List<String> subnetIdsFor(Region region) {
-        try (Ec2Client ec2 = ec2Client(region)) {
-            return ec2.describeSubnets().subnets().stream()
-                    .map(subnet -> subnet.subnetId())
-                    .sorted()
-                    .limit(2)
-                    .toList();
-        }
-    }
-
     private static Ec2Client ec2Client(Region region) {
         return Ec2Client.builder()
                 .endpointOverride(TestFixtures.endpoint())
@@ -955,7 +1107,7 @@ class RdsControlPlaneTest {
                 .build();
     }
 
-    private static software.amazon.awssdk.services.rds.model.CreateDbInstanceResponse createDbInstance(
+    private static CreateDbInstanceResponse createDbInstance(
             RdsClient client, String name, String password) {
         return client.createDBInstance(b -> b
                 .dbInstanceIdentifier(name)

@@ -134,19 +134,107 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
     }
 
     private void poll(Integration integration) {
-        writer.createLandingTable(integration.getAccountId(), integration.getTargetClusterIdentifier(),
+        if (targetPaused(integration)) {
+            return;
+        }
+        writer.createLandingTable(integration.getAccountId(), integration.getTargetArn(),
                 integration.getLandingTableName());
         if (!integration.isBackfillCompleted()) {
             pollBackfillPage(integration);
             return;
         }
-        DynamoDbStreamReader.Stream stream = DynamoDbStreamReader.Stream.of(integration.getSourceStreamArn());
+        String streamArn = followedStream(integration);
+        if (streamArn == null) {
+            // A table that never had a stream has nothing to replicate after its backfill.
+            redshiftService.recoverIntegrationRuntime(integration.getAccountId(), integration.getIntegrationArn());
+            return;
+        }
+        DynamoDbStreamReader.Stream stream = DynamoDbStreamReader.Stream.of(streamArn);
+        List<DynamoDbStreamReader.Shard> shards;
+        try {
+            shards = streamReader.shards(stream);
+        } catch (AwsException e) {
+            // A stream the table has replaced and that has since expired has nothing left to read.
+            if (!"ResourceNotFoundException".equals(e.getErrorCode()) || !moveToLatestStream(integration)) {
+                throw e;
+            }
+            return;
+        }
         Set<String> finished = finishedShards.computeIfAbsent(integration.getIntegrationArn(),
                 ignored -> ConcurrentHashMap.newKeySet());
         // ponytail: a shard whose read or write throws ends the tick for the shards after it; the next
         // tick starts over from committed progress, so it only delays them.
-        for (DynamoDbStreamReader.Shard shard : DynamoDbStreamReader.readable(streamReader.shards(stream), finished)) {
-            pollShard(integration, stream, shard.shardId(), finished);
+        boolean checkpointPersisted = false;
+        for (DynamoDbStreamReader.Shard shard : DynamoDbStreamReader.readable(shards, finished)) {
+            if (pollShard(integration, stream, shard.shardId(), finished)) {
+                checkpointPersisted = true;
+            }
+        }
+        if (!checkpointPersisted) {
+            // Every record of the followed stream has landed, so a newer stream of the table takes over.
+            moveToLatestStream(integration);
+            redshiftService.recoverIntegrationRuntime(integration.getAccountId(), integration.getIntegrationArn());
+        }
+    }
+
+    /**
+     * The stream to read changes from. A stream source is that stream. A table source follows the
+     * stream it already reads, or the table's latest stream when it reads none yet.
+     */
+    private String followedStream(Integration integration) {
+        if (integration.getSourceStreamArn() == null) {
+            moveToLatestStream(integration);
+        }
+        return integration.getSourceStreamArn();
+    }
+
+    /**
+     * Moves a table source to the table's latest stream when that is another stream: none exists until
+     * streams are first turned on, and a new one each time they are turned on again. Callers move only
+     * once the followed stream has been read to its end or has expired, since a disabled stream stays
+     * readable and its last records must still land. A table whose streams are off reports no latest
+     * stream, so the followed one is kept. Shard ids repeat across a table's streams, so the move drops
+     * the checkpoints of the old stream; the new one is read from its trim horizon.
+     *
+     * @return whether the integration moved to another stream
+     */
+    private boolean moveToLatestStream(Integration integration) {
+        String sourceArn = integration.getSourceArn();
+        if (sourceArn == null || RedshiftZeroEtlEndpoints.isStreamArn(sourceArn)) {
+            return false;
+        }
+        String region = AwsArnUtils.parse(sourceArn).region();
+        String latest = RequestScopes.callAs(integration.getAccountId(), region, () -> {
+            TableDefinition table = dynamoDb.tables().describeTable(new Scope(integration.getAccountId(), region),
+                    RedshiftZeroEtlEndpoints.tableName(sourceArn));
+            return table.getStreamArn();
+        });
+        if (latest == null || latest.equals(integration.getSourceStreamArn())) {
+            return false;
+        }
+        integration.getShardSequenceNumbers().clear();
+        finishedShards.remove(integration.getIntegrationArn());
+        integration.setSourceStreamArn(latest);
+        redshiftService.updateIntegrationSourceStream(integration.getAccountId(), integration.getIntegrationArn(),
+                latest);
+        return true;
+    }
+
+    private boolean targetPaused(Integration integration) {
+        if (integration.getTargetClusterIdentifier() == null) {
+            // Only a provisioned cluster pauses.
+            return false;
+        }
+        try {
+            return redshiftService.describeClustersForAccount(integration.getAccountId(),
+                            integration.getTargetClusterIdentifier()).stream()
+                    .anyMatch(cluster -> "paused".equals(cluster.getClusterStatus()));
+        } catch (AwsException expected) {
+            if (!"ClusterNotFound".equals(expected.getErrorCode())) {
+                throw expected;
+            }
+            // A missing target is a polling failure, not an intentional pause; let the writer report it.
+            return false;
         }
     }
 
@@ -154,7 +242,7 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
      * Writes one batch after the shard's committed sequence and commits it only once written, so a
      * failed write is read and written again next poll.
      */
-    private void pollShard(Integration integration, DynamoDbStreamReader.Stream stream, String shardId,
+    private boolean pollShard(Integration integration, DynamoDbStreamReader.Stream stream, String shardId,
                            Set<String> finished) {
         Map<String, String> committed = integration.getShardSequenceNumbers();
         DynamoDbStreamReader.RecordsPage page;
@@ -171,20 +259,23 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
             if (page.closed()) {
                 finished.add(shardId);
             }
-            return;
+            return false;
         }
-        writer.writeBatch(integration.getAccountId(), integration.getTargetClusterIdentifier(),
+        writer.writeBatch(integration.getAccountId(), integration.getTargetArn(),
                 integration.getLandingTableName(),
                 records.stream().map(DynamoDbStreamReader.Record::awsRecord).toList());
         committed.put(shardId, records.get(records.size() - 1).sequenceNumber());
         redshiftService.updateIntegrationRuntime(integration.getAccountId(), integration.getIntegrationArn(),
                 committed, true, null);
+        return true;
     }
 
     private void pollBackfillPage(Integration integration) {
         RequestScopes.runAs(integration.getAccountId(), () -> {
-            String tableName = extractTableName(integration.getSourceStreamArn());
-            String region = AwsArnUtils.parse(integration.getSourceStreamArn()).region();
+            String sourceArn = integration.getSourceArn() != null
+                    ? integration.getSourceArn() : integration.getSourceStreamArn();
+            String tableName = RedshiftZeroEtlEndpoints.tableName(sourceArn);
+            String region = AwsArnUtils.parse(sourceArn).region();
             Scope scope = new Scope(integration.getAccountId(), region);
             TableDefinition table = dynamoDb.tables().describeTable(scope, tableName);
             JsonNode exclusiveStartKey = parseBackfillKey(integration.getBackfillLastEvaluatedKey());
@@ -195,7 +286,7 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
                 List<JsonNode> records = result.items().stream()
                         .map(item -> toBackfillRecord(integration, item, table))
                         .toList();
-                writer.writeBatch(integration.getAccountId(), integration.getTargetClusterIdentifier(),
+                writer.writeBatch(integration.getAccountId(), integration.getTargetArn(),
                         integration.getLandingTableName(), records);
             }
 
@@ -224,11 +315,6 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
         dynamodb.set("Keys", keys);
         dynamodb.set("NewImage", item);
         return record;
-    }
-
-    private static String extractTableName(String sourceStreamArn) {
-        String resource = AwsArnUtils.parse(sourceStreamArn).resource();
-        return resource.substring("table/".length(), resource.indexOf("/stream/"));
     }
 
     private JsonNode parseBackfillKey(String backfillLastEvaluatedKey) {
@@ -351,10 +437,14 @@ public class RedshiftDynamoDbZeroEtlConsumer implements Resettable {
         try {
             unlessQuiesced(submittedAt, () -> poll(integration));
         } catch (Exception e) {
-            LOG.warnv(e, "Zero-ETL polling failed for integration {0}", integration.getIntegrationArn());
             try {
-                unlessQuiesced(submittedAt, () -> redshiftService.updateIntegrationRuntime(integration.getAccountId(),
-                        integration.getIntegrationArn(), integration.getShardSequenceNumbers(), false, e.getMessage()));
+                unlessQuiesced(submittedAt, () -> {
+                    if (!targetPaused(integration)) {
+                        LOG.warnv(e, "Zero-ETL polling failed for integration {0}", integration.getIntegrationArn());
+                        redshiftService.updateIntegrationRuntime(integration.getAccountId(), integration.getIntegrationArn(),
+                                integration.getShardSequenceNumbers(), false, e.getMessage());
+                    }
+                });
             } catch (Exception updateError) {
                 LOG.warnv(updateError, "Could not persist zero-ETL failure for integration {0}",
                         integration.getIntegrationArn());

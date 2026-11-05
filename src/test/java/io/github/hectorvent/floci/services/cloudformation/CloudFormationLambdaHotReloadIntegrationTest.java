@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.Test;
@@ -32,6 +33,7 @@ class CloudFormationLambdaHotReloadIntegrationTest {
 
         createStack(stackName, template(fnName, hostPath));
 
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
         describeStacks(stackName)
             .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
 
@@ -61,6 +63,8 @@ class CloudFormationLambdaHotReloadIntegrationTest {
 
         createStack(stackName, template(fnName, "relative/dist"));
 
+        CfnStackWaits.StackState state = CfnStackWaits.awaitTerminal(stackName, CFN_AUTH);
+        assertThat(state.status(), not("CREATE_COMPLETE"));
         describeStacks(stackName)
             .body(not(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>")));
         assertThat(CfnStackWaits.failedResourceReason(stackName, CFN_AUTH),

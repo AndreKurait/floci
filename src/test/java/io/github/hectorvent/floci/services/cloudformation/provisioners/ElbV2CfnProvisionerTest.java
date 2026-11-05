@@ -15,11 +15,13 @@ import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import io.github.hectorvent.floci.services.elbv2.model.Rule;
 import io.github.hectorvent.floci.services.elbv2.model.RuleCondition;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
+import org.mockito.Mockito;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -67,6 +69,61 @@ class ElbV2CfnProvisionerTest {
     private final ElbV2Service elb = mock(ElbV2Service.class);
     private final ElbV2CfnProvisioner provisioner = new ElbV2CfnProvisioner(elb);
     private final ObjectMapper mapper = new ObjectMapper();
+
+    @BeforeEach
+    void defaultListenerLoadBalancer() {
+        LoadBalancer lb = new LoadBalancer();
+        lb.setType("application");
+        when(elb.describeLoadBalancers(eq(REGION), anyList(), isNull(), isNull(), isNull()))
+                .thenReturn(List.of(lb));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void gatewayListenerLeavesProtocolAndPortUnset(boolean update) {
+        LoadBalancer lb = new LoadBalancer();
+        lb.setType("gateway");
+        when(elb.describeLoadBalancers(REGION, List.of(LB_ARN), null, null, null)).thenReturn(List.of(lb));
+        if (update) {
+            when(elb.describeListeners(REGION, null, List.of(LISTENER_ARN))).thenReturn(List.of(listener(LB_ARN)));
+            when(elb.modifyListener(eq(REGION), eq(LISTENER_ARN), isNull(), isNull(), isNull(),
+                    anyList(), anyList(), isNull())).thenReturn(listener(LB_ARN));
+        } else {
+            when(elb.createListener(eq(REGION), eq(LB_ARN), isNull(), isNull(), isNull(),
+                    anyList(), anyList(), isNull(), eq(Map.of()))).thenReturn(listener(LB_ARN));
+        }
+        StackResource resource = resource("AWS::ElasticLoadBalancingV2::Listener", "Listener");
+
+        provisioner.provision(resource, mapper.createObjectNode().put("LoadBalancerArn", LB_ARN),
+                ctx(update ? LISTENER_ARN : null));
+
+        assertEquals(LISTENER_ARN, resource.getPhysicalId());
+        assertEquals(LISTENER_ARN, resource.getAttributes().get("ListenerArn"));
+        if (update) {
+            verify(elb).modifyListener(eq(REGION), eq(LISTENER_ARN), isNull(), isNull(), isNull(),
+                    anyList(), anyList(), isNull());
+        } else {
+            verify(elb).createListener(eq(REGION), eq(LB_ARN), isNull(), isNull(), isNull(),
+                    anyList(), anyList(), isNull(), eq(Map.of()));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HTTP", ""})
+    void gatewayListenerPassesExplicitProtocolToService(String protocol) {
+        LoadBalancer lb = new LoadBalancer();
+        lb.setType("gateway");
+        when(elb.describeLoadBalancers(REGION, List.of(LB_ARN), null, null, null)).thenReturn(List.of(lb));
+        when(elb.createListener(eq(REGION), eq(LB_ARN), eq(protocol), isNull(), isNull(),
+                anyList(), anyList(), isNull(), eq(Map.of()))).thenReturn(listener(LB_ARN));
+        StackResource resource = resource("AWS::ElasticLoadBalancingV2::Listener", "Listener");
+
+        provisioner.provision(resource, mapper.createObjectNode().put("LoadBalancerArn", LB_ARN)
+                .put("Protocol", protocol), ctx());
+
+        verify(elb).createListener(eq(REGION), eq(LB_ARN), eq(protocol), isNull(), isNull(),
+                anyList(), anyList(), isNull(), eq(Map.of()));
+    }
 
     private ProvisionContext ctx() {
         return ctx(null);
@@ -180,7 +237,7 @@ class ElbV2CfnProvisionerTest {
         updated.getAttributes().put("LoadBalancerName", generated);
         provisioner.provision(updated, onTwoSubnets(mapper.createObjectNode()), ctx(LB_ARN));
 
-        verify(elb, org.mockito.Mockito.times(2)).createLoadBalancer(eq(REGION), eq(generated), isNull(), isNull(),
+        verify(elb, Mockito.times(2)).createLoadBalancer(eq(REGION), eq(generated), isNull(), isNull(),
                 isNull(), eq(TWO_SUBNETS), anyList(), any());
     }
 
@@ -368,7 +425,7 @@ class ElbV2CfnProvisionerTest {
         provisioner.provision(retained, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v2")), ctx(LB_ARN));
         assertNull(provisioner.updateCleanupPhysicalId(retained));
         assertEquals(new UpdateCleanupResult(true, true, LB_ARN, 0, null), provisioner.completeUpdate(retained));
-        verify(elb, org.mockito.Mockito.times(1)).deleteLoadBalancer(REGION, LB_ARN);
+        verify(elb, Mockito.times(1)).deleteLoadBalancer(REGION, LB_ARN);
     }
 
     @Test
@@ -389,7 +446,7 @@ class ElbV2CfnProvisionerTest {
         UpdateCleanupResult third = provisioner.completeUpdate(r);
         assertEquals(3, third.attempts());
         assertEquals(3, provisioner.completeUpdate(r).attempts(), "no fourth attempt");
-        verify(elb, org.mockito.Mockito.times(3)).deleteListener(REGION, LISTENER_ARN);
+        verify(elb, Mockito.times(3)).deleteListener(REGION, LISTENER_ARN);
     }
 
     @Test
@@ -488,11 +545,48 @@ class ElbV2CfnProvisionerTest {
         assertEquals(Set.of("subnet-1", "subnet-2"), usedSubnets(created));
 
         StackResource moved = keptLoadBalancerUpdatedTo(loadBalancerOn("web", "subnet-1", "subnet-2"),
-                "subnet-3");
-        assertEquals(Set.of("subnet-3"), usedSubnets(moved));
+                "subnet-3", "subnet-4");
+        assertEquals(Set.of("subnet-3", "subnet-4"), usedSubnets(moved));
 
         assertTrue(provisioner.rollbackUpdate(moved));
         assertEquals(Set.of("subnet-1", "subnet-2"), usedSubnets(moved));
+    }
+
+    /**
+     * An update whose template names neither {@code Subnets} nor {@code SubnetMappings} leaves the kept
+     * load balancer on its subnets: it does not call ElbV2Service.setSubnets, which would move the
+     * balancer onto none.
+     */
+    @Test
+    void anUpdateThatNamesNoSubnetsLeavesTheKeptLoadBalancerOnItsSubnets() {
+        when(elb.createLoadBalancer(eq(REGION), eq("web"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
+                .thenThrow(new AwsException("DuplicateLoadBalancerName", "exists", 400));
+        when(elb.describeLoadBalancers(REGION, null, List.of("web"), null, null))
+                .thenReturn(List.of(loadBalancerOn("web", "subnet-1", "subnet-2")));
+        StackResource lb = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
+        lb.getAttributes().put("LoadBalancerName", "web");
+
+        provisioner.provision(lb, mapper.createObjectNode().put("Name", "web"), ctx(LB_ARN));
+
+        assertEquals(Set.of("subnet-1", "subnet-2"), usedSubnets(lb));
+        assertTrue(provisioner.rollbackUpdate(lb));
+        verify(elb, never()).setSubnets(anyString(), anyString(), anyList());
+    }
+
+    /**
+     * A load balancer an earlier Floci version saved without subnets is moved back onto none when an
+     * update that gave it subnets rolls back: the move back goes through ElbV2Service.setSubnets, which
+     * takes an empty list, where the SetSubnets action refuses one.
+     */
+    @Test
+    void aRollbackMovesALoadBalancerSavedWithoutSubnetsBackOntoNone() {
+        StackResource lb = keptLoadBalancerUpdatedTo(loadBalancerOn("web"), "subnet-1", "subnet-2");
+        verify(elb).setSubnets(REGION, LB_ARN, List.of("subnet-1", "subnet-2"));
+
+        assertTrue(provisioner.rollbackUpdate(lb));
+
+        verify(elb).setSubnets(REGION, LB_ARN, List.of());
+        assertEquals(Set.of(), usedSubnets(lb));
     }
 
     @Test
@@ -635,18 +729,22 @@ class ElbV2CfnProvisionerTest {
         assertEquals("SubnetNotFound", e.getErrorCode());
     }
 
-    /** On an update of a kept load balancer, a blank {@code SubnetId} reaches SetSubnets for ELBv2 to refuse. */
+    /**
+     * On an update of a kept Network Load Balancer, a blank {@code SubnetId} reaches SetSubnets for ELBv2
+     * to refuse as an unknown subnet. An Application Load Balancer would get the subnet count error first.
+     */
     @Test
     void anUpdateWithABlankSubnetIdIsRefusedByTheMoveAndKeepsNoSnapshot() {
-        when(elb.createLoadBalancer(eq(REGION), eq("web"), isNull(), isNull(), isNull(), anyList(), anyList(), any()))
-                .thenThrow(new AwsException("DuplicateLoadBalancerName", "exists", 400));
-        when(elb.describeLoadBalancers(REGION, null, List.of("web"), null, null))
-                .thenReturn(List.of(loadBalancerOn("web", "subnet-1", "subnet-2")));
+        when(elb.createLoadBalancer(eq(REGION), eq("web"), isNull(), eq("network"), isNull(), anyList(), anyList(),
+                any())).thenThrow(new AwsException("DuplicateLoadBalancerName", "exists", 400));
+        LoadBalancer kept = loadBalancerOn("web", "subnet-1", "subnet-2");
+        kept.setType("network");
+        when(elb.describeLoadBalancers(REGION, null, List.of("web"), null, null)).thenReturn(List.of(kept));
         doThrow(new AwsException("SubnetNotFound", "The subnet ID ' ' does not exist", 400))
                 .when(elb).setSubnets(REGION, LB_ARN, List.of(" "));
-        ObjectNode props = mapper.createObjectNode().put("Name", "web");
+        ObjectNode props = mapper.createObjectNode().put("Name", "web").put("Type", "network");
         props.putArray("SubnetMappings").addObject().put("SubnetId", " ");
-        StackResource lb = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Alb");
+        StackResource lb = resource("AWS::ElasticLoadBalancingV2::LoadBalancer", "Nlb");
         lb.getAttributes().put("LoadBalancerName", "web");
 
         AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(lb, props, ctx(LB_ARN)));
@@ -738,7 +836,7 @@ class ElbV2CfnProvisionerTest {
         // The replacement the failed update created stays owed a delete; the restored prior does not.
         assertTrue(provisioner.hasReplacementUpdate(r));
         assertEquals(renamed.getLoadBalancerArn(), provisioner.updateCleanupPhysicalId(r));
-        org.mockito.Mockito.reset(elb);
+        Mockito.reset(elb);
         // A retried rollback (ContinueUpdateRollback) re-attempts the delete that failed; succeeding,
         // it owes nothing more and never touches the restored prior.
         assertTrue(provisioner.rollbackUpdate(r));
@@ -778,7 +876,7 @@ class ElbV2CfnProvisionerTest {
         when(elb.createLoadBalancer(eq(REGION), eq("web-v3"), isNull(), isNull(), isNull(), eq(TWO_SUBNETS), anyList(), any()))
                 .thenReturn(third);
         provisioner.provision(r, onTwoSubnets(mapper.createObjectNode().put("Name", "web-v3")), ctx(LB_ARN));
-        org.mockito.Mockito.reset(elb);
+        Mockito.reset(elb);
         UpdateCleanupResult cleanup = provisioner.completeUpdate(r);
         assertTrue(cleanup.complete(), cleanup.toString());
         verify(elb).deleteLoadBalancer(REGION, orphanArn);
@@ -816,8 +914,8 @@ class ElbV2CfnProvisionerTest {
         UpdateCleanupResult third3 = provisioner.completeUpdate(r);
         assertEquals(3, third3.attempts());
         assertEquals("listeners attached", third3.failureReason());
-        verify(elb, org.mockito.Mockito.times(1)).deleteLoadBalancer(REGION, LB_ARN);
-        verify(elb, org.mockito.Mockito.times(4)).deleteLoadBalancer(REGION, orphanArn);
+        verify(elb, Mockito.times(1)).deleteLoadBalancer(REGION, LB_ARN);
+        verify(elb, Mockito.times(4)).deleteLoadBalancer(REGION, orphanArn);
     }
 
     @Test
@@ -852,13 +950,13 @@ class ElbV2CfnProvisionerTest {
         assertEquals(first.previousPhysicalId(), provisioner.updateCleanupPhysicalId(r),
                 "progress and failure events name the same entity");
 
-        org.mockito.Mockito.doNothing().when(elb).deleteLoadBalancer(REGION, LB_ARN);
+        Mockito.doNothing().when(elb).deleteLoadBalancer(REGION, LB_ARN);
         UpdateCleanupResult second = provisioner.completeUpdate(r);
         assertEquals(3, second.attempts(), "only the exhausted orphan remains");
         assertEquals(orphanArn, second.previousPhysicalId());
         provisioner.clearUpdate(r);
         assertFalse(provisioner.hasReplacementUpdate(r));
-        verify(elb, org.mockito.Mockito.times(4)).deleteLoadBalancer(REGION, orphanArn);
+        verify(elb, Mockito.times(4)).deleteLoadBalancer(REGION, orphanArn);
     }
 
     @Test

@@ -7,6 +7,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.core.common.FileTrees;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -46,7 +48,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.PathMatcher;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -213,7 +215,7 @@ public class CodeBuildRunner implements ContainerTeardown {
                     || (build.getEnvironment() != null
                     && Boolean.TRUE.equals(build.getEnvironment().getPrivilegedMode()));
 
-            Map<String, Object> logsMap = new java.util.HashMap<>();
+            Map<String, Object> logsMap = new HashMap<>();
             logsMap.put("groupName", logGroup);
             logsMap.put("streamName", logStream);
             logsMap.put("cloudWatchLogsArn", AwsArnUtils.Arn.of("logs", region, regionResolver.getAccountId(), "log-group:" + logGroup + ":log-stream:" + logStream).toString());
@@ -356,13 +358,13 @@ public class CodeBuildRunner implements ContainerTeardown {
             build.setCurrentPhase("COMPLETED");
             completePhase(build, "COMPLETED", buildFailed ? "FAILED" : "SUCCEEDED");
 
-            build.setEndTime(System.currentTimeMillis() / 1000.0);
+            build.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
             build.setBuildComplete(true);
             build.setBuildStatus(buildFailed ? "FAILED" : "SUCCEEDED");
 
         } catch (Exception e) {
             LOG.error("Unexpected error in build " + build.getId(), e);
-            build.setEndTime(System.currentTimeMillis() / 1000.0);
+            build.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
             build.setBuildComplete(true);
             build.setBuildStatus("FAULT");
             build.setCurrentPhase("COMPLETED");
@@ -375,8 +377,8 @@ public class CodeBuildRunner implements ContainerTeardown {
                 BuildPhase completedPhase = new BuildPhase();
                 completedPhase.setPhaseType("COMPLETED");
                 completedPhase.setPhaseStatus("FAILED");
-                completedPhase.setStartTime(System.currentTimeMillis() / 1000.0);
-                completedPhase.setEndTime(System.currentTimeMillis() / 1000.0);
+                completedPhase.setStartTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
+                completedPhase.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
                 completedPhase.setDurationInSeconds(0L);
                 if (e.getMessage() != null) {
                     completedPhase.setContexts(List.of(Map.of(
@@ -802,14 +804,14 @@ public class CodeBuildRunner implements ContainerTeardown {
         BuildPhase phase = new BuildPhase();
         phase.setPhaseType(phaseType);
         phase.setPhaseStatus("IN_PROGRESS");
-        phase.setStartTime(System.currentTimeMillis() / 1000.0);
+        phase.setStartTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
         build.getPhases().add(phase);
         build.setCurrentPhase(phaseType);
     }
 
     private void completePhase(Build build, String phaseType, String status) {
         findPhase(build, phaseType).ifPresent(p -> {
-            double end = System.currentTimeMillis() / 1000.0;
+            double end = EpochSeconds.fromMillis(System.currentTimeMillis());
             p.setPhaseStatus(status);
             p.setEndTime(end);
             p.setDurationInSeconds(Math.round(end - p.getStartTime()));
@@ -818,7 +820,7 @@ public class CodeBuildRunner implements ContainerTeardown {
 
     private void completePhaseWithError(Build build, String phaseType, String status, String message) {
         findPhase(build, phaseType).ifPresent(p -> {
-            double end = System.currentTimeMillis() / 1000.0;
+            double end = EpochSeconds.fromMillis(System.currentTimeMillis());
             p.setPhaseStatus(status);
             p.setEndTime(end);
             p.setDurationInSeconds(Math.round(end - p.getStartTime()));
@@ -833,7 +835,7 @@ public class CodeBuildRunner implements ContainerTeardown {
         BuildPhase phase = new BuildPhase();
         phase.setPhaseType(phaseType);
         phase.setPhaseStatus("SUCCEEDED");
-        double now = System.currentTimeMillis() / 1000.0;
+        double now = EpochSeconds.fromMillis(System.currentTimeMillis());
         phase.setStartTime(now);
         phase.setEndTime(now);
         phase.setDurationInSeconds(0L);
@@ -841,14 +843,14 @@ public class CodeBuildRunner implements ContainerTeardown {
     }
 
     private void finishStopped(Build build) {
-        build.setEndTime(System.currentTimeMillis() / 1000.0);
+        build.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
         build.setBuildComplete(true);
         build.setBuildStatus("STOPPED");
         build.setCurrentPhase("COMPLETED");
     }
 
     private void finishFailed(Build build) {
-        build.setEndTime(System.currentTimeMillis() / 1000.0);
+        build.setEndTime(EpochSeconds.fromMillis(System.currentTimeMillis()));
         build.setBuildComplete(true);
         build.setBuildStatus("FAILED");
         build.setCurrentPhase("COMPLETED");
@@ -862,11 +864,8 @@ public class CodeBuildRunner implements ContainerTeardown {
 
     private void deleteDirectory(Path path) {
         try {
-            if (!Files.exists(path)) { return; }
-            Files.walk(path).sorted(Comparator.reverseOrder()).forEach(p -> {
-                try { Files.delete(p); } catch (Exception ignored) {}
-            });
-        } catch (Exception e) {
+            FileTrees.delete(path);
+        } catch (IOException e) {
             LOG.debugv("Could not delete workspace {0}: {1}", path, e.getMessage());
         }
     }

@@ -1,9 +1,13 @@
 package io.github.hectorvent.floci.services.ssm;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.JsonPath;
 import io.restassured.response.Response;
+import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -14,14 +18,17 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.Stream;
 
+import static io.github.hectorvent.floci.testing.CfnRequests.cfn;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 @QuarkusTest
@@ -29,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 class SsmIntegrationTest {
 
     private static final String SSM_CONTENT_TYPE = "application/x-amz-json-1.1";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @BeforeAll
     static void configureRestAssured() {
@@ -1369,6 +1377,72 @@ class SsmIntegrationTest {
             .body("Parameter.Version", equalTo(1))
             .body("Parameter.ARN", equalTo("arn:aws:ssm:us-east-1::parameter" + eksOptimizedAmi));
 
+        String ecsRecommended = "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended";
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Name": "%s" }
+                """.formatted(ecsRecommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameter.Value", containsString("\"image_id\":\"ami-0abcdef1234567891\""));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameters")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Names": ["%s", "%s/image_id"] }
+                """.formatted(ecsRecommended, ecsRecommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameters.Name", hasItems(ecsRecommended, ecsRecommended + "/image_id"));
+
+        String ecsArm64Recommended =
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended";
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Name": "%s" }
+                """.formatted(ecsArm64Recommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameter.Value", containsString("\"image_id\":\"ami-amazonlinux2023-arm64\""));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameters")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Names": ["%s/image_name", "%s/image_id"] }
+                """.formatted(ecsRecommended, ecsArm64Recommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("InvalidParameters", empty())
+            .body("Parameters.Value", hasItems(
+                    "al2023-ami-2023.0.20230315.0-kernel-6.1-x86_64", "ami-amazonlinux2023-arm64"));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                { "Path": "%s" }
+                """.formatted(ecsArm64Recommended))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Parameters.Name", hasItems(ecsArm64Recommended + "/image_name",
+                    ecsArm64Recommended + "/os", ecsArm64Recommended + "/schema_version"));
+
         given()
             .header("X-Amz-Target", "AmazonSSM.GetParametersByPath")
             .contentType(SSM_CONTENT_TYPE)
@@ -2044,7 +2118,7 @@ class SsmIntegrationTest {
             .header("X-Amz-Target", "AmazonSSM.GetParameters")
             .contentType(SSM_CONTENT_TYPE)
             .body("""
-                { "Names": ["/selector/param:1", "/selector/param:9"] }
+                { "Names": ["/selector/param:1", "/selector/param:9"], "WithDecryption": true }
                 """)
         .when()
             .post("/")
@@ -2099,7 +2173,7 @@ class SsmIntegrationTest {
             .body("message", equalTo("NUMBER_VALUE can not be converted to a String"));
     }
 
-    private io.restassured.response.ValidatableResponse labelParameterVersion(String body) {
+    private ValidatableResponse labelParameterVersion(String body) {
         return given()
             .header("X-Amz-Target", "AmazonSSM.LabelParameterVersion")
             .contentType(SSM_CONTENT_TYPE)
@@ -2305,7 +2379,7 @@ class SsmIntegrationTest {
         }
     }
 
-    private io.restassured.response.ValidatableResponse unlabel(String body) {
+    private ValidatableResponse unlabel(String body) {
         return given()
             .header("X-Amz-Target", "AmazonSSM.UnlabelParameterVersion")
             .contentType(SSM_CONTENT_TYPE)
@@ -2315,7 +2389,139 @@ class SsmIntegrationTest {
         .then();
     }
 
-    private io.restassured.response.ValidatableResponse describeParameters(String body) {
+    @Test
+    void parameterChangesArePublishedToTheDefaultEventBus() throws Exception {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String base = "/events-" + suffix;
+        String queueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", "ssm-events-" + suffix)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+        String queueArn = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetQueueAttributes")
+            .formParam("QueueUrl", queueUrl)
+            .formParam("AttributeName.1", "QueueArn")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getString("**.find { it.Name == 'QueueArn' }.Value");
+        String pattern = "{\"source\":[\"aws.ssm\"],\"detail-type\":[\"Parameter Store Change\"],"
+                + "\"detail\":{\"name\":[{\"prefix\":\"" + base + "/\"}]}}";
+        events("PutRule", MAPPER.createObjectNode().put("Name", "ssm-events-" + suffix).put("EventPattern", pattern));
+        events("PutTargets", MAPPER.readTree("{\"Rule\":\"ssm-events-" + suffix + "\","
+                + "\"Targets\":[{\"Id\":\"1\",\"Arn\":\"" + queueArn + "\"}]}"));
+
+        ssm("PutParameter", "{\"Name\":\"" + base + "/a\",\"Value\":\"v1\",\"Type\":\"String\",\"Description\":\"d\"}")
+            .statusCode(200);
+        ssm("PutParameter", "{\"Name\":\"" + base + "/a\",\"Value\":\"v2\",\"Type\":\"String\",\"Description\":\"d\","
+                + "\"Overwrite\":true}")
+            .statusCode(200);
+        ssm("LabelParameterVersion", "{\"Name\":\"" + base + "/a\",\"ParameterVersion\":2,\"Labels\":[\"stable\"]}")
+            .statusCode(200);
+        ssm("UnlabelParameterVersion", "{\"Name\":\"" + base + "/a\",\"ParameterVersion\":2,\"Labels\":[\"stable\"]}")
+            .statusCode(200);
+        ssm("PutParameter", "{\"Name\":\"" + base + "/a\",\"Value\":\"v3\",\"Type\":\"String\"}")
+            .statusCode(400)
+            .body("__type", equalTo("ParameterAlreadyExists"));
+        String arn = ssm("GetParameter", "{\"Name\":\"" + base + "/a\"}").statusCode(200)
+            .extract().path("Parameter.ARN");
+        ssm("DeleteParameter", "{\"Name\":\"" + base + "/a\"}").statusCode(200);
+        ssm("PutParameter", "{\"Name\":\"" + base + "/b\",\"Value\":\"v\",\"Type\":\"String\"}").statusCode(200);
+        ssm("DeleteParameters", "{\"Names\":[\"" + base + "/b\",\"" + base + "/missing\"]}").statusCode(200);
+
+        String stack = "ssm-events-" + suffix;
+        cfn("CreateStack", stack).formParam("TemplateBody", "{\"Resources\":{\"P\":{\"Type\":\"AWS::SSM::Parameter\","
+                + "\"Properties\":{\"Name\":\"" + base + "/cfn\",\"Type\":\"String\",\"Value\":\"v\"}}}}")
+            .when().post("/").then().statusCode(200);
+        CfnStackWaits.awaitStatus(stack, "CREATE_COMPLETE");
+        cfn("DeleteStack", stack).when().post("/").then().statusCode(200);
+
+        List<JsonNode> received = receiveEvents(queueUrl, 9);
+        assertEquals(List.of("Create " + base + "/a", "Update " + base + "/a",
+                        "LabelParameterVersion " + base + "/a", "UnlabelParameterVersion " + base + "/a",
+                        "Delete " + base + "/a",
+                        "Create " + base + "/b", "Delete " + base + "/b",
+                        "Create " + base + "/cfn", "Delete " + base + "/cfn"),
+                received.stream().map(e -> e.at("/detail/operation").asText() + " " + e.at("/detail/name").asText())
+                        .toList());
+        JsonNode created = received.getFirst();
+        assertEquals("aws.ssm", created.path("source").asText());
+        assertEquals("Parameter Store Change", created.path("detail-type").asText());
+        assertEquals(arn, created.at("/resources/0").asText());
+        assertEquals("us-east-1", created.path("region").asText());
+        assertFalse(created.path("account").asText().isEmpty());
+        assertEquals(MAPPER.readTree("{\"operation\":\"Create\",\"name\":\"" + base + "/a\",\"type\":\"String\","
+                + "\"description\":\"d\"}"), created.path("detail"));
+        assertEquals(MAPPER.readTree("{\"operation\":\"LabelParameterVersion\",\"name\":\"" + base + "/a\","
+                + "\"type\":\"String\",\"description\":\"d\",\"label\":\"stable\",\"fromVersion\":\"\",\"toVersion\":\"2\"}"),
+                received.get(2).path("detail"));
+        assertEquals(MAPPER.readTree("{\"operation\":\"UnlabelParameterVersion\",\"name\":\"" + base + "/a\","
+                + "\"type\":\"String\",\"description\":\"d\",\"labels\":[\"stable\"],\"fromVersion\":\"2\",\"toVersion\":\"\"}"),
+                received.get(3).path("detail"));
+
+        events("RemoveTargets", MAPPER.readTree("{\"Rule\":\"ssm-events-" + suffix + "\",\"Ids\":[\"1\"]}"));
+        events("DeleteRule", MAPPER.createObjectNode().put("Name", "ssm-events-" + suffix));
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteQueue")
+            .formParam("QueueUrl", queueUrl)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    private static ValidatableResponse ssm(String action, String body) {
+        return given()
+            .header("X-Amz-Target", "AmazonSSM." + action)
+            .contentType(SSM_CONTENT_TYPE)
+            .body(body)
+        .when()
+            .post("/")
+        .then();
+    }
+
+    private static void events(String action, JsonNode body) {
+        given()
+            .header("X-Amz-Target", "AWSEvents." + action)
+            .contentType(SSM_CONTENT_TYPE)
+            .body(body.toString())
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    private static List<JsonNode> receiveEvents(String queueUrl, int expected) throws Exception {
+        List<JsonNode> received = new ArrayList<>();
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (received.size() < expected && System.currentTimeMillis() < deadline) {
+            List<String> bodies = given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", queueUrl)
+                .formParam("MaxNumberOfMessages", "10")
+                .formParam("WaitTimeSeconds", "1")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract().xmlPath().getList("ReceiveMessageResponse.ReceiveMessageResult.Message.Body");
+            for (String body : bodies) {
+                received.add(MAPPER.readTree(body));
+            }
+        }
+        return received;
+    }
+
+    private ValidatableResponse describeParameters(String body) {
         return given()
             .header("X-Amz-Target", "AmazonSSM.DescribeParameters")
             .contentType(SSM_CONTENT_TYPE)

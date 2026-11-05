@@ -40,7 +40,27 @@ class Ec2ImageCatalogTest {
                 "ami-ubuntu2404-cloud-arm64",
                 "ami-debian12",
                 "ami-alpine",
-                "ami-0abcdef1234567893"), imageIds);
+                "ami-0abcdef1234567893",
+                "ami-opensuse-leap160",
+                "ami-sles15sp4-byos",
+                "ami-sles15sp5-byos",
+                "ami-sles15sp6-byos",
+                "ami-sles15sp7-byos",
+                "ami-sles12sp5-byos",
+                "ami-sles-sap15sp5",
+                "ami-smlm-server51-x86-64",
+                "ami-smlm-server51-arm64",
+                "ami-smlm-proxy51-x86-64",
+                "ami-smlm-proxy51-arm64",
+                "ami-sles12sp5",
+                "ami-sles15sp5",
+                "ami-sles15sp6",
+                "ami-sles15sp7",
+                "ami-sles160",
+                "ami-rocky9",
+                "ami-rocky10",
+                "ami-rhel8",
+                "ami-rhel9"), imageIds);
 
         assertTrue(imageCatalog.findByIdOrAlias("ami-amazonlinux2").isPresent());
         assertTrue(imageCatalog.findByIdOrAlias("ami-amazonlinux2023").isPresent());
@@ -67,7 +87,14 @@ class Ec2ImageCatalogTest {
                 "/aws/service/eks/optimized-ami/1.33/amazon-linux-2023/x86_64/standard/recommended/image_id",
                 "/aws/service/eks/optimized-ami/1.34/amazon-linux-2023/x86_64/standard/recommended/image_id",
                 "/aws/service/eks/optimized-ami/1.35/amazon-linux-2023/x86_64/standard/recommended/image_id",
-                "/aws/service/eks/optimized-ami/1.36/amazon-linux-2023/x86_64/standard/recommended/image_id"),
+                "/aws/service/eks/optimized-ami/1.36/amazon-linux-2023/x86_64/standard/recommended/image_id",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/schema_version",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_name",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/os",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/ecs_agent_version",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/ecs_runtime_version"),
                 x86.publicParameterNames());
 
         Ec2ImageCatalog.CatalogImage arm64 = imageCatalog.findByIdOrAlias("ami-amazonlinux2023-arm64").orElseThrow();
@@ -85,7 +112,14 @@ class Ec2ImageCatalogTest {
                 "/aws/service/eks/optimized-ami/1.33/amazon-linux-2023/arm64/standard/recommended/image_id",
                 "/aws/service/eks/optimized-ami/1.34/amazon-linux-2023/arm64/standard/recommended/image_id",
                 "/aws/service/eks/optimized-ami/1.35/amazon-linux-2023/arm64/standard/recommended/image_id",
-                "/aws/service/eks/optimized-ami/1.36/amazon-linux-2023/arm64/standard/recommended/image_id"),
+                "/aws/service/eks/optimized-ami/1.36/amazon-linux-2023/arm64/standard/recommended/image_id",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/schema_version",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_name",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/os",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/ecs_agent_version",
+                "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/ecs_runtime_version"),
                 arm64.publicParameterNames());
     }
 
