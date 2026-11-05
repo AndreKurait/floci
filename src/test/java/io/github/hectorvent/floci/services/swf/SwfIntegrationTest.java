@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.services.swf;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.quarkus.arc.ClientProxy;
+import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.response.Response;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.MethodOrderer;
@@ -11,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.stubbing.Answer;
 
 import java.time.Duration;
 import java.util.List;
@@ -36,11 +39,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.mock;
 
 /**
  * End-to-end coverage of the SWF wire protocol: registration, the decider/worker
@@ -56,8 +60,10 @@ class SwfIntegrationTest {
 
     private static final String SWF_CONTENT_TYPE = "application/x-amz-json-1.0";
 
-    @InjectSpy
+    @Inject
     SwfService service;
+
+    private SwfService realService;
 
     @BeforeAll
     static void configureRestAssured() {
@@ -68,19 +74,23 @@ class SwfIntegrationTest {
     void shortenIdlePolls() {
         // Keep existing empty-response tests fast while exercising the real wait/claim path.
         // The delayed-task HTTP control below retains the production 60-second deadline.
-        doAnswer(call -> service.pollForDecisionTask(call.getArgument(0), call.getArgument(1),
+        realService = ClientProxy.unwrap(service);
+        Answer<Object> delegate = delegatesTo(realService);
+        SwfService idlePollService = mock(SwfService.class, delegate);
+        doAnswer(call -> realService.pollForDecisionTask(call.getArgument(0), call.getArgument(1),
                 call.getArgument(2), call.getArgument(3), Duration.ofMillis(100)))
-                .when(service).pollForDecisionTask(anyString(), anyString(), anyString(),
+                .when(idlePollService).pollForDecisionTask(anyString(), anyString(), anyString(),
                         nullable(String.class), eq(Duration.ofSeconds(60)));
-        doAnswer(call -> service.pollForActivityTask(call.getArgument(0), call.getArgument(1),
+        doAnswer(call -> realService.pollForActivityTask(call.getArgument(0), call.getArgument(1),
                 call.getArgument(2), call.getArgument(3), Duration.ofMillis(100)))
-                .when(service).pollForActivityTask(anyString(), anyString(), anyString(),
+                .when(idlePollService).pollForActivityTask(anyString(), anyString(), anyString(),
                         nullable(String.class), eq(Duration.ofSeconds(60)));
+        QuarkusMock.installMockForType(idlePollService, SwfService.class);
     }
 
     @Test
     void decisionPollWaitsForALaterTask() throws Exception {
-        reset(service);
+        QuarkusMock.installMockForType(realService, SwfService.class);
         String domain = uniqueName("long-poll");
         registerDomain(domain);
         registerWorkflowType(domain, "TestWf", "1.0");
