@@ -16,6 +16,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -75,7 +76,7 @@ class Ec2CreateSnapshotServiceTest {
 
     private Map<String, String> snapshotTags(Ec2Service service, String id) {
         return service.describeSnapshots(REGION, List.of(id), List.of(), Map.of()).getFirst().getTags()
-                .stream().collect(java.util.stream.Collectors.toMap(Tag::getKey, Tag::getValue));
+                .stream().collect(Collectors.toMap(Tag::getKey, Tag::getValue));
     }
 
     @Test

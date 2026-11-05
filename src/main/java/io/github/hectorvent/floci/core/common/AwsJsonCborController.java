@@ -12,6 +12,7 @@ import com.google.gson.JsonParseException;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbStreamsJsonHandler;
+import io.github.hectorvent.floci.services.eventbridgev2.EventBridgeV2Handler;
 import io.github.hectorvent.floci.services.kinesis.KinesisJsonHandler;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceEntitlementController;
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
@@ -25,13 +26,16 @@ import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.zip.GZIPInputStream;
 
 /**
@@ -39,7 +43,7 @@ import java.util.zip.GZIPInputStream;
  * via either smithy-rpc-v2-cbor path routing or the legacy X-Amz-Target header.
  * <p>
  * Currently supported services: DynamoDB (incl. Streams), SQS, SNS, Kinesis,
- * Step Functions, and CloudWatch Metrics.
+ * Step Functions, CloudWatch Metrics, and EventBridge V2.
  * <p>
  * Requests run on virtual threads, as in {@link AwsJsonController}, so a ReceiveMessage or
  * GetActivityTask long poll does not hold one of the shared request workers while it waits.
@@ -67,6 +71,7 @@ public class AwsJsonCborController {
     private final StepFunctionsJsonHandler sfnJsonHandler;
     private final CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler;
     private final MarketplaceEntitlementController marketplaceEntitlementController;
+    private final EventBridgeV2Handler eventBridgeV2Handler;
 
     @Inject
     public AwsJsonCborController(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -77,7 +82,8 @@ public class AwsJsonCborController {
                                  KinesisJsonHandler kinesisJsonHandler,
                                  StepFunctionsJsonHandler sfnJsonHandler,
                                  CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler,
-                                 MarketplaceEntitlementController marketplaceEntitlementController) {
+                                 MarketplaceEntitlementController marketplaceEntitlementController,
+                                 EventBridgeV2Handler eventBridgeV2Handler) {
         this.objectMapper = objectMapper;
         this.catalog = catalog;
         this.regionResolver = regionResolver;
@@ -89,6 +95,7 @@ public class AwsJsonCborController {
         this.sfnJsonHandler = sfnJsonHandler;
         this.cloudWatchMetricsJsonHandler = cloudWatchMetricsJsonHandler;
         this.marketplaceEntitlementController = marketplaceEntitlementController;
+        this.eventBridgeV2Handler = eventBridgeV2Handler;
     }
 
 
@@ -108,7 +115,15 @@ public class AwsJsonCborController {
      * without booting Quarkus.
      */
     static byte[] nodeToSmithyCbor(JsonNode node) throws Exception {
-        return writeCbor(node, false);
+        return nodeToSmithyCbor(node, Set.of());
+    }
+
+    /**
+     * As {@link #nodeToSmithyCbor(JsonNode)}, also tagging the members named, wherever they appear, as timestamps:
+     * a service whose model names its timestamps otherwise than {@link #isTimestampField} expects declares them.
+     */
+    static byte[] nodeToSmithyCbor(JsonNode node, Set<String> timestampMembers) throws Exception {
+        return writeCbor(node, false, timestampMembers);
     }
 
     /**
@@ -119,14 +134,15 @@ public class AwsJsonCborController {
      * newer smithy-rpc-v2-cbor protocol, and {@link #writeCborTimestamp} for why.
      */
     static byte[] nodeToLegacyCbor(JsonNode node) throws Exception {
-        return writeCbor(node, true);
+        return writeCbor(node, true, Set.of());
     }
 
-    private static byte[] writeCbor(JsonNode node, boolean legacyDialect) throws Exception {
+    private static byte[] writeCbor(JsonNode node, boolean legacyDialect, Set<String> timestampMembers)
+            throws Exception {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         CBORFactory factory = (CBORFactory) CBOR_MAPPER.getFactory();
         try (CBORGenerator gen = factory.createGenerator(out)) {
-            writeNodeToCbor(gen, node, false, legacyDialect);
+            writeNodeToCbor(gen, node, false, legacyDialect, timestampMembers);
         }
         return out.toByteArray();
     }
@@ -139,16 +155,18 @@ public class AwsJsonCborController {
      * object fields and is propagated into array elements, so both scalar timestamps and
      * elements of timestamp lists are tagged. {@code legacyDialect} selects which of the
      * two wire conventions tag(1) uses - see {@link #nodeToSmithyCbor}/{@link #nodeToLegacyCbor}.
+     * {@code timestampMembers} are field names tagged besides those the heuristic matches.
      */
     private static void writeNodeToCbor(CBORGenerator gen, JsonNode node, boolean numberIsTimestamp,
-            boolean legacyDialect) throws Exception {
+            boolean legacyDialect, Set<String> timestampMembers) throws Exception {
         if (node.isObject()) {
             gen.writeStartObject();
             Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
             while (fields.hasNext()) {
                 Map.Entry<String, JsonNode> entry = fields.next();
                 gen.writeFieldName(entry.getKey());
-                writeNodeToCbor(gen, entry.getValue(), isTimestampField(entry.getKey()), legacyDialect);
+                boolean timestamp = isTimestampField(entry.getKey()) || timestampMembers.contains(entry.getKey());
+                writeNodeToCbor(gen, entry.getValue(), timestamp, legacyDialect, timestampMembers);
             }
             gen.writeEndObject();
         } else if (node.isArray()) {
@@ -156,7 +174,7 @@ public class AwsJsonCborController {
             for (JsonNode item : node) {
                 // Propagate the timestamp context so every element of a timestamp list
                 // (e.g. CloudWatch GetMetricData MetricDataResults[].Timestamps) is tagged.
-                writeNodeToCbor(gen, item, numberIsTimestamp, legacyDialect);
+                writeNodeToCbor(gen, item, numberIsTimestamp, legacyDialect, timestampMembers);
             }
             gen.writeEndArray();
         } else if (numberIsTimestamp && node.isNumber()) {
@@ -317,7 +335,7 @@ public class AwsJsonCborController {
             JsonNode responseNode = delegated.getEntity() instanceof JsonNode
                     ? (JsonNode) delegated.getEntity()
                     : objectMapper.valueToTree(delegated.getEntity());
-            byte[] cborBytes = nodeToSmithyCbor(responseNode);
+            byte[] cborBytes = nodeToSmithyCbor(responseNode, timestampMembers(serviceId));
             String responseContentType = responseContentType(httpHeaders);
             return Response.status(delegated.getStatus())
                     .header("smithy-protocol", "rpc-v2-cbor")
@@ -366,7 +384,7 @@ public class AwsJsonCborController {
             return false;
         }
         for (String header : contentEncodingHeaders) {
-            if (header != null && header.toLowerCase(java.util.Locale.ROOT).contains("gzip")) {
+            if (header != null && header.toLowerCase(Locale.ROOT).contains("gzip")) {
                 return true;
             }
         }
@@ -460,7 +478,7 @@ public class AwsJsonCborController {
         int totalRead = 0;
         int maxRead = 10 * 1024 * 1024; // 10 MB limit max over all aws services, to avoid OOM. AWS services should not send more than 10 MB in a single request.
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        try (GZIPInputStream gis = new GZIPInputStream(new java.io.ByteArrayInputStream(compressed))) {
+        try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(compressed))) {
             int read;
             while ((read = gis.read(buffer)) != -1) {
                 totalRead += read;
@@ -497,8 +515,17 @@ public class AwsJsonCborController {
             case "states" -> sfnJsonHandler.handle(operation, request, region);
             case "monitoring" -> cloudWatchMetricsJsonHandler.handle(operation, request, region);
             case "marketplace" -> marketplaceEntitlementController.handle(operation, request, region);
+            case "eventsv2" -> eventBridgeV2Handler.handle(operation, request, region);
             default -> null;
         };
+    }
+
+    /** The timestamp members a service's responses carry under names {@link #isTimestampField} does not match. */
+    private Set<String> timestampMembers(String serviceId) {
+        return catalog.byCborSdkServiceId(serviceId)
+                .filter(descriptor -> "eventsv2".equals(descriptor.externalKey()))
+                .map(descriptor -> EventBridgeV2Handler.TIMESTAMP_MEMBERS)
+                .orElse(Set.of());
     }
 
     private Response cborUnknownOperationError(String message, HttpHeaders httpHeaders) {

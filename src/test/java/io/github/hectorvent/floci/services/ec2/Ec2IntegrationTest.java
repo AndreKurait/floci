@@ -4,6 +4,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.response.ExtractableResponse;
 import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
+import org.hamcrest.MatcherAssert;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -3103,6 +3105,215 @@ class Ec2IntegrationTest {
 
     @Test
     @Order(52)
+    void describeVpcEndpointServicesFilterByServiceTypeGateway() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "service-type")
+            .formParam("Filter.1.Value.1", "Gateway")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", greaterThanOrEqualTo(1))
+            // S3 has both Gateway and Interface, so it's included but serviceType has both
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.serviceType.item.serviceType",
+                    hasItem(equalTo("Gateway")));
+    }
+
+    @Test
+    @Order(52)
+    void describeVpcEndpointServicesFilterByServiceTypeInterface() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "service-type")
+            .formParam("Filter.1.Value.1", "Interface")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", greaterThanOrEqualTo(1))
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.serviceType.item.serviceType",
+                    hasItem(equalTo("Interface")));
+    }
+
+    @Test
+    @Order(52)
+    void describeVpcEndpointServicesFilterByServiceName() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "service-name")
+            .formParam("Filter.1.Value.1", "com.amazonaws.us-east-1.s3")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", equalTo(1))
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.serviceName", equalTo("com.amazonaws.us-east-1.s3"));
+    }
+
+    @Test
+    @Order(52)
+    void describeVpcEndpointServicesFilterByServiceNameWildcard() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "service-name")
+            .formParam("Filter.1.Value.1", "com.amazonaws.us-east-1.*")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", greaterThanOrEqualTo(1))
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.serviceName", hasItem("com.amazonaws.us-east-1.s3"));
+    }
+
+    @Test
+    @Order(52)
+    void describeVpcEndpointServicesFilterByOwner() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "owner")
+            .formParam("Filter.1.Value.1", "amazon")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", greaterThanOrEqualTo(1))
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.owner", everyItem(equalTo("amazon")));
+    }
+
+    @Test
+    @Order(52)
+    void describeVpcEndpointServicesFilterByServiceRegion() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "service-region")
+            .formParam("Filter.1.Value.1", "us-east-1")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", greaterThanOrEqualTo(1));
+    }
+
+    @Test
+    @Order(52)
+    void describeVpcEndpointServicesFilterBySupportedIpAddressTypes() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "supported-ip-address-types")
+            .formParam("Filter.1.Value.1", "ipv4")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", greaterThanOrEqualTo(1));
+    }
+
+    @Test
+    @Order(52)
+    void describeVpcEndpointServicesFilterByTagKeyReturnsEmpty() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "tag-key")
+            .formParam("Filter.1.Value.1", "any")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(51)
+    void describeVpcEndpointServicesRejectsUnknownFilterName() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "invalid-filter")
+            .formParam("Filter.1.Value.1", "any")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidFilter"))
+            .body("Response.Errors.Error.Message", containsString("invalid-filter"));
+    }
+
+    @Test
+    @Order(52)
+    void describeVpcEndpointServicesRejectsUnsupportedBracket() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "service-name")
+            .formParam("Filter.1.Value.1", "[")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidFilter"))
+            .body("Response.Errors.Error.Message", containsString("contains unsupported characters"));
+    }
+
+    @Test
+    @Order(53)
+    void describeVpcEndpointServicesRejectsUnsupportedPlus() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "service-name")
+            .formParam("Filter.1.Value.1", "com.amazonaws.us-east-1.s3+")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidFilter"))
+            .body("Response.Errors.Error.Message", containsString("contains unsupported characters"));
+    }
+
+    @Test
+    @Order(54)
+    void describeVpcEndpointServicesRejectsUnsupportedAfterEmptyFilter() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "service-name")
+            .formParam("Filter.1.Value.1", "nonexistent-service-xyz")
+            .formParam("Filter.2.Name", "service-name")
+            .formParam("Filter.2.Value.1", "[")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidFilter"))
+            .body("Response.Errors.Error.Message", containsString("contains unsupported characters"));
+    }
+
+    @Test
+    @Order(55)
+    void describeVpcEndpointServicesFilterByTagValueReturnsEmpty() {
+        given()
+            .formParam("Action", "DescribeVpcEndpointServices")
+            .formParam("Filter.1.Name", "tag:Environment")
+            .formParam("Filter.1.Value.1", "prod")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeVpcEndpointServicesResponse.serviceDetailSet.item.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(52)
     void describeInternetGateways() {
         given()
             .formParam("Action", "DescribeInternetGateways")
@@ -4138,7 +4349,7 @@ class Ec2IntegrationTest {
             .statusCode(200)
         .extract().body().asString();
 
-        org.hamcrest.MatcherAssert.assertThat(body, not(containsString("<nextToken>")));
+        MatcherAssert.assertThat(body, not(containsString("<nextToken>")));
     }
 
     // =========================================================================
@@ -4216,14 +4427,14 @@ class Ec2IntegrationTest {
         int pageCount = 0;
         String nextToken = null;
         do {
-            io.restassured.specification.RequestSpecification req = given()
+            RequestSpecification req = given()
                     .formParam("Action", "DescribeNetworkInterfaces")
                     .formParam("MaxResults", "5")
                     .header("Authorization", AUTH_HEADER);
             if (nextToken != null) {
                 req = req.formParam("NextToken", nextToken);
             }
-            io.restassured.response.Response resp = req.when().post("/");
+            Response resp = req.when().post("/");
             resp.then().statusCode(200);
             pageCount++;
 
@@ -4235,16 +4446,16 @@ class Ec2IntegrationTest {
 
             // Every page but the last must be a full page of 5.
             if (nextToken != null && !nextToken.isEmpty()) {
-                org.hamcrest.MatcherAssert.assertThat(ids.size(), equalTo(5));
+                MatcherAssert.assertThat(ids.size(), equalTo(5));
             }
         } while (nextToken != null && !nextToken.isEmpty());
 
-        org.hamcrest.MatcherAssert.assertThat(
+        MatcherAssert.assertThat(
                 "Expected " + expectedTotal + " ENIs across " + pageCount + " page(s)",
                 collected, equalTo(expectedTotal));
         // With 5 new ENIs and MaxResults=5, at least one truncated page
         // must have occurred (i.e. more than a single page was fetched).
-        org.hamcrest.MatcherAssert.assertThat(pageCount, greaterThanOrEqualTo(2));
+        MatcherAssert.assertThat(pageCount, greaterThanOrEqualTo(2));
 
         // ── Cleanup: terminate the 5 extra instances ──
         for (String id : batchIds) {
@@ -4268,14 +4479,14 @@ class Ec2IntegrationTest {
         int total = 0;
         String nextToken = null;
         do {
-            io.restassured.specification.RequestSpecification req = given()
+            RequestSpecification req = given()
                     .formParam("Action", "DescribeNetworkInterfaces")
                     .formParam("MaxResults", "1000")
                     .header("Authorization", AUTH_HEADER);
             if (nextToken != null) {
                 req = req.formParam("NextToken", nextToken);
             }
-            io.restassured.response.Response resp = req.when().post("/");
+            Response resp = req.when().post("/");
             resp.then().statusCode(200);
 
             List<String> ids = resp.xmlPath().getList(
@@ -5667,6 +5878,80 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    @Order(3225)
+    void describeIpamPoolsAppliesFiltersOverQuery() {
+        String ipamId = given()
+            .formParam("Action", "CreateIpam")
+            .formParam("OperatingRegion.1.RegionName", "us-east-1")
+            .formParam("OperatingRegion.2.RegionName", "eu-west-1")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().path("CreateIpamResponse.ipam.ipamId");
+        String scopeId = given()
+            .formParam("Action", "DescribeIpams")
+            .formParam("IpamId.1", ipamId)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().path("DescribeIpamsResponse.ipamSet.item.privateDefaultScopeId");
+        String poolId = given()
+            .formParam("Action", "CreateIpamPool")
+            .formParam("IpamScopeId", scopeId)
+            .formParam("AddressFamily", "ipv4")
+            .formParam("Locale", "eu-west-1")
+            .formParam("Description", "filter-target-pool")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().path("CreateIpamPoolResponse.ipamPool.ipamPoolId");
+
+        // scope-id pins the query to this test's pool; the other filter is the one under test
+        assertIpamPoolFilter("locale", "eu-west-1", scopeId, poolId, true);
+        assertIpamPoolFilter("locale", "eu-west-9", scopeId, poolId, false);
+        assertIpamPoolFilter("address-family", "ipv4", scopeId, poolId, true);
+        assertIpamPoolFilter("address-family", "ipv6", scopeId, poolId, false);
+        assertIpamPoolFilter("description", "filter-target-*", scopeId, poolId, true);
+        assertIpamPoolFilter("description", "no-such-pool", scopeId, poolId, false);
+        assertIpamPoolFilter("ipam-scope-type", "private", scopeId, poolId, true);
+        assertIpamPoolFilter("ipam-scope-type", "public", scopeId, poolId, false);
+        assertIpamPoolFilter("tag:Env", "prod", scopeId, poolId, false);
+
+        // AND across two non-scope filters: locale matches, description does not
+        List<String> anded = given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("Filter.1.Name", "locale")
+            .formParam("Filter.1.Value.1", "eu-west-1")
+            .formParam("Filter.2.Name", "description")
+            .formParam("Filter.2.Value.1", "no-such-pool")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().xmlPath()
+            .getList("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamPoolId");
+        assertEquals(List.of(), anded);
+
+        given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("Filter.1.Name", "no-such-filter")
+            .formParam("Filter.1.Value.1", "x")
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(400).body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"));
+    }
+
+    private void assertIpamPoolFilter(String name, String value, String scopeId, String poolId,
+                                      boolean expectPool) {
+        List<String> ids = given()
+            .formParam("Action", "DescribeIpamPools")
+            .formParam("Filter.1.Name", "ipam-scope-id")
+            .formParam("Filter.1.Value.1", scopeId)
+            .formParam("Filter.2.Name", name)
+            .formParam("Filter.2.Value.1", value)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/")
+        .then().statusCode(200).extract().xmlPath()
+            .getList("DescribeIpamPoolsResponse.ipamPoolSet.item.ipamPoolId");
+        assertEquals(expectPool ? List.of(poolId) : List.of(), ids, name + "=" + value);
+    }
+
+    @Test
     @Order(323)
     void associateIpamByoasnSuccess() {
         given()
@@ -5999,7 +6284,7 @@ class Ec2IntegrationTest {
 
     @Test
     @Order(335)
-    void runInstancesRejectsRemovalOfTheEbsRootMapping() {
+    void runInstancesNoDeviceRootMappingFallsBackToAmiRootVolumeType() {
         String templateId = given()
             .formParam("Action", "CreateLaunchTemplate")
             .formParam("LaunchTemplateName", "gp3-root-nodevice-template")
@@ -6012,41 +6297,21 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .extract().path("CreateLaunchTemplateResponse.launchTemplate.launchTemplateId");
 
-        given()
-            .formParam("Action", "RunInstances")
-            .formParam("ImageId", "ami-0abcdef1234567890")
-            .formParam("InstanceType", "t2.micro")
-            .formParam("MinCount", "1")
-            .formParam("MaxCount", "1")
-            .formParam("LaunchTemplate.LaunchTemplateId", templateId)
-            .formParam("BlockDeviceMapping.1.DeviceName", "/dev/xvda")
-            .formParam("BlockDeviceMapping.1.NoDevice", "")
-            .header("Authorization", AUTH_HEADER)
-        .when()
-            .post("/")
-        .then()
-            .statusCode(400)
-            .body(containsString("<Code>InvalidBlockDeviceMapping</Code>"));
+        // NoDevice removes the template's root mapping, so the AMI's gp2 root applies.
+        assertEquals("gp2", rootVolumeType(launch(Map.of(
+            "LaunchTemplate.LaunchTemplateId", templateId,
+            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
+            "BlockDeviceMapping.1.NoDevice", ""))));
     }
 
     @Test
     @Order(336)
-    void runInstancesRejectsNoDeviceCombinedWithEbs() {
-        given()
-            .formParam("Action", "RunInstances")
-            .formParam("ImageId", "ami-0abcdef1234567890")
-            .formParam("InstanceType", "t2.micro")
-            .formParam("MinCount", "1")
-            .formParam("MaxCount", "1")
-            .formParam("BlockDeviceMapping.1.DeviceName", "/dev/xvda")
-            .formParam("BlockDeviceMapping.1.NoDevice", "")
-            .formParam("BlockDeviceMapping.1.Ebs.VolumeType", "gp9")
-            .header("Authorization", AUTH_HEADER)
-        .when()
-            .post("/")
-        .then()
-            .statusCode(400)
-            .body(containsString("<Code>InvalidBlockDeviceMapping</Code>"));
+    void runInstancesIgnoresVolumeTypeOnANoDeviceMapping() {
+        // The device is removed regardless of the assigned value, so gp9 is never validated.
+        assertEquals("gp2", rootVolumeType(launch(Map.of(
+            "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
+            "BlockDeviceMapping.1.NoDevice", "",
+            "BlockDeviceMapping.1.Ebs.VolumeType", "gp9"))));
     }
 
     private String launch(Map<String, String> params) {
@@ -6065,6 +6330,7 @@ class Ec2IntegrationTest {
             .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
     }
 
+    /** The type of the instance's root volume, ami-0abcdef1234567890's /dev/xvda; data devices also get volumes. */
     private String rootVolumeType(String instanceId) {
         return given()
             .formParam("Action", "DescribeVolumes")
@@ -6075,7 +6341,7 @@ class Ec2IntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .extract().path("DescribeVolumesResponse.volumeSet.item.find { "
-                + "it.attachmentSet.item.device == '/dev/xvda' }.volumeType");
+            .extract().path("DescribeVolumesResponse.volumeSet.item.find { it.attachmentSet.item.device == '/dev/xvda' }"
+                    + ".volumeType");
     }
 }

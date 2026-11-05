@@ -27,7 +27,9 @@ import org.jboss.logging.Logger;
 import java.io.Closeable;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
+import java.net.SocketException;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -849,8 +851,8 @@ public class FlociUiManager {
             return "Could not start the Floci web console: Floci could not reach the container runtime ("
                     + detail
                     + "). Check that the Docker/Podman socket is mounted into the Floci container and "
-                    + "accessible — on SELinux hosts the socket bind-mount may need relabeling "
-                    + "(e.g. ':z') or '--security-opt label=disable'.";
+                    + "accessible. On SELinux hosts, start the Floci container with "
+                    + "'--security-opt label=disable'.";
         }
         return "Could not start the Floci web console from image '" + image + "': " + detail + ".";
     }
@@ -876,7 +878,7 @@ public class FlociUiManager {
         for (Throwable t = e; t != null; t = t.getCause()) {
             // BindException and ConnectException both extend SocketException; the docker-java
             // Apache transport surfaces a refused/denied Unix-socket connect this way.
-            if (t instanceof java.net.SocketException || t instanceof java.net.UnknownHostException) {
+            if (t instanceof SocketException || t instanceof UnknownHostException) {
                 return true;
             }
         }

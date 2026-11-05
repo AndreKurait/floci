@@ -5,8 +5,8 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 /**
  * One entry of a launch configuration's {@code BlockDeviceMappings}. The shape follows the
- * Auto Scaling API, including its Boolean {@code NoDevice}; EC2 uses a string
- * marker for the equivalent launch-time suppression.
+ * Auto Scaling API rather than EC2's: {@code NoDevice} is a Boolean here, where EC2's launch-time
+ * mapping marks a suppressed device with a string.
  */
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
