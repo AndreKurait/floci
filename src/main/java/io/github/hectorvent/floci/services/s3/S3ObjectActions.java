@@ -148,7 +148,7 @@ public final class S3ObjectActions {
      */
     public static Map<String, List<String>> objectCreationConditions(Function<String, String> header, String tagging,
                                                                      boolean copy, Instant now) {
-        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        Map<String, List<String>> conditions = new LinkedHashMap<>(cannedAclConditions(header));
         Map<String, List<String>> tags = appliesRequestTags(header, copy) ? requestObjectTagConditions(tagging) : null;
         if (tags != null) {
             conditions.putAll(tags);
@@ -162,6 +162,12 @@ public final class S3ObjectActions {
         conditions.putAll(encryptionConditions(header.apply("x-amz-server-side-encryption"),
                 header.apply("x-amz-server-side-encryption-aws-kms-key-id")));
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    /** The requested canned ACL, without inventing a private ACL when the header is absent. */
+    public static Map<String, List<String>> cannedAclConditions(Function<String, String> header) {
+        String acl = header.apply("x-amz-acl");
+        return acl == null ? Map.of() : Map.of("s3:x-amz-acl", List.of(acl));
     }
 
     /**
