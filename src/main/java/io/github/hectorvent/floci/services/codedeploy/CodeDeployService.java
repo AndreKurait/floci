@@ -10,6 +10,8 @@ import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.codedeploy.model.Application;
@@ -27,6 +29,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -36,8 +39,10 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -110,6 +115,7 @@ public class CodeDeployService {
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
     // key: region -> instanceName -> OnPremisesInstance
     private Map<String, Map<String, OnPremisesInstance>> onPremisesInstances = new ConcurrentHashMap<>();
+    private Map<String, SuccessfulAgentRevision> successfulAgentRevisions = new ConcurrentHashMap<>();
 
     // ---- Transient runtime state (in memory only) ----
     // key: account/region -> deploymentId -> Deployment
@@ -123,8 +129,52 @@ public class CodeDeployService {
     private final ConcurrentHashMap<String, CompletableFuture<String>> hookFutures = new ConcurrentHashMap<>();
     // key: deploymentId -> stop flag
     private final ConcurrentHashMap<String, AtomicBoolean> stopFlags = new ConcurrentHashMap<>();
+    private final StripedLocks agentGroupLocks = new StripedLocks(256);
+    private final ConcurrentHashMap<AgentGroupScope, String> activeAgentDeployments = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AgentDeploymentContext> agentDeploymentContexts = new ConcurrentHashMap<>();
 
     private record RuntimeScope(String account, String region) {}
+    private record AgentGroupScope(String account, String region, String groupId) {
+        String historyKey() {
+            return account + ":" + region + ":" + groupId;
+        }
+    }
+
+    @RegisterForReflection
+    public record SuccessfulAgentRevision(String deploymentId, Map<String, Object> revision,
+                                           String fileExistsBehavior, String configName) {}
+
+    private record AgentDeploymentContext(AgentGroupScope scope, SuccessfulAgentRevision revision,
+                                          AgentRollbackPolicy policy, boolean rollback, AtomicBoolean stop,
+                                          AtomicBoolean rollbackRequested) {}
+
+    private record AgentRollbackPolicy(boolean enabled, List<String> events) {
+        static AgentRollbackPolicy from(Map<String, Object> configuration) {
+            if (configuration == null) {
+                return new AgentRollbackPolicy(false, List.of());
+            }
+            Object enabled = configuration.getOrDefault("enabled", false);
+            Object events = configuration.getOrDefault("events", List.of());
+            if (!(enabled instanceof Boolean) || !(events instanceof List<?> values)
+                    || values.stream().anyMatch(value -> !(value instanceof String)
+                            || !Set.of("DEPLOYMENT_FAILURE", "DEPLOYMENT_STOP_ON_ALARM",
+                                    "DEPLOYMENT_STOP_ON_REQUEST").contains(value))) {
+                throw new AwsException("InvalidAutoRollbackConfigException",
+                        "Rollback configuration requires a boolean enabled and valid event names", 400);
+            }
+            List<String> names = values.stream().map(String.class::cast).toList();
+            if (Boolean.TRUE.equals(enabled) && names.stream().anyMatch(value -> !"DEPLOYMENT_FAILURE".equals(value))) {
+                throw new AwsException("UnsupportedOperationException",
+                        "S3 agent deployments support failure rollback; use StopDeployment for an explicit rollback. "
+                                + "Automatic alarm and request-stop triggers are not implemented", 400);
+            }
+            return new AgentRollbackPolicy((Boolean) enabled, names);
+        }
+
+        Map<String, Object> configuration() {
+            return Map.of("enabled", enabled, "events", events);
+        }
+    }
 
     @PostConstruct
     void initializeStorage() {
@@ -141,6 +191,8 @@ public class CodeDeployService {
                 new TypeReference<Map<String, Map<String, String>>>() {});
         this.onPremisesInstances = storageBacked("codedeploy-on-premises-instances.json",
                 new TypeReference<Map<String, Map<String, OnPremisesInstance>>>() {});
+        this.successfulAgentRevisions = storageBacked("codedeploy-agent-successes.json",
+                new TypeReference<Map<String, SuccessfulAgentRevision>>() {});
         normalizeRegionMaps(applications);
         normalizeDeploymentGroups();
         normalizeRegionMaps(deploymentConfigs);
@@ -406,6 +458,7 @@ public class CodeDeployService {
         Map<String, DeploymentGroup> removedGroups = deploymentGroupsFor(region).remove(name);
         if (removedGroups != null) {
             removedGroups.keySet().forEach(group -> tags.remove(deploymentGroupArn(region, name, group)));
+            removedGroups.values().forEach(group -> forgetAgentHistory(region, group.getDeploymentGroupId()));
             persistRegion(deploymentGroups, region);
         }
         tags.remove(applicationArn(region, name));
@@ -495,15 +548,26 @@ public class CodeDeployService {
     }
 
     public void deleteDeploymentGroup(String region, String appName, String groupName) {
-        getApplication(region, appName);
+        DeploymentGroup group = getDeploymentGroup(region, appName, groupName);
         Map<String, Map<String, DeploymentGroup>> appGroups = deploymentGroupsFor(region);
         Map<String, DeploymentGroup> groupStore = appGroups.get(appName);
-        if (groupStore == null || groupStore.remove(groupName) == null) {
-            throw new AwsException("DeploymentGroupDoesNotExistException",
-                    "Deployment group does not exist: " + groupName, 400);
+        AgentGroupScope scope = new AgentGroupScope(regionResolver.getAccountId(), region, group.getDeploymentGroupId());
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            if (groupStore == null || !groupStore.remove(groupName, group)) {
+                throw new AwsException("DeploymentGroupDoesNotExistException",
+                        "Deployment group does not exist: " + groupName, 400);
+            }
+            successfulAgentRevisions.remove(scope.historyKey());
+            persistRegion(deploymentGroups, region);
         }
-        persistRegion(deploymentGroups, region);
         tags.remove(deploymentGroupArn(region, appName, groupName));
+    }
+
+    private void forgetAgentHistory(String region, String groupId) {
+        AgentGroupScope scope = new AgentGroupScope(regionResolver.getAccountId(), region, groupId);
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            successfulAgentRevisions.remove(scope.historyKey());
+        }
     }
 
     public List<String> listDeploymentGroups(String region, String appName) {
@@ -604,6 +668,13 @@ public class CodeDeployService {
     public String createDeployment(String region, String appName, String groupName,
                                    String configName, Map<String, Object> revision, String description,
                                    String fileExistsBehavior) {
+        return createDeployment(region, appName, groupName, configName, revision, description,
+                fileExistsBehavior, null);
+    }
+
+    public String createDeployment(String region, String appName, String groupName,
+                                    String configName, Map<String, Object> revision, String description,
+                                    String fileExistsBehavior, Map<String, Object> autoRollbackConfiguration) {
         Application app = getApplication(region, appName);
         DeploymentGroup group = getDeploymentGroup(region, appName, groupName);
         // Compute platform is authoritative on the Application; the deployment group may also carry it
@@ -617,6 +688,11 @@ public class CodeDeployService {
             throw new AwsException("InvalidFileExistsBehaviorException",
                     "File behavior overrides require an S3 Server revision", 400);
         }
+        if (autoRollbackConfiguration != null && (!"Server".equals(computePlatform) || revision == null
+                || !"S3".equals(revision.get("revisionType")))) {
+            throw new AwsException("UnsupportedOperationException",
+                    "Rollback overrides currently require an S3 Server revision", 400);
+        }
 
         if ("ECS".equals(computePlatform)) {
             return createEcsDeployment(region, appName, groupName, group, configName, revision, description);
@@ -624,7 +700,7 @@ public class CodeDeployService {
 
         if ("Server".equals(computePlatform)) {
             return createServerDeployment(region, appName, groupName, group, configName, revision, description,
-                    fileExistsBehavior);
+                    fileExistsBehavior, autoRollbackConfiguration, null);
         }
         AppSpecInfo appSpec = parseAppSpec(revision);
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
@@ -692,10 +768,28 @@ public class CodeDeployService {
     }
 
     public Map<String, String> stopDeployment(String region, String deploymentId) {
+        return stopDeployment(region, deploymentId, false);
+    }
+
+    public Map<String, String> stopDeployment(String region, String deploymentId, boolean autoRollbackEnabled) {
         Deployment d = getDeployment(region, deploymentId);
+        AgentDeploymentContext agent = agentDeploymentContexts.get(deploymentId);
+        if (agent != null) {
+            synchronized (agentGroupLocks.lockFor(agent.scope())) {
+                if (agentDeploymentContexts.get(deploymentId) == agent) {
+                    agent.rollbackRequested().set(autoRollbackEnabled);
+                    agent.stop().set(true);
+                    return Map.of("status", "Pending", "statusMessage", "Stop request submitted.");
+                }
+            }
+        }
         String status = d.getStatus();
         if ("Succeeded".equals(status) || "Failed".equals(status) || "Stopped".equals(status)) {
             return Map.of("status", "Succeeded", "statusMessage", "Deployment is already in a terminal state.");
+        }
+        if (autoRollbackEnabled) {
+            throw new AwsException("UnsupportedActionForDeploymentTypeException",
+                    "Explicit stop rollback currently requires an S3 Server deployment", 400);
         }
         AtomicBoolean flag = stopFlags.get(deploymentId);
         if (flag != null) {
@@ -844,9 +938,12 @@ public class CodeDeployService {
     private String createServerDeployment(String region, String appName, String groupName,
                                           DeploymentGroup group, String configName,
                                           Map<String, Object> revision, String description,
-                                          String fileExistsBehavior) {
+                                          String fileExistsBehavior, Map<String, Object> rollbackOverride,
+                                          String rollbackTrigger) {
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
         boolean s3Revision = revision != null && "S3".equals(revision.get("revisionType"));
+        AgentRollbackPolicy policy = s3Revision ? AgentRollbackPolicy.from(rollbackOverride == null
+                ? group.getAutoRollbackConfiguration() : rollbackOverride) : null;
         CodeDeployAgentDeployment.Prepared prepared = s3Revision
                 ? agentDeployment.prepare(region, group, effectiveConfig, revision, fileExistsBehavior) : null;
         ServerAppSpecInfo appSpec = s3Revision ? null : parseServerAppSpec(revision);
@@ -860,62 +957,170 @@ public class CodeDeployService {
         deployment.setDeploymentGroupName(groupName);
         deployment.setDeploymentConfigName(prepared == null ? effectiveConfig : prepared.config());
         deployment.setStatus("Queued");
-        deployment.setRevision(revision);
+        deployment.setRevision(s3Revision ? captureAgentRevision(revision) : revision);
         deployment.setCreateTime(now);
         deployment.setDescription(description);
-        deployment.setCreator("user");
+        deployment.setCreator(rollbackTrigger == null ? "user" : "codeDeployRollback");
         deployment.setComputePlatform("Server");
         if (s3Revision) {
             deployment.setFileExistsBehavior(fileExistsBehavior);
+            deployment.setAutoRollbackConfiguration(policy.configuration());
+            if (rollbackTrigger != null) {
+                deployment.setRollbackInfo(Map.of("rollbackTriggeringDeploymentId", rollbackTrigger,
+                        "rollbackDeploymentId", deploymentId,
+                        "rollbackMessage", "Redeploying the last successful revision"));
+            }
         }
-        // Resolve target instances
-        List<String> instanceIds = prepared == null ? resolveServerTargets(region, group) : prepared.instanceIds();
-        if (instanceIds.isEmpty()) {
-            deployment.setStatus("Failed");
-            deployment.setCompleteTime(now);
-            deployment.setErrorInformation(Map.of("code", "NoInstancesReachable",
-                    "message", "No instances found for deployment group"));
-            deploymentsFor(region).put(deploymentId, deployment);
-            return deploymentId;
-        }
-
-        ConcurrentHashMap<String, Map<String, Object>> allTargets = new ConcurrentHashMap<>();
-        List<Map<String, Object>> instanceTargetMaps = new ArrayList<>();
-        for (String instanceId : instanceIds) {
-            Map<String, Object> instanceTargetMap = new ConcurrentHashMap<>();
-            instanceTargetMap.put("deploymentId", deploymentId);
-            instanceTargetMap.put("targetId", instanceId);
-            instanceTargetMap.put("targetArn", prepared == null ? instanceId : prepared.hosts().get(instanceId));
-            instanceTargetMap.put("status", "Pending");
-            instanceTargetMap.put("lastUpdatedAt", now);
-            instanceTargetMap.put("lifecycleEvents", new CopyOnWriteArrayList<>());
-
-            Map<String, Object> targetWrapper = new ConcurrentHashMap<>();
-            targetWrapper.put("deploymentTargetType", "InstanceTarget");
-            targetWrapper.put("instanceTarget", instanceTargetMap);
-            allTargets.put(instanceId, targetWrapper);
-            instanceTargetMaps.add(instanceTargetMap);
-        }
-        CodeDeployAgentCommands.Session session = prepared == null ? null : agentDeployment.open(prepared, deployment);
-        deploymentsFor(region).put(deploymentId, deployment);
-        deploymentTargetsFor(region).put(deploymentId, allTargets);
-
         AtomicBoolean stopFlag = new AtomicBoolean(false);
-        stopFlags.put(deploymentId, stopFlag);
+        AgentDeploymentContext agent = prepared == null ? null : admitAgentDeployment(
+                prepared, deployment, policy, rollbackTrigger != null, stopFlag);
+        try {
+            // Resolve target instances
+            List<String> instanceIds = prepared == null ? resolveServerTargets(region, group) : prepared.instanceIds();
+            if (instanceIds.isEmpty()) {
+                deploymentsFor(region).put(deploymentId, deployment);
+                CodeDeployAgentDeployment.Outcome outcome = new CodeDeployAgentDeployment.Outcome(
+                        "Failed", "NoInstancesReachable", "No instances found for deployment group");
+                if (agent == null) {
+                    outcome.publish(deployment);
+                } else {
+                    completeAgentDeployment(deployment, agent, outcome);
+                }
+                return deploymentId;
+            }
 
-        Thread.ofVirtual().name("codedeploy-server-" + deploymentId).start(
-                () -> {
-                    try {
-                        if (prepared != null) {
-                            agentDeployment.run(prepared, session, deployment, instanceTargetMaps, stopFlag);
-                        } else {
-                            runServerStateMachine(region, deployment, appSpec, instanceIds, instanceTargetMaps, stopFlag);
+            ConcurrentHashMap<String, Map<String, Object>> allTargets = new ConcurrentHashMap<>();
+            List<Map<String, Object>> instanceTargetMaps = new ArrayList<>();
+            for (String instanceId : instanceIds) {
+                Map<String, Object> instanceTargetMap = new ConcurrentHashMap<>();
+                instanceTargetMap.put("deploymentId", deploymentId);
+                instanceTargetMap.put("targetId", instanceId);
+                instanceTargetMap.put("targetArn", prepared == null ? instanceId : prepared.hosts().get(instanceId));
+                instanceTargetMap.put("status", "Pending");
+                instanceTargetMap.put("lastUpdatedAt", now);
+                instanceTargetMap.put("lifecycleEvents", new CopyOnWriteArrayList<>());
+
+                Map<String, Object> targetWrapper = new ConcurrentHashMap<>();
+                targetWrapper.put("deploymentTargetType", "InstanceTarget");
+                targetWrapper.put("instanceTarget", instanceTargetMap);
+                allTargets.put(instanceId, targetWrapper);
+                instanceTargetMaps.add(instanceTargetMap);
+            }
+            CodeDeployAgentCommands.Session session = prepared == null ? null : agentDeployment.open(prepared, deployment);
+            deploymentsFor(region).put(deploymentId, deployment);
+            deploymentTargetsFor(region).put(deploymentId, allTargets);
+
+            stopFlags.put(deploymentId, stopFlag);
+
+            Thread.ofVirtual().name("codedeploy-server-" + deploymentId).start(
+                    () -> {
+                        try {
+                            if (prepared != null) {
+                                agentDeployment.run(prepared, session, deployment, instanceTargetMaps, stopFlag,
+                                        outcome -> RequestScopes.runAs(prepared.account(), prepared.region(),
+                                                () -> completeAgentDeployment(deployment, agent, outcome)));
+                            } else {
+                                runServerStateMachine(region, deployment, appSpec, instanceIds, instanceTargetMaps, stopFlag);
+                            }
+                        } finally {
+                            stopFlags.remove(deploymentId);
                         }
-                    } finally {
-                        stopFlags.remove(deploymentId);
-                    }
-                });
-        return deploymentId;
+                    });
+            return deploymentId;
+        } catch (RuntimeException | Error failure) {
+            if (agent != null) {
+                synchronized (agentGroupLocks.lockFor(agent.scope())) {
+                    agentDeploymentContexts.remove(deploymentId, agent);
+                    activeAgentDeployments.remove(agent.scope(), deploymentId);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private Map<String, Object> captureAgentRevision(Map<String, Object> revision) {
+        JsonNode source = mapper.valueToTree(revision).path("s3Location");
+        Map<String, Object> location = new LinkedHashMap<>();
+        for (String key : List.of("bucket", "key", "bundleType", "version", "eTag")) {
+            if (source.hasNonNull(key)) {
+                location.put(key, source.path(key).asText());
+            }
+        }
+        return Map.of("revisionType", "S3", "s3Location", Map.copyOf(location));
+    }
+
+    private AgentDeploymentContext admitAgentDeployment(CodeDeployAgentDeployment.Prepared prepared,
+                                                          Deployment deployment, AgentRollbackPolicy policy,
+                                                          boolean rollback, AtomicBoolean stop) {
+        AgentGroupScope scope = new AgentGroupScope(prepared.account(), prepared.region(), prepared.groupId());
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            if (activeAgentDeployments.containsKey(scope)) {
+                throw new AwsException("DeploymentLimitExceededException",
+                        "An S3 agent deployment is already running in this deployment group", 400);
+            }
+            SuccessfulAgentRevision revision = new SuccessfulAgentRevision(deployment.getDeploymentId(),
+                    deployment.getRevision(), prepared.fileExistsBehavior(), prepared.config());
+            AgentDeploymentContext context = new AgentDeploymentContext(scope, revision, policy, rollback, stop,
+                    new AtomicBoolean());
+            activeAgentDeployments.put(scope, deployment.getDeploymentId());
+            agentDeploymentContexts.put(deployment.getDeploymentId(), context);
+            return context;
+        }
+    }
+
+    /** Called only after all old host and traffic workers have settled. */
+    private void completeAgentDeployment(Deployment deployment, AgentDeploymentContext context,
+                                          CodeDeployAgentDeployment.Outcome completed) {
+        AgentGroupScope scope = context.scope();
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            if (agentDeploymentContexts.get(deployment.getDeploymentId()) != context) {
+                return;
+            }
+            CodeDeployAgentDeployment.Outcome outcome = context.stop().get()
+                    ? new CodeDeployAgentDeployment.Outcome("Stopped", null, null) : completed;
+            DeploymentGroup currentGroup = deploymentGroupsFor(scope.region())
+                    .getOrDefault(deployment.getApplicationName(), Map.of()).values().stream()
+                    .filter(group -> scope.groupId().equals(group.getDeploymentGroupId())).findFirst().orElse(null);
+            boolean rollback = ("Stopped".equals(outcome.status()) && context.rollbackRequested().get())
+                    || (!context.rollback() && "Failed".equals(outcome.status()) && context.policy().enabled()
+                        && context.policy().events().contains("DEPLOYMENT_FAILURE"));
+            try {
+                if ("Succeeded".equals(outcome.status()) && currentGroup != null) {
+                    successfulAgentRevisions.put(scope.historyKey(), context.revision());
+                }
+                // Keep the group monitor across the handoff; no user deployment can interleave.
+                activeAgentDeployments.remove(scope, deployment.getDeploymentId());
+                if (rollback) {
+                    startAgentRollback(deployment, context, currentGroup);
+                }
+            } catch (RuntimeException failure) {
+                LOG.warnv("Deployment {0} rollback bookkeeping failed: {1}",
+                        deployment.getDeploymentId(), failure.getMessage());
+                deployment.setRollbackInfo(Map.of("rollbackMessage", "Rollback could not be started: "
+                        + failure.getMessage()));
+            } finally {
+                activeAgentDeployments.remove(scope, deployment.getDeploymentId());
+                agentDeploymentContexts.remove(deployment.getDeploymentId(), context);
+                outcome.publish(deployment);
+            }
+        }
+    }
+
+    private void startAgentRollback(Deployment deployment, AgentDeploymentContext context, DeploymentGroup group) {
+        SuccessfulAgentRevision previous = successfulAgentRevisions.get(context.scope().historyKey());
+        if (group == null || previous == null) {
+            deployment.setRollbackInfo(Map.of("rollbackMessage", group == null
+                    ? "The original deployment group no longer exists"
+                    : "No successful S3 agent deployment is available for rollback"));
+            return;
+        }
+        String rollback = createServerDeployment(context.scope().region(), deployment.getApplicationName(),
+                group.getDeploymentGroupName(), group, previous.configName(), previous.revision(),
+                "Rollback of " + deployment.getDeploymentId(), previous.fileExistsBehavior(),
+                Map.of("enabled", false, "events", List.of()), deployment.getDeploymentId());
+        deployment.setRollbackInfo(Map.of("rollbackDeploymentId", rollback,
+                "rollbackTriggeringDeploymentId", deployment.getDeploymentId(),
+                "rollbackMessage", "Redeploying successful deployment " + previous.deploymentId()));
     }
 
     private void runServerStateMachine(String region, Deployment deployment,

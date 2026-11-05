@@ -35,6 +35,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 /** Coordinates real host-agent commands; the agent owns bundle download, AppSpec and script execution. */
 @ApplicationScoped
@@ -102,10 +103,6 @@ public class CodeDeployAgentDeployment {
         if (style != null && (!"IN_PLACE".equals(style.getOrDefault("deploymentType", "IN_PLACE"))
                 || (!"WITHOUT_TRAFFIC_CONTROL".equals(option) && !"WITH_TRAFFIC_CONTROL".equals(option)))) {
             throw unsupported("S3 agent deployments require IN_PLACE deployment");
-        }
-        if (group.getAutoRollbackConfiguration() != null
-                && Boolean.TRUE.equals(group.getAutoRollbackConfiguration().get("enabled"))) {
-            throw unsupported("Automatic rollback is not yet supported for S3 agent deployments");
         }
         if (group.getAlarmConfiguration() != null
                 && Boolean.TRUE.equals(group.getAlarmConfiguration().get("enabled"))) {
@@ -215,7 +212,7 @@ public class CodeDeployAgentDeployment {
                 "DeploymentGroupId", prepared.groupId(),
                 "DeploymentGroupName", deployment.getDeploymentGroupName(),
                 "ApplicationName", deployment.getApplicationName(),
-                "DeploymentCreator", "user",
+                "DeploymentCreator", deployment.getCreator() == null ? "user" : deployment.getCreator(),
                 "DeploymentType", "IN_PLACE",
                 "AgentActionOverrides", Map.of("AgentOverrides",
                         Map.of("FileExistsBehavior", prepared.fileExistsBehavior())),
@@ -226,9 +223,15 @@ public class CodeDeployAgentDeployment {
 
     public void run(Prepared prepared, CodeDeployAgentCommands.Session session, Deployment deployment,
                     List<Map<String, Object>> targets, AtomicBoolean stop) {
+        run(prepared, session, deployment, targets, stop, outcome -> outcome.publish(deployment));
+    }
+
+    public void run(Prepared prepared, CodeDeployAgentCommands.Session session, Deployment deployment,
+                    List<Map<String, Object>> targets, AtomicBoolean stop, Consumer<Outcome> completion) {
         List<CompletableFuture<Boolean>> workers = new ArrayList<>();
         AtomicBoolean terminating = new AtomicBoolean();
         BooleanSupplier cancelled = () -> stop.get() || terminating.get();
+        Outcome outcome;
         try {
             deployment.setStartTime(now());
             deployment.setStatus("InProgress");
@@ -266,24 +269,25 @@ public class CodeDeployAgentDeployment {
                 }
             }
             if (stop.get()) {
-                finish(deployment, "Stopped", null);
+                outcome = new Outcome("Stopped", null, null);
             } else {
                 int required = ALL_AT_ONCE.equals(prepared.config()) ? 1 : Math.max(1, targets.size() - 1);
                 boolean complete = succeeded >= required
                         && targets.stream().noneMatch(target -> "Pending".equals(target.get("status")));
-                finish(deployment, complete ? "Succeeded" : "Failed", complete ? null : "HEALTH_CONSTRAINTS");
+                outcome = new Outcome(complete ? "Succeeded" : "Failed",
+                        complete ? null : "HEALTH_CONSTRAINTS", null);
             }
         } catch (InterruptedException failure) {
             Thread.currentThread().interrupt();
-            finish(deployment, "Stopped", null);
+            outcome = new Outcome("Stopped", null, null);
         } catch (CancellationException failure) {
-            finish(deployment, "Stopped", null);
+            outcome = new Outcome("Stopped", null, null);
         } catch (Exception failure) {
             LOG.warnv("Agent deployment {0} failed: {1}", deployment.getDeploymentId(), failure.getMessage());
             Throwable cause = failure instanceof ExecutionException ? failure.getCause() : failure;
             String code = cause instanceof AwsException aws && "IAM_ROLE_PERMISSIONS".equals(aws.getErrorCode())
                     ? aws.getErrorCode() : "DeploymentFailed";
-            finish(deployment, stop.get() ? "Stopped" : "Failed", stop.get() ? null : code,
+            outcome = new Outcome(stop.get() ? "Stopped" : "Failed", stop.get() ? null : code,
                     "IAM_ROLE_PERMISSIONS".equals(code) ? cause.getMessage() : null);
         } finally {
             terminating.set(true);
@@ -294,6 +298,7 @@ public class CodeDeployAgentDeployment {
             targets.stream().filter(target -> Set.of("Pending", "InProgress").contains(target.get("status")))
                     .forEach(target -> update(target, "Skipped"));
         }
+        completion.accept(outcome);
     }
 
     private boolean runHost(Prepared prepared, CodeDeployAgentCommands.Session session,
@@ -404,17 +409,15 @@ public class CodeDeployAgentDeployment {
         target.put("status", status);
     }
 
-    private static void finish(Deployment deployment, String status, String error) {
-        finish(deployment, status, error, null);
-    }
-
-    private static void finish(Deployment deployment, String status, String error, String message) {
-        if (error != null) {
-            deployment.setErrorInformation(Map.of("code", error, "message",
-                    message == null ? "A host-agent deployment failed" : message));
+    public record Outcome(String status, String error, String message) {
+        void publish(Deployment deployment) {
+            if (error != null) {
+                deployment.setErrorInformation(Map.of("code", error, "message",
+                        message == null ? "A host-agent deployment failed" : message));
+            }
+            deployment.setCompleteTime(now());
+            deployment.setStatus(status);
         }
-        deployment.setCompleteTime(now());
-        deployment.setStatus(status);
     }
 
     private static double now() {

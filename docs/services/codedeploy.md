@@ -59,7 +59,7 @@ existing application storage and region visibility.
 |---|---|
 | `CreateDeployment` | Starts Lambda/ECS traffic shifting or an S3 Server deployment through the AWS agent; Server file handling follows DISALLOW, OVERWRITE or RETAIN |
 | `GetDeployment` | Returns current deployment state; poll `status` until `Succeeded`, `Failed`, or `Stopped` |
-| `StopDeployment` | Signals an in-progress deployment to stop; transitions to `Stopped` |
+| `StopDeployment` | Stops an in-progress deployment; S3 Server deployments honor explicit `autoRollbackEnabled` |
 | `ContinueDeployment` | Accepted (no-op for fully automated deployments) |
 | `ListDeployments` | Returns deployment IDs filtered by application, group, or status |
 | `BatchGetDeployments` | Returns info for multiple deployments |
@@ -100,7 +100,14 @@ An in-place group can specify `WITH_TRAFFIC_CONTROL` and Classic load balancers.
 Floci waits for connections to drain before installation and for healthy
 registration before the agent's final traffic hook. These operations use the
 deployment group's service-role permissions and owning account. Target-group
-traffic control and automatic rollback for S3 Server revisions remain unsupported.
+traffic control remains unsupported.
+
+S3 Server deployments support `DEPLOYMENT_FAILURE` rollback and explicit
+stop-and-rollback. Recovery is a new deployment of the group's last successful
+revision and its file handling policy; the original result remains visible.
+Per-deployment rollback settings override the group's settings. Successful
+revision history persists across restarts and is scoped to the account, Region
+and group ID. Automatic alarm and request-stop policy triggers remain unsupported.
 
 The host-agent APIs use the independent `codedeploy-commands` and
 `codedeploy-commands-secure` IAM namespaces. See the

@@ -31,7 +31,7 @@ class CodeDeployAgentRequestValidationTest {
             "{\"deploymentMode\":\"RESTART\"}",
             "{\"deploymentMode\":42}",
             "{\"fileExistsBehavior\":\"unknown\"}",
-            "{\"autoRollbackConfiguration\":{\"enabled\":false}}",
+            "{\"autoRollbackConfiguration\":[]}",
             "{\"overrideAlarmConfiguration\":{\"enabled\":false}}",
             "{\"targetInstances\":{\"autoScalingGroups\":[\"replacement\"]}}",
             "{\"ec2DeploymentOptions\":{\"autoScalingGroupProcessesToSuspend\":[\"Terminate\"]}}",

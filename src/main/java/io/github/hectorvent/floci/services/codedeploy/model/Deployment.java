@@ -24,6 +24,8 @@ public class Deployment {
     private String creator;
     private String computePlatform;
     private String fileExistsBehavior;
+    private Map<String, Object> autoRollbackConfiguration;
+    private volatile Map<String, String> rollbackInfo;
 
     public String getDeploymentId() { return deploymentId; }
     public void setDeploymentId(String deploymentId) { this.deploymentId = deploymentId; }
@@ -66,4 +68,10 @@ public class Deployment {
 
     public String getFileExistsBehavior() { return fileExistsBehavior; }
     public void setFileExistsBehavior(String fileExistsBehavior) { this.fileExistsBehavior = fileExistsBehavior; }
+
+    public Map<String, Object> getAutoRollbackConfiguration() { return autoRollbackConfiguration; }
+    public void setAutoRollbackConfiguration(Map<String, Object> configuration) { this.autoRollbackConfiguration = configuration; }
+
+    public Map<String, String> getRollbackInfo() { return rollbackInfo; }
+    public void setRollbackInfo(Map<String, String> rollbackInfo) { this.rollbackInfo = rollbackInfo; }
 }

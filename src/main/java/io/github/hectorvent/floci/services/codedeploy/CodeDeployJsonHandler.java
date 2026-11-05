@@ -237,8 +237,16 @@ public class CodeDeployJsonHandler {
         String description = req.has("description") ? req.path("description").asText() : null;
         Map<String, Object> revision = req.has("revision")
                 ? mapper.treeToValue(req.get("revision"), Map.class) : null;
-        String deploymentId = service.createDeployment(region, appName, groupName, configName, revision, description,
-                fileExistsBehavior);
+        if (req.hasNonNull("autoRollbackConfiguration") && !req.path("autoRollbackConfiguration").isObject()) {
+            throw new AwsException("InvalidAutoRollbackConfigException",
+                    "autoRollbackConfiguration must be an object", 400);
+        }
+        Map<String, Object> rollback = req.hasNonNull("autoRollbackConfiguration")
+                ? mapper.treeToValue(req.get("autoRollbackConfiguration"), Map.class) : null;
+        String deploymentId = rollback == null
+                ? service.createDeployment(region, appName, groupName, configName, revision, description, fileExistsBehavior)
+                : service.createDeployment(region, appName, groupName, configName, revision, description,
+                        fileExistsBehavior, rollback);
         return Response.ok(Map.of("deploymentId", deploymentId)).build();
     }
 
@@ -264,7 +272,7 @@ public class CodeDeployJsonHandler {
             }
             return behavior;
         }
-        for (String option : List.of("autoRollbackConfiguration", "overrideAlarmConfiguration",
+        for (String option : List.of("overrideAlarmConfiguration",
                 "targetInstances", "ec2DeploymentOptions")) {
             if (req.hasNonNull(option)) {
                 throw new AwsException("UnsupportedOperationException",
@@ -302,7 +310,12 @@ public class CodeDeployJsonHandler {
 
     private Response stopDeployment(JsonNode req, String region) {
         String id = req.path("deploymentId").asText(null);
-        Map<String, String> result = service.stopDeployment(region, id);
+        if (req.hasNonNull("autoRollbackEnabled") && !req.path("autoRollbackEnabled").isBoolean()) {
+            throw new AwsException("InvalidInputException", "autoRollbackEnabled must be a boolean", 400);
+        }
+        Map<String, String> result = req.hasNonNull("autoRollbackEnabled")
+                ? service.stopDeployment(region, id, req.path("autoRollbackEnabled").booleanValue())
+                : service.stopDeployment(region, id);
         return Response.ok(result).build();
     }
 
