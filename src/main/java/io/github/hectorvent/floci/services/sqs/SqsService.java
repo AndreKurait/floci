@@ -897,6 +897,14 @@ public class SqsService implements Resettable, ResourceProvider {
         return getQueueByUrl(regionKey(region, queueUrl), queueUrl).isPresent();
     }
 
+    /** Reads the resource policy in the account and Region named by the queue ARN. */
+    public Optional<String> findQueuePolicy(String queueArn) {
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(queueArn);
+        String url = buildQueueUrl(arn.region(), arn.accountId(), arn.resource());
+        return getQueueByUrl(regionKey(arn.region(), url), url)
+                .map(queue -> queue.getAttributes().get("Policy"));
+    }
+
     public Map<String, String> getQueueAttributes(String queueUrl, List<String> attributeNames, String region) {
         String storageKey = regionKey(region, queueUrl);
         Queue queue = queueStore.get(storageKey)

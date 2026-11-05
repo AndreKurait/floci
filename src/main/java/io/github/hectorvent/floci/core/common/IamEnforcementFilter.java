@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.IamService.CallerArns;
 import io.github.hectorvent.floci.services.iam.IamService.PresignedScope;
 import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
+import io.github.hectorvent.floci.services.iam.RequestBodyReader;
 import io.github.hectorvent.floci.services.iam.RequestPrincipal;
 import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
@@ -2229,6 +2230,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private boolean servesWithoutCredentials(ProtocolClaim claim, ContainerRequestContext ctx) {
         if (claim.protocol() == WireProtocol.AWS_QUERY) {
             String operation = queryOperation(ctx);
+            if ("ConfirmSubscription".equals(operation)) {
+                // SNS validates the recipient's token. Only opting into authenticated unsubscribe
+                // requires credentials on this call (SNS ConfirmSubscription API reference).
+                return !"true".equalsIgnoreCase(RequestBodyReader.formField(ctx, "AuthenticateOnUnsubscribe"));
+            }
             return operation != null && NO_AUTH_QUERY_OPERATIONS.contains(operation);
         }
         if (claim.service() == null || claim.operation() == null) {
@@ -2236,6 +2242,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             // is the safe side of that: an unsigned request whose shape cannot even be read is not
             // one of the public flows.
             return false;
+        }
+        if ("sns".equals(claim.service().externalKey()) && "ConfirmSubscription".equals(claim.operation())) {
+            JsonNode body = arnBuilder.readJsonBody(ctx);
+            return body != null && !"true".equalsIgnoreCase(body.path("AuthenticateOnUnsubscribe").asText());
         }
         return NO_AUTH_OPERATIONS
                 .getOrDefault(claim.service().externalKey(), Set.of())

@@ -328,6 +328,15 @@ class SesSnsPublishAuthorizationIntegrationTest {
                 "{\"QueueUrl\":\"" + queueUrl + "\",\"AttributeNames\":[\"QueueArn\"]}")
                 .statusCode(200)
                 .extract().jsonPath().getString("Attributes.QueueArn");
+        String queuePolicy = """
+                {"Version":"2012-10-17","Statement":[{
+                  "Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},
+                  "Action":"sqs:SendMessage","Resource":"%s",
+                  "Condition":{"ArnEquals":{"aws:SourceArn":"%s"}}}]}"""
+                .formatted(queueArn, topicArn);
+        query(account, "sqs", "SetQueueAttributes", Map.of(
+                "QueueUrl", queueUrl, "Attribute.1.Name", "Policy", "Attribute.1.Value", queuePolicy))
+                .statusCode(200);
         sns(account, "Subscribe", Map.of("TopicArn", topicArn, "Protocol", "sqs", "Endpoint", queueArn))
                 .statusCode(200);
         return topicArn;
