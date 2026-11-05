@@ -53,13 +53,14 @@ public class SsmJsonHandler {
     private final SsmPatchBaselineService patchBaselines;
     private final SsmResourceDataSyncService resourceDataSyncs;
     private final SsmAgentAssociationService agentAssociations;
+    private final SsmManagedNodeDiscovery managedNodeDiscovery;
 
     @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
                           SsmInventoryService inventoryService, ObjectMapper objectMapper,
                           IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
                           SsmResourceDataSyncService resourceDataSyncs,
-                          SsmAgentAssociationService agentAssociations) {
+                          SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery) {
         this.ssmService = ssmService;
         this.commandService = commandService;
         this.inventoryService = inventoryService;
@@ -68,6 +69,7 @@ public class SsmJsonHandler {
         this.patchBaselines = patchBaselines;
         this.resourceDataSyncs = resourceDataSyncs;
         this.agentAssociations = agentAssociations;
+        this.managedNodeDiscovery = managedNodeDiscovery;
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
@@ -1512,13 +1514,14 @@ public class SsmJsonHandler {
     }
 
     private Response handleDescribeInstanceInformation(JsonNode request, String region) {
-        List<InstanceInformation> instances = commandService.describeInstanceInformation(region);
+        PaginatedResult<InstanceInformation> page = managedNodeDiscovery.describe(request, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode list = objectMapper.createArrayNode();
-        for (InstanceInformation info : instances) {
+        for (InstanceInformation info : page.items()) {
             list.add(instanceInfoToNode(info));
         }
         response.set("InstanceInformationList", list);
+        putNextToken(response, page);
         return Response.ok(response).build();
     }
 

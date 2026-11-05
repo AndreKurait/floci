@@ -85,7 +85,9 @@ jobs:
 
       - name: Test shard partitioner
         if: matrix.shard == 1
-        run: python3 -m unittest discover -s .github/ci -p 'test_partition.py'
+        run: |
+          python3 -m unittest discover -s .github/ci -p 'test_partition.py'
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
       # Derived from test sources, not target/test-classes, so shard.txt exists
       # before Compile and the image prefetch below overlaps the compile instead
