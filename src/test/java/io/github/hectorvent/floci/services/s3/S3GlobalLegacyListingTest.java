@@ -125,6 +125,13 @@ class S3GlobalLegacyListingTest {
                     invocation.<Runnable>getArgument(1).run();
                     return null;
                 }));
+        scopes.when(() -> RequestScopes.runAs(anyString(), anyString(), any(Runnable.class))).thenAnswer(invocation -> {
+            assertEquals(request.getRegion(), invocation.getArgument(1));
+            return inAccount(invocation.getArgument(0), () -> {
+                invocation.<Runnable>getArgument(2).run();
+                return null;
+            });
+        });
         s3.createBucket(BUCKET, "us-east-1");
         s3.putObject(BUCKET, "object.txt", "owner-data".getBytes(UTF_8), "text/plain", Map.of());
     }
