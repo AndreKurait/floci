@@ -89,19 +89,27 @@ class NetworkExposureGuardTest {
         assertEquals("0.0.0.0", NetworkExposureGuard.publicHost(config));
     }
 
-    @Test
-    void publicHostIgnoresTheLoopbackPinTlsModeAppliesToQuarkus() {
+    @ParameterizedTest
+    @ValueSource(ints = {255, 400})
+    void publicHostIgnoresTheLoopbackPinTlsModeAppliesToQuarkus(int ordinal) {
         System.setProperty("floci.tls.enabled", "true");
         System.setProperty("floci.tls.self-signed", "true");
         System.setProperty("floci.storage.persistent-path", tempDir.toString());
         SmallRyeConfig config = new SmallRyeConfigBuilder()
                 .withSources(new TlsConfigSource())
-                .withSources(new PropertiesConfigSource(Map.of("quarkus.http.host", "0.0.0.0"), "yml", 255))
+                .withSources(new PropertiesConfigSource(Map.of(
+                        "quarkus.http.host", "0.0.0.0",
+                        "quarkus.http.port", "9000",
+                        "quarkus.http.ssl-port", "9001",
+                        "quarkus.http.proxy.use-proxy-protocol", "false"), "configured", ordinal))
                 .build();
 
         assertEquals("127.0.0.1", config.getValue("quarkus.http.host", String.class),
                 "precondition: TLS mode keeps Quarkus itself on loopback behind the proxy");
         assertEquals("0.0.0.0", NetworkExposureGuard.publicHost(config),
                 "the proxy must listen where the user asked, not on the internal pin");
+        assertEquals(TlsConfigSource.HTTP_INTERNAL_PORT, config.getValue("quarkus.http.port", Integer.class));
+        assertEquals(TlsConfigSource.HTTPS_INTERNAL_PORT, config.getValue("quarkus.http.ssl-port", Integer.class));
+        assertTrue(config.getValue("quarkus.http.proxy.use-proxy-protocol", Boolean.class));
     }
 }

@@ -62,7 +62,9 @@ With TLS enabled, the proxy that accepts HTTP and HTTPS on Floci's ports listens
 
 The proxy preserves the original client address and port for both protocols using
 a PROXY protocol preface on its connection to Quarkus. The internal HTTP and HTTPS
-listeners remain on loopback and require that preface. Clients should use the
+listeners remain on loopback and require that preface. Their loopback address,
+internal ports, and PROXY protocol setting take precedence over system-property
+overrides; the public proxy still uses the configured host. Clients should use the
 public Floci port. Client-supplied `Forwarded` and `X-Forwarded-For` headers remain
 subject to the configured forwarding policy; the TCP proxy does not use them to
 choose the client's address.
