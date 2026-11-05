@@ -979,7 +979,8 @@ public class AslExecutor {
         boolean nestedTask = NestedTaskCredentials.isNested(StatesIntegration.parse(resource).orElse(null));
         JsonNode credentials = null;
         boolean readCredentials = stateDef.has("Credentials")
-                && (iamEnforcementEnabled() || (mockedInvocation == null && nestedTask));
+                && (iamEnforcementEnabled() || (mockedInvocation == null
+                && (nestedTask || SdkComputeTaskInvoker.supports(StatesIntegration.parse(resource).orElse(null)))));
         if (jsonata) {
             effectiveInput = input;
             if (stateDef.has("Arguments")) {
@@ -1499,7 +1500,8 @@ public class AslExecutor {
         }
 
         if (SdkManagementTaskInvoker.supports(integration)) {
-            return sdkManagementTaskInvoker.invoke(integration, input, extractRegionFromArn(sm.getStateMachineArn()));
+            return sdkManagementTaskInvoker.invoke(integration, input, extractRegionFromArn(sm.getStateMachineArn()),
+                    sm, credentialsRoleArn);
         }
 
         // ECS optimized integration: arn:<partition>:states:::ecs:runTask (request-response, .sync, .waitForTaskToken).
