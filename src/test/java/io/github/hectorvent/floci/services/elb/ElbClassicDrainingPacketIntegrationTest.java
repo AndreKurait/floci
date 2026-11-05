@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -41,6 +42,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestProfile(ElbClassicDrainingPacketIntegrationTest.DrainingRouting.class)
 class ElbClassicDrainingPacketIntegrationTest extends ElbClassicPublicNatPacketIntegrationTest {
     public static class DrainingRouting extends PublicRouting {}
+
+    @Inject
+    ElbClassicHealthChecker healthChecker;
 
     @ParameterizedTest
     @ValueSource(strings = {"scale-in", "refresh", "explicit"})
@@ -241,7 +245,10 @@ class ElbClassicDrainingPacketIntegrationTest extends ElbClassicPublicNatPacketI
         draining(name, true, drainSeconds);
         elb.registerInstancesWithLoadBalancer(change -> change.loadBalancerName(name)
                 .instances(instance -> instance.instanceId(first)));
-        await().atMost(Duration.ofSeconds(30)).until(() -> healthy(name, first));
+        await().atMost(Duration.ofSeconds(30)).until(() -> {
+            healthChecker.runArmedChecks();
+            return healthy(name, first);
+        });
         List<String> addresses = dns.resolveIpv4(hostname).orElseThrow().addresses();
         Topology topology = new Topology(name, hostname, addresses, callerHelper, first, second,
                 localInstance(first).getDockerContainerId());
