@@ -255,7 +255,7 @@ class S3ServiceTest {
     }
 
     @Test
-    void putObjectTrimsBlankServerSideEncryptionToAbsent() {
+    void putObjectTreatsBlankServerSideEncryptionAsTheBucketDefault() {
         s3Service.createBucket("test-bucket", "us-east-1");
 
         S3Object put = s3Service.putObject(
@@ -267,7 +267,7 @@ class S3ServiceTest {
                 new PutObjectOptions().withServerSideEncryption("   ")
         );
 
-        assertNull(put.getServerSideEncryption());
+        assertEquals("AES256", put.getServerSideEncryption());
     }
 
     @Test
