@@ -49,6 +49,9 @@ public class SsmDocument {
     @JsonProperty("Versions")
     private Map<String, String> versions = new LinkedHashMap<>();
 
+    @JsonProperty("Tags")
+    private Map<String, String> tags = new LinkedHashMap<>();
+
     public SsmDocument() {}
 
     public SsmDocument(String name, String content, String documentType) {
@@ -109,6 +112,14 @@ public class SsmDocument {
 
     public void setVersions(Map<String, String> versions) {
         this.versions = versions != null ? new LinkedHashMap<>(versions) : new LinkedHashMap<>();
+    }
+
+    public Map<String, String> getTags() {
+        return tags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(tags);
+    }
+
+    public void setTags(Map<String, String> tags) {
+        this.tags = tags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(tags);
     }
 
     /**

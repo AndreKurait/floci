@@ -1340,6 +1340,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             List<Map<String, List<String>>> batchContexts = "dynamodb".equals(credentialScope)
                     ? conditionContextResolver.dynamoDbBatchConditionContexts(action, ctx, resource) : null;
             List<Map<String, List<String>>> resourceContexts = targetContexts;
+            if ("ssm:SendCommand".equals(action)) {
+                resourceContexts = targetContexts.stream().map(base ->
+                        conditionContextResolver.ssmCommandResourceContext(resource, base, region, accountId)).toList();
+            }
             if (batchContexts != null && !batchContexts.isEmpty()) {
                 resourceContexts = new ArrayList<>();
                 for (Map<String, List<String>> targetContext : targetContexts) {

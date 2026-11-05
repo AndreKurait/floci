@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import io.github.hectorvent.floci.services.s3.S3ObjectKeys;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.S3SignatureConditions;
+import io.github.hectorvent.floci.services.ssm.SsmService;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -100,6 +101,7 @@ public class IamConditionContextResolver {
     private final Instance<CloudWatchLogsService> logsService;
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
+    private final Instance<SsmService> ssmService;
     private final RequestContext requestContext;
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
@@ -120,9 +122,24 @@ public class IamConditionContextResolver {
                                        RequestContext requestContext,
                                        EmulatorConfig config,
                                        CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC());
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -135,12 +152,28 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, clock, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                        Instance<Ec2Service> ec2Service,
+                                        Instance<S3Service> s3Service,
+                                        Instance<CloudWatchLogsService> logsService,
+                                        Instance<IamService> iamService,
+                                        Instance<LambdaWebService> lambdaWebService,
+                                        RequestContext requestContext,
+                                        EmulatorConfig config,
+                                        CurrentVertxRequest currentVertxRequest,
+                                        ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                        Instance<SsmService> ssmService) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
         this.logsService = logsService;
         this.iamService = iamService;
         this.lambdaWebService = lambdaWebService;
+        this.ssmService = ssmService;
         this.requestContext = requestContext;
         this.config = config;
         this.currentVertxRequest = currentVertxRequest;
@@ -186,6 +219,43 @@ public class IamConditionContextResolver {
             // Leave malformed selectors to the ordinary authorization and API validation.
         }
         return null;
+    }
+
+    /** Run Command checks each document and target with that resource's own tags. */
+    public Map<String, List<String>> ssmCommandResourceContext(String resource,
+                                                              Map<String, List<String>> base,
+                                                              String region, String accountId) {
+        Map<String, List<String>> conditions = base == null ? new LinkedHashMap<>() : new LinkedHashMap<>(base);
+        conditions.keySet().removeIf(key -> key.startsWith(RESOURCE_TAG_PREFIX)
+                || key.startsWith("ssm:resourceTag/"));
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(resource);
+        String partition = requestContext.getPartition() == null
+                ? AwsRegions.partitionFor(region) : requestContext.getPartition();
+        if (!region.equals(arn.region()) || !accountId.equals(arn.accountId())
+                || !partition.equals(arn.partition())) {
+            return conditions;
+        }
+        if ("ec2".equals(arn.service()) && arn.resource().startsWith("instance/")) {
+            String instance = arn.resource().substring("instance/".length());
+            addResourceTags(conditions, instance);
+            new LinkedHashMap<>(conditions).forEach((key, value) -> {
+                if (key.startsWith(RESOURCE_TAG_PREFIX)) {
+                    conditions.put("ssm:resourceTag/" + key.substring(RESOURCE_TAG_PREFIX.length()), value);
+                }
+            });
+        } else if ("ssm".equals(arn.service()) && arn.resource().startsWith("document/")
+                && ssmService != null && ssmService.isResolvable()) {
+            try {
+                ssmService.get().listDocumentTags(arn.resource().substring("document/".length()), region)
+                        .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+            } catch (AwsException expected) {
+                if (!"InvalidResourceId".equals(expected.getErrorCode())) {
+                    throw expected;
+                }
+                // Missing documents have no tags; the handler retains its normal not-found response.
+            }
+        }
+        return conditions;
     }
 
     /** Group mutations and stream access use the handler's group and request scope. */

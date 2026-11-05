@@ -37,7 +37,7 @@ record SsmCommandDocument(String version, JsonNode content) {
 
     static SsmCommandDocument resolve(SsmService documents, ObjectMapper mapper, String name,
                                       String requestedVersion, String region) {
-        if ("AWS-RunShellScript".equals(name) || "AWS-RunPowerShellScript".equals(name)) {
+        if (SsmService.isAwsCommandDocument(name)) {
             if (requestedVersion != null && !requestedVersion.isBlank()
                     && !"$DEFAULT".equals(requestedVersion) && !"$LATEST".equals(requestedVersion)
                     && !"1".equals(requestedVersion)) {

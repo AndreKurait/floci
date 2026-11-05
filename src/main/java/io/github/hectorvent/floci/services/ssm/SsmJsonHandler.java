@@ -648,7 +648,9 @@ public class SsmJsonHandler {
         String content = requireDocumentContent(request);
         String documentType = requireDocumentType(request);
 
-        SsmDocument document = ssmService.createDocument(name, content, documentType, region);
+        Map<String, String> tags = new LinkedHashMap<>();
+        request.path("Tags").forEach(tag -> tags.put(tag.path("Key").asText(), tag.path("Value").asText()));
+        SsmDocument document = ssmService.createDocument(name, content, documentType, region, tags);
         return Response.ok(documentDescriptionResponse(document)).build();
     }
 
@@ -702,6 +704,8 @@ public class SsmJsonHandler {
         description.put("Status", document.getStatus());
         description.put("LatestVersion", String.valueOf(document.getDocumentVersion()));
         description.put("DefaultVersion", String.valueOf(document.getDefaultVersion()));
+        ArrayNode tags = description.putArray("Tags");
+        document.getTags().forEach((key, value) -> tags.addObject().put("Key", key).put("Value", value));
         response.set("DocumentDescription", description);
         return response;
     }
@@ -1218,7 +1222,11 @@ public class SsmJsonHandler {
         request.path("Tags").forEach(t ->
                 tags.put(t.path("Key").asText(), t.path("Value").asText()));
 
-        ssmService.addTagsToResource(resourceId, tags, region);
+        if ("Document".equals(request.path("ResourceType").asText())) {
+            ssmService.addDocumentTags(resourceId, tags, region);
+        } else {
+            ssmService.addTagsToResource(resourceId, tags, region);
+        }
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -1227,7 +1235,8 @@ public class SsmJsonHandler {
             return Response.ok(patchBaselines.resourceTags("ListTagsForResource", request, region)).build();
         }
         String resourceId = request.path("ResourceId").asText();
-        Map<String, String> tags = ssmService.listTagsForResource(resourceId, region);
+        Map<String, String> tags = "Document".equals(request.path("ResourceType").asText())
+                ? ssmService.listDocumentTags(resourceId, region) : ssmService.listTagsForResource(resourceId, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode tagsArray = objectMapper.createArrayNode();
@@ -1249,7 +1258,11 @@ public class SsmJsonHandler {
         List<String> tagKeys = new ArrayList<>();
         request.path("TagKeys").forEach(k -> tagKeys.add(k.asText()));
 
-        ssmService.removeTagsFromResource(resourceId, tagKeys, region);
+        if ("Document".equals(request.path("ResourceType").asText())) {
+            ssmService.removeDocumentTags(resourceId, tagKeys, region);
+        } else {
+            ssmService.removeTagsFromResource(resourceId, tagKeys, region);
+        }
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -1663,6 +1676,8 @@ public class SsmJsonHandler {
         documentNode.put("Status", document.getStatus());
         documentNode.put("DefaultVersion", String.valueOf(document.getDefaultVersion()));
         documentNode.put("LatestVersion", String.valueOf(document.getDocumentVersion()));
+        ArrayNode tags = documentNode.putArray("Tags");
+        document.getTags().forEach((key, value) -> tags.addObject().put("Key", key).put("Value", value));
         if (document.getCreatedDate() != null) {
             documentNode.put("CreatedDate", EpochSeconds.fromInstant(document.getCreatedDate()));
         }
