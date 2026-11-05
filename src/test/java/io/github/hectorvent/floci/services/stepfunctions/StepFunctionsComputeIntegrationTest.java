@@ -14,12 +14,14 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.client.config.SdkAdvancedClientOption;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.sfn.SfnClient;
 import software.amazon.awssdk.services.sfn.model.DescribeExecutionResponse;
+import software.amazon.awssdk.services.sfn.model.StartSyncExecutionResponse;
 import software.amazon.awssdk.services.ssm.SsmClient;
 
 import java.net.URI;
@@ -187,6 +189,54 @@ class StepFunctionsComputeIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"STANDARD,base", "STANDARD,version", "STANDARD,alias",
+            "EXPRESS,base", "EXPRESS,version", "EXPRESS,alias"})
+    void qualifiedExecutionsUseTheBaseMachineForServiceTrustAndContext(String type, String selection) throws Exception {
+        try (Cloud cloud = new Cloud(ACCOUNT, "eu-west-2", "aws")) {
+            String definition = """
+                    {"StartAt":"Call","States":{
+                      "Call":{"Type":"Task","Resource":"arn:aws:states:::aws-sdk:ec2:describeInstances",
+                        "Parameters":{},"ResultPath":"$.response","Next":"Done",
+                        "Catch":[{"ErrorEquals":["States.ALL"],"ResultPath":"$.response","Next":"Done"}]},
+                      "Done":{"Type":"Pass","Parameters":{"machine.$":"$$.StateMachine.Id","response.$":"$.response"},
+                        "End":true}}}
+                    """;
+            String arn = cloud.sfn.createStateMachine(request -> request.name(cloud.name)
+                    .roleArn(cloud.role).type(type).definition(definition).publish(true)).stateMachineArn();
+            String version = arn + ":1";
+            String alias = null;
+            try {
+                String selected = "version".equals(selection) ? version : arn;
+                if ("alias".equals(selection)) {
+                    alias = cloud.sfn.createStateMachineAlias(request -> request.name("stable")
+                            .routingConfiguration(route -> route.stateMachineVersionArn(version).weight(100)))
+                            .stateMachineAliasArn();
+                    selected = alias;
+                }
+                cloud.trustSource(arn, ACCOUNT);
+                JsonNode accepted = cloud.execute(selected, type);
+                assertTrue(accepted.path("response").path("Reservations").isArray(), accepted.toString());
+                assertEquals(arn, accepted.path("machine").asText());
+                assertEquals(version, cloud.sfn.describeStateMachine(request -> request.stateMachineArn(version))
+                        .stateMachineArn());
+
+                cloud.trustSource(arn + "-other", ACCOUNT);
+                assertEquals("States.Permissions", cloud.execute(selected, type).path("response").path("Error").asText());
+                cloud.trustSource(arn, OTHER_ACCOUNT);
+                assertEquals("States.Permissions", cloud.execute(selected, type).path("response").path("Error").asText());
+                cloud.trustSource(arn, ACCOUNT);
+                assertTrue(cloud.execute(selected, type).path("response").path("Reservations").isArray());
+            } finally {
+                if (alias != null) {
+                    String ownedAlias = alias;
+                    cloud.sfn.deleteStateMachineAlias(request -> request.stateMachineAliasArn(ownedAlias));
+                }
+                cloud.sfn.deleteStateMachine(request -> request.stateMachineArn(arn));
+            }
+        }
+    }
+
     private static final class Cloud implements AutoCloseable {
         private final String account;
         private final String region;
@@ -213,6 +263,8 @@ class StepFunctionsComputeIntegrationTest {
             iam = IamClient.builder().endpointOverride(endpoint).region(Region.of(region))
                     .credentialsProvider(credentials).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
             sfn = SfnClient.builder().endpointOverride(endpoint).region(Region.of(region))
+                    .overrideConfiguration(config -> config.putAdvancedOption(
+                            SdkAdvancedClientOption.DISABLE_HOST_PREFIX_INJECTION, true))
                     .credentialsProvider(credentials).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
             role = iam.createRole(request -> request.roleName(name).assumeRolePolicyDocument("""
                     {"Statement":[{"Effect":"Allow","Principal":{"Service":"states.amazonaws.com"},
@@ -257,15 +309,33 @@ class StepFunctionsComputeIntegrationTest {
             String arn = sfn.createStateMachine(request -> request.name("sdk-" + UUID.randomUUID())
                     .roleArn(role).definition(definition)).stateMachineArn();
             try {
-                String execution = sfn.startExecution(request -> request.stateMachineArn(arn).input("{}")).executionArn();
-                await().atMost(Duration.ofSeconds(15)).until(() -> !"RUNNING".equals(
-                        sfn.describeExecution(request -> request.executionArn(execution)).statusAsString()));
-                DescribeExecutionResponse result = sfn.describeExecution(request -> request.executionArn(execution));
-                assertEquals("SUCCEEDED", result.statusAsString(), result.toString());
-                return MAPPER.readTree(result.output());
+                return execute(arn, "STANDARD");
             } finally {
                 sfn.deleteStateMachine(request -> request.stateMachineArn(arn));
             }
+        }
+
+        private JsonNode execute(String arn, String type) throws Exception {
+            if ("EXPRESS".equals(type)) {
+                StartSyncExecutionResponse result = sfn.startSyncExecution(request -> request
+                        .stateMachineArn(arn).input("{}"));
+                assertEquals("SUCCEEDED", result.statusAsString(), result.toString());
+                return MAPPER.readTree(result.output());
+            }
+            String execution = sfn.startExecution(request -> request.stateMachineArn(arn).input("{}")).executionArn();
+            await().atMost(Duration.ofSeconds(15)).until(() -> !"RUNNING".equals(
+                    sfn.describeExecution(request -> request.executionArn(execution)).statusAsString()));
+            DescribeExecutionResponse result = sfn.describeExecution(request -> request.executionArn(execution));
+            assertEquals("SUCCEEDED", result.statusAsString(), result.toString());
+            return MAPPER.readTree(result.output());
+        }
+
+        private void trustSource(String source, String sourceAccount) {
+            iam.updateAssumeRolePolicy(request -> request.roleName(name).policyDocument("""
+                    {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                    "Principal":{"Service":"states.amazonaws.com"},"Action":"sts:AssumeRole",
+                    "Condition":{"ArnEquals":{"aws:SourceArn":"%s"},"StringEquals":{"aws:SourceAccount":"%s"}}}]}
+                    """.formatted(source, sourceAccount)));
         }
 
         @Override
