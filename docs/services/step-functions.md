@@ -11,6 +11,7 @@
 | `CreateStateMachine` | Create a state machine (Standard or Express) |
 | `UpdateStateMachine` | Update definition, role, logging, tracing, or encryption settings and optionally publish a version |
 | `DescribeStateMachine` | Get state machine definition and metadata |
+| `DescribeStateMachineForExecution` | - |
 | `ListStateMachines` | List all state machines |
 | `DeleteStateMachine` | Delete a state machine |
 | `PublishStateMachineVersion` | - |
@@ -45,6 +46,18 @@
 `UpdateStateMachine` returns the new revision ID and update timestamp. CloudFormation updates
 definition, role, logging, tracing, encryption, and tags without replacing the state machine;
 changes to `StateMachineName` or `StateMachineType` use replacement semantics.
+
+`DescribeStateMachineForExecution` reads a configuration captured before the Standard
+execution starts, including the resolved version when invoked through an alias.
+Later state-machine updates or deletion do not change that definition, execution
+role, revision or logging/tracing/encryption metadata. `METADATA_ONLY` returns an
+empty definition, consistent with `DescribeStateMachine`. The snapshot uses the
+execution storage backend and contains no unrelated versions or tags.
+
+Older persisted executions without a captured configuration return
+`UnsupportedOperation`; the current mutable definition is never substituted.
+Express and Distributed Map child lookups, variable-reference summaries and
+KMS decryption enforcement are not implemented by this action.
 
 `ListExecutions` honors `statusFilter` when listing a state machine's executions.
 Omitting the filter returns all statuses. Invalid filter values or types return
