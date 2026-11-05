@@ -27,6 +27,7 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Map;
 
 /**
@@ -71,12 +72,9 @@ public class BedrockAgentCoreControlController {
                     stringMap(req.get("environmentVariables")),
                     obj(req, "authorizerConfiguration"),
                     obj(req, "protocolConfiguration"),
+                    stringMap(req.get("tags")),
                     text(req, "clientToken"),
                     region);
-            Map<String, String> tags = stringMap(req.get("tags"));
-            if (tags != null) {
-                runtime.getTags().putAll(tags);
-            }
             String version = String.valueOf(runtime.getLatestVersion());
 
             ObjectNode out = objectMapper.createObjectNode();
@@ -401,7 +399,7 @@ public class BedrockAgentCoreControlController {
         if (instant != null) {
             // AgentCore models these as ISO-8601 strings; second precision stays within
             // AWS's 20-char timestamp limit.
-            node.put(field, instant.truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString());
+            node.put(field, instant.truncatedTo(ChronoUnit.SECONDS).toString());
         }
     }
 

@@ -23,6 +23,7 @@ import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 
@@ -70,6 +71,21 @@ public class VerdaccioSidecarClient implements RepositorySidecarManager {
     @Override
     public void release(String repositoryContainerId) {
         manager.release(repositoryContainerId);
+    }
+
+    @Override
+    public void registerRepository(String repositoryContainerId) {
+        manager.registerRepository(repositoryContainerId);
+    }
+
+    @Override
+    public void beginUse(String repositoryContainerId) {
+        manager.beginUse(repositoryContainerId);
+    }
+
+    @Override
+    public void endUse(String repositoryContainerId) {
+        manager.endUse(repositoryContainerId);
     }
 
     /** The public URL a Verdaccio sidecar is told to advertise for one npm repository. */
@@ -364,6 +380,33 @@ public class VerdaccioSidecarClient implements RepositorySidecarManager {
     }
 
     /**
+     * The exact version whose tarball Verdaccio's own packument records {@code filename} under,
+     * found by checking every version's own {@link #tarballFilenameFor} rather than assuming
+     * {@code filename} embeds its version in the {@code <packageName>-<version>.tgz} shape this
+     * emulator's own publish path always writes: nothing in the real npm publish protocol
+     * requires a client-chosen {@code dist.tarball} name to follow that convention, so {@code
+     * CodeArtifactNpmDataPlane}'s own download-side Archived guard resolves the real coordinate
+     * here instead of guessing from the filename's own text. Empty when the package doesn't
+     * exist, or no version's own tarball matches.
+     */
+    public Optional<String> versionForTarballFilename(String repositoryContainerId, String domain,
+            String repository, String namespace, String packageName, String filename) {
+        String baseUrl = ensureReady(repositoryContainerId, publicUrl(domain, repository));
+        JsonNode document = fetchPackageDocument(baseUrl, namespace, packageName).orElse(null);
+        if (document == null) {
+            return Optional.empty();
+        }
+        Iterator<String> versions = document.path("versions").fieldNames();
+        while (versions.hasNext()) {
+            String version = versions.next();
+            if (filename.equals(tarballFilenameFor(document, version))) {
+                return Optional.of(version);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
      * npm has exactly one asset per version, the tarball: unlike Maven's version directory, there
      * is no separate checksum sidecar file or secondary artifact to enumerate. Empty when the
      * package or version doesn't exist, or the existing version has no tarball recorded (should
@@ -382,15 +425,16 @@ public class VerdaccioSidecarClient implements RepositorySidecarManager {
     /**
      * Publishes {@code version} straight to this sidecar's own packument, the real npm registry
      * wire shape confirmed against a live Verdaccio container: a {@code PUT} to the package path
-     * carrying just the new version's metadata, its tarball as a base64 {@code _attachments}
-     * entry, and {@code dist-tags.latest} pointed at it. Verdaccio merges this into whatever
-     * {@code versions} the package already has rather than requiring the caller to resend them
-     * (also confirmed live), so this never needs to read the existing packument first the way
-     * {@link #deletePackageVersionAsset} does. Rejected outright (a real {@code 409}, "this
-     * package is already present") if {@code version} already exists, even if its content is
-     * identical: the caller ({@code CodeArtifactService#copyContainerBackedPackageVersions}) is
-     * expected to have already deleted a conflicting existing version first for an overwrite, the
-     * same reason {@code ReposiliteSidecarClient#storePackageVersionAsset} documents for Maven.
+     * carrying just the new version's metadata and its tarball as a base64 {@code _attachments}
+     * entry, deliberately with no {@code dist-tags} of its own (see {@link #storeVersion}'s own
+     * javadoc for why). Verdaccio merges this into whatever {@code versions} the package already
+     * has rather than requiring the caller to resend them (also confirmed live), so this never
+     * needs to read the existing packument first the way {@link #deletePackageVersionAsset} does.
+     * Rejected outright (a real {@code 409}, "this package is already present") if {@code
+     * version} already exists, even if its content is identical: the caller ({@code
+     * CodeArtifactService#copyContainerBackedPackageVersions}) is expected to have already
+     * deleted a conflicting existing version first for an overwrite, the same reason {@code
+     * ReposiliteSidecarClient#storePackageVersionAsset} documents for Maven.
      */
     @Override
     public void storePackageVersionAsset(String repositoryContainerId, String domain, String repository,
@@ -423,6 +467,40 @@ public class VerdaccioSidecarClient implements RepositorySidecarManager {
                 sourceVersionDoc);
     }
 
+    /**
+     * {@code CodeArtifactNpmExternalConnectionImporter}'s own destination write for a version
+     * retained through a {@code public:npmjs} external connection, the same reuse-the-source-
+     * document treatment {@link #copyPackageVersionAsset} already gives a version copied from
+     * another repository here, just sourced from the real public registry's own fetched packument
+     * instead of another Verdaccio-backed repository (found by Greptile's review of npm's own
+     * external-connection work: a plain {@link #storePackageVersionAsset} call builds a minimal
+     * document with no {@code dependencies}/{@code engines}/{@code scripts}, which a real {@code
+     * npm install} of this exact version needs). {@code externalVersionDoc} is {@code null} when
+     * the caller could not resolve the real registry's own version entry (should not normally
+     * happen once {@link CodeArtifactNpmExternalConnectionImporter#mergedPackument} has already
+     * merged this exact version in, but defended the same way {@link #copyPackageVersionAsset}
+     * already is): falls back to the same minimal document {@link #storePackageVersionAsset}
+     * would have built.
+     */
+    public void storeRetainedVersionAsset(String repositoryContainerId, String domain, String repository,
+            String namespace, String packageName, String version, String assetName, byte[] content,
+            JsonNode externalVersionDoc) {
+        storeVersion(repositoryContainerId, domain, repository, namespace, packageName, version, assetName, content,
+                externalVersionDoc);
+    }
+
+    /**
+     * The one real write every {@code storePackageVersionAsset}/{@code copyPackageVersionAsset}/
+     * {@code storeRetainedVersionAsset} call goes through. Sends no {@code dist-tags} of its own
+     * (found by hectorvent's review of the npm external-connection work: the unconditional {@code
+     * dist-tags.latest} this used to always send clobbered a real local {@code latest} the moment
+     * any other version was copied or retained). Confirmed live against the pinned image: a PUT
+     * that omits {@code dist-tags} entirely leaves an existing package's own {@code dist-tags.
+     * latest} untouched, while a package's genuinely first-ever version still gets it set to that
+     * version by Verdaccio's own default (there is nothing yet to preserve), so omitting it here
+     * is always correct, and this method never needs its own "is this the right version to call
+     * latest" decision.
+     */
     private void storeVersion(String repositoryContainerId, String domain, String repository, String namespace,
             String packageName, String version, String assetName, byte[] content, JsonNode sourceVersionDoc) {
         String baseUrl = ensureReady(repositoryContainerId, publicUrl(domain, repository));
@@ -441,11 +519,11 @@ public class VerdaccioSidecarClient implements RepositorySidecarManager {
         dist.put("integrity", "sha512-" + Base64.getEncoder().encodeToString(sha512().digest(content)));
         dist.put("tarball", tarballUrl);
 
+        // No dist-tags sent: see this method's own javadoc for why.
         ObjectNode body = mapper.createObjectNode();
         body.put("_id", npmName);
         body.put("name", npmName);
         body.put("description", "");
-        body.putObject("dist-tags").put("latest", version);
         body.putObject("versions").set(version, versionDoc);
         ObjectNode attachment = body.putObject("_attachments").putObject(assetName);
         attachment.put("content_type", "application/octet-stream");

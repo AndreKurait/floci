@@ -31,8 +31,24 @@ class AthenaGetWorkGroupIntegrationTest {
             .statusCode(200)
             .body("WorkGroup.Name", equalTo("primary"))
             .body("WorkGroup.State", equalTo("ENABLED"))
+            // An empty result configuration, as AWS reports it for primary.
+            .body("WorkGroup.Configuration.ResultConfiguration.size()", equalTo(0))
+            .body("WorkGroup.Configuration.EngineVersion.SelectedEngineVersion", equalTo("AUTO"))
             .body("WorkGroup.Configuration.EngineVersion.EffectiveEngineVersion",
                     equalTo("Athena engine version 3"));
+    }
+
+    @Test
+    void getWorkGroupNamingNullReturnsPrimary() {
+        given()
+            .header("X-Amz-Target", "AmazonAthena.GetWorkGroup")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"WorkGroup\": null }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("WorkGroup.Name", equalTo("primary"));
     }
 
     @Test

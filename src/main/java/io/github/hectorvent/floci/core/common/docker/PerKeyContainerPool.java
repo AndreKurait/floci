@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import org.jboss.logging.Logger;
 
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -110,6 +112,15 @@ public class PerKeyContainerPool {
      * registration, orphaning it since nothing calls stop for the key again.
      */
     public void stopContainer(String key) {
+        stopContainer(key, false);
+    }
+
+    /** Stops one key only after Docker confirms that its container is gone. */
+    public void stopContainerStrict(String key) {
+        stopContainer(key, true);
+    }
+
+    private void stopContainer(String key, boolean strict) {
         if (key == null) {
             return;
         }
@@ -117,10 +128,17 @@ public class PerKeyContainerPool {
         synchronized (lock) {
             StartedContainer container;
             synchronized (registryLock) {
-                container = containers.remove(key);
+                container = strict ? containers.get(key) : containers.remove(key);
             }
             if (container != null) {
-                lifecycleManager.stopAndRemove(container.containerId(), null);
+                if (strict) {
+                    lifecycleManager.stopAndRemoveStrict(container.containerId(), null);
+                } else {
+                    lifecycleManager.stopAndRemove(container.containerId(), null);
+                }
+                synchronized (registryLock) {
+                    containers.remove(key, container);
+                }
             }
         }
     }
@@ -144,5 +162,32 @@ public class PerKeyContainerPool {
                 LOG.debugv(e, "Failed to stop pooled sidecar container for key {0}", key);
             }
         });
+    }
+
+    /** Stops unprotected containers, retaining failed removals for a later teardown retry. */
+    public void stopAllStrictExcept(Set<String> protectedKeys) {
+        List<String> keys;
+        synchronized (registryLock) {
+            generation++;
+            keys = List.copyOf(containers.keySet());
+        }
+        RuntimeException failure = null;
+        for (String key : keys) {
+            if (protectedKeys.contains(key)) {
+                continue;
+            }
+            try {
+                stopContainerStrict(key);
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 }

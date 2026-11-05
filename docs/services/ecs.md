@@ -69,8 +69,11 @@ A task definition round-trips whole. Members Floci acts on are modelled
 such as `proxyConfiguration`, `ulimits`, `resourceRequirements`,
 `systemControls` and placement constraints, is kept verbatim and returned as registered. A client
 that reads back what it wrote (Terraform, or a deploy tool verifying its own
-`RegisterTaskDefinition`) sees no drift. `runtimePlatform` does not change where a local task
-runs: Floci launches every task on the host's own architecture. An `AWS::ECS::TaskDefinition` in a
+`RegisterTaskDefinition`) sees no drift. A task runs its images for the architecture its
+`runtimePlatform.cpuArchitecture` names (`X86_64` as `linux/amd64`, `ARM64` as `linux/arm64`):
+a local image built for that platform is used as is, a pull asks the registry for that platform,
+and the container is created for it, so an `X86_64` task runs under emulation on an arm64 Docker
+host. Without a `cpuArchitecture` a task runs on the Docker host's own architecture. An `AWS::ECS::TaskDefinition` in a
 CloudFormation template carries its containers' `LinuxParameters` into the same place, read as the
 ECS handler reads them (see [CloudFormation](cloudformation.md#ecs-task-definitions)), so they are
 returned in the API's shape and checked against the Fargate rules below exactly as if the task
@@ -196,6 +199,12 @@ other case, the injected `FLUENT_HOST` (the router's container IP) must be reach
 config is written to `/fluent-bit/etc/fluent-bit.conf`. Fluentd config is
 written to `/fluentd/etc/fluent.conf` and uses `@type` (not `Name`) for output plugins; Floci
 does not inject an `endpoint` into Fluentd outputs.
+FireLens uses a bounded socket-volume name derived from the complete deployment and task identity,
+while its Docker labels retain the full configured resource namespace. The inspected host socket
+path must fit Linux's 107-byte Unix socket pathname limit. An unusually long Docker data root can
+still exceed that limit; launch then fails before creating containers and retains any failed volume
+cleanup for retry. Operator-named volumes are unaffected.
+
 FireLens configuration archive uploads retry transient Docker connection failures up to six
 attempts, with exponential backoff starting at 500 ms. Each attempt sends the complete prebuilt
 archive through a fresh byte-backed stream, without a streaming pipe or writer thread.
@@ -320,8 +329,13 @@ applied without rolling anything. An update replaces only the members it names: 
 array clears a member the way AWS clears it.
 
 When a service replaces or stops a task in Docker mode, the task remains `STOPPING` until its
-containers are removed. A failed Docker removal is retried on later reconciliation ticks, so the
-task is not reported as `STOPPED` while its container may still be serving.
+containers are removed. The service scheduler runs these Docker stops in the background, up to
+eight at a time, so a container waiting out its `stopTimeout` does not hold up the reconciliation
+of other tasks and services; a `DAEMON` replacement still starts only once the task it replaces
+is `STOPPED`. A failed Docker removal is retried on later reconciliation ticks, so the task is not
+reported as `STOPPED` while its container may still be serving. `StopTask` answers once its stop
+has landed, and on a task the scheduler is already stopping it waits for that stop rather than
+starting a second one.
 
 Every `awsvpc` task gets a real ENI in the subnet it asked for, in Docker and in mock mode alike,
 and reports it as an `attachments` entry with its `networkInterfaceId`, `privateIPv4Address` and
@@ -482,8 +496,11 @@ Known differences from AWS:
 
 - There is never a second `ACTIVE` deployment draining alongside the `PRIMARY` one.
   The running tasks *are* rolled onto a changed task definition (replacements on the new
-  revision start first, then the stale tasks are drained, one reconciler tick apart), but
+  revision normally start first, then the stale tasks are drained, one reconciler tick apart), but
   the deployments list reports only the single `PRIMARY` throughout.
+  A Docker-backed `REPLICA` service with an explicit `minimumHealthyPercent: 0` stops
+  stale tasks first when their fixed published ports conflict with the replacement's ports.
+  See [stable-port replacement](#stable-port-replacement) below.
 - `deployments` is reported for every service. AWS omits it for services that use the
   `CODE_DEPLOY` or `EXTERNAL` deployment controller; Floci records and echoes
   `deploymentController` (along with `schedulingStrategy` and
@@ -494,7 +511,7 @@ Known differences from AWS:
   `CODE_DEPLOY` / `EXTERNAL` controllers, as on AWS. Placement constraints are not evaluated.
 - `pendingCount` is always `0`, matching the top-level service field.
 - `forceNewDeployment` (with an unchanged task definition) mints a new deployment `id`
-  and rolls the running tasks: a replacement on the new deployment starts first, then
+  and rolls the running tasks: a replacement on the new deployment normally starts first, then
   the task from the previous deployment is drained one reconciler tick later. The
   `deployments` list still reports a single `PRIMARY` throughout.
 - `updatedAt` starts at `createdAt` and advances when the deployment status changes.
@@ -718,7 +735,11 @@ dropping it, so a later `DescribeContainerInstances` still answers for it, as on
 
 `ListContainerInstances` defaults to every instance other than the `INACTIVE` ones, validates
 `status` against the five documented values, and pages with `maxResults` (1 to 100) and
-`nextToken`. The cluster query language `filter` is accepted and ignored.
+`nextToken`. Its `filter` supports a single `runningTasksCount` numeric comparison with
+`==`, `!=`, `>`, `>=`, `<`, `<=` or their named equivalents. Other cluster query subjects
+and compound expressions are not implemented and return `InvalidParameterException`. The
+running count in list filtering and `DescribeContainerInstances` includes tasks whose desired
+status is `RUNNING`, even while their last status is `PENDING`.
 
 `UpdateContainerInstancesState` sets only `ACTIVE` or `DRAINING`, takes at most 10 instances per
 call, and refuses to drain an instance that is not `ACTIVE` first. It and
@@ -898,6 +919,11 @@ definition sets a resolvable `taskRoleArn` gets credentials for that role the wa
 them: Floci
 writes `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` into every container in the task, pointing at one
 `/v2/credentials/{id}` path per task, and the AWS SDKs pick it up with no code change.
+
+The published path stays the same when credentials renew, including when a task first reads it
+after the previous credentials expire. Reads near expiry return a fresh session. Credentials
+already cached by another client remain valid until their original expiry; stopping the task
+revokes every generation. A deleted or recreated task role invalidates the endpoint.
 
 **A user-defined Docker network is required.** Set `FLOCI_SERVICES_ECS_DOCKER_NETWORK` to a network
 you created; the default bridge will not work. The SDKs hardcode `169.254.170.2` for this endpoint,
@@ -1092,6 +1118,33 @@ With dynamic allocation enabled, host-side clients must use each task's reported
 port. Load balancers inside Docker use the container's Docker-network address and
 container port; native load balancers use the published host port. Bridge/host-mode
 explicit bindings retain their existing fixed-port behavior.
+
+### Stable-port replacement
+
+A Docker-backed `REPLICA` service can reuse a stable published host port across
+deployments by explicitly setting `deploymentConfiguration.minimumHealthyPercent`
+to `0`. When a stale task holds a fixed port needed by the replacement, the scheduler
+stops that task before placing the replacement. This applies both to forced deployments
+of the same task definition and to task-definition changes that reuse the port.
+
+The task stays `STOPPING` until Docker confirms removal of every container and any
+security-group namespace helper that owns its published ports. Incomplete removal is
+retried on later ticks. Stops run in the background so a slow graceful stop
+does not hold up unrelated services. Task protection still applies: a protected stale
+task keeps its port and delays replacement until its protection expires or is disabled.
+
+For `awsvpc`, stable ports require `FLOCI_SERVICES_ECS_PUBLISH_AWSVPC_PORTS_TO_HOST=true`
+and `FLOCI_SERVICES_ECS_DYNAMIC_AWSVPC_HOST_PORTS=false`. An explicit non-zero
+`hostPort` is stable, and an omitted or zero `hostPort` uses `containerPort`. Explicit
+fixed bindings in bridge/host modes can also be reused this way. Dynamic ports and
+nonconflicting port changes keep the replacement-first behavior, as do services with
+positive or omitted minima. `DAEMON` scheduling is unchanged.
+Collision detection follows the actual Docker publisher, which currently publishes
+every mapping as TCP: changing a declared protocol alone does not free the host port.
+
+This permits an outage at the stable endpoint. Zero is a minimum healthy percentage,
+not a general requirement for AWS to stop tasks first. Floci does not implement the
+full percentage-based deployment scheduler.
 
 ## Examples
 
