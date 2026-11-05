@@ -1,13 +1,16 @@
 package io.github.hectorvent.floci.services.redshift;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.redshift.model.Cluster;
 import io.github.hectorvent.floci.services.redshift.model.ClusterParameterGroup;
 import io.github.hectorvent.floci.services.redshift.model.ClusterSubnetGroup;
 import io.github.hectorvent.floci.services.redshift.model.Endpoint;
+import io.github.hectorvent.floci.services.redshift.model.EventSubscription;
 import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import io.github.hectorvent.floci.services.redshift.model.Snapshot;
 import io.github.hectorvent.floci.services.redshift.model.SnapshotCopyGrant;
@@ -31,6 +34,100 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
 class RedshiftQueryHandlerTest {
+
+    @Test
+    void pauseAndResumeRequireClusterIdentifier() {
+        for (String action : List.of("PauseCluster", "ResumeCluster")) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> handler.handle(action, new MultivaluedHashMap<>()));
+            assertEquals("InvalidParameterValue", error.getErrorCode());
+        }
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void pauseAndResumeUseAwsQueryClusterWrappersAndNamespace() {
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("warehouse");
+        cluster.setClusterStatus("paused");
+        when(service.pauseCluster("warehouse")).thenReturn(cluster);
+        when(service.resumeCluster("warehouse")).thenReturn(cluster);
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "warehouse");
+        for (String action : List.of("PauseCluster", "ResumeCluster")) {
+            Response response = handler.handle(action, params);
+            assertEquals(200, response.getStatus());
+            String xml = response.getEntity().toString();
+            assertTrue(xml.contains("<" + action + "Response xmlns=\"" + AwsNamespaces.REDSHIFT + "\">"));
+            assertTrue(xml.contains("<" + action + "Result><Cluster>"));
+            assertTrue(xml.contains("<ClusterIdentifier>warehouse</ClusterIdentifier>"));
+        }
+        verify(service).pauseCluster("warehouse");
+        verify(service).resumeCluster("warehouse");
+    }
+
+    @Test
+    void eventSubscriptionResponsesUseTheRedshiftNamespace() {
+        EventSubscription subscription = new EventSubscription();
+        subscription.setCustSubscriptionId("watcher");
+        subscription.setSubscriptionCreationTime(Instant.parse("2026-10-26T12:00:00Z"));
+        when(service.createEventSubscription(any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(subscription);
+        Response response = handler.handle("CreateEventSubscription", new MultivaluedHashMap<>());
+        assertTrue(response.getEntity().toString().contains(
+                "<CreateEventSubscriptionResponse xmlns=\"" + AwsNamespaces.REDSHIFT + "\">"));
+    }
+
+    @Test
+    void nonFiniteEventTimestampsReturnAnAwsValidationError() {
+        for (String invalid : List.of("NaN", "Infinity", "-Infinity", "1e300")) {
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("StartTime", invalid);
+            AwsException error = assertThrows(AwsException.class, () -> handler.handle("DescribeEvents", params));
+            assertEquals("InvalidParameterValue", error.getErrorCode());
+        }
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void modifyClusterIamRolesParsesAndReturnsDefaultRole() {
+        String role = "arn:aws:iam::111111111111:role/default";
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "c1");
+        params.putSingle("AddIamRoles.IamRoleArn.1", role);
+        params.putSingle("DefaultIamRoleArn", role);
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("c1");
+        cluster.setDefaultIamRoleArn(role);
+        when(service.modifyClusterIamRoles("c1", List.of(role), List.of(), role)).thenReturn(cluster);
+
+        Response response = handler.handle("ModifyClusterIamRoles", params);
+
+        verify(service).modifyClusterIamRoles("c1", List.of(role), List.of(), role);
+        assertTrue(response.getEntity().toString().contains("<DefaultIamRoleArn>" + role + "</DefaultIamRoleArn>"));
+    }
+
+    @Test
+    void createClusterPassesDefaultRoleToService() {
+        String role = "arn:aws:iam::111111111111:role/default";
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "c1");
+        params.putSingle("NodeType", "dc2.large");
+        params.putSingle("MasterUsername", "admin");
+        params.putSingle("MasterUserPassword", "pw");
+        params.putSingle("IamRoles.IamRoleArn.1", role);
+        params.putSingle("DefaultIamRoleArn", role);
+        Cluster cluster = new Cluster();
+        cluster.setClusterIdentifier("c1");
+        cluster.setDefaultIamRoleArn(role);
+        when(service.createCluster("c1", "dc2.large", "admin", "pw", null, List.of(), List.of(role), role))
+                .thenReturn(cluster);
+
+        Response response = handler.handle("CreateCluster", params);
+
+        assertTrue(response.getEntity().toString().contains("<DefaultIamRoleArn>" + role + "</DefaultIamRoleArn>"));
+        verify(service).createCluster("c1", "dc2.large", "admin", "pw", null, List.of(), List.of(role), role);
+    }
 
     private RedshiftQueryHandler handler;
     private RedshiftService service;
@@ -288,7 +385,7 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("test-cluster");
         cluster.setClusterStatus("available");
-        when(service.createCluster(any(), any(), any(), any(), any(), any())).thenReturn(cluster);
+        when(service.createCluster(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(cluster);
 
         Response response = handler.handle("CreateCluster", params);
 
@@ -314,7 +411,7 @@ class RedshiftQueryHandlerTest {
         cluster.setClusterStatus("available");
         cluster.setMasterPasswordSecretArn("arn:aws:secretsmanager:us-east-1:acc:secret:redshift-managed");
         cluster.setMasterPasswordSecretKmsKeyId("arn:aws:kms:us-east-1:acc:key/key-1");
-        when(service.createClusterWithManagedMasterPassword(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(service.createClusterWithManagedMasterPassword(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(cluster);
 
         Response response = handler.handle("CreateCluster", params,
@@ -327,7 +424,7 @@ class RedshiftQueryHandlerTest {
         assertFalse(xml.contains("<MasterUserSecret>"));
         verify(service).createClusterWithManagedMasterPassword(eq("managed-cluster"), eq("dc2.large"),
                 eq("admin"), isNull(), eq(List.of()), eq(List.of()),
-                eq("arn:aws:kms:us-east-1:acc:key/key-1"), eq("us-east-1"));
+                eq("arn:aws:kms:us-east-1:acc:key/key-1"), eq("us-east-1"), isNull());
     }
 
     @Test
@@ -343,13 +440,13 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("test-cluster");
         cluster.setClusterStatus("available");
-        when(service.createCluster(any(), any(), any(), any(), any(), any(), any())).thenReturn(cluster);
+        when(service.createCluster(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(cluster);
 
         handler.handle("CreateCluster", params);
 
         verify(service).createCluster(eq("test-cluster"), eq("dc2.large"), eq("admin"), eq("password123"),
                 isNull(), eq(List.of()), eq(List.of("arn:aws:iam::000000000000:role/first",
-                        "arn:aws:iam::000000000000:role/second")));
+                        "arn:aws:iam::000000000000:role/second")), isNull());
     }
     
     @Test
@@ -392,7 +489,7 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("test-cluster");
         cluster.setClusterStatus("creating");
-        when(service.createCluster(any(), any(), any(), any(), any(), any())).thenReturn(cluster);
+        when(service.createCluster(any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(cluster);
 
         Response response = handler.handle("CreateCluster", params);
         String xml = (String) response.getEntity();
@@ -422,7 +519,7 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("test-cluster");
         cluster.setClusterStatus("deleting");
-        when(service.deleteCluster(any())).thenReturn(cluster);
+        when(service.deleteCluster("test-cluster", null, null, null)).thenReturn(cluster);
 
         Response response = handler.handle("DeleteCluster", params);
         assertEquals(200, response.getStatus());
@@ -449,10 +546,27 @@ class RedshiftQueryHandlerTest {
         assertTrue(xml.contains("<Port>5439</Port>"));
         assertTrue(xml.contains("<MasterUsername>admin</MasterUsername>"));
         assertTrue(xml.contains("<RequestId>test-req-id</RequestId>"));
+        assertTrue(xml.contains("<ManualSnapshotRetentionPeriod>-1</ManualSnapshotRetentionPeriod>"));
         // A Snapshot built via this constructor carries no ARN/CreateTime; the elements
         // must be omitted rather than serialized as empty or "null".
         assertFalse(xml.contains("<SnapshotArn>"));
         assertFalse(xml.contains("<SnapshotCreateTime>"));
+    }
+
+    @Test
+    void describeLegacySnapshotsDefaultsMissingAndNullRetention() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        for (String json : List.of("{\"snapshotIdentifier\":\"legacy\"}",
+                "{\"snapshotIdentifier\":\"legacy\",\"manualSnapshotRetentionPeriod\":null}")) {
+            Snapshot snapshot = mapper.readValue(json, Snapshot.class);
+            when(service.describeSnapshots("legacy", null)).thenReturn(List.of(snapshot));
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("SnapshotIdentifier", "legacy");
+
+            String xml = handler.handle("DescribeClusterSnapshots", params).getEntity().toString();
+
+            assertTrue(xml.contains("<ManualSnapshotRetentionPeriod>-1</ManualSnapshotRetentionPeriod>"));
+        }
     }
 
     @Test
@@ -483,7 +597,7 @@ class RedshiftQueryHandlerTest {
         params.putSingle("SnapshotIdentifier", "test-snapshot");
 
         Snapshot snapshot = new Snapshot("test-snapshot", "test-cluster", "deleted", 5439, "admin");
-        when(service.deleteSnapshot("test-snapshot")).thenReturn(snapshot);
+        when(service.deleteSnapshot("test-snapshot", null)).thenReturn(snapshot);
 
         Response response = handler.handle("DeleteClusterSnapshot", params);
         assertEquals(200, response.getStatus());
@@ -505,7 +619,7 @@ class RedshiftQueryHandlerTest {
         cluster.setMasterUsername("admin");
         cluster.setClusterStatus("available");
         cluster.setEndpoint(new Endpoint("localhost", 5439));
-        when(service.restoreFromClusterSnapshot("restored-cluster", "test-snapshot", "dc2.large")).thenReturn(cluster);
+        when(service.restoreFromClusterSnapshot("restored-cluster", "test-snapshot", null, "dc2.large")).thenReturn(cluster);
 
         Response response = handler.handle("RestoreFromClusterSnapshot", params);
         assertEquals(200, response.getStatus());
@@ -522,11 +636,11 @@ class RedshiftQueryHandlerTest {
         params.putSingle("ClusterIdentifier", "restored-cluster");
         params.putSingle("SnapshotArn", "arn:aws:redshift:us-east-1:acc:snapshot:src/my-snap");
         Cluster cluster = availableCluster("restored-cluster");
-        when(service.restoreFromClusterSnapshot("restored-cluster", "my-snap", null)).thenReturn(cluster);
+        when(service.restoreFromClusterSnapshot("restored-cluster", "my-snap", "src", null)).thenReturn(cluster);
 
         Response response = handler.handle("RestoreFromClusterSnapshot", params, "auth");
         assertEquals(200, response.getStatus());
-        verify(service).restoreFromClusterSnapshot("restored-cluster", "my-snap", null);
+        verify(service).restoreFromClusterSnapshot("restored-cluster", "my-snap", "src", null);
     }
 
     @Test
@@ -560,7 +674,7 @@ class RedshiftQueryHandlerTest {
         AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("RestoreFromClusterSnapshot", params, "auth"));
         assertEquals("ClusterSnapshotNotFound", ex.getErrorCode());
-        verify(service, never()).restoreFromClusterSnapshot(any(), any(), any());
+        verify(service, never()).restoreFromClusterSnapshot(any(), any(), any(), any());
     }
 
     @Test
@@ -574,7 +688,59 @@ class RedshiftQueryHandlerTest {
                 () -> handler.handle("RestoreFromClusterSnapshot", params, "auth"));
         assertEquals("InvalidParameterCombination", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
-        verify(service, never()).restoreFromClusterSnapshot(any(), any(), any());
+        verify(service, never()).restoreFromClusterSnapshot(any(), any(), any(), any());
+    }
+
+    /** The cluster a request is authorized on, snapshot:<cluster>/<name>, is the one its snapshot must be of. */
+    @Test
+    void deleteClusterSnapshotPassesTheClusterItNamesTheSnapshotBy() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("SnapshotIdentifier", "test-snapshot");
+        params.putSingle("SnapshotClusterIdentifier", "prod");
+        Snapshot snapshot = new Snapshot("test-snapshot", "prod", "deleted", 5439, "admin");
+        when(service.deleteSnapshot("test-snapshot", "prod")).thenReturn(snapshot);
+
+        assertEquals(200, handler.handle("DeleteClusterSnapshot", params).getStatus());
+        verify(service).deleteSnapshot("test-snapshot", "prod");
+    }
+
+    @Test
+    void restoreFromClusterSnapshotPassesTheClusterItNamesTheSnapshotBy() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "restored-cluster");
+        params.putSingle("SnapshotIdentifier", "test-snapshot");
+        params.putSingle("SnapshotClusterIdentifier", "prod");
+        when(service.restoreFromClusterSnapshot("restored-cluster", "test-snapshot", "prod", null))
+                .thenReturn(availableCluster("restored-cluster"));
+
+        assertEquals(200, handler.handle("RestoreFromClusterSnapshot", params, "auth").getStatus());
+        verify(service).restoreFromClusterSnapshot("restored-cluster", "test-snapshot", "prod", null);
+    }
+
+    @Test
+    void restoreFromClusterSnapshotNamingTwoClustersIsNotFound() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "restored-cluster");
+        params.putSingle("SnapshotArn", "arn:aws:redshift:us-east-1:acc:snapshot:src/my-snap");
+        params.putSingle("SnapshotClusterIdentifier", "other");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RestoreFromClusterSnapshot", params, "auth"));
+        assertEquals("ClusterSnapshotNotFound", ex.getErrorCode());
+        assertEquals(404, ex.getHttpStatus());
+        verify(service, never()).restoreFromClusterSnapshot(any(), any(), any(), any());
+    }
+
+    @Test
+    void restoreFromClusterSnapshotArnWithoutAClusterIsNotFound() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("ClusterIdentifier", "restored-cluster");
+        params.putSingle("SnapshotArn", "arn:aws:redshift:us-east-1:acc:snapshot:/my-snap");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> handler.handle("RestoreFromClusterSnapshot", params, "auth"));
+        assertEquals("ClusterSnapshotNotFound", ex.getErrorCode());
+        verify(service, never()).restoreFromClusterSnapshot(any(), any(), any(), any());
     }
 
     @Test
@@ -678,14 +844,14 @@ class RedshiftQueryHandlerTest {
         params.putSingle("SubnetIds.SubnetIdentifier.2", "subnet-bbb");
 
         ClusterSubnetGroup group = new ClusterSubnetGroup("test-sng", "desc", null, List.of("subnet-aaa", "subnet-bbb"));
-        when(service.createClusterSubnetGroup(any(), any(), any(), any())).thenReturn(group);
+        when(service.createClusterSubnetGroup(any(), any(), any(), any(), any())).thenReturn(group);
 
         Response response = handler.handle("CreateClusterSubnetGroup", params);
         assertEquals(200, response.getStatus());
 
         @SuppressWarnings("unchecked")
         ArgumentCaptor<List<String>> captor = ArgumentCaptor.forClass(List.class);
-        verify(service).createClusterSubnetGroup(eq("test-sng"), eq("desc"), any(), captor.capture());
+        verify(service).createClusterSubnetGroup(eq("test-sng"), eq("desc"), any(), captor.capture(), any());
         assertEquals(List.of("subnet-aaa", "subnet-bbb"), captor.getValue());
     }
 
@@ -815,13 +981,13 @@ class RedshiftQueryHandlerTest {
         Cluster cluster = new Cluster();
         cluster.setClusterIdentifier("c1");
         cluster.setIamRoleArns(List.of("arn:aws:iam::111111111111:role/a"));
-        when(service.modifyClusterIamRoles(eq("c1"), any(), any())).thenReturn(cluster);
+        when(service.modifyClusterIamRoles(eq("c1"), any(), any(), isNull())).thenReturn(cluster);
 
         Response response = handler.handle("ModifyClusterIamRoles", params);
 
         assertEquals(200, response.getStatus());
         verify(service).modifyClusterIamRoles("c1",
-                List.of("arn:aws:iam::111111111111:role/a"), List.of("arn:aws:iam::111111111111:role/b"));
+                List.of("arn:aws:iam::111111111111:role/a"), List.of("arn:aws:iam::111111111111:role/b"), null);
         String body = response.getEntity().toString();
         assertTrue(body.contains("<ModifyClusterIamRolesResult>"));
         assertTrue(body.contains("<IamRoleArn>arn:aws:iam::111111111111:role/a</IamRoleArn>"));

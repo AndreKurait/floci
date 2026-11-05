@@ -19,6 +19,7 @@ import java.security.SecureRandom;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 /**
  * Owns the PostgreSQL container and the auth proxy behind a workgroup endpoint.
@@ -35,6 +36,9 @@ public class RedshiftServerlessRuntime {
     private static final String PASSWORD_ALPHABET =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     private static final int GENERATED_PASSWORD_LENGTH = 32;
+    private static final Pattern HAS_UPPERCASE = Pattern.compile("[A-Z]");
+    private static final Pattern HAS_LOWERCASE = Pattern.compile("[a-z]");
+    private static final Pattern HAS_DIGIT = Pattern.compile("[0-9]");
 
     /** The namespace admin pair as it stands now; read on every login so a password change applies at once. */
     public record AdminCredentials(String username, String password) {
@@ -63,8 +67,8 @@ public class RedshiftServerlessRuntime {
 
     /**
      * Starts (or, when {@code adopt} is set, re-attaches to) the container and fronts it with the
-     * auth proxy on {@code endpoint}. Anything started before a failure is torn down again, so a
-     * failed call leaves neither a container nor a bound port behind.
+     * auth proxy on {@code endpoint}. Failed startup removes newly created containers and closes
+     * the proxy; adopted containers are preserved for another recovery attempt.
      */
     public Backend start(String accountId, String region, String workgroupName, String masterUsername,
                          String masterPassword, String dbName, Endpoint endpoint, boolean adopt,
@@ -72,8 +76,8 @@ public class RedshiftServerlessRuntime {
         String backendId = backendId(region, workgroupName);
         try {
             RedshiftContainerHandle handle = adopt
-                    ? containerManager.adoptOrStart(accountId, backendId, masterUsername, masterPassword, dbName)
-                    : containerManager.start(accountId, backendId, masterUsername, masterPassword, dbName);
+                    ? containerManager.adoptOrStart(accountId, backendId, masterUsername, masterPassword, dbName, "serverless")
+                    : containerManager.start(accountId, backendId, masterUsername, masterPassword, dbName, "serverless");
             proxyManager.startProxy(relayKey(accountId, backendId), endpoint.getPort(),
                     handle.getHost(), handle.getPort(), endpoint.getAddress(),
                     masterUsername, masterPassword, dbName,
@@ -99,6 +103,12 @@ public class RedshiftServerlessRuntime {
      */
     public void restoreSnapshot(String accountId, String region, String workgroupName, String masterUsername,
                                 String dbName, Path dumpFile) {
+        restoreSnapshot(accountId, region, workgroupName, masterUsername, dbName, dumpFile, () -> { });
+    }
+
+    /** Keeps the safety dump until the namespace's credentials and metadata have also committed. */
+    public void restoreSnapshot(String accountId, String region, String workgroupName, String masterUsername,
+                                String dbName, Path dumpFile, Runnable afterRestore) {
         String backendId = backendId(region, workgroupName);
         Path safety;
         try {
@@ -112,6 +122,7 @@ public class RedshiftServerlessRuntime {
             try {
                 containerManager.resetUserSchemas(accountId, backendId, masterUsername, dbName);
                 containerManager.restoreSnapshot(accountId, backendId, masterUsername, dbName, dumpFile, true);
+                afterRestore.run();
             } catch (RuntimeException e) {
                 rollBackRestore(accountId, backendId, masterUsername, dbName, safety, e);
                 throw e;
@@ -192,11 +203,30 @@ public class RedshiftServerlessRuntime {
     }
 
     public String generatePassword() {
-        StringBuilder password = new StringBuilder(GENERATED_PASSWORD_LENGTH);
+        return generatePassword(this::randomPasswordCandidate);
+    }
+
+    String generatePassword(Supplier<String> candidateSupplier) {
+        String password;
+        do {
+            password = candidateSupplier.get();
+        } while (!isValidPassword(password));
+        return password;
+    }
+
+    private String randomPasswordCandidate() {
+        StringBuilder sb = new StringBuilder(GENERATED_PASSWORD_LENGTH);
         for (int i = 0; i < GENERATED_PASSWORD_LENGTH; i++) {
-            password.append(PASSWORD_ALPHABET.charAt(random.nextInt(PASSWORD_ALPHABET.length())));
+            sb.append(PASSWORD_ALPHABET.charAt(random.nextInt(PASSWORD_ALPHABET.length())));
         }
-        return password.toString();
+        return sb.toString();
+    }
+
+    static boolean isValidPassword(String password) {
+        return password != null
+                && HAS_UPPERCASE.matcher(password).find()
+                && HAS_LOWERCASE.matcher(password).find()
+                && HAS_DIGIT.matcher(password).find();
     }
 
     private void rollback(String accountId, String backendId) {
@@ -206,7 +236,7 @@ public class RedshiftServerlessRuntime {
             LOG.warnv(e, "Could not stop the proxy while rolling back workgroup backend {0}", backendId);
         }
         try {
-            containerManager.stop(accountId, backendId);
+            containerManager.rollbackStartup(accountId, backendId);
         } catch (RuntimeException e) {
             LOG.warnv(e, "Could not remove the container while rolling back workgroup backend {0}", backendId);
         }

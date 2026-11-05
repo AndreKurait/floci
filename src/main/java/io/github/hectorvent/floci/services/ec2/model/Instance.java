@@ -19,6 +19,10 @@ public class Instance {
     private String stateTransitionReason;
     private String instanceType;
     private boolean spot;
+    private String capacityReservationPlatform = "Linux/UNIX";
+    private String capacityReservationPreference = "open";
+    private String capacityReservationTarget;
+    private String capacityReservationGroupArn;
     private Placement placement;
     private String subnetId;
     private String vpcId;
@@ -88,6 +92,11 @@ public class Instance {
      * registered so metadata answers either way.
      */
     private String imdsSourceIp;
+    /**
+     * The instance's address on Floci's own Docker network, recorded at launch, start and
+     * restore when {@code publicIpFromServiceNetwork} is on, so reporting it needs no Docker call.
+     */
+    private String serviceNetworkIp;
     private String userData;
     private String encodedUserData;
     private int sshHostPort;
@@ -106,10 +115,27 @@ public class Instance {
     public void setImageId(String imageId) { this.imageId = imageId; }
 
     public InstanceState getState() { return state; }
-    public void setState(InstanceState state) { this.state = state; }
+    public synchronized void setState(InstanceState state) { this.state = state; }
+
+    public synchronized boolean compareAndSetState(InstanceState expected, InstanceState updated) {
+        if (state != expected) {
+            return false;
+        }
+        state = updated;
+        return true;
+    }
 
     public String getStateTransitionReason() { return stateTransitionReason; }
     public void setStateTransitionReason(String stateTransitionReason) { this.stateTransitionReason = stateTransitionReason; }
+
+    public String getCapacityReservationPlatform() { return capacityReservationPlatform; }
+    public void setCapacityReservationPlatform(String platform) { capacityReservationPlatform = platform; }
+    public String getCapacityReservationPreference() { return capacityReservationPreference; }
+    public void setCapacityReservationPreference(String preference) { capacityReservationPreference = preference; }
+    public String getCapacityReservationTarget() { return capacityReservationTarget; }
+    public void setCapacityReservationTarget(String target) { capacityReservationTarget = target; }
+    public String getCapacityReservationGroupArn() { return capacityReservationGroupArn; }
+    public void setCapacityReservationGroupArn(String arn) { capacityReservationGroupArn = arn; }
 
     public boolean isSpot() { return spot; }
     public void setSpot(boolean spot) { this.spot = spot; }
@@ -227,6 +253,9 @@ public class Instance {
 
     public String getContainerBridgeIp() { return containerBridgeIp; }
     public void setContainerBridgeIp(String containerBridgeIp) { this.containerBridgeIp = containerBridgeIp; }
+
+    public String getServiceNetworkIp() { return serviceNetworkIp; }
+    public void setServiceNetworkIp(String serviceNetworkIp) { this.serviceNetworkIp = serviceNetworkIp; }
 
     public String getImdsSourceIp() { return imdsSourceIp; }
     public void setImdsSourceIp(String imdsSourceIp) { this.imdsSourceIp = imdsSourceIp; }

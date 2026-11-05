@@ -28,6 +28,8 @@ import io.github.hectorvent.floci.services.s3.model.Bucket;
 import io.github.hectorvent.floci.services.s3.model.ObjectAnnotation;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
+import io.github.hectorvent.floci.services.sns.SnsService;
+import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.quarkus.test.junit.QuarkusTest;
 import io.vertx.core.Vertx;
 import jakarta.enterprise.event.Event;
@@ -105,9 +107,9 @@ class DynamoDbStreamsEventSourcePollerTest {
     private EsmStore esmStore;
     private EmulatorConfig config;
     private PipesFilterMatcher filterMatcher;
-    private io.github.hectorvent.floci.services.sqs.SqsService sqsService;
-    private io.github.hectorvent.floci.services.sns.SnsService snsService;
-    private io.github.hectorvent.floci.services.s3.S3Service s3Service;
+    private SqsService sqsService;
+    private SnsService snsService;
+    private S3Service s3Service;
     private final AtomicLong clock = new AtomicLong();
     private final AtomicLong sequence = new AtomicLong();
 
@@ -133,9 +135,9 @@ class DynamoDbStreamsEventSourcePollerTest {
         aliasStore = mock(LambdaAliasStore.class);
         esmStore = new EsmStore(new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, ACCOUNT_ID));
         filterMatcher = new PipesFilterMatcher(OBJECT_MAPPER);
-        sqsService = mock(io.github.hectorvent.floci.services.sqs.SqsService.class);
-        snsService = mock(io.github.hectorvent.floci.services.sns.SnsService.class);
-        s3Service = mock(io.github.hectorvent.floci.services.s3.S3Service.class);
+        sqsService = mock(SqsService.class);
+        snsService = mock(SnsService.class);
+        s3Service = mock(S3Service.class);
 
         poller = pollerOver(reader, esmStore);
     }
@@ -409,14 +411,14 @@ class DynamoDbStreamsEventSourcePollerTest {
     void versionQualifiedMappingInvokesThatVersion() {
         stubTrimHorizon(List.of(ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}")));
         LambdaFunction version1 = stubVersion("1");
-        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("1")))
                 .thenReturn(new InvokeResult());
         EventSourceMapping esm = filterEsm();
         esm.setFunctionArn("arn:aws:lambda:us-east-1:" + ACCOUNT_ID + ":function:fn:1");
 
         pollerWith(mock(EsmStore.class)).pollAndInvoke(esm);
 
-        verify(executorService, timeout(2000)).invoke(eq(version1), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(executorService, timeout(2000)).invoke(eq(version1), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("1"));
     }
 
     @Test
@@ -428,14 +430,14 @@ class DynamoDbStreamsEventSourcePollerTest {
         alias.setFunctionName("fn");
         alias.setFunctionVersion("2");
         when(aliasStore.getForAccount(ACCOUNT_ID, "us-east-1", "fn", "live")).thenReturn(Optional.of(alias));
-        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("live")))
                 .thenReturn(new InvokeResult());
         EventSourceMapping esm = filterEsm();
         esm.setFunctionArn("arn:aws:lambda:us-east-1:" + ACCOUNT_ID + ":function:fn:live");
 
         pollerWith(mock(EsmStore.class)).pollAndInvoke(esm);
 
-        verify(executorService, timeout(2000)).invoke(eq(version2), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(executorService, timeout(2000)).invoke(eq(version2), any(byte[].class), eq(InvocationType.RequestResponse), eq(0), eq("live"));
     }
 
     private LambdaFunction stubVersion(String version) {
@@ -946,8 +948,8 @@ class DynamoDbStreamsEventSourcePollerTest {
                 invocation -> requestContextInstance.get().getAccountId());
         s3Service = new S3Service(
                 storageFactory, config,
-                mock(io.github.hectorvent.floci.services.sqs.SqsService.class),
-                mock(io.github.hectorvent.floci.services.sns.SnsService.class),
+                mock(SqsService.class),
+                mock(SnsService.class),
                 mock(Instance.class), mock(EventBridgeService.class), mock(Event.class),
                 regionResolver, OBJECT_MAPPER, mock(IamService.class));
 

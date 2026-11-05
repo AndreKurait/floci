@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsEventStreamEncoder;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisConsumer;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisShard;
@@ -244,17 +245,26 @@ public class KinesisJsonHandler {
             throw invalidNextToken();
         }
         String after = token.isTextual() ? streamCursorFromToken(decodeNextToken(token.textValue()), region) : startName;
-        List<String> streamNames = service.listStreams(region).stream()
-                .filter(name -> after == null || name.compareTo(after) > 0)
+        List<KinesisStream> streams = service.listStreamDetails(region).stream()
+                .filter(stream -> after == null || stream.getStreamName().compareTo(after) > 0)
                 .toList();
-        List<String> page = streamNames.stream().limit(limit).toList();
+        List<KinesisStream> page = streams.stream().limit(limit).toList();
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode names = response.putArray("StreamNames");
-        page.forEach(names::add);
-        response.put("HasMoreStreams", streamNames.size() > limit);
-        if (streamNames.size() > limit) {
+        ArrayNode summaries = response.putArray("StreamSummaries");
+        for (KinesisStream stream : page) {
+            names.add(stream.getStreamName());
+            ObjectNode summary = summaries.addObject();
+            summary.put("StreamName", stream.getStreamName());
+            summary.put("StreamARN", stream.getStreamArn());
+            summary.put("StreamStatus", stream.getStreamStatus());
+            addStreamModeDetailsNode(summary, stream);
+            summary.put("StreamCreationTimestamp", epochSeconds(stream.getStreamCreationTimestamp()));
+        }
+        response.put("HasMoreStreams", streams.size() > limit);
+        if (streams.size() > limit) {
             response.put("NextToken", encodeNextToken("ListStreams|" + region,
-                    Base64Url.encode(page.getLast()), System.currentTimeMillis()));
+                    Base64Url.encode(page.getLast().getStreamName()), System.currentTimeMillis()));
         }
         return Response.ok(response).build();
     }
@@ -264,7 +274,7 @@ public class KinesisJsonHandler {
             throw invalidNextToken();
         }
         try {
-            String cursor = new String(Base64.getUrlDecoder().decode(token.cursor()), StandardCharsets.UTF_8);
+            String cursor = Base64Url.decode(token.cursor());
             if (!Base64Url.encode(cursor).equals(token.cursor())) {
                 throw invalidNextToken();
             }
@@ -408,7 +418,7 @@ public class KinesisJsonHandler {
         List<KinesisRecord> records = (List<KinesisRecord>) result.get("Records");
         long millisBehind = ((Number) result.get("MillisBehindLatest")).longValue();
 
-        String continuationSeqNo = records.isEmpty() ? null
+        String continuationSeqNo = result.get("NextShardIterator") == null || records.isEmpty() ? null
                 : records.get(records.size() - 1).getSequenceNumber();
 
         ObjectNode eventPayload = objectMapper.createObjectNode();
@@ -426,7 +436,7 @@ public class KinesisJsonHandler {
             eventPayload.put("ContinuationSequenceNumber", continuationSeqNo);
         }
         eventPayload.put("MillisBehindLatest", millisBehind);
-        eventPayload.putArray("ChildShards");
+        writeChildShards(eventPayload, result);
 
         try {
             // The Go SDK (and other SDKs) expect an initial-response message before
@@ -462,7 +472,7 @@ public class KinesisJsonHandler {
         node.put("ConsumerName", c.getConsumerName());
         node.put("ConsumerARN", c.getConsumerArn());
         node.put("ConsumerStatus", c.getConsumerStatus());
-        node.put("ConsumerCreationTimestamp", c.getConsumerCreationTimestamp().toEpochMilli() / 1000.0);
+        node.put("ConsumerCreationTimestamp", EpochSeconds.fromInstant(c.getConsumerCreationTimestamp()));
         if (c.getStreamArn() != null) {
             node.put("StreamARN", c.getStreamArn());
         }
@@ -689,13 +699,13 @@ public class KinesisJsonHandler {
         if (request.has("Timestamp") && !request.path("Timestamp").isNull()) {
             JsonNode tsNode = request.path("Timestamp");
             if (!tsNode.isNumber()) {
-                throw new io.github.hectorvent.floci.core.common.AwsException("InvalidArgumentException",
+                throw new AwsException("InvalidArgumentException",
                         "Timestamp must be a number (epoch seconds)", 400);
             }
             timestampMillis = Math.round(tsNode.asDouble() * 1000);
         }
         if ("AT_TIMESTAMP".equals(type) && timestampMillis == null) {
-            throw new io.github.hectorvent.floci.core.common.AwsException("InvalidArgumentException",
+            throw new AwsException("InvalidArgumentException",
                     "ShardIteratorType AT_TIMESTAMP requires a Timestamp", 400);
         }
 
@@ -726,8 +736,27 @@ public class KinesisJsonHandler {
             }
         }
         response.put("NextShardIterator", (String) result.get("NextShardIterator"));
+        writeChildShards(response, result);
         response.put("MillisBehindLatest", ((Number) result.get("MillisBehindLatest")).longValue());
         return Response.ok(response).build();
+    }
+
+    @SuppressWarnings("unchecked")
+    private void writeChildShards(ObjectNode response, Map<String, Object> result) {
+        List<KinesisService.ChildShard> children = (List<KinesisService.ChildShard>) result.get("ChildShards");
+        if (children == null) {
+            return;
+        }
+        ArrayNode childNodes = response.putArray("ChildShards");
+        for (KinesisService.ChildShard child : children) {
+            ObjectNode node = childNodes.addObject();
+            node.put("ShardId", child.shardId());
+            ArrayNode parents = node.putArray("ParentShards");
+            child.parentShards().forEach(parents::add);
+            node.putObject("HashKeyRange")
+                    .put("StartingHashKey", child.hashKeyRange().startingHashKey())
+                    .put("EndingHashKey", child.hashKeyRange().endingHashKey());
+        }
     }
 
     private Response handleIncreaseStreamRetentionPeriod(JsonNode request, String region) {
@@ -815,7 +844,7 @@ public class KinesisJsonHandler {
         }
         String decoded;
         try {
-            decoded = new String(Base64.getUrlDecoder().decode(nextToken), StandardCharsets.UTF_8);
+            decoded = Base64Url.decode(nextToken);
         } catch (IllegalArgumentException e) {
             throw invalidNextToken();
         }

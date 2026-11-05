@@ -1,11 +1,14 @@
 package io.github.hectorvent.floci.services.msk;
 
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.JsonPath;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
@@ -225,8 +228,33 @@ class MskControllerIntegrationTest {
         .then()
             .statusCode(200)
             .body("clusterInfo.enhancedMonitoring", equalTo("DEFAULT"))
-            .body("clusterInfo.encryptionInfo.encryptionInTransit.clientBroker", equalTo("TLS_PLAINTEXT"))
+            .body("clusterInfo.encryptionInfo.encryptionInTransit.clientBroker", equalTo("TLS"))
             .body("clusterInfo.encryptionInfo.encryptionInTransit.inCluster", equalTo(true));
+    }
+
+    // An explicitly requested clientBroker is echoed as-is, including TLS_PLAINTEXT, which is
+    // now different from the default rather than the default itself.
+    @Test
+    void createClusterV1EchoesAnExplicitEncryptionInTransitClientBroker() {
+        String clusterArn = given()
+            .contentType("application/json")
+            .body("""
+                {"clusterName": "v1-explicit-client-broker-test", "kafkaVersion": "3.6.0",
+                 "numberOfBrokerNodes": 1,
+                 "encryptionInfo": {"encryptionInTransit": {"clientBroker": "TLS_PLAINTEXT"}}}
+                """)
+        .when()
+            .post("/v1/clusters")
+        .then()
+            .statusCode(200)
+            .extract().path("clusterArn");
+
+        given()
+        .when()
+            .get("/v1/clusters/{clusterArn}", clusterArn)
+        .then()
+            .statusCode(200)
+            .body("clusterInfo.encryptionInfo.encryptionInTransit.clientBroker", equalTo("TLS_PLAINTEXT"));
     }
 
     // The v2 ClusterInfo is not the flat v1 shape: everything provisioned-specific nests under
@@ -1220,5 +1248,146 @@ class MskControllerIntegrationTest {
         .then()
             .statusCode(400)
             .body("message", containsString("Exactly one"));
+    }
+
+
+    private String createScramKey() {
+        return given()
+                .contentType("application/x-amz-json-1.1")
+                .header("X-Amz-Target", "TrentService.CreateKey")
+                .body(Map.of())
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract().path("KeyMetadata.Arn");
+    }
+
+    @Test
+    void batchAssociateScramSecret() {
+        String clusterArn = createScramCluster();
+        String secretArn = createScramSecret();
+
+        given()
+            .contentType("application/json")
+            .body(Map.of("secretArnList", List.of(secretArn)))
+        .when()
+            .post("/v1/clusters/{clusterArn}/scram-secrets", clusterArn)
+        .then()
+            .statusCode(200)
+            .body("clusterArn", equalTo(clusterArn))
+            .body("unprocessedScramSecrets", empty());
+        given()
+        .when()
+            .get("/v1/clusters/{clusterArn}/scram-secrets", clusterArn)
+        .then()
+            .statusCode(200)
+            .body("secretArnList", equalTo(List.of(secretArn)));
+    }
+
+    @Test
+    void batchAssociateScramSecretReportsUnprocessedSecret() {
+        String clusterArn = createScramCluster();
+        String secretArn = createScramSecret();
+        associateScramSecret(clusterArn, secretArn);
+
+        given().contentType("application/json")
+            .body(Map.of("secretArnList", List.of(secretArn)))
+        .when()
+            .post("/v1/clusters/{clusterArn}/scram-secrets", clusterArn)
+        .then()
+            .statusCode(200)
+            .body("unprocessedScramSecrets", hasSize(1))
+            .body("unprocessedScramSecrets[0].secretArn", equalTo(secretArn))
+            .body("unprocessedScramSecrets[0].errorCode", equalTo("InvalidSecretArn"));
+    }
+
+    @Test
+    void listScramSecrets() {
+        String clusterArn = createScramCluster();
+        String secretArn = createScramSecret();
+        associateScramSecret(clusterArn, secretArn);
+
+        given()
+            .get("/v1/clusters/{clusterArn}/scram-secrets", clusterArn)
+        .then()
+            .statusCode(200)
+            .body("secretArnList", equalTo(List.of(secretArn)));
+    }
+
+    @Test
+    void batchDisassociateScramSecret() {
+        String clusterArn = createScramCluster();
+        String secretArn = createScramSecret();
+        associateScramSecret(clusterArn, secretArn);
+
+        given().contentType("application/json")
+            .body(Map.of("secretArnList", List.of(secretArn)))
+        .when()
+            .patch("/v1/clusters/{clusterArn}/scram-secrets", clusterArn)
+        .then()
+            .statusCode(200)
+            .body("clusterArn", equalTo(clusterArn))
+            .body("unprocessedScramSecrets", empty());
+        given().get("/v1/clusters/{clusterArn}/scram-secrets", clusterArn)
+            .then()
+            .statusCode(200)
+            .body("secretArnList", empty());
+    }
+
+    @Test
+    void batchDisassociateScramSecretReportsUnassociatedSecret() {
+        String clusterArn = createScramCluster();
+        String secretArn = createScramSecret();
+
+        given()
+            .contentType("application/json")
+            .body(Map.of("secretArnList", List.of(secretArn)))
+        .when()
+            .patch("/v1/clusters/{clusterArn}/scram-secrets", clusterArn)
+        .then()
+            .statusCode(200)
+            .body("unprocessedScramSecrets", hasSize(1))
+            .body("unprocessedScramSecrets[0].secretArn", equalTo(secretArn))
+            .body("unprocessedScramSecrets[0].errorCode", equalTo("InvalidSecretArn"));
+    }
+
+    private String createScramCluster() {
+        return given()
+                .contentType("application/json")
+                .body(Map.of("clusterName", "scram-" + UUID.randomUUID()))
+            .when()
+                .post("/v1/clusters")
+            .then()
+                .statusCode(200)
+                .extract().path("clusterArn");
+    }
+
+    private String createScramSecret() {
+        RestAssuredJsonUtils.configureAwsContentTypes();
+        return given()
+                .contentType("application/x-amz-json-1.1")
+                .header("X-Amz-Target", "secretsmanager.CreateSecret")
+                .body(Map.of(
+                    "Name", "AmazonMSK_" + UUID.randomUUID(),
+                    "KmsKeyId", createScramKey(),
+                    "SecretString", "{\"username\":\"alice\",\"password\":\"password\"}")
+                )
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract().path("ARN");
+    }
+
+    private void associateScramSecret(String clusterArn, String secretArn) {
+        given()
+            .contentType("application/json")
+            .body(Map.of("secretArnList", List.of(secretArn)))
+        .when()
+            .post("/v1/clusters/{clusterArn}/scram-secrets", clusterArn)
+        .then()
+            .statusCode(200)
+            .body("unprocessedScramSecrets", empty());
     }
 }

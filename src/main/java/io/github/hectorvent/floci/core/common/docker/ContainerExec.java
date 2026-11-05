@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import org.jboss.logging.Logger;
@@ -11,6 +12,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -74,18 +76,35 @@ public final class ContainerExec {
      */
     public static Result run(DockerClient dockerClient, String containerId, String[] cmd, int timeoutSeconds,
                              OutputStream stdout, OutputStream stderr) {
-        return run(dockerClient, containerId, cmd, Duration.ofSeconds(timeoutSeconds), stdout, stderr);
+        return run(dockerClient, containerId, cmd, List.of(), timeoutSeconds, stdout, stderr);
+    }
+
+    /**
+     * Runs {@code cmd} as {@link #run(DockerClient, String, String[], int, OutputStream, OutputStream)} does,
+     * with {@code env} on top of the container's environment for this command alone, so a secret it holds
+     * never becomes part of the container's configuration.
+     */
+    public static Result run(DockerClient dockerClient, String containerId, String[] cmd, List<String> env,
+                             int timeoutSeconds, OutputStream stdout, OutputStream stderr) {
+        return run(dockerClient, containerId, cmd, env, Duration.ofSeconds(timeoutSeconds), stdout, stderr);
     }
 
     /** Runs a command with a subsecond budget, writing output to the supplied streams. */
     public static Result run(DockerClient dockerClient, String containerId, String[] cmd, Duration timeout,
                              OutputStream stdout, OutputStream stderr) {
-        String execId = dockerClient.execCreateCmd(containerId)
+        return run(dockerClient, containerId, cmd, List.of(), timeout, stdout, stderr);
+    }
+
+    private static Result run(DockerClient dockerClient, String containerId, String[] cmd, List<String> env,
+                              Duration timeout, OutputStream stdout, OutputStream stderr) {
+        ExecCreateCmd create = dockerClient.execCreateCmd(containerId)
                 .withCmd(cmd)
                 .withAttachStdout(true)
-                .withAttachStderr(true)
-                .exec()
-                .getId();
+                .withAttachStderr(true);
+        if (!env.isEmpty()) {
+            create.withEnv(env);
+        }
+        String execId = create.exec().getId();
 
         ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>() {
             @Override

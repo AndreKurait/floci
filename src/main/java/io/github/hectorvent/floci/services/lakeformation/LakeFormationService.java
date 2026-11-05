@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lakeformation;
 
+import io.github.hectorvent.floci.core.common.AwsArnShapes;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -40,7 +41,7 @@ public class LakeFormationService {
         if (request.getResourceArn() == null) {
             throw new AwsException("InvalidInputException", "ResourceArn is required", 400);
         }
-        if (!request.getResourceArn().startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(request.getResourceArn())) {
             throw new AwsException("InvalidInputException", "ResourceArn must be a valid ARN", 400);
         }
         if (storage.describeResource(region, request.getResourceArn()).isPresent()) {
@@ -93,11 +94,7 @@ public class LakeFormationService {
         try {
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(roleArn);
             if (parsed.partition().isBlank()
-                    || !"iam".equals(parsed.service())
-                    || !parsed.region().isEmpty()
-                    || parsed.accountId().isBlank()
-                    || !parsed.resource().startsWith("role/")
-                    || parsed.resource().length() == "role/".length()
+                    || !AwsArnShapes.isIamRole(parsed)
                     || roleArn.chars().anyMatch(Character::isWhitespace)) {
                 throw new IllegalArgumentException("Invalid IAM role ARN");
             }
@@ -151,7 +148,7 @@ public class LakeFormationService {
         String catalogId = request.getCatalogId() != null ? request.getCatalogId() : regionResolver.getAccountId();
         
         if (request.getPermissionsWithGrantOption() != null) {
-            java.util.List<String> perms = request.getPermissions() != null ? request.getPermissions() : java.util.List.of();
+            List<String> perms = request.getPermissions() != null ? request.getPermissions() : List.of();
             for (String grantOption : request.getPermissionsWithGrantOption()) {
                 if (!perms.contains(grantOption)) {
                     throw new AwsException("InvalidInputException", "PermissionsWithGrantOption must be a subset of Permissions", 400);

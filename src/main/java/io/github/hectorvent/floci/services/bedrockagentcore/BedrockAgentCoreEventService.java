@@ -8,16 +8,20 @@ import io.github.hectorvent.floci.services.bedrockagentcore.model.Branch;
 import io.github.hectorvent.floci.services.bedrockagentcore.model.MemoryEvent;
 import io.github.hectorvent.floci.services.bedrockagentcore.model.PayloadType;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryService;
+import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryService.MemoryDeleted;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * AgentCore Memory events: the data plane behind {@code CreateEvent}, {@code ListEvents},
@@ -96,7 +100,8 @@ public class BedrockAgentCoreEventService {
         event.setPayload(resolvedPayload);
         event.setBranch(branch != null ? branch : new Branch(DEFAULT_BRANCH));
 
-        eventStore.put(eventKey(memoryId, actorId, resolvedSession, event.getEventId()), event);
+        memoryService.writeEvent(memoryId, region,
+                () -> eventStore.put(eventKey(memoryId, actorId, resolvedSession, event.getEventId()), event));
         LOG.debugv("CreateEvent: memory={0} actor={1} session={2} event={3}",
                 memoryId, actorId, resolvedSession, event.getEventId());
         return event;
@@ -169,6 +174,12 @@ public class BedrockAgentCoreEventService {
         return eventId;
     }
 
+    void onMemoryDeleted(@Observes MemoryDeleted deleted) {
+        String prefix = deleted.memoryId() + "::";
+        eventStore.deleteAllAtomically(eventStore.keys().stream()
+                .filter(k -> k.startsWith(prefix)).collect(Collectors.toSet()));
+    }
+
     // ── validation ───────────────────────────────────────────────
 
     /**
@@ -225,11 +236,7 @@ public class BedrockAgentCoreEventService {
         long millis = Math.round(eventTimestampSeconds * 1000d);
         byte[] suffix = new byte[4];
         RANDOM.nextBytes(suffix);
-        StringBuilder hex = new StringBuilder();
-        for (byte b : suffix) {
-            hex.append(String.format("%02x", b));
-        }
-        return String.format("%019d", millis) + "#" + hex;
+        return String.format("%019d", millis) + "#" + HexFormat.of().formatHex(suffix);
     }
 
     private static MemoryEvent withoutPayload(MemoryEvent source) {

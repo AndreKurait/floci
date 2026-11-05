@@ -1,11 +1,14 @@
 package io.github.hectorvent.floci.services.sqs;
 
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
@@ -20,10 +23,12 @@ import java.util.stream.Collectors;
 class GuardedMessageQueue {
 
     private final ReentrantLock lock = new ReentrantLock();
-    private final List<Message> messages;
+    private MessageList messages;
     private final StorageBackend<String, List<Message>> messageStore;
     private final String storageKey;
     private final String receiptHandleSecret;
+    private final boolean detachedSnapshots;
+    private final SqsQueueActivity activity = new SqsQueueActivity();
     private volatile boolean closed;
 
     @FunctionalInterface
@@ -47,7 +52,10 @@ class GuardedMessageQueue {
 
     GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
                         String receiptHandleSecret) {
-        this.messages = new ArrayList<>(initial);
+        this.detachedSnapshots = messageStore != null
+                && !(messageStore instanceof InMemoryStorage<?, ?>
+                || messageStore instanceof AccountAwareStorageBackend<?> aware && aware.isInMemory());
+        this.messages = MessageList.copyOf(snapshot(initial));
         this.messageStore = messageStore;
         this.storageKey = storageKey;
         this.receiptHandleSecret = receiptHandleSecret;
@@ -58,29 +66,13 @@ class GuardedMessageQueue {
 
     void addMessage(Message message) {
         try (Guard _ = hold()) {
-            int mark = messages.size();
-            messages.add(message);
-            try {
-                persist();
-            } catch (RuntimeException e) {
-                messages.remove(mark);
-                throw e;
-            }
+            commit(messages.plus(message));
         }
     }
 
-    /** If persisting fails the in-memory add is rolled back and the exception propagates, so a
-     *  caller that compensates on the source side does not leave a duplicate here. */
     void addAll(List<Message> toAdd) {
         try (Guard _ = hold()) {
-            int mark = messages.size();
-            messages.addAll(toAdd);
-            try {
-                persist();
-            } catch (RuntimeException e) {
-                messages.subList(mark, messages.size()).clear();
-                throw e;
-            }
+            commit(messages.plusAll(toAdd));
         }
     }
 
@@ -91,25 +83,47 @@ class GuardedMessageQueue {
             List<Message> claimed = new ArrayList<>();
             List<Message> dlqCandidates = new ArrayList<>();
 
-            if (fifo) {
-                claimFifo(maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
-                        claimed, dlqCandidates);
-            } else {
-                claimStandard(maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
-                        claimed, dlqCandidates);
+            List<DeliveryState> previous = new ArrayList<>();
+            try {
+                if (fifo) {
+                    claimFifo(maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
+                            claimed, dlqCandidates, previous);
+                } else {
+                    claimStandard(maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
+                            claimed, dlqCandidates, previous);
+                }
+                if (!dlqCandidates.isEmpty()) {
+                    commit(messages.withoutAll(dlqCandidates::contains));
+                } else if (!claimed.isEmpty()) {
+                    persist(messages);
+                }
+            } catch (RuntimeException exception) {
+                previous.forEach(DeliveryState::restore);
+                throw exception;
             }
-
-            if (!claimed.isEmpty() || !dlqCandidates.isEmpty()) {
-                persist();
-            }
-
             return new ClaimResult(claimed, dlqCandidates);
+        }
+    }
+
+    private record DeliveryState(Message message, int receiveCount, Instant firstReceiveTimestamp,
+                                 String receiptHandle, Instant visibleAt) {
+        DeliveryState(Message message) {
+            this(message, message.getReceiveCount(), message.getFirstReceiveTimestamp(),
+                    message.getReceiptHandle(), message.getVisibleAt());
+        }
+
+        void restore() {
+            message.setReceiveCount(receiveCount);
+            message.setFirstReceiveTimestamp(firstReceiveTimestamp);
+            message.setReceiptHandle(receiptHandle);
+            message.setVisibleAt(visibleAt);
         }
     }
 
     private boolean tryClaim(Message msg, int effectiveTimeout, int maxReceiveCount,
                              String deadLetterTargetArn, List<Message> claimed,
-                             List<Message> dlqCandidates) {
+                             List<Message> dlqCandidates, List<DeliveryState> previous) {
+        previous.add(new DeliveryState(msg));
         msg.setReceiveCount(msg.getReceiveCount() + 1);
         if (msg.getFirstReceiveTimestamp() == null) {
             msg.setFirstReceiveTimestamp(Instant.now());
@@ -129,17 +143,17 @@ class GuardedMessageQueue {
 
     private void claimStandard(int maxMessages, int effectiveTimeout,
                                int maxReceiveCount, String deadLetterTargetArn,
-                               List<Message> claimed, List<Message> dlqCandidates) {
+                               List<Message> claimed, List<Message> dlqCandidates, List<DeliveryState> previous) {
         for (Message msg : messages) {
             if (claimed.size() >= maxMessages) break;
             if (!msg.isVisible()) continue;
-            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates);
+            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
         }
     }
 
     private void claimFifo(int maxMessages, int effectiveTimeout,
                            int maxReceiveCount, String deadLetterTargetArn,
-                           List<Message> claimed, List<Message> dlqCandidates) {
+                           List<Message> claimed, List<Message> dlqCandidates, List<DeliveryState> previous) {
         // Cross-call group locking: a group that already has an in-flight
         // message from a previous ReceiveMessage call is blocked until that
         // message is deleted or its visibility expires. Within a single call
@@ -160,7 +174,7 @@ class GuardedMessageQueue {
             String groupId = msg.getMessageGroupId();
             if (groupId != null && groupsWithInFlight.contains(groupId)) continue;
 
-            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates);
+            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
         }
     }
 
@@ -176,8 +190,7 @@ class GuardedMessageQueue {
             if (result != HandleResult.APPLIED) {
                 return new Removal(result, null);
             }
-            messages.remove(msg);
-            persist();
+            commit(messages.without(msg));
             return new Removal(HandleResult.APPLIED, msg);
         }
     }
@@ -187,8 +200,14 @@ class GuardedMessageQueue {
             Message msg = findByMessageId(handle.messageId());
             HandleResult result = checkHandle(msg, handle, fifo);
             if (result == HandleResult.APPLIED) {
+                Instant previous = msg.getVisibleAt();
                 msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
-                persist();
+                try {
+                    persist(messages);
+                } catch (RuntimeException exception) {
+                    msg.setVisibleAt(previous);
+                    throw exception;
+                }
             }
             return result;
         }
@@ -217,33 +236,25 @@ class GuardedMessageQueue {
         return HandleResult.APPLIED;
     }
 
-    void removeMessages(List<Message> toRemove) {
-        try (Guard _ = hold()) {
-            messages.removeAll(toRemove);
-            persist();
-        }
-    }
-
     void removeExpired(Instant cutoff) {
         try (Guard _ = hold()) {
-            if (messages.removeIf(msg -> msg.isExpired(cutoff))) {
-                persist();
+            MessageList candidate = messages.withoutAll(msg -> msg.isExpired(cutoff));
+            if (candidate != messages) {
+                commit(candidate);
             }
         }
     }
 
     void purge() {
         try (Guard _ = hold()) {
-            messages.clear();
-            persist();
+            commit(MessageList.EMPTY);
         }
     }
 
     List<Message> drainAll() {
         try (Guard _ = hold()) {
             List<Message> drained = new ArrayList<>(messages);
-            messages.clear();
-            persist();
+            commit(MessageList.EMPTY);
             return drained;
         }
     }
@@ -257,8 +268,8 @@ class GuardedMessageQueue {
             if (messages.isEmpty() || !eligible.test(messages.getFirst())) {
                 return null;
             }
-            Message head = messages.removeFirst();
-            persist();
+            Message head = messages.getFirst();
+            commit(messages.withoutFirst());
             return head;
         }
     }
@@ -266,8 +277,7 @@ class GuardedMessageQueue {
     /** Put a message that could not be delivered back at the head, preserving queue order. */
     void restoreFirst(Message message) {
         try (Guard _ = hold()) {
-            messages.addFirst(message);
-            persist();
+            commit(messages.withFirst(message));
         }
     }
 
@@ -300,6 +310,42 @@ class GuardedMessageQueue {
         }
     }
 
+    record Gauges(MessageCounts counts, long ageOfOldestMessageSeconds, long groupsWithInflightMessages) {
+        boolean isEmpty() {
+            return counts.visible() + counts.inFlight() + counts.delayed() == 0;
+        }
+    }
+
+    /**
+     * The queue contents AWS/SQS reports each minute. The age is that of the oldest message by the
+     * time its retention started, so a message moved to a FIFO dead-letter queue or by a move task
+     * counts from the move.
+     */
+    Gauges gauges(Instant now) {
+        try (Guard _ = hold()) {
+            Instant oldest = null;
+            Set<String> groupsInFlight = new HashSet<>();
+            for (Message m : messages) {
+                if (!m.isVisible() && m.getReceiptHandle() != null && m.getMessageGroupId() != null) {
+                    groupsInFlight.add(m.getMessageGroupId());
+                }
+                // ponytail: AWS also leaves out a standard-queue message received 3+ times in this queue;
+                // that needs a per-queue receive count, since a redriven message keeps its total.
+                Instant enqueued = m.getRetentionStartTimestamp() != null
+                        ? m.getRetentionStartTimestamp() : m.getSentTimestamp();
+                if (enqueued != null && (oldest == null || enqueued.isBefore(oldest))) {
+                    oldest = enqueued;
+                }
+            }
+            long age = oldest == null ? 0 : Math.max(0, Duration.between(oldest, now).toSeconds());
+            return new Gauges(messageCounts(), age, groupsInFlight.size());
+        }
+    }
+
+    SqsQueueActivity activity() {
+        return activity;
+    }
+
     List<Message> peekAll() {
         try (Guard _ = hold()) {
             return new ArrayList<>(messages);
@@ -330,18 +376,31 @@ class GuardedMessageQueue {
         closed = true;
     }
 
-    private void persist() {
+    private void commit(MessageList candidate) {
+        persist(candidate);
+        messages = candidate;
+    }
+
+    private List<Message> snapshot(List<Message> source) {
+        if (!detachedSnapshots) {
+            return source;
+        }
+        return source.stream().map(Message::copy).collect(Collectors.toCollection(ArrayList::new));
+    }
+
+    private void persist(List<Message> candidate) {
         if (closed || messageStore == null || storageKey == null) {
             return;
         }
+        List<Message> snapshot = snapshot(candidate);
         if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
             String accountId = extractAccountFromStorageKey(storageKey);
             if (accountId != null) {
-                aware.putForAccount(accountId, storageKey, new ArrayList<>(messages));
+                aware.putForAccount(accountId, storageKey, snapshot);
                 return;
             }
         }
-        messageStore.put(storageKey, new ArrayList<>(messages));
+        messageStore.put(storageKey, snapshot);
     }
 
     /**

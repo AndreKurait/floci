@@ -14,6 +14,7 @@ Compatibility tests for [Floci](https://github.com/hectorvent/floci) using **bot
 | `s3-notifications`      | S3 → SQS event notifications                                             |
 | `dynamodb`              | Tables, CRUD, batch, TTL, tags                                           |
 | `lambda`                | Create/invoke/update/delete functions                                    |
+| `lambda-web`            | Web functions, revisions, endpoints, waiters, tags, resource policy      |
 | `iam`                   | Users, roles, policies, access keys                                      |
 | `sts`                   | GetCallerIdentity, AssumeRole, GetSessionToken                           |
 | `secretsmanager`        | Create/get/put/list/delete secrets, versioning, tags                     |
@@ -57,6 +58,9 @@ python3.9 -m venv .venv-legacy
 .venv-legacy/bin/pip install -r requirements-legacy.txt
 FLOCI_ENDPOINT=http://localhost:4566 .venv-legacy/bin/python -m pytest legacy/
 ```
+
+`tests/test_ec2_subnet_ipv6.py` checks that expanded IPv6 subnet CIDRs are
+stored and returned in canonical form through Boto 3.
 
 ## Legacy Query GET
 

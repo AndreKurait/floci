@@ -241,4 +241,16 @@ class CloudWatchMetricsQueryHandlerTest {
         verify(metricsService).putMetricData(eq("NS"), captor.capture(), eq(REGION));
         assertEquals(List.of(" "), captor.getValue().stream().map(MetricDatum::getMetricName).toList());
     }
+
+    @Test
+    void describeAlarmsReturnsEmptyCompositeAndLogAlarmCollections() {
+        when(metricsService.describeAlarms(any(CloudWatchMetricsService.AlarmFilter.class), eq(REGION)))
+                .thenReturn(new CloudWatchMetricsService.DescribedAlarms(List.of(), List.of()));
+
+        String xml = (String) handler.handle("DescribeAlarms", new MultivaluedHashMap<>(), REGION).getEntity();
+
+        assertTrue(xml.contains("<MetricAlarms></MetricAlarms>"), xml);
+        assertTrue(xml.contains("<CompositeAlarms></CompositeAlarms>"), xml);
+        assertTrue(xml.contains("<LogAlarms></LogAlarms>"), xml);
+    }
 }

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.firehose;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription;
+import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.CloudWatchLoggingOptions;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.ProcessingConfiguration;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.Processor;
 import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescription.ProcessorParameter;
@@ -9,6 +10,12 @@ import io.github.hectorvent.floci.services.firehose.model.DeliveryStreamDescript
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,7 +46,7 @@ class S3DestinationValidatorTest {
     private static S3Destination withProcessors(String unusedShapeName, Processor... processors) {
         ProcessingConfiguration processing = new ProcessingConfiguration();
         processing.setEnabled(true);
-        processing.setProcessors(java.util.List.of(processors));
+        processing.setProcessors(List.of(processors));
         S3Destination config = new S3Destination();
         config.setProcessingConfiguration(processing);
         return config;
@@ -48,7 +55,7 @@ class S3DestinationValidatorTest {
     private static S3Destination withProcessor(String type, String... parameterNames) {
         Processor processor = new Processor();
         processor.setType(type);
-        java.util.List<ProcessorParameter> parameters = new java.util.ArrayList<>();
+        List<ProcessorParameter> parameters = new ArrayList<>();
         for (String name : parameterNames) {
             ProcessorParameter parameter = new ProcessorParameter();
             parameter.setParameterName(name);
@@ -58,7 +65,7 @@ class S3DestinationValidatorTest {
         processor.setParameters(parameters);
         ProcessingConfiguration processing = new ProcessingConfiguration();
         processing.setEnabled(true);
-        processing.setProcessors(java.util.List.of(processor));
+        processing.setProcessors(List.of(processor));
         S3Destination config = new S3Destination();
         config.setProcessingConfiguration(processing);
         return config;
@@ -89,7 +96,7 @@ class S3DestinationValidatorTest {
     @Test
     void aProcessorWithoutATypeFailsAsRequired() {
         Processor processor = new Processor();
-        processor.setParameters(java.util.List.of(namedParameter("LambdaArn", "value")));
+        processor.setParameters(List.of(namedParameter("LambdaArn", "value")));
         AwsException error = assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
                 withProcessors("extendedS3DestinationConfiguration", processor),
                 "extendedS3DestinationConfiguration"));
@@ -103,7 +110,7 @@ class S3DestinationValidatorTest {
     void aParameterMissingEitherMemberFailsAsRequired() {
         Processor processor = new Processor();
         processor.setType("Lambda");
-        processor.setParameters(java.util.List.of(new ProcessorParameter()));
+        processor.setParameters(List.of(new ProcessorParameter()));
         AwsException error = assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
                 withProcessors("extendedS3DestinationConfiguration", processor),
                 "extendedS3DestinationConfiguration"));
@@ -119,7 +126,7 @@ class S3DestinationValidatorTest {
     void anEmptyParameterValueFailsBothItsConstraints() {
         Processor processor = new Processor();
         processor.setType("Lambda");
-        processor.setParameters(java.util.List.of(namedParameter("LambdaArn", "")));
+        processor.setParameters(List.of(namedParameter("LambdaArn", "")));
         AwsException error = assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
                 withProcessors("extendedS3DestinationConfiguration", processor),
                 "extendedS3DestinationConfiguration"));
@@ -139,10 +146,10 @@ class S3DestinationValidatorTest {
     void aNullListMemberIsIgnoredRatherThanReported() {
         Processor processor = new Processor();
         processor.setType("Lambda");
-        processor.setParameters(java.util.Arrays.asList(namedParameter("LambdaArn", "value"), null));
+        processor.setParameters(Arrays.asList(namedParameter("LambdaArn", "value"), null));
         ProcessingConfiguration processing = new ProcessingConfiguration();
         processing.setEnabled(true);
-        processing.setProcessors(java.util.Arrays.asList(processor, null));
+        processing.setProcessors(Arrays.asList(processor, null));
         S3Destination config = new S3Destination();
         config.setProcessingConfiguration(processing);
 
@@ -474,7 +481,7 @@ class S3DestinationValidatorTest {
             + " Member must have length greater than or equal to 1,"
             + " Member must satisfy regular expression pattern: ";
 
-    private static S3Destination withColumnMappings(java.util.Map<String, String> mappings) {
+    private static S3Destination withColumnMappings(Map<String, String> mappings) {
         DeliveryStreamDescription.OpenXJsonSerDe openX = new DeliveryStreamDescription.OpenXJsonSerDe();
         openX.setColumnToJsonKeyMappings(mappings);
         DeliveryStreamDescription.Deserializer deserializer = new DeliveryStreamDescription.Deserializer();
@@ -493,7 +500,7 @@ class S3DestinationValidatorTest {
     @Test
     void wireShapeAcceptsWellFormedColumnMappings() {
         assertDoesNotThrow(() -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("ticker", "sym", "price", "unit price")),
+                withColumnMappings(Map.of("ticker", "sym", "price", "unit price")),
                 "extendedS3DestinationConfiguration"));
     }
 
@@ -502,19 +509,19 @@ class S3DestinationValidatorTest {
     void mappingKeysRejectWhitespaceButValuesOnlyRejectBlanks() {
         AwsException keyError = assertThrows(AwsException.class,
                 () -> S3DestinationValidator.validateWireShape(
-                        withColumnMappings(java.util.Map.of("has space", "v")),
+                        withColumnMappings(Map.of("has space", "v")),
                         "extendedS3DestinationConfiguration"));
         assertEquals("1 validation error detected: Value at '" + MAPPINGS_PATH + "' failed to satisfy "
                 + "constraint: Map keys must satisfy constraint: " + LENGTH_RULES + "^\\S+$]",
                 keyError.getMessage());
 
         assertDoesNotThrow(() -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("ticker", "has space")),
+                withColumnMappings(Map.of("ticker", "has space")),
                 "extendedS3DestinationConfiguration"));
 
         AwsException valueError = assertThrows(AwsException.class,
                 () -> S3DestinationValidator.validateWireShape(
-                        withColumnMappings(java.util.Map.of("ticker", "   ")),
+                        withColumnMappings(Map.of("ticker", "   ")),
                         "extendedS3DestinationConfiguration"));
         assertEquals("1 validation error detected: Value at '" + MAPPINGS_PATH + "' failed to satisfy "
                 + "constraint: Map value must satisfy constraint: " + LENGTH_RULES + "^(?!\\s*$).+]",
@@ -524,7 +531,7 @@ class S3DestinationValidatorTest {
     /** However many entries break the rule, AWS reports keys once and values once. */
     @Test
     void mappingViolationsAreReportedOncePerAspectWithKeysFirst() {
-        java.util.Map<String, String> mappings = new java.util.LinkedHashMap<>();
+        Map<String, String> mappings = new LinkedHashMap<>();
         mappings.put("has space", "");
         mappings.put("also space", " ");
 
@@ -549,32 +556,32 @@ class S3DestinationValidatorTest {
     @Test
     void mappingValuesFollowTheDeclaredPatternRatherThanIsBlank() {
         assertDoesNotThrow(() -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("ticker", "　")),
+                withColumnMappings(Map.of("ticker", "　")),
                 "extendedS3DestinationConfiguration"));
 
         assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("ticker", "a\nb")),
+                withColumnMappings(Map.of("ticker", "a\nb")),
                 "extendedS3DestinationConfiguration"));
         assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("ticker", "ab\n")),
+                withColumnMappings(Map.of("ticker", "ab\n")),
                 "extendedS3DestinationConfiguration"));
 
         assertDoesNotThrow(() -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("a b", "v")),
+                withColumnMappings(Map.of("a b", "v")),
                 "extendedS3DestinationConfiguration"));
         assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("a\nb", "v")),
+                withColumnMappings(Map.of("a\nb", "v")),
                 "extendedS3DestinationConfiguration"));
     }
 
     @Test
     void mappingLengthsAreBoundedAt1024() {
         assertDoesNotThrow(() -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("k".repeat(1024), "v".repeat(1024))),
+                withColumnMappings(Map.of("k".repeat(1024), "v".repeat(1024))),
                 "extendedS3DestinationConfiguration"));
 
         assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
-                withColumnMappings(java.util.Map.of("k".repeat(1025), "v")),
+                withColumnMappings(Map.of("k".repeat(1025), "v")),
                 "extendedS3DestinationConfiguration"));
     }
 
@@ -585,7 +592,7 @@ class S3DestinationValidatorTest {
         parquet.setPageSizeBytes(1L);
         S3Destination config = withParquetSerDe(parquet);
         DeliveryStreamDescription.OpenXJsonSerDe openX = new DeliveryStreamDescription.OpenXJsonSerDe();
-        openX.setColumnToJsonKeyMappings(java.util.Map.of("has space", "v"));
+        openX.setColumnToJsonKeyMappings(Map.of("has space", "v"));
         DeliveryStreamDescription.Deserializer deserializer = new DeliveryStreamDescription.Deserializer();
         deserializer.setOpenXJsonSerDe(openX);
         DeliveryStreamDescription.InputFormatConfiguration input =
@@ -757,6 +764,67 @@ class S3DestinationValidatorTest {
         assertEquals("1 validation error detected: Value at '" + PARQUET_PATH + ".compression' "
                 + "failed to satisfy constraint: Member must satisfy enum value set: [SNAPPY, GZIP, UNCOMPRESSED]",
                 error.getMessage());
+    }
+
+    private static final String LOG_GROUP_PATTERN = "Member must satisfy regular expression pattern: "
+            + "[\\.\\-_/#A-Za-z0-9]*";
+    private static final String LOG_STREAM_PATTERN = "Member must satisfy regular expression pattern: [^:*]*";
+
+    private static S3Destination withLogging(String logGroupName, String logStreamName) {
+        CloudWatchLoggingOptions logging = new CloudWatchLoggingOptions();
+        logging.setEnabled(true);
+        logging.setLogGroupName(logGroupName);
+        logging.setLogStreamName(logStreamName);
+        S3Destination config = new S3Destination();
+        config.setCloudWatchLoggingOptions(logging);
+        return config;
+    }
+
+    @Test
+    void logStreamNameWithAColonFailsItsPattern() {
+        AwsException error = assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
+                withLogging(null, "bad:stream"), "extendedS3DestinationConfiguration"));
+
+        assertEquals("ValidationException", error.getErrorCode());
+        assertEquals("1 validation error detected: Value at 'extendedS3DestinationConfiguration"
+                + ".cloudWatchLoggingOptions.logStreamName' failed to satisfy constraint: "
+                + LOG_STREAM_PATTERN, error.getMessage());
+    }
+
+    /** Probed: unlike FileExtension, both rules are reported, the length one first. */
+    @Test
+    void anOverlongLogGroupNameWithABadCharacterReportsLengthThenPattern() {
+        AwsException error = assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
+                withLogging("a".repeat(513) + " ", null), "extendedS3DestinationConfiguration"));
+
+        String path = "Value at 'extendedS3DestinationConfiguration.cloudWatchLoggingOptions.logGroupName'"
+                + " failed to satisfy constraint: ";
+        assertEquals("2 validation errors detected: "
+                + path + "Member must have length less than or equal to 512; "
+                + path + LOG_GROUP_PATTERN, error.getMessage());
+    }
+
+    @Test
+    void logGroupViolationsPrecedeLogStreamOnes() {
+        AwsException error = assertThrows(AwsException.class, () -> S3DestinationValidator.validateWireShape(
+                withLogging("bad group", "bad:stream"), "s3DestinationConfiguration"));
+
+        assertEquals("2 validation errors detected: "
+                + "Value at 's3DestinationConfiguration.cloudWatchLoggingOptions.logGroupName'"
+                + " failed to satisfy constraint: " + LOG_GROUP_PATTERN + "; "
+                + "Value at 's3DestinationConfiguration.cloudWatchLoggingOptions.logStreamName'"
+                + " failed to satisfy constraint: " + LOG_STREAM_PATTERN, error.getMessage());
+    }
+
+    @Test
+    void wellFormedLoggingNamesPass() {
+        assertDoesNotThrow(() -> S3DestinationValidator.validateWireShape(
+                withLogging("/aws/kinesisfirehose/my-stream", "DestinationDelivery"),
+                "extendedS3DestinationConfiguration"));
+        assertDoesNotThrow(() -> S3DestinationValidator.validateWireShape(
+                withLogging("a".repeat(512), "b".repeat(512)), "extendedS3DestinationConfiguration"));
+        assertDoesNotThrow(() -> S3DestinationValidator.validateWireShape(
+                withLogging("", ""), "extendedS3DestinationConfiguration"));
     }
 
 }

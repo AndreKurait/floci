@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
@@ -204,6 +205,33 @@ class CloudFormationS3BucketPropertiesIntegrationTest {
         bucketGet(bucket, "tagging").body(containsString("<Value>before</Value>"));
     }
 
+    /**
+     * A stack update cannot suspend versioning on a bucket that has since had Object Lock enabled: S3
+     * refuses it, the update rolls back, and the bucket stays versioned.
+     */
+    @Test
+    void anUpdateSuspendingVersioningOnALockedBucketRollsBack() throws InterruptedException {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String bucket = "cfn-locked-versioning-" + suffix;
+        String stackName = "cfn-locked-versioning-stack-" + suffix;
+        String bucketTemplate = """
+                { "Resources": { "Bucket": { "Type": "AWS::S3::Bucket", "Properties": {
+                    "BucketName": "%s", "VersioningConfiguration": { "Status": "%s" } } } } }
+                """;
+        String stackId = stack("CreateStack", stackName, bucketTemplate.formatted(bucket, "Enabled"));
+        await(stackId, "CREATE_COMPLETE");
+        given().body("<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>")
+            .when().put("/" + bucket + "?object-lock").then().statusCode(200);
+
+        stack("UpdateStack", stackName, bucketTemplate.formatted(bucket, "Suspended"));
+        await(stackId, "UPDATE_ROLLBACK_COMPLETE");
+
+        String events = stackEvents(stackId);
+        assertTrue(events.contains("An Object Lock configuration is present on this bucket"),
+                "the update failed on the suspend: " + events);
+        bucketGet(bucket, "versioning").body(containsString("<Status>Enabled</Status>"));
+    }
+
     @Test
     void theBucketCarriesWhatItsTemplateDeclares() throws InterruptedException {
         String suffix = Long.toString(System.nanoTime(), 36);
@@ -325,7 +353,7 @@ class CloudFormationS3BucketPropertiesIntegrationTest {
         return member.substring(idStart, member.indexOf("</PhysicalResourceId>", idStart));
     }
 
-    private static io.restassured.response.ValidatableResponse bucketGet(String bucket, String subresource) {
+    private static ValidatableResponse bucketGet(String bucket, String subresource) {
         return given().when().get("/" + bucket + "?" + subresource).then().statusCode(200);
     }
 

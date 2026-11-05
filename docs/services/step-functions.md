@@ -46,6 +46,37 @@
 definition, role, logging, tracing, encryption, and tags without replacing the state machine;
 changes to `StateMachineName` or `StateMachineType` use replacement semantics.
 
+`ListExecutions` honors `statusFilter` when listing a state machine's executions.
+Omitting the filter returns all statuses. Invalid filter values or types return
+`ValidationException`. Map Run execution listing and `PENDING_REDRIVE` filtering are not
+supported; `PENDING_REDRIVE` returns `ValidationException` even when a `mapRunArn` is supplied.
+
+Lambda task invocation retains the alias or version from `FunctionName`, the
+optimized integration's `Qualifier` parameter, or a direct function ARN when
+acquiring execution capacity. Embedded and explicit qualifiers must agree.
+A READY provisioned
+concurrency pool for that qualifier can serve the task; resolving an alias to
+its version does not discard its pool identity. Unqualified invocation retains
+the normal on-demand path, and existing authorization checks still precede
+execution.
+
+## Task-token IAM resources
+
+With IAM enforcement enabled, `SendTaskSuccess`, `SendTaskFailure`, and
+`SendTaskHeartbeat` authorize against the resource associated with the token:
+the activity ARN for an activity task, or the unqualified state-machine ARN
+for a `.waitForTaskToken` service integration, including versioned executions.
+A grant on only the version ARN does not match. A wildcard grant also matches, and
+an explicit deny on the matching resource wins. An execution ARN or an
+unrelated resource does not grant callback access.
+
+This distinction was verified with signed SDK calls against AWS using both
+Lambda callback integrations and activities. Recent completed tokens retain
+their resource so a permitted retry receives `TaskTimedOut`. Unknown tokens
+return `InvalidToken` before IAM resource evaluation. Resource lookup
+does not consume the token. The caller must own the token before its resource
+is used for IAM evaluation, including for recent completed tokens.
+
 ## Nested task credentials
 
 Nested `states:startExecution` tasks, including `.sync` and `.sync:2`, and the SDK
@@ -59,7 +90,9 @@ With IAM enforcement enabled, the existing task authorizer checks the execution 
 permission to assume the task role, its trust policy, and the task role's permission to
 start the child. Account routing also works with enforcement disabled. The `.sync`
 polling and cancellation paths retain the task account; their additional IAM permissions
-are not evaluated. Other integrations retain their existing credential handling.
+are not evaluated. Lambda, API Gateway and SQS tasks evaluate `Credentials` themselves
+([Lambda](#lambda-tasks-under-iam-enforcement), [SQS](#sqs-tasks-under-iam-enforcement)); other
+integrations retain their existing credential handling.
 A foreign state-machine ARN without task credentials grants no account access.
 
 A missing or mismatched task role fails with `States.TaskFailed`. A target account
@@ -80,12 +113,14 @@ that does not match the selected task account fails with
   `HeartbeatSeconds` as a literal number.
   `resourceType` is the integrated service (`states`, `ecs`, `aws-sdk:sqs`) and `resource` the
   API with its suffix (`startExecution.sync:2`, `runTask.sync`), as AWS names them. A `.sync`
-  Task (`states:startExecution.sync` and `.sync:2`, `ecs:runTask.sync`) also records
+  Task (`states:startExecution.sync` and `.sync:2`, `ecs:runTask.sync`, the `elasticmapreduce:`
+  and `emr-serverless:` ones) also records
   `TaskSubmitted` after `TaskStarted`, once the call that started its job has returned and before
   it waits on the job. `taskSubmittedEventDetails` carries `resourceType`, `resource`,
   `outputDetails`, and that call's response as `output`, in PascalCase: `{"ExecutionArn",
   "StartDate"}` with `StartDate` in epoch milliseconds for a nested execution, `{"Failures",
-  "Tasks"}` for an ECS task. AWS folds the SDK's `SdkHttpMetadata` and `SdkResponseMetadata`
+  "Tasks"}` for an ECS task, `{"ClusterId"}`, `{"StepId"}` or `{}` for an EMR one, the API's
+  response or `{"ApplicationId"}` for an EMR Serverless one. AWS folds the SDK's `SdkHttpMetadata` and `SdkResponseMetadata`
   into that response as well; Floci records the response fields alone.
 - A direct Lambda function ARN emits `LambdaFunctionScheduled`, `LambdaFunctionStarted`,
   and then `LambdaFunctionSucceeded` or `LambdaFunctionFailed`. `LambdaFunctionScheduled`
@@ -149,6 +184,16 @@ the three `.sync` integrations above and not yet for a `.waitForTaskToken` one, 
 records it for. A Distributed `Map` that declares no tolerance reports a failed item's own error
 rather than AWS's `States.ExceedToleratedFailureThreshold`, and emits `MapRunFailed` with that
 error. A `Map` that declares one reports `States.ExceedToleratedFailureThreshold`, as AWS does.
+
+### Pages of history
+
+`GetExecutionHistory` returns one page per call: `maxResults` events, 100 when it is omitted or
+`0`, and at most 1,000. A `nextToken` comes back while events remain, and `reverseOrder` lists the
+newest event first. A token belongs to its execution and its `reverseOrder`: used with another
+execution or the other order it is refused with `InvalidToken`, while `maxResults` and
+`includeExecutionData` may change from one page to the next. Each token expires 24 hours after it
+was issued, as on AWS. Floci signs its tokens with a key it generates at startup, so an edited
+token, or one issued before a restart, is refused with `InvalidToken` as well.
 
 ## Map concurrency
 
@@ -269,7 +314,8 @@ One deviation. Every pause is capped at `floci.services.stepfunctions.max-wait-s
 ASL carries two `TimeoutSeconds` fields and Floci enforces both, in the two terminal shapes
 AWS uses. The state machine's own field bounds every state; a `Task`'s own field bounds one that
 waits: for a task token (an activity, or a `.waitForTaskToken` integration) or for a job to end
-(`ecs:runTask.sync`, `states:startExecution.sync` and `.sync:2`). A Lambda or other SDK task that
+(`ecs:runTask.sync`, the `elasticmapreduce:` and `emr-serverless:` `.sync` ones, `states:startExecution.sync`
+and `.sync:2`). A Lambda or other SDK task that
 returns directly is not bound by it.
 
 The state machine's own `TimeoutSeconds` is the whole execution's budget. It is checked before
@@ -302,6 +348,10 @@ both carry the cause `The Task state in AWS Step Functions execution [<arn>] whi
 this resource was aborted`. A `StopExecution` that lands while the state waits ends the wait and
 stops the job with the same cause, and so does the execution's budget, and so does a failure in
 another branch of the `Parallel`, or in another iteration of the `Map`, that the `Task` is in.
+An `addStep.sync` step is cancelled with `CancelSteps` instead, and the cluster of a
+`createCluster.sync` is left running (see [Amazon EMR tasks](#amazon-emr-tasks)). An EMR Serverless
+job run is cancelled, a started application stopped and a created one deleted (see
+[Amazon EMR Serverless tasks](#amazon-emr-serverless-tasks)).
 
 One deviation. AWS starts the `TimeoutSeconds` clock when a worker picks the task up, the instant
 it emits `ActivityStarted`. Floci emits `ActivityStarted` at schedule time, so both clocks start
@@ -516,6 +566,43 @@ function as `RoleArn.$`, or through JSONata. A role the execution role cannot as
 with `States.Permissions`, whose cause names the execution role's session and `sts:AssumeRole` on
 the role.
 
+## SQS tasks under IAM enforcement
+
+`arn:aws:states:::sqs:sendMessage`, `arn:aws:states:::aws-sdk:sqs:sendMessage` and their
+`.waitForTaskToken` forms are evaluated with [IAM enforcement](iam.md#resource-based-policies) on,
+each attempt in turn, so `Retry` and `Catch` see a refusal like any other task failure:
+
+1. The execution role has to exist and to trust `states.amazonaws.com`, or the task fails with
+   `States.Permissions`.
+2. If the task's `Credentials` name a role, the execution role has to be able to assume it, as for a
+   [Lambda task](#lambda-tasks-under-iam-enforcement). A role it cannot assume, or one that does not
+   exist, fails the task with `States.TaskFailed` and the cause "The role X is not authorized to
+   assume the task state's role, Y.", the form AWS answers a nested execution with. `Credentials`
+   that do not resolve to an object holding only `RoleArn` fail with `States.Runtime`.
+3. The role the task ends up with has to be allowed `sqs:SendMessage` on the queue `QueueUrl` names,
+   or the task fails with `SQS.AccessDeniedException` (`Sqs.AccessDeniedException` for the
+   `aws-sdk` form), whose cause names the role's session and the kind of policy that refused it. The
+   queue is the one Floci's lookup reaches: the account and name in the URL's path, in the state
+   machine's Region. A request with no `QueueUrl` gets SQS's own error once the role has passed.
+
+The error names `States.Permissions` and `<prefix>.AccessDeniedException` are Floci's reading: they
+have not been verified against AWS. Only global condition keys are available to the policies. The
+queue's own policy (`SetQueueAttributes` or `AddPermission`) takes part as it does for a direct SQS
+request: within one account it or the role's policies can allow the send, and across accounts both
+have to. A role in another account, named by `Credentials`, is authorized as that role but the task
+still runs in the state machine's account. Nested executions are the only tasks that run in the
+role's account. With enforcement off nothing here is evaluated.
+
+Integrations other than these, Lambda, API Gateway and nested executions are not evaluated yet: they
+run in the state machine's account whatever the execution role's policies say.
+
+## Task credentials in history
+
+A task that declares `Credentials` records the resolved role in the `taskCredentials.roleArn` of its
+`TaskScheduled` or `LambdaFunctionScheduled` event, with enforcement on or off. With enforcement off,
+`Credentials` that do not resolve are left out of the event and the task runs as if they were not
+there. `ActivityScheduled` has no such member, as in the AWS model.
+
 ## AWS SDK task integrations
 
 A resource of the form `arn:aws:states:::aws-sdk:<service>:<action>` calls the service's API and
@@ -532,6 +619,12 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 
 | Resource | Result | Notable failure |
 | --- | --- | --- |
+| `arn:aws:states:::aws-sdk:ecs:updateService` | `{Service}` | `Ecs.ServiceNotFoundException` |
+| `arn:aws:states:::aws-sdk:ecs:listServices` | `{ServiceArns, NextToken?}` | `Ecs.ClusterNotFoundException` |
+| `arn:aws:states:::aws-sdk:ecs:describeServices` | `{Services, Failures}` | Missing services appear in `Failures` |
+| `arn:aws:states:::aws-sdk:lambda:listEventSourceMappings` | `{EventSourceMappings}` | `Lambda.InvalidParameterValueException` |
+| `arn:aws:states:::aws-sdk:lambda:updateEventSourceMapping` | mapping metadata, including `UUID` | `Lambda.ResourceNotFoundException` |
+| `arn:aws:states:::aws-sdk:secretsmanager:describeSecret` | secret metadata, including `VersionIdsToStages` | `SecretsManager.ResourceNotFoundException` |
 | `arn:aws:states:::aws-sdk:sfn:startExecution` | `{ExecutionArn, StartDate}` | `Sfn.ExecutionAlreadyExistsException` when `Name` is reused on a Standard child |
 | `arn:aws:states:::aws-sdk:sfn:startSyncExecution` | execution envelope | `Sfn.StateMachineTypeNotSupportedException` for a Standard child |
 | `arn:aws:states:::aws-sdk:sfn:sendTaskSuccess` | `{}` | `Sfn.InvalidTokenException` when no task is waiting on the token |
@@ -543,6 +636,45 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 | `arn:aws:states:::aws-sdk:scheduler:updateSchedule` | `{ScheduleArn}` | `Scheduler.ResourceNotFoundException` |
 | `arn:aws:states:::aws-sdk:scheduler:deleteSchedule` | `{}` | `Scheduler.ResourceNotFoundException` |
 | `arn:aws:states:::aws-sdk:sns:publish` | `{MessageId}` | `Sns.NotFoundException` when the topic does not exist |
+
+Callback tokens are owned by the execution account. Foreign callbacks return
+`AccessDeniedException`; unknown tokens return `InvalidToken`. Recently closed tokens return
+`TaskTimedOut`. Closed-token classification retains at most 1,024 tokens for five minutes; older
+or evicted tokens return `InvalidToken`. Invalid JSON output leaves a pending token available
+for a corrected callback. Token state remains in memory.
+
+The six ECS, Lambda mapping, and Secrets Manager management tasks above delegate
+to the existing local service handlers in the execution account and state-machine
+region. They use PascalCase request/response members and ISO-8601 response
+timestamps. Opaque dictionary keys, including secret version IDs and ECS log
+options, retain their original spelling. `describeSecret` returns metadata without
+the secret value. Disabled services fail with a catchable service exception.
+
+ECS `listServices` supports the same `MaxResults` and opaque `NextToken` as the
+direct ECS API. Lambda mapping tasks currently return an unpaginated list;
+`Marker` and `MaxItems` are rejected with `Lambda.InvalidParameterValueException`
+instead of being silently ignored. These six integrations do not evaluate the
+state-machine execution role's per-action IAM policies; among the task integrations, Lambda, API
+Gateway, nested executions and [SQS](#sqs-tasks-under-iam-enforcement) do. Name-based lookups use the
+execution scope; explicit ARNs retain the underlying service's cross-account lookup
+behavior. The underlying services' validation still applies. They implement
+request-response calls, without job-completion polling.
+
+For example, force a deployment of an existing disposable service:
+
+```json
+{
+  "StartAt": "Restart",
+  "States": {
+    "Restart": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ecs:updateService",
+      "Parameters": {"Cluster": "example", "Service": "example", "ForceNewDeployment": true},
+      "End": true
+    }
+  }
+}
+```
 
 Redshift Data API execution returns a statement `Id` before SQL completes. Follow the
 `executeStatement` task with `describeStatement`, a Choice on `Status`, and a Wait state
@@ -609,15 +741,15 @@ fails the task with `SNS.NotFoundException` and a missing `Message` with
 cause is the response serialized as a string, so a `Catch` can read which entry was rejected:
 
 ```json
-{"FailedEntryCount":1,"Entries":[{"EventId":"08cbdc46-…"},{"ErrorCode":"InvalidArgument","ErrorMessage":"EventBus not found: no-such-bus"}]}
+{"FailedEntryCount":1,"Entries":[{"EventId":"08cbdc46-…"},{"ErrorCode":"InvalidArgument","ErrorMessage":"Parameter Source is not valid. Reason: Source is a required argument."}]}
 ```
 
 The optimized integration accepts `Detail` as a JSON object in JSONPath and JSONata workflows. It
 serializes that object once for the EventBridge request, preserving nested values and escaped text.
 The direct EventBridge API continues to accept its native string-valued `Detail` field.
 
-One deviation, and it belongs to EventBridge rather than to the integration: Floci rejects an entry
-addressed to an event bus that does not exist, while AWS accepts it and returns an `EventId`.
+An entry addressed to an event bus that does not exist is accepted with an `EventId`, as in AWS, and
+dropped, so it does not fail the task.
 
 ## JSONata expressions are validated when the state machine is created
 
@@ -757,8 +889,18 @@ Floci currently supports object roots and scalar `COMMAS` arrays. Non-object roo
 (other than an absent or null body) and `COMMAS` arrays containing objects or arrays
 fail explicitly instead of being silently coerced. These are Floci limitations,
 not documented AWS restrictions; their exact AWS behavior has not been verified.
-EventBridge connection lookup and connection-level parameter merging are not
-implemented by the HTTP Task.
+
+## HTTP Task connections
+
+The EventBridge connection named by `InvocationConfig.ConnectionArn` or
+`Authentication.ConnectionArn` authorizes the request: `BASIC` and `OAUTH_CLIENT_CREDENTIALS`
+set the `Authorization` header and `API_KEY` sets the named header, as for an API destination.
+The connection's `InvocationHttpParameters` are merged over the task's `Headers`,
+`QueryParameters` and `RequestBody`, and the connection's value wins on a duplicate key, as
+[AWS merges them](https://docs.aws.amazon.com/step-functions/latest/dg/call-https-apis.html#http-task-data-merge).
+Body parameters are merged before `Transform` encodes the body. A `RequestBody` that is not a
+JSON object fails the task with `States.Runtime` when the connection has body parameters, and a
+connection that does not exist fails it with `Events.ConnectionResource.ResourceNotFound`.
 
 ## Executions abandoned by a restart
 
@@ -839,6 +981,114 @@ block execution. Temporary signing credentials are revoked after each request.
 Successful responses preserve their headers and status. JSON response text is parsed regardless of
 its content type, matching the live AWS integration; other text remains a string. Non-2xx responses
 raise catchable `ApiGateway.<status>` failures.
+
+## Amazon EMR tasks
+
+`arn:...:states:::elasticmapreduce:` serves the optimized EMR integrations the Step Functions guide
+lists, request-response for all seven and `.sync` for `createCluster`, `terminateCluster` and
+`addStep`. Each one calls Floci's EMR in the state machine's Region, under the guide's field names:
+
+| Resource | EMR calls | Result |
+| --- | --- | --- |
+| `createCluster` | `RunJobFlow` | `{ClusterId}` |
+| `createCluster.sync` | `RunJobFlow`, then `DescribeCluster` until `WAITING` | `Cluster`, then `ClusterId` |
+| `setClusterTerminationProtection` | `SetTerminationProtection`, `ClusterId` as `JobFlowIds` | `{}` |
+| `terminateCluster` | `TerminateJobFlows`, `ClusterId` as `JobFlowIds` | `{}` |
+| `terminateCluster.sync` | the same, then `DescribeCluster` until `TERMINATED` or `TERMINATED_WITH_ERRORS` | `Cluster` |
+| `addStep` | `AddJobFlowSteps` with the one `Step`, and `ExecutionRoleArn` when given | `{StepId}` |
+| `addStep.sync` | the same, then `DescribeStep` until `COMPLETED` | `Step`, then `StepId` |
+| `cancelStep` | `CancelSteps` with the one `StepId` | `{CancelStepsInfo}` |
+| `modifyInstanceFleetByName` | `ListInstanceFleets` for the fleet named `InstanceFleetName`, then `ModifyInstanceFleet` | `{}` |
+| `modifyInstanceGroupByName` | `ListInstanceGroups` for the group named `InstanceGroupName`, then `ModifyInstanceGroups` | `{}` |
+
+A `.sync` result is the describe call's response with the starting call's result after it. That is
+the `createCluster.sync` output recorded on AWS: `Cluster`, the SDK's `SdkHttpMetadata` and
+`SdkResponseMetadata`, then `ClusterId`. Floci leaves the SDK metadata out, as it does everywhere.
+State machines read an `addStep.sync` result's `Step` (`$.result.Step.Status.State`); its `StepId`,
+and `terminateCluster.sync`'s whole result, follow the same rule without a recording of their own.
+The timestamps inside are EMR's epoch seconds, which no recording confirms either.
+
+A `.sync` Task records `TaskSubmitted` with the starting call's result, then polls every 100 ms under
+the same two clocks as the other `.sync` integrations (see [Timeouts](#timeouts)). A step that ends
+`FAILED`, `CANCELLED` or `INTERRUPTED`, and a cluster that terminates before it reaches `WAITING`,
+fail the Task with `States.TaskFailed`, the describe response as the cause: a JSON string, which a
+`Catch` reads with `States.StringToJson` (for example its `Step.Status.State`). When
+the wait ends early, `addStep.sync` cancels its step with `CancelSteps`, as Step Functions "will make
+a best-effort attempt to cancel the task". A cluster is never terminated: "Step Functions does not
+terminate an Amazon EMR cluster automatically if execution is stopped." EMR in Floci reaches each
+state at once, so every wait ends at its first poll.
+
+An error from EMR fails the Task with the SDK exception class under the `EMR.` prefix:
+`EMR.InvalidRequestException` and `EMR.InternalServerException` for the two errors EMR models,
+`EMR.AmazonElasticMapReduceException` for any other, such as the `ValidationException`
+"Specified job flow ID does not exist." that `AddJobFlowSteps` answers for an unknown cluster. The cause is EMR's message; AWS
+also appends `(Service: AmazonElasticMapReduce; Status Code: 400; Error Code: ...; Request ID: ...)`.
+
+The integrations refuse what the guide rules out with `States.TaskFailed`, since no source gives
+AWS's error; the `createCluster` messages are the guide's own rules, the others Floci's words: a
+`createCluster` whose `Instances.KeepJobFlowAliveWhenNoSteps` is not `true` or that carries `Steps`,
+an `addStep` without a `Step`, an `InstanceGroupId` or `InstanceFleetId` in a ByName request, and a
+name that matches no group or fleet, or more than one. They also refuse a request without the
+integration's own fields, before EMR sees it: a `ClusterId` (every API but `createCluster`),
+`cancelStep`'s `StepId`, and a ByName request's name. A member EMR itself requires, such as
+`TerminationProtected`, is left to EMR, which answers its validation error.
+`.waitForTaskToken`, which AWS does not offer for EMR, and `.sync` on any other API fail as an
+unsupported resource.
+
+## Amazon EMR Serverless tasks
+
+`arn:...:states:::emr-serverless:` serves the six optimized EMR Serverless integrations the Step
+Functions guide lists, each request-response and `.sync`. Each one calls Floci's EMR Serverless in
+the state machine's Region:
+
+| Resource | EMR Serverless calls | Result | `.sync` waits until |
+| --- | --- | --- | --- |
+| `createApplication` | `CreateApplication` | `{ApplicationId, Name, Arn}` | the application is past `CREATING` |
+| `startApplication` | `StartApplication` | `{ApplicationId}` | `STARTED` |
+| `stopApplication` | `StopApplication` | `{ApplicationId}` | `STOPPED` |
+| `deleteApplication` | `DeleteApplication` | `{ApplicationId}` | `TERMINATED` |
+| `startJobRun` | `StartJobRun` | `{ApplicationId, JobRunId, Arn}` | the run is `SUCCESS` |
+| `cancelJobRun` | `CancelJobRun` | `{ApplicationId, JobRunId}` | the run is `CANCELLED` |
+
+The request is the API's, with its members in PascalCase (`ReleaseLabel`, `JobDriver.SparkSubmit.EntryPoint`,
+`ConfigurationOverrides.MonitoringConfiguration`) and the application and run named by `ApplicationId`
+and `JobRunId`; the result is the API's response in PascalCase, or `{ApplicationId}` where the API
+answers nothing, as the guide's table says. Member names are mapped against botocore's EMR Serverless
+model, so a map keeps the keys the state machine wrote: tag keys, `InitialCapacity`'s `DRIVER` and
+`EXECUTOR`, and a configuration's `Properties` such as `spark.executor.memory`. A member may be written
+in either case, the API's `applicationId` as well as `ApplicationId`. A member the model does not have
+is dropped. A request without `ClientToken` gets a random one, as the SDK fills in an
+idempotency token; the guide's examples leave it out of requests the API requires it for.
+
+A `.sync` result is the starting call's own result, since the guide finds no difference between
+the two responses: state machines read a `createApplication.sync` result's `ApplicationId` and a
+`startJobRun.sync` result's `JobRunId`. The Task records `TaskSubmitted` with that result, then
+polls `GetApplication` or `GetJobRun` every 100 ms under the same two clocks as the other `.sync`
+integrations (see [Timeouts](#timeouts)). A state the wait can no longer end from fails the Task
+with `States.TaskFailed` and the `GetApplication` or `GetJobRun` response, in PascalCase, as the
+cause: a `startJobRun.sync` run that ends `FAILED` or `CANCELLED`, a `cancelJobRun.sync` run that
+ends `SUCCESS` or `FAILED`, an application that is `TERMINATED` before `createApplication.sync` sees
+it created, stops or terminates before `startApplication.sync` sees it `STARTED`, or starts or
+terminates before `stopApplication.sync` sees it `STOPPED`. No source gives these failures' error or
+cause. When the wait ends early, Step Functions "will make a best-effort attempt to cancel the task":
+`startJobRun.sync` cancels its run, `startApplication.sync` stops the application and
+`createApplication.sync` deletes it, the one call each integration's IAM policy grants beyond its
+own and the read it polls with. If EMR Serverless answers that the application or run is gone or past
+undoing (`ResourceNotFoundException`, `ValidationException`), the Task ends as it would have; any other
+failure fails it. `stopApplication.sync`, `deleteApplication.sync` and
+`cancelJobRun.sync` leave the application or run as it is. EMR Serverless in Floci reaches each
+application state at once, and a job run's as its configured duration says, so an application's
+wait ends at its first poll.
+
+An error from EMR Serverless fails the Task with its code under the `EmrServerless.` prefix, such as
+`EmrServerless.ResourceNotFoundException` for an unknown application or
+`EmrServerless.ValidationException` "Job run is not in a cancellable state" for a finished run; the
+cause is EMR Serverless's message. `EmrServerless` is the exception prefix the guide gives the
+service's AWS SDK integration; no record shows the optimized integration's, which differs from the
+SDK one for EMR (`EMR.` against `Emr.`). A request without `ApplicationId`, or a `cancelJobRun`
+without `JobRunId`, fails with `States.TaskFailed` before EMR Serverless sees it, in Floci's words.
+`.waitForTaskToken`, which AWS does not offer for EMR Serverless, and `.sync:2` fail as an
+unsupported resource.
 
 ## Configuration
 

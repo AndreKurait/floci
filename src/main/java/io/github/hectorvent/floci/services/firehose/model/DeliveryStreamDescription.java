@@ -66,13 +66,8 @@ public class DeliveryStreamDescription {
         this.deliveryStreamARN = arn;
         this.deliveryStreamStatus = DeliveryStreamStatus.ACTIVE;
         this.createTimestamp = Instant.now();
-        if (s3 != null) {
-            s3.applyDefaults();
-        }
-        if (redshift != null && redshift.getS3() != null) {
-            redshift.getS3().applyDefaults();
-        }
         this.destinations = List.of(redshift != null ? new Destination(redshift) : new Destination(s3));
+        applyDefaults();
         this.deliveryStreamEncryptionConfiguration = DeliveryStreamEncryptionConfiguration.disabled();
         if (kinesisStreamSource != null) {
             this.source = new Source(kinesisStreamSource);
@@ -170,6 +165,54 @@ public class DeliveryStreamDescription {
         return first.getExtendedS3DestinationDescription();
     }
 
+    /**
+     * The ProcessingConfiguration that transforms this stream's records, or null when it has none. A Redshift
+     * destination carries its own, next to its intermediate S3 configuration; any other destination keeps it
+     * on the S3 destination.
+     */
+    public ProcessingConfiguration processingConfiguration() {
+        if (destinations == null || destinations.isEmpty()) {
+            return null;
+        }
+        Destination first = destinations.get(0);
+        if (first.getRedshiftDestinationDescription() != null) {
+            return first.getRedshiftDestinationDescription().getProcessingConfiguration();
+        }
+        S3Destination s3 = first.getExtendedS3DestinationDescription();
+        return s3 == null ? null : s3.getProcessingConfiguration();
+    }
+
+    /**
+     * True when a transformation applies to deliveries: the configuration is present
+     * and Enabled is explicitly true. An omitted Enabled leaves it disabled, the
+     * opposite of the conversion block below. Probed rather than carried over from
+     * there (2026-09-11): DescribeDeliveryStream echoes an omitted Enabled as false
+     * here and as true on the conversion block.
+     */
+    @JsonIgnore
+    public boolean isProcessingEnabled() {
+        ProcessingConfiguration processing = processingConfiguration();
+        return processing != null && Boolean.TRUE.equals(processing.getEnabled());
+    }
+
+    /**
+     * Fills the AWS defaults on every S3 configuration the stream describes: its S3 destination, or
+     * a Redshift destination's intermediate and backup configurations.
+     */
+    public final void applyDefaults() {
+        S3Destination s3 = s3Destination();
+        if (s3 != null) {
+            s3.applyDefaults();
+        }
+        if (destinations == null || destinations.isEmpty()) {
+            return;
+        }
+        RedshiftDestination redshift = destinations.get(0).getRedshiftDestinationDescription();
+        if (redshift != null && redshift.getS3Backup() != null) {
+            redshift.getS3Backup().applyDefaults();
+        }
+    }
+
     @RegisterForReflection
     @JsonIgnoreProperties(ignoreUnknown = true)
     @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -247,6 +290,8 @@ public class DeliveryStreamDescription {
         private DataFormatConversionConfiguration dataFormatConversionConfiguration;
         @JsonProperty("ProcessingConfiguration")
         private ProcessingConfiguration processingConfiguration;
+        @JsonProperty("CloudWatchLoggingOptions")
+        private CloudWatchLoggingOptions cloudWatchLoggingOptions;
 
         public S3Destination() {}
         public String getRoleArn() { return roleArn; }
@@ -282,21 +327,8 @@ public class DeliveryStreamDescription {
         public void setProcessingConfiguration(ProcessingConfiguration processingConfiguration) {
             this.processingConfiguration = processingConfiguration;
         }
-
-        /**
-         * True when a transformation applies to deliveries: the configuration is present
-         * and Enabled is explicitly true. An omitted Enabled leaves it disabled, the
-         * opposite of the conversion block below. Probed rather than carried over from
-         * there (2026-09-11): DescribeDeliveryStream echoes an omitted Enabled as false
-         * here and as true on the conversion block.
-         *
-         * Ignored for serialization for the same reason as the accessor below.
-         */
-        @JsonIgnore
-        public boolean isProcessingEnabled() {
-            return processingConfiguration != null
-                    && Boolean.TRUE.equals(processingConfiguration.getEnabled());
-        }
+        public CloudWatchLoggingOptions getCloudWatchLoggingOptions() { return cloudWatchLoggingOptions; }
+        public void setCloudWatchLoggingOptions(CloudWatchLoggingOptions options) { this.cloudWatchLoggingOptions = options; }
 
         /**
          * True when data format conversion applies to deliveries: the configuration is
@@ -356,6 +388,14 @@ public class DeliveryStreamDescription {
             if (processingConfiguration != null && processingConfiguration.getEnabled() == null) {
                 processingConfiguration.setEnabled(false);
             }
+            // AWS describes a destination that never configured logging as {"Enabled": false},
+            // and an omitted Enabled as false (probed 2026-10-22).
+            if (cloudWatchLoggingOptions == null) {
+                cloudWatchLoggingOptions = new CloudWatchLoggingOptions();
+            }
+            if (cloudWatchLoggingOptions.getEnabled() == null) {
+                cloudWatchLoggingOptions.setEnabled(false);
+            }
         }
 
         /**
@@ -374,6 +414,14 @@ public class DeliveryStreamDescription {
          * role was current at the time of the read.
          */
         public void canonicalizeProcessors() {
+            canonicalizeProcessors(processingConfiguration, roleArn);
+        }
+
+        /**
+         * The same defaults for a ProcessingConfiguration that is not an S3 destination's own, as a Redshift
+         * destination's is; {@code roleArn} is the role of the destination that carries it.
+         */
+        public static void canonicalizeProcessors(ProcessingConfiguration processingConfiguration, String roleArn) {
             if (processingConfiguration == null) {
                 return;
             }
@@ -436,6 +484,7 @@ public class DeliveryStreamDescription {
             view.compressionFormat = compressionFormat;
             view.bufferingHints = bufferingHints;
             view.encryptionConfiguration = encryptionConfiguration;
+            view.cloudWatchLoggingOptions = cloudWatchLoggingOptions;
             return view;
         }
 
@@ -467,6 +516,31 @@ public class DeliveryStreamDescription {
         public void setEnabled(Boolean enabled) { this.enabled = enabled; }
         public List<Processor> getProcessors() { return processors; }
         public void setProcessors(List<Processor> processors) { this.processors = processors; }
+    }
+
+    /**
+     * Stored and echoed as AWS models it. Floci writes no delivery error logs to the named
+     * group. UpdateDestination merges it a member at a time (probed).
+     */
+    @RegisterForReflection
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public static class CloudWatchLoggingOptions {
+        @JsonProperty("Enabled")
+        private Boolean enabled;
+        @JsonProperty("LogGroupName")
+        private String logGroupName;
+        @JsonProperty("LogStreamName")
+        private String logStreamName;
+
+        public CloudWatchLoggingOptions() {}
+
+        public Boolean getEnabled() { return enabled; }
+        public void setEnabled(Boolean enabled) { this.enabled = enabled; }
+        public String getLogGroupName() { return logGroupName; }
+        public void setLogGroupName(String logGroupName) { this.logGroupName = logGroupName; }
+        public String getLogStreamName() { return logStreamName; }
+        public void setLogStreamName(String logStreamName) { this.logStreamName = logStreamName; }
     }
 
     @RegisterForReflection

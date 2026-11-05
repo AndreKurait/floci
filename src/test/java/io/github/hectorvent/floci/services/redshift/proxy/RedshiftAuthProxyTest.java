@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.redshift.proxy;
 
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
+import io.github.hectorvent.floci.core.common.PostgresWire;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.rds.proxy.PasswordValidator;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyTlsCertificates;
 import io.github.hectorvent.floci.services.rds.proxy.RdsSigV4Validator;
+import io.github.hectorvent.floci.services.redshift.RedshiftAuditLogPublisher;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.testutil.FreePorts;
 import org.junit.jupiter.api.AfterEach;
@@ -22,17 +24,79 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.Mockito.mock;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
 class RedshiftAuthProxyTest {
+
+    @Test
+    void failedLoginAuditsTheRequestedUserAndDatabase() throws Exception {
+        RedshiftAuditLogPublisher audit = mock(RedshiftAuditLogPublisher.class);
+        int port = FreePorts.anyInterfacePort();
+        proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", 1, "admin", "password", "dev",
+                mock(RdsSigV4Validator.class), realTls(), (user, password) -> PasswordValidator.AuthResult.REJECT,
+                mock(S3Service.class), mock(IamService.class), "111111111111", List.of(), 5000, 5000, 10, null, audit, null);
+        proxy.start(port);
+        try (Socket client = new Socket("localhost", port)) {
+            client.setSoTimeout(5000);
+            client.getOutputStream().write(PostgresWire.startupMessage(Map.of("user", "analyst", "database", "analytics")));
+            client.getOutputStream().flush();
+            assertEquals(9, client.getInputStream().readNBytes(9).length);
+            PostgresWire.write(client.getOutputStream(), 'p', "bad\0".getBytes(StandardCharsets.UTF_8));
+            client.getOutputStream().flush();
+            assertEquals('E', client.getInputStream().read());
+            verify(audit, timeout(2000)).publishRegisteredConnection(eq("111111111111"), eq("c1"), eq("analytics"),
+                    eq("analyst"), eq("authentication failure"), anyString(), anyInt());
+        }
+    }
+
+    @Test
+    void successfulLoginAndActivityUseTheRequestedIdentity() throws Exception {
+        fakeBackend = new ServerSocket(0);
+        Thread.ofVirtual().start(() -> {
+            try (Socket backend = fakeBackend.accept()) {
+                PostgresWire.readStartup(backend.getInputStream(), 10000, "startup");
+                PostgresWire.write(backend.getOutputStream(), 'R', new byte[4]);
+                PostgresWire.write(backend.getOutputStream(), 'Z', new byte[]{'I'});
+                backend.getOutputStream().flush();
+                PostgresWire.read(backend.getInputStream(), 10000, "query");
+            } catch (IOException expected) {
+                // Closing the test sockets ends the fake server.
+            }
+        });
+        RedshiftAuditLogPublisher audit = mock(RedshiftAuditLogPublisher.class);
+        int port = FreePorts.anyInterfacePort();
+        proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", fakeBackend.getLocalPort(), "admin", "password", "dev",
+                mock(RdsSigV4Validator.class), realTls(), (user, password) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
+                mock(S3Service.class), mock(IamService.class), "111111111111", List.of(), 5000, 5000, 10, null, audit, null);
+        proxy.start(port);
+        try (Socket client = new Socket("localhost", port)) {
+            client.setSoTimeout(5000);
+            client.getOutputStream().write(PostgresWire.startupMessage(Map.of("user", "analyst", "database", "analytics")));
+            client.getOutputStream().flush();
+            assertEquals(9, client.getInputStream().readNBytes(9).length);
+            PostgresWire.write(client.getOutputStream(), 'p', "password\0".getBytes(StandardCharsets.UTF_8));
+            client.getOutputStream().flush();
+            assertEquals('R', PostgresWire.read(client.getInputStream(), 10000, "authenticated").type());
+            assertEquals('Z', PostgresWire.read(client.getInputStream(), 10000, "ready").type());
+            PostgresWire.write(client.getOutputStream(), 'Q', "SELECT 1\0".getBytes(StandardCharsets.UTF_8));
+            client.getOutputStream().flush();
+            verify(audit, timeout(2000)).publishRegisteredActivity("111111111111", "c1", "analytics", "analyst", "SELECT 1");
+            verify(audit, timeout(2000)).publishRegisteredConnection(eq("111111111111"), eq("c1"), eq("analytics"),
+                    eq("analyst"), eq("authenticated"), anyString(), anyInt());
+        }
+    }
 
     @TempDir
     Path tempDir;
@@ -173,6 +237,33 @@ class RedshiftAuthProxyTest {
     }
 
     @Test
+    void activeConnectionsCountsOpenClientsAndFallsOnClose() throws Exception {
+        fakeBackend = new ServerSocket(0);
+        int proxyPort = FreePorts.anyInterfacePort();
+        proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", fakeBackend.getLocalPort(),
+                "admin", "Secret123", "dev",
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
+                mock(S3Service.class), mock(IamService.class), 5000, 5000, 5);
+        proxy.start(proxyPort);
+        assertEquals(0, proxy.activeConnections());
+
+        try (Socket first = new Socket("localhost", proxyPort); Socket second = new Socket("localhost", proxyPort)) {
+            awaitActiveConnections(2);
+            first.close();
+            awaitActiveConnections(1);
+        }
+        awaitActiveConnections(0);
+    }
+
+    private void awaitActiveConnections(int expected) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (proxy.activeConnections() != expected && System.nanoTime() < deadline) {
+            Thread.sleep(25);
+        }
+        assertEquals(expected, proxy.activeConnections());
+    }
+
+    @Test
     void startRetriesTheBindWhileThePortIsMomentarilyStillInUse() throws Exception {
         fakeBackend = new ServerSocket(0);
         int proxyPort = FreePorts.anyInterfacePort();
@@ -214,6 +305,24 @@ class RedshiftAuthProxyTest {
         Field f = RedshiftAuthProxy.class.getDeclaredField("masterPassword");
         f.setAccessible(true);
         assertEquals("rotated", f.get(proxy));
+    }
+
+    @Test
+    void bindsWithABurstTolerantAcceptBacklog() throws Exception {
+        AtomicInteger acceptBacklog = new AtomicInteger();
+        proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", 1,
+                "admin", "Secret123", "dev",
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.REJECT,
+                mock(S3Service.class), mock(IamService.class), 5000, 5000, 100) {
+            @Override
+            ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
+                acceptBacklog.set(backlog);
+                return super.listenSocket(proxyPort, backlog);
+            }
+        };
+        proxy.start(0);
+        assertEquals(4096, acceptBacklog.get(),
+                "a connection burst must not overflow the proxy's accept queue");
     }
 
     private RdsProxyTlsCertificates realTls() {

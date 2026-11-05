@@ -18,8 +18,10 @@ import org.junit.jupiter.api.TestMethodOrder;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -620,11 +622,13 @@ class CodeArtifactPypiDockerIntegrationTest {
 
     /**
      * The real-world gap this closes: {@code ListPackageVersionAssets} used to not exist at all.
-     * Confirms the bridge enumerates pypi's one-asset-per-version simple index entry against the
-     * real pypiserver sidecar (not a mock) and reports the exact byte size and hash of a freshly
-     * uploaded file. A throwaway package, not {@link #PACKAGE_NAME}: {@link
+     * Confirms the bridge enumerates a single-asset pypi version against the real pypiserver
+     * sidecar (not a mock) and reports the exact byte size and hash of a freshly uploaded file. A
+     * throwaway package, not {@link #PACKAGE_NAME}: {@link
      * #deletePackageRemovesTheFileFromTheRealPypiserverSidecar} deletes that fixture for good with
-     * no republish afterward, unlike this format's sibling test classes.
+     * no republish afterward, unlike this format's sibling test classes. {@link
+     * #listPackageVersionAssetsListsBothTheSdistAndTheWheelOfOneVersion} covers the multi-asset
+     * case this one doesn't.
      */
     @Test
     @Order(18)
@@ -670,6 +674,178 @@ class CodeArtifactPypiDockerIntegrationTest {
                 .body("versions[0].version", equalTo("1.0.0"))
                 .body("versions[0].status", equalTo("Published"))
                 .body("versions[0].origin.originType", equalTo("INTERNAL"));
+    }
+
+    /**
+     * The bug this fixes: {@code CodeArtifactService#listPackageVersionAssets}'s own javadoc used
+     * to claim {@code pypi} genuinely has exactly one asset per version, the same wrong assumption
+     * {@link #listPackageVersionAssetsBridgesToTheRealPypiserverSidecar}'s javadoc made. A real
+     * pypi release commonly carries both a source distribution and a wheel for the same version
+     * (the exact shape {@link #copyPackageVersionsOverwriteKeepsEveryAssetWhenAPypiReleaseHasBothAnSdistAndAWheel}
+     * already uploads for its own purpose), so this confirms the real pypiserver sidecar lists
+     * both, each with its own correct size and hash, not just one of them.
+     */
+    @Test
+    @Order(20)
+    @SuppressWarnings("unchecked")
+    void listPackageVersionAssetsListsBothTheSdistAndTheWheelOfOneVersion() {
+        String packageName = "list-assets-multi-pypi-pkg";
+        String sdistFilename = "list_assets_multi_pypi_pkg-1.0.0.tar.gz";
+        String wheelFilename = "list_assets_multi_pypi_pkg-1.0.0-py3-none-any.whl";
+        byte[] sdistContent = "list-assets-multi-sdist-bytes".getBytes(StandardCharsets.UTF_8);
+        byte[] wheelContent = "list-assets-multi-wheel-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(twineUploadBody("boundary123", packageName, sdistFilename, sdistContent))
+                .post("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/")
+                .then().statusCode(200);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(twineUploadBody("boundary123", packageName, wheelFilename, wheelContent))
+                .post("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/")
+                .then().statusCode(200);
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/package/version/assets?domain=" + DOMAIN + "&repository=" + REPO + "&format=pypi"
+                        + "&package=" + packageName + "&version=1.0.0")
+                .then().statusCode(200)
+                .body("package", equalTo(packageName))
+                .body("assets.size()", equalTo(2))
+                .extract().jsonPath();
+        List<Map<String, Object>> assets = (List<Map<String, Object>>) (List<?>) body.getList("assets");
+        Map<String, Object> sdistAsset = findAssetByName(assets, sdistFilename);
+        assertEquals(sdistContent.length, sdistAsset.get("size"));
+        assertEquals(Digests.sha256Hex(sdistContent), ((Map<?, ?>) sdistAsset.get("hashes")).get("SHA-256"));
+        Map<String, Object> wheelAsset = findAssetByName(assets, wheelFilename);
+        assertEquals(wheelContent.length, wheelAsset.get("size"));
+        assertEquals(Digests.sha256Hex(wheelContent), ((Map<?, ?>) wheelAsset.get("hashes")).get("SHA-256"));
+    }
+
+    private static Map<String, Object> findAssetByName(List<Map<String, Object>> assets, String name) {
+        for (Map<String, Object> asset : assets) {
+            if (name.equals(asset.get("name"))) {
+                return asset;
+            }
+        }
+        throw new AssertionError("expected an asset named " + name + " among " + assets);
+    }
+
+    /**
+     * The real-world gap this guards against: {@code PypiserverSidecarClient#listPackageVersions}
+     * used to send one {@code HEAD} per version, one at a time, so a package with many versions
+     * answered no faster than its slowest version's own round trip, times the version count. This
+     * uploads enough versions that a broken fan-out (dropped, duplicated, or silently empty results
+     * from the bounded executor) would show up as something other than exactly this set of
+     * versions, against the real pypiserver sidecar, not a mock.
+     */
+    @Test
+    @Order(21)
+    void listPackageVersionsFetchesManyVersionsPublishTimesCorrectly() {
+        String packageName = "many-versions-pypi-pkg";
+        int versionCount = 12;
+        Set<String> expectedVersions = new HashSet<>();
+        for (int i = 1; i <= versionCount; i++) {
+            String version = "1.0." + i;
+            expectedVersions.add(version);
+            String filename = "many_versions_pypi_pkg-" + version + ".tar.gz";
+            byte[] content = ("many-versions-sdist-bytes-" + i).getBytes(StandardCharsets.UTF_8);
+            given().header("Authorization", "Bearer " + bearerToken)
+                    .contentType("multipart/form-data; boundary=boundary123")
+                    .body(twineUploadBody("boundary123", packageName, version, filename, content, null))
+                    .post("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/")
+                    .then().statusCode(200);
+        }
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=pypi"
+                        + "&package=" + packageName)
+                .then().statusCode(200)
+                .body("package", equalTo(packageName))
+                .body("versions.size()", equalTo(versionCount))
+                .extract().jsonPath();
+        List<String> actualVersions = body.getList("versions.version", String.class);
+        assertEquals(expectedVersions, new HashSet<>(actualVersions));
+        String defaultDisplayVersion = body.getString("defaultDisplayVersion");
+        assertTrue(expectedVersions.contains(defaultDisplayVersion),
+                "expected defaultDisplayVersion to be one of the uploaded versions, got "
+                        + defaultDisplayVersion);
+    }
+
+    /**
+     * Bridges to pypiserver's own root {@code /simple/} index, confirmed live: uploads a package
+     * with a mixed-case, dotted name to confirm {@code PypiserverSidecarClient#listPackages}'s own
+     * href parsing really gets back the PEP 503-normalized project name a live pypiserver root
+     * index reports, not the originally-uploaded spelling, matching what {@code
+     * CodeArtifactService}'s own {@code accountingPackageName} already normalizes pypi names to.
+     */
+    @Test
+    @Order(22)
+    void listPackagesBridgesToTheRealPypiserverRootSimpleIndex() {
+        String packageName = "List.Packages_Probe";
+        String filename = "list_packages_probe-1.0.0.tar.gz";
+        byte[] content = "list-packages-probe-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(twineUploadBody("boundary123", packageName, filename, content))
+                .post("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/")
+                .then().statusCode(200);
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/packages?domain=" + DOMAIN + "&repository=" + REPO + "&format=pypi")
+                .then().statusCode(200)
+                .extract().jsonPath();
+        List<String> names = body.getList("packages.package", String.class);
+        assertTrue(names.contains("list-packages-probe"), "expected list-packages-probe among " + names);
+    }
+
+    /**
+     * Closes 10-NATIVE-STATUS for pypi: a plain {@code pip install} download of an Archived
+     * version's real file must 404 against the live pypiserver sidecar, even though the file
+     * itself is still sitting there untouched. This is the one format whose download route is a
+     * bare filename with no package name or version in the URL at all (see {@code
+     * CodeArtifactPypiController#fileIdentitiesByRepo}'s own javadoc), so this also proves the
+     * identity this test's own upload recorded is what the download route resolved the coordinate
+     * from. Its own package, not {@link #PACKAGE_NAME}, so archiving it can't disturb any other
+     * ordered test in this class.
+     */
+    @Test
+    @Order(22)
+    void archivingAVersionBlocksItsRealPypiserverFileDownloadWhileLeavingTheBytesInPlace() {
+        String packageName = "archive-download-pypi-pkg";
+        String filename = "archive_download_pypi_pkg-1.0.0.tar.gz";
+        byte[] content = "archive download throwaway sdist".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .contentType("multipart/form-data; boundary=boundary123")
+                .body(twineUploadBody("boundary123", packageName, filename, content))
+                .post("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/")
+                .then().statusCode(200);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"],\"targetStatus\":\"Archived\"}")
+                .post("/v1/package/versions/update_status?domain=" + DOMAIN + "&repository=" + REPO
+                        + "&format=pypi&package=" + packageName)
+                .then().statusCode(200)
+                .body("successfulVersions['1.0.0'].status", equalTo("Archived"));
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/packages/" + filename)
+                .then().statusCode(404);
+
+        // Proves the block above is this check's own override, not pypiserver having genuinely
+        // lost the file: un-archiving must make the exact same bytes fetchable again, with
+        // nothing re-uploaded in between.
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"],\"targetStatus\":\"Published\"}")
+                .post("/v1/package/versions/update_status?domain=" + DOMAIN + "&repository=" + REPO
+                        + "&format=pypi&package=" + packageName)
+                .then().statusCode(200)
+                .body("successfulVersions['1.0.0'].status", equalTo("Published"));
+        byte[] fetchedAfterUnarchive = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/pypi/" + DOMAIN + "/" + REPO + "/packages/" + filename)
+                .then().statusCode(200)
+                .extract().asByteArray();
+        assertEquals(new String(content, StandardCharsets.UTF_8),
+                new String(fetchedAfterUnarchive, StandardCharsets.UTF_8));
     }
 
     /**
@@ -752,7 +928,7 @@ class CodeArtifactPypiDockerIntegrationTest {
      * {@code name} and the {@code content} file part, so the rest are included for realism only.
      */
     private static byte[] twineUploadBody(String boundary, String packageName, String filename, byte[] content) {
-        return twineUploadBody(boundary, packageName, filename, content, null);
+        return twineUploadBody(boundary, packageName, "1.0.0", filename, content, null);
     }
 
     /**
@@ -762,6 +938,19 @@ class CodeArtifactPypiDockerIntegrationTest {
      */
     private static byte[] twineUploadBody(String boundary, String packageName, String filename, byte[] content,
             String description) {
+        return twineUploadBody(boundary, packageName, "1.0.0", filename, content, description);
+    }
+
+    /**
+     * Full shape, with an explicit {@code version} field: every other overload above hardcodes
+     * {@code 1.0.0}, which happens to match every other test's own fixed filename in this class,
+     * but {@code CodeArtifactPypiController#upload} now checks the version field against the
+     * real filename (Greptile's review of this PR), so a caller whose filename embeds a different
+     * version (see {@link #listPackageVersionsFetchesManyVersionsPublishTimesCorrectly}'s own
+     * loop) must pass the matching one here instead.
+     */
+    private static byte[] twineUploadBody(String boundary, String packageName, String version, String filename,
+            byte[] content, String description) {
         String preamble = "--" + boundary + "\r\n"
                 + "Content-Disposition: form-data; name=\":action\"\r\n\r\n"
                 + "file_upload\r\n"
@@ -773,7 +962,7 @@ class CodeArtifactPypiDockerIntegrationTest {
                 + packageName + "\r\n"
                 + "--" + boundary + "\r\n"
                 + "Content-Disposition: form-data; name=\"version\"\r\n\r\n"
-                + "1.0.0\r\n"
+                + version + "\r\n"
                 + "--" + boundary + "\r\n"
                 + "Content-Disposition: form-data; name=\"filetype\"\r\n\r\n"
                 + "sdist\r\n"

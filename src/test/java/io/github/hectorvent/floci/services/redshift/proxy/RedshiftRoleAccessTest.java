@@ -17,7 +17,11 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -65,8 +69,14 @@ class RedshiftRoleAccessTest {
             "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}""";
 
     private static IamService iamServiceWithRole(String trustPolicy) {
+        return iamServiceWithRole(trustPolicy, ROLE_ARN);
+    }
+
+    /** IAM holding {@code spectrum-role} under {@code heldArn}. */
+    private static IamService iamServiceWithRole(String trustPolicy, String heldArn) {
         IamService iamService = mock(IamService.class);
         IamRole role = mock(IamRole.class);
+        when(role.getArn()).thenReturn(heldArn);
         when(role.getAssumeRolePolicyDocument()).thenReturn(trustPolicy);
         when(iamService.findRole(ACCOUNT, "spectrum-role")).thenReturn(Optional.of(role));
         return iamService;
@@ -99,6 +109,40 @@ class RedshiftRoleAccessTest {
     }
 
     @Test
+    void resolveRoleSessionTakesTheRoleOnlyUnderTheArnIamHoldsItUnder() {
+        String held = "arn:aws:iam::111111111111:role/app/spectrum-role";
+        String otherPath = "arn:aws:iam::111111111111:role/sandbox/spectrum-role";
+        IamService iamService = iamServiceWithRole(TRUST_POLICY, held);
+
+        assertRefused("does not exist", otherPath, iamService, ACCOUNT, List.of(otherPath));
+        assertRefused("does not exist", ROLE_ARN, iamService, ACCOUNT, List.of(ROLE_ARN));
+        RedshiftRoleAccess.RoleSession session =
+                RedshiftRoleAccess.resolveRoleSession(held, iamService, ACCOUNT, List.of(held));
+        verify(iamService).registerSessionForAccount(eq(ACCOUNT), eq(session.accessKeyId()), anyString(),
+                eq(session.sessionToken()), eq(held), any(Instant.class), isNull());
+    }
+
+    @Test
+    void findRoleLooksUpTheRoleHonouringItsPath() {
+        String held = "arn:aws:iam::111111111111:role/app/spectrum-role";
+        String otherPath = "arn:aws:iam::111111111111:role/sandbox/spectrum-role";
+        IamService iamService = iamServiceWithRole(TRUST_POLICY, held);
+
+        assertTrue(RedshiftRoleAccess.findRole(held, iamService).isPresent());
+        assertTrue(RedshiftRoleAccess.findRole(otherPath, iamService).isEmpty());
+        assertTrue(RedshiftRoleAccess.findRole(ROLE_ARN, iamService).isEmpty());
+        assertTrue(RedshiftRoleAccess.findRole("not-an-arn", iamService).isEmpty());
+        assertTrue(RedshiftRoleAccess.findRole("arn:aws:iam::111111111111:user/someone", iamService).isEmpty());
+        assertTrue(RedshiftRoleAccess.findRole(null, iamService).isEmpty());
+
+        assertTrue(RedshiftRoleAccess.roleExists(held, iamService));
+        assertFalse(RedshiftRoleAccess.roleExists(otherPath, iamService));
+        assertFalse(RedshiftRoleAccess.roleExists(ROLE_ARN, iamService));
+        assertFalse(RedshiftRoleAccess.roleExists("not-an-arn", iamService));
+        assertFalse(RedshiftRoleAccess.roleExists(null, iamService));
+    }
+
+    @Test
     void resolveRoleSessionRefusesARoleWhoseTrustPolicyExcludesRedshift() {
         assertRefused("trust policy", ROLE_ARN, iamServiceWithRole(EC2_TRUST_POLICY), ACCOUNT, List.of(ROLE_ARN));
     }
@@ -116,6 +160,19 @@ class RedshiftRoleAccessTest {
                 eq(session.sessionToken()), eq(ROLE_ARN), expiry.capture(), isNull());
         assertThat(expiry.getValue().isAfter(before.plus(Duration.ofMinutes(29))), equalTo(true));
         assertThat(expiry.getValue().isBefore(before.plus(Duration.ofMinutes(31))), equalTo(true));
+    }
+
+    @Test
+    void resolveRoleSessionIncludesSecretAccessKeyMatchingIamSession() {
+        IamService iamService = iamServiceWithRole(TRUST_POLICY);
+
+        RedshiftRoleAccess.RoleSession session = RedshiftRoleAccess.resolveRoleSession(
+                ROLE_ARN, iamService, ACCOUNT, List.of(ROLE_ARN));
+
+        assertNotNull(session.secretAccessKey());
+        assertThat(session.secretAccessKey().length(), equalTo(40));
+        verify(iamService).registerSessionForAccount(eq(ACCOUNT), eq(session.accessKeyId()),
+                eq(session.secretAccessKey()), eq(session.sessionToken()), eq(ROLE_ARN), any(), isNull());
     }
 
     @Test
@@ -137,7 +194,7 @@ class RedshiftRoleAccessTest {
         when(iamService.resolvePrincipalContext(ROLE_ARN)).thenReturn(CallerContext.of(List.of("""
                 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket",
                  "Resource":"arn:aws:s3:::bucket","Condition":{"StringLike":{"s3:prefix":["events/*"]}}}]}""")));
-        RedshiftRoleAccess.RoleSession session = new RedshiftRoleAccess.RoleSession("ASIAX", "token");
+        RedshiftRoleAccess.RoleSession session = new RedshiftRoleAccess.RoleSession("ASIAX", "secret", "token");
 
         RedshiftRoleAccess.authorizeRoleList(s3, iamService, session, ROLE_ARN, "bucket", "events/");
         S3CopySimulator.S3TransferException denied = assertThrows(S3CopySimulator.S3TransferException.class,
@@ -151,9 +208,9 @@ class RedshiftRoleAccessTest {
         S3Service s3 = mock(S3Service.class);
         when(s3.isAuthEnforced()).thenReturn(false);
         IamService iamService = mock(IamService.class);
-        RedshiftRoleAccess.RoleSession session = new RedshiftRoleAccess.RoleSession("ASIAX", "token");
+        RedshiftRoleAccess.RoleSession session = new RedshiftRoleAccess.RoleSession("ASIAX", "secret", "token");
         doThrow(new AwsException("NoSuchBucket", "The specified bucket does not exist", 404)).when(s3)
-                .authorizeSignedListBucket("ASIAX", "token", "bucket");
+                .authorizeSignedListBucket("ASIAX", "token", "bucket", "");
 
         S3CopySimulator.S3TransferException missing = assertThrows(S3CopySimulator.S3TransferException.class,
                 () -> RedshiftRoleAccess.authorizeRoleList(s3, iamService, session, ROLE_ARN, "bucket", ""));
@@ -167,9 +224,9 @@ class RedshiftRoleAccessTest {
         S3Service s3 = mock(S3Service.class);
         when(s3.isAuthEnforced()).thenReturn(false);
         IamService iamService = mock(IamService.class);
-        RedshiftRoleAccess.RoleSession session = new RedshiftRoleAccess.RoleSession("ASIAX", "token");
+        RedshiftRoleAccess.RoleSession session = new RedshiftRoleAccess.RoleSession("ASIAX", "secret", "token");
         doThrow(new AwsException("AccessDenied", "Access Denied", 403)).when(s3)
-                .authorizeSignedListBucket("ASIAX", "token", "bucket");
+                .authorizeSignedListBucket("ASIAX", "token", "bucket", "");
         doThrow(new AwsException("AccessDenied", "Access Denied", 403)).when(s3)
                 .authorizeSignedGetObject("ASIAX", "token", "bucket", "key");
 
@@ -194,5 +251,35 @@ class RedshiftRoleAccessTest {
 
         // No exception, and resolvePrincipalContext is never consulted when enforcement is off.
         verifyNoInteractions(iamService);
+    }
+
+    @Test
+    void authorizeRoleActionSuppliesPrincipalArnToOrganizationPolicies() {
+        authorizeRoleWithOrganizationPolicy(ROLE_ARN);
+    }
+
+    @Test
+    void authorizeRoleActionDeniesWhenPrincipalArnDoesNotMatchApprovedRoleInOrganizationPolicy() {
+        String otherRole = "arn:aws:iam::111111111111:role/other-role";
+        S3CopySimulator.S3TransferException exception = assertThrows(S3CopySimulator.S3TransferException.class,
+                () -> authorizeRoleWithOrganizationPolicy(otherRole));
+
+        assertThat(exception.sqlState(), equalTo("42501"));
+        assertThat(exception.getMessage(), containsString("S3 access denied"));
+    }
+
+    private void authorizeRoleWithOrganizationPolicy(String roleArn) {
+        S3Service s3 = mock(S3Service.class);
+        when(s3.isAuthEnforced()).thenReturn(true);
+        IamService iamService = mock(IamService.class);
+        when(iamService.resolvePrincipalContext(roleArn)).thenReturn(CallerContext.of(List.of("""
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}""")));
+        when(iamService.effectiveScpLevels(ACCOUNT)).thenReturn(List.of(List.of("""
+                {"Version":"2012-10-17","Statement":[
+                 {"Effect":"Allow","Action":"*","Resource":"*"},
+                 {"Effect":"Deny","Action":"s3:GetObject","Resource":"*",
+                  "Condition":{"ArnNotLike":{"aws:PrincipalArn":"%s"}}}]}""".formatted(ROLE_ARN))));
+
+        RedshiftRoleAccess.authorizeRoleAction(s3, iamService, roleArn, "s3:GetObject", "arn:aws:s3:::bucket/key");
     }
 }

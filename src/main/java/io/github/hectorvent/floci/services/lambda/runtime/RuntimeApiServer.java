@@ -15,6 +15,7 @@ import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -72,6 +73,9 @@ public class RuntimeApiServer {
 
     private static final Logger LOG = Logger.getLogger(RuntimeApiServer.class);
 
+    // The Go runtime sends X-Ray error causes below 1 MiB, in addition to normal request headers.
+    private static final int MAX_RUNTIME_API_HEADER_SIZE = 1024 * 1024 + 16 * 1024;
+
     private static final String RUNTIME_API_VERSION = "2018-06-01";
     private static final String NEXT_PATH = "/" + RUNTIME_API_VERSION + "/runtime/invocation/next";
     private static final String RESPONSE_PATH = "/" + RUNTIME_API_VERSION + "/runtime/invocation/:requestId/response";
@@ -114,6 +118,8 @@ public class RuntimeApiServer {
     private final Object lock = new Object();
     private final CompletableFuture<Void> initialization = new CompletableFuture<>();
     private boolean runtimeNextReceived;
+    // When the launcher started this runtime's container, in epoch millis; 0 until then.
+    private volatile long containerStartedAtMs;
 
     // Invocations queued before a /next poller arrived. Guarded by lock.
     private final ArrayDeque<PendingInvocation> pendingQueue = new ArrayDeque<>();
@@ -173,6 +179,12 @@ public class RuntimeApiServer {
      * but for the synchronous handler-thread dispatch path.
      */
     protected void beforeNextPathDispatchGuard() { }
+
+    /**
+     * Test-only: signals that a stopped guard suppressed a runtime dispatch or INVOKE fan-out.
+     * May run under the server lock, so overrides must not block.
+     */
+    protected void onStoppedDispatchSkipped() { }
 
     /**
      * Test-only: called inside quiesce() immediately after the lock has been
@@ -309,6 +321,26 @@ public class RuntimeApiServer {
         }
     }
 
+    /** Records that the container running this runtime has started, which opens its Init phase. */
+    public void markContainerStarted() {
+        containerStartedAtMs = System.currentTimeMillis();
+    }
+
+    /** Epoch millis at which the container started, or 0 when no launcher has recorded it. */
+    public long getContainerStartedAtMs() {
+        return containerStartedAtMs;
+    }
+
+    /**
+     * Whether the runtime has polled {@code /next} at least once, which ends its Init phase.
+     * Unlike {@link #isInitialized()} this does not wait for extensions.
+     */
+    public boolean hasRuntimePolled() {
+        synchronized (lock) {
+            return runtimeNextReceived;
+        }
+    }
+
     private void completeInitializationIfReady() {
         synchronized (lock) {
             CountDownLatch latch = extensionsReady;
@@ -348,7 +380,7 @@ public class RuntimeApiServer {
         if (latch == null) {
             return true;
         }
-        return latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        return latch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -421,6 +453,8 @@ public class RuntimeApiServer {
                 }
                 if (!alreadyHandled) {
                     sendInvocation(ctx, toDispatch);
+                } else {
+                    onStoppedDispatchSkipped();
                 }
             }
             // else: parked — enqueue() or the httpServer close will dispatch/end this ctx.
@@ -590,6 +624,7 @@ public class RuntimeApiServer {
         if (started.isDone()) return;
         httpServer = vertx.createHttpServer(new HttpServerOptions()
                 .setMaxFormAttributeSize(-1)
+                .setMaxHeaderSize(MAX_RUNTIME_API_HEADER_SIZE)
                 // Real AWS's Runtime/Extensions API is plain HTTP/1.1. Vert.x defaults to
                 // accepting an h2c upgrade, which the JDK HttpClient used in tests and by some
                 // language runtimes opts into unless told otherwise. That multiplexes every
@@ -780,7 +815,11 @@ public class RuntimeApiServer {
     private void notifyExtensionsOfInvoke(PendingInvocation invocation) {
         List<Runnable> dispatches = new ArrayList<>();
         synchronized (lock) {
-            if (stopped || extensions.isEmpty()) {
+            if (stopped) {
+                onStoppedDispatchSkipped();
+                return;
+            }
+            if (extensions.isEmpty()) {
                 return;
             }
             ExtensionEvent event = ExtensionEvent.invoke(
@@ -870,6 +909,7 @@ public class RuntimeApiServer {
                 boolean shouldDispatch;
                 synchronized (lock) {
                     if (stopped) {
+                        onStoppedDispatchSkipped();
                         return;
                     }
                     if (waitingCtx.response().ended()) {
@@ -1103,7 +1143,7 @@ public class RuntimeApiServer {
                 .put("errorType", "Runtime.ExitError")
                 .put("errorMessage", message)
                 .encode()
-                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                .getBytes(StandardCharsets.UTF_8);
     }
 
     private void handleExtensionFatalError(RoutingContext ctx, String phase) {

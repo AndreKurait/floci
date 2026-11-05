@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.s3;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -127,6 +128,24 @@ class S3LifecycleServiceTest {
     }
 
     @Test
+    void noncurrentExpirationDeletesAnArchivedNullVersionWithoutChangingTheCurrentVersion() {
+        put("a.txt");
+        s3Service.putBucketVersioning(BUCKET, "Enabled");
+        S3Object current = put("a.txt");
+        lifecycle(rule("Enabled", "<Filter></Filter>",
+                "<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays>"
+                        + "</NoncurrentVersionExpiration>"));
+
+        s3Service.applyLifecycleExpiration(Instant.now().plus(Duration.ofDays(3)));
+
+        assertThat(versionIds("a.txt"), contains(current.getVersionId()));
+        assertEquals("data", new String(s3Service.getObject(BUCKET, "a.txt").getData(), StandardCharsets.UTF_8));
+        AwsException missing = assertThrows(AwsException.class,
+                () -> s3Service.getObject(BUCKET, "a.txt", "null"));
+        assertEquals("NoSuchVersion", missing.getErrorCode());
+    }
+
+    @Test
     void aNoncurrentVersionUnderALegalHoldIsKept() {
         s3Service.putBucketVersioning(BUCKET, "Enabled");
         s3Service.setBucketObjectLockEnabled(BUCKET);
@@ -227,20 +246,36 @@ class S3LifecycleServiceTest {
     }
 
     @Test
-    void aKeyLeftWithOnlyVersionsInASuspendedBucketHasItsOlderVersionsExpired() {
+    void aSuspendedDeleteMakesTheCurrentVersionNoncurrent() {
         s3Service.putBucketVersioning(BUCKET, "Enabled");
         S3Object v1 = put("a.txt");
         S3Object v2 = put("a.txt");
         s3Service.putBucketVersioning(BUCKET, "Suspended");
         s3Service.deleteObject(BUCKET, "a.txt");
-        assertThat(versionIds("a.txt"), contains(v2.getVersionId(), v1.getVersionId()));
+        assertThat(versionIds("a.txt"), contains(null, v2.getVersionId(), v1.getVersionId()));
         lifecycle(rule("Enabled", "<Filter></Filter>",
                 "<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>"));
 
         s3Service.applyLifecycleExpiration(Instant.now().plus(Duration.ofDays(3)));
 
-        // v1 has been noncurrent since v2 was written. When v2 stopped being current is not recorded.
-        assertThat(versionIds("a.txt"), contains(v2.getVersionId()));
+        List<S3Object> left = versions("a.txt");
+        assertEquals(1, left.size());
+        assertTrue(left.get(0).isDeleteMarker());
+        assertNull(left.get(0).getVersionId());
+    }
+
+    @Test
+    void anExpiredNullDeleteMarkerIsRemoved() {
+        s3Service.putBucketVersioning(BUCKET, "Enabled");
+        s3Service.putBucketVersioning(BUCKET, "Suspended");
+        s3Service.deleteObject(BUCKET, "a.txt");
+        assertEquals(1, versions("a.txt").size(), "only the null delete marker exists");
+        lifecycle(rule("Enabled", "<Filter></Filter>",
+                "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>"));
+
+        s3Service.applyLifecycleExpiration(Instant.now());
+
+        assertThat(versions("a.txt"), empty());
     }
 
     @Test

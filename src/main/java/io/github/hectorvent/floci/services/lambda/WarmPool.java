@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.quarkus.runtime.Startup;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -43,6 +44,7 @@ import java.util.concurrent.TimeUnit;
  *    after the invocation completes.
  */
 @ApplicationScoped
+@Startup
 public class WarmPool implements ContainerTeardown, Resettable {
 
     private static final Logger LOG = Logger.getLogger(WarmPool.class);
@@ -662,11 +664,14 @@ public class WarmPool implements ContainerTeardown, Resettable {
 
     private void stopQuietly(ContainerHandle handle) {
         boolean shutdown;
+        long deadline;
         synchronized (capLock) {
             shutdown = lifecycleState.stopped;
+            deadline = lifecycleState.deadlineNanos;
         }
         if (shutdown) {
-            stopInParallel(List.of(handle));
+            long now = System.nanoTime();
+            stopInParallel(List.of(handle), deadline > now ? deadline : now + drainTimeoutNanos);
         } else {
             stopOwnedHandle(handle, System.nanoTime());
         }
@@ -693,7 +698,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             pendingTeardown.remove(handle);
             activeLeases.remove(handle);
         } catch (Exception e) {
-            LOG.warnv("Error stopping container {0}: {1}", handle.getContainerId(), e.getMessage());
+            LOG.warnv(e, "Error stopping container {0}", handle.getContainerId());
         } finally {
             stoppingHandles.remove(handle, completion);
             completion.countDown();

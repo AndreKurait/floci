@@ -1,6 +1,5 @@
 package io.github.hectorvent.floci.services.ses;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -37,8 +36,6 @@ import static io.github.hectorvent.floci.services.ses.SesV2Json.parseTagsArray;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.putTimestamp;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.readOptionBody;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.remapV1Exception;
-import static io.github.hectorvent.floci.services.ses.SesV2Json.requireJsonObject;
-import static io.github.hectorvent.floci.services.ses.SesV2Json.requireObjectOrAbsent;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.stringMapMemberOrAbsent;
 import static io.github.hectorvent.floci.services.ses.SesV2Json.stringMemberOrAbsent;
 
@@ -85,7 +82,7 @@ public class SesIdentityController {
     public Response createEmailIdentity(@Context HttpHeaders headers, String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = objectMapper.readTree(body);
+            JsonNode request = readOptionBody(objectMapper, body);
             JsonNode emailIdentityNode = request.path("EmailIdentity");
             if (!emailIdentityNode.isMissingNode() && !emailIdentityNode.isNull()
                     && !emailIdentityNode.isTextual()) {
@@ -232,8 +229,6 @@ public class SesIdentityController {
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("BadRequestException", e.getMessage(), 400);
         }
     }
 
@@ -249,8 +244,6 @@ public class SesIdentityController {
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("BadRequestException", e.getMessage(), 400);
         }
     }
 
@@ -276,18 +269,16 @@ public class SesIdentityController {
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
-    private String readPolicyBody(String body) throws JsonProcessingException {
-        if (body == null || body.isBlank()) {
+    private String readPolicyBody(String body) {
+        if (body == null || body.isEmpty()) {
             throw new AwsException("BadRequestException", "Request body is required.", 400);
         }
-        JsonNode request = objectMapper.readTree(body);
-        requireJsonObject(request);
+        JsonNode request = readOptionBody(objectMapper, body);
         JsonNode policyNode = request.path("Policy");
         if (policyNode.isMissingNode() || policyNode.isNull()) {
             // Verified against AWS: a missing/null required member is a Smithy validation error.
             throw SmithyValidationErrors.badRequest(
-                    "Value at 'policy' failed to satisfy constraint: "
-                            + "Member must not be null");
+                    SmithyValidationErrors.notNullWithoutValue("policy"));
         }
         if (!policyNode.isTextual()) {
             // Policy is a String; AWS rejects a non-string with an empty-bodied 400. Don't coerce
@@ -322,15 +313,14 @@ public class SesIdentityController {
                                                           String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            JsonNode request = (body == null || body.isBlank())
-                    ? objectMapper.createObjectNode() : objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
+            SesV2RequestShapes.check("PutEmailIdentityDkimSigningAttributes", request);
             String origin = request.path("SigningAttributesOrigin").asText(null);
             if (!"AWS_SES".equals(origin) && !"EXTERNAL".equals(origin)) {
                 throw new AwsException("BadRequestException",
                         "SigningAttributesOrigin must be AWS_SES or EXTERNAL.", 400);
             }
-            JsonNode attrs = requireObjectOrAbsent(request, "SigningAttributes");
+            JsonNode attrs = request.path("SigningAttributes");
             String selector = attrs.path("DomainSigningSelector").asText(null);
             String nextKeyLength = attrs.path("NextSigningKeyLength").asText(null);
             if (nextKeyLength != null
@@ -366,11 +356,10 @@ public class SesIdentityController {
                                                         String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            if (body == null || body.isBlank()) {
+            if (body == null || body.isEmpty()) {
                 throw new AwsException("BadRequestException", "Request body is required.", 400);
             }
-            JsonNode request = objectMapper.readTree(body);
-            requireJsonObject(request);
+            JsonNode request = readOptionBody(objectMapper, body);
             JsonNode mailFromDomainNode = request.path("MailFromDomain");
             if (mailFromDomainNode.isMissingNode()) {
                 throw new AwsException("BadRequestException",
@@ -397,8 +386,6 @@ public class SesIdentityController {
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("BadRequestException", e.getMessage(), 400);
         }
     }
 
@@ -428,32 +415,21 @@ public class SesIdentityController {
                                                                String body) {
         String region = regionResolver.resolveRegion(headers);
         try {
+            // An omitted or explicit-null ConfigurationSetName clears the association, as does an
+            // empty body.
             String configurationSetName = null;
-            if (body != null && !body.isEmpty()) {
-                // Only a truly empty body is "no body". A non-empty body must be a JSON object; a
-                // whitespace-only or otherwise unparseable body is a serialization error (verified
-                // against real AWS: whitespace-only returns SerializationException and does not
-                // clear). Within a valid object, an omitted or explicit-null ConfigurationSetName
-                // clears the association (as does an empty body / {}).
-                JsonNode request = objectMapper.readTree(body);
-                if (request == null || !request.isObject()) {
-                    throw new AwsException("SerializationException", null, 400);
+            JsonNode node = readOptionBody(objectMapper, body).path("ConfigurationSetName");
+            if (!node.isMissingNode() && !node.isNull()) {
+                if (!node.isTextual()) {
+                    throw new AwsException("BadRequestException",
+                            "ConfigurationSetName must be a JSON string.", 400);
                 }
-                JsonNode node = request.path("ConfigurationSetName");
-                if (!node.isMissingNode() && !node.isNull()) {
-                    if (!node.isTextual()) {
-                        throw new AwsException("BadRequestException",
-                                "ConfigurationSetName must be a JSON string.", 400);
-                    }
-                    configurationSetName = node.asText();
-                }
+                configurationSetName = node.asText();
             }
             sesService.setEmailIdentityConfigurationSet(emailIdentity, configurationSetName, region);
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
             throw remapV1Exception(e);
-        } catch (JsonProcessingException e) {
-            throw new AwsException("SerializationException", null, 400);
         }
     }
 

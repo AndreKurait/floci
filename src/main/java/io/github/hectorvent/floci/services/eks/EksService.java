@@ -72,6 +72,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -154,6 +155,14 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             EksOidcService oidcService, EksAccessEntryService accessEntries) {
         this(storageFactory, config, regionResolver, clusterManager, ec2Service,
                 oidcService, accessEntries, null, null);
+    }
+
+    /** Called at boot so this lazily created bean runs {@link #init()}, which restarts persisted clusters. */
+    public void restorePersistedRuntime() {
+        int persistedClusters = allClusterEntries().size();
+        if (persistedClusters > 0) {
+            LOG.infov("Found {0} persisted EKS cluster record(s)", persistedClusters);
+        }
     }
 
     @PostConstruct
@@ -389,6 +398,12 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     void deleteClusterForAccount(String accountId, String clusterName) {
+        synchronized (capacityLock(accountId, clusterName)) {
+            deleteClusterForAccountHoldingCapacity(accountId, clusterName);
+        }
+    }
+
+    private void deleteClusterForAccountHoldingCapacity(String accountId, String clusterName) {
         Cluster cluster = (storage instanceof AccountAwareStorageBackend<Cluster> aware)
                 ? aware.getForAccount(accountId, clusterName).orElse(null)
                 : storage.get(clusterName).orElse(null);
@@ -734,6 +749,37 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 ? aware.getForAccount(accountId, name) : storage.get(name);
     }
 
+    /**
+     * The ARN of what an EKS route names in the caller's account, looked up as its handler looks it up: the
+     * cluster {@code clusterName} when {@code collection} is null, or else the node group, Fargate profile,
+     * add-on, access entry or Pod Identity association {@code name} in that cluster, by the route's
+     * collection segment, or for the update {@code name} the add-on it was made to. Empty when there is none,
+     * or the handler would refuse the lookup.
+     */
+    public Optional<String> findResourceArn(String clusterName, String collection, String name) {
+        Optional<Cluster> cluster = storage.get(clusterName);
+        if (cluster.isEmpty() || collection == null) {
+            return cluster.map(Cluster::getArn);
+        }
+        try {
+            return Optional.ofNullable(switch (collection) {
+                case "node-groups" -> describeNodeGroup(clusterName, name).getNodegroupArn();
+                case "fargate-profiles" -> describeFargateProfile(clusterName, name).getFargateProfileArn();
+                case "addons" -> addons.describe(cluster.get(), name).addonArn();
+                case "access-entries" -> accessEntries.describe(cluster.get(), name).accessEntryArn();
+                case "pod-identity-associations" -> podIdentityAssociations.describe(cluster.get(), name).associationArn();
+                case "updates" -> {
+                    String addon = addons.updateAddonName(cluster.get(), name);
+                    yield addon == null ? null : addons.describe(cluster.get(), addon).addonArn();
+                }
+                default -> null;
+            });
+        } catch (AwsException expected) {
+            // The handler answers this lookup with the same error, so the route names no resource to act on.
+            return Optional.empty();
+        }
+    }
+
     public Cluster describeCluster(String name) {
         Cluster cluster = storage.get(name)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
@@ -814,15 +860,24 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     public Cluster deleteCluster(String name) {
-        Cluster cluster = storage.get(name)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "No cluster found for name: " + name, 404));
-        if (cluster.getAccountId() == null) {
-            cluster.setAccountId(regionResolver.getAccountId());
+        // A first node group replacing the node holds this lock while the swap runs; deleting
+        // meanwhile would find no container to stop and have its cluster written back. Read the
+        // cluster only once the lock is held: a delete that waited may find it gone.
+        synchronized (capacityLock(regionResolver.getAccountId(), name)) {
+            Cluster cluster = storage.get(name)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "No cluster found for name: " + name, 404));
+            if (cluster.getAccountId() == null) {
+                cluster.setAccountId(regionResolver.getAccountId());
+            }
+            return deleteClusterHoldingCapacity(name, cluster);
         }
+    }
 
+    private Cluster deleteClusterHoldingCapacity(String name, Cluster cluster) {
         // One delete at a time per cluster, so a delete that fails cannot restore the status or
-        // state of a cluster another delete is tearing down.
+        // state of a cluster another delete is tearing down. Deletes from other threads already
+        // wait on the capacity lock; this refuses one nested on the same thread.
         if (!clustersBeingDeleted.add(cluster)) {
             throw new AwsException("ResourceInUseException",
                     "Cluster is already being deleted: " + name, 409);
@@ -944,8 +999,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         nodeGroup.setTags(request.getTags() != null ? new HashMap<>(request.getTags()) : new HashMap<>());
 
         String capacityKey = accountId + "/" + clusterName;
-        Object capacityLock = nodeGroupCapacityLocks.computeIfAbsent(capacityKey,
-                ignored -> new Object());
+        Object capacityLock = capacityLock(accountId, clusterName);
         boolean hasUserData = launchTemplateData != null && launchTemplateData.getUserData() != null
                 && !launchTemplateData.getUserData().isBlank();
         Cluster currentCluster;
@@ -1133,9 +1187,13 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 .collect(Collectors.toList());
     }
 
+    /** Serializes node group capacity changes and cluster deletion; taken before clustersBeingDeleted. */
+    private Object capacityLock(String accountId, String clusterName) {
+        return nodeGroupCapacityLocks.computeIfAbsent(accountId + "/" + clusterName, ignored -> new Object());
+    }
+
     public Nodegroup deleteNodeGroup(String clusterName, String nodegroupName) {
-        Object capacityLock = nodeGroupCapacityLocks.computeIfAbsent(
-                regionResolver.getAccountId() + "/" + clusterName, ignored -> new Object());
+        Object capacityLock = capacityLock(regionResolver.getAccountId(), clusterName);
         synchronized (capacityLock) {
             Nodegroup nodeGroup = describeNodeGroup(clusterName, nodegroupName);
             nodeGroup.setStatus(NodegroupStatus.DELETING);
@@ -1212,42 +1270,41 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         return "eks";
     }
 
+    /** EKS models no {@code responseCode} on either tag write, so both answer 200. */
+    @Override
+    public int tagResourceSuccessStatus() {
+        return 200;
+    }
+
+    @Override
+    public int untagResourceSuccessStatus() {
+        return 200;
+    }
+
     @Override
     public void tagResource(String region, String resourceArn, Map<String, String> tags) {
         ReservedTags.rejectReservedTagsOnUpdate(tags);
-        String clusterName = extractClusterName(resourceArn);
-        Cluster cluster = storage.get(clusterName)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "Resource not found: " + resourceArn, 404));
-
-        if (cluster.getTags() == null) {
-            cluster.setTags(new HashMap<>());
-        }
-        cluster.getTags().putAll(tags);
-        storage.put(clusterName, cluster);
+        retag(resourceArn, current -> {
+            Map<String, String> next = new HashMap<>(current);
+            next.putAll(tags);
+            return next;
+        });
     }
 
     @Override
     public void untagResource(String region, String resourceArn, List<String> tagKeys) {
-        String clusterName = extractClusterName(resourceArn);
-        Cluster cluster = storage.get(clusterName)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "Resource not found: " + resourceArn, 404));
-
-        if (cluster.getTags() != null && tagKeys != null) {
-            tagKeys.forEach(cluster.getTags()::remove);
-        }
-        storage.put(clusterName, cluster);
+        retag(resourceArn, current -> {
+            Map<String, String> next = new HashMap<>(current);
+            if (tagKeys != null) {
+                tagKeys.forEach(next::remove);
+            }
+            return next;
+        });
     }
 
     @Override
     public Map<String, String> listTags(String region, String resourceArn) {
-        String clusterName = extractClusterName(resourceArn);
-        Cluster cluster = storage.get(clusterName)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "Resource not found: " + resourceArn, 404));
-
-        return cluster.getTags() != null ? cluster.getTags() : Map.of();
+        return retag(resourceArn, UnaryOperator.identity());
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags) {
@@ -1262,14 +1319,81 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         return listTags(null, resourceArn);
     }
 
-    private String extractClusterName(String resourceArn) {
-        // arn:aws:eks:us-east-1:000000000000:cluster/my-cluster
-        int idx = resourceArn.lastIndexOf('/');
-        if (idx < 0 || idx == resourceArn.length() - 1) {
-            throw new AwsException("InvalidParameterException",
-                    "Invalid resource ARN: " + resourceArn, 400);
+    /**
+     * Applies {@code edit} to the tags of the resource {@code resourceArn} names and returns them.
+     * TagResource takes a cluster, node group, Fargate profile, add-on, pod identity association or
+     * access entry ARN; each child ARN names its cluster as the segment after the resource type.
+     */
+    private Map<String, String> retag(String resourceArn, UnaryOperator<Map<String, String>> edit) {
+        String resource = AwsArnUtils.isArnFor(resourceArn, "eks") ? AwsArnUtils.parse(resourceArn).resource() : "";
+        String[] parts = resource.split("/", -1);
+        boolean child = !"cluster".equals(parts[0]);
+        if (parts.length < (child ? 3 : 2) || parts[1].isEmpty() || (child && parts[2].isEmpty())) {
+            throw new AwsException("BadRequestException", "Invalid resource ARN: " + resourceArn, 400);
         }
-        return resourceArn.substring(idx + 1);
+        String clusterName = parts[1];
+        String childName = child ? parts[2] : "";
+        UnaryOperator<Map<String, String>> change = current -> {
+            Map<String, String> next = edit.apply(current);
+            if (!next.equals(current)) {
+                checkTagLimits(next);
+            }
+            return next;
+        };
+        Optional<Map<String, String>> tags = switch (parts[0]) {
+            case "cluster" -> storage.get(clusterName).map(cluster -> applyTags(cluster.getTags(), change, next -> {
+                cluster.setTags(new HashMap<>(next));
+                storage.put(clusterName, cluster);
+            }));
+            case "nodegroup" -> nodeGroupStorage.get(nodeGroupKey(clusterName, childName))
+                    .filter(nodegroup -> resourceArn.equals(nodegroup.getNodegroupArn()))
+                    .map(nodegroup -> applyTags(nodegroup.getTags(), change, next -> {
+                        nodegroup.setTags(new HashMap<>(next));
+                        nodeGroupStorage.put(nodeGroupKey(clusterName, childName), nodegroup);
+                    }));
+            case "fargateprofile" -> fargateProfileStorage.get(fargateProfileKey(clusterName, childName))
+                    .filter(profile -> resourceArn.equals(profile.getFargateProfileArn()))
+                    .map(profile -> applyTags(profile.getTags(), change, next -> {
+                        profile.setTags(new HashMap<>(next));
+                        fargateProfileStorage.put(fargateProfileKey(clusterName, childName), profile);
+                    }));
+            case "addon" -> addons == null ? Optional.empty() : storage.get(clusterName)
+                    .flatMap(cluster -> addons.retag(cluster, childName, resourceArn, change));
+            case "podidentityassociation" -> podIdentityAssociations == null ? Optional.empty()
+                    : storage.get(clusterName)
+                            .flatMap(cluster -> podIdentityAssociations.retag(cluster, childName, resourceArn, change));
+            case "access-entry" -> accessEntries == null ? Optional.empty() : storage.get(clusterName)
+                    .flatMap(cluster -> accessEntries.retag(cluster, resourceArn, change));
+            default -> Optional.empty();
+        };
+        return tags.orElseThrow(() -> new AwsException("NotFoundException",
+                "Resource not found: " + resourceArn, 404));
+    }
+
+    /** The TagMap limits: at most 50 tags, keys of 1 to 128 characters and values of at most 256. */
+    private static void checkTagLimits(Map<String, String> tags) {
+        if (tags.size() > 50) {
+            throw new AwsException("BadRequestException", "Too many tags: maximum is 50", 400);
+        }
+        for (Map.Entry<String, String> tag : tags.entrySet()) {
+            if (tag.getKey() == null || tag.getKey().isEmpty() || tag.getKey().length() > 128) {
+                throw new AwsException("BadRequestException", "Invalid tag key: " + tag.getKey(), 400);
+            }
+            if (tag.getValue() == null || tag.getValue().length() > 256) {
+                throw new AwsException("BadRequestException", "Invalid tag value for key: " + tag.getKey(), 400);
+            }
+        }
+    }
+
+    /** The tags {@code change} makes of {@code current}, handed to {@code store} only when they differ. */
+    private static Map<String, String> applyTags(Map<String, String> current,
+                                                 UnaryOperator<Map<String, String>> change,
+                                                 Consumer<Map<String, String>> store) {
+        Map<String, String> next = Map.copyOf(change.apply(current != null ? current : Map.of()));
+        if (!next.equals(current)) {
+            store.accept(next);
+        }
+        return next;
     }
 
     /**

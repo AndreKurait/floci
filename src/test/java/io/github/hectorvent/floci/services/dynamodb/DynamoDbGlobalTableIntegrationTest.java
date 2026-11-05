@@ -3,9 +3,15 @@ package io.github.hectorvent.floci.services.dynamodb;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.parsing.Parser;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+
+import static io.github.hectorvent.floci.testing.DynamoDbRequests.assertEpochMillisBetween;
+import static io.github.hectorvent.floci.testing.DynamoDbRequests.decimalAt;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
@@ -22,11 +28,11 @@ class DynamoDbGlobalTableIntegrationTest {
         RestAssured.registerParser("application/x-amz-json-1.0", Parser.JSON);
     }
 
-    private static io.restassured.response.Response call(String target, String body) {
+    private static Response call(String target, String body) {
         return given()
             .header("X-Amz-Target", "DynamoDB_20120810." + target)
             .contentType("application/x-amz-json-1.0")
-            .body(body.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            .body(body.getBytes(StandardCharsets.UTF_8))
         .when().post("/");
     }
 
@@ -69,6 +75,19 @@ class DynamoDbGlobalTableIntegrationTest {
         call("ListGlobalTables", "{}")
             .then().statusCode(200)
             .body("GlobalTables.GlobalTableName", hasItem(name));
+    }
+
+    @Test
+    void creationDateTimeHasMilliseconds() throws Exception {
+        String name = "gt-created-" + Long.toString(System.nanoTime(), 36);
+        long before = System.currentTimeMillis();
+        createTable(name, true, "NEW_AND_OLD_IMAGES");
+
+        BigDecimal created = decimalAt(call("CreateGlobalTable", "{\"GlobalTableName\":\"" + name + "\","
+                + "\"ReplicationGroup\":[{\"RegionName\":\"eu-west-1\"}]}")
+            .then().statusCode(200), "/GlobalTableDescription/CreationDateTime");
+        long after = System.currentTimeMillis();
+        assertEpochMillisBetween(before, created, after);
     }
 
     @Test

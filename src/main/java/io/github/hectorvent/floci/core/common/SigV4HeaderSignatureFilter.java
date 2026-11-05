@@ -12,7 +12,6 @@ import io.github.hectorvent.floci.services.apigateway.ApiGatewayUserRequestContr
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.RequestBodyReader;
-import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import io.github.hectorvent.floci.services.s3.S3ControlController;
 import io.github.hectorvent.floci.services.s3.S3Controller;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
@@ -92,9 +91,7 @@ import java.util.function.UnaryOperator;
  * not know, and {@code SignatureDoesNotMatch} / {@code InvalidSignatureException} for a signature
  * that does not verify, exceeds its query expiry or falls outside the header clock-skew window.
  *
- * <p>With global verification off, the optional Lambda identity facility authenticates only
- * native execution-role and one-hop session records. Other credentials retain their existing
- * behavior; no unknown-key secret fallback is added. With both flags off no headers are read.
+ * <p>Nothing here runs with the flag off: the filter returns before reading a single header.
  */
 @Provider
 @Priority(Priorities.AUTHENTICATION)
@@ -128,15 +125,13 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     // Lazily resolved: JAX-RS providers are instantiated before runtime config mappings exist
     // (the AwsProtocolClaimFilter pattern).
     private final jakarta.inject.Provider<EmulatorConfig> configProvider;
+    private volatile EmulatorConfig config;
     private final IamService iamService;
     private final ResolvedServiceCatalog catalog;
     private final CurrentVertxRequest currentVertxRequest;
 
     @Context
     ResourceInfo resourceInfo;
-
-    @Inject
-    RequestContext verifiedRequest;
 
     @Inject
     public SigV4HeaderSignatureFilter(jakarta.inject.Provider<EmulatorConfig> configProvider,
@@ -148,15 +143,18 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         this.currentVertxRequest = currentVertxRequest;
     }
 
+    private EmulatorConfig config() {
+        EmulatorConfig resolved = config;
+        if (resolved == null) {
+            resolved = configProvider.get();
+            config = resolved;
+        }
+        return resolved;
+    }
+
     @Override
     public void filter(ContainerRequestContext ctx) throws IOException {
-        if (verifiedRequest != null) {
-            verifiedRequest.setVerifiedSession(null, null, null);
-        }
-        EmulatorConfig config = configProvider.get();
-        boolean validateAll = config.auth().validateSignatures();
-        boolean lambdaIdentity = config.services().iam().lambdaIdentityVerificationEnabled();
-        if (!validateAll && !lambdaIdentity) {
+        if (!config().auth().validateSignatures()) {
             return;
         }
         Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
@@ -186,11 +184,6 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         }
 
         CredentialScope scope = CredentialScope.parse(signed.credential());
-        SessionCredential nativeSession = !lambdaIdentity || scope == null ? null
-                : iamService.lambdaIdentitySession(scope.accessKeyId()).orElse(null);
-        if (!validateAll && nativeSession == null) {
-            return;
-        }
         if (scope == null || isBlank(signed.signedHeaders()) || isBlank(signed.signature())) {
             incompleteSignature(ctx, resource, "Authorization header requires 'Credential' (in the form "
                     + "<access key>/<date>/<region>/<service>/aws4_request), 'SignedHeaders' and "
@@ -297,8 +290,6 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             LOG.debugv("Refusing {0} request: signature mismatch for accessKey={1}",
                     scope.service(), SigV4RequestValidator.sanitizeForLog(scope.accessKeyId()));
             signatureDoesNotMatch(ctx, resource, MISMATCH_MESSAGE);
-        } else if (verifiedRequest != null) {
-            verifiedRequest.setVerifiedSession(nativeSession, secretKey.get(), token);
         }
     }
 

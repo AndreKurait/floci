@@ -4,8 +4,12 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -17,7 +21,9 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
@@ -43,15 +49,24 @@ import java.util.stream.Stream;
  * observes the resting state.</p>
  */
 @ApplicationScoped
-public class LambdaMicrovmsService {
+public class LambdaMicrovmsService implements ResourceProvider {
 
+    private static final String IMAGE_TYPE = "lambda:microvm-image";
+    private static final String CONNECTOR_TYPE = "lambda:network-connector";
     private static final Pattern NAME_PATTERN = Pattern.compile("[a-zA-Z0-9-_]{1,64}");
     private static final int MAX_CONNECTOR_SUBNETS = 16;
+    private static final Pattern CONNECTOR_VERSION = Pattern.compile("[1-9][0-9]{0,17}");
     /** The one AWS-managed base image the catalog serves. */
     private static final String MANAGED_IMAGE = "al2023-1";
+    private static final String IMAGE_RESOURCE = "microvm-image:";
+    private static final String CONNECTOR_RESOURCE = "network-connector:";
+    /** The name or id a tag target's image or connector resource carries: no version qualifier. */
+    private static final Pattern TAGGED_NAME = Pattern.compile("[a-zA-Z0-9-_]+");
 
     private final RegionResolver regionResolver;
     private final StorageFactory storageFactory;
+    /** Guards every read and write of an image's or connector's tag map. */
+    private final Object tagLock = new Object();
 
     /**
      * Keyed {@code region/id}. The account is not part of the key here: the backend prefixes every
@@ -197,7 +212,7 @@ public class LambdaMicrovmsService {
      * ids/names through — CloudFormation physical ids stay name-based.
      */
     private static String unwrap(String identifier) {
-        if (identifier != null && identifier.startsWith("arn:")) {
+        if (AwsArnUtils.looksLikeArn(identifier)) {
             return identifier.substring(identifier.lastIndexOf(':') + 1);
         }
         return identifier;
@@ -411,7 +426,31 @@ public class LambdaMicrovmsService {
         public String stateReason;
         public String lastUpdateStatus;
         public String lastUpdateStatusReason;
+        public long latestVersion = 1;
+        /** Oldest first. The latest one has the configuration above. */
+        public List<NetworkConnectorVersion> versions = new ArrayList<>();
         public final Map<String, String> tags = new LinkedHashMap<>();
+    }
+
+    @RegisterForReflection
+    public static final class NetworkConnectorVersion {
+        public long version;
+        public String state;
+        public String stateReason;
+        public String operatorRole;
+        public List<String> subnetIds = List.of();
+        public List<String> securityGroupIds = List.of();
+        public String networkProtocol;
+        public List<String> associatedComputeResourceTypes = List.of();
+        public Instant lastModified;
+    }
+
+    /** A connector and the version an identifier names, the latest one when it names none. */
+    public record ConnectorVersion(NetworkConnector connector, NetworkConnectorVersion version, boolean qualified) {
+
+        public String versionArn() {
+            return LambdaArnUtils.networkConnectorVersionArn(connector.arn, version.version);
+        }
     }
 
     public NetworkConnector createConnector(String region, String accountId, String name,
@@ -465,16 +504,23 @@ public class LambdaMicrovmsService {
         connector.stateReason = "Initial creation";
         // Settle instantly, as with VMs.
         connector.state = "ACTIVE";
+        connector.versions.add(snapshot(connector, 1));
         connectors.put(key(region, connector.id), connector);
         // The create response is a snapshot taken before the instant settle,
         // so it reports PENDING while the stored connector is already ACTIVE.
         // It has to carry every member the stored one does, or a client reads
         // back less than it just sent.
+        NetworkConnector response = responseOf(connector);
+        response.state = "PENDING";
+        return response;
+    }
+
+    private static NetworkConnector responseOf(NetworkConnector connector) {
         NetworkConnector response = new NetworkConnector();
         response.id = connector.id;
         response.name = connector.name;
         response.arn = connector.arn;
-        response.state = "PENDING";
+        response.state = connector.state;
         response.operatorRole = connector.operatorRole;
         response.subnetIds = connector.subnetIds;
         response.securityGroupIds = connector.securityGroupIds;
@@ -482,16 +528,114 @@ public class LambdaMicrovmsService {
         response.associatedComputeResourceTypes = connector.associatedComputeResourceTypes;
         response.lastModified = connector.lastModified;
         response.stateReason = connector.stateReason;
+        response.lastUpdateStatus = connector.lastUpdateStatus;
+        response.lastUpdateStatusReason = connector.lastUpdateStatusReason;
+        response.latestVersion = connector.latestVersion;
         return response;
     }
 
-    public NetworkConnector getConnector(String region, String id) {
-        NetworkConnector connector = connectors.get(key(region, unwrap(id)));
-        if (connector == null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Network connector not found: " + id, 404);
+    private static NetworkConnectorVersion snapshot(NetworkConnector connector, long version) {
+        NetworkConnectorVersion out = new NetworkConnectorVersion();
+        out.version = version;
+        out.state = connector.state;
+        out.stateReason = connector.stateReason;
+        out.operatorRole = connector.operatorRole;
+        out.subnetIds = connector.subnetIds;
+        out.securityGroupIds = connector.securityGroupIds;
+        out.networkProtocol = connector.networkProtocol;
+        out.associatedComputeResourceTypes = connector.associatedComputeResourceTypes;
+        out.lastModified = connector.lastModified;
+        return out;
+    }
+
+    public NetworkConnector getConnector(String region, String identifier) {
+        return getConnectorVersion(region, identifier).connector();
+    }
+
+    /**
+     * The identifier is an id, a name or an ARN, each with an optional {@code :<version>}. AWS names
+     * the full ARN, with the version asked for, when either is missing.
+     */
+    public synchronized ConnectorVersion getConnectorVersion(String region, String identifier) {
+        ConnectorRef ref = ConnectorRef.parse(identifier);
+        NetworkConnector connector = find(region, ref);
+        long wanted = ref.version() == null ? connector.latestVersion : ref.version();
+        NetworkConnectorVersion found = connector.versions.stream()
+                .filter(v -> v.version == wanted)
+                .findFirst()
+                .orElseThrow(() -> connectorNotFound(LambdaArnUtils.networkConnectorVersionArn(connector.arn, wanted)));
+        return new ConnectorVersion(connector, found, ref.version() != null);
+    }
+
+    /** Oldest first. */
+    public synchronized List<NetworkConnectorVersion> listConnectorVersions(String region, String identifier) {
+        ConnectorRef ref = ConnectorRef.parse(identifier);
+        if (ref.version() != null) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Identifier must not include a version qualifier", 400);
         }
+        return List.copyOf(find(region, ref).versions);
+    }
+
+    /**
+     * The version a Web Function revision names by its version-qualified ARN. Only the connector id names it,
+     * not its name, and only in {@code region}.
+     */
+    public synchronized Optional<NetworkConnectorVersion> connectorVersion(String region, String connectorArn,
+                                                                         long version) {
+        Optional<NetworkConnector> connector = in(connectors, region)
+                .filter(c -> connectorArn.equals(c.arn))
+                .findFirst();
+        connector.ifPresent(LambdaMicrovmsService::backfillVersions);
+        return connector.flatMap(c -> c.versions.stream().filter(v -> v.version == version).findFirst());
+    }
+
+    private record ConnectorRef(String unqualified, boolean arn, String idOrName, Long version) {
+
+        static ConnectorRef parse(String identifier) {
+            boolean arn = AwsArnUtils.isArn(identifier);
+            // network-connector:<id>, with an optional :<version>
+            String[] resource = arn ? AwsArnUtils.parse(identifier).resource().split(":", -1) : null;
+            String unqualified = identifier;
+            Long version = null;
+            int colon = identifier.lastIndexOf(':');
+            if (colon >= 0 && (!arn || resource.length == 3)
+                    && CONNECTOR_VERSION.matcher(identifier.substring(colon + 1)).matches()) {
+                unqualified = identifier.substring(0, colon);
+                version = Long.parseLong(identifier.substring(colon + 1));
+            }
+            String idOrName = arn ? unqualified.substring(unqualified.lastIndexOf(':') + 1) : unqualified;
+            return new ConnectorRef(unqualified, arn, idOrName, version);
+        }
+    }
+
+    private NetworkConnector find(String region, ConnectorRef ref) {
+        NetworkConnector connector = connectors.get(key(region, ref.idOrName()));
+        if (connector == null) {
+            connector = in(connectors, region)
+                    .filter(c -> ref.idOrName().equals(c.name))
+                    .findFirst()
+                    .orElseThrow(() -> {
+                        String arn = ref.arn() ? ref.unqualified()
+                                : AwsArnUtils.Arn.of("lambda", region, regionResolver.getAccountId(),
+                                "network-connector:" + ref.idOrName()).toString();
+                        return connectorNotFound(ref.version() == null ? arn
+                                : LambdaArnUtils.networkConnectorVersionArn(arn, ref.version()));
+                    });
+        }
+        backfillVersions(connector);
         return connector;
+    }
+
+    /** One stored before versions has only its latest version. */
+    private static void backfillVersions(NetworkConnector connector) {
+        if (connector.versions.isEmpty()) {
+            connector.versions.add(snapshot(connector, connector.latestVersion));
+        }
+    }
+
+    private static AwsException connectorNotFound(String arn) {
+        return new AwsException("ResourceNotFoundException", "Network connector not found: " + arn, 404);
     }
 
     public List<NetworkConnector> listConnectors(String region) {
@@ -502,59 +646,151 @@ public class LambdaMicrovmsService {
 
     /**
      * UpdateNetworkConnector: every member is optional and a null one leaves the connector's value
-     * as it is. The model lets an update change the operator role, the network protocol and the
-     * associated compute resource types as well as the subnets and security groups.
+     * as it is. As on AWS, an update that changes the configuration or the operator role makes the
+     * next version, one that changes nothing keeps the version, and the compute resource types
+     * cannot change. Updates hold the service lock, so a version names the one update that made it.
      */
-    public NetworkConnector updateConnector(String region, String id,
-                                            List<String> subnetIds, List<String> securityGroupIds,
-                                            String operatorRole, String networkProtocol,
-                                            List<String> computeResourceTypes) {
+    public synchronized NetworkConnector updateConnector(String region, String id,
+                                                         List<String> subnetIds, List<String> securityGroupIds,
+                                                         String operatorRole, String networkProtocol,
+                                                         List<String> computeResourceTypes) {
         NetworkConnector connector = getConnector(region, id);
-        if (subnetIds != null && !subnetIds.isEmpty()) {
-            if (subnetIds.size() > MAX_CONNECTOR_SUBNETS) {
-                throw new AwsException("InvalidParameterValueException",
-                        "SubnetIds must contain between 1 and " + MAX_CONNECTOR_SUBNETS + " entries", 400);
-            }
-            connector.subnetIds = List.copyOf(subnetIds);
-            connector.lastModified = Instant.now();
-            connector.lastUpdateStatus = "Successful";
+        if (computeResourceTypes != null && !computeResourceTypes.isEmpty()
+                && !Set.copyOf(computeResourceTypes).equals(Set.copyOf(connector.associatedComputeResourceTypes))) {
+            throw new AwsException("InvalidParameterValueException",
+                    "AssociatedComputeResourceTypes cannot be changed on an existing network connector. Current: "
+                    + connector.associatedComputeResourceTypes + ", requested: " + computeResourceTypes + ".", 400);
+        }
+        if (subnetIds != null && subnetIds.size() > MAX_CONNECTOR_SUBNETS) {
+            throw new AwsException("InvalidParameterValueException",
+                    "SubnetIds must contain between 1 and " + MAX_CONNECTOR_SUBNETS + " entries", 400);
+        }
+        List<String> newSubnets = subnetIds != null && !subnetIds.isEmpty()
+                ? List.copyOf(subnetIds) : connector.subnetIds;
+        List<String> newGroups = securityGroupIds != null ? List.copyOf(securityGroupIds) : connector.securityGroupIds;
+        String newRole = operatorRole != null && !operatorRole.isBlank() ? operatorRole : connector.operatorRole;
+        String newProtocol = networkProtocol != null && !networkProtocol.isBlank()
+                ? networkProtocol : connector.networkProtocol;
+        connector.lastModified = Instant.now();
+        connector.lastUpdateStatus = "Successful";
+        // AWS keeps the stored order when only the order differs.
+        if (Set.copyOf(newSubnets).equals(Set.copyOf(connector.subnetIds))
+                && Set.copyOf(newGroups).equals(Set.copyOf(connector.securityGroupIds))
+                && Objects.equals(newRole, connector.operatorRole)
+                && Objects.equals(newProtocol, connector.networkProtocol)) {
             connector.lastUpdateStatusReason = "No configuration changes detected";
+            persist(connectors, region, connector.id, connector);
+            return responseOf(connector);
         }
-        if (securityGroupIds != null) {
-            connector.securityGroupIds = List.copyOf(securityGroupIds);
-        }
-        if (operatorRole != null && !operatorRole.isBlank()) {
-            connector.operatorRole = operatorRole;
-            connector.lastModified = Instant.now();
-        }
-        if (networkProtocol != null && !networkProtocol.isBlank()) {
-            connector.networkProtocol = networkProtocol;
-            connector.lastModified = Instant.now();
-        }
-        if (computeResourceTypes != null && !computeResourceTypes.isEmpty()) {
-            connector.associatedComputeResourceTypes = List.copyOf(computeResourceTypes);
-            connector.lastModified = Instant.now();
-        }
+        connector.subnetIds = newSubnets;
+        connector.securityGroupIds = newGroups;
+        connector.operatorRole = newRole;
+        connector.networkProtocol = newProtocol;
+        connector.latestVersion++;
+        connector.stateReason = "Update initiated";
+        connector.lastUpdateStatusReason = "Update was successful";
+        connector.versions.add(snapshot(connector, connector.latestVersion));
         persist(connectors, region, connector.id, connector);
-        return connector;
+        // Taken before the instant settle, so it reports the update in progress.
+        NetworkConnector response = responseOf(connector);
+        response.lastUpdateStatus = "InProgress";
+        response.lastUpdateStatusReason = "Update in progress";
+        return response;
     }
 
-    public void deleteConnector(String region, String id) {
-        getConnector(region, id);
-        connectors.remove(key(region, unwrap(id)));
+    /** Deletes the connector, or only the version the identifier names. Returns what was deleted. */
+    public synchronized ConnectorVersion deleteConnector(String region, String identifier) {
+        ConnectorVersion named = getConnectorVersion(region, identifier);
+        NetworkConnector connector = named.connector();
+        if (!named.qualified()) {
+            connectors.remove(key(region, connector.id));
+            return named;
+        }
+        if (named.version().version == connector.latestVersion) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Cannot delete the latest version of a network connector.", 400);
+        }
+        connector.versions.remove(named.version());
+        persist(connectors, region, connector.id, connector);
+        return named;
     }
 
     // ------------------------------------------------------------------ tags
 
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (MicrovmImage image : images.values()) {
+            addResource(resources, image.imageArn, IMAGE_TYPE, image.updatedAt, image.tags);
+        }
+        for (NetworkConnector connector : connectors.values()) {
+            addResource(resources, connector.arn, CONNECTOR_TYPE, connector.lastModified, connector.tags);
+        }
+        return resources;
+    }
+
+    private void addResource(List<ExplorerResource> resources, String arn, String type,
+                             Instant lastModified, Map<String, String> tags) {
+        if (arn == null) {
+            return;
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        resources.add(new ExplorerResource(arn, type, "lambda", parsed.region(), parsed.accountId(),
+                lastModified != null ? lastModified : Instant.now(), snapshotTags(tags)));
+    }
+
+    /** A copy taken under the tag lock, so a concurrent tag change cannot break the iteration. */
+    Map<String, String> snapshotTags(Map<String, String> tags) {
+        synchronized (tagLock) {
+            return new LinkedHashMap<>(tags);
+        }
+    }
+
+    /**
+     * Empty on purpose: AWS ListSupportedResourceTypes advertises neither type, so the images and
+     * connectors stay discoverable through {@link #getResources()} without widening that list.
+     */
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of();
+    }
+
     /** True when the ARN names a MicroVM-family resource this service owns. */
     public static boolean ownsArn(String arn) {
-        return arn != null && (arn.contains(":microvm-image:")
-                || arn.contains(":microvm:")
-                || arn.contains(":network-connector:"));
+        String resource = AwsArnUtils.resourceIfArnFor(arn, "lambda").orElse("");
+        return resource.startsWith(IMAGE_RESOURCE) || resource.startsWith("microvm:")
+                || resource.startsWith(CONNECTOR_RESOURCE);
+    }
+
+    /**
+     * The image or connector a tag target names, {@code microvm-image:<name>} or
+     * {@code network-connector:<id>}, read from a Lambda ARN. Empty for anything else, a
+     * version-qualified connector included, which the TagResource pattern does not take.
+     */
+    public static Optional<String> taggedResource(String arn) {
+        return AwsArnUtils.resourceIfArnFor(arn, "lambda").filter(LambdaMicrovmsService::isTaggedResource);
+    }
+
+    private static boolean isTaggedResource(String resource) {
+        String name = resource.startsWith(IMAGE_RESOURCE) ? resource.substring(IMAGE_RESOURCE.length())
+                : resource.startsWith(CONNECTOR_RESOURCE) ? resource.substring(CONNECTOR_RESOURCE.length())
+                : null;
+        return name != null && TAGGED_NAME.matcher(name).matches();
+    }
+
+    /** The tag target's resource, refusing an image or connector the TagResource pattern does not take. */
+    private static String tagTargetResource(String arn) {
+        String resource = AwsArnUtils.resourceIfArnFor(arn, "lambda").orElse("");
+        if ((resource.startsWith(IMAGE_RESOURCE) || resource.startsWith(CONNECTOR_RESOURCE))
+                && !isTaggedResource(resource)) {
+            throw new AwsException("ValidationException",
+                    "Resource must name an image or a network connector without a version: " + arn, 400);
+        }
+        return resource;
     }
 
     public Map<String, String> listTags(String region, String arn) {
-        return taggable(region, arn);
+        return snapshotTags(taggable(region, arn));
     }
 
     public void tagResource(String region, String arn, Map<String, String> tags) {
@@ -574,15 +810,20 @@ public class LambdaMicrovmsService {
      * stored object, so mutating it alone would never reach the backend.
      */
     private void mutateTags(String region, String arn, Consumer<Map<String, String>> mutation) {
-        if (arn.contains(":microvm-image:")) {
-            MicrovmImage image = getImage(region, arn.substring(arn.lastIndexOf(':') + 1));
-            mutation.accept(image.tags);
+        String resource = tagTargetResource(arn);
+        if (resource.startsWith(IMAGE_RESOURCE)) {
+            MicrovmImage image = getImage(region, resource.substring(IMAGE_RESOURCE.length()));
+            synchronized (tagLock) {
+                mutation.accept(image.tags);
+            }
             persist(images, region, image.name, image);
             return;
         }
-        if (arn.contains(":network-connector:")) {
-            NetworkConnector connector = getConnector(region, arn.substring(arn.lastIndexOf(':') + 1));
-            mutation.accept(connector.tags);
+        if (resource.startsWith(CONNECTOR_RESOURCE)) {
+            NetworkConnector connector = getConnector(region, resource.substring(CONNECTOR_RESOURCE.length()));
+            synchronized (tagLock) {
+                mutation.accept(connector.tags);
+            }
             persist(connectors, region, connector.id, connector);
             return;
         }
@@ -591,13 +832,12 @@ public class LambdaMicrovmsService {
     }
 
     private Map<String, String> taggable(String region, String arn) {
-        if (arn.contains(":microvm-image:")) {
-            String name = arn.substring(arn.lastIndexOf(':') + 1);
-            return getImage(region, name).tags;
+        String resource = tagTargetResource(arn);
+        if (resource.startsWith(IMAGE_RESOURCE)) {
+            return getImage(region, resource.substring(IMAGE_RESOURCE.length())).tags;
         }
-        if (arn.contains(":network-connector:")) {
-            String id = arn.substring(arn.lastIndexOf(':') + 1);
-            return getConnector(region, id).tags;
+        if (resource.startsWith(CONNECTOR_RESOURCE)) {
+            return getConnector(region, resource.substring(CONNECTOR_RESOURCE.length())).tags;
         }
         throw new AwsException("ResourceNotFoundException",
                 "Resource not found: " + arn, 404);

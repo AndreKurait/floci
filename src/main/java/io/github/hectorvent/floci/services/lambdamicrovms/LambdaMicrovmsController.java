@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService.Microvm;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService.MicrovmBuild;
@@ -25,6 +26,9 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+
+import java.util.List;
+import java.util.Map;
 
 /**
  * AWS Lambda MicroVMs control plane ("Lambda Microvms", apiVersion 2025-09-09,
@@ -331,7 +335,7 @@ public class LambdaMicrovmsController {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("name", image.name);
         node.put("imageArn", image.imageArn);
-        node.put("createdAt", epoch(image.createdAt));
+        node.put("createdAt", EpochSeconds.fromInstant(image.createdAt));
 
         boolean detail = shape == ImageShape.CREATE || shape == ImageShape.UPDATE;
         // A mutation reports the state it is entering, not the one it left.
@@ -363,7 +367,7 @@ public class LambdaMicrovmsController {
 
         // updatedAt is on everything but the list item.
         if (shape != ImageShape.LIST) {
-            node.put("updatedAt", epoch(image.updatedAt));
+            node.put("updatedAt", EpochSeconds.fromInstant(image.updatedAt));
         }
 
         if (detail) {
@@ -390,7 +394,7 @@ public class LambdaMicrovmsController {
             node.putNull("tags");
         } else if (shape == ImageShape.GET) {
             ObjectNode tags = node.putObject("tags");
-            image.tags.forEach(tags::put);
+            service.snapshotTags(image.tags).forEach(tags::put);
         }
         return node;
     }
@@ -404,8 +408,8 @@ public class LambdaMicrovmsController {
         node.put("imageVersion", version.imageVersion);
         node.put("state", version.state);
         node.put("status", version.status);
-        node.put("createdAt", epoch(version.createdAt));
-        node.put("updatedAt", epoch(image.updatedAt));
+        node.put("createdAt", EpochSeconds.fromInstant(version.createdAt));
+        node.put("updatedAt", EpochSeconds.fromInstant(image.updatedAt));
         node.put("baseImageArn", image.baseImageArn);
         node.put("baseImageVersion", image.baseImageVersion);
         node.put("buildRoleArn", image.buildRoleArn);
@@ -442,7 +446,7 @@ public class LambdaMicrovmsController {
         node.put("chipsetGeneration", build.chipsetGeneration);
         node.put("imageArn", image.imageArn);
         node.put("imageVersion", version.imageVersion);
-        node.put("createdAt", epoch(build.createdAt));
+        node.put("createdAt", EpochSeconds.fromInstant(build.createdAt));
         node.putNull("stateReason");
         node.putNull("terminationReasonCode");
         if (withSnapshot) {
@@ -460,8 +464,7 @@ public class LambdaMicrovmsController {
      * cannot name a different region than the resource it describes.
      */
     private static String regionOf(String arn) {
-        String[] parts = arn.split(":", 5);
-        return parts.length > 3 ? parts[3] : "";
+        return AwsArnUtils.regionOrDefault(arn, "");
     }
 
     /**
@@ -476,7 +479,7 @@ public class LambdaMicrovmsController {
         node.put("state", vm.state);
         node.put("imageArn", vm.imageArn);
         node.put("imageVersion", vm.imageVersion);
-        node.put("startedAt", epoch(vm.startedAt));
+        node.put("startedAt", EpochSeconds.fromInstant(vm.startedAt));
         return node;
     }
 
@@ -504,19 +507,19 @@ public class LambdaMicrovmsController {
         } else {
             node.put("stateReason", vm.stateReason);
         }
-        node.put("startedAt", epoch(vm.startedAt));
+        node.put("startedAt", EpochSeconds.fromInstant(vm.startedAt));
         if (vm.terminatedAt == null) {
             node.putNull("terminatedAt");
         } else {
-            node.put("terminatedAt", epoch(vm.terminatedAt));
+            node.put("terminatedAt", EpochSeconds.fromInstant(vm.terminatedAt));
         }
         return node;
     }
 
-    private ObjectNode catalogNode(java.util.List<java.util.Map<String, Object>> entries) {
+    private ObjectNode catalogNode(List<Map<String, Object>> entries) {
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("items");
-        for (java.util.Map<String, Object> entry : entries) {
+        for (Map<String, Object> entry : entries) {
             ObjectNode node = items.addObject();
             entry.forEach((k, v) -> {
                 if (v instanceof Double d) {
@@ -528,10 +531,6 @@ public class LambdaMicrovmsController {
         }
         root.putNull("nextToken");
         return root;
-    }
-
-    private double epoch(java.time.Instant instant) {
-        return instant.toEpochMilli() / 1000.0;
     }
 
     private JsonNode parse(String body) {
