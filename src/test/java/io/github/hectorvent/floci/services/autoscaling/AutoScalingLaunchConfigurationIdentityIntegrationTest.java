@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.response.ValidatableResponse;
@@ -244,6 +245,8 @@ class AutoScalingLaunchConfigurationIdentityIntegrationTest {
             given().header("Authorization", AUTH.replace("/autoscaling/", "/cloudformation/"))
                     .formParam("Action", "CreateStack").formParam("StackName", name)
                     .formParam("TemplateBody", template).post("/").then().statusCode(200);
+            assertThat(CfnStackWaits.awaitTerminal(name,
+                    AUTH.replace("/autoscaling/", "/cloudformation/")).status(), equalTo("CREATE_COMPLETE"));
         } else {
             given().header("Authorization", AUTH).formParam("Action", "CreateLaunchConfiguration")
                     .formParam("LaunchConfigurationName", name).formParam("ImageId", "ami-amazonlinux2023")

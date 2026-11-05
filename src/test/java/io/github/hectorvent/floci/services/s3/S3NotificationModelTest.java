@@ -5,6 +5,9 @@ import io.github.hectorvent.floci.services.s3.model.LambdaNotification;
 import io.github.hectorvent.floci.services.s3.model.QueueNotification;
 import io.github.hectorvent.floci.services.s3.model.TopicNotification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 
@@ -77,5 +80,30 @@ class S3NotificationModelTest {
     void filterRuleNameIsCaseInsensitive() {
         assertTrue(new FilterRule("Prefix", "images/").matches("images/photo.jpg"));
         assertTrue(new FilterRule("SUFFIX", ".jpg").matches("photo.jpg"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "prefix, AWS%3AApplication/, AWS:Application/node.json, true",
+        "prefix, AWS%3AApplication/, AWS%3AApplication/node.json, false",
+        "prefix, reports+from+nodes/, reports from nodes/node.json, true",
+        "prefix, reports+from+nodes/, reports+from+nodes/node.json, false",
+        "suffix, %2Bresult.json, node+result.json, true",
+        "suffix, %2Bresult.json, node result.json, false",
+        "prefix, r%C3%A9sum%C3%A9/%25/, résumé/%/node.json, true",
+        "prefix, literal%253A/, literal%3A/node.json, true",
+        "prefix, literal%253A/, literal:/node.json, false",
+        "suffix, %252B.json, node%2B.json, true",
+        "suffix, %252B.json, node+.json, false"
+    })
+    void filterRulesDecodeFormEncodingExactlyOnce(String name, String value, String key, boolean expected) {
+        assertEquals(expected, new FilterRule(name, value).matches(key));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"%", "%0", "%GG"})
+    void malformedStoredFilterDoesNotMatchOrInterruptOtherDestinations(String value) {
+        assertFalse(new FilterRule("prefix", value).matches(value + "/object"));
+        assertFalse(new FilterRule("suffix", value).matches("object/" + value));
     }
 }
