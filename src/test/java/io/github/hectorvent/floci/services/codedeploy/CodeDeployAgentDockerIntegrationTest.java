@@ -4,6 +4,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.codedeploy.CodeDeployClient;
+import software.amazon.awssdk.services.codedeploy.model.DeploymentInfo;
 import software.amazon.awssdk.services.codedeploy.model.DeploymentStatus;
 import software.amazon.awssdk.services.codedeploy.model.RevisionLocation;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -116,6 +117,30 @@ class CodeDeployAgentDockerIntegrationTest extends CodeDeployAgentDockerFixture 
             assertInstalledPayload(target, "after-stop");
             assertFalse(output(target, "cat", "/var/lib/floci-agent-events")
                     .contains(stopped + " ValidateService"));
+        }
+
+        deployments.updateDeploymentGroup(request -> request.applicationName(name).currentDeploymentGroupName(name)
+                .autoRollbackConfiguration(configuration -> configuration.enabled(true)
+                        .eventsWithStrings("DEPLOYMENT_FAILURE")));
+        RevisionLocation lastGood = deployments.getDeployment(request -> request.deploymentId(afterStop))
+                .deploymentInfo().revision();
+        upload(s3, name, "after-stop.zip", bundle("unselected-rollback-version", false));
+        String rollbackTrigger = deploy(deployments, name,
+                upload(s3, name, "rollback-failure.zip", bundle("rollback-failure", true)), "OVERWRITE");
+        assertDeployment(deployments, rollbackTrigger, DeploymentStatus.FAILED);
+        String rollback = deployments.getDeployment(request -> request.deploymentId(rollbackTrigger))
+                .deploymentInfo().rollbackInfo().rollbackDeploymentId();
+        assertNotNull(rollback);
+        assertDeployment(deployments, rollback, DeploymentStatus.SUCCEEDED);
+        DeploymentInfo recovery = deployments.getDeployment(request -> request.deploymentId(rollback)).deploymentInfo();
+        assertEquals("codeDeployRollback", recovery.creatorAsString());
+        assertEquals(rollbackTrigger, recovery.rollbackInfo().rollbackTriggeringDeploymentId());
+        assertEquals(lastGood, recovery.revision());
+        assertEquals("DISALLOW", recovery.fileExistsBehaviorAsString());
+        for (String target : targets) {
+            assertInstalledPayload(target, "after-stop");
+            assertEvents(target, rollback,
+                    List.of("ApplicationStop", "BeforeInstall", "AfterInstall", "ApplicationStart", "ValidateService"));
         }
     }
 }

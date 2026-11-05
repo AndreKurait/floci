@@ -22,14 +22,42 @@ they must receive the command or encounter the normal agent-start deadline.
 and permits the documented last-instance failure when preceding instances
 succeeded. `AllAtOnce` starts all selected hosts and requires at least one
 successful deployment. Half-at-a-time and custom health policies, target-group
-traffic control, blue/green Server deployments, and automatic rollback are
-rejected before queuing agent commands.
+traffic control, and blue/green Server deployments are rejected before queuing
+agent commands.
 Prior revision-health scheduling and Auto Scaling launch hooks are not
 implemented. Group membership cannot establish that newly launched instances
 received the last successful revision.
 Enabled deployment alarms, restart mode, outdated-instance filtering, ignored
-stop failures, and per-request rollback, alarm, target or EC2-process overrides
+stop failures, and per-request alarm, target or EC2-process overrides
 are rejected rather than silently discarded.
+
+## Failure recovery and explicit stop
+
+An S3 Server deployment can enable `DEPLOYMENT_FAILURE` rollback through its
+group or a per-deployment `autoRollbackConfiguration` override. The effective
+policy is captured when the deployment starts. An explicit disabled override
+prevents automatic recovery even when the group enables it.
+
+Recovery creates a new deployment of the group's last successful S3 revision,
+including its version, ETag and `fileExistsBehavior`. The original deployment
+keeps its failed or stopped status. `rollbackInfo` links the two IDs, and the
+recovery's creator is `codeDeployRollback`. A failed recovery does not trigger
+another automatic rollback. A first failure with no successful revision records
+that recovery is unavailable.
+
+`StopDeployment(autoRollbackEnabled=false)` stops without recovery. Explicit
+`true` schedules the last successful revision after the old controller workers
+have settled. Already executing guest scripts remain under the stock agent's
+control. A recovery uses the normal agent and traffic phases; cancellation
+itself never restores load-balancer membership. Automatic alarm and
+`DEPLOYMENT_STOP_ON_REQUEST` policy triggers remain unsupported.
+
+Admission, stop and recovery share a group lock. Another S3 agent deployment
+cannot overlap the handoff. History uses the account, Region and immutable group
+ID, so renaming a group retains its history while deleting and recreating the
+same name does not. Recovery resolves the current group and its existing
+permission checks under the captured owner. Successful revisions persist through
+`StorageFactory`; active commands and deployment records remain transient.
 
 ## Classic load-balancer traffic
 
@@ -124,7 +152,8 @@ command retries, account/Region isolation and complete cleanup.
 `CodeDeployAgentDockerIntegrationTest` exercises the stock agent in two Auto
 Scaling guests with IMDS role credentials. It verifies versioned S3 content
 hashes, file-conflict policies, hook diagnostics, cancellation during a hook
-blocked on a pipe, and subsequent recovery. The fixture launches the agent's
+blocked on a pipe, and automatic recovery to the exact successful S3 version.
+The fixture launches the agent's
 foreground master in the background so user data can finish; it checks that
 bootstrap continued before deploying.
 
@@ -135,9 +164,16 @@ unscoped health-read permission. Its mailbox replies simulate an agent.
 and a Classic frontend with actual connections: a held request blocks draining,
 missing HTTP health blocks registration, and an explicit stop prevents later
 hooks. Traffic control also applies to the first deployment, when no previous
-revision exists. A later deployment recovers both guests. Its private HTTP fixture
+revision exists. Explicit stop-and-rollback also restores both guests after
+registration waits on failed health. Its private HTTP fixture
 does not establish production TLS, caller NAT routing or a native service rollout.
 The two Docker tests share the same agent image and ASG/S3 setup.
+
+`CodeDeployAgentRollbackIntegrationTest` verifies policy overrides, stop choices,
+owner and Region isolation, group replacement and rename, nonrecursive recovery
+and exclusive admission through the signed SDK. Its mailbox replies are
+simulated. `CodeDeployServicePersistenceTest` independently reloads persistent
+JSON before failing a deployment and recovering the stored revision.
 
 The SDK compatibility suite's `CodeDeployAgentTest` verifies signed
 specifications and command completion against the standalone server, including

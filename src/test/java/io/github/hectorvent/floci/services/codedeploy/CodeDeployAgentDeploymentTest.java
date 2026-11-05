@@ -14,6 +14,8 @@ import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -109,7 +111,7 @@ class CodeDeployAgentDeploymentTest {
         group.setDeploymentStyle(Map.of("deploymentType", "BLUE_GREEN"));
         assertThrows(AwsException.class, () -> prepare(null));
         group.setDeploymentStyle(null);
-        group.setAutoRollbackConfiguration(Map.of("enabled", true));
+        group.setAlarmConfiguration(Map.of("enabled", true));
         assertThrows(AwsException.class, () -> prepare(null));
         assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
     }
@@ -338,19 +340,23 @@ class CodeDeployAgentDeploymentTest {
         return runner.prepare(REGION, group, config, REVISION);
     }
 
-    @Test
-    void fileBehaviorIsPartOfTheSignedAgentSpecification() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"user", "codeDeployRollback"})
+    void fileBehaviorAndCreatorArePartOfTheSignedAgentSpecification(String creator) throws Exception {
         CodeDeployAgentDeployment.Prepared prepared = runner.prepare(REGION, group, null, REVISION, "RETAIN");
         Deployment deployment = new Deployment();
         deployment.setDeploymentId("d-options");
         deployment.setApplicationName("app");
         deployment.setDeploymentGroupName("group");
+        deployment.setCreator(creator);
         CodeDeployAgentCommands.Session session = runner.open(prepared, deployment);
         Map<?, ?> specification = (Map<?, ?>) commands.specification(ACCOUNT, REGION, "d-options", host(FIRST))
                 .get("DeploymentSpecification");
         Map<?, ?> envelope = (Map<?, ?>) specification.get("GenericEnvelope");
         assertEquals("RETAIN", new ObjectMapper().readTree((String) envelope.get("Payload"))
                 .path("AgentActionOverrides").path("AgentOverrides").path("FileExistsBehavior").asText());
+        assertEquals(creator, new ObjectMapper().readTree((String) envelope.get("Payload"))
+                .path("DeploymentCreator").asText());
         commands.close(session);
     }
 

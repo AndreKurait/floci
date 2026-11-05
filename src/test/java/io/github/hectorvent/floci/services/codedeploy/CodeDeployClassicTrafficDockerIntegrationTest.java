@@ -53,7 +53,7 @@ class CodeDeployClassicTrafficDockerIntegrationTest extends CodeDeployAgentDocke
     @Inject ElbClassicDnsRecordSource dns;
 
     @Test
-    void stockAgentWaitsForDrainingAndHealthAndDoesNotContinueAfterStop() throws Exception {
+    void stockAgentWaitsForTrafficAndHonorsExplicitStopRecovery() throws Exception {
         Fleet fleet = fleet();
         String first = fleet.targets().getFirst();
         String second = fleet.targets().getLast();
@@ -126,6 +126,25 @@ class CodeDeployClassicTrafficDockerIntegrationTest extends CodeDeployAgentDocke
         assertDeployment(fleet.deployments(), recovered, DeploymentStatus.SUCCEEDED);
         for (String target : fleet.targets()) {
             assertTrafficHooks(target, recovered, "updated", "recovered");
+            assertEquals("InService", health(frontend, target));
+        }
+        assertPacket(frontend, "recovered");
+
+        String rollbackTrigger = deploy(fleet.deployments(), fleet.name(),
+                upload(fleet.s3(), fleet.name(), "stop-with-rollback.zip", trafficBundle("stop-with-rollback", false)));
+        stage(fleet, rollbackTrigger, first, "AllowTraffic");
+        assertEquals("OutOfService", health(frontend, first));
+        assertPacket(frontend, "recovered");
+        fleet.deployments().stopDeployment(request -> request.deploymentId(rollbackTrigger).autoRollbackEnabled(true));
+        assertDeployment(fleet.deployments(), rollbackTrigger, DeploymentStatus.STOPPED);
+        String rollback = fleet.deployments().getDeployment(request -> request.deploymentId(rollbackTrigger))
+                .deploymentInfo().rollbackInfo().rollbackDeploymentId();
+        assertNotNull(rollback);
+        assertDeployment(fleet.deployments(), rollback, DeploymentStatus.SUCCEEDED);
+        for (String target : fleet.targets()) {
+            assertEquals("Succeeded", fleet.deployments().getDeploymentTarget(request ->
+                    request.deploymentId(rollback).targetId(target)).deploymentTarget().instanceTarget().statusAsString());
+            assertEquals("recovered", output(target, "cat", "/opt/floci-traffic-proof/payload.txt").trim());
             assertEquals("InService", health(frontend, target));
         }
         assertPacket(frontend, "recovered");
