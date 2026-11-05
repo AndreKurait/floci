@@ -1,6 +1,7 @@
 """Readiness checks must survive registration latency without hiding API errors."""
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -166,6 +167,8 @@ class AllocationCleanupTest(unittest.TestCase):
             def docker(*arguments, **options):
                 if arguments[:2] == ("info", "--format"):
                     return Mock(stdout="amd64" if arguments[2] == "{{.Architecture}}" else "daemon")
+                if arguments[:2] == ("context", "inspect"):
+                    return Mock(stdout="unix:///test.sock")
                 return Mock(stdout="", stderr="", returncode=1 if "inspect" in arguments else 0)
 
             with patch.object(smoke, "docker", side_effect=docker) as commands, \
@@ -180,6 +183,88 @@ class AllocationCleanupTest(unittest.TestCase):
                     subject.cleanup()
                 commands.assert_any_call("image", "rm", "owned-fixture-guest")
             self.assertTrue(subject.record["cleanup_passed"])
+
+class DockerContextTest(unittest.TestCase):
+    def test_remote_context_is_rejected_before_download_or_build(self):
+        for endpoint in ("ssh://remote", "tcp://remote:2376", ""):
+            with self.subTest(endpoint=endpoint), patch.dict(os.environ, {}, clear=True):
+                subject = smoke.Smoke.__new__(smoke.Smoke)
+                subject.image = subject.helper = "example@sha256:abc"
+                def run(*args, **kwargs):
+                    return Mock(stdout="x86_64" if args[0] == "info" else endpoint)
+                with patch.object(smoke, "docker", side_effect=run) as docker, \
+                        patch.object(smoke.urllib.request, "urlopen", side_effect=AssertionError("download started")):
+                    with self.assertRaisesRegex(ValueError, "local Docker daemon"):
+                        subject.prepare()
+                self.assertEqual(["info", "context"], [call.args[0] for call in docker.call_args_list])
+
+    def test_resolved_endpoint_is_used_instead_of_environment_hint(self):
+        subject = smoke.Smoke.__new__(smoke.Smoke)
+        subject.image = subject.helper = "example@sha256:abc"
+        stop = RuntimeError("admitted local endpoint")
+        with patch.dict(os.environ, {"DOCKER_HOST": "tcp://ignored:2376", "DOCKER_CONTEXT": "local"}), \
+                patch.object(smoke, "docker", side_effect=[Mock(stdout="x86_64"), Mock(stdout="unix:///local.sock")]) as docker, \
+                patch.object(smoke.urllib.request, "urlopen", side_effect=stop):
+            with self.assertRaises(RuntimeError) as observed:
+                subject.prepare()
+        self.assertIs(stop, observed.exception)
+        self.assertEqual(("context", "inspect", "--format", "{{.Endpoints.docker.Host}}"), docker.call_args.args)
+
+    def test_context_resolution_failure_propagates(self):
+        subject = smoke.Smoke.__new__(smoke.Smoke)
+        subject.image = subject.helper = "example@sha256:abc"
+        error = subprocess.CalledProcessError(1, ["docker", "context", "inspect"])
+        with patch.object(smoke, "docker", side_effect=[Mock(stdout="x86_64"), error]), \
+                patch.object(smoke.urllib.request, "urlopen", side_effect=AssertionError("download started")):
+            with self.assertRaises(subprocess.CalledProcessError) as observed:
+                subject.prepare()
+        self.assertIs(error, observed.exception)
+
+
+class CancellationAdmissionTest(unittest.TestCase):
+    def test_ready_file_does_not_admit_cancellation_without_reader(self):
+        subject = smoke.Smoke.__new__(smoke.Smoke)
+        subject.created = {"instance": "i-example"}
+        subject.guest = "owned-guest"
+        subject.record = {}
+        subject.aws = Mock(return_value={"Command": {"CommandId": "command"}})
+        def observe(description, predicate, **kwargs):
+            self.assertFalse(predicate(), "ready marker alone admitted cancellation")
+            raise TimeoutError("no reader")
+        def execute(*args, **kwargs):
+            # Run the actual admission shell against a real FIFO and ready marker.
+            with tempfile.TemporaryDirectory() as directory:
+                fifo = Path(directory) / "input.fifo"
+                ready = Path(directory) / "ready"
+                os.mkfifo(fifo)
+                ready.touch()
+                return subprocess.run(["/bin/sh", "-ec", args[4], "admission", str(fifo), str(ready)],
+                                      capture_output=True, text=True, timeout=5)
+        with patch.object(smoke, "docker", side_effect=execute), patch.object(smoke, "wait_for", side_effect=observe):
+            with self.assertRaisesRegex(TimeoutError, "no reader"):
+                smoke.exercise_cancellation(subject)
+        self.assertEqual(["send-command"], [call.args[1] for call in subject.aws.call_args_list])
+        self.assertNotIn("native_cancellation_qualified", subject.record)
+
+    def test_actual_fifo_reader_is_admitted_and_disappearance_revokes_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fifo, other, ready = [Path(directory) / name for name in ("input.fifo", "other.fifo", "ready")]
+            os.mkfifo(fifo)
+            os.mkfifo(other)
+            ready.touch()
+            def admitted(path=fifo):
+                return subprocess.run(["/bin/sh", "-ec", smoke.FIFO_READER, "admission", str(path), str(ready)],
+                                      capture_output=True, timeout=5).returncode == 0
+            self.assertFalse(admitted())
+            with subprocess.Popen(["cat", str(fifo)], stdout=subprocess.DEVNULL) as reader:
+                try:
+                    self.assertTrue(smoke.wait_for("cat did not start", admitted, seconds=5))
+                    self.assertFalse(admitted(other))
+                finally:
+                    reader.terminate()
+                    reader.wait(timeout=5)
+            self.assertFalse(admitted())
+
 
 if __name__ == "__main__":
     unittest.main()

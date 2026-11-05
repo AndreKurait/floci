@@ -121,7 +121,7 @@ class Smoke:
         architecture = docker("info", "--format", "{{.Architecture}}").stdout.strip()
         if architecture not in ("x86_64", "amd64"):
             raise ValueError("This smoke currently qualifies the x86_64 agent")
-        socket = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
+        socket = docker("context", "inspect", "--format", "{{.Endpoints.docker.Host}}").stdout.strip()
         if not socket.startswith("unix://"):
             raise ValueError("Run this smoke on a local Docker daemon")
         if "@sha256:" not in self.image or "@sha256:" not in self.helper:
@@ -632,6 +632,19 @@ def exercise_commands(smoke):
     smoke.record["native_custom_document_executed"] = True
 
 
+FIFO_READER = r"""
+test -p "$1" && test -f "$2" || exit 1
+expected=$(printf 'cat\n%s' "$1")
+for entry in /proc/[0-9]*/cmdline; do
+    arguments=$(tr '\000' '\n' < "$entry" 2>/dev/null) || continue
+    if [ "$arguments" = "$expected" ]; then
+        exit 0
+    fi
+done
+exit 1
+"""
+
+
 def exercise_cancellation(smoke):
     print("Cancelling a real agent command blocked on a FIFO", flush=True)
     prefix = "/tmp/floci-cancel-" + uuid.uuid4().hex
@@ -646,7 +659,7 @@ def exercise_cancellation(smoke):
 
     def running():
         return docker("exec", smoke.guest, "/bin/sh", "-ec",
-                            'test -p "$1" && test -f "$2"', "ready-check", fifo, ready,
+                            FIFO_READER, "reader-admission", fifo, ready,
                             check=False).returncode == 0
 
     wait_for("The real command did not reach its blocking operation", running, seconds=45)
