@@ -30,6 +30,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.github.hectorvent.floci.testing.Ec2Requests.ec2;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
@@ -48,6 +49,9 @@ public class RedshiftOperationsTest {
 
     private static final String AUTH_HEADER =
             "AWS4-HMAC-SHA256 Credential=test/20260822/us-east-1/redshift/aws4_request";
+
+    private static final String EC2_ACCOUNT = "000000000000";
+    private static final String EC2_REGION = "us-east-1";
 
     private static final String GRANT_NAMES_PATH = "DescribeSnapshotCopyGrantsResponse"
             + ".DescribeSnapshotCopyGrantsResult.SnapshotCopyGrants.SnapshotCopyGrant.SnapshotCopyGrantName";
@@ -167,14 +171,14 @@ public class RedshiftOperationsTest {
     @Test
     @Order(2)
     void clusterAndSnapshotLifecycle() {
-        when(containerManager.start(any(), eq("cluster-src"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-src"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c1", "cluster-src", "localhost", 5439));
         doAnswer(invocation -> {
             Path p = invocation.getArgument(3);
             Files.writeString(p, "-- dump sql table test_data;");
             return null;
         }).when(containerManager).takeSnapshot(any(), eq("cluster-src"), eq("admin"), any(Path.class));
-        when(containerManager.start(any(), eq("cluster-restored"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-restored"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c2", "cluster-restored", "localhost", 5440));
 
         // 1. CreateCluster
@@ -453,6 +457,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-src")
         .when()
             .post("/")
@@ -512,6 +517,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-restored")
         .when()
             .post("/")
@@ -519,6 +525,57 @@ public class RedshiftOperationsTest {
             .statusCode(200)
             .contentType("application/xml")
             .body(containsString("<ClusterIdentifier>cluster-restored</ClusterIdentifier>"));
+    }
+
+    private String ec2Id(String path, RequestSpecification req) {
+        return req.post("/").then().statusCode(200).extract().path(path);
+    }
+
+    private XmlPath describeSubnetGroup(String name) {
+        return XmlPath.from(redshift("DescribeClusterSubnetGroups", "ClusterSubnetGroupName", name).asString())
+                .setRootPath("DescribeClusterSubnetGroupsResponse.DescribeClusterSubnetGroupsResult.ClusterSubnetGroups.ClusterSubnetGroup");
+    }
+
+    @Test
+    @Order(4)
+    void clusterSubnetGroupKeepsTagsVpcAndSubnetDetail() {
+        String vpc = ec2Id("CreateVpcResponse.vpc.vpcId", ec2("CreateVpc", EC2_ACCOUNT, EC2_REGION)
+                .formParam("CidrBlock", "10.77.0.0/16"));
+        String subnet = ec2Id("CreateSubnetResponse.subnet.subnetId", ec2("CreateSubnet", EC2_ACCOUNT, EC2_REGION)
+                .formParam("VpcId", vpc).formParam("CidrBlock", "10.77.1.0/24")
+                .formParam("AvailabilityZone", "us-east-1b"));
+
+        assertEquals(200, redshift("CreateClusterSubnetGroup", "ClusterSubnetGroupName", "sng-tagged",
+                "Description", "d", "SubnetIds.SubnetIdentifier.1", subnet,
+                "Tags.Tag.1.Key", "env", "Tags.Tag.1.Value", "dev").statusCode());
+
+        // Read back through a separate call, not the create response.
+        XmlPath group = describeSubnetGroup("sng-tagged");
+        assertEquals(vpc, group.getString("VpcId"));
+        assertEquals("Complete", group.getString("SubnetGroupStatus"));
+        assertEquals(subnet, group.getString("Subnets.Subnet.SubnetIdentifier"));
+        assertEquals("us-east-1b", group.getString("Subnets.Subnet.SubnetAvailabilityZone.Name"));
+        assertEquals("Active", group.getString("Subnets.Subnet.SubnetStatus"));
+        assertEquals("env", group.getString("Tags.Tag.Key"));
+        assertEquals("dev", group.getString("Tags.Tag.Value"));
+
+        XmlPath tagged = XmlPath.from(redshift("DescribeTags", "ResourceName",
+                "arn:aws:redshift:us-east-1:000000000000:subnetgroup:sng-tagged").asString())
+                .setRootPath("DescribeTagsResponse.DescribeTagsResult.TaggedResources");
+        assertEquals("dev", tagged.getString("TaggedResource.Tag.Value"));
+
+        // Modify keeps tags and recomputes the VPC from the new subnet list.
+        String vpc2 = ec2Id("CreateVpcResponse.vpc.vpcId", ec2("CreateVpc", EC2_ACCOUNT, EC2_REGION)
+                .formParam("CidrBlock", "10.78.0.0/16"));
+        String subnet2 = ec2Id("CreateSubnetResponse.subnet.subnetId", ec2("CreateSubnet", EC2_ACCOUNT, EC2_REGION)
+                .formParam("VpcId", vpc2).formParam("CidrBlock", "10.78.1.0/24")
+                .formParam("AvailabilityZone", "us-east-1c"));
+        assertEquals(200, redshift("ModifyClusterSubnetGroup", "ClusterSubnetGroupName", "sng-tagged",
+                "SubnetIds.SubnetIdentifier.1", subnet2).statusCode());
+        group = describeSubnetGroup("sng-tagged");
+        assertEquals(vpc2, group.getString("VpcId"));
+        assertEquals("us-east-1c", group.getString("Subnets.Subnet.SubnetAvailabilityZone.Name"));
+        assertEquals("dev", group.getString("Tags.Tag.Value"));
     }
 
     @Test
@@ -840,7 +897,7 @@ public class RedshiftOperationsTest {
     @Test
     @Order(3)
     void tagLifecycle() {
-        when(containerManager.start(any(), eq("cluster-tags"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-tags"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c3", "cluster-tags", "localhost", 5441));
 
         given()
@@ -898,6 +955,7 @@ public class RedshiftOperationsTest {
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", AUTH_HEADER)
             .formParam("Action", "DeleteCluster")
+            .formParam("SkipFinalClusterSnapshot", "true")
             .formParam("ClusterIdentifier", "cluster-tags")
         .when()
             .post("/")
@@ -1016,7 +1074,7 @@ public class RedshiftOperationsTest {
     @Test
     @Order(9)
     void snapshotCopyLifecycle() {
-        when(containerManager.start(any(), eq("cluster-copy"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-copy"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c9", "cluster-copy", "localhost", 5449));
         assertEquals(200, redshift("CreateCluster", "ClusterIdentifier", "cluster-copy", "NodeType", "dc2.large",
                 "MasterUsername", "admin", "MasterUserPassword", "password123").statusCode());
@@ -1083,7 +1141,8 @@ public class RedshiftOperationsTest {
                 400, "InvalidSnapshotCopyGrantStateFault");
         assertEquals(200, redshift("DisableSnapshotCopy", "ClusterIdentifier", "cluster-copy").statusCode());
 
-        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-copy").statusCode());
+        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-copy",
+                "SkipFinalClusterSnapshot", "true").statusCode());
         assertEquals(200, redshift("DeleteSnapshotCopyGrant", "SnapshotCopyGrantName", "copy-lifecycle-grant").statusCode());
     }
 
@@ -1094,7 +1153,7 @@ public class RedshiftOperationsTest {
     @Test
     @Order(10)
     void snapshotScheduleLifecycle() {
-        when(containerManager.start(any(), eq("cluster-sched"), any(), any()))
+        when(containerManager.start(any(), eq("cluster-sched"), any(), any(), any(), any()))
                 .thenReturn(new RedshiftContainerHandle("c10", "cluster-sched", "localhost", 5450));
         assertEquals(200, redshift("CreateCluster", "ClusterIdentifier", "cluster-sched", "NodeType", "dc2.large",
                 "MasterUsername", "admin", "MasterUserPassword", "password123").statusCode());
@@ -1186,7 +1245,8 @@ public class RedshiftOperationsTest {
         assertEquals(0, describeSchedules("ScheduleIdentifier", "sched-1").getList("SnapshotSchedule").size());
         assertFault(redshift("DeleteSnapshotSchedule", "ScheduleIdentifier", "sched-1"), 400, "SnapshotScheduleNotFound");
 
-        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-sched").statusCode());
+        assertEquals(200, redshift("DeleteCluster", "ClusterIdentifier", "cluster-sched",
+                "SkipFinalClusterSnapshot", "true").statusCode());
     }
 
     @Test

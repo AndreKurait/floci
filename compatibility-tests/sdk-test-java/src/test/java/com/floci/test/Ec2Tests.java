@@ -229,6 +229,8 @@ class Ec2Tests {
     void describeAvailabilityZones() {
         DescribeAvailabilityZonesResponse resp = ec2.describeAvailabilityZones();
         assertThat(resp.availabilityZones()).hasSize(3);
+        assertThat(resp.availabilityZones()).allSatisfy(zone ->
+                assertThat(zone.networkBorderGroup()).isEqualTo(TestFixtures.region().id()));
     }
 
     @Test
@@ -856,7 +858,7 @@ class Ec2Tests {
     void createTags() {
         ec2.createTags(CreateTagsRequest.builder()
                 .resources(instanceId)
-                .tags(software.amazon.awssdk.services.ec2.model.Tag.builder().key("Name").value("sdk-test-instance").build())
+                .tags(Tag.builder().key("Name").value("sdk-test-instance").build())
                 .build());
     }
 

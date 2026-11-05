@@ -65,16 +65,21 @@ public class CodeArtifactNuGetController {
 
     private final CodeArtifactService service;
     private final BagetterSidecarClient bagetter;
+    private final CodeArtifactNuGetExternalConnectionImporter externalConnectionImporter;
     private final HttpClient httpClient;
 
     @Inject
-    public CodeArtifactNuGetController(CodeArtifactService service, BagetterSidecarClient bagetter) {
-        this(service, bagetter, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build());
+    public CodeArtifactNuGetController(CodeArtifactService service, BagetterSidecarClient bagetter,
+            CodeArtifactNuGetExternalConnectionImporter externalConnectionImporter) {
+        this(service, bagetter, externalConnectionImporter,
+                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build());
     }
 
-    CodeArtifactNuGetController(CodeArtifactService service, BagetterSidecarClient bagetter, HttpClient httpClient) {
+    CodeArtifactNuGetController(CodeArtifactService service, BagetterSidecarClient bagetter,
+            CodeArtifactNuGetExternalConnectionImporter externalConnectionImporter, HttpClient httpClient) {
         this.service = service;
         this.bagetter = bagetter;
+        this.externalConnectionImporter = externalConnectionImporter;
         this.httpClient = httpClient;
     }
 
@@ -88,6 +93,14 @@ public class CodeArtifactNuGetController {
     public Response serviceIndex(@Context HttpHeaders headers, @PathParam("domain") String domain,
                                   @PathParam("repository") String repository) {
         RepositoryHandle handle = requireRepository(headers, domain, repository);
+        try {
+            return serviceIndexWithLease(handle);
+        } finally {
+            endUse(handle.repoId());
+        }
+    }
+
+    private Response serviceIndexWithLease(RepositoryHandle handle) {
         // domain and repository are free to embed here unescaped: requireRepository above only
         // returns once CodeArtifactService has confirmed a repository by this exact name already
         // exists, which it could only do if that name already passed CreateRepository's own
@@ -110,9 +123,13 @@ public class CodeArtifactNuGetController {
     @Produces(MediaType.APPLICATION_JSON)
     public Response packageVersions(@Context HttpHeaders headers, @PathParam("domain") String domain,
                                      @PathParam("repository") String repository, @PathParam("id") String id) {
-        String baseUrl = requireRepository(headers, domain, repository).baseUrl();
-        return proxyGet(baseUrl, "/v3/package/" + SidecarUriUtils.encodeSegment(id) + "/index.json",
-                MediaType.APPLICATION_JSON);
+        RepositoryHandle handle = requireRepository(headers, domain, repository);
+        try {
+            return proxyGet(handle.baseUrl(), "/v3/package/" + SidecarUriUtils.encodeSegment(id) + "/index.json",
+                    MediaType.APPLICATION_JSON);
+        } finally {
+            endUse(handle.repoId());
+        }
     }
 
     /**
@@ -130,7 +147,23 @@ public class CodeArtifactNuGetController {
     public Response packageContent(@Context HttpHeaders headers, @PathParam("domain") String domain,
                                     @PathParam("repository") String repository, @PathParam("id") String id,
                                     @PathParam("version") String version, @PathParam("filename") String filename) {
-        String baseUrl = requireRepository(headers, domain, repository).baseUrl();
+        RepositoryHandle handle = requireRepository(headers, domain, repository);
+        try {
+            return packageContentWithLease(handle, domain, repository, id, version, filename);
+        } finally {
+            endUse(handle.repoId());
+        }
+    }
+
+    private Response packageContentWithLease(RepositoryHandle handle, String domain, String repository, String id,
+            String version, String filename) {
+        try {
+            service.requireContainerBackedVersionDownloadable(handle.owner(), handle.region(), domain, repository,
+                    "nuget", null, id, version, handle.repoId());
+        } catch (AwsException e) {
+            return Response.status(404).build();
+        }
+        String baseUrl = handle.baseUrl();
         String lowerId = SidecarUriUtils.encodeSegment(id.toLowerCase(Locale.ROOT));
         String encodedVersion = SidecarUriUtils.encodeSegment(version);
         String lowerFilename = filename.toLowerCase(Locale.ROOT);
@@ -143,6 +176,15 @@ public class CodeArtifactNuGetController {
                     + lowerId + ".nuspec", "text/xml");
         }
         if (lowerFilename.endsWith(".nupkg")) {
+            // A cache miss on this emulator's own BaGetter is exactly the trigger AWS's own docs
+            // describe for an external connection: fetch the real asset from the public repository
+            // and retain it, then let the proxy below find it there, the same as any other
+            // request. Not attempted at all when BaGetter already has it: the only extra cost on
+            // every other request is this one cheap local existence check.
+            if (!bagetter.packageVersionExists(handle.repoId(), domain, repository, null, id, version)) {
+                externalConnectionImporter.tryImport(handle.region(), domain, handle.owner(), repository,
+                        handle.repoId(), id, version);
+            }
             return proxyGet(baseUrl, "/v3/package/" + lowerId + "/" + encodedVersion + "/"
                     + lowerId + "." + SidecarUriUtils.encodeSegment(version.toLowerCase(Locale.ROOT)) + ".nupkg",
                     MediaType.APPLICATION_OCTET_STREAM);
@@ -176,6 +218,15 @@ public class CodeArtifactNuGetController {
         }
         RepositoryHandle handle = requireRepository(headers, domain, repository);
 
+        try {
+            return pushWithLease(headers, domain, repository, content, handle);
+        } finally {
+            endUse(handle.repoId());
+        }
+    }
+
+    private Response pushWithLease(HttpHeaders headers, String domain, String repository, byte[] content,
+            RepositoryHandle handle) {
         String contentType = headers.getHeaderString(HttpHeaders.CONTENT_TYPE);
         String boundary = MultipartFormParser.extractBoundary(contentType).orElse(null);
         if (boundary == null) {
@@ -197,6 +248,51 @@ public class CodeArtifactNuGetController {
         String packageName = nuspec.id().toLowerCase(Locale.ROOT);
         String version = NuGetVersions.normalize(nuspec.version());
 
+        // A package whose origin configuration sets publish:BLOCK refuses every dotnet nuget push,
+        // the same way PublishPackageVersion refuses it for the generic format, ahead of the
+        // byte-identical shortcut below: a retry of bytes already stored is still a publish. Also
+        // the default for a package first retained from nuget.org (see
+        // CodeArtifactService#ensureRetainedPackageOriginDefault).
+        try {
+            service.requireContainerBackedPackagePublishAllowed(handle.region(), domain, handle.owner(), repository,
+                    "nuget", null, packageName);
+        } catch (AwsException e) {
+            return Response.status(409).entity(e.getMessage()).build();
+        }
+
+        // Raised by hectorvent's review: a real dotnet nuget push to a coordinate
+        // updatePackageVersionsStatus/disposePackageVersions left Archived or Disposed must be
+        // refused outright, the same way PublishPackageVersion already refuses it for the generic
+        // format, not accepted and then have forgetContainerBackedStatusOverride below silently
+        // un-block it afterward. Checked before even the existence check below, let alone the real
+        // write, the same way CodeArtifactNpmDataPlane's own guard already runs ahead of its
+        // byte-identical shortcut (Greptile review: an archived coordinate re-pushed byte-identical
+        // must still be refused, not quietly accepted as "nothing changed").
+        String beforeRevision;
+        try {
+            beforeRevision = service.requireContainerBackedVersionNotArchivedOrDisposed(handle.region(), domain,
+                    handle.owner(), repository, "nuget", null, packageName, version);
+        } catch (AwsException e) {
+            return Response.status(409).entity(e.getMessage()).build();
+        }
+
+        // Raised by Greptile's review: DisposePackageVersions holds CodeArtifactService's own
+        // lock for its whole call, and its container-backed asset deletion (see
+        // CodeArtifactService#deleteContainerBackedVersionAssets) acquires this exact same
+        // per-repository BaGetter lock from inside that hold. Calling any synchronized
+        // CodeArtifactService method (recordContainerBackedAssetBytes/
+        // forgetContainerBackedStatusOverride below) from inside this lock, as both used to, would
+        // let a push and a concurrent dispose of the same version each wait forever on the other's
+        // lock. Neither call needs this lock at all: BaGetter's own content is already finalized by
+        // the time forwardPush below returns, so both bookkeeping calls run after this block
+        // releases it instead. currentContainerBackedPackageFence is exempt from this concern: it
+        // is deliberately lock-free (see its own javadoc), not a synchronized CodeArtifactService
+        // method, so taking the snapshot before entering the lock changes nothing it protects
+        // against.
+        long fenceSnapshot = service.currentContainerBackedPackageFence(handle.region(), domain, handle.owner(),
+                repository, "nuget", null, packageName);
+        Response response;
+        boolean pushSucceeded;
         // The exact same lock BagetterSidecarClient#deletePackage takes for this repository, not
         // a private one: without sharing it, a DeletePackage racing this push could still list
         // its versions before this push lands and miss it, the one case a private lock here
@@ -211,21 +307,16 @@ public class CodeArtifactNuGetController {
                         .entity("A package with this id and version already exists.")
                         .build();
             }
-
-            // Snapshotted before the real write, not after: see
-            // CodeArtifactService#currentContainerBackedPackageFence's own javadoc for why the
-            // order matters.
-            long fenceSnapshot = service.currentContainerBackedPackageFence(handle.region(), domain, handle.owner(),
-                    repository, "nuget", null, packageName);
-            Response response = forwardPush(handle.baseUrl(), contentType, content);
-            boolean pushSucceeded = response.getStatus() == 200 || response.getStatus() == 201
+            response = forwardPush(handle.baseUrl(), contentType, content);
+            pushSucceeded = response.getStatus() == 200 || response.getStatus() == 201
                     || response.getStatus() == 202;
-            if (pushSucceeded) {
-                service.recordContainerBackedAssetBytes(handle.region(), domain, handle.owner(), repository,
-                        "nuget", null, packageName, nupkgBytes.length, fenceSnapshot);
-            }
-            return response;
         }
+        if (pushSucceeded) {
+            service.completeContainerBackedPublishIfCurrentRepository(handle.region(), domain, handle.owner(),
+                    repository, handle.repoId(), "nuget", packageName, version, nupkgBytes.length, fenceSnapshot,
+                    beforeRevision, null, 0L);
+        }
+        return response;
     }
 
     /**
@@ -302,10 +393,25 @@ public class CodeArtifactNuGetController {
                 .orElseThrow(() -> new NotAuthorizedException("Basic realm=\"floci-codeartifact\""));
         String repoId;
         try {
-            repoId = service.ensureFormatContainerId("nuget", scope.region(), domain, scope.owner(), repository);
+            repoId = service.resolveContainerIdAndBeginUse("nuget", scope.region(), domain, scope.owner(),
+                    repository, bagetter);
         } catch (AwsException e) {
             throw new NotFoundException();
         }
+        try {
+            return readyRepository(scope, domain, repository, repoId);
+        } catch (RuntimeException e) {
+            endUse(repoId);
+            throw e;
+        }
+    }
+
+    private void endUse(String repoId) {
+        bagetter.endUse(repoId);
+    }
+
+    private RepositoryHandle readyRepository(AuthorizationTokenScope scope, String domain, String repository,
+            String repoId) {
         String baseUrl = bagetter.ensureReady(repoId, null);
         // The real GetRepositoryEndpoint value, not just this controller's own path: a NuGet
         // client's own service-index parser only keeps a resource whose @id parses as an

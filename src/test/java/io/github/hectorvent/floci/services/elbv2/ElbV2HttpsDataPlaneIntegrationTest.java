@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.elbv2;
 import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
+import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.Certificate;
@@ -11,19 +12,15 @@ import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.github.hectorvent.floci.services.acm.model.ValidationMethod;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.testing.AlbFixtures;
+import io.github.hectorvent.floci.testing.InlineMocks;
+import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.arc.ClientProxy;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
-import io.vertx.core.Future;
-import io.vertx.core.Vertx;
-import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpServerOptions;
-import io.vertx.core.net.PemKeyCertOptions;
-import io.vertx.core.net.SSLOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -67,6 +64,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
+import static io.github.hectorvent.floci.testing.AlbFixtures.deleteListener;
+import static io.github.hectorvent.floci.testing.AlbFixtures.deleteLoadBalancer;
+import static io.github.hectorvent.floci.testing.AlbFixtures.deleteTargetGroup;
+import static io.github.hectorvent.floci.testing.AlbFixtures.loadBalancerDnsName;
+import static io.github.hectorvent.floci.testing.AlbFixtures.registerTarget;
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
@@ -87,16 +89,9 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 
 @QuarkusTest
-@TestProfile(ElbV2HttpsDataPlaneIntegrationTest.RealElbV2DataPlaneProfile.class)
+@TestProfile(RealElbV2DataPlaneProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ElbV2HttpsDataPlaneIntegrationTest {
-
-    public static final class RealElbV2DataPlaneProfile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.elbv2.mock", "false");
-        }
-    }
 
     private static final String REGION = "us-east-1";
     private static final String AUTH =
@@ -183,9 +178,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             assertAll("Delete the local transport fixture after any failure",
                     () -> {
                         if (ownedLoadBalancer != null) {
-                            given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                                    .formParam("LoadBalancerArn", ownedLoadBalancer.arn())
-                                    .when().post("/").then().statusCode(200);
+                            deleteLoadBalancer(ownedLoadBalancer.arn());
                         }
                     },
                     () -> {
@@ -222,12 +215,10 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             HttpsResult secondWire = awaitHttpsAtPort(loadBalancer.dnsName(), HTTP_PORT, current);
             assertEquals("second", secondWire.body());
             assertPeerCertificate(secondWire.session(), current, loadBalancer.dnsName());
-            given().header("Authorization", AUTH).formParam("Action", "DeleteListener")
-                    .formParam("ListenerArn", second).when().post("/").then().statusCode(200);
+            deleteListener(second);
             assertAcmConsumers(current.getArn(), List.of(loadBalancer.arn(), persistedConsumer));
             assertAcmDeleteInUse(current.getArn());
-            given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                    .formParam("LoadBalancerArn", loadBalancer.arn()).when().post("/").then().statusCode(200);
+            deleteLoadBalancer(loadBalancer.arn());
             assertAcmConsumers(current.getArn(), List.of(persistedConsumer));
             assertAcmDeleteInUse(current.getArn());
             acmService.removeInUseBy(current.getArn(), persistedConsumer, REGION);
@@ -242,8 +233,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
         } finally {
             boolean releasePersisted = persisted;
             assertAll("Clean every association fixture resource",
-                    () -> given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                            .formParam("LoadBalancerArn", loadBalancer.arn()).when().post("/").then().statusCode(200),
+                    () -> deleteLoadBalancer(loadBalancer.arn()),
                     () -> { if (releasePersisted) { acmService.removeInUseBy(certificate.getArn(), persistedConsumer, REGION); } },
                     () -> {
                         try {
@@ -263,7 +253,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
         acmRequest()
                 .header("Authorization", accountAuthorization("test", "acm"))
                 .header("X-Amz-Target", "CertificateManager.DeleteCertificate")
-                .body(Map.of("CertificateArn", arn)).when().post("/").then().statusCode(409)
+                .body(Map.of("CertificateArn", arn)).when().post("/").then().statusCode(400)
                 .body("__type", equalTo("ResourceInUseException"));
     }
 
@@ -417,7 +407,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                     () -> assertEquals(400, rejected.statusCode()),
                     () -> assertEquals("HTTP", described.path(result + "Protocol")),
                     () -> assertEquals(String.valueOf(HTTPS_PORT), described.path(result + "Port")),
-                    () -> assertEquals("", described.path(result + "SslPolicy")),
+                    () -> assertTrue(described.xmlPath().getList(result + "SslPolicy").isEmpty()),
                     () -> assertTrue(described.xmlPath().getList(result + "Certificates.member").isEmpty()),
                     () -> assertEquals("original", described.path(result
                             + "DefaultActions.member.FixedResponseConfig.MessageBody")),
@@ -428,6 +418,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                     () -> assertPlainResponse(loadBalancer.dnsName(), HTTPS_PORT, "original"));
             given().header("Authorization", AUTH).formParam("Action", "ModifyListener")
                     .formParam("ListenerArn", listener).formParam("Protocol", "HTTPS")
+                    .formParam("SslPolicy", "ELBSecurityPolicy-2016-08")
                     .formParam("Certificates.member.1.CertificateArn", certificate.getArn())
                     .when().post("/").then().statusCode(200);
             HttpsResult retried = awaitHttps(loadBalancer.dnsName(), certificate);
@@ -484,8 +475,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                             .extract().xmlPath().getList("DescribeTagsResponse.DescribeTagsResult.TagDescriptions.member.Tags.member").isEmpty()),
                     () -> assertEquals("winner", awaitHttps(winner.dnsName(), certificate).body()),
                     () -> assertPlainResponse(first.dnsName(), HTTP_PORT, "unrelated"));
-            given().header("Authorization", AUTH).formParam("Action", "DeleteListener")
-                    .formParam("ListenerArn", winnerArn).when().post("/").then().statusCode(200);
+            deleteListener(winnerArn);
             awaitListenerPortClosed();
             createFixedResponseListener(first.arn(), "HTTP", HTTPS_PORT, null, "retry");
             awaitPlainResponse(first.dnsName(), HTTPS_PORT, "retry");
@@ -540,17 +530,17 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                     () -> assertEquals(400, rejected.statusCode()),
                     () -> assertEquals("HTTP", described.path(result + "Protocol")),
                     () -> assertEquals(String.valueOf(HTTP_PORT), described.path(result + "Port")),
-                    () -> assertEquals("", described.path(result + "SslPolicy")),
+                    () -> assertTrue(described.xmlPath().getList(result + "SslPolicy").isEmpty()),
                     () -> assertTrue(described.xmlPath().getList(result + "Certificates.member").isEmpty()),
                     () -> assertEquals("original", described.path(result
                             + "DefaultActions.member.FixedResponseConfig.MessageBody")),
                     () -> assertPlainResponse(first.dnsName(), HTTP_PORT, "original"),
                     () -> assertPlainResponse(winner.dnsName(), HTTPS_PORT, "winner"));
-            given().header("Authorization", AUTH).formParam("Action", "DeleteListener")
-                    .formParam("ListenerArn", winnerArn).when().post("/").then().statusCode(200);
+            deleteListener(winnerArn);
             awaitListenerPortClosed();
             given().header("Authorization", AUTH).formParam("Action", "ModifyListener")
                     .formParam("ListenerArn", firstArn).formParam("Protocol", "HTTPS").formParam("Port", HTTPS_PORT)
+                    .formParam("SslPolicy", "ELBSecurityPolicy-2016-08")
                     .formParam("Certificates.member.1.CertificateArn", certificate.getArn())
                     .when().post("/").then().statusCode(200);
             assertEquals("original", awaitHttps(first.dnsName(), certificate).body());
@@ -637,8 +627,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             String progress = createFixedResponseListener(unrelated.arn(), "HTTP", HTTP_PORT, null, "progress");
             awaitPlainResponse(unrelated.dnsName(), HTTP_PORT, "progress");
             assertEquals("original", awaitHttps(loadBalancer.dnsName(), first).body());
-            given().header("Authorization", AUTH).formParam("Action", "DeleteListener")
-                    .formParam("ListenerArn", progress).when().post("/").then().statusCode(200);
+            deleteListener(progress);
             awaitListenerPortClosed(HTTP_PORT);
             release.get().countDown();
             assertEquals(200, moving.get(10, TimeUnit.SECONDS).statusCode());
@@ -685,10 +674,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                 Certificate ownedFirst = first;
                 Certificate ownedAdded = added;
                 assertAll("Clean all material-retry resources after success or failure",
-                        () -> given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                                .formParam("LoadBalancerArn", loadBalancer.arn()).when().post("/").then().statusCode(200),
-                        () -> given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                                .formParam("LoadBalancerArn", unrelated.arn()).when().post("/").then().statusCode(200),
+                        () -> deleteLoadBalancer(loadBalancer.arn()),
+                        () -> deleteLoadBalancer(unrelated.arn()),
                         () -> awaitListenerPortClosed(HTTPS_PORT),
                         () -> awaitListenerPortClosed(HTTP_PORT),
                         () -> {
@@ -724,10 +711,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
 
     private void cleanupProtocolFixtures(LoadBalancerRef first, LoadBalancerRef winner, Certificate certificate) {
         assertAll("Remove both protocol-race fixtures even when the loser was published",
-                () -> given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                        .formParam("LoadBalancerArn", first.arn()).when().post("/").then().statusCode(200),
-                () -> given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                        .formParam("LoadBalancerArn", winner.arn()).when().post("/").then().statusCode(200),
+                () -> deleteLoadBalancer(first.arn()),
+                () -> deleteLoadBalancer(winner.arn()),
                 ElbV2HttpsDataPlaneIntegrationTest::awaitListenerPortClosed,
                 () -> acmService.deleteCertificate(certificate.getArn(), REGION));
     }
@@ -740,13 +725,11 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                             .when().post("/").then().statusCode(200).extract().xmlPath()
                             .getList("DescribeListenersResponse.DescribeListenersResult.Listeners.member.ListenerArn");
                     for (String listener : listeners) {
-                        given().header("Authorization", AUTH).formParam("Action", "DeleteListener")
-                                .formParam("ListenerArn", listener).when().post("/").then().statusCode(200);
+                        deleteListener(listener);
                     }
                     awaitListenerPortClosed();
                 },
-                () -> given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                        .formParam("LoadBalancerArn", loadBalancer.arn()).when().post("/").then().statusCode(200),
+                () -> deleteLoadBalancer(loadBalancer.arn()),
                 () -> acmService.deleteCertificate(certificate.getArn(), REGION));
     }
 
@@ -761,7 +744,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static void awaitPlainResponse(String host, int port, String body) {
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
+        await().ignoreException(ConnectException.class)
+                .atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
                 assertPlainResponse(host, port, body));
     }
 
@@ -873,6 +857,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             Response rejected = given().header("Authorization", AUTH)
                     .formParam("Action", "ModifyListener").formParam("ListenerArn", firstListener)
                     .formParam("Protocol", "HTTPS")
+                    .formParam("SslPolicy", "ELBSecurityPolicy-2016-08")
                     .formParam("Certificates.member.1.CertificateArn", certificate.getArn())
                     .when().post("/");
             assertTrue(rejected.statusCode() >= 400);
@@ -882,6 +867,54 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                     .body("DescribeListenersResponse.DescribeListenersResult.Listeners.member.Protocol", equalTo("HTTP"));
             assertPlainResponse(first.dnsName(), HTTP_PORT, "first");
             assertPlainResponse(second.dnsName(), HTTP_PORT, "second");
+        } finally {
+            deleteListener(firstListener);
+            deleteListener(secondListener);
+            deleteLoadBalancer(first.arn());
+            deleteLoadBalancer(second.arn());
+            acmService.deleteCertificate(certificate.getArn(), REGION);
+        }
+    }
+
+    @Test
+    @Order(11)
+    void protocolChangesPublishSecuritySettingsTogetherWithTheRuntime() throws Exception {
+        LoadBalancerRef first = createLoadBalancer("protocol-first");
+        LoadBalancerRef second = createLoadBalancer("protocol-second");
+        Certificate certificate = requestCertificate(first.dnsName());
+        String firstListener = null;
+        String secondListener = null;
+        try {
+            firstListener = createFixedResponseListener(first.arn(), "HTTPS", HTTPS_PORT, certificate.getArn(), "first");
+            secondListener = createFixedResponseListener(second.arn(), "HTTPS", HTTPS_PORT, certificate.getArn(), "second");
+            given().header("Authorization", AUTH).formParam("Action", "ModifyListener")
+                    .formParam("ListenerArn", firstListener).formParam("Protocol", "HTTP")
+                    .when().post("/").then().statusCode(400);
+            describeHttpsListener(firstListener, certificate.getArn());
+            assertEquals("first", awaitHttps(first.dnsName(), certificate).body());
+
+            deleteListener(secondListener);
+            secondListener = null;
+            given().header("Authorization", AUTH).formParam("Action", "ModifyListener")
+                    .formParam("ListenerArn", firstListener).formParam("Protocol", "HTTP")
+                    .when().post("/").then().statusCode(200);
+            awaitPlainResponse(first.dnsName(), HTTPS_PORT, "first");
+            assertAcmConsumers(certificate.getArn(), List.of());
+
+            given().header("Authorization", AUTH).formParam("Action", "ModifyListener")
+                    .formParam("ListenerArn", firstListener).formParam("Protocol", "HTTPS")
+                    .formParam("Certificates.member.1.CertificateArn", certificate.getArn())
+                    .when().post("/").then().statusCode(400);
+            assertPlainResponse(first.dnsName(), HTTPS_PORT, "first");
+            given().header("Authorization", AUTH).formParam("Action", "ModifyListener")
+                    .formParam("ListenerArn", firstListener).formParam("Protocol", "HTTPS")
+                    .formParam("SslPolicy", "ELBSecurityPolicy-TLS13-1-2-2021-06")
+                    .formParam("Certificates.member.1.CertificateArn", certificate.getArn())
+                    .when().post("/").then().statusCode(200);
+            describeHttpsListener(firstListener, certificate.getArn());
+            HttpsResult restored = awaitHttps(first.dnsName(), certificate);
+            assertEquals("first", restored.body());
+            assertPeerCertificate(restored.session(), certificate, first.dnsName());
         } finally {
             deleteListener(firstListener);
             deleteListener(secondListener);
@@ -1125,46 +1158,32 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             assertEquals(200, before.statusCode());
             assertEquals("before", before.body());
             assertPeerCertificate(before.session(), original, loadBalancer.dnsName());
-            try (Socket transport = new Socket()) {
-                transport.connect(new InetSocketAddress("127.0.0.1", HTTPS_PORT), 2000);
-                try (SSLSocket socket = (SSLSocket) trustedContext(original, replacement).getSocketFactory()
-                        .createSocket(transport, loadBalancer.dnsName(), HTTPS_PORT, true)) {
-                    socket.setSoTimeout(2000);
-                    SSLParameters parameters = socket.getSSLParameters();
-                    parameters.setEndpointIdentificationAlgorithm("HTTPS");
-                    socket.setSSLParameters(parameters);
-                    socket.startHandshake();
-                    assertPeerCertificate(socket.getSession(), original, loadBalancer.dnsName());
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(
-                            socket.getInputStream(), StandardCharsets.UTF_8));
-                    assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "before");
-                    given().header("Authorization", AUTH)
-                            .formParam("Action", "ModifyListener").formParam("ListenerArn", listener)
-                            .formParam("Certificates.member.1.CertificateArn", replacement.getArn())
-                            .formParam("DefaultActions.member.1.Type", "fixed-response")
-                            .formParam("DefaultActions.member.1.FixedResponseConfig.StatusCode", "200")
-                            .formParam("DefaultActions.member.1.FixedResponseConfig.ContentType", "text/plain")
-                            .formParam("DefaultActions.member.1.FixedResponseConfig.MessageBody", "after")
-                            .when().post("/").then().statusCode(200);
-                    awaitHttpsMaterial(loadBalancer.dnsName(), 200, "after", replacement, original, replacement);
-                    assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "after");
-                    assertPeerCertificate(socket.getSession(), original, loadBalancer.dnsName());
-                    assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "after");
-                }
+            try (SSLSocket socket = openTlsConnection(loadBalancer.dnsName(), HTTPS_PORT,
+                    original, replacement)) {
+                assertPeerCertificate(socket.getSession(), original, loadBalancer.dnsName());
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        socket.getInputStream(), StandardCharsets.UTF_8));
+                assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "before");
+                given().header("Authorization", AUTH)
+                        .formParam("Action", "ModifyListener").formParam("ListenerArn", listener)
+                        .formParam("Certificates.member.1.CertificateArn", replacement.getArn())
+                        .formParam("DefaultActions.member.1.Type", "fixed-response")
+                        .formParam("DefaultActions.member.1.FixedResponseConfig.StatusCode", "200")
+                        .formParam("DefaultActions.member.1.FixedResponseConfig.ContentType", "text/plain")
+                        .formParam("DefaultActions.member.1.FixedResponseConfig.MessageBody", "after")
+                        .when().post("/").then().statusCode(200);
+                awaitHttpsMaterial(loadBalancer.dnsName(), 200, "after", replacement, original, replacement);
+                assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "after");
+                assertPeerCertificate(socket.getSession(), original, loadBalancer.dnsName());
+                assertPersistentResponse(socket, reader, loadBalancer.dnsName(), "after");
             }
         } finally {
             String ownedListener = listener;
             Certificate ownedOriginal = original;
             Certificate ownedReplacement = replacement;
             assertAll("Delete all keep-alive fixture resources",
-                    () -> {
-                        if (ownedListener != null) {
-                            given().header("Authorization", AUTH).formParam("Action", "DeleteListener")
-                                    .formParam("ListenerArn", ownedListener).when().post("/").then().statusCode(200);
-                        }
-                    },
-                    () -> given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                            .formParam("LoadBalancerArn", loadBalancer.arn()).when().post("/").then().statusCode(200),
+                    () -> deleteListener(ownedListener),
+                    () -> deleteLoadBalancer(loadBalancer.arn()),
                     () -> {
                         if (ownedOriginal != null) {
                             acmService.deleteCertificate(ownedOriginal.getArn(), REGION);
@@ -1318,40 +1337,39 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     @Order(Integer.MAX_VALUE - 1)
     void identicalCertificateUpdateRecoversAfterAnActualSslRefreshFailure() throws Exception {
         ElbV2DataPlane runtime = ClientProxy.unwrap(dataPlane);
-        Vertx originalVertx = runtime.vertx;
-        Vertx delegatingVertx = mock(Vertx.class, delegatesTo(originalVertx));
-        AtomicBoolean failOnce = new AtomicBoolean(true);
+        CertificateReferenceResolver originalResolver = runtime.certificateResolver;
+        CertificateReferenceResolver wrapped = mock(CertificateReferenceResolver.class, delegatesTo(originalResolver));
         AtomicInteger updates = new AtomicInteger();
-        AtomicReference<Future<Boolean>> failedUpdate = new AtomicReference<>();
-        CountDownLatch failureCompleted = new CountDownLatch(1);
-        doAnswer(creation -> {
-            // Qualify Vert.x HttpServer to distinguish it from the fixture's JDK HttpServer.
-            io.vertx.core.http.HttpServer actual = originalVertx.createHttpServer(
-                    (HttpServerOptions) creation.getArgument(0));
-            io.vertx.core.http.HttpServer wrapped = mock(io.vertx.core.http.HttpServer.class, delegatesTo(actual));
-            doAnswer(update -> {
-                updates.incrementAndGet();
-                if (failOnce.compareAndSet(true, false)) {
-                    SSLOptions invalid = new SSLOptions().setKeyCertOptions(new PemKeyCertOptions()
-                            .addKeyValue(Buffer.buffer("not a PEM private key"))
-                            .addCertValue(Buffer.buffer("not a PEM certificate")));
-                    Future<Boolean> failure = actual.updateSSLOptions(invalid, true);
-                    failedUpdate.set(failure);
-                    failure.onComplete(ignored -> failureCompleted.countDown());
-                    return failure;
+        AtomicReference<String> replacementArn = new AtomicReference<>();
+        AtomicReference<CertificateMaterial> failedMaterial = new AtomicReference<>();
+        doAnswer(call -> {
+            CertificateMaterial material = originalResolver.publishedMaterial(
+                    call.getArgument(0), call.getArgument(1), call.getArgument(2));
+            if (material.arn().equals(replacementArn.get())) {
+                int read = updates.incrementAndGet();
+                if (read == 1) {
+                    CertificateMaterial invalid = InlineMocks.inlineSpy(material);
+                    // Let pair validation succeed, then fail the key-manager load.
+                    AtomicInteger keyReads = new AtomicInteger();
+                    doAnswer(ignored -> keyReads.incrementAndGet() == 1 ? material.privateKey() : "not a PEM private key")
+                            .when(invalid).privateKey();
+                    failedMaterial.set(invalid);
                 }
-                return actual.updateSSLOptions((SSLOptions) update.getArgument(0), true);
-            }).when(wrapped).updateSSLOptions(any(SSLOptions.class), eq(true));
-            return wrapped;
-        }).when(delegatingVertx).createHttpServer(any(HttpServerOptions.class));
+                if (read <= 2) {
+                    return failedMaterial.get();
+                }
+            }
+            return material;
+        }).when(wrapped).publishedMaterial(anyString(), anyString(), anyString());
         LoadBalancerRef loadBalancer = createLoadBalancer("https-refresh-retry");
         Certificate original = null;
         Certificate replacement = null;
         String listener = null;
         try {
-            runtime.vertx = delegatingVertx;
+            runtime.certificateResolver = wrapped;
             original = requestCertificate(loadBalancer.dnsName());
             replacement = requestCertificate(loadBalancer.dnsName());
+            replacementArn.set(replacement.getArn());
             assertNotEquals(fingerprint(parseCertificate(original.getCertificateBody())),
                     fingerprint(parseCertificate(replacement.getCertificateBody())));
             listener = createFixedResponseListener(loadBalancer.arn(), "HTTPS", HTTPS_PORT,
@@ -1363,17 +1381,15 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                         .formParam("Certificates.member.1.CertificateArn", replacement.getArn())
                         .when().post("/").then().statusCode(200);
                 if (attempt == 0) {
-                    assertTrue(failureCompleted.await(5, TimeUnit.SECONDS));
-                    assertNotNull(failedUpdate.get());
-                    assertTrue(failedUpdate.get().failed(), "malformed PEM must fail the real SSL update");
+                    assertEquals(2, updates.get(), "the failed snapshot must pass the publication recheck");
                     awaitHttpsMaterial(loadBalancer.dnsName(), 200, "retry", original, original, replacement);
                 } else {
                     awaitHttpsMaterial(loadBalancer.dnsName(), 200, "retry", replacement, original, replacement);
                 }
             }
-            assertEquals(2, updates.get(), "identical API retry must retry the real server update");
+            assertEquals(4, updates.get(), "both API attempts must resolve and recheck their certificate snapshot");
         } finally {
-            runtime.vertx = originalVertx;
+            runtime.certificateResolver = originalResolver;
             String ownedListener = listener;
             Certificate ownedOriginal = original;
             Certificate ownedReplacement = replacement;
@@ -1457,14 +1473,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             String ownedOriginal = originalArn;
             String ownedReplacement = replacementArn;
             assertAll("Delete stored IAM TLS fixture resources",
-                    () -> {
-                        if (ownedListener != null) {
-                            given().header("Authorization", AUTH).formParam("Action", "DeleteListener")
-                                    .formParam("ListenerArn", ownedListener).when().post("/").then().statusCode(200);
-                        }
-                    },
-                    () -> given().header("Authorization", AUTH).formParam("Action", "DeleteLoadBalancer")
-                            .formParam("LoadBalancerArn", loadBalancer.arn()).when().post("/").then().statusCode(200),
+                    () -> deleteListener(ownedListener),
+                    () -> deleteLoadBalancer(loadBalancer.arn()),
                     () -> {
                         if (ownedOriginal != null) {
                             given().header("Authorization", accountAuthorization("test", "iam"))
@@ -1559,22 +1569,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static LoadBalancerRef createLoadBalancer(String name) {
-        Response response = given()
-                .formParam("Action", "CreateLoadBalancer")
-                .formParam("Name", name)
-                .formParam("Type", "application")
-                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId(REGION, "a"))
-                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId(REGION, "b"))
-                .header("Authorization", AUTH)
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract()
-                .response();
-        return new LoadBalancerRef(
-                response.path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn"),
-                response.path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.DNSName"));
+        String arn = AlbFixtures.createLoadBalancer(name);
+        return new LoadBalancerRef(arn, loadBalancerDnsName(arn));
     }
 
     private static String createFixedResponseListener(
@@ -1623,16 +1619,7 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                 .extract()
                 .path("CreateTargetGroupResponse.CreateTargetGroupResult.TargetGroups.member.TargetGroupArn");
 
-        given()
-                .formParam("Action", "RegisterTargets")
-                .formParam("TargetGroupArn", targetGroupArn)
-                .formParam("Targets.member.1.Id", "127.0.0.1")
-                .formParam("Targets.member.1.Port", String.valueOf(targetPort))
-                .header("Authorization", AUTH)
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200);
+        registerTarget(targetGroupArn, "127.0.0.1", targetPort);
         return targetGroupArn;
     }
 
@@ -1693,34 +1680,50 @@ class ElbV2HttpsDataPlaneIntegrationTest {
 
     private static HttpsResult awaitHttpsAtPort(String host, int port, Certificate... trustedCertificates) {
         HttpsResult[] result = new HttpsResult[1];
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
-            result[0] = httpsRequest(host, port, trustedCertificates);
-        });
+        ElbV2TlsReadiness.await(() -> {
+                    result[0] = httpsRequest(host, port, trustedCertificates);
+                });
         return result[0];
     }
 
     private static void awaitHttpsMaterial(String host, int status, String body, Certificate expected,
                                           Certificate... trustedCertificates) {
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
-            HttpsResult response = httpsRequest(host, HTTPS_PORT, trustedCertificates);
-            assertEquals(status, response.statusCode());
-            assertEquals(body, response.body());
-            assertPeerCertificate(response.session(), expected, host);
-        });
+        ElbV2TlsReadiness.await(() -> {
+                    HttpsResult response = httpsRequest(host, HTTPS_PORT, trustedCertificates);
+                    assertEquals(status, response.statusCode());
+                    assertEquals(body, response.body());
+                    assertPeerCertificate(response.session(), expected, host);
+                });
     }
 
     private static HttpsResult httpsRequest(String host, int port, Certificate... certificates) throws Exception {
-        try (Socket transport = new Socket()) {
+        try (SSLSocket socket = openTlsConnection(host, port, certificates)) {
+            HttpResult response = request(socket, host);
+            return new HttpsResult(response.statusCode(), response.body(), socket.getSession());
+        }
+    }
+
+    private static SSLSocket openTlsConnection(String host, int port, Certificate... certificates) throws Exception {
+        SSLContext context = trustedContext(certificates);
+        Socket transport = new Socket();
+        try {
             transport.connect(new InetSocketAddress("127.0.0.1", port), 2000);
-            try (SSLSocket socket = (SSLSocket) trustedContext(certificates).getSocketFactory()
-                    .createSocket(transport, host, port, true)) {
+            SSLSocket socket = (SSLSocket) context.getSocketFactory().createSocket(transport, host, port, true);
+            try {
                 socket.setSoTimeout(2000);
                 SSLParameters parameters = socket.getSSLParameters();
                 parameters.setEndpointIdentificationAlgorithm("HTTPS");
                 socket.setSSLParameters(parameters);
                 socket.startHandshake();
-                HttpResult response = request(socket, host);
-                return new HttpsResult(response.statusCode(), response.body(), socket.getSession());
+                return socket;
+            } catch (Exception failure) {
+                try (socket) {
+                    throw failure;
+                }
+            }
+        } catch (Exception failure) {
+            try (transport) {
+                throw failure;
             }
         }
     }
@@ -1775,42 +1778,6 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             }
         }
         return false;
-    }
-
-    private static void deleteListener(String listenerArn) {
-        if (listenerArn == null) {
-            return;
-        }
-        given()
-                .formParam("Action", "DeleteListener")
-                .formParam("ListenerArn", listenerArn)
-                .header("Authorization", AUTH)
-            .when()
-                .post("/");
-    }
-
-    private static void deleteLoadBalancer(String lbArn) {
-        if (lbArn == null) {
-            return;
-        }
-        given()
-                .formParam("Action", "DeleteLoadBalancer")
-                .formParam("LoadBalancerArn", lbArn)
-                .header("Authorization", AUTH)
-            .when()
-                .post("/");
-    }
-
-    private static void deleteTargetGroup(String targetGroupArn) {
-        if (targetGroupArn == null) {
-            return;
-        }
-        given()
-                .formParam("Action", "DeleteTargetGroup")
-                .formParam("TargetGroupArn", targetGroupArn)
-                .header("Authorization", AUTH)
-            .when()
-                .post("/");
     }
 
     private record LoadBalancerRef(String arn, String dnsName) {}

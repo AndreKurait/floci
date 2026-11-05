@@ -21,6 +21,8 @@ public class Namespace {
      * credentials. AWS never returns it, so no response builder may read it.
      */
     private String adminUserPassword;
+    private String adminPasswordSecretArn;
+    private String adminPasswordSecretKmsKeyId;
     private String dbName;
     private String kmsKeyId;
     private String defaultIamRoleArn;
@@ -45,6 +47,8 @@ public class Namespace {
         this.namespaceArn = other.namespaceArn;
         this.adminUsername = other.adminUsername;
         this.adminUserPassword = other.adminUserPassword;
+        this.adminPasswordSecretArn = other.adminPasswordSecretArn;
+        this.adminPasswordSecretKmsKeyId = other.adminPasswordSecretKmsKeyId;
         this.dbName = other.dbName;
         this.kmsKeyId = other.kmsKeyId;
         this.defaultIamRoleArn = other.defaultIamRoleArn;
@@ -53,6 +57,7 @@ public class Namespace {
         this.status = other.status;
         this.creationDate = other.creationDate;
         this.tags = new LinkedHashMap<>(other.tags);
+        this.resourcePolicy = other.resourcePolicy;
     }
 
     public String getNamespaceName() {
@@ -97,6 +102,22 @@ public class Namespace {
 
     public String getDbName() {
         return dbName;
+    }
+
+    public String getAdminPasswordSecretArn() {
+        return adminPasswordSecretArn;
+    }
+
+    public void setAdminPasswordSecretArn(String adminPasswordSecretArn) {
+        this.adminPasswordSecretArn = adminPasswordSecretArn;
+    }
+
+    public String getAdminPasswordSecretKmsKeyId() {
+        return adminPasswordSecretKmsKeyId;
+    }
+
+    public void setAdminPasswordSecretKmsKeyId(String adminPasswordSecretKmsKeyId) {
+        this.adminPasswordSecretKmsKeyId = adminPasswordSecretKmsKeyId;
     }
 
     public void setDbName(String dbName) {
@@ -157,5 +178,16 @@ public class Namespace {
 
     public void setTags(Map<String, String> tags) {
         this.tags = tags;
+    }
+
+    /** The Redshift resource policy {@code PutResourcePolicy} set, kept with the namespace so it goes with it. */
+    private String resourcePolicy;
+
+    public String getResourcePolicy() {
+        return resourcePolicy;
+    }
+
+    public void setResourcePolicy(String resourcePolicy) {
+        this.resourcePolicy = resourcePolicy;
     }
 }

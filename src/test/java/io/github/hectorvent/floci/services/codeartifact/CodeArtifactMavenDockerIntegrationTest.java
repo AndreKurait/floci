@@ -20,7 +20,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -588,6 +591,162 @@ class CodeArtifactMavenDockerIntegrationTest {
                 .body("versions[0].version", equalTo("1.0.0"))
                 .body("versions[0].status", equalTo("Published"))
                 .body("versions[0].origin.originType", equalTo("INTERNAL"));
+    }
+
+    /**
+     * The real-world gap this guards against: {@code ReposiliteSidecarClient#listPackageVersions}
+     * used to fetch every version's publish-time details page one at a time, so a package with
+     * many versions still answered no faster than its slowest version's own round trip, times the
+     * version count. This deploys enough versions that a broken fan-out (dropped, duplicated, or
+     * silently empty results from the bounded executor) would show up as something other than
+     * exactly this set of versions, against the real Reposilite sidecar, not a mock.
+     */
+    @Test
+    @Order(22)
+    void listPackageVersionsFetchesManyVersionsPublishTimesCorrectly() {
+        String packageName = "manyversions";
+        int versionCount = 12;
+        Set<String> expectedVersions = new HashSet<>();
+        for (int i = 1; i <= versionCount; i++) {
+            String version = "1.0." + i;
+            expectedVersions.add(version);
+            byte[] content = ("many-versions-bytes-" + i).getBytes(StandardCharsets.UTF_8);
+            given().header("Authorization", "Bearer " + bearerToken).body(content)
+                    .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/" + packageName + "/" + version
+                            + "/" + packageName + "-" + version + ".jar")
+                    .then().statusCode(200);
+        }
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=" + packageName)
+                .then().statusCode(200)
+                .body("package", equalTo(packageName))
+                .body("versions.size()", equalTo(versionCount))
+                .extract().jsonPath();
+        List<String> actualVersions = body.getList("versions.version", String.class);
+        assertEquals(expectedVersions, new HashSet<>(actualVersions));
+        String defaultDisplayVersion = body.getString("defaultDisplayVersion");
+        assertTrue(expectedVersions.contains(defaultDisplayVersion),
+                "expected defaultDisplayVersion to be one of the deployed versions, got "
+                        + defaultDisplayVersion);
+    }
+
+    /**
+     * A throwaway groupId/artifactId, not {@link #GAV}: disposing it is destructive (the real
+     * assets are gone afterward), and must not disturb the artifact every other test in this class
+     * shares. Confirms the whole real round trip: {@code DisposePackageVersions} deletes the real
+     * jar/pom through Reposilite's own asset-delete endpoint, a subsequent fetch 404s, and
+     * {@code ListPackageVersions} still reports the version, by status {@code Disposed} alone,
+     * since the real sidecar listing no longer names it at all once its content is gone.
+     */
+    @Test
+    @Order(23)
+    void disposePackageVersionsDeletesTheRealReposiliteAssetsAndKeepsListingTheVersionAsDisposed() {
+        byte[] content = "dispose-me-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/disposeme/1.0.0/disposeme-1.0.0.jar")
+                .then().statusCode(200);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"]}")
+                .post("/v1/package/versions/dispose?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=disposeme")
+                .then().statusCode(200)
+                .body("successfulVersions['1.0.0'].status", equalTo("Disposed"))
+                .body("failedVersions.size()", equalTo(0));
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/disposeme/1.0.0/disposeme-1.0.0.jar")
+                .then().statusCode(404);
+
+        given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=disposeme&status=Disposed")
+                .then().statusCode(200)
+                .body("versions.size()", equalTo(1))
+                .body("versions[0].version", equalTo("1.0.0"))
+                .body("versions[0].status", equalTo("Disposed"));
+    }
+
+    /**
+     * A throwaway groupId/artifactId, not {@link #GAV}: {@code ListPackages} walks Reposilite's
+     * whole directory tree repository-wide, so publishing its own package here (rather than
+     * reusing one another test already created) keeps this test's own expected set independent of
+     * whatever else this class's shared repository happens to hold by the time it runs.
+     */
+    @Test
+    @Order(24)
+    void listPackagesWalksTheRealReposiliteDirectoryTreeToFindTheGroupAndArtifact() {
+        byte[] content = "list-packages-bytes".getBytes(StandardCharsets.UTF_8);
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO
+                        + "/com/example/nested/listpkgsprobe/1.0.0/listpkgsprobe-1.0.0.jar")
+                .then().statusCode(200);
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/packages?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example.nested")
+                .then().statusCode(200)
+                .extract().jsonPath();
+        List<String> names = body.getList("packages.package", String.class);
+        List<String> namespaces = body.getList("packages.namespace", String.class);
+        assertTrue(names.contains("listpkgsprobe"), "expected listpkgsprobe among " + names);
+        assertEquals("com.example.nested", namespaces.get(names.indexOf("listpkgsprobe")));
+    }
+
+    /**
+     * Closes 10-NATIVE-STATUS for Maven: a plain {@code mvn dependency:get} fetch of an Archived
+     * version's real GAV path must 404 against the real Reposilite sidecar, even though the jar's
+     * own bytes are still sitting there untouched (unlike {@link
+     * #disposePackageVersionsDeletesTheRealReposiliteAssetsAndKeepsListingTheVersionAsDisposed}'s
+     * own 404, which comes from Reposilite genuinely no longer having the file).
+     */
+    @Test
+    @Order(24)
+    void deployThenArchiveBlocksBothGetAndHeadAgainstTheRealReposiliteSidecarWhileLeavingTheBytesInPlace() {
+        byte[] content = "archive-me-bytes".getBytes(StandardCharsets.UTF_8);
+        String gav = "com/example/archiveme/1.0.0/archiveme-1.0.0.jar";
+        given().header("Authorization", "Bearer " + bearerToken).body(content)
+                .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + gav)
+                .then().statusCode(200);
+
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"],\"targetStatus\":\"Archived\"}")
+                .post("/v1/package/versions/update_status?domain=" + DOMAIN + "&repository=" + REPO
+                        + "&format=maven&namespace=com.example&package=archiveme")
+                .then().statusCode(200)
+                .body("successfulVersions['1.0.0'].status", equalTo("Archived"));
+
+        given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + gav)
+                .then().statusCode(404);
+        given().header("Authorization", "Bearer " + bearerToken)
+                .head("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + gav)
+                .then().statusCode(404);
+
+        given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=archiveme&status=Archived")
+                .then().statusCode(200)
+                .body("versions[0].version", equalTo("1.0.0"))
+                .body("versions[0].status", equalTo("Archived"));
+
+        // Proves the block above is this check's own override, not Reposilite having genuinely
+        // lost the file the way the dispose test's 404 does: un-archiving must make the exact
+        // same bytes fetchable again, with nothing re-deployed in between.
+        given().contentType("application/json").header("Authorization", AUTH)
+                .body("{\"versions\":[\"1.0.0\"],\"targetStatus\":\"Published\"}")
+                .post("/v1/package/versions/update_status?domain=" + DOMAIN + "&repository=" + REPO
+                        + "&format=maven&namespace=com.example&package=archiveme")
+                .then().statusCode(200)
+                .body("successfulVersions['1.0.0'].status", equalTo("Published"));
+        byte[] fetchedAfterUnarchive = given().header("Authorization", "Bearer " + bearerToken)
+                .get("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/" + gav)
+                .then().statusCode(200)
+                .extract().asByteArray();
+        assertEquals(new String(content, StandardCharsets.UTF_8),
+                new String(fetchedAfterUnarchive, StandardCharsets.UTF_8));
     }
 
     /**

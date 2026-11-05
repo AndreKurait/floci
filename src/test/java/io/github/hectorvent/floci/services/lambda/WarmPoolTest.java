@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
@@ -9,6 +10,7 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -155,6 +157,124 @@ class WarmPoolTest {
         pool.release(handle);
         pool.shutdown();
         verify(containerLauncher, times(2)).stop(handle);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shutdownStopsBusyHandlesAndResetAcceptsNewInvocations(boolean ephemeral) {
+        WarmPool pool = buildPool();
+        when(config.services().lambda().ephemeral()).thenReturn(ephemeral);
+        ContainerHandle busy = new ContainerHandle("busy", "fn", null, ContainerState.WARM);
+        ContainerHandle current = new ContainerHandle("current", "fn", null, ContainerState.WARM);
+        LambdaFunction fn = function("fn");
+        when(containerLauncher.launch(any())).thenReturn(busy, current);
+        try {
+            pool.init();
+            assertSame(busy, pool.acquire(fn));
+
+            pool.stopManagedContainers();
+
+            verify(containerLauncher).stop(busy);
+            AwsException failure = assertThrows(AwsException.class, () -> pool.acquire(fn));
+            assertEquals("ResourceConflictException", failure.getErrorCode());
+            assertEquals(409, failure.getHttpStatus());
+            pool.release(busy);
+            verify(containerLauncher, times(1)).stop(busy);
+            pool.afterReset();
+            assertSame(current, pool.acquire(fn));
+        } finally {
+            pool.shutdown();
+        }
+        verify(containerLauncher, times(1)).stop(busy);
+        verify(containerLauncher, times(1)).stop(current);
+    }
+
+    @Test
+    void shutdownDeadlineCancelsConcurrentRemovalsAndResetRetainsThemForRetry() throws Exception {
+        WarmPool pool = buildPool(Optional.empty(), 0, null, 1);
+        ContainerHandle first = new ContainerHandle("first", "first", null, ContainerState.WARM);
+        ContainerHandle second = new ContainerHandle("second", "second", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(first, second);
+        CountDownLatch bothStarted = new CountDownLatch(2);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch bothInterrupted = new CountDownLatch(2);
+        doAnswer(invocation -> {
+            bothStarted.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException interrupted) {
+                bothInterrupted.countDown();
+                throw interrupted;
+            }
+            return null;
+        }).when(containerLauncher).stop(any());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            pool.init();
+            pool.release(pool.acquire(function("first")));
+            pool.release(pool.acquire(function("second")));
+            Future<?> drain = executor.submit(pool::stopManagedContainers);
+            assertTrue(bothStarted.await(3, TimeUnit.SECONDS));
+            drain.get(3, TimeUnit.SECONDS);
+            assertTrue(bothInterrupted.await(3, TimeUnit.SECONDS));
+            pool.stopManagedContainers();
+            verify(containerLauncher, times(1)).stop(first);
+            verify(containerLauncher, times(1)).stop(second);
+
+            pool.afterReset();
+            doNothing().when(containerLauncher).stop(any());
+            // Cancellation can return before workers finish releasing their teardown ownership.
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
+                pool.evictIdleContainers();
+                verify(containerLauncher, times(2)).stop(first);
+                verify(containerLauncher, times(2)).stop(second);
+            });
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+            pool.shutdown();
+        }
+        verify(containerLauncher, times(2)).stop(first);
+        verify(containerLauncher, times(2)).stop(second);
+    }
+
+    @Test
+    void releaseAfterShutdownDeadlineRetriesFailedRemoval() throws Exception {
+        WarmPool pool = buildPool(Optional.empty(), 0, null, 1);
+        LambdaFunction fn = function("late-release");
+        ContainerHandle busy = new ContainerHandle("busy", "late-release", null, ContainerState.WARM);
+        ContainerHandle slow = new ContainerHandle("slow", "late-release", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(busy, slow);
+        doThrow(new IllegalStateException("Removal failed")).doNothing().when(containerLauncher).stop(busy);
+        CountDownLatch slowStopStarted = new CountDownLatch(1);
+        CountDownLatch releaseSlowStop = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            slowStopStarted.countDown();
+            releaseSlowStop.await();
+            return null;
+        }).when(containerLauncher).stop(slow);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            pool.init();
+            assertSame(busy, pool.acquire(fn));
+            assertSame(slow, pool.acquire(fn));
+            Future<?> shutdown = executor.submit(pool::stopManagedContainers);
+            assertTrue(slowStopStarted.await(3, TimeUnit.SECONDS));
+            shutdown.get(3, TimeUnit.SECONDS);
+            verify(containerLauncher, times(1)).stop(busy);
+
+            pool.release(busy);
+
+            verify(containerLauncher, times(2)).stop(busy);
+            pool.release(busy);
+            verify(containerLauncher, times(2)).stop(busy);
+        } finally {
+            releaseSlowStop.countDown();
+            executor.shutdownNow();
+            doNothing().when(containerLauncher).stop(slow);
+            pool.afterReset();
+            pool.shutdown();
+        }
     }
 
     @Test
@@ -1128,6 +1248,8 @@ class WarmPoolTest {
             IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
                     () -> WarmPool.resolveDrainTimeout(emulatorConfig));
             assertTrue(failure.getMessage().contains("must be between 1 and 300"));
+            assertThrows(IllegalArgumentException.class,
+                    () -> new WarmPool(containerLauncher, emulatorConfig, clock));
         }
     }
 

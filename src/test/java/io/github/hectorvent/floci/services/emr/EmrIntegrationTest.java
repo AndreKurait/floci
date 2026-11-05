@@ -127,22 +127,23 @@ class EmrIntegrationTest {
                 .then().statusCode(200)
                 .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
 
-        EmrCluster cluster = emrService.describeCluster(clusterId);
+        EmrCluster cluster = storedCluster("floci-emr-pinned");
+        String pinnedId = cluster.getId();
         Instant originalCreationTime = cluster.getCreationDateTime();
         cluster.setCreationDateTime(Instant.ofEpochMilli(1_761_000_000_000L));
         try {
             emr("ListClusters", "{\"CreatedBefore\":1761000000.001}")
                     .then().statusCode(200)
-                    .body("Clusters.find { it.Id == '" + clusterId + "' }.Name", equalTo("floci-emr"));
+                    .body("Clusters.find { it.Id == '" + pinnedId + "' }.Name", equalTo("floci-emr-pinned"));
             emr("ListClusters", "{\"CreatedAfter\":1760999999.999}")
                     .then().statusCode(200)
-                    .body("Clusters.find { it.Id == '" + clusterId + "' }.Name", equalTo("floci-emr"));
+                    .body("Clusters.find { it.Id == '" + pinnedId + "' }.Name", equalTo("floci-emr-pinned"));
             emr("ListClusters", "{\"CreatedBefore\":1761000000.000000001}")
                     .then().statusCode(200)
-                    .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
+                    .body("Clusters.find { it.Id == '" + pinnedId + "' }", nullValue());
             emr("ListClusters", "{\"CreatedAfter\":1760999999.999999999}")
                     .then().statusCode(200)
-                    .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
+                    .body("Clusters.find { it.Id == '" + pinnedId + "' }", nullValue());
         } finally {
             cluster.setCreationDateTime(originalCreationTime);
         }
@@ -153,7 +154,7 @@ class EmrIntegrationTest {
                     .then().statusCode(200).extract().asString()).path("Clusters");
             JsonNode listedTime = null;
             for (JsonNode listed : clusters) {
-                if (clusterId.equals(listed.path("Id").asText())) {
+                if (pinnedId.equals(listed.path("Id").asText())) {
                     listedTime = listed.path("Status").path("Timeline").path("CreationDateTime");
                     break;
                 }
@@ -163,7 +164,7 @@ class EmrIntegrationTest {
             assertEquals(0, new BigDecimal("1761000000.123").compareTo(listedTime.decimalValue()));
 
             JsonNode describedTime = objectMapper.readTree(emr("DescribeCluster",
-                    "{\"ClusterId\":\"" + clusterId + "\"}")
+                    "{\"ClusterId\":\"" + pinnedId + "\"}")
                     .then().statusCode(200).extract().asString())
                     .path("Cluster").path("Status").path("Timeline").path("CreationDateTime");
             assertTrue(describedTime.isNumber());
@@ -171,10 +172,10 @@ class EmrIntegrationTest {
 
             emr("ListClusters", "{\"CreatedAfter\":" + listedTime.asText() + "}")
                     .then().statusCode(200)
-                    .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
+                    .body("Clusters.find { it.Id == '" + pinnedId + "' }", nullValue());
             emr("ListClusters", "{\"CreatedBefore\":" + listedTime.asText() + "}")
                     .then().statusCode(200)
-                    .body("Clusters.find { it.Id == '" + clusterId + "' }", nullValue());
+                    .body("Clusters.find { it.Id == '" + pinnedId + "' }", nullValue());
         } finally {
             cluster.setCreationDateTime(originalCreationTime);
         }
@@ -366,13 +367,13 @@ class EmrIntegrationTest {
 
     @Test
     @Order(17)
-    void addStepsToUnknownClusterIsInvalidRequest() {
+    void addStepsToUnknownClusterIsAValidationException() {
         emr("AddJobFlowSteps",
                 "{\"JobFlowId\":\"j-DOESNOTEXIST0\",\"Steps\":[{\"Name\":\"s\","
                         + "\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}}]}")
                 .then().statusCode(400)
-                .body("__type", equalTo("InvalidRequestException"))
-                .body("message", equalTo("Cluster id 'j-DOESNOTEXIST0' is not valid."));
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("Specified job flow ID does not exist."));
     }
 
     @Test
@@ -404,17 +405,46 @@ class EmrIntegrationTest {
                 .body("Cluster.Status.State", equalTo("WAITING"));
     }
 
+    @Test
+    void settersAndCancelStepsRefuseARequestWithoutTheMembersTheyRequire() {
+        String id = emr("RunJobFlow", "{\"Name\":\"required\",\"Instances\":{\"KeepJobFlowAliveWhenNoSteps\":true}}")
+                .then().statusCode(200).extract().path("JobFlowId");
+        String ids = "\"JobFlowIds\":[\"" + id + "\"]";
+
+        assertMissing("TerminateJobFlows", "{}", "jobFlowIds");
+        assertMissing("SetTerminationProtection", "{\"TerminationProtected\":true}", "jobFlowIds");
+        assertMissing("SetTerminationProtection", "{" + ids + "}", "terminationProtected");
+        assertMissing("SetVisibleToAllUsers", "{" + ids + "}", "visibleToAllUsers");
+        assertMissing("SetKeepJobFlowAliveWhenNoSteps", "{" + ids + "}", "keepJobFlowAliveWhenNoSteps");
+        assertMissing("SetUnhealthyNodeReplacement", "{" + ids + "}", "unhealthyNodeReplacement");
+        assertMissing("CancelSteps", "{\"ClusterId\":\"" + id + "\"}", "stepIds");
+        emr("SetVisibleToAllUsers", "{}").then().statusCode(400)
+                .body("message", equalTo("2 validation errors detected: "
+                        + "Value null at 'jobFlowIds' failed to satisfy constraint: Member must not be null; "
+                        + "Value null at 'visibleToAllUsers' failed to satisfy constraint: Member must not be null"));
+        emr("TerminateJobFlows", "{\"JobFlowIds\":[]}").then().statusCode(200);
+
+        emr("DescribeCluster", "{\"ClusterId\":\"" + id + "\"}").then().statusCode(200)
+                .body("Cluster.Status.State", equalTo("WAITING"))
+                .body("Cluster.TerminationProtected", equalTo(false))
+                .body("Cluster.VisibleToAllUsers", equalTo(true))
+                .body("Cluster.AutoTerminate", equalTo(false));
+        emr("TerminateJobFlows", "{" + ids + "}").then().statusCode(200);
+    }
+
+    private static void assertMissing(String action, String body, String member) {
+        emr(action, body).then().statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo("1 validation error detected: Value null at '" + member
+                        + "' failed to satisfy constraint: Member must not be null"));
+    }
+
     // Catches: a cluster stored before the DNS fix keeps reporting its old us-east-1 master name.
     @Test
     void storedClusterReportsTheRegionalMasterDnsName() {
-        String id = emr("RunJobFlow",
-                "{\"Name\":\"stale-dns\",\"ReleaseLabel\":\"emr-7.5.0\","
-                        + "\"Instances\":{\"KeepJobFlowAliveWhenNoSteps\":true,"
-                        + "\"InstanceGroups\":[{\"Name\":\"master\",\"InstanceRole\":\"MASTER\","
-                        + "\"InstanceType\":\"m5.xlarge\",\"InstanceCount\":1}]}}")
-                .then().statusCode(200)
-                .extract().path("JobFlowId");
-        emrService.describeCluster(id).setMasterPublicDnsName("ip-10-0-0-1.us-east-1.compute.internal");
+        EmrCluster stored = storedCluster("stale-dns");
+        stored.setMasterPublicDnsName("ip-10-0-0-1.us-east-1.compute.internal");
+        String id = stored.getId();
 
         emr("DescribeCluster", "{\"ClusterId\":\"" + id + "\"}")
                 .then().statusCode(200)
@@ -422,5 +452,16 @@ class EmrIntegrationTest {
 
         emr("TerminateJobFlows", "{\"JobFlowIds\":[\"" + id + "\"]}")
                 .then().statusCode(200);
+    }
+
+    /**
+     * A kept-alive cluster as RunJobFlow stores it: the service's own object, which a test can change,
+     * unlike the copy DescribeCluster answers from.
+     */
+    private EmrCluster storedCluster(String name) {
+        EmrCluster cluster = new EmrCluster();
+        cluster.setName(name);
+        cluster.setKeepJobFlowAliveWhenNoSteps(true);
+        return emrService.runJobFlow(cluster, "us-east-1");
     }
 }

@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
+import io.github.hectorvent.floci.core.common.StarWildcard;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -54,15 +55,18 @@ import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -78,6 +82,8 @@ public class SnsService implements Resettable, ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(SnsService.class);
     private static final Duration FIFO_DEDUP_WINDOW = Duration.ofMinutes(5);
+    private static final DateTimeFormatter MESSAGE_TIMESTAMP =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
     private static final Set<String> SMS_ATTRIBUTE_NAMES = Set.of("MonthlySpendLimit",
             "DeliveryStatusIAMRole", "DeliveryStatusSuccessSamplingRate", "DefaultSenderID",
             "DefaultSMSType", "UsageReportS3Bucket");
@@ -145,8 +151,8 @@ public class SnsService implements Resettable, ResourceProvider {
     /** Mobile-push platforms Floci mocks. iOS and Android only — anything else is rejected. */
     private static final Set<String> SUPPORTED_PUSH_PLATFORMS = Set.of(
             "APNS", "APNS_SANDBOX", "GCM", "FCM");
-    private static final java.util.regex.Pattern PLATFORM_APP_NAME_PATTERN =
-            java.util.regex.Pattern.compile("[a-zA-Z0-9_.\\-]{1,256}");
+    private static final Pattern PLATFORM_APP_NAME_PATTERN =
+            Pattern.compile("[a-zA-Z0-9_.\\-]{1,256}");
 
     /**
      * Operator names that may not appear as a field name inside a {@code $or} array; their
@@ -343,7 +349,11 @@ public class SnsService implements Resettable, ResourceProvider {
         this.firehoseService = firehoseService;
         this.baseUrl = baseUrl;
         this.objectMapper = objectMapper;
-        this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+        // Pin to HTTP/1.1 like AWS SNS: the default HTTP_2 sends an h2c upgrade to http:// endpoints.
+        this.httpClient = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(Duration.ofSeconds(5))
+                .build();
         this.messageSigner = messageSigner;
     }
 
@@ -556,6 +566,14 @@ public class SnsService implements Resettable, ResourceProvider {
 
     public Topic createTopic(String name, Map<String, String> attributes,
                              Map<String, String> tags, String region) {
+        return createTopicWithStatus(name, attributes, tags, region).topic();
+    }
+
+    public record TopicCreation(Topic topic, boolean created) {
+    }
+
+    public synchronized TopicCreation createTopicWithStatus(String name, Map<String, String> attributes,
+                                                            Map<String, String> tags, String region) {
         if (name == null || name.isBlank()) {
             throw new AwsException("InvalidParameter", "Topic name is required.", 400);
         }
@@ -566,7 +584,7 @@ public class SnsService implements Resettable, ResourceProvider {
         String key = topicKey(region, topicArn);
 
         Topic existing = topicStore.get(key).orElse(null);
-        if (existing != null) return existing;
+        if (existing != null) return new TopicCreation(existing, false);
 
         Topic topic = new Topic(name, topicArn);
         if (attributes != null) topic.getAttributes().putAll(attributes);
@@ -583,7 +601,7 @@ public class SnsService implements Resettable, ResourceProvider {
 
         topicStore.put(key, topic);
         LOG.infov("Created SNS topic: {0} in region {1}", name, region);
-        return topic;
+        return new TopicCreation(topic, true);
     }
 
     public void deleteTopic(String topicArn, String region) {
@@ -911,7 +929,17 @@ public class SnsService implements Resettable, ResourceProvider {
         }
     }
 
-    public Subscription subscribe(String topicArn, String protocol, String endpoint, String region, Map<String, String> attributes) {
+    public Subscription subscribe(String topicArn, String protocol, String endpoint, String region,
+                                  Map<String, String> attributes) {
+        return subscribeWithStatus(topicArn, protocol, endpoint, region, attributes).subscription();
+    }
+
+    public record SubscriptionCreation(Subscription subscription, boolean created) {
+    }
+
+    public SubscriptionCreation subscribeWithStatus(String topicArn, String protocol,
+                                                    String endpoint, String region,
+                                                    Map<String, String> attributes) {
         String topicKey = topicKey(region, topicArn);
         if (topicStore.get(topicKey).isEmpty() && !ensureControlTowerManagedTopic(topicArn, region)) {
             throw new AwsException("NotFound", "Topic does not exist.", 404);
@@ -934,29 +962,32 @@ public class SnsService implements Resettable, ResourceProvider {
             requireLargePayloadProtocol(protocol);
         }
 
-        for (Subscription existing : subscriptionsByTopic(topicArn, region)) {
-            if (protocol.equals(existing.getProtocol())
-                    && Objects.equals(endpoint, existing.getEndpoint())) {
-                return existing;
+        Subscription subscription;
+        synchronized (this) {
+            for (Subscription existing : subscriptionsByTopic(topicArn, region)) {
+                if (protocol.equals(existing.getProtocol())
+                        && Objects.equals(endpoint, existing.getEndpoint())) {
+                    return new SubscriptionCreation(existing, false);
+                }
             }
+
+            String subscriptionArn = topicArn + ":" + UUID.randomUUID().toString();
+            subscription = new Subscription(subscriptionArn, topicArn, protocol, endpoint,
+                    regionResolver.getAccountId());
+            subscription.setAccountId(regionResolver.getAccountId());
+            if (attributes != null) subscription.getAttributes().putAll(attributes);
+
+            if (PENDING_CONFIRMATION_PROTOCOLS.contains(protocol)) {
+                String token = UUID.randomUUID().toString().replace("-", "")
+                        + UUID.randomUUID().toString().replace("-", "");
+                subscription.getAttributes().put("PendingConfirmation", "true");
+                subscription.getAttributes().put("ConfirmationToken", token);
+                LOG.infov("Subscription pending confirmation for {0} ({1}) to topic {2} in {3}",
+                        endpoint, protocol, topicArn, region);
+            }
+
+            subscriptionStore.put(subKey(region, subscriptionArn), subscription);
         }
-
-        String subscriptionArn = topicArn + ":" + UUID.randomUUID().toString();
-        Subscription subscription = new Subscription(subscriptionArn, topicArn, protocol, endpoint,
-                regionResolver.getAccountId());
-        subscription.setAccountId(regionResolver.getAccountId());
-        if (attributes != null) subscription.getAttributes().putAll(attributes);
-
-        if (PENDING_CONFIRMATION_PROTOCOLS.contains(protocol)) {
-            String token = UUID.randomUUID().toString().replace("-", "")
-                    + UUID.randomUUID().toString().replace("-", "");
-            subscription.getAttributes().put("PendingConfirmation", "true");
-            subscription.getAttributes().put("ConfirmationToken", token);
-            LOG.infov("Subscription pending confirmation for {0} ({1}) to topic {2} in {3}",
-                    endpoint, protocol, topicArn, region);
-        }
-
-        subscriptionStore.put(subKey(region, subscriptionArn), subscription);
         if (attributes == null || attributes.isEmpty()) {
             LOG.infov("Subscribed {0} ({1}) to topic {2} in {3}", endpoint, protocol, topicArn, region);
         } else {
@@ -967,7 +998,7 @@ public class SnsService implements Resettable, ResourceProvider {
             sendSubscriptionConfirmation(subscription, topicArn, region);
         }
 
-        return subscription;
+        return new SubscriptionCreation(subscription, true);
     }
 
     private boolean ensureControlTowerManagedTopic(String topicArn, String region) {
@@ -1098,6 +1129,8 @@ public class SnsService implements Resettable, ResourceProvider {
         }
 
         String messageId = UUID.randomUUID().toString();
+        Notification notification = new Notification(messageId,
+                MESSAGE_TIMESTAMP.format(Instant.now()), signatureVersion(topic), new HashMap<>());
         JsonNode parsedBody = null;
         boolean bodyParseAttempted = false;
         for (Subscription sub : subscriptionsByTopic(effectiveArn, region)) {
@@ -1112,10 +1145,10 @@ public class SnsService implements Resettable, ResourceProvider {
             if (!matchesFilterPolicy(sub, parsedBody, messageAttributes)) {
                 continue;
             }
-            deliverMessage(sub, message, subject, messageAttributes, messageId, effectiveArn, messageGroupId, dedupId, messageStructure,
-                    signatureVersion(topic));
+            deliverMessage(sub, message, subject, messageAttributes, notification, effectiveArn, messageGroupId, dedupId,
+                    messageStructure);
         }
-        LOG.infov("Published message {0} to topic {1}", messageId, effectiveArn);
+        LOG.debugv("Published message {0} to topic {1}", messageId, effectiveArn);
         return messageId;
     }
 
@@ -1174,7 +1207,7 @@ public class SnsService implements Resettable, ResourceProvider {
         PlatformApplication app = platformAppStore.get(key)
                 .orElseThrow(() -> new AwsException("NotFound",
                         "PlatformApplication does not exist.", 404));
-        return new java.util.LinkedHashMap<>(app.getAttributes());
+        return new LinkedHashMap<>(app.getAttributes());
     }
 
     public void setPlatformApplicationAttributes(String arn, Map<String, String> attributes, String region) {
@@ -1249,7 +1282,7 @@ public class SnsService implements Resettable, ResourceProvider {
     public Map<String, String> getEndpointAttributes(String endpointArn, String region) {
         PlatformEndpoint endpoint = platformEndpointStore.get(endpointKey(region, endpointArn))
                 .orElseThrow(() -> new AwsException("NotFound", "Endpoint does not exist.", 404));
-        return new java.util.LinkedHashMap<>(endpoint.getAttributes());
+        return new LinkedHashMap<>(endpoint.getAttributes());
     }
 
     public void setEndpointAttributes(String endpointArn, Map<String, String> attributes, String region) {
@@ -1323,7 +1356,7 @@ public class SnsService implements Resettable, ResourceProvider {
         recordPushNotification(new PushNotification(
                 endpoint.getArn(), app.getArn(), app.getPlatform(), endpoint.getToken(),
                 payload, subject, messageAttributes, messageId, Instant.now()));
-        LOG.infov("Captured push notification {0} -> {1} ({2})", messageId, endpoint.getArn(), app.getPlatform());
+        LOG.debugv("Captured push notification {0} -> {1} ({2})", messageId, endpoint.getArn(), app.getPlatform());
         return messageId;
     }
 
@@ -1436,7 +1469,7 @@ public class SnsService implements Resettable, ResourceProvider {
     }
 
     private static boolean isExpiredSentinelToken(String token) {
-        return token != null && token.toUpperCase(java.util.Locale.ROOT).contains("EXPIRED");
+        return token != null && token.toUpperCase(Locale.ROOT).contains("EXPIRED");
     }
 
     private static boolean isEndpointArn(String arn) {
@@ -1477,7 +1510,13 @@ public class SnsService implements Resettable, ResourceProvider {
         attrs.put("RawMessageDelivery", attrs.getOrDefault("RawMessageDelivery", "false"));
         attrs.putIfAbsent("PendingConfirmation", "false");
         attrs.putIfAbsent("ConfirmationWasAuthenticated", "false");
-        attrs.putIfAbsent("FilterPolicyScope", "MessageAttributes");
+        // AWS reports FilterPolicyScope, stored or default, only alongside a filter policy.
+        String filterPolicy = attrs.get("FilterPolicy");
+        if (filterPolicy == null || filterPolicy.isEmpty()) {
+            attrs.remove("FilterPolicyScope");
+        } else {
+            attrs.putIfAbsent("FilterPolicyScope", "MessageAttributes");
+        }
         attrs.remove("ConfirmationToken");
         return attrs;
     }
@@ -1528,6 +1567,8 @@ public class SnsService implements Resettable, ResourceProvider {
         boolean groupScopedDedup = isGroupScopedDeduplication(topic);
         List<String[]> successful = new ArrayList<>();
         List<String[]> failed = new ArrayList<>();
+        String timestamp = MESSAGE_TIMESTAMP.format(Instant.now());
+        String version = signatureVersion(topic);
         for (Map<String, Object> entry : entries) {
             String id = (String) entry.get("Id");
             String message = (String) entry.get("Message");
@@ -1564,6 +1605,7 @@ public class SnsService implements Resettable, ResourceProvider {
             }
 
             String messageId = UUID.randomUUID().toString();
+            Notification notification = new Notification(messageId, timestamp, version, new HashMap<>());
             @SuppressWarnings("unchecked")
             Map<String, MessageAttributeValue> attrs = (Map<String, MessageAttributeValue>) entry.get("MessageAttributes");
             JsonNode parsedBody = null;
@@ -1575,8 +1617,8 @@ public class SnsService implements Resettable, ResourceProvider {
                     bodyParseAttempted = true;
                 }
                 if (!matchesFilterPolicy(sub, parsedBody, attrs)) continue;
-                deliverMessage(sub, message, subject, attrs, messageId, topicArn, messageGroupId, messageDeduplicationId, messageStructure,
-                        signatureVersion(topic));
+                deliverMessage(sub, message, subject, attrs, notification, topicArn, messageGroupId, messageDeduplicationId,
+                        messageStructure);
             }
             LOG.debugv("Batch published message {0} (id={1}) to {2}", messageId, id, topicArn);
             successful.add(new String[]{id, messageId});
@@ -1607,7 +1649,7 @@ public class SnsService implements Resettable, ResourceProvider {
         Topic topic = topicStore.get(key)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Resource does not exist.", 404));
-        return new java.util.LinkedHashMap<>(topic.getTags());
+        return new LinkedHashMap<>(topic.getTags());
     }
 
     @Override
@@ -2103,7 +2145,7 @@ public class SnsService implements Resettable, ResourceProvider {
             case "prefix" -> value.startsWith(expected);
             case "suffix" -> value.endsWith(expected);
             case "equals-ignore-case" -> value.equalsIgnoreCase(expected);
-            case "wildcard" -> wildcardMatches(expected, value);
+            case "wildcard" -> StarWildcard.matches(expected, value);
             case "cidr" -> cidrContains(expected, value);
             default -> false;
         };
@@ -2147,37 +2189,6 @@ public class SnsService implements Resettable, ResourceProvider {
         }
         Optional<Boolean> matched = evaluateNumericCondition(number, operand);
         return matched.isPresent() && !matched.get();
-    }
-
-    /**
-     * Anchored, case-sensitive glob. Each {@code *} matches any run of characters, including an
-     * empty one, and every other character matches only itself. This is a scan, not a regular
-     * expression, so {@code .} and other metacharacters stay literal.
-     */
-    private static boolean wildcardMatches(String pattern, String value) {
-        int patternIndex = 0;
-        int valueIndex = 0;
-        int starPattern = -1;
-        int starValue = -1;
-        while (valueIndex < value.length()) {
-            if (patternIndex < pattern.length() && pattern.charAt(patternIndex) == '*') {
-                starPattern = patternIndex++;
-                starValue = valueIndex;
-            } else if (patternIndex < pattern.length()
-                    && pattern.charAt(patternIndex) == value.charAt(valueIndex)) {
-                patternIndex++;
-                valueIndex++;
-            } else if (starPattern >= 0) {
-                patternIndex = starPattern + 1;
-                valueIndex = ++starValue;
-            } else {
-                return false;
-            }
-        }
-        while (patternIndex < pattern.length() && pattern.charAt(patternIndex) == '*') {
-            patternIndex++;
-        }
-        return patternIndex == pattern.length();
     }
 
     /**
@@ -2487,10 +2498,15 @@ public class SnsService implements Resettable, ResourceProvider {
         return result;
     }
 
+    /** What every subscriber of one published message shares. AWS stamps and signs a publish once. */
+    private record Notification(String messageId, String timestamp, String signatureVersion,
+                                Map<String, String> signatures) { }
+
     private void deliverMessage(Subscription sub, String message, String subject,
-                                Map<String, MessageAttributeValue> messageAttributes, String messageId,
+                                Map<String, MessageAttributeValue> messageAttributes, Notification notification,
                                 String topicArn, String messageGroupId, String messageDeduplicationId,
-                                String messageStructure, String signatureVersion) {
+                                String messageStructure) {
+        String messageId = notification.messageId();
         try {
             // Under MessageStructure="json" every subscriber gets the value under its own
             // protocol key, falling back to "default". The application case resolves against
@@ -2508,8 +2524,8 @@ public class SnsService implements Resettable, ResourceProvider {
                     boolean rawDelivery = "true".equalsIgnoreCase(sub.getAttributes().get("RawMessageDelivery"));
                     String body = rawDelivery
                             ? protocolMessage
-                            : buildSnsEnvelope(protocolMessage, subject, messageAttributes, topicArn, messageId,
-                                    sub.getSubscriptionArn(), signatureVersion);
+                            : buildSnsEnvelope(protocolMessage, subject, messageAttributes, topicArn, notification,
+                                    sub.getSubscriptionArn());
                     Map<String, MessageAttributeValue> sqsAttributes = rawDelivery
                             ? toSqsMessageAttributes(messageAttributes)
                             : Collections.emptyMap();
@@ -2518,8 +2534,8 @@ public class SnsService implements Resettable, ResourceProvider {
                 }
                 case "lambda" -> {
                     String region = extractRegionFromArn(sub.getEndpoint());
-                    String eventJson = buildSnsLambdaEvent(topicArn, messageId, protocolMessage,
-                            subject, messageAttributes, sub.getSubscriptionArn(), signatureVersion);
+                    String eventJson = buildSnsLambdaEvent(topicArn, notification, protocolMessage,
+                            subject, messageAttributes, sub.getSubscriptionArn());
                     lambdaService.invoke(region, sub.getEndpoint(), eventJson.getBytes(), InvocationType.Event);
                     LOG.debugv("Delivered SNS message to Lambda: {0}", sub.getEndpoint());
                 }
@@ -2530,8 +2546,8 @@ public class SnsService implements Resettable, ResourceProvider {
                     boolean rawDelivery = "true".equalsIgnoreCase(sub.getAttributes().get("RawMessageDelivery"));
                     String body = rawDelivery
                             ? protocolMessage
-                            : buildSnsHttpNotification(protocolMessage, subject, messageAttributes, topicArn, messageId,
-                                    sub.getSubscriptionArn(), signatureVersion);
+                            : buildSnsHttpNotification(protocolMessage, subject, messageAttributes, topicArn, notification,
+                                    sub.getSubscriptionArn());
                     HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                             .uri(URI.create(sub.getEndpoint()))
                             .timeout(Duration.ofSeconds(5))
@@ -2606,8 +2622,8 @@ public class SnsService implements Resettable, ResourceProvider {
                             && "true".equalsIgnoreCase(sub.getAttributes().get("RawMessageDelivery"));
                     String body = rawDelivery
                             ? protocolMessage
-                            : buildSnsEnvelope(protocolMessage, subject, messageAttributes, topicArn, messageId,
-                                    null, null);
+                            : buildSnsEnvelope(protocolMessage, subject, messageAttributes, topicArn, notification,
+                                    null);
                     byte[] data = body.getBytes(StandardCharsets.UTF_8);
                     firehoseService.putRecord(accountId, region, streamName, new Record(data));
                     LOG.debugv("Delivered SNS message to Firehose: {0} ({1}) raw={2}", sub.getEndpoint(), streamName, rawDelivery);
@@ -2699,14 +2715,13 @@ public class SnsService implements Resettable, ResourceProvider {
         }
     }
 
-    private String buildSnsLambdaEvent(String topicArn, String messageId, String message,
+    private String buildSnsLambdaEvent(String topicArn, Notification notification, String message,
                                        String subject, Map<String, MessageAttributeValue> messageAttributes,
-                                       String subscriptionArn, String signatureVersion) {
+                                       String subscriptionArn) {
         try {
-            String timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
             ObjectNode snsNode = objectMapper.createObjectNode();
             snsNode.put("Type", "Notification");
-            snsNode.put("MessageId", messageId);
+            snsNode.put("MessageId", notification.messageId());
             snsNode.put("TopicArn", topicArn);
             if (subject != null) {
                 snsNode.put("Subject", subject);
@@ -2714,8 +2729,8 @@ public class SnsService implements Resettable, ResourceProvider {
                 snsNode.putNull("Subject");
             }
             snsNode.put("Message", message);
-            snsNode.put("Timestamp", timestamp);
-            messageSigner.sign(snsNode, signatureVersion, "SigningCertUrl");
+            snsNode.put("Timestamp", notification.timestamp());
+            messageSigner.sign(snsNode, notification.signatureVersion(), "SigningCertUrl", notification.signatures());
             snsNode.put("UnsubscribeUrl", unsubscribeUrl(subscriptionArn));
             ObjectNode attrs = snsNode.putObject("MessageAttributes");
             if (messageAttributes != null) {
@@ -2755,7 +2770,7 @@ public class SnsService implements Resettable, ResourceProvider {
         if (snsAttributes == null || snsAttributes.isEmpty()) {
             return Collections.emptyMap();
         }
-        return new java.util.HashMap<>(snsAttributes);
+        return new HashMap<>(snsAttributes);
     }
 
     /**
@@ -2765,21 +2780,19 @@ public class SnsService implements Resettable, ResourceProvider {
      */
     private String buildSnsEnvelope(String message, String subject,
                                     Map<String, MessageAttributeValue> messageAttributes,
-                                    String topicArn, String messageId, String subscriptionArn,
-                                    String signatureVersion) {
+                                    String topicArn, Notification notification, String subscriptionArn) {
         try {
-            String timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
             ObjectNode node = objectMapper.createObjectNode();
             node.put("Type", "Notification");
-            node.put("MessageId", messageId);
+            node.put("MessageId", notification.messageId());
             node.put("TopicArn", topicArn);
-            node.put("Timestamp", timestamp);
+            node.put("Timestamp", notification.timestamp());
             if (subject != null) {
                 node.put("Subject", subject);
             }
             node.put("Message", message);
             if (subscriptionArn != null) {
-                messageSigner.sign(node, signatureVersion, "SigningCertURL");
+                messageSigner.sign(node, notification.signatureVersion(), "SigningCertURL", notification.signatures());
                 node.put("UnsubscribeURL", unsubscribeUrl(subscriptionArn));
             }
             ObjectNode attrs = node.putObject("MessageAttributes");
@@ -2797,7 +2810,7 @@ public class SnsService implements Resettable, ResourceProvider {
             }
             return objectMapper.writeValueAsString(node);
         } catch (JsonProcessingException e) {
-            LOG.warnv("Failed to build SNS envelope for message {0}: {1}", messageId, e.getMessage());
+            LOG.warnv("Failed to build SNS envelope for message {0}: {1}", notification.messageId(), e.getMessage());
             return "{}";
         }
     }
@@ -2813,20 +2826,18 @@ public class SnsService implements Resettable, ResourceProvider {
 
     private String buildSnsHttpNotification(String message, String subject,
                                              Map<String, MessageAttributeValue> messageAttributes,
-                                             String topicArn, String messageId, String subscriptionArn,
-                                             String signatureVersion) {
+                                             String topicArn, Notification notification, String subscriptionArn) {
         try {
-            String timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
             ObjectNode node = objectMapper.createObjectNode();
             node.put("Type", "Notification");
-            node.put("MessageId", messageId);
+            node.put("MessageId", notification.messageId());
             node.put("TopicArn", topicArn);
-            node.put("Timestamp", timestamp);
+            node.put("Timestamp", notification.timestamp());
             if (subject != null) {
                 node.put("Subject", subject);
             }
             node.put("Message", message);
-            messageSigner.sign(node, signatureVersion, "SigningCertURL");
+            messageSigner.sign(node, notification.signatureVersion(), "SigningCertURL", notification.signatures());
             node.put("UnsubscribeURL", unsubscribeUrl(subscriptionArn));
             ObjectNode attrs = node.putObject("MessageAttributes");
             if (messageAttributes != null) {
@@ -2860,7 +2871,7 @@ public class SnsService implements Resettable, ResourceProvider {
         try {
             String token = subscription.getAttributes().get("ConfirmationToken");
             String subscribeUrl = baseUrl + "/?Action=ConfirmSubscription&TopicArn=" + topicArn + "&Token=" + token;
-            String timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
+            String timestamp = MESSAGE_TIMESTAMP.format(Instant.now());
             ObjectNode node = objectMapper.createObjectNode();
             node.put("Type", "SubscriptionConfirmation");
             node.put("MessageId", UUID.randomUUID().toString());
@@ -3020,7 +3031,7 @@ public class SnsService implements Resettable, ResourceProvider {
         String effectiveRegion = region != null ? region : regionResolver.getDefaultRegion();
         SentSms sms = new SentSms(messageId, effectiveRegion, phoneNumber, message, subject, Instant.now());
         smsStore.put("sms::" + effectiveRegion + "::" + messageId, sms);
-        LOG.infov("SNS SMS published: messageId={0} phone={1}", messageId, phoneNumber);
+        LOG.debugv("SNS SMS published: messageId={0} phone={1}", messageId, phoneNumber);
         return messageId;
     }
 

@@ -2,11 +2,16 @@ package io.github.hectorvent.floci.services.applicationautoscaling;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
+import io.github.hectorvent.floci.core.common.SignedMarkers;
+import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.Alarm;
+import io.github.hectorvent.floci.services.applicationautoscaling.model.PredefinedMetricSpecification;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.ScalableTarget;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.ScalingPolicy;
@@ -42,9 +47,11 @@ import java.util.UUID;
  * @see <a href="https://docs.aws.amazon.com/autoscaling/application/APIReference/Welcome.html">Application Auto Scaling API Reference</a>
  */
 @ApplicationScoped
-public class ApplicationAutoScalingService {
+public class ApplicationAutoScalingService implements StoredResourceArns {
 
     private static final Logger LOG = Logger.getLogger(ApplicationAutoScalingService.class);
+    private static final int MAX_TARGET_PAGE_SIZE = 50;
+    private static final int MAX_POLICY_PAGE_SIZE = 10;
 
     static final Set<String> SERVICE_NAMESPACES = Set.of(
             "ecs", "elasticmapreduce", "ec2", "appstream", "dynamodb", "rds", "sagemaker",
@@ -85,6 +92,7 @@ public class ApplicationAutoScalingService {
     private final StorageBackend<String, ScalingActivity> activities;
     private final RegionResolver regionResolver;
     private final CloudWatchMetricsService cloudWatchMetricsService;
+    private final SignedMarkers pageTokens = new SignedMarkers();
 
     @Inject
     public ApplicationAutoScalingService(StorageFactory factory,
@@ -186,6 +194,18 @@ public class ApplicationAutoScalingService {
                 .toList();
     }
 
+    PaginatedResult<ScalableTarget> describeScalableTargets(String serviceNamespace, List<String> resourceIds,
+                                                            String scalableDimension, Integer maxResults,
+                                                            String nextToken, String region) {
+        String cursor = decodeNextToken(nextToken, "DescribeScalableTargets");
+        List<ScalableTarget> matching = describeScalableTargets(serviceNamespace, resourceIds,
+                scalableDimension, region);
+        return signedPage(Pagination.paginate(matching, ApplicationAutoScalingService::scalableTargetCursor,
+                pageSize(maxResults, MAX_TARGET_PAGE_SIZE), cursor,
+                pageNamespace(resourceIds, "DescribeScalableTargets", region, serviceNamespace, scalableDimension),
+                token -> invalidNextToken("DescribeScalableTargets")));
+    }
+
     /**
      * Deregisters a scalable target and, per AWS semantics, deletes every scaling policy
      * attached to it along with the CloudWatch alarms those policies own.
@@ -275,8 +295,21 @@ public class ApplicationAutoScalingService {
                 .filter(p -> resourceId == null || resourceId.equals(p.getResourceId()))
                 .filter(p -> scalableDimension == null || scalableDimension.equals(p.getScalableDimension()))
                 .filter(p -> policyNames == null || policyNames.isEmpty() || policyNames.contains(p.getPolicyName()))
-                .sorted(Comparator.comparing(ScalingPolicy::getPolicyName))
+                .sorted(Comparator.comparing(ApplicationAutoScalingService::scalingPolicyCursor))
                 .toList();
+    }
+
+    PaginatedResult<ScalingPolicy> describeScalingPolicies(String serviceNamespace, String resourceId,
+                                                           String scalableDimension, List<String> policyNames,
+                                                           Integer maxResults, String nextToken, String region) {
+        String cursor = decodeNextToken(nextToken, "DescribeScalingPolicies");
+        List<ScalingPolicy> matching = describeScalingPolicies(serviceNamespace, resourceId,
+                scalableDimension, policyNames, region);
+        return signedPage(Pagination.paginate(matching, ApplicationAutoScalingService::scalingPolicyCursor,
+                pageSize(maxResults, MAX_POLICY_PAGE_SIZE), cursor,
+                pageNamespace(policyNames, "DescribeScalingPolicies", region, serviceNamespace,
+                        resourceId, scalableDimension),
+                token -> invalidNextToken("DescribeScalingPolicies")));
     }
 
     public void deleteScalingPolicy(String policyName, String serviceNamespace, String resourceId,
@@ -361,10 +394,7 @@ public class ApplicationAutoScalingService {
             alarm.setAlarmName(alarmName);
             alarm.setAlarmDescription("DO NOT EDIT OR DELETE. For TargetTrackingScaling policy "
                     + policy.getPolicyArn() + ".");
-            alarm.setNamespace(cloudWatchNamespace(policy.getServiceNamespace()));
-            alarm.setMetricName(predefinedMetricType(policy));
-            alarm.setDimensions(resolveDimensions(policy));
-            alarm.setStatistic("Average");
+            applyMetricSpecification(alarm, policy);
             alarm.setPeriod(60);
             alarm.setEvaluationPeriods("AlarmHigh".equals(suffix) ? 3 : 15);
             alarm.setThreshold(targetValue(policy));
@@ -377,16 +407,18 @@ public class ApplicationAutoScalingService {
         return alarms;
     }
 
+    /**
+     * Deletes the policy's alarms one at a time: CloudWatch refuses a whole DeleteAlarms request
+     * that names an alarm a composite alarm still names, and the others should go regardless.
+     */
     private void deleteAlarms(ScalingPolicy policy, String region) {
-        List<String> names = policy.getAlarms().stream().map(Alarm::getAlarmName).toList();
-        if (names.isEmpty()) {
-            return;
-        }
-        try {
-            cloudWatchMetricsService.deleteAlarms(names, region);
-        } catch (RuntimeException e) {
-            // Alarm cleanup is best-effort: a user may have deleted them out of band.
-            LOG.debugv(e, "Could not delete target-tracking alarms {0} in {1}", names, region);
+        for (Alarm alarm : policy.getAlarms()) {
+            try {
+                cloudWatchMetricsService.deleteAlarms(List.of(alarm.getAlarmName()), region);
+            } catch (RuntimeException e) {
+                // Alarm cleanup is best-effort: a composite alarm may still name this one.
+                LOG.debugv(e, "Could not delete target-tracking alarm {0} in {1}", alarm.getAlarmName(), region);
+            }
         }
     }
 
@@ -406,6 +438,109 @@ public class ApplicationAutoScalingService {
         return List.of();
     }
 
+    /**
+     * The alarm must watch the metric the policy scales on, exactly as AWS's own target
+     * tracking alarms do, otherwise data published the way AWS (or the caller) publishes it
+     * never matches the alarm and the policy never scales. A customized specification
+     * carries the caller's namespace, metric name, dimensions and statistic through; a
+     * predefined type maps onto the CloudWatch identity its backing service documents.
+     */
+    private void applyMetricSpecification(MetricAlarm alarm, ScalingPolicy policy) {
+        TargetTrackingConfiguration config = policy.getTargetTrackingConfiguration();
+        if (config != null && config.getCustomizedMetricSpecification() != null) {
+            applyCustomizedSpecification(alarm, config.getCustomizedMetricSpecification(), policy);
+        } else {
+            applyPredefinedSpecification(alarm, policy,
+                    config == null ? null : config.getPredefinedMetricSpecification());
+        }
+    }
+
+    private static void applyCustomizedSpecification(MetricAlarm alarm, Map<String, Object> spec,
+                                                     ScalingPolicy policy) {
+        alarm.setNamespace(metricOrDefault(textValue(spec.get("Namespace")),
+                cloudWatchNamespace(policy.getServiceNamespace())));
+        alarm.setMetricName(metricOrDefault(textValue(spec.get("MetricName")), "CustomizedMetric"));
+        alarm.setDimensions(customizedDimensions(spec));
+        alarm.setStatistic(metricOrDefault(textValue(spec.get("Statistic")), "Average"));
+        String unit = textValue(spec.get("Unit"));
+        if (unit != null) {
+            alarm.setUnit(unit);
+        }
+    }
+
+    private void applyPredefinedSpecification(MetricAlarm alarm, ScalingPolicy policy,
+                                              PredefinedMetricSpecification spec) {
+        String type = spec == null ? null : spec.getPredefinedMetricType();
+        PredefinedMetric metric = type == null ? null : PREDEFINED_METRICS.get(type);
+        alarm.setStatistic(metric == null ? "Average" : metric.statistic());
+        if (metric != null) {
+            alarm.setNamespace(metric.namespace());
+            alarm.setMetricName(metric.metricName());
+            alarm.setDimensions("ALBRequestCountPerTarget".equals(type)
+                    ? resourceLabelDimensions(spec.getResourceLabel()) : resolveDimensions(policy));
+        } else {
+            alarm.setNamespace(cloudWatchNamespace(policy.getServiceNamespace()));
+            alarm.setMetricName(type != null ? type : "CustomizedMetric");
+            alarm.setDimensions(resolveDimensions(policy));
+        }
+    }
+
+    /**
+     * The documented CloudWatch identity of each predefined type Floci resolves, exactly as
+     * the backing service publishes it: {@code ECSServiceAverageCPUUtilization} and
+     * {@code ECSServiceAverageMemoryUtilization} read the AWS/ECS service-level metrics
+     * keyed by {@code ClusterName}/{@code ServiceName}, and {@code ALBRequestCountPerTarget}
+     * reads the AWS/ApplicationELB per-target request count keyed by the load balancer and
+     * target group inside {@code ResourceLabel}. RequestCountPerTarget's only valid
+     * CloudWatch statistic is Sum (the value is already the per-minute average across
+     * targets), so each mapping carries the statistic the alarm must read. Types without a
+     * mapping Floci is certain of
+     * are left onto the service namespace's own namespace under the type's name rather than
+     * silently pointing at a metric the backing service never publishes.
+     */
+    private static final Map<String, PredefinedMetric> PREDEFINED_METRICS = Map.of(
+            "ECSServiceAverageCPUUtilization", new PredefinedMetric("AWS/ECS", "CPUUtilization", "Average"),
+            "ECSServiceAverageMemoryUtilization", new PredefinedMetric("AWS/ECS", "MemoryUtilization", "Average"),
+            "ALBRequestCountPerTarget", new PredefinedMetric("AWS/ApplicationELB", "RequestCountPerTarget", "Sum"));
+
+    private record PredefinedMetric(String namespace, String metricName, String statistic) {
+    }
+
+    private static String metricOrDefault(String value, String fallback) {
+        return value != null ? value : fallback;
+    }
+
+    private static String textValue(Object value) {
+        return value instanceof String text && !text.isBlank() ? text : null;
+    }
+
+    private static List<Dimension> customizedDimensions(Map<String, Object> spec) {
+        List<Dimension> dimensions = new ArrayList<>();
+        Object entries = spec.get("Dimensions");
+        if (entries instanceof List<?> list) {
+            for (Object entry : list) {
+                if (entry instanceof Map<?, ?> dimension
+                        && dimension.get("Name") instanceof String name
+                        && dimension.get("Value") instanceof String value) {
+                    dimensions.add(new Dimension(name, value));
+                }
+            }
+        }
+        return List.copyOf(dimensions);
+    }
+
+    /**
+     * AWS's {@code ResourceLabel} for the ALB per-target metric is the tail of the two ARNs,
+     * {@code app/{name}/{id}/targetgroup/{name}/{id}}, which are verbatim the {@code
+     * LoadBalancer} and {@code TargetGroup} dimension values the metric is published under.
+     */
+    private static List<Dimension> resourceLabelDimensions(String resourceLabel) {
+        int split = resourceLabel == null ? -1 : resourceLabel.indexOf("/targetgroup/");
+        return split <= 0 ? List.of() : List.of(
+                new Dimension("LoadBalancer", resourceLabel.substring(0, split)),
+                new Dimension("TargetGroup", resourceLabel.substring(split + 1)));
+    }
+
     private static String cloudWatchNamespace(String serviceNamespace) {
         return switch (serviceNamespace) {
             case "ecs" -> "AWS/ECS";
@@ -416,15 +551,6 @@ public class ApplicationAutoScalingService {
             case "elasticache" -> "AWS/ElastiCache";
             default -> "AWS/" + serviceNamespace.toUpperCase(Locale.ROOT);
         };
-    }
-
-    private static String predefinedMetricType(ScalingPolicy policy) {
-        TargetTrackingConfiguration config = policy.getTargetTrackingConfiguration();
-        if (config != null && config.getPredefinedMetricSpecification() != null
-                && config.getPredefinedMetricSpecification().getPredefinedMetricType() != null) {
-            return config.getPredefinedMetricSpecification().getPredefinedMetricType();
-        }
-        return "CustomizedMetric";
     }
 
     private static double targetValue(ScalingPolicy policy) {
@@ -513,6 +639,57 @@ public class ApplicationAutoScalingService {
         return now.getEpochSecond() + (now.getNano() / 1_000_000 / 1000.0d);
     }
 
+    private static int pageSize(Integer maxResults, int maximum) {
+        if (maxResults != null && (maxResults < 1 || maxResults > maximum)) {
+            throw new AwsException("ValidationException",
+                    "MaxResults must be between 1 and " + maximum + ".", 400);
+        }
+        return maxResults == null ? maximum : maxResults;
+    }
+
+    private static AwsException invalidNextToken(String operation) {
+        return new AwsException("InvalidNextTokenException",
+                "Invalid NextToken for " + operation + ".", 400);
+    }
+
+    private String decodeNextToken(String nextToken, String operation) {
+        if (nextToken == null) {
+            return null;
+        }
+        String cursor = pageTokens.cursorOf(nextToken);
+        if (cursor == null) {
+            throw invalidNextToken(operation);
+        }
+        return cursor;
+    }
+
+    private <T> PaginatedResult<T> signedPage(PaginatedResult<T> page) {
+        return new PaginatedResult<>(page.items(),
+                page.nextToken() == null ? null : pageTokens.issue(page.nextToken()));
+    }
+
+    private static String scalableTargetCursor(ScalableTarget target) {
+        return target.getResourceId() + "\u0000" + target.getScalableDimension();
+    }
+
+    private static String scalingPolicyCursor(ScalingPolicy policy) {
+        return policy.getPolicyName() + "\u0000" + policy.getResourceId()
+                + "\u0000" + policy.getScalableDimension();
+    }
+
+    private static String pageNamespace(List<String> filters, String... fields) {
+        StringBuilder namespace = new StringBuilder();
+        for (String field : fields) {
+            namespace.append(field == null ? "-1:" : field.length() + ":" + field);
+        }
+        List<String> normalized = filters == null ? List.of() : filters.stream().distinct().sorted().toList();
+        namespace.append(normalized.size()).append(':');
+        for (String filter : normalized) {
+            namespace.append(filter.length()).append(':').append(filter);
+        }
+        return namespace.toString();
+    }
+
     private static String targetKey(String region, String serviceNamespace, String resourceId,
                                     String scalableDimension) {
         return region + "::" + serviceNamespace + "::" + scalableDimension + "::" + resourceId;
@@ -526,6 +703,23 @@ public class ApplicationAutoScalingService {
     Optional<ScalableTarget> findTarget(String region, String serviceNamespace, String resourceId,
                                         String scalableDimension) {
         return targets.get(targetKey(region, serviceNamespace, resourceId, scalableDimension));
+    }
+
+    @Override
+    public String namespace() {
+        return "application-autoscaling";
+    }
+
+    /**
+     * The ARN of the caller's scalable target in the Region named by its service namespace, resource id and scalable
+     * dimension, in that order, which ends in the id it was registered with, as its handlers look it up.
+     */
+    @Override
+    public Optional<String> find(String type, List<String> names, String region) {
+        if (!"ScalableTarget".equals(type) || names.size() != 3) {
+            return Optional.empty();
+        }
+        return findTarget(region, names.get(0), names.get(1), names.get(2)).map(ScalableTarget::getScalableTargetArn);
     }
 
     /**

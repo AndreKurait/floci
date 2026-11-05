@@ -18,7 +18,9 @@ import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -44,11 +46,14 @@ public class CodeArtifactMavenController {
 
     private final CodeArtifactService service;
     private final ReposiliteSidecarClient reposilite;
+    private final CodeArtifactMavenExternalConnectionImporter externalConnectionImporter;
 
     @Inject
-    public CodeArtifactMavenController(CodeArtifactService service, ReposiliteSidecarClient reposilite) {
+    public CodeArtifactMavenController(CodeArtifactService service, ReposiliteSidecarClient reposilite,
+                                        CodeArtifactMavenExternalConnectionImporter externalConnectionImporter) {
         this.service = service;
         this.reposilite = reposilite;
+        this.externalConnectionImporter = externalConnectionImporter;
     }
 
     @PUT
@@ -65,6 +70,49 @@ public class CodeArtifactMavenController {
         }
         MavenRequestScope scope = requireScope(headers, domain, repository);
         Optional<String[]> coordinate = parseNamespaceAndPackageName(gav);
+        // A package whose origin configuration sets publish:BLOCK refuses every mvn deploy, the
+        // same way PublishPackageVersion refuses it for the generic format. The restriction is
+        // per package, so a bare maven-metadata.xml PUT (no version) is refused too, and it runs
+        // ahead of every check below, Reposilite's own byte-identical republish included.
+        try {
+            for (String[] checked : publishCheckedPackages(gav)) {
+                service.requireContainerBackedPackagePublishAllowed(scope.region(), domain, scope.owner(),
+                        repository, "maven", checked[0], checked[1]);
+            }
+        } catch (AwsException e) {
+            return Response.status(409).entity(e.getMessage()).build();
+        }
+        // Raised by hectorvent's review: a real mvn deploy to a coordinate
+        // updatePackageVersionsStatus/disposePackageVersions left Archived or Disposed must be
+        // refused outright, the same way PublishPackageVersion already refuses it for the generic
+        // format, not accepted and then have forgetContainerBackedStatusOverride below silently
+        // un-block it afterward. Checked before the real write, not after; the version element is
+        // null for a bare maven-metadata.xml PUT (see this coordinate's own javadoc), which never
+        // represents a specific version to block either way. The returned revision (or null) is
+        // held onto below: raised by Greptile's review, a concurrent status change landing between
+        // this check and the clear below must not be erased by it (see
+        // CodeArtifactService#forgetContainerBackedStatusOverrideIfUnchanged's own javadoc).
+        String beforeRevision = null;
+        if (coordinate.filter(c -> c[2] != null).isPresent()) {
+            String[] c = coordinate.get();
+            try {
+                beforeRevision = service.requireContainerBackedVersionNotArchivedOrDisposed(scope.region(), domain,
+                        scope.owner(), repository, "maven", c[0], c[1], c[2]);
+            } catch (AwsException e) {
+                return Response.status(409).entity(e.getMessage()).build();
+            }
+            // AWS's own documented behavior: "CodeArtifact will not permit publishing a package
+            // version that is already present in the external repository." Checked only for a
+            // well-formed, versioned GAV, same scope as the Archived/Disposed guard above; a bare
+            // maven-metadata.xml PUT is never a specific version to check either way.
+            if (externalConnectionImporter.existsInExternalConnection(scope.region(), domain, scope.owner(),
+                    repository, gav)) {
+                return Response.status(409)
+                        .entity("A version of this package is already present in the repository's external "
+                                + "connection and cannot be republished directly.")
+                        .build();
+            }
+        }
         // Snapshotted before the real write, not after: see
         // CodeArtifactService#currentContainerBackedPackageFence's own javadoc for why the order
         // matters.
@@ -74,17 +122,31 @@ public class CodeArtifactMavenController {
         if (outcome.wroteNewContent()) {
             coordinate.ifPresent(c -> service.recordContainerBackedAssetBytes(scope.region(), domain, scope.owner(),
                     repository, "maven", c[0], c[1], content.length, fenceSnapshot.get()));
+            // Found by Qodo review: a real mvn deploy to a coordinate updatePackageVersionsStatus/
+            // disposePackageVersions previously archived or disposed would still have its fresh
+            // content blocked by that stale override, since nothing before this cleared it for a
+            // native publish the way copyPackageVersions now does for its own overwrite path. The
+            // version element is null for a bare maven-metadata.xml PUT (see this coordinate's own
+            // javadoc), which never represents a specific version to clear an override for anyway.
+            // By this point the guard above has already refused an Archived/Disposed coordinate,
+            // so the only override left to clear here is Unlisted (or none), and only if it is
+            // still exactly what the guard above saw.
+            String beforeRevisionFinal = beforeRevision;
+            coordinate.filter(c -> c[2] != null).ifPresent(c -> service.forgetContainerBackedStatusOverrideIfUnchanged(
+                    scope.region(), domain, scope.owner(), repository, "maven", c[0], c[1], c[2],
+                    beforeRevisionFinal));
         }
         return Response.status(outcome.status()).build();
     }
 
     /**
      * Splits a GAV path ({@code <groupId-as-slashes>/<artifactId>/<version>/<filename>}, the real
-     * Maven repository layout) into CodeArtifact's Maven namespace (dot-joined groupId) and
-     * package name (artifactId), the inverse of what {@code ReposiliteSidecarClient}'s own
-     * namespace/packageName-aware methods already build. Only ever used for byte accounting, a
-     * side channel that must never fail a publish that would otherwise succeed, so a path with too
-     * few segments to be a well-formed GAV is reported as unknown rather than thrown.
+     * Maven repository layout) into CodeArtifact's Maven namespace (dot-joined groupId), package
+     * name (artifactId), and version: the inverse of what {@code ReposiliteSidecarClient}'s own
+     * namespace/packageName-aware methods already build. The namespace/packageName pair is used
+     * for byte accounting, a side channel that must never fail a publish that would otherwise
+     * succeed, so a path with too few segments to be a well-formed GAV is reported as unknown
+     * rather than thrown.
      *
      * <p>{@code maven-metadata.xml} (and its {@code .sha1}/{@code .md5}/{@code .sha256} checksum
      * siblings) needs its own rule, not the ordinary one below: every real {@code mvn deploy} also
@@ -94,23 +156,54 @@ public class CodeArtifactMavenController {
      * alone can't tell the two apart; the filename itself can, and already does, via
      * {@link #isMavenMetadataFile}. Once that is known, the artifactId is always the segment
      * directly before it, no version segment in between, so this takes one fewer trailing segment
-     * than the ordinary rule does. A versioned snapshot's own {@code .../<version>/
-     * maven-metadata.xml} is the one real path this still gets slightly wrong, reading the version
-     * string itself as the package name instead of skipping over it; accepted rather than chased
-     * further, since this is a byte count summed at the domain level only (never read back by
-     * package), and this one rare case still adds its real byte count to the right total under a
-     * harmless, if misnamed, bucket nothing else will ever look up by that name.
+     * than the ordinary rule does, and the returned version is {@code null} rather than guessed.
+     * The one exception is a snapshot's own version-level {@code
+     * .../<artifactId>/<version>-SNAPSHOT/maven-metadata.xml}, the only version directory a
+     * real {@code mvn deploy} writes metadata into: the {@code -SNAPSHOT} segment is the version,
+     * not the artifactId, so it resolves exactly like a versioned GAV. Raised by Greptile and
+     * pgermosen's review: the publish:BLOCK check reads this pair back by package, so reading
+     * the version as the package name would let a blocked snapshot's metadata through.
      */
-    private static Optional<String[]> parseNamespaceAndPackageName(String gav) {
+    static Optional<String[]> parseNamespaceAndPackageName(String gav) {
         String[] segments = gav.split("/");
-        int packageNameIndex = isMavenMetadataFile(segments[segments.length - 1])
-                ? segments.length - 2 : segments.length - 3;
+        boolean metadataFile = isMavenMetadataFile(segments[segments.length - 1]);
+        boolean versionLevelMetadata = metadataFile && segments.length >= 4
+                && segments[segments.length - 2].endsWith("-SNAPSHOT");
+        boolean bareMetadata = metadataFile && !versionLevelMetadata;
+        int packageNameIndex = bareMetadata ? segments.length - 2 : segments.length - 3;
         if (packageNameIndex < 1) {
             return Optional.empty();
         }
         String packageName = segments[packageNameIndex];
         String namespace = String.join(".", Arrays.asList(segments).subList(0, packageNameIndex));
-        return Optional.of(new String[] {namespace, packageName});
+        String version = bareMetadata ? null : segments[packageNameIndex + 1];
+        return Optional.of(new String[] {namespace, packageName, version});
+    }
+
+    /**
+     * The (namespace, packageName) pairs the publish:BLOCK check runs against for {@code gav}:
+     * {@link #parseNamespaceAndPackageName}'s own pair, plus, for a {@code maven-metadata.xml}
+     * whose parent segment ends in {@code -SNAPSHOT}, the artifact-level reading as well. The
+     * layout alone cannot tell {@code com/example/widget/1.0-SNAPSHOT/maven-metadata.xml}, a
+     * snapshot's version metadata, from {@code com/example/widget-SNAPSHOT/maven-metadata.xml},
+     * the bare metadata of an artifact named {@code widget-SNAPSHOT}, so a block on either reading
+     * refuses it (Greptile and pgermosen's review).
+     */
+    static List<String[]> publishCheckedPackages(String gav) {
+        Optional<String[]> coordinate = parseNamespaceAndPackageName(gav);
+        if (coordinate.isEmpty()) {
+            return List.of();
+        }
+        List<String[]> packages = new ArrayList<>();
+        packages.add(new String[] {coordinate.get()[0], coordinate.get()[1]});
+        String[] segments = gav.split("/");
+        int artifactIndex = segments.length - 2;
+        if (isMavenMetadataFile(segments[segments.length - 1]) && artifactIndex >= 2
+                && segments[artifactIndex].endsWith("-SNAPSHOT")) {
+            packages.add(new String[] {String.join(".", Arrays.asList(segments).subList(0, artifactIndex)),
+                    segments[artifactIndex]});
+        }
+        return packages;
     }
 
     private static boolean isMavenMetadataFile(String filename) {
@@ -121,19 +214,71 @@ public class CodeArtifactMavenController {
     @Produces(MediaType.WILDCARD)
     public Response fetch(@Context HttpHeaders headers, @PathParam("domain") String domain,
                            @PathParam("repository") String repository, @PathParam("gav") String gav) {
-        String repoId = requireScope(headers, domain, repository).repoId();
-        return reposilite.fetchArtifact(repoId, gav)
-                .map(this::toResponse)
-                .orElseGet(() -> Response.status(Response.Status.NOT_FOUND).build());
+        MavenRequestScope scope = requireScope(headers, domain, repository);
+        if (!isDownloadable(scope, domain, repository, gav)) {
+            return Response.status(Response.Status.NOT_FOUND).build();
+        }
+        Optional<FetchedArtifact> artifact = reposilite.fetchArtifact(scope.repoId(), gav);
+        if ((artifact.isEmpty() || isBareMavenMetadataFile(gav))
+                && externalConnectionImporter.tryImport(scope.region(), domain, scope.owner(), repository,
+                        scope.repoId(), gav)) {
+            artifact = reposilite.fetchArtifact(scope.repoId(), gav);
+        }
+        return artifact.map(this::toResponse).orElseGet(() -> Response.status(Response.Status.NOT_FOUND).build());
     }
 
     @HEAD
     public Response head(@Context HttpHeaders headers, @PathParam("domain") String domain,
                           @PathParam("repository") String repository, @PathParam("gav") String gav) {
-        String repoId = requireScope(headers, domain, repository).repoId();
-        return reposilite.artifactExists(repoId, gav)
-                ? Response.ok().build()
-                : Response.status(Response.Status.NOT_FOUND).build();
+        MavenRequestScope scope = requireScope(headers, domain, repository);
+        if (!isDownloadable(scope, domain, repository, gav)) {
+            return Response.status(Response.Status.NOT_FOUND).build();
+        }
+        // A dependency resolver can probe with HEAD before ever issuing the GET that would
+        // otherwise trigger retention below, so a miss here must attempt the same import a GET
+        // miss would, or a HEAD-first client would see a false "not found" before the real GET
+        // ever gets the chance to retain it.
+        boolean exists = reposilite.artifactExists(scope.repoId(), gav);
+        if ((!exists || isBareMavenMetadataFile(gav))
+                && externalConnectionImporter.tryImport(scope.region(), domain, scope.owner(), repository,
+                        scope.repoId(), gav)) {
+            exists = reposilite.artifactExists(scope.repoId(), gav);
+        }
+        return exists ? Response.ok().build() : Response.status(Response.Status.NOT_FOUND).build();
+    }
+
+    /**
+     * {@code true} only for the exact, bare {@code maven-metadata.xml} path, never a checksum
+     * sibling: unlike a fixed version's own assets, which never change once retained, a package's
+     * available-version list can keep growing on the real public repository after this
+     * repository's own first merge of it, so a request for this exact file always gets a fresh
+     * import attempt even when a local copy already exists, not just on the first ever miss.
+     * Raised by Greptile's review: without this, {@link #fetch}/{@link #head} only ever imported
+     * metadata once, the first time this exact GAV was requested, and every later request for the
+     * same package's version list silently kept serving that same first snapshot forever, no
+     * matter how many releases the public repository published afterward.
+     */
+    private static boolean isBareMavenMetadataFile(String gav) {
+        return gav.endsWith("/maven-metadata.xml");
+    }
+
+    /**
+     * {@code true} unless {@code gav} names an exact version this service knows is {@code
+     * Archived}: {@link #parseNamespaceAndPackageName}'s own version element is {@code null} for a
+     * bare {@code maven-metadata.xml} path (no specific version to block), which this treats the
+     * same as "not a well-formed, versioned GAV at all": both fall through to Reposilite
+     * unchecked, exactly as {@code deploy} above already does for the identical case.
+     */
+    private boolean isDownloadable(MavenRequestScope scope, String domain, String repository, String gav) {
+        return parseNamespaceAndPackageName(gav).filter(c -> c[2] != null).map(c -> {
+            try {
+                service.requireContainerBackedVersionDownloadable(scope.owner(), scope.region(), domain, repository,
+                        "maven", c[0], c[1], c[2], scope.repoId());
+                return true;
+            } catch (AwsException e) {
+                return false;
+            }
+        }).orElse(true);
     }
 
     private Response toResponse(FetchedArtifact artifact) {

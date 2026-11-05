@@ -8,7 +8,9 @@ import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -20,6 +22,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -257,6 +260,10 @@ class RedshiftServerlessIntegrationTest {
     @Test
     void snapshotLifecycleIsVisibleThroughSeparateReads() {
         doAnswer(invocation -> {
+            invocation.getArgument(6, Runnable.class).run();
+            return null;
+        }).when(runtime).restoreSnapshot(any(), any(), any(), any(), any(), any(), any());
+        doAnswer(invocation -> {
             Files.writeString(invocation.getArgument(5, Path.class), "-- dump");
             return null;
         }).when(runtime).takeSnapshot(any(), any(), any(), any(), any(), any());
@@ -330,10 +337,11 @@ class RedshiftServerlessIntegrationTest {
                 .body("snapshots", hasSize(0));
 
         call("RestoreFromSnapshot", "{\"namespaceName\":\"snap-life-ns\",\"workgroupName\":\"snap-life-wg\","
-                + "\"snapshotArn\":\"" + snapshotArn + "\"}")
+                + "\"snapshotArn\":\"" + snapshotArn + "\",\"manageAdminPassword\":true}")
                 .statusCode(200)
                 .body("snapshotName", equalTo("snap-life"))
                 .body("namespace.namespaceName", equalTo("snap-life-ns"))
+                .body("namespace.adminPasswordSecretArn", notNullValue())
                 .body("namespace.status", equalTo("AVAILABLE"))
                 .body("ownerAccount", matchesPattern("\\d{12}"));
         call("RestoreFromSnapshot", "{\"workgroupName\":\"snap-life-wg\",\"snapshotName\":\"snap-life\"}")
@@ -651,7 +659,7 @@ class RedshiftServerlessIntegrationTest {
                 .body("resourcePolicy.policy", equalTo(policyJson));
     }
 
-    private static io.restassured.response.ValidatableResponse callAs(String accountId, String action, String body) {
+    private static ValidatableResponse callAs(String accountId, String action, String body) {
         return given()
                 .header("X-Amz-Target", TARGET_PREFIX + action)
                 .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + accountId
@@ -779,7 +787,44 @@ class RedshiftServerlessIntegrationTest {
         call("DeleteScheduledAction", "{\"scheduledActionName\":\"admin-sched\"}").statusCode(200);
     }
 
-    private static io.restassured.response.ValidatableResponse call(String action, String body) {
+    @Inject
+    RedshiftServerlessScheduledActionService scheduledActions;
+
+    @Test
+    void scheduledActionTakesItsSnapshotOnASweepAndReportsTheNextInvocation() {
+        String namespace = "sweep-ns";
+        call("CreateNamespace", "{\"namespaceName\":\"" + namespace + "\",\"adminUsername\":\"admin\"}")
+                .statusCode(200);
+        cleanup.register(() -> call("DeleteNamespace", "{\"namespaceName\":\"" + namespace + "\"}"));
+        call("CreateScheduledAction", "{\"scheduledActionName\":\"sweep-sched\",\"namespaceName\":\"" + namespace + "\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/r\",\"schedule\":{\"cron\":\"0 * * * ? *\"},"
+                + "\"targetAction\":{\"createSnapshot\":{\"namespaceName\":\"" + namespace + "\","
+                + "\"snapshotNamePrefix\":\"sweep\",\"retentionPeriod\":3,"
+                + "\"tags\":[{\"key\":\"env\",\"value\":\"it\"}]}}}")
+                .statusCode(200)
+                .body("scheduledAction.nextInvocations", hasSize(1));
+        cleanup.register(() -> call("DeleteScheduledAction", "{\"scheduledActionName\":\"sweep-sched\"}"));
+        call("CreateScheduledAction", "{\"scheduledActionName\":\"too-often\",\"namespaceName\":\"" + namespace + "\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/r\",\"schedule\":{\"cron\":\"0,30 * * * ? *\"},"
+                + "\"targetAction\":{\"createSnapshot\":{\"namespaceName\":\"" + namespace + "\","
+                + "\"snapshotNamePrefix\":\"p\"}}}")
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"));
+
+        Instant tick = Instant.now().plusSeconds(3 * 3600);
+        scheduledActions.runScheduledActions(tick);
+        String snapshot = RedshiftServerlessScheduledActionService.snapshotName("sweep",
+                tick.truncatedTo(ChronoUnit.HOURS));
+        cleanup.register(() -> call("DeleteSnapshot", "{\"snapshotName\":\"" + snapshot + "\"}"));
+
+        call("GetSnapshot", "{\"snapshotName\":\"" + snapshot + "\"}")
+                .statusCode(200)
+                .body("snapshot.namespaceName", equalTo(namespace))
+                .body("snapshot.status", equalTo("AVAILABLE"))
+                .body("snapshot.snapshotRetentionPeriod", equalTo(3));
+    }
+
+    private static ValidatableResponse call(String action, String body) {
         return given()
                 .header("X-Amz-Target", TARGET_PREFIX + action)
                 .header("Authorization", AUTH)

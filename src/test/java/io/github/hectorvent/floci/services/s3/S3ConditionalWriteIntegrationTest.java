@@ -12,11 +12,11 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.IntFunction;
 
 import static io.restassured.RestAssured.given;
 import static java.util.Collections.frequency;
 import static java.util.concurrent.TimeUnit.SECONDS;
-import static java.util.stream.Collectors.toList;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
@@ -67,35 +67,18 @@ class S3ConditionalWriteIntegrationTest {
         String bucket = createBucket("put-if-none-concurrent");
         String key = "object.txt";
         int writers = 16;
-        CyclicBarrier barrier = new CyclicBarrier(writers);
-        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
-        try {
-            List<Future<Integer>> futures = java.util.stream.IntStream.range(0, writers)
-                    .mapToObj(writer -> executor.submit(() -> {
-                        barrier.await();
-                        return given()
-                            .header("If-None-Match", "*")
-                            .body("writer-" + writer)
-                        .when()
-                            .put("/" + bucket + "/" + key)
-                        .then()
-                            .extract()
-                            .statusCode();
-                    }))
-                    .collect(toList());
+        List<Integer> statusCodes = raceStatusCodes(writers, writer -> given()
+                .header("If-None-Match", "*")
+                .body("writer-" + writer)
+            .when()
+                .put("/" + bucket + "/" + key)
+            .then()
+                .extract()
+                .statusCode());
 
-            List<Integer> statusCodes = new ArrayList<>();
-            for (Future<Integer> future : futures) {
-                statusCodes.add(future.get(30, SECONDS));
-            }
-
-            assertEquals(1, frequency(statusCodes, 200));
-            assertEquals(writers - 1, frequency(statusCodes, 412));
-        }
-        finally {
-            executor.shutdownNow();
-        }
+        assertEquals(1, frequency(statusCodes, 200));
+        assertEquals(writers - 1, frequency(statusCodes, 412));
     }
 
     @Test
@@ -247,6 +230,34 @@ class S3ConditionalWriteIntegrationTest {
         assertPreconditionFailed(response, "If-None-Match");
 
         assertObjectBody(bucket, "object.txt", "first");
+    }
+
+    @Test
+    void concurrentCompleteMultipartUpload_ifNoneMatchStar_allowsOnlyOneWriter() throws Exception {
+        String bucket = createBucket("mpu-if-none-concurrent");
+        String key = "object.txt";
+        int writers = 16;
+        List<String> uploadIds = new ArrayList<>();
+        List<String> partETags = new ArrayList<>();
+        for (int writer = 0; writer < writers; writer++) {
+            String uploadId = initiateMultipartUpload(bucket, key);
+            uploadIds.add(uploadId);
+            partETags.add(uploadPart(bucket, key, uploadId, 1, "writer-" + writer));
+        }
+
+        List<Integer> statusCodes = raceStatusCodes(writers, writer -> given()
+                .contentType("application/xml")
+                .header("If-None-Match", "*")
+                .body(completeMultipartXml(1, partETags.get(writer)))
+            .when()
+                .post("/" + bucket + "/" + key + "?uploadId=" + uploadIds.get(writer))
+            .then()
+                .extract()
+                .statusCode());
+
+        assertEquals(1, frequency(statusCodes, 200));
+        assertEquals(writers - 1, frequency(statusCodes, 412));
+        assertObjectBody(bucket, key, "writer-" + statusCodes.indexOf(200));
     }
 
     @Test
@@ -537,6 +548,33 @@ class S3ConditionalWriteIntegrationTest {
     private static void assertNotImplemented(ValidatableResponse response) {
         response.statusCode(501)
                 .body("Error.Code", equalTo("NotImplemented"));
+    }
+
+    /**
+     * Releases {@code writers} requests at once behind a barrier and returns each one's status
+     * code, in writer order.
+     */
+    private static List<Integer> raceStatusCodes(int writers, IntFunction<Integer> request) throws Exception {
+        CyclicBarrier barrier = new CyclicBarrier(writers);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            List<Future<Integer>> futures = new ArrayList<>();
+            for (int writer = 0; writer < writers; writer++) {
+                int current = writer;
+                futures.add(executor.submit(() -> {
+                    barrier.await();
+                    return request.apply(current);
+                }));
+            }
+            List<Integer> statusCodes = new ArrayList<>();
+            for (Future<Integer> future : futures) {
+                statusCodes.add(future.get(30, SECONDS));
+            }
+            return statusCodes;
+        }
+        finally {
+            executor.shutdownNow();
+        }
     }
 
     private static void assertPreconditionFailed(ValidatableResponse response, String condition) {

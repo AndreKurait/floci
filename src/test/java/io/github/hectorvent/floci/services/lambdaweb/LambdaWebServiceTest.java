@@ -9,10 +9,16 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.lambdaweb.model.WebFunction;
 import io.github.hectorvent.floci.services.lambdaweb.model.WebFunctionEndpoint;
 import io.github.hectorvent.floci.services.lambdaweb.model.WebFunctionRevision;
@@ -27,9 +33,13 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -40,6 +50,9 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.startsWith;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -53,6 +66,10 @@ class LambdaWebServiceTest {
     private static final byte[] NOT_A_ZIP = "this is not a zip\n".getBytes(StandardCharsets.UTF_8);
 
     private final ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+    private final ServiceCallAuthorizer serviceCalls = mock(ServiceCallAuthorizer.class);
+    private final LambdaMicrovmsService microvms = new LambdaMicrovmsService(new RegionResolver(REGION, ACCOUNT_ID), null);
+    private final IamService iamService = new IamService(new MemoryStorageFactory(),
+            mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), new RegionResolver(REGION, ACCOUNT_ID), Clock.systemUTC());
 
     @TempDir
     Path storageDir;
@@ -70,10 +87,16 @@ class LambdaWebServiceTest {
     }
 
     private LambdaWebService service(StorageFactory storage, String baseUrl, S3Service s3Service) {
+        return service(storage, baseUrl, s3Service, mock(LambdaWebExecutionRole.class));
+    }
+
+    private LambdaWebService service(StorageFactory storage, String baseUrl, S3Service s3Service,
+                                     LambdaWebExecutionRole executionRole) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.effectiveBaseUrl()).thenReturn(baseUrl);
         LambdaWebService service = new LambdaWebService(new RegionResolver(REGION, ACCOUNT_ID), storage, config,
-                s3Service, new LambdaWebCode(storageDir.resolve("code")), mapper, null);
+                s3Service, new LambdaWebCode(storageDir.resolve("code")), mapper, null, executionRole, serviceCalls,
+                microvms, new LambdaWebPolicyPrincipals(iamService));
         service.initializeStorage();
         return service;
     }
@@ -85,6 +108,24 @@ class LambdaWebServiceTest {
         build.putObject("runtimeConfig").put("runtime", "nodejs24.x");
         config.putObject("serviceConfig").put("executionRoleArn", ROLE).put("timeoutSeconds", timeoutSeconds);
         return config;
+    }
+
+    private ObjectNode revisionConfig(String executionRoleArn) {
+        ObjectNode config = revisionConfig(30);
+        ((ObjectNode) config.get("serviceConfig")).put("executionRoleArn", executionRoleArn);
+        return config;
+    }
+
+    private ObjectNode revisionConfig(String executionRoleArn, String connectorArn) {
+        ObjectNode config = revisionConfig(executionRoleArn);
+        ((ObjectNode) config.get("serviceConfig")).put("egressNetworkConnectorArn", connectorArn);
+        return config;
+    }
+
+    private LambdaMicrovmsService.NetworkConnector connector(String name, String computeResourceType) {
+        return microvms.createConnector(REGION, ACCOUNT_ID, name, List.of("subnet-00000000000000001"),
+                List.of("sg-00000000000000001"), "arn:aws:iam::000000000000:role/operator", "token",
+                List.of(computeResourceType), "IPv4");
     }
 
     private ObjectNode endpointConfig(String name) {
@@ -277,6 +318,186 @@ class LambdaWebServiceTest {
     }
 
     @Test
+    void executionRoleIsCheckedInTheOrderAwsChecksIt() {
+        String missingRole = "arn:aws:iam::000000000000:role/missing";
+        LambdaWebExecutionRole executionRole = mock(LambdaWebExecutionRole.class);
+        doThrow(new AwsException("ValidationException", "cannot be assumed", 400))
+                .when(executionRole).requireAssumable(REGION, missingRole);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", null, executionRole);
+        service.createFunction(REGION, createRequest("app"));
+
+        ObjectNode otherAccount = revisionConfig("arn:aws:iam::111122223333:role/web");
+        ((ObjectNode) otherAccount.get("serviceConfig")).putObject("environmentVariables").put("AWS_REGION", "x");
+        assertEquals("Invalid function name or ARN 'bad.name'",
+                message(() -> service.createRevision(REGION, "bad.name", otherAccount)));
+        AwsException denied = error(() -> service.createRevision(REGION, "missing", otherAccount));
+        assertEquals("AccessDeniedException", denied.getErrorCode());
+        assertEquals(403, denied.getHttpStatus());
+        assertEquals("Cross-account pass role is not allowed.", denied.getMessage());
+
+        ObjectNode reserved = revisionConfig(missingRole);
+        ((ObjectNode) reserved.get("serviceConfig")).putObject("environmentVariables").put("AWS_REGION", "x");
+        assertEquals("The environmentVariables cannot contain reserved keys. The request specified the reserved keys"
+                + " [AWS_REGION].", message(() -> service.createRevision(REGION, "app", reserved)));
+
+        ObjectNode runtime = revisionConfig(missingRole);
+        ((ObjectNode) runtime.path("buildConfig").path("runtimeConfig")).put("runtime", "nodejs22.x");
+        assertEquals("cannot be assumed", message(() -> service.createRevision(REGION, "missing", runtime)));
+        assertEquals("cannot be assumed", message(() -> service.createRevision(REGION, "app", runtime)));
+
+        ObjectNode existing = createRequest("app");
+        existing.set("revisionConfig", revisionConfig(missingRole));
+        assertEquals("cannot be assumed", message(() -> service.createFunction(REGION, existing)));
+        ObjectNode multiRegion = createRequest("other");
+        multiRegion.set("revisionConfig", revisionConfig(missingRole));
+        ((ObjectNode) multiRegion.get("endpointConfig")).put("endpointType", "MultiRegion");
+        assertEquals("cannot be assumed", message(() -> service.createFunction(REGION, multiRegion)));
+    }
+
+    @Test
+    void egressConnectorArnIsCheckedInTheOrderAwsChecksIt() {
+        String missingRole = "arn:aws:iam::000000000000:role/missing";
+        LambdaWebExecutionRole executionRole = mock(LambdaWebExecutionRole.class);
+        doThrow(new AwsException("ValidationException", "cannot be assumed", 400))
+                .when(executionRole).requireAssumable(REGION, missingRole);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", null, executionRole);
+        String connector = ":000000000000:network-connector:nc-1:";
+
+        String unversioned = "arn:aws:lambda:us-east-1:000000000000:network-connector:nc-1";
+        assertEquals("1 validation error detected: Value '" + unversioned + "' at 'serviceConfig.egressNetworkConnectorArn'"
+                + " failed to satisfy constraint: Member must satisfy regular expression pattern:"
+                + " arn:(aws[a-z-]*):lambda:[a-z0-9-]+:[0-9]{12}:network-connector:[a-zA-Z0-9_-]+:[0-9]+",
+                message(() -> service.createRevision(REGION, "missing", revisionConfig(missingRole, unversioned))));
+        Map<String, String> invalid = new LinkedHashMap<>();
+        invalid.put("arn:aws:lambda:moon-1" + connector + "0", "Invalid region.: moon-1");
+        invalid.put("arn:aws:lambda:us-east-1a" + connector + "1", "Invalid region.: us-east-1a");
+        invalid.put("arn:aws-cn:lambda:us-east-1" + connector + "0", "Invalid arn partition.: aws-cn");
+        invalid.put("arn:aws:lambda:cn-north-1" + connector + "1", "Invalid arn partition.: aws");
+        invalid.put("arn:awsx:lambda:us-east-1" + connector + "1", "Invalid arn partition.: awsx");
+        invalid.put("arn:aws:lambda:us-east-1" + connector + "0",
+                "Invalid network connector version format - must be numeric: 0");
+        invalid.put("arn:aws:lambda:us-east-1" + connector + "01",
+                "Invalid network connector version format - must be numeric: 01");
+        invalid.put("arn:aws:lambda:moon-1:111111111111:network-connector:nc-1:1", "Invalid region.: moon-1");
+        invalid.put("arn:aws:lambda:us-east-1:111111111111:network-connector:nc-1:0",
+                "Invalid network connector version format - must be numeric: 0");
+        invalid.forEach((arn, reason) -> {
+            AwsException e = error(() -> service.createRevision(REGION, "missing", revisionConfig(missingRole, arn)));
+            assertEquals(400, e.getHttpStatus());
+            assertEquals("The egress network connector ARN: '" + arn + "' is not valid. " + reason, e.getMessage());
+        });
+
+        String otherAccount = "arn:aws:lambda:us-east-1:111111111111:network-connector:nc-1:1";
+        assertEquals("Cross-account pass role is not allowed.", message(() -> service.createRevision(REGION, "missing",
+                revisionConfig("arn:aws:iam::111122223333:role/web", "arn:aws:lambda:us-east-1" + connector + "0"))));
+        ObjectNode reserved = revisionConfig(missingRole, otherAccount);
+        ((ObjectNode) reserved.get("serviceConfig")).putObject("environmentVariables").put("AWS_REGION", "x");
+        AwsException denied = error(() -> service.createRevision(REGION, "missing", reserved));
+        assertEquals("AccessDeniedException", denied.getErrorCode());
+        assertEquals(403, denied.getHttpStatus());
+        assertEquals("Cross-account pass lambda-network-connector is not allowed.", denied.getMessage());
+
+        String pastLong = "arn:aws:lambda:us-east-1" + connector + "9223372036854775808";
+        assertEquals("cannot be assumed",
+                message(() -> service.createRevision(REGION, "missing", revisionConfig(missingRole, pastLong))));
+        assertEquals("ResourceNotFoundException",
+                error(() -> service.createRevision(REGION, "missing", revisionConfig(ROLE, pastLong))).getErrorCode());
+    }
+
+    @Test
+    void aRevisionNamesAWebFunctionConnectorVersionByItsId() {
+        LambdaWebService service = service();
+        service.createFunction(REGION, createRequest("app"));
+        LambdaMicrovmsService.NetworkConnector web = connector("web", "WebFunction");
+        LambdaMicrovmsService.NetworkConnector vm = connector("vm", "MicroVm");
+
+        WebFunctionRevision first = service.createRevision(REGION, "app", revisionConfig(ROLE, web.arn + ":1"));
+        assertEquals(web.arn + ":1", first.serviceConfig.egressNetworkConnectorArn);
+        assertEquals("The egress network connector " + web.arn + ":2 does not exist.",
+                message(() -> service.createRevision(REGION, "app", revisionConfig(ROLE, web.arn + ":2"))));
+        microvms.updateConnector(REGION, web.id, List.of("subnet-00000000000000002"), null, null, null, null);
+        service.createRevision(REGION, "app", revisionConfig(ROLE, web.arn + ":2"));
+        microvms.deleteConnector(REGION, web.arn + ":1");
+        for (String gone : List.of(web.arn + ":1", web.arn.replace(web.id, "web") + ":2",
+                web.arn.replace(REGION, "us-west-2") + ":2", web.arn + ":9223372036854775807")) {
+            AwsException e = error(() -> service.createRevision(REGION, "app", revisionConfig(ROLE, gone)));
+            assertEquals(404, e.getHttpStatus());
+            assertEquals("The egress network connector " + gone + " does not exist.", e.getMessage());
+        }
+        assertEquals("The egress network connector " + vm.arn + ":1 cannot be used because its"
+                + " associatedComputeResourceTypes do not include WebFunction.",
+                message(() -> service.createRevision(REGION, "app", revisionConfig(ROLE, vm.arn + ":1"))));
+        AwsException internal = error(() -> service.createRevision(REGION, "app",
+                revisionConfig(ROLE, web.arn + ":9223372036854775808")));
+        assertEquals(500, internal.getHttpStatus());
+        assertEquals("InternalServerException", internal.getErrorCode());
+    }
+
+    @Test
+    void onlyHomeRegionEndpointsServeARevisionWithAConnector() {
+        LambdaWebService service = service();
+        String connectorArn = connector("web", "WebFunction").arn + ":1";
+        ObjectNode perRegion = createRequest("app");
+        perRegion.set("revisionConfig", revisionConfig(ROLE, connectorArn));
+        perRegion.set("endpointConfig", mapper.createObjectNode().put("endpointName", "dev")
+                .put("endpointType", "PerRegion").put("authType", "ApplicationManaged"));
+        ((ObjectNode) perRegion.get("endpointConfig")).putArray("regions").add("us-west-2");
+        String refused = "The endpointType PerRegion cannot be used with a revision that has an"
+                + " egressNetworkConnectorArn specified. Only the endpointType HomeRegion supports such revisions.";
+        assertEquals(refused, message(() -> service.createFunction(REGION, perRegion)));
+        ((ObjectNode) perRegion.get("endpointConfig")).put("endpointType", "MultiRegion");
+        assertEquals(refused.replace("PerRegion", "MultiRegion"), message(() -> service.createFunction(REGION, perRegion)));
+
+        service.createFunction(REGION, createRequest("app"));
+        ((ObjectNode) perRegion.get("endpointConfig")).put("endpointType", "PerRegion");
+        assertEquals(refused, message(() -> service.createFunction(REGION, perRegion)));
+        ObjectNode missingConnector = createRequest("app");
+        missingConnector.set("revisionConfig", revisionConfig(ROLE, connectorArn.substring(0, connectorArn.length() - 1) + "2"));
+        assertEquals("ConflictException", error(() -> service.createFunction(REGION, missingConnector)).getErrorCode());
+
+        String plain = service.getEndpoint(REGION, "app", "dev").revisionWeights.get(0).revisionId;
+        String connected = service.createRevision(REGION, "app", revisionConfig(ROLE, connectorArn)).revisionId;
+        String notServed = "The revision " + connected + " has an egressNetworkConnectorArn configured and cannot be used"
+                + " by a PerRegion endpoint. Only HomeRegion endpoints support revisions with an"
+                + " egressNetworkConnectorArn configured.";
+        assertEquals(notServed, message(() -> service.createEndpoint(REGION, "app",
+                weighted("pr", "PerRegion", plain, connected))));
+        assertEquals("The revision rev-zzzzz does not exist.", message(() -> service.createEndpoint(REGION, "app",
+                weighted("pr", "PerRegion", connected, "rev-zzzzz"))));
+        service.createEndpoint(REGION, "app", weighted("pr", "PerRegion", plain));
+        service.createEndpoint(REGION, "app", weighted("mr", "MultiRegion", plain));
+        service.createEndpoint(REGION, "app", weighted("home", "HomeRegion", connected));
+
+        ObjectNode update = mapper.createObjectNode();
+        update.putArray("revisionWeights").addObject().put("revisionId", connected).put("weight", 100);
+        assertEquals(notServed, message(() -> service.updateEndpoint(REGION, "app", "pr", update)));
+        assertEquals(notServed.replace("PerRegion", "MultiRegion"),
+                message(() -> service.updateEndpoint(REGION, "app", "mr", update)));
+        assertEquals(plain, service.getEndpoint(REGION, "app", "pr").revisionWeights.get(0).revisionId);
+
+        for (int i = 5; i <= 10; i++) {
+            service.createEndpoint(REGION, "app", weighted("ep" + i, "HomeRegion", plain));
+        }
+        assertEquals(notServed, message(() -> service.createEndpoint(REGION, "app",
+                weighted("pr2", "PerRegion", connected))), "before the quota");
+        assertEquals("ServiceQuotaExceededException", error(() -> service.createEndpoint(REGION, "app",
+                weighted("home2", "HomeRegion", connected))).getErrorCode());
+    }
+
+    private ObjectNode weighted(String name, String endpointType, String... revisionIds) {
+        ObjectNode request = mapper.createObjectNode().put("endpointName", name).put("endpointType", endpointType)
+                .put("authType", "ApplicationManaged");
+        if (!"HomeRegion".equals(endpointType)) {
+            request.putArray("regions").add("us-west-2");
+        }
+        ArrayNode weights = request.putArray("revisionWeights");
+        for (String revisionId : revisionIds) {
+            weights.addObject().put("revisionId", revisionId).put("weight", 100 / revisionIds.length);
+        }
+        return request;
+    }
+
+    @Test
     void aRejectedEndpointUpdateChangesNothing() {
         LambdaWebService service = service();
         service.createFunction(REGION, createRequest("app"));
@@ -451,6 +672,12 @@ class LambdaWebServiceTest {
         assertEquals("ServiceQuotaExceededException", quota.getErrorCode());
         assertEquals(402, quota.getHttpStatus());
         assertEquals("The function " + ARN + " has reached the maxEndpointsPerFunction quota of 10.", quota.getMessage());
+        assertEquals("The endpoint dev already exists.", message(() -> service.createEndpoint(REGION, "app",
+                endpointConfig("dev"))));
+        ObjectNode missing = endpointConfig("ep11").put("autoDeploymentMode", "Disabled");
+        missing.putArray("revisionWeights").addObject().put("revisionId", "rev-aaaaa").put("weight", 100);
+        assertEquals("The revision rev-aaaaa does not exist.", message(() -> service.createEndpoint(REGION, "app",
+                missing)));
 
         String revisionId = service.listRevisions(REGION, "app", mapper.createObjectNode()).items().get(0).revisionId;
         assertEquals("The revision " + revisionId + " cannot be deleted because the endpoints [dev, ep10, ep2, ep3, ep4,"
@@ -504,12 +731,14 @@ class LambdaWebServiceTest {
         assertEquals("The provided input'foo/bar'was invalid. Member must satisfy expression: [\\w+=,.@\\:-]*"
                 + " Please check your input and try again.", message(() -> service.putResourcePolicy(REGION, missing,
                 policy(members.formatted("{\"AWS\":\"foo/bar\"}", invoke, "\"" + resource + "\"")))));
+        iamService.createUser("alice", "/path/");
         assertEquals("ResourceNotFoundException", error(() -> service.putResourcePolicy(REGION, missing,
                 policy(members.formatted("{\"AWS\":\"arn:aws:iam::000000000000:user/path/alice\"}", invoke,
                         "\"" + resource + "\"")))).getErrorCode());
-        assertEquals("ValidationException", error(() -> service.putResourcePolicy(REGION, missing,
-                policy(members.formatted("{\"CanonicalUser\":\"arn:aws:iam::000000000000:foo/bar\"}", invoke,
-                        "\"" + resource + "\"")))).getErrorCode(), "only an AWS principal may carry a path");
+        assertEquals("The provided principal was invalid. Please check the principal and try again.",
+                message(() -> service.putResourcePolicy(REGION, missing,
+                        policy(members.formatted("{\"CanonicalUser\":\"arn:aws:iam::000000000000:foo/bar\"}", invoke,
+                                "\"" + resource + "\"")))), "a canonical user is never found, whatever its pattern");
         assertEquals("Lambda blocked the creation of this policy because it would grant public access to your function.",
                 message(() -> service.putResourcePolicy(REGION, missing, policy("{\"Statement\":[{\"Effect\":\"Allow\","
                         + "\"Principal\":{\"AWS\":[\"arn:aws:iam::000000000000:root\",\"*\"]},"
@@ -545,6 +774,226 @@ class LambdaWebServiceTest {
             assertEquals("ResourceNotFoundException",
                     error(() -> service.putResourcePolicy(REGION, missing, policy(accepted))).getErrorCode(), accepted);
         }
+    }
+
+    @Test
+    void theRolesAndUsersAPolicyNamesHaveToExist() {
+        LambdaWebService service = service();
+        String missing = "arn:aws:lambda:us-east-1:000000000000:web-function/missing";
+        String invalid = "The provided principal was invalid. Please check the principal and try again.";
+        String otherArn = "The principal arn provided does not match the actual principal arn."
+                + " Please check your input and try again.";
+        IamRole role = iamService.createRole("reader", "/team/", "{\"Version\":\"2012-10-17\",\"Statement\":["
+                + "{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},"
+                + "\"Action\":\"sts:AssumeRole\"}]}", null, 3600, null);
+        IamUser user = iamService.createUser("writer", "/team/");
+
+        for (String exists : List.of("arn:aws:iam::000000000000:role/team/reader",
+                "arn:aws:iam::000000000000:user/team/writer", role.getRoleId(), user.getUserId(), "111122223333",
+                "arn:aws:iam::111122223333:root", "arn:aws:sts::000000000000:federated-user/bob")) {
+            assertEquals("ResourceNotFoundException", error(() -> service.putResourcePolicy(REGION, missing,
+                    policy(principalPolicy("Allow", "{\"AWS\":\"" + exists + "\"}", missing)))).getErrorCode(), exists);
+        }
+        for (String other : List.of("arn:aws:iam::000000000000:role/reader", "arn:aws:iam::000000000000:role/x/reader",
+                "arn:aws:iam::000000000000:user/writer")) {
+            assertEquals(otherArn, message(() -> service.putResourcePolicy(REGION, missing,
+                    policy(principalPolicy("Allow", "{\"AWS\":\"" + other + "\"}", missing)))), other);
+        }
+        for (String absent : List.of("{\"AWS\":\"arn:aws:iam::000000000000:role/gone\"}",
+                "{\"AWS\":\"arn:aws:iam::111122223333:role/reader\"}", "{\"AWS\":\"AROAGONE\"}",
+                "{\"AWS\":\"arn:aws-cn:iam::000000000000:root\"}",
+                "{\"AWS\":\"arn:aws:sts::000000000000:assumed-role/reader/s\"}",
+                "{\"AWS\":[\"arn:aws:iam::000000000000:role/team/reader\",\"arn:aws:iam::000000000000:role/gone\"]}",
+                "{\"CanonicalUser\":\"79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be\"}")) {
+            assertEquals(invalid, message(() -> service.putResourcePolicy(REGION, missing,
+                    policy(principalPolicy("Allow", absent, missing)))), absent);
+        }
+        String gone = principalPolicy("Deny", "{\"AWS\":\"arn:aws:iam::000000000000:role/gone\"}", missing);
+        assertEquals(invalid, message(() -> service.putResourcePolicy(REGION, missing, policy(gone))));
+    }
+
+    @Test
+    void everyStatementPassesItsOwnChecksBeforeAnyPrincipalIsLookedUp() {
+        LambdaWebService service = service();
+        String missing = "arn:aws:lambda:us-east-1:000000000000:web-function/missing";
+        String gone = statement("Allow", "{\"AWS\":\"arn:aws:iam::000000000000:role/gone\"}", missing);
+        String badAction = "{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"000000000000\"},"
+                + "\"Action\":\"s3:GetObject\",\"Resource\":\"" + missing + "\"}";
+        String badPattern = statement("Allow", "{\"AWS\":\"bad!value\"}", missing);
+        String open = statement("Allow", "\"*\"", missing);
+
+        assertEquals("Policy has syntax errors.", message(() -> service.putResourcePolicy(REGION, missing,
+                policy("{\"Statement\":[" + gone + "," + badAction + "]}"))));
+        assertEquals("The provided input'bad!value'was invalid. Member must satisfy expression: [\\w+=,.@\\:-]*"
+                + " Please check your input and try again.", message(() -> service.putResourcePolicy(REGION, missing,
+                policy("{\"Statement\":[" + gone + "," + badPattern + "]}"))));
+        assertEquals("The provided principal was invalid. Please check the principal and try again.",
+                message(() -> service.putResourcePolicy(REGION, missing,
+                        policy("{\"Statement\":[" + open + "," + gone + "]}"))));
+    }
+
+    @Test
+    void aFederatedPrincipalIsPublicUnlessAConditionPinsTheCaller() {
+        LambdaWebService service = service();
+        String missing = "arn:aws:lambda:us-east-1:000000000000:web-function/missing";
+        String cognito = "{\"Federated\":\"cognito-identity.amazonaws.com\"}";
+        for (String federated : List.of(cognito, "{\"Federated\":\"bad!value\"}", "{\"Federated\":\"\"}",
+                "{\"Federated\":\"arn:aws:iam::000000000000:saml-provider/gone\"}",
+                "{\"Federated\":[\"cognito-identity.amazonaws.com\",\"accounts.google.com\"]}",
+                "{\"AWS\":\"000000000000\",\"Federated\":\"cognito-identity.amazonaws.com\"}")) {
+            assertEquals("Lambda blocked the creation of this policy because it would grant public access to your"
+                    + " function.", message(() -> service.putResourcePolicy(REGION, missing,
+                    policy(principalPolicy("Allow", federated, missing)))), federated);
+        }
+        for (String accepted : List.of(principalPolicy("Deny", cognito, missing),
+                principalPolicy("Deny", "{\"Federated\":\"a/b\"}", missing),
+                principalPolicy("Deny", "{\"Federated\":\"arn:aws:iam::000000000000:saml-provider/gone\"}", missing),
+                principalPolicy("Allow", "{\"Federated\":[\"*\",\"cognito-identity.amazonaws.com\"]}", missing),
+                federatedPolicy(missing, "{\"StringEquals\":{\"aws:PrincipalAccount\":\"000000000000\"}}"),
+                federatedPolicy(missing, "{\"Bool\":{\"aws:PrincipalIsAWSService\":\"true\"}}"))) {
+            assertEquals("ResourceNotFoundException",
+                    error(() -> service.putResourcePolicy(REGION, missing, policy(accepted))).getErrorCode(), accepted);
+        }
+        assertEquals("Lambda blocked the creation of this policy because it would grant public access to your function.",
+                message(() -> service.putResourcePolicy(REGION, missing, policy(federatedPolicy(missing,
+                        "{\"StringNotEquals\":{\"aws:PrincipalAccount\":\"000000000000\"}}")))));
+    }
+
+    private static String federatedPolicy(String functionArn, String condition) {
+        return "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\"cognito-identity.amazonaws.com\"},"
+                + "\"Action\":\"lambda:InvokeWebFunctionEndpoint\",\"Resource\":\"" + functionArn + "/endpoint/*\","
+                + "\"Condition\":" + condition + "}]}";
+    }
+
+    @Test
+    void eachStatementCheckRunsOnEveryStatementBeforeTheNextOne() {
+        LambdaWebService service = service();
+        String missing = "arn:aws:lambda:us-east-1:000000000000:web-function/missing";
+        String account = "{\"AWS\":\"000000000000\"}";
+        String grant = "\"Action\":\"lambda:InvokeWebFunctionEndpoint\",\"Resource\":\"" + missing + "/endpoint/*\"";
+        String maybe = "{\"Effect\":\"Maybe\",\"Principal\":" + account + "," + grant + "}";
+        String spaced = "{\"Effect\":\" Allow\",\"Principal\":" + account + "," + grant + "}";
+        String unknownKey = "{\"Effect\":\"Allow\",\"Principal\":" + account + "," + grant + ",\"Foo\":1}";
+        String noEffect = "{\"Principal\":" + account + "," + grant + "}";
+        String notPrincipal = "{\"Effect\":\"Allow\",\"Principal\":" + account + ",\"NotPrincipal\":" + account + ","
+                + grant + "}";
+        String badAction = "{\"Effect\":\"Allow\",\"Principal\":" + account + ",\"Action\":\"s3:GetObject\","
+                + "\"Resource\":\"" + missing + "\"}";
+        String textPrincipal = statement("Allow", "\"foo\"", missing);
+        String nullPrincipal = statement("Allow", "null", missing);
+        String badPattern = statement("Allow", "{\"AWS\":\"bad!value\"}", missing);
+        String emptyPrincipal = statement("Allow", "{\"AWS\":[]}", missing);
+        String gone = statement("Allow", "{\"AWS\":\"arn:aws:iam::000000000000:role/gone\"}", missing);
+        String open = statement("Allow", "\"*\"", missing);
+        String syntax = "Policy has syntax errors.";
+        String position = "Syntax error at position (-1,-1)";
+        String noEffectMessage = "Effect must be explicitly available for a statement";
+        String invalid = "The provided principal was invalid. Please check the principal and try again.";
+        String pattern = "The provided input'bad!value'was invalid. Member must satisfy expression: [\\w+=,.@\\:-]*"
+                + " Please check your input and try again.";
+
+        for (List<String> pair : List.of(
+                List.of(maybe, spaced, syntax),
+                List.of(badPattern, nullPrincipal, syntax),
+                List.of(badPattern, maybe, "Invalid effect: Maybe"),
+                List.of(textPrincipal, badPattern, position),
+                List.of(noEffect, unknownKey, position),
+                List.of(noEffect, badPattern, noEffectMessage),
+                List.of(noEffect, badAction, noEffectMessage),
+                List.of(badAction, badPattern, pattern),
+                List.of(emptyPrincipal, badPattern, pattern),
+                List.of(emptyPrincipal, badAction, invalid),
+                List.of(notPrincipal, emptyPrincipal, invalid),
+                List.of("\"x\"", open, syntax))) {
+            for (String statements : List.of(pair.get(0) + "," + pair.get(1), pair.get(1) + "," + pair.get(0))) {
+                assertEquals(pair.get(2), message(() -> service.putResourcePolicy(REGION, missing,
+                        policy("{\"Statement\":[" + statements + "]}"))), statements);
+            }
+        }
+        for (List<String> ordered : List.of(
+                List.of("[" + unknownKey + "," + maybe + "]", position),
+                List.of("[" + maybe + "," + unknownKey + "]", "Invalid effect: Maybe"),
+                List.of("[" + textPrincipal + "," + maybe + "]", position),
+                List.of("[" + maybe + "," + textPrincipal + "]", "Invalid effect: Maybe"),
+                List.of("[{\"Foo\":1,\"Effect\":\"Maybe\",\"Principal\":" + account + "," + grant + "}]",
+                        "Invalid effect: Maybe"),
+                List.of("[\"x\"," + gone + "]", invalid),
+                List.of("[\"x\"," + badPattern + "]", pattern),
+                List.of("[" + statement("", account, missing) + "]", "Invalid effect: "),
+                List.of("[" + statement("Allow", "1", missing) + "]", position),
+                List.of("[" + statement("Allow", "{\"Foo\":\"x\"}", missing) + "]", position),
+                List.of("[{\"Effect\":1,\"Principal\":" + account + "," + grant + "}]", position),
+                List.of("[{\"Effect\":\"Allow\",\"NotPrincipal\":{\"AWS\":\"bad!value\"}," + grant + "}]", pattern))) {
+            assertEquals(ordered.get(1), message(() -> service.putResourcePolicy(REGION, missing,
+                    policy("{\"Statement\":" + ordered.get(0) + "}"))), ordered.get(0));
+        }
+    }
+
+    @Test
+    void aPolicyResourceIsReadByItsServiceAndResourceOnly() {
+        LambdaWebService service = service();
+        String missing = "arn:aws:lambda:us-east-1:000000000000:web-function/missing";
+        String function = "web-function/missing";
+        for (String accepted : List.of("arn:aws-cn:lambda:us-east-1:000000000000:" + function,
+                "arn::lambda:us-east-1:000000000000:" + function, "xyz:aws:lambda:us-east-1:000000000000:" + function,
+                "ARN:aws:lambda:us-east-1:000000000000:" + function, "arn:aws:lambda:*:*:" + function,
+                "arn:aws:lambda:foo:000000000000:" + function, "arn:aws:lambda:us-west-2:111122223333:" + function,
+                "arn:aws:lambda:us-east-1::" + function, missing + "*", missing + "/", missing + "/endpoint/x:y",
+                missing + "//x")) {
+            assertEquals("ResourceNotFoundException", error(() -> service.putResourcePolicy(REGION, missing,
+                    policy(resourcePolicy("\"" + accepted + "\"")))).getErrorCode(), accepted);
+        }
+        for (String refused : List.of("arn:aws:lambda*:us-east-1:000000000000:" + function,
+                "arn:aws:LAMBDA:us-east-1:000000000000:" + function, "arn:aws:lambda:us-east-1:" + function,
+                "arn:aws:lambda:us-east-1:000000000000:Web-Function/missing", missing + ":1", missing + "**",
+                missing + "x", missing + "x*", missing + "*/endpoint/x", missing + "?",
+                "arn:aws:lambda:us-east-1:000000000000:web-function/miss*", "arn:aws:lambda:us-east-1:000000000000:*",
+                "*")) {
+            assertEquals("Policy has syntax errors.", message(() -> service.putResourcePolicy(REGION, missing,
+                    policy(resourcePolicy("\"" + refused + "\"")))), refused);
+        }
+        String other = "arn:aws:lambda:us-east-1:000000000000:web-function/other";
+        assertEquals("Policy has syntax errors.", message(() -> service.putResourcePolicy(REGION, missing,
+                policy(resourcePolicy("[\"" + missing + "\",\"" + other + "\"]")))));
+    }
+
+    private static String resourcePolicy(String resource) {
+        return grantPolicy("\"lambda:GetWebFunction\"", resource);
+    }
+
+    private static String grantPolicy(String action, String resource) {
+        return "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"000000000000\"},"
+                + "\"Action\":" + action + ",\"Resource\":" + resource + "}]}";
+    }
+
+    @Test
+    void aPolicyActionIsAStarOrALambdaActionInAnyCase() {
+        LambdaWebService service = service();
+        String missing = "arn:aws:lambda:us-east-1:000000000000:web-function/missing";
+        for (String accepted : List.of("\"*\"", "\"Lambda:GetWebFunction\"", "\"LAMBDA:GetWebFunction\"", "\"lambda:\"",
+                "\"lambda:*x\"", "\"lambda:Get?ebFunction\"", "\"lambda:a b!c\"", "[\"*\",\"s3:GetObject\"]",
+                "[\"s3:GetObject\",\"*\"]", "[\"*\",\"*\"]", "[\"*\",\"a.b:x\"]", "[\"*\",\"9:x\"]", "[\"*\",\"s3:\"]",
+                "[\"lambda:GetWebFunction\",\"Lambda:x\"]")) {
+            assertEquals("ResourceNotFoundException", error(() -> service.putResourcePolicy(REGION, missing,
+                    policy(grantPolicy(accepted, "\"" + missing + "\"")))).getErrorCode(), accepted);
+        }
+        for (String refused : List.of("\"lambda*\"", "\"*:*\"", "\"*:GetWebFunction\"", "\" lambda:GetWebFunction\"",
+                "\"lambda :GetWebFunction\"", "\"lambda\"", "\"**\"", "\"*x\"", "\"?\"", "\"lambda::x\"", "\"\"",
+                "\"s3:GetObject\"", "[\"lambda:GetWebFunction\",\"s3:GetObject\"]", "[\"lambda:*\",\"s3:GetObject\"]",
+                "[\"*\",\"garbage\"]", "[\"*\",\"\"]", "[\"*\",\"lambda::x\"]", "[\"*\",\"a_b:x\"]", "[\"*\",\"a+b:x\"]",
+                "[\"*\",\"l*:x\"]")) {
+            assertEquals("Policy has syntax errors.", message(() -> service.putResourcePolicy(REGION, missing,
+                    policy(grantPolicy(refused, "\"" + missing + "\"")))), refused);
+        }
+    }
+
+    private static String principalPolicy(String effect, String principal, String functionArn) {
+        return "{\"Statement\":[" + statement(effect, principal, functionArn) + "]}";
+    }
+
+    private static String statement(String effect, String principal, String functionArn) {
+        return "{\"Effect\":\"" + effect + "\",\"Principal\":" + principal
+                + ",\"Action\":\"lambda:InvokeWebFunctionEndpoint\",\"Resource\":\"" + functionArn + "/endpoint/*\"}";
     }
 
     private ObjectNode policy(String document) {
@@ -601,6 +1050,28 @@ class LambdaWebServiceTest {
         assertTrue(service.endpointDomain("nope.001.lambda-web.us-east-1.floci.example").isEmpty());
         service.deleteEndpoint(REGION, "app", "dev");
         assertTrue(service.endpointDomain(host).isEmpty(), "a deleted endpoint's domain is gone");
+    }
+
+    @Test
+    void theGlobalDomainIsServedInTheDefaultRegionWhenTheEndpointHasIt() {
+        LambdaWebService service = service();
+        service.createFunction("us-west-2", createRequest("app"));
+        String revisionId = service.getEndpoint("us-west-2", "app", "dev").revisionWeights.get(0).revisionId;
+        String near = service.createEndpoint("us-west-2", "app", multiRegion("near", revisionId, REGION)).domainName;
+        String far = service.createEndpoint("us-west-2", "app", multiRegion("far", revisionId, "eu-west-1")).domainName;
+
+        LambdaWebService.WebFunctionTarget target = service.locate(near).orElseThrow();
+        assertEquals("us-west-2", target.region());
+        assertEquals(REGION, target.servingRegion());
+        assertEquals("us-west-2", service.locate(far).orElseThrow().servingRegion());
+    }
+
+    private ObjectNode multiRegion(String name, String revisionId, String region) {
+        ObjectNode request = mapper.createObjectNode().put("endpointName", name).put("endpointType", "MultiRegion")
+                .put("authType", "ApplicationManaged");
+        request.putArray("regions").add(region);
+        request.putArray("revisionWeights").addObject().put("revisionId", revisionId).put("weight", 100);
+        return request;
     }
 
     @Test
@@ -723,6 +1194,17 @@ class LambdaWebServiceTest {
         assertEquals(latestRefusal, message(() -> service.updateEndpoint(REGION, "app", "dev",
                 mapper.createObjectNode().put("autoDeploymentMode", "LatestRevision"))));
         assertEquals(latestRefusal, message(() -> service.createEndpoint(REGION, "app", endpointConfig("auto"))));
+        for (int i = 2; i <= 10; i++) {
+            ObjectNode pinned = endpointConfig("ep" + i).put("autoDeploymentMode", "Disabled");
+            pinned.set("revisionWeights", disabled.get("revisionWeights"));
+            service.createEndpoint(REGION, "app", pinned);
+        }
+        assertEquals(refusal, message(() -> service.createEndpoint(REGION, "app", weighted)), "before the quota");
+        assertEquals(latestRefusal, message(() -> service.createEndpoint(REGION, "app", endpointConfig("auto"))),
+                "before the quota");
+        for (int i = 2; i <= 10; i++) {
+            service.deleteEndpoint(REGION, "app", "ep" + i);
+        }
 
         service.deleteRevision(REGION, "app", bad.revisionId);
         assertEquals(List.of(good), List.copyOf(service.getFunction(REGION, "app").revisions.keySet()));
@@ -845,6 +1327,122 @@ class LambdaWebServiceTest {
         }
     }
 
+    @Test
+    void theNullVersionAsTheLatestIsRefusedBeforeTheSize() {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        byte[] zip = LambdaWebZips.indexJs("");
+        when(s3.openObject("code", "app.zip", null)).thenReturn(nullVersion(object(zip, LambdaWebCode.MAX_BYTES + 1)));
+
+        AwsException create = error(() -> service.createFunction(REGION, createRequest("app")));
+        assertEquals("ValidationException", create.getErrorCode());
+        assertEquals(400, create.getHttpStatus());
+        assertEquals("You must enable S3 versioning for your S3 bucket when S3ObjectStorageMode is set to REFERENCE.",
+                create.getMessage());
+        assertEquals("The function arn:aws:lambda:us-east-1:000000000000:web-function/app does not exist.",
+                message(() -> service.getFunction(REGION, "app")));
+
+        ObjectNode pinned = createRequest("app");
+        ((ObjectNode) pinned.path("revisionConfig").path("buildConfig").path("codeConfig").path("s3Object"))
+                .put("versionId", "null");
+        when(s3.openObject("code", "app.zip", "null")).thenReturn(nullVersion(object(zip)));
+        assertNull(service.createFunction(REGION, pinned).revisions.values().iterator().next().failureReason);
+    }
+
+    @Test
+    void lambdaMustBeAllowedToReadTheObjectVersionAfterTheSizeCheck() throws IOException {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        when(serviceCalls.authorize(eq("lambda"), eq("s3:GetObjectVersion"), eq("arn:aws:s3:::code/app.zip"),
+                startsWith(ARN + "/revision/rev-"), eq(ACCOUNT_ID), eq(Map.of("s3:versionid", List.of("v1")))))
+                .thenReturn(Decision.DENY);
+        when(s3.openObject("code", "app.zip", null)).thenReturn(object(new byte[0]));
+
+        AwsException create = error(() -> service.createFunction(REGION, createRequest("app")));
+        assertEquals("ValidationException", create.getErrorCode());
+        assertEquals(400, create.getHttpStatus());
+        assertEquals("Lambda service principal lambda.amazonaws.com does not have s3:GetObject and s3:GetObjectVersion"
+                + " permission on s3://code/app.zip. Update the bucket policy to grant the Lambda service principal"
+                + " access and retry.", create.getMessage());
+        assertEquals("The function arn:aws:lambda:us-east-1:000000000000:web-function/app does not exist.",
+                message(() -> service.getFunction(REGION, "app")));
+        Files.createDirectories(storageDir.resolve("code"));
+        try (Stream<Path> copies = Files.walk(storageDir.resolve("code"))) {
+            assertEquals(0, copies.filter(Files::isRegularFile).count());
+        }
+
+        when(s3.openObject("code", "app.zip", null))
+                .thenReturn(object(LambdaWebZips.indexJs(""), LambdaWebCode.MAX_BYTES + 1));
+        assertEquals("Zipped size must be smaller than 536870912 bytes",
+                message(() -> service.createFunction(REGION, createRequest("app"))));
+    }
+
+    @Test
+    void anActiveRevisionPastFiftyDeletesTheOldestUnusedOnes() {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        byte[] zip = LambdaWebZips.indexJs("");
+        when(s3.openObject("code", "app.zip", null)).thenAnswer(invocation -> object(zip));
+        String pinned = service.createFunction(REGION, createRequest("app")).revisions.keySet().iterator().next();
+        ObjectNode pin = endpointConfig("pin").put("autoDeploymentMode", "Disabled");
+        pin.putArray("revisionWeights").addObject().put("revisionId", pinned).put("weight", 100);
+        service.createEndpoint(REGION, "app", pin);
+        when(s3.openObject("code", "app.zip", null)).thenAnswer(invocation -> object(NOT_A_ZIP));
+        String failed = service.createRevision(REGION, "app", revisionConfig(30)).revisionId;
+        when(s3.openObject("code", "app.zip", null)).thenAnswer(invocation -> object(zip));
+        List<String> active = new ArrayList<>();
+        for (int i = 0; i < 48; i++) {
+            active.add(service.createRevision(REGION, "app", revisionConfig(30)).revisionId);
+        }
+        assertEquals(50, service.getFunction(REGION, "app").revisions.size());
+
+        service.createRevision(REGION, "app", revisionConfig(30));
+        Set<String> kept = service.getFunction(REGION, "app").revisions.keySet();
+        assertEquals(50, kept.size());
+        assertFalse(kept.contains(failed));
+        assertTrue(kept.contains(pinned));
+
+        when(s3.openObject("code", "app.zip", null)).thenAnswer(invocation -> object(NOT_A_ZIP));
+        service.createRevision(REGION, "app", revisionConfig(30));
+        assertEquals(51, service.getFunction(REGION, "app").revisions.size(), "a Failed revision cleans up nothing");
+
+        when(s3.openObject("code", "app.zip", null)).thenAnswer(invocation -> object(zip));
+        service.createRevision(REGION, "app", revisionConfig(30));
+        kept = service.getFunction(REGION, "app").revisions.keySet();
+        assertEquals(50, kept.size());
+        assertFalse(kept.contains(active.get(0)));
+        assertFalse(kept.contains(active.get(1)));
+        assertTrue(kept.contains(active.get(2)));
+        LambdaWebCode code = new LambdaWebCode(storageDir.resolve("code"));
+        assertFalse(Files.exists(code.file(ACCOUNT_ID, REGION, "app", active.get(0))));
+        assertTrue(Files.exists(code.file(ACCOUNT_ID, REGION, "app", active.get(2))));
+    }
+
+    @Test
+    void theRevisionALatestRevisionEndpointLeavesStaysUntilTheNextActiveOne() {
+        S3Service s3 = mock(S3Service.class);
+        LambdaWebService service = service(new MemoryStorageFactory(), "http://localhost:4566", s3);
+        byte[] zip = LambdaWebZips.indexJs("");
+        when(s3.openObject("code", "app.zip", null)).thenAnswer(invocation -> object(zip));
+        String first = service.createFunction(REGION, createRequest("app")).revisions.keySet().iterator().next();
+        when(s3.openObject("code", "app.zip", null)).thenAnswer(invocation -> object(NOT_A_ZIP));
+        String failed = service.createRevision(REGION, "app", revisionConfig(30)).revisionId;
+        for (int i = 0; i < 48; i++) {
+            service.createRevision(REGION, "app", revisionConfig(30));
+        }
+        when(s3.openObject("code", "app.zip", null)).thenAnswer(invocation -> object(zip));
+
+        String second = service.createRevision(REGION, "app", revisionConfig(30)).revisionId;
+        Set<String> kept = service.getFunction(REGION, "app").revisions.keySet();
+        assertTrue(kept.contains(first));
+        assertFalse(kept.contains(failed));
+
+        service.createRevision(REGION, "app", revisionConfig(30));
+        kept = service.getFunction(REGION, "app").revisions.keySet();
+        assertFalse(kept.contains(first));
+        assertTrue(kept.contains(second));
+    }
+
     private ObjectNode stateFilter(String state) {
         ObjectNode request = mapper.createObjectNode();
         request.putArray("filters").addObject().put("name", "state").putArray("values").add(state);
@@ -852,14 +1450,22 @@ class LambdaWebServiceTest {
     }
 
     private static S3Service.ObjectRead object(byte[] bytes) {
-        return new S3Service.ObjectRead(new S3Object("code", "app.zip", bytes, "application/zip"),
-                new ByteArrayInputStream(bytes));
+        return versioned(new S3Object("code", "app.zip", bytes, "application/zip"), bytes);
     }
 
     /** An object S3 reports as {@code size} bytes, whatever its body. */
     private static S3Service.ObjectRead object(byte[] bytes, long size) {
-        return new S3Service.ObjectRead(new S3Object("code", "app.zip", size, "application/zip", "etag"),
-                new ByteArrayInputStream(bytes));
+        return versioned(new S3Object("code", "app.zip", size, "application/zip", "etag"), bytes);
+    }
+
+    private static S3Service.ObjectRead versioned(S3Object object, byte[] bytes) {
+        object.setVersionId("v1");
+        return new S3Service.ObjectRead(object, new ByteArrayInputStream(bytes));
+    }
+
+    private static S3Service.ObjectRead nullVersion(S3Service.ObjectRead read) {
+        read.object().setVersionId(null);
+        return read;
     }
 
     private static final class MemoryStorageFactory extends StorageFactory {

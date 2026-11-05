@@ -1,6 +1,5 @@
 package io.github.hectorvent.floci.services.iam.model;
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -9,21 +8,6 @@ import java.time.Instant;
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class SessionCredential {
-
-    /** In-process provenance only; restored credentials are never admitted by the management verifier. */
-    @JsonIgnore
-    private boolean assumeRoleIssued;
-    @JsonIgnore
-    private boolean managedSessionPolicyPresent;
-    @JsonIgnore
-    private LambdaExecutionBinding lambdaExecution;
-    @JsonIgnore
-    private SessionCredential lambdaParentSession;
-
-    public LambdaExecutionBinding getLambdaExecution() { return lambdaExecution; }
-    public void setLambdaExecution(LambdaExecutionBinding value) { lambdaExecution = value; }
-    public SessionCredential getLambdaParentSession() { return lambdaParentSession; }
-    public void setLambdaParentSession(SessionCredential value) { lambdaParentSession = value; }
 
     private String accessKeyId;
     private String secretAccessKey;
@@ -50,6 +34,8 @@ public class SessionCredential {
     /** Exact object action and ARN for an internally generated S3 presigned URL. */
     private String presignedAction;
     private String presignedResourceArn;
+    /** Exact object ARN or UUID-scoped prefix permitted for an internal S3 transfer. */
+    private String scratchResourceArn;
     /**
      * The long-term identity whose key minted this session through GetSessionToken or
      * GetFederationToken: an IAM user's ARN, or the account root's. Null for every other session.
@@ -113,12 +99,6 @@ public class SessionCredential {
         this.originAccountId = originAccountId;
     }
 
-    public boolean isAssumeRoleIssued() { return assumeRoleIssued; }
-    public void setAssumeRoleIssued(boolean value) { assumeRoleIssued = value; }
-
-    public boolean isManagedSessionPolicyPresent() { return managedSessionPolicyPresent; }
-    public void setManagedSessionPolicyPresent(boolean value) { managedSessionPolicyPresent = value; }
-
     public String getAccessKeyId() { return accessKeyId; }
     public void setAccessKeyId(String accessKeyId) { this.accessKeyId = accessKeyId; }
 
@@ -160,6 +140,11 @@ public class SessionCredential {
 
     public String getPresignedResourceArn() { return presignedResourceArn; }
     public void setPresignedResourceArn(String presignedResourceArn) { this.presignedResourceArn = presignedResourceArn; }
+
+    public String getScratchResourceArn() { return scratchResourceArn; }
+    public void setScratchResourceArn(String scratchResourceArn) {
+        this.scratchResourceArn = scratchResourceArn;
+    }
 
     public boolean isLambdaExecutionRole() { return lambdaExecutionRole; }
     public void setLambdaExecutionRole(boolean lambdaExecutionRole) { this.lambdaExecutionRole = lambdaExecutionRole; }

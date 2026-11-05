@@ -31,6 +31,10 @@ class EmrTerminatedCapacityIntegrationTest {
             + "\"TargetSpotCapacity\":3,\"InstanceTypeConfigs\":[{\"InstanceType\":\"m5.xlarge\"}]}]";
     private static final String STEP = "{\"Name\":\"complete\","
             + "\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}}";
+    private static final String GROUP_REFUSAL =
+            "An instance group may only be modified when the cluster is running or waiting.";
+    private static final String FLEET_REFUSAL =
+            "A job flow that is shutting down, terminated, or finished may not be modified.";
 
     @BeforeAll
     static void configure() {
@@ -133,7 +137,9 @@ class EmrTerminatedCapacityIntegrationTest {
         emr("ModifyInstanceGroups", "{\"InstanceGroups\":["
                 + "{\"InstanceGroupId\":\"" + activeGroup + "\",\"InstanceCount\":4},"
                 + "{\"InstanceGroupId\":\"" + terminatedGroup + "\",\"InstanceCount\":4}]}")
-                .then().statusCode(400).body("__type", equalTo("InvalidRequestException"));
+                .then().statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo(GROUP_REFUSAL));
         emr("ListInstanceGroups", clusterRequest(activeId)).then().statusCode(200)
                 .body("InstanceGroups.find { it.Id == '" + activeGroup + "' }.RunningInstanceCount", equalTo(2));
         assertTerminatedGroup(terminatedId);
@@ -172,7 +178,9 @@ class EmrTerminatedCapacityIntegrationTest {
         String clusterId = includeClusterId ? "\"ClusterId\":\"" + id + "\"," : "";
         emr("ModifyInstanceGroups", "{" + clusterId + "\"InstanceGroups\":[{\"InstanceGroupId\":\""
                 + coreGroupId(id) + "\",\"InstanceCount\":4}]}")
-                .then().statusCode(400).body("__type", equalTo("InvalidRequestException"));
+                .then().statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo(GROUP_REFUSAL));
         assertTerminatedGroup(id);
     }
 
@@ -181,7 +189,10 @@ class EmrTerminatedCapacityIntegrationTest {
                 .extract().jsonPath().getString("InstanceFleets.find { it.InstanceFleetType == 'CORE' }.Id");
         emr("ModifyInstanceFleet", "{\"ClusterId\":\"" + id + "\",\"InstanceFleet\":{"
                 + "\"InstanceFleetId\":\"" + fleetId + "\",\"TargetOnDemandCapacity\":4}}")
-                .then().statusCode(400).body("__type", equalTo("InvalidRequestException"));
+                .then().statusCode(400)
+                .body("__type", equalTo("InvalidRequestException"))
+                .body("message", equalTo(FLEET_REFUSAL))
+                .body("ErrorCode", equalTo("INVALID_JOB_SHUT_DOWN"));
         assertTerminatedFleet(id);
     }
 

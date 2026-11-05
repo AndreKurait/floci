@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
 import io.github.hectorvent.floci.services.elasticache.model.CacheCluster;
 import io.github.hectorvent.floci.services.elasticache.model.CacheClusterStatus;
 import io.github.hectorvent.floci.services.elasticache.model.ClusterNode;
+import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUser;
 import io.github.hectorvent.floci.services.elasticache.model.Endpoint;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupSettings;
@@ -46,6 +47,7 @@ class ElastiCacheQueryHandlerTest {
         memcachedService = mock(ElastiCacheMemcachedService.class);
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getRegion()).thenReturn("us-east-1");
+        when(regionResolver.getDefaultRegion()).thenReturn("us-east-1");
         when(regionResolver.getAccountId()).thenReturn("000000000000");
         handler = new ElastiCacheQueryHandler(sigV4Validator, service, memcachedService, regionResolver,
                 mock(ElastiCacheServerlessQueryHandler.class));
@@ -71,6 +73,48 @@ class ElastiCacheQueryHandlerTest {
         assertTrue(body.contains("<DescribeCacheParameterGroupsResult><CacheParameterGroups></CacheParameterGroups></DescribeCacheParameterGroupsResult>"),
                 "Expected empty CacheParameterGroups wrapper inside the Result element");
         assertFalse(body.contains("<Marker>"), "Empty list must omit Marker");
+    }
+
+    @Test
+    void addTagsToResource_supportsUserResource() {
+        MultivaluedMap<String, String> p = params();
+        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:user:sub1");
+        p.add("Tags.Tag.1.Key", "env");
+        p.add("Tags.Tag.1.Value", "test");
+        when(service.addTagsToResource(anyString(), anyMap(), anyString()))
+                .thenReturn(Map.of("env", "test"));
+
+        Response response = handler.handle("AddTagsToResource", p, "us-east-1");
+
+        assertEquals(200, response.getStatus(), (String) response.getEntity());
+        assertTrue(((String) response.getEntity()).contains("<Key>env</Key><Value>test</Value>"));
+    }
+
+    @Test
+    void removeTagsFromResource_supportsUserResource() {
+        MultivaluedMap<String, String> p = params();
+        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:user:sub1");
+        p.add("TagKeys.member.1", "env");
+        when(service.removeTagsFromResource(anyString(), anyList(), anyString()))
+                .thenReturn(Map.of());
+
+        Response response = handler.handle("RemoveTagsFromResource", p, "us-east-1");
+
+        assertEquals(200, response.getStatus(), (String) response.getEntity());
+        assertTrue(((String) response.getEntity()).contains("<TagList></TagList>"));
+    }
+
+    @Test
+    void addTagsToResource_rejectsMissingTagKeyBeforeCallingService() {
+        MultivaluedMap<String, String> p = params();
+        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:user:sub1");
+        p.add("Tags.Tag.1.Value", "test");
+
+        Response response = handler.handle("AddTagsToResource", p, "us-east-1");
+
+        assertEquals(400, response.getStatus());
+        assertTrue(((String) response.getEntity()).contains("InvalidParameterValue"));
+        verifyNoInteractions(service);
     }
 
     @Test
@@ -413,7 +457,7 @@ class ElastiCacheQueryHandlerTest {
 
     @Test
     void modifyReplicationGroup_passesSnapshotSettingsOnly() {
-        when(service.modifyReplicationGroup(eq("g1"), isNull(), isNull(), eq(false), eq(false), any()))
+        when(service.modifyReplicationGroup(eq("g1"), isNull(), isNull(), eq(false), eq(false), any(), isNull()))
                 .thenReturn(group("g1"));
         MultivaluedMap<String, String> p = params();
         p.add("ReplicationGroupId", "g1");
@@ -424,12 +468,12 @@ class ElastiCacheQueryHandlerTest {
 
         assertEquals(200, handler.handle("ModifyReplicationGroup", p, "us-east-1").getStatus());
         verify(service).modifyReplicationGroup("g1", null, null, false, false,
-                new ReplicationGroupSettings(null, null, 3, "01:00-02:00"));
+                new ReplicationGroupSettings(null, null, 3, "01:00-02:00"), null);
     }
 
     @Test
     void modifyReplicationGroup_passesRemoveUserGroupsAndAuthTokenDelete() {
-        when(service.modifyReplicationGroup(eq("g1"), any(), isNull(), eq(true), eq(true), any()))
+        when(service.modifyReplicationGroup(eq("g1"), any(), isNull(), eq(true), eq(true), any(), isNull()))
                 .thenReturn(group("g1"));
         MultivaluedMap<String, String> p = params();
         p.add("ReplicationGroupId", "g1");
@@ -439,7 +483,21 @@ class ElastiCacheQueryHandlerTest {
 
         assertEquals(200, handler.handle("ModifyReplicationGroup", p, "us-east-1").getStatus());
         verify(service).modifyReplicationGroup("g1", List.of("new-users"), null, true, true,
-                new ReplicationGroupSettings(null, null, null, null));
+                new ReplicationGroupSettings(null, null, null, null), null);
+    }
+
+    @Test
+    void modifyReplicationGroup_passesNamedSecurityGroupIdsAndUnchangedOtherwise() {
+        when(service.modifyReplicationGroup(eq("g1"), isNull(), isNull(), eq(false), eq(false), any(), any()))
+                .thenReturn(group("g1"));
+        MultivaluedMap<String, String> p = params();
+        p.add("ReplicationGroupId", "g1");
+        p.add("SecurityGroupIds.SecurityGroupId.1", "sg-1");
+        p.add("SecurityGroupIds.SecurityGroupId.2", "sg-2");
+
+        assertEquals(200, handler.handle("ModifyReplicationGroup", p, "us-east-1").getStatus());
+        verify(service).modifyReplicationGroup("g1", null, null, false, false,
+                new ReplicationGroupSettings(null, null, null, null), List.of("sg-1", "sg-2"));
     }
 
     @Test
@@ -583,6 +641,41 @@ class ElastiCacheQueryHandlerTest {
         verify(service, never()).createCacheCluster(any());
         assertTrue(body.contains(
                 "<ConfigurationEndpoint><Address>localhost</Address><Port>11211</Port></ConfigurationEndpoint>"), body);
+    }
+
+    @Test
+    void createCacheCluster_memcachedKeepsRequestedVersionAndAutoMinorVersionUpgrade() {
+        ArgumentCaptor<ElastiCacheService.CreateCacheClusterRequest> captor =
+                ArgumentCaptor.forClass(ElastiCacheService.CreateCacheClusterRequest.class);
+        CacheCluster created = new CacheCluster(
+                "mc", CacheClusterStatus.AVAILABLE, "memcached", "1.5.16",
+                new Endpoint("localhost", 11211), Instant.now());
+        created.setAutoMinorVersionUpgrade(false);
+        when(memcachedService.createCacheCluster(captor.capture())).thenReturn(created);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("CacheClusterId", "mc");
+        p.add("Engine", "memcached");
+        p.add("EngineVersion", "1.5.16");
+        p.add("AutoMinorVersionUpgrade", "false");
+
+        String body = (String) handler.handle("CreateCacheCluster", p, "us-east-1").getEntity();
+
+        assertEquals("1.5.16", captor.getValue().engineVersion());
+        assertEquals(false, captor.getValue().autoMinorVersionUpgrade());
+        assertTrue(body.contains("<EngineVersion>1.5.16</EngineVersion>"), body);
+        assertTrue(body.contains("<AutoMinorVersionUpgrade>false</AutoMinorVersionUpgrade>"), body);
+    }
+
+    @Test
+    void describeCacheClusters_autoMinorVersionUpgradeDefaultsToTrue() {
+        when(service.findCacheClusters("tf-redis")).thenReturn(List.of(redisCacheCluster("tf-redis")));
+
+        MultivaluedMap<String, String> p = params();
+        p.add("CacheClusterId", "tf-redis");
+        String body = (String) handler.handle("DescribeCacheClusters", p, "us-east-1").getEntity();
+
+        assertTrue(body.contains("<AutoMinorVersionUpgrade>true</AutoMinorVersionUpgrade>"), body);
     }
 
     @Test
@@ -799,5 +892,55 @@ class ElastiCacheQueryHandlerTest {
         assertEquals(200, response.getStatus());
         assertTrue(((String) response.getEntity()).contains("<TagList></TagList>"),
                 (String) response.getEntity());
+    }
+
+    @Test
+    void describeUsers_outputsMinimumEngineVersion6ForBothIamAndNonIam() {
+        ElastiCacheUser iamUser = new ElastiCacheUser(
+                "iam-app", "iam-app", AuthMode.IAM, List.of(), "on ~* +@all", "redis", "active", Instant.now());
+        ElastiCacheUser passUser = new ElastiCacheUser(
+                "pass-app", "pass-app", AuthMode.PASSWORD, List.of("secret"), "on ~* +@all", "redis", "active", Instant.now());
+
+        when(service.listUsers(eq("iam-app"), isNull())).thenReturn(List.of(iamUser));
+        when(service.listUsers(eq("pass-app"), isNull())).thenReturn(List.of(passUser));
+
+        MultivaluedMap<String, String> iamParams = params();
+        iamParams.putSingle("UserId", "iam-app");
+        Response iamResponse = handler.handle("DescribeUsers", iamParams, "us-east-1");
+        assertEquals(200, iamResponse.getStatus());
+        String iamBody = (String) iamResponse.getEntity();
+        assertTrue(iamBody.contains("<MinimumEngineVersion>6.0</MinimumEngineVersion>"),
+                "IAM user XML representation must output MinimumEngineVersion 6.0");
+        assertFalse(iamBody.contains("<MinimumEngineVersion>7.0</MinimumEngineVersion>"));
+
+        MultivaluedMap<String, String> passParams = params();
+        passParams.putSingle("UserId", "pass-app");
+        Response passResponse = handler.handle("DescribeUsers", passParams, "us-east-1");
+        assertEquals(200, passResponse.getStatus());
+        String passBody = (String) passResponse.getEntity();
+        assertTrue(passBody.contains("<MinimumEngineVersion>6.0</MinimumEngineVersion>"),
+                "Non-IAM user XML representation must output MinimumEngineVersion 6.0");
+        assertFalse(passBody.contains("<MinimumEngineVersion>7.0</MinimumEngineVersion>"));
+    }
+
+    @Test
+    void createReplicationGroup_transitEncryptionWithoutAuthTokenDoesNotDefaultToIam() {
+        MultivaluedMap<String, String> params = params();
+        params.putSingle("ReplicationGroupId", "tls-grp");
+        params.putSingle("ReplicationGroupDescription", "TLS replication group");
+        params.putSingle("TransitEncryptionEnabled", "true");
+
+        ArgumentCaptor<ElastiCacheService.CreateReplicationGroupRequest> captor =
+                ArgumentCaptor.forClass(ElastiCacheService.CreateReplicationGroupRequest.class);
+        ReplicationGroup mockGroup = new ReplicationGroup("tls-grp", "TLS replication group",
+                ReplicationGroupStatus.AVAILABLE, AuthMode.NO_AUTH, new Endpoint("localhost", 6379), Instant.now(), 6379);
+        when(service.createReplicationGroup(captor.capture())).thenReturn(mockGroup);
+
+        Response response = handler.handle("CreateReplicationGroup", params, "us-east-1");
+        assertEquals(200, response.getStatus());
+
+        ElastiCacheService.CreateReplicationGroupRequest capturedRequest = captor.getValue();
+        assertEquals(AuthMode.NO_AUTH, capturedRequest.authMode(),
+                "TransitEncryptionEnabled=true without AuthToken must not default to IAM (should be NO_AUTH)");
     }
 }

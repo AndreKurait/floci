@@ -14,12 +14,14 @@ import io.github.hectorvent.floci.services.dynamodb.DynamoDbResponses;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbStreamsJsonHandler;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceJsonHandler;
 import io.github.hectorvent.floci.services.networkfirewall.NetworkFirewallJsonHandler;
+import io.github.hectorvent.floci.services.paymentcryptography.PaymentCryptographyJsonHandler;
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandler;
 import io.github.hectorvent.floci.services.swf.SwfJsonHandler;
 import io.github.hectorvent.floci.services.timestreaminfluxdb.TimestreamInfluxDbJsonHandler;
 import io.github.hectorvent.floci.services.verifiedpermissions.VerifiedPermissionsJsonHandler;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
@@ -34,8 +36,15 @@ import org.jboss.logging.Logger;
  * Currently supported services:
  * - DynamoDB (DynamoDB_20120810.*)
  * - SQS (AmazonSQS.*)
+ * <p>
+ * A gzip-encoded CloudWatch {@code PutMetricData} body arrives here decompressed, by
+ * {@link CloudWatchGzipReaderInterceptor}.
+ * <p>
+ * Requests run on virtual threads: SQS ReceiveMessage and Step Functions GetActivityTask wait up
+ * to 20 and 60 seconds for work, and that wait must not hold one of the shared request workers.
  */
 @Path("/")
+@CloudWatchGzipBody
 public class AwsJsonController {
 
     public static final String CONTENT_TYPE_AWS_JSON_1_0 = "application/x-amz-json-1.0";
@@ -54,6 +63,7 @@ public class AwsJsonController {
     private final CloudControlJsonHandler cloudControlJsonHandler;
     private final SwfJsonHandler swfJsonHandler;
     private final NetworkFirewallJsonHandler networkFirewallJsonHandler;
+    private final PaymentCryptographyJsonHandler paymentCryptographyJsonHandler;
     private final MarketplaceJsonHandler marketplaceJsonHandler;
     private final VerifiedPermissionsJsonHandler verifiedPermissionsJsonHandler;
     private final BcmPricingCalculatorJsonHandler bcmPricingCalculatorJsonHandler;
@@ -70,6 +80,7 @@ public class AwsJsonController {
                              CloudControlJsonHandler cloudControlJsonHandler,
                              SwfJsonHandler swfJsonHandler,
                              NetworkFirewallJsonHandler networkFirewallJsonHandler,
+                             PaymentCryptographyJsonHandler paymentCryptographyJsonHandler,
                              MarketplaceJsonHandler marketplaceJsonHandler,
                              VerifiedPermissionsJsonHandler verifiedPermissionsJsonHandler,
                              BcmPricingCalculatorJsonHandler bcmPricingCalculatorJsonHandler,
@@ -87,6 +98,7 @@ public class AwsJsonController {
         this.cloudControlJsonHandler = cloudControlJsonHandler;
         this.swfJsonHandler = swfJsonHandler;
         this.networkFirewallJsonHandler = networkFirewallJsonHandler;
+        this.paymentCryptographyJsonHandler = paymentCryptographyJsonHandler;
         this.marketplaceJsonHandler = marketplaceJsonHandler;
         this.verifiedPermissionsJsonHandler = verifiedPermissionsJsonHandler;
         this.bcmPricingCalculatorJsonHandler = bcmPricingCalculatorJsonHandler;
@@ -100,6 +112,7 @@ public class AwsJsonController {
     @POST
     @Consumes("application/json")
     @Produces("application/json")
+    @RunOnVirtualThread
     public Response handlePlainJsonRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
@@ -118,6 +131,7 @@ public class AwsJsonController {
     @POST
     @Consumes(CONTENT_TYPE_AWS_JSON_1_0)
     @Produces(CONTENT_TYPE_AWS_JSON_1_0)
+    @RunOnVirtualThread
     public Response handleJsonRequest(
             @HeaderParam("X-Amz-Target") String target,
             @Context HttpHeaders httpHeaders,
@@ -170,11 +184,17 @@ public class AwsJsonController {
                 case "sns" -> snsJsonHandler.handle(action, request, region);
                 case "states" -> sfnJsonHandler.handle(action, request, region);
                 case "swf" -> swfJsonHandler.handle(action, request, region);
-                case "monitoring" -> cloudWatchMetricsJsonHandler.handle(action, request, region);
+                case "monitoring" -> targetMatch.jsonOnly()
+                        ? cloudWatchMetricsJsonHandler.handleLegacy(action, request, region)
+                        : cloudWatchMetricsJsonHandler.handle(action, request, region);
                 case "cloudcontrol" -> cloudControlJsonHandler.handle(
                                         action, request, region, regionResolver.getAccountId());
                 case "network-firewall" -> networkFirewallJsonHandler.handle(
                         action, request, region, regionResolver.getAccountId());
+                // The control plane of Payment Cryptography is an awsJson 1.0 service: the
+                // AWS SDK sends application/x-amz-json-1.0 and targets
+                // PaymentCryptographyControlPlane.<Operation>.
+                case "paymentcryptography" -> paymentCryptographyJsonHandler.handle(action, request, region);
                 case "marketplace" -> marketplaceJsonHandler.handle(action, request, region);
                 case "verifiedpermissions" -> verifiedPermissionsJsonHandler.handle(action, request, region);
                 case "bcm-pricing-calculator" -> bcmPricingCalculatorJsonHandler.handle(action, request, region);

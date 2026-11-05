@@ -11,6 +11,8 @@ import java.net.BindException;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.channels.ClosedByInterruptException;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.NoSuchFileException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -219,5 +221,15 @@ class DockerRetryTest {
                 new RuntimeException(new BindException("Permission denied"))));
         assertFalse(DockerRetry.isTransientIo(
                 new IOException("Broken pipe", new SocketException("PERMISSION DENIED"))));
+    }
+
+    @Test
+    void isTransientIo_missingOrDeniedNamedPipe_isNotTransient() {
+        // Windows without Docker running: the pipe is absent and its exception message is only the
+        // pipe's name, so the message match above cannot see it. Each retry cost a 30 s connect.
+        assertFalse(DockerRetry.isTransientIo(new NoSuchFileException("\\\\.\\pipe\\docker_engine")));
+        assertFalse(DockerRetry.isTransientIo(
+                new RuntimeException(new NoSuchFileException("\\\\.\\pipe\\docker_engine"))));
+        assertFalse(DockerRetry.isTransientIo(new AccessDeniedException("\\\\.\\pipe\\docker_engine")));
     }
 }

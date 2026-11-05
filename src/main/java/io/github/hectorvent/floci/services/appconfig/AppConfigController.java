@@ -17,6 +17,7 @@ import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.HeaderParam;
+import jakarta.ws.rs.PATCH;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
@@ -62,6 +63,14 @@ public class AppConfigController {
     @Path("/applications/{id}")
     public Response getApplication(@PathParam("id") String id) {
         return Response.ok(service.getApplication(id)).build();
+    }
+
+    @PATCH
+    @Path("/applications/{id}")
+    public Response updateApplication(@PathParam("id") String id, String body) throws IOException {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> request = objectMapper.readValue(body, Map.class);
+        return Response.ok(service.updateApplication(id, request)).build();
     }
 
     @GET
@@ -275,6 +284,14 @@ public class AppConfigController {
         return Response.ok(service.getDeployment(appId, envId, deploymentNumber)).build();
     }
 
+    @DELETE
+    @Path("/applications/{appId}/environments/{envId}/deployments/{deploymentNumber}")
+    public Response stopDeployment(@PathParam("appId") String appId, @PathParam("envId") String envId,
+                                   @PathParam("deploymentNumber") int deploymentNumber,
+                                   @HeaderParam("Allow-Revert") boolean allowRevert) {
+        return Response.status(202).entity(service.stopDeployment(appId, envId, deploymentNumber, allowRevert)).build();
+    }
+
     // ──────────────────────────── Configuration ────────────────────────────
 
     // The deprecated GetConfiguration: superseded by AppConfigData, but still an AppConfig operation.
@@ -293,6 +310,11 @@ public class AppConfigController {
         String clientVersion = uriInfo.getQueryParameters().getFirst("client_configuration_version");
         LegacyConfiguration data = dataService.getConfiguration(
                 appId, envId, configuration, clientId, clientVersion, accept);
+        if (data.configurationVersion().equals(clientVersion)) {
+            return Response.noContent()
+                    .header("Configuration-Version", data.configurationVersion())
+                    .build();
+        }
         // A version stored without a content type would otherwise go out as the */* of @Produces.
         String contentType = data.contentType() != null ? data.contentType() : MediaType.APPLICATION_OCTET_STREAM;
         return Response.ok(data.content())

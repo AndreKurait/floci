@@ -31,6 +31,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 
 /**
  * Handles the PostgreSQL wire protocol auth intercept.
@@ -127,7 +128,10 @@ public class PostgresProtocolHandler {
                 handshakeTimeoutMillis, forwardStartupParameters, true);
     }
 
-    /** Standard DB Proxy IAM does not enroll the backend role in database-native IAM. */
+    /**
+     * {@code databaseIamAuthentication} is false on a standard DB Proxy endpoint, which neither
+     * enrolls the backend role in database-native IAM nor forwards a client's CancelRequest.
+     */
     public static AuthenticatedSession authenticate(Socket client, BackendConnector backendConnector,
                                       String masterUsername, String masterPassword, String dbName,
                                       boolean iamEnabled, RdsSigV4Validator sigV4,
@@ -137,16 +141,31 @@ public class PostgresProtocolHandler {
                                       int handshakeTimeoutMillis, boolean forwardStartupParameters,
                                       boolean databaseIamAuthentication) throws IOException {
 
+        return authenticate(client, backendConnector, masterUsername, masterPassword, dbName, iamEnabled, sigV4,
+                binding, tlsCertificates, passwordValidator, handshakeTimeoutMillis, forwardStartupParameters,
+                databaseIamAuthentication, (user, database) -> { });
+    }
+
+    public static AuthenticatedSession authenticate(Socket client, BackendConnector backendConnector,
+                                      String masterUsername, String masterPassword, String dbName,
+                                      boolean iamEnabled, RdsSigV4Validator sigV4,
+                                      RdsProxyBinding binding, RdsProxyTlsCertificates tlsCertificates,
+                                      PasswordValidator passwordValidator, int handshakeTimeoutMillis,
+                                      boolean forwardStartupParameters, boolean databaseIamAuthentication,
+                                      BiConsumer<String, String> startupObserver) throws IOException {
+
         client.setSoTimeout(handshakeTimeoutMillis);
 
         // Phase 1: Read client startup message (possibly preceded by SSL request)
-        StartupMessage startup = readStartupMessage(client, tlsCertificates, handshakeTimeoutMillis);
+        StartupMessage startup = readStartupMessage(client, backendConnector, databaseIamAuthentication,
+                tlsCertificates, handshakeTimeoutMillis);
         if (startup == null) {
             closeQuietly(client);
             return null;
         }
         client = startup.socket();
         String clientUsername = startup.username();
+        startupObserver.accept(clientUsername, resolveEffectiveDbName(startup.database(), dbName));
         InputStream clientIn = client.getInputStream();
         // PgBouncer rejects partial login packets; keep the challenge together until flush().
         // https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_24_0/src/server.c#L116-L119
@@ -471,7 +490,8 @@ public class PostgresProtocolHandler {
 
     // ── Startup ───────────────────────────────────────────────────────────────
 
-    private static StartupMessage readStartupMessage(Socket socket, RdsProxyTlsCertificates tlsCertificates,
+    private static StartupMessage readStartupMessage(Socket socket, BackendConnector backendConnector,
+            boolean forwardCancel, RdsProxyTlsCertificates tlsCertificates,
             int handshakeTimeoutMillis) throws IOException {
         Socket currentSocket = socket;
         while (true) {
@@ -489,6 +509,19 @@ public class PostgresProtocolHandler {
                 continue;
             }
 
+            if (startup.code() == PostgresWire.CANCEL_REQUEST) {
+                if (!forwardCancel) {
+                    // RDS Proxy does not support a CancelRequest from a client, so it drops one.
+                    LOG.debugv("Dropping a PostgreSQL CancelRequest sent to a DB proxy endpoint");
+                } else if (startup.body().length == 8) {
+                    forwardCancelRequest(startup.body(), backendConnector);
+                } else {
+                    LOG.warnv("Dropping a PostgreSQL CancelRequest of length {0}; it must be 16",
+                            startup.body().length + 8);
+                }
+                return null;
+            }
+
             if (startup.code() != PostgresWire.PROTOCOL_3) {
                 LOG.warnv("Unexpected PostgreSQL startup protocol version: {0}", startup.code());
                 return null;
@@ -499,6 +532,22 @@ public class PostgresProtocolHandler {
                     params.getOrDefault("user", "postgres"),
                     params.get("database"),
                     params);
+        }
+    }
+
+    /**
+     * Relays a CancelRequest to the backend on a connection of its own, as PostgreSQL expects.
+     * The client holds the backend's own process id and key from its BackendKeyData, so the
+     * request goes through unchanged. Nothing is answered: the server never replies to one.
+     */
+    private static void forwardCancelRequest(byte[] key, BackendConnector backendConnector)
+            throws IOException {
+        try (Socket backend = backendConnector.connect()) {
+            OutputStream out = backend.getOutputStream();
+            PostgresWire.writeInt32(out, 16);
+            PostgresWire.writeInt32(out, PostgresWire.CANCEL_REQUEST);
+            out.write(key);
+            out.flush();
         }
     }
 
@@ -820,19 +869,15 @@ public class PostgresProtocolHandler {
     }
 
     private static String computeMd5Password(String password, String username, byte[] salt) {
-        try {
-            MessageDigest md5 = MessageDigest.getInstance("MD5");
-            md5.update(password.getBytes(StandardCharsets.UTF_8));
-            md5.update(username.getBytes(StandardCharsets.UTF_8));
-            String hex1 = bytesToHex(md5.digest());
+        MessageDigest md5 = Digests.md5Digest();
+        md5.update(password.getBytes(StandardCharsets.UTF_8));
+        md5.update(username.getBytes(StandardCharsets.UTF_8));
+        String hex1 = HexFormat.of().formatHex(md5.digest());
 
-            md5.reset();
-            md5.update(hex1.getBytes(StandardCharsets.UTF_8));
-            md5.update(salt);
-            return "md5" + bytesToHex(md5.digest());
-        } catch (Exception e) {
-            throw new RuntimeException("MD5 computation failed", e);
-        }
+        md5.reset();
+        md5.update(hex1.getBytes(StandardCharsets.UTF_8));
+        md5.update(salt);
+        return "md5" + HexFormat.of().formatHex(md5.digest());
     }
 
     // ── Post-auth buffering ───────────────────────────────────────────────────
@@ -1513,10 +1558,9 @@ public class PostgresProtocolHandler {
                 closeQuietly(backend);
             }
         };
-        Thread t1 = Thread.ofVirtual().name("rds-pg-c2b")
-                .start(() -> relay(clientIn, backendOut, closeBoth));
-        Thread t2 = Thread.ofVirtual().name("rds-pg-b2c")
-                .start(() -> relayToClient(backendIn, clientOut, session.iamRole(), closeBoth));
+        Thread t1 = RelayThreads.start("rds-pg-c2b", () -> relay(clientIn, backendOut, closeBoth));
+        Thread t2 = RelayThreads.start("rds-pg-b2c",
+                () -> relayToClient(backendIn, clientOut, session.iamRole(), closeBoth));
         try {
             t1.join();
             t2.join();
@@ -1536,7 +1580,7 @@ public class PostgresProtocolHandler {
         }
         BufferedOutputStream buffered = new BufferedOutputStream(to, 8192);
         try {
-            relayGuardingSessionRole(from, buffered, iamRole);
+            relayGuardingSessionRole(new RelayInputStream(from), buffered, iamRole);
         } catch (IOException e) {
             // Either side closing mid-relay is the normal way a session ends, so this stays at
             // debug: it is one line per connection teardown, not per message.
@@ -1556,7 +1600,7 @@ public class PostgresProtocolHandler {
      * Copies framed backend messages, stopping the session if PostgreSQL ever reports a
      * {@code session_authorization} other than {@code iamRole}.
      */
-    private static void relayGuardingSessionRole(InputStream from, OutputStream to, String iamRole)
+    private static void relayGuardingSessionRole(RelayInputStream from, OutputStream to, String iamRole)
             throws IOException {
         byte[] buf = new byte[8192];
         while (true) {
@@ -1603,7 +1647,7 @@ public class PostgresProtocolHandler {
             }
 
             // Batch while the backend keeps talking, flush as soon as it pauses.
-            if (from.available() == 0) {
+            if (from.isDrained()) {
                 to.flush();
             }
         }
@@ -1640,14 +1684,6 @@ public class PostgresProtocolHandler {
     }
 
     // ── Wire helpers ──────────────────────────────────────────────────────────
-
-    private static String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b));
-        }
-        return sb.toString();
-    }
 
     static void closeQuietly(Socket s) {
         try { s.close(); } catch (IOException ignored) {}

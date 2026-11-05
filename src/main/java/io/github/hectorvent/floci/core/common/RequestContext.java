@@ -1,9 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
-import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import jakarta.enterprise.context.RequestScoped;
-
-import java.util.Objects;
 
 /**
  * Holds per-request derived values, account ID, region and partition, extracted from the
@@ -19,21 +16,6 @@ public class RequestContext {
     private String accessKeyId;
     private String sessionToken;
     private Boolean iamGovernanceBypass;
-    /** Set only after the native SigV4 header verifier authenticates this request. */
-    private SessionCredential verifiedSession;
-    private String verifiedSecret;
-    private String verifiedToken;
-
-    public SessionCredential getVerifiedSession() {
-        return verifiedSession != null && Objects.equals(verifiedSecret, verifiedSession.getSecretAccessKey())
-                && Objects.equals(verifiedToken, verifiedSession.getSessionToken()) ? verifiedSession : null;
-    }
-
-    public void setVerifiedSession(SessionCredential session, String secret, String token) {
-        verifiedSession = session;
-        verifiedSecret = secret;
-        verifiedToken = token;
-    }
 
     public String getAccountId() {
         return accountId;

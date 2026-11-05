@@ -25,6 +25,7 @@ public class LambdaFunctionStore implements Resettable {
 
     private final StorageBackend<String, LambdaFunction> backend;
     private final ConcurrentHashMap<String, LambdaFunction> urlIdIndex = new ConcurrentHashMap<>();
+    // Retain locks across deletion and reset so a queued operation cannot race a newly created lock.
     private final ConcurrentHashMap<String, Object> concurrencyOpLocks = new ConcurrentHashMap<>();
 
     @Inject
@@ -143,6 +144,18 @@ public class LambdaFunctionStore implements Resettable {
     public List<LambdaFunction> list(String region) {
         String prefix = "lambda::" + region + "::";
         return backend.scan(key -> key.startsWith(prefix) && key.endsWith("::$LATEST"));
+    }
+
+    /** Lists the caller's {@code $LATEST} functions without relying on request context. */
+    public List<LambdaFunction> listForAccount(String accountId, String region) {
+        String prefix = "lambda::" + region + "::";
+        if (backend instanceof AccountAwareStorageBackend<LambdaFunction> aware) {
+            return aware.scanForAccount(accountId,
+                    key -> key.startsWith(prefix) && key.endsWith("::$LATEST"));
+        }
+        return list(region).stream()
+                .filter(function -> belongsToAccount(function, accountId))
+                .toList();
     }
 
     public List<LambdaFunction> listVersions(String region, String functionName) {

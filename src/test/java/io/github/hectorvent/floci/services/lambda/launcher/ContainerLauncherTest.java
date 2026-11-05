@@ -12,6 +12,7 @@ import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
+import com.github.dockerjava.api.command.VersionCmd;
 import com.github.dockerjava.api.command.WaitContainerCmd;
 import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
@@ -20,6 +21,9 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.StreamType;
+import com.github.dockerjava.api.model.Version;
+import com.github.dockerjava.api.model.VersionComponent;
+import com.github.dockerjava.api.model.VersionPlatform;
 import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.api.model.WaitResponse;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
@@ -33,6 +37,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -73,14 +78,18 @@ import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.reflect.Constructor;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -88,7 +97,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -129,7 +140,7 @@ class ContainerLauncherTest {
 
     ContainerLauncher launcher;
     /** Collects remote paths passed to withRemotePath across all copy mocks. */
-    final java.util.List<String> capturedRemotePaths = new java.util.ArrayList<>();
+    final List<String> capturedRemotePaths = new ArrayList<>();
     String capturedRuntimeBootstrap;
     final Map<String, String> capturedLayerFiles = new LinkedHashMap<>();
     Closeable exitTransport;
@@ -139,15 +150,12 @@ class ContainerLauncherTest {
     void setUp() {
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
-        EmulatorConfig.IamServiceConfig iam = mock(EmulatorConfig.IamServiceConfig.class);
         EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
         EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class);
         EmulatorConfig.EfsSharingConfig efs = mock(EmulatorConfig.EfsSharingConfig.class);
 
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambda);
-        lenient().when(services.iam()).thenReturn(iam);
-        lenient().when(iam.lambdaIdentityVerificationEnabled()).thenReturn(false);
         when(lambda.dockerNetwork()).thenReturn(Optional.empty());
         lenient().when(lambda.extraHosts()).thenReturn(Optional.empty());
         lenient().when(lambda.awsConfigPath()).thenReturn(Optional.empty());
@@ -177,14 +185,7 @@ class ContainerLauncherTest {
         lenient().when(ecrRegistryManager.rewriteImageUri(any()))
                 .thenAnswer(inv -> inv.getArgument(0));
 
-        ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
-        ContainerReachableEndpoint reachableEndpoint =
-                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566);
-        LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
-        launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
-                runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
-                layerService, awsEnv,
-                executionRoleCredentials, codeVolumeFunctionStore());
+        launcher = newLauncher(imageResolver);
         lenient().when(lifecycleManager.tryVolumeLabels(anyString())).thenReturn(Optional.of(Map.of()));
 
         when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
@@ -224,7 +225,7 @@ class ContainerLauncherTest {
         capturedLayerFiles.clear();
         lenient().when(dockerClient.copyArchiveToContainerCmd(any())).thenAnswer(inv -> {
             CopyArchiveToContainerCmd cmd = mock(CopyArchiveToContainerCmd.class);
-            final java.io.InputStream[] captured = {null};
+            final InputStream[] captured = {null};
             String[] remote = {null};
             when(cmd.withRemotePath(any())).thenAnswer(pathInv -> {
                 capturedRemotePaths.add(pathInv.getArgument(0));
@@ -256,7 +257,7 @@ class ContainerLauncherTest {
                         }
                         return null;
                     }
-                    try { captured[0].transferTo(java.io.OutputStream.nullOutputStream()); }
+                    try { captured[0].transferTo(OutputStream.nullOutputStream()); }
                     catch (Exception ignored) {}
                 }
                 return null;
@@ -535,6 +536,30 @@ class ContainerLauncherTest {
                         .filter(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION=")).toList());
     }
 
+    @ParameterizedTest
+    @CsvSource({"JSON, DEBUG, DEBUG", "JSON, , INFO", "Text, , "})
+    void launchPassesTheLoggingConfigToTheRuntime(String logFormat, String level, String runtimeLevel) {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("logging-config-fn");
+        fn.setHotReloadHostPath("/home/ci/code");
+        fn.setRuntime("python3.13");
+        fn.setHandler("fn.handler");
+        fn.setLogFormat(logFormat);
+        fn.setApplicationLogLevel(level);
+
+        launcher.launch(fn);
+
+        List<String> expected = new ArrayList<>(List.of("AWS_LAMBDA_LOG_FORMAT=" + logFormat));
+        if (runtimeLevel != null) {
+            expected.add("AWS_LAMBDA_LOG_LEVEL=" + runtimeLevel);
+        }
+        assertEquals(expected,
+                captureRealContainerSpec().env().stream()
+                        .filter(value -> value.startsWith("AWS_LAMBDA_LOG_FORMAT=")
+                                || value.startsWith("AWS_LAMBDA_LOG_LEVEL="))
+                        .toList());
+    }
+
     @Test
     void launchFunction_hotReloadMountsTheHostDirectoryReadOnlyAtVarTask() {
         LambdaFunction fn = new LambdaFunction();
@@ -624,6 +649,72 @@ class ContainerLauncherTest {
         verify(lifecycleManager, never()).create(any(ContainerSpec.class), anyString());
     }
 
+    private ContainerLauncher newLauncher(ImageResolver selectedResolver) {
+        return newLauncher(selectedResolver, null);
+    }
+
+    private ContainerLauncher newLauncher(ImageResolver selectedResolver,
+                                          CurrentContainerNetworkResolver networkResolver) {
+        ContainerBuilder builder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer,
+                networkResolver);
+        ContainerReachableEndpoint endpoint =
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566);
+        return new ContainerLauncher(builder, lifecycleManager, logStreamer, selectedResolver,
+                runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
+                layerService, new LaunchedContainerAwsEnv(endpoint),
+                executionRoleCredentials, codeVolumeFunctionStore());
+    }
+
+    private void stubDaemonVersion(String platformName, List<VersionComponent> components) {
+        VersionCmd versionCmd = mock(VersionCmd.class);
+        Version version = mock(Version.class);
+        when(dockerClient.versionCmd()).thenReturn(versionCmd);
+        when(versionCmd.exec()).thenReturn(version);
+        when(version.getPlatform()).thenReturn(new VersionPlatform().withName(platformName));
+        when(version.getComponents()).thenReturn(components);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "arm64, true, , linux/arm64, arm64",
+            "x86_64, true, , linux/amd64, amd64",
+            ", true, , linux/amd64, amd64",
+            "arm64, false, , , fallback",
+            "arm64, true, --platform linux/amd64, linux/amd64, amd64",
+            "x86_64, false, --platform linux/arm64, linux/arm64, arm64"
+    })
+    void launchFunction_selectsRuntimePinForEffectiveContainerPlatform(
+            String architecture, boolean honourArchitecture, String flags,
+            String expectedPlatform, String expectedImage) throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        lenient().when(lambda.honourArchitectures()).thenReturn(honourArchitecture);
+        when(lambda.dockerFlags()).thenReturn(Optional.ofNullable(flags));
+        when(lambda.runtimeImages()).thenReturn(Map.of(
+                "nodejs20.x", "registry.example/node:fallback",
+                "nodejs20.x.linux.amd64", "registry.example/node:amd64",
+                "nodejs20.x.linux.arm64", "registry.example/node:arm64"));
+        launcher = newLauncher(new ImageResolver(config));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("runtime-pin-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(Files.createDirectory(tempDir.resolve("runtime-pin-code")).toString());
+        if (architecture != null) {
+            fn.setArchitectures(List.of(architecture));
+        }
+
+        launcher.launch(fn);
+
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
+        if (expectedPlatform == null) {
+            verify(lifecycleManager).create(spec.capture());
+            verify(lifecycleManager, never()).create(any(ContainerSpec.class), anyString());
+        } else {
+            verify(lifecycleManager).create(spec.capture(), eq(expectedPlatform));
+        }
+        assertEquals("registry.example/node:" + expectedImage, spec.getValue().image());
+    }
+
     @ParameterizedTest
     @MethodSource("invalidPersistedArchitectures")
     void launchFunction_rejectsInvalidPersistedArchitecturesBeforeCreatingContainer(
@@ -656,10 +747,13 @@ class ContainerLauncherTest {
                 List.of("arm64", "x86_64"));
     }
 
-    @Test
-    void launchFunction_usesArm64DockerPlatformForCodeVolumeHelper() throws Exception {
+    @ParameterizedTest
+    @CsvSource({"arm64, ", "x86_64, --platform linux/arm64"})
+    void launchFunction_usesArm64DockerPlatformForCodeVolumeHelper(String architecture, String flags)
+            throws Exception {
         EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
-        when(lambda.honourArchitectures()).thenReturn(true);
+        lenient().when(lambda.honourArchitectures()).thenReturn(true);
+        when(lambda.dockerFlags()).thenReturn(Optional.ofNullable(flags));
         Path codePath = Files.createDirectory(tempDir.resolve("large-arm64-code"));
         Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]);
 
@@ -669,15 +763,11 @@ class ContainerLauncherTest {
         fn.setHandler("index.handler");
         fn.setCodeLocalPath(codePath.toString());
         fn.setCodeSha256("large-arm64-code-sha");
-        fn.setArchitectures(List.of("arm64"));
+        fn.setArchitectures(List.of(architecture));
 
-        long originalThreshold = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+        withLoweredCodeVolumeThreshold(() -> {
             launcher.launch(fn);
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalThreshold;
-        }
+        });
 
         ArgumentCaptor<String> platformCaptor = ArgumentCaptor.forClass(String.class);
         verify(lifecycleManager, times(2)).create(any(ContainerSpec.class), platformCaptor.capture());
@@ -708,6 +798,31 @@ class ContainerLauncherTest {
                 spec.labels());
     }
 
+    @ParameterizedTest
+    @CsvSource({"java21, true", "java8.al2, true", "java17, true", "nodejs20.x, false", "python3.13, false",
+            "provided.al2023, false"})
+    void launchFunction_hasTheJvmsOfAJavaRuntimeTrustFlocisCa(String runtime, boolean javaTrustStore)
+            throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("code"));
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("runtime-fn");
+        fn.setRuntime(runtime);
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+
+        launcher.launch(fn);
+
+        assertEquals(javaTrustStore, captureRealContainerSpec().javaTrustStore());
+    }
+
+    @Test
+    void launchFunction_hasTheJvmsOfAContainerImageTrustFlocisCa() {
+        launcher.launch(imageFunction());
+
+        assertTrue(captureRealContainerSpec().javaTrustStore());
+    }
+
     @Test
     void launchFunction_createsWithoutBindMountsOrVolume_forSmallCode() throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("code"));
@@ -728,6 +843,122 @@ class ContainerLauncherTest {
         // The code is tar-copied straight into /var/task on the real container.
         assertTrue(capturedRemotePaths.contains("/var/task"),
                 "small code should be copied directly into /var/task");
+    }
+
+    @Test
+    void launchFunction_inPodmanComposeBridgeUsesFlociIpWithoutHostGateway() {
+        CurrentContainerNetworkResolver networkResolver = mock(CurrentContainerNetworkResolver.class);
+        when(networkResolver.resolveNetworkName()).thenReturn(Optional.of("podman_compose_default"));
+        when(dockerHostResolver.resolve()).thenReturn("10.89.0.5");
+        lenient().when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+        when(config.services().lambda().extraHosts()).thenReturn(Optional.of(List.of("db.internal:10.0.0.5")));
+        stubDaemonVersion("linux/amd64/fedora-42", List.of(new VersionComponent().withName("Podman Engine")));
+
+        newLauncher(imageResolver, networkResolver).launch(imageFunction());
+
+        ContainerSpec spec = captureRealContainerSpec();
+        assertEquals("podman_compose_default", spec.networkMode());
+        assertTrue(spec.env().contains("AWS_LAMBDA_RUNTIME_API=10.89.0.5:9000"));
+        assertTrue(spec.env().contains("AWS_ENDPOINT_URL=http://10.89.0.5:4566"));
+        assertEquals(List.of("db.internal:10.0.0.5"), spec.extraHosts());
+    }
+
+    @Test
+    void launchFunction_inNativeLinuxDockerBridgeKeepsHostAliasWithFlociIpCallback() {
+        CurrentContainerNetworkResolver networkResolver = mock(CurrentContainerNetworkResolver.class);
+        when(networkResolver.resolveNetworkName()).thenReturn(Optional.of("docker_compose_default"));
+        when(dockerHostResolver.resolve()).thenReturn("172.18.0.5");
+        lenient().when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+        stubDaemonVersion("Docker Engine - Community", List.of());
+        LambdaFunction fn = imageFunction();
+        fn.setEnvironment(Map.of("HOST_SERVICE_URL", "http://host.docker.internal:8080"));
+
+        newLauncher(imageResolver, networkResolver).launch(fn);
+
+        ContainerSpec spec = captureRealContainerSpec();
+        assertEquals("docker_compose_default", spec.networkMode());
+        assertTrue(spec.env().contains("AWS_LAMBDA_RUNTIME_API=172.18.0.5:9000"));
+        assertTrue(spec.env().contains("HOST_SERVICE_URL=http://host.docker.internal:8080"));
+        assertTrue(spec.extraHosts().contains("host.docker.internal:host-gateway"));
+    }
+
+    @Test
+    void launchFunction_onNativeLinuxDockerAddsHostGatewayForCallback() {
+        when(dockerHostResolver.resolve()).thenReturn("host.docker.internal");
+        when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+        stubDaemonVersion("Docker Engine - Community", List.of());
+
+        launcher.launch(imageFunction());
+
+        ContainerSpec spec = captureRealContainerSpec();
+        assertTrue(spec.env().contains("AWS_LAMBDA_RUNTIME_API=host.docker.internal:9000"));
+        assertTrue(spec.env().contains("AWS_ENDPOINT_URL=http://host.docker.internal:4566"));
+        assertEquals(List.of("host.docker.internal:host-gateway"), spec.extraHosts());
+    }
+
+    @Test
+    void launchFunction_prefersHostAliasFromDockerFlags() {
+        when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
+                "--add-host host.docker.internal:192.0.2.10"));
+        when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+
+        launcher.launch(imageFunction());
+
+        assertEquals(List.of("host.docker.internal:192.0.2.10"), captureRealContainerSpec().extraHosts());
+        verify(dockerClient, never()).versionCmd();
+    }
+
+    @Test
+    void launchFunction_prefersHostAliasFromExtraHosts() {
+        when(config.services().lambda().extraHosts()).thenReturn(Optional.of(List.of(
+                "host.docker.internal:192.0.2.11", "db.internal:192.0.2.12")));
+        when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+
+        launcher.launch(imageFunction());
+
+        assertEquals(List.of("host.docker.internal:192.0.2.11", "db.internal:192.0.2.12"),
+                captureRealContainerSpec().extraHosts());
+        verify(dockerClient, never()).versionCmd();
+    }
+
+    @Test
+    void launchFunction_keepsHostAliasWhenDaemonMetadataIsUnknown() {
+        VersionCmd versionCmd = mock(VersionCmd.class);
+        when(dockerClient.versionCmd()).thenReturn(versionCmd);
+        when(versionCmd.exec()).thenReturn(new Version());
+        when(dockerHostResolver.resolve()).thenReturn("172.18.0.5");
+        when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+
+        launcher.launch(imageFunction());
+        launcher.launch(imageFunction());
+
+        assertEquals(List.of("host.docker.internal:host-gateway"), captureRealContainerSpec().extraHosts());
+        verify(dockerClient, times(1)).versionCmd();
+    }
+
+    @Test
+    void launchFunction_keepsHostAliasWhenVersionProbeFails() {
+        VersionCmd versionCmd = mock(VersionCmd.class);
+        when(dockerClient.versionCmd()).thenReturn(versionCmd);
+        when(versionCmd.exec()).thenThrow(new IllegalStateException("/version unavailable"));
+        when(dockerHostResolver.resolve()).thenReturn("172.18.0.5");
+        when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+
+        launcher.launch(imageFunction());
+
+        assertEquals(List.of("host.docker.internal:host-gateway"), captureRealContainerSpec().extraHosts());
+    }
+
+    @Test
+    void launchFunction_reusesDetectedEngineAcrossInvocations() {
+        when(dockerHostResolver.resolve()).thenReturn("172.18.0.5");
+        when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+        stubDaemonVersion("Docker Engine - Community", List.of());
+
+        launcher.launch(imageFunction());
+        launcher.launch(imageFunction());
+
+        verify(dockerClient, times(1)).versionCmd();
     }
 
     @Test
@@ -1315,7 +1546,7 @@ class ContainerLauncherTest {
         assertTrue(spec.binds().stream()
                         .anyMatch(b -> b.getPath().equals("/home/user/.aws")
                                 && b.getVolume().getPath().equals("/opt/aws-config")
-                                && b.getAccessMode() == com.github.dockerjava.api.model.AccessMode.ro),
+                                && b.getAccessMode() == AccessMode.ro),
                 "awsConfigPath should be bind-mounted read-only to /opt/aws-config");
 
         // Should set explicit file paths for SDK discovery
@@ -1627,14 +1858,9 @@ class ContainerLauncherTest {
         fn.setCodeSha256("large-fn-sha-v1");
         when(lifecycleManager.create(any())).thenReturn("helper-123", "container-123");
 
-        long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        try {
-            // Force the volume path without writing a 32 MiB file.
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024; // 4 KiB
+        withLoweredCodeVolumeThreshold(() -> {
             launcher.launch(fn);
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = original;
-        }
+        });
 
         ContainerSpec spec = captureRealContainerSpec();
         // The real container mounts /var/task read-only from the code volume...
@@ -1714,13 +1940,9 @@ class ContainerLauncherTest {
         // The code-volume populate fails (daemon under load), before any container is created.
         doThrow(new RuntimeException("docker daemon busy")).when(lifecycleManager).ensureVolume(any());
 
-        long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024; // force the volume path without a 32 MiB file
+        withLoweredCodeVolumeThreshold(() -> {
             assertThrows(RuntimeException.class, () -> launcher.launch(fn));
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = original;
-        }
+        });
 
         // The runtime-api port allocated before the populate is released on this failure path...
         verify(runtimeApiServerFactory).release(runtimeApiServer);
@@ -1748,14 +1970,10 @@ class ContainerLauncherTest {
         // ensureCodeVolume checks, regardless of what the in-memory flag says.
         when(lifecycleManager.volumeExists(anyString())).thenReturn(false);
 
-        long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+        withLoweredCodeVolumeThreshold(() -> {
             launcher.launch(fn);
             launcher.launch(fn);
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = original;
-        }
+        });
 
         // Populated twice, once per launch, because the bookkeeping alone is never trusted.
         assertEquals(2, capturedRemotePaths.stream().filter("/var/task"::equals).count(),
@@ -2177,7 +2395,7 @@ class ContainerLauncherTest {
                 new CodeStore(tempDir.resolve("code-store")), new ZipExtractor(), null,
                 new RegionResolver("us-east-1", "000000000000"), null, null,
                 new LambdaTargetResolver(store, null), null, null, null, null, null,
-                null, null, null, null, null, new ObjectMapper());
+                null, null, null, null, null, new ObjectMapper(), null);
     }
 
     @Test
@@ -2204,27 +2422,26 @@ class ContainerLauncherTest {
         v2.setCodeSha256("cleanup-fn-sha-v2");
         String volumeV2 = ContainerLauncher.codeVolumeName(v2);
 
-        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
-            launcher.launch(v1);
-            launcher.launch(v2);
+        withLoweredCodeVolumeThreshold(() -> {
+            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+            try {
+                launcher.launch(v1);
+                launcher.launch(v2);
 
-            // The v1 volume is superseded but not yet cleaned up: the grace period hasn't elapsed.
-            launcher.cleanupSupersededVolumes();
-            verify(lifecycleManager, never()).removeVolume(volumeV1);
+                // The v1 volume is superseded but not yet cleaned up: the grace period hasn't elapsed.
+                launcher.cleanupSupersededVolumes();
+                verify(lifecycleManager, never()).removeVolume(volumeV1);
 
-            // Once the grace period has (trivially) elapsed, the sweep removes exactly the
-            // superseded v1 volume, not the current v2 one.
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-            launcher.cleanupSupersededVolumes();
-            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
-            verify(lifecycleManager, never()).removeVolume(volumeV2);
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-        }
+                // Once the grace period has (trivially) elapsed, the sweep removes exactly the
+                // superseded v1 volume, not the current v2 one.
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+                launcher.cleanupSupersededVolumes();
+                verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+                verify(lifecycleManager, never()).removeVolume(volumeV2);
+            } finally {
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+            }
+        });
     }
 
     @Test
@@ -2256,25 +2473,24 @@ class ContainerLauncherTest {
         // fast path actually evaluates volumeExists instead of short-circuiting past it.
         when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
 
-        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
-            store.save("us-east-1", v1);
-            launcher.launch(v1);
-            store.save("us-east-1", v2);
-            launcher.launch(v2);
-            store.save("us-east-1", v1);
-            launcher.launch(v1); // roll back
+        withLoweredCodeVolumeThreshold(() -> {
+            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+            try {
+                store.save("us-east-1", v1);
+                launcher.launch(v1);
+                store.save("us-east-1", v2);
+                launcher.launch(v2);
+                store.save("us-east-1", v1);
+                launcher.launch(v1); // roll back
 
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-            launcher.cleanupSupersededVolumes();
-            verify(lifecycleManager, never()).removeVolume(volumeV1);
-            verify(lifecycleManager, times(1)).removeVolume(volumeV2);
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-        }
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+                launcher.cleanupSupersededVolumes();
+                verify(lifecycleManager, never()).removeVolume(volumeV1);
+                verify(lifecycleManager, times(1)).removeVolume(volumeV2);
+            } finally {
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+            }
+        });
     }
 
     /**
@@ -2301,23 +2517,22 @@ class ContainerLauncherTest {
         when(lifecycleManager.tryVolumeLabels(volumeV1))
                 .thenReturn(Optional.of(Map.of("floci_namespace", "someone-else")));
 
-        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-            launcher.launch(v1);
-            launcher.launch(v2);
+        withLoweredCodeVolumeThreshold(() -> {
+            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+            try {
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+                launcher.launch(v1);
+                launcher.launch(v2);
 
-            launcher.cleanupSupersededVolumes();
-            launcher.cleanupSupersededVolumes();
+                launcher.cleanupSupersededVolumes();
+                launcher.cleanupSupersededVolumes();
 
-            verify(lifecycleManager, never()).removeVolume(volumeV1);
-            verify(lifecycleManager, times(1)).tryVolumeLabels(volumeV1);
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-        }
+                verify(lifecycleManager, never()).removeVolume(volumeV1);
+                verify(lifecycleManager, times(1)).tryVolumeLabels(volumeV1);
+            } finally {
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+            }
+        });
     }
 
     @Test
@@ -2347,25 +2562,24 @@ class ContainerLauncherTest {
         // v1's volume persists (still in use) no matter how many times removal is attempted.
         when(lifecycleManager.removeVolume(volumeV1)).thenReturn(false);
 
-        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
-            launcher.launch(v1);
-            launcher.launch(v2);
+        withLoweredCodeVolumeThreshold(() -> {
+            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+            try {
+                launcher.launch(v1);
+                launcher.launch(v2);
 
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-            launcher.cleanupSupersededVolumes();
-            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+                launcher.cleanupSupersededVolumes();
+                verify(lifecycleManager, times(1)).removeVolume(volumeV1);
 
-            // A later sweep must still retry it, not have silently dropped it after the first
-            // no-op'd attempt.
-            launcher.cleanupSupersededVolumes();
-            verify(lifecycleManager, times(2)).removeVolume(volumeV1);
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-        }
+                // A later sweep must still retry it, not have silently dropped it after the first
+                // no-op'd attempt.
+                launcher.cleanupSupersededVolumes();
+                verify(lifecycleManager, times(2)).removeVolume(volumeV1);
+            } finally {
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+            }
+        });
     }
 
     @Test
@@ -2397,50 +2611,49 @@ class ContainerLauncherTest {
 
         when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
 
-        java.util.concurrent.CountDownLatch cleanupHoldingLock = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.CountDownLatch releaseCleanup = new java.util.concurrent.CountDownLatch(1);
+        CountDownLatch cleanupHoldingLock = new CountDownLatch(1);
+        CountDownLatch releaseCleanup = new CountDownLatch(1);
         doAnswer(inv -> {
             cleanupHoldingLock.countDown();
             // Blocks here while still holding volumeV1's per-volume lock, simulating a slow delete.
-            assertTrue(releaseCleanup.await(5, java.util.concurrent.TimeUnit.SECONDS),
+            assertTrue(releaseCleanup.await(5, TimeUnit.SECONDS),
                     "test did not release cleanup in time");
             return null;
         }).when(lifecycleManager).removeVolume(volumeV1);
 
-        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
-            launcher.launch(v1);
-            launcher.launch(v2);
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-
-            Thread cleanupThread = new Thread(launcher::cleanupSupersededVolumes);
-            cleanupThread.start();
-            assertTrue(cleanupHoldingLock.await(5, java.util.concurrent.TimeUnit.SECONDS),
-                    "cleanup never reached removeVolume");
-
-            java.util.concurrent.atomic.AtomicBoolean rollbackReturned =
-                    new java.util.concurrent.atomic.AtomicBoolean(false);
-            Thread rollbackThread = new Thread(() -> {
+        withLoweredCodeVolumeThreshold(() -> {
+            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+            try {
                 launcher.launch(v1);
-                rollbackReturned.set(true);
-            });
-            rollbackThread.start();
+                launcher.launch(v2);
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
 
-            // Give the rollback every chance to (wrongly) proceed if the lock weren't shared.
-            Thread.sleep(200);
-            assertFalse(rollbackReturned.get(),
-                    "rollback must block while cleanup holds the volume's lock, not race past it");
+                Thread cleanupThread = new Thread(launcher::cleanupSupersededVolumes);
+                cleanupThread.start();
+                assertTrue(cleanupHoldingLock.await(5, TimeUnit.SECONDS),
+                        "cleanup never reached removeVolume");
 
-            releaseCleanup.countDown();
-            cleanupThread.join(5000);
-            rollbackThread.join(5000);
-            assertTrue(rollbackReturned.get(), "rollback should complete once cleanup releases the lock");
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-        }
+                AtomicBoolean rollbackReturned =
+                        new AtomicBoolean(false);
+                Thread rollbackThread = new Thread(() -> {
+                    launcher.launch(v1);
+                    rollbackReturned.set(true);
+                });
+                rollbackThread.start();
+
+                // Give the rollback every chance to (wrongly) proceed if the lock weren't shared.
+                Thread.sleep(200);
+                assertFalse(rollbackReturned.get(),
+                        "rollback must block while cleanup holds the volume's lock, not race past it");
+
+                releaseCleanup.countDown();
+                cleanupThread.join(5000);
+                rollbackThread.join(5000);
+                assertTrue(rollbackReturned.get(), "rollback should complete once cleanup releases the lock");
+            } finally {
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+            }
+        });
     }
 
     @Test
@@ -2475,59 +2688,58 @@ class ContainerLauncherTest {
         // fast path actually evaluates volumeExists instead of short-circuiting past it.
         when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
 
-        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+        withLoweredCodeVolumeThreshold(() -> {
+            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+            try {
 
-            // Pre-populate v1's volume with an ordinary launch, before installing the create()
-            // blocking stub below - otherwise that stub would catch populateCodeVolume's own
-            // helper-container create() call instead of the real container's.
-            launcher.launch(v1);
+                // Pre-populate v1's volume with an ordinary launch, before installing the create()
+                // blocking stub below - otherwise that stub would catch populateCodeVolume's own
+                // helper-container create() call instead of the real container's.
+                launcher.launch(v1);
 
-            java.util.concurrent.CountDownLatch launchReachedCreate = new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.CountDownLatch releaseLaunch = new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.atomic.AtomicBoolean blockedOnce = new java.util.concurrent.atomic.AtomicBoolean(false);
-            doAnswer(inv -> {
-                if (blockedOnce.compareAndSet(false, true)) {
-                    // Only the delayed re-launch of v1 (the first caller after this stub is
-                    // installed) blocks here; v2's later launch below must not, or the test would
-                    // deadlock itself waiting on its own main thread to release the latch.
-                    launchReachedCreate.countDown();
-                    assertTrue(releaseLaunch.await(5, java.util.concurrent.TimeUnit.SECONDS),
-                            "test did not release the delayed launch in time");
-                }
-                return "container-123";
-            }).when(lifecycleManager).create(any());
+                CountDownLatch launchReachedCreate = new CountDownLatch(1);
+                CountDownLatch releaseLaunch = new CountDownLatch(1);
+                AtomicBoolean blockedOnce = new AtomicBoolean(false);
+                doAnswer(inv -> {
+                    if (blockedOnce.compareAndSet(false, true)) {
+                        // Only the delayed re-launch of v1 (the first caller after this stub is
+                        // installed) blocks here; v2's later launch below must not, or the test would
+                        // deadlock itself waiting on its own main thread to release the latch.
+                        launchReachedCreate.countDown();
+                        assertTrue(releaseLaunch.await(5, TimeUnit.SECONDS),
+                                "test did not release the delayed launch in time");
+                    }
+                    return "container-123";
+                }).when(lifecycleManager).create(any());
 
-            Thread launchThread = new Thread(() -> launcher.launch(v1));
-            launchThread.start();
-            assertTrue(launchReachedCreate.await(5, java.util.concurrent.TimeUnit.SECONDS),
-                    "v1's delayed re-launch never reached create()");
+                Thread launchThread = new Thread(() -> launcher.launch(v1));
+                launchThread.start();
+                assertTrue(launchReachedCreate.await(5, TimeUnit.SECONDS),
+                        "v1's delayed re-launch never reached create()");
 
-            assertEquals(1, launcher.inFlightCount(volumeV1),
-                    "ensureCodeVolume must mark the volume in-flight before create() confirms it");
+                assertEquals(1, launcher.inFlightCount(volumeV1),
+                        "ensureCodeVolume must mark the volume in-flight before create() confirms it");
 
-            // A redeploy resolves v2 and supersedes v1's volume while v1's own launch is still stuck.
-            launcher.launch(v2);
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1; // grace period elapses instantly
+                // A redeploy resolves v2 and supersedes v1's volume while v1's own launch is still stuck.
+                launcher.launch(v2);
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1; // grace period elapses instantly
 
-            launcher.cleanupSupersededVolumes();
-            verify(lifecycleManager, never()).removeVolume(volumeV1);
+                launcher.cleanupSupersededVolumes();
+                verify(lifecycleManager, never()).removeVolume(volumeV1);
 
-            // Let the delayed launch finish; it releases its in-flight reference on success.
-            releaseLaunch.countDown();
-            launchThread.join(5000);
-            assertEquals(0, launcher.inFlightCount(volumeV1),
-                    "in-flight count must be released once create() succeeds");
+                // Let the delayed launch finish; it releases its in-flight reference on success.
+                releaseLaunch.countDown();
+                launchThread.join(5000);
+                assertEquals(0, launcher.inFlightCount(volumeV1),
+                        "in-flight count must be released once create() succeeds");
 
-            // Nothing is in flight anymore, so a later sweep is free to actually delete it.
-            launcher.cleanupSupersededVolumes();
-            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-        }
+                // Nothing is in flight anymore, so a later sweep is free to actually delete it.
+                launcher.cleanupSupersededVolumes();
+                verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+            } finally {
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+            }
+        });
     }
 
     @Test
@@ -2554,18 +2766,16 @@ class ContainerLauncherTest {
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("xfn-sha-v1");
 
-        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+        withLoweredCodeVolumeThreshold(() -> {
 
             Object functionLock = launcher.functionVolumeTransitionLockFor("xfn");
-            java.util.concurrent.CountDownLatch testHoldingLock = new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.CountDownLatch releaseLock = new java.util.concurrent.CountDownLatch(1);
+            CountDownLatch testHoldingLock = new CountDownLatch(1);
+            CountDownLatch releaseLock = new CountDownLatch(1);
             Thread holderThread = new Thread(() -> {
                 synchronized (functionLock) {
                     testHoldingLock.countDown();
                     try {
-                        assertTrue(releaseLock.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                        assertTrue(releaseLock.await(5, TimeUnit.SECONDS),
                                 "test did not release the function lock in time");
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
@@ -2573,7 +2783,7 @@ class ContainerLauncherTest {
                 }
             });
             holderThread.start();
-            assertTrue(testHoldingLock.await(5, java.util.concurrent.TimeUnit.SECONDS),
+            assertTrue(testHoldingLock.await(5, TimeUnit.SECONDS),
                     "test thread never acquired the function lock");
 
             AtomicBoolean launchReturned = new AtomicBoolean(false);
@@ -2593,9 +2803,7 @@ class ContainerLauncherTest {
             holderThread.join(5000);
             launchThread.join(5000);
             assertTrue(launchReturned.get(), "launch should complete once the function lock is released");
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
-        }
+        });
     }
 
     @Test
@@ -2627,24 +2835,23 @@ class ContainerLauncherTest {
         v2.setCodeLocalPath(codePath.toString());
         v2.setCodeSha256("lock-persist-fn-sha-v2");
 
-        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-        try {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
-            launcher.launch(v1);
-            assertTrue(launcher.hasCodeVolumeLock(volumeV1), "lock must exist right after populate");
+        withLoweredCodeVolumeThreshold(() -> {
+            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+            try {
+                launcher.launch(v1);
+                assertTrue(launcher.hasCodeVolumeLock(volumeV1), "lock must exist right after populate");
 
-            launcher.launch(v2); // supersedes v1's volume, queues it for cleanup
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-            launcher.cleanupSupersededVolumes(); // deletes v1's volume for real
+                launcher.launch(v2); // supersedes v1's volume, queues it for cleanup
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+                launcher.cleanupSupersededVolumes(); // deletes v1's volume for real
 
-            assertTrue(launcher.hasCodeVolumeLock(volumeV1),
-                    "lock must still exist even after the volume itself was deleted - "
-                            + "pruning it here is exactly the bug this test guards against");
-        } finally {
-            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-        }
+                assertTrue(launcher.hasCodeVolumeLock(volumeV1),
+                        "lock must still exist even after the volume itself was deleted - "
+                                + "pruning it here is exactly the bug this test guards against");
+            } finally {
+                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+            }
+        });
     }
 
     /** Builds a tar archive matching what {@code docker cp}/{@code copyArchiveFromContainerCmd}
@@ -2662,7 +2869,7 @@ class ContainerLauncherTest {
      *  (name -> executable), so filtering logic (non-executable files, nested paths) can be
      *  exercised. Names containing "/" are written as-is (not prefixed), to model entries nested
      *  more than one level below the extensions directory. */
-    private static byte[] tarOfRaw(java.util.Map<String, Boolean> nameToExecutable) throws IOException {
+    private static byte[] tarOfRaw(Map<String, Boolean> nameToExecutable) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         try (TarArchiveOutputStream tar = new TarArchiveOutputStream(bos)) {
             TarArchiveEntry dir = new TarArchiveEntry("extensions/");
@@ -2693,16 +2900,16 @@ class ContainerLauncherTest {
      *  calling {@code launch()} to assert on exactly which discovered names were (and weren't) launched. */
     private List<ExecCreateCmd> stubExtensionDiscoveryFromTar(byte[] tar) {
         CopyArchiveFromContainerCmd copyCmd = mock(CopyArchiveFromContainerCmd.class);
-        when(copyCmd.exec()).thenReturn(new java.io.ByteArrayInputStream(tar));
+        when(copyCmd.exec()).thenReturn(new ByteArrayInputStream(tar));
         when(dockerClient.copyArchiveFromContainerCmd("container-123", "/opt/extensions"))
                 .thenReturn(copyCmd);
 
-        List<ExecCreateCmd> launchCmds = new java.util.ArrayList<>();
+        List<ExecCreateCmd> launchCmds = new ArrayList<>();
         lenient().when(dockerClient.execCreateCmd("container-123"))
                 .thenAnswer(invocation -> {
                     ExecCreateCmd launchCmd = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
                     ExecCreateCmdResponse launchResponse = mock(ExecCreateCmdResponse.class);
-                    when(launchResponse.getId()).thenReturn("exec-launch-" + java.util.UUID.randomUUID());
+                    when(launchResponse.getId()).thenReturn("exec-launch-" + UUID.randomUUID());
                     when(launchCmd.exec()).thenReturn(launchResponse);
                     launchCmds.add(launchCmd);
                     return launchCmd;
@@ -2744,7 +2951,7 @@ class ContainerLauncherTest {
      *  via {@code withCmd(String...)}, in call order — the {@code /opt/extensions/<name>} path
      *  each discovered extension binary was launched with. */
     private static List<String> capturedLaunchPaths(List<ExecCreateCmd> launchCmds) {
-        List<String> paths = new java.util.ArrayList<>();
+        List<String> paths = new ArrayList<>();
         for (ExecCreateCmd cmd : launchCmds) {
             ArgumentCaptor<String[]> captor = ArgumentCaptor.forClass(String[].class);
             verify(cmd).withCmd(captor.capture());
@@ -2803,7 +3010,7 @@ class ContainerLauncherTest {
                 new ContainerLogStreamer(dockerClient, cloudWatchLogs),
                 imageResolver, runtimeApiServerFactory, dockerHostResolver, config,
                 ecrRegistryManager,
-                mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class),
+                mock(LambdaLayerService.class),
                 new LaunchedContainerAwsEnv(reachableEndpoint),
                 executionRoleCredentials);
 
@@ -2987,7 +3194,7 @@ class ContainerLauncherTest {
         assertEquals(List.of("/opt/extensions/lambda-adapter", "/opt/extensions/otel-collector"),
                 capturedLaunchPaths(launchCmds));
     }
-    private static void withLoweredCodeVolumeThreshold(Runnable action) {
+    private static void withLoweredCodeVolumeThreshold(ThrowingRunnable action) throws Exception {
         long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
         try {
             ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
@@ -2997,4 +3204,8 @@ class ContainerLauncherTest {
         }
     }
 
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
 }

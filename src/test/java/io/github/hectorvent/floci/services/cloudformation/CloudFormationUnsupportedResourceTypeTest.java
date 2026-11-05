@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
+import io.github.hectorvent.floci.services.ecr.EcrService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -13,9 +14,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -131,6 +134,54 @@ class CloudFormationUnsupportedResourceTypeTest {
                 "expected the skipped delete to be reported at warn, got: " + rendered(logged));
     }
 
+    private static final String ECR_TYPE = "AWS::ECR::Repository";
+    private static final String ECR_DISABLED_HINT =
+            "Resource type AWS::ECR::Repository is not provisioned because its Floci service is disabled. "
+                    + "Set floci.services.ecr.enabled=true to provision it.";
+
+    @Test
+    void disabledEcrIsStubbedWithADisabledReasonAndWarningNamingItsFlag() {
+        CfnResourceDispatcher ecrDisabled = ecrDisabledDispatcher(true);
+        List<LogRecord> logged = new CopyOnWriteArrayList<>();
+
+        StackResource resource = whileCapturingProvisionerLogs(logged, () -> ecrDisabled
+                .provision("Repo", ECR_TYPE, props(), engine(), REGION, ACCOUNT_ID, STACK_NAME));
+
+        assertEquals("CREATE_COMPLETE", resource.getStatus());
+        assertEquals(ECR_DISABLED_HINT + " It was stubbed and nothing was created for it.",
+                resource.getStatusReason());
+        assertTrue(logged.stream().anyMatch(r -> r.getLevel().intValue() >= Level.WARNING.intValue()
+                        && ("Stubbing resource type AWS::ECR::Repository (Repo): its service is disabled, "
+                        + "so nothing is created for it. Set floci.services.ecr.enabled=true to provision it.")
+                        .equals(formatted(r))),
+                "expected the disabled-service warning, got: " + rendered(logged));
+        assertTrue(logged.stream().noneMatch(r -> formatted(r).contains("allow-stub-unsupported-resource-types")),
+                "the warning must not blame the unsupported-type flag: " + rendered(logged));
+    }
+
+    @Test
+    void disabledEcrFailsWithTheDisabledReasonWhenTheStubIsDisallowed() {
+        StackResource resource = ecrDisabledDispatcher(false)
+                .provision("Repo", ECR_TYPE, props(), engine(), REGION, ACCOUNT_ID, STACK_NAME);
+
+        assertEquals("CREATE_FAILED", resource.getStatus());
+        assertEquals(ECR_DISABLED_HINT, resource.getStatusReason());
+        assertNull(resource.getPhysicalId());
+    }
+
+    private CfnResourceDispatcher ecrDisabledDispatcher(boolean stubAllowed) {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.CloudFormationServiceConfig cloudformation =
+                mock(EmulatorConfig.CloudFormationServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.cloudformation()).thenReturn(cloudformation);
+        when(cloudformation.allowStubUnsupportedResourceTypes()).thenReturn(stubAllowed);
+        EcrService ecr = mock(EcrService.class);
+        when(ecr.isDisabled()).thenReturn(true);
+        return CfnProvisionerFixture.builder().objectMapper(mapper).config(config).ecr(ecr).build();
+    }
+
     private CfnResourceDispatcher provisionerWithStubAllowed(boolean allowed) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
@@ -149,9 +200,9 @@ class CloudFormationUnsupportedResourceTypeTest {
 
     /** Runs {@code action} with a handler on the provisioner's logger, collecting every record. */
     private <T> T whileCapturingProvisionerLogs(List<LogRecord> collected,
-                                                java.util.function.Supplier<T> action) {
-        java.util.logging.Logger logger =
-                java.util.logging.Logger.getLogger(CfnResourceDispatcher.class.getName());
+                                                Supplier<T> action) {
+        Logger logger =
+                Logger.getLogger(CfnResourceDispatcher.class.getName());
         Level original = logger.getLevel();
         Handler handler = new Handler() {
             @Override
