@@ -3,6 +3,19 @@
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 **Endpoint:** `POST http://localhost:4566/`
 
+## EC2 instance network placement
+
+`AWS::EC2::Instance` uses the resolved `NetworkInterfaces` entry with `DeviceIndex`
+`0` for its subnet, `GroupSet` security groups and launch-time
+`AssociatePublicIpAddress` setting. Changing or removing the resolved primary
+interface replaces the instance, including changes supplied through parameters.
+The prior declaration is restored on rollback. As specified by the
+[CloudFormation instance contract](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ec2-instance.html#cfn-ec2-instance-subnetid),
+declare the subnet and security groups inside the interface when using
+`NetworkInterfaces`; combining interfaces with instance-level `SubnetId`,
+`SecurityGroupIds` or `SecurityGroups` is rejected. Existing ENI attachment and
+secondary-interface provisioning remain outside this implementation.
+
 ## Mapping values
 
 `Fn::FindInMap` preserves both string and list values from `Mappings`. Mapped lists
