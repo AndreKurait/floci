@@ -27,6 +27,14 @@ class ElbClassicHealthCheckTargetTest {
     }
 
     @Test
+    void httpsTargetPreservesTlsAndItsPath() {
+        ElbClassicHealthChecker.Target target = ElbClassicHealthChecker.Target.parse("HTTPS:8443/ping");
+        assertEquals("https", target.scheme());
+        assertEquals(8443, target.port());
+        assertEquals("/ping", target.path());
+    }
+
+    @Test
     void tcpTargetHasNoPathAndSoIsProbedByConnection() {
         ElbClassicHealthChecker.Target target = ElbClassicHealthChecker.Target.parse("TCP:8080");
         assertNull(target.path());
@@ -35,8 +43,10 @@ class ElbClassicHealthCheckTargetTest {
     }
 
     @Test
-    void sslTargetIsAConnectionProbeToo() {
-        assertNull(ElbClassicHealthChecker.Target.parse("SSL:443").path());
+    void sslTargetRequiresTlsWithoutAnHttpPath() {
+        ElbClassicHealthChecker.Target target = ElbClassicHealthChecker.Target.parse("SSL:443");
+        assertEquals("ssl", target.scheme());
+        assertNull(target.path());
     }
 
     @Test

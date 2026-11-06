@@ -77,10 +77,13 @@ opened and no traffic is forwarded. Only the control plane and health checking a
 - A new load balancer gets AWS's default health check (`TCP:80`, interval 30, timeout 5,
   unhealthy 2, healthy 10) and AWS's default attributes (cross-zone off, access log off,
   connection draining off with a 300 second timeout, 60 second idle timeout).
-- Health checks probe the instance's reachable local address. `HTTP:`/`HTTPS:` targets are probed
-  with an HTTP request to the target's path and any 2xx/3xx is healthy; `TCP:`/`SSL:` targets are
-  probed by connecting. TLS is not terminated — an `HTTPS:` target is probed over plain HTTP on
-  the same port.
+- Health checks probe the instance's reachable local address. `HTTP:` and `HTTPS:` send a request
+  to the target's path and require status 200; redirects and other success codes are unhealthy.
+  `HTTPS:` uses TLS. `TCP:` requires a connection, while `SSL:` also requires a TLS handshake.
+  The configured health timeout is one deadline for connection, TLS handshake and HTTP response
+  headers, even when a backend sends bytes continuously. Expiry closes the probe connection and
+  records a failed health check. Health probes
+  do not authenticate backend certificates. TLS uses the runtime's enabled protocols and ciphers.
 - Between registration and the first successful check an instance reports `OutOfService` with
   reason code `ELB`, as it does on AWS.
 - Health is tracked per account, so two accounts can each have a load balancer with the same name

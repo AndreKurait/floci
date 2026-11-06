@@ -6,20 +6,30 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.vertx.core.Vertx;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URL;
+import java.security.GeneralSecurityException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Health checking for Classic (2012-06-01) load balancers.
@@ -60,6 +70,7 @@ public class ElbClassicHealthChecker implements Resettable {
     private final Vertx vertx;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
+    private final SSLSocketFactory backendTls = backendTls();
 
     // "account|region|lbName" → instanceId → state
     private final Map<String, Map<String, InstanceState>> states = new ConcurrentHashMap<>();
@@ -238,31 +249,70 @@ public class ElbClassicHealthChecker implements Resettable {
         return bridgeIp != null && !bridgeIp.isBlank() ? bridgeIp : instanceId;
     }
 
-    private static boolean probe(String host, Target target, int timeoutSeconds) throws IOException {
+    private boolean probe(String host, Target target, int timeoutSeconds) throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        FutureTask<Boolean> attempt = new FutureTask<>(() -> probeTransport(host, target, timeoutSeconds));
+        Thread.ofVirtual().name("classic-elb-health-probe").start(attempt);
+        try {
+            return attempt.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof IOException cause) {
+                throw cause;
+            }
+            throw new IllegalStateException("Classic ELB health probe failed", e.getCause());
+        } finally {
+            // Interrupting the virtual thread closes its blocking JDK socket, including TLS reads.
+            attempt.cancel(true);
+        }
+    }
+
+    private boolean probeTransport(String host, Target target, int timeoutSeconds) throws IOException {
         int timeoutMs = timeoutSeconds * 1000;
         if (target.path() == null) {
-            try (Socket socket = new Socket()) {
+            try (Socket socket = "ssl".equals(target.scheme()) ? backendTls.createSocket() : new Socket()) {
                 socket.connect(new InetSocketAddress(host, target.port()), timeoutMs);
+                socket.setSoTimeout(timeoutMs);
+                if (socket instanceof SSLSocket tls) {
+                    tls.startHandshake();
+                }
                 return true;
             }
         }
         URL url = new URL(target.scheme(), host, target.port(), target.path());
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        if (conn instanceof HttpsURLConnection https) {
+            https.setSSLSocketFactory(backendTls);
+            https.setHostnameVerifier((hostname, session) -> true);
+        }
         conn.setConnectTimeout(timeoutMs);
         conn.setReadTimeout(timeoutMs);
         conn.setInstanceFollowRedirects(false);
         try {
-            int code = conn.getResponseCode();
-            // Classic ELB treats any 2xx or 3xx as a healthy HTTP check.
-            return code >= 200 && code < 400;
+            return conn.getResponseCode() == HttpURLConnection.HTTP_OK;
         } finally {
             conn.disconnect();
         }
     }
 
+    private static SSLSocketFactory backendTls() {
+        try {
+            // Classic backend certificate authentication is opt-in; its policy APIs remain unsupported.
+            SSLContext context = SSLContext.getInstance("TLS");
+            context.init(null, InsecureTrustManagerFactory.INSTANCE.getTrustManagers(), null);
+            return context.getSocketFactory();
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("Cannot initialize Classic ELB backend TLS", e);
+        }
+    }
+
     /**
-     * A parsed {@code HealthCheck.Target} — {@code HTTP:8080/health}, {@code TCP:80}, and so on.
-     * {@code path} is null for the connection-only protocols, which is what selects a TCP probe.
+     * A parsed {@code HealthCheck.Target}, such as {@code HTTP:8080/health} or {@code TCP:80}.
+     * {@code path} is null for TCP and SSL; SSL also requires the TLS handshake to succeed.
      */
     record Target(String scheme, int port, String path) {
 
@@ -287,10 +337,9 @@ public class ElbClassicHealthChecker implements Resettable {
             }
             return switch (protocol) {
                 case "HTTP" -> new Target("http", port, path != null ? path : "/");
-                // Floci does not terminate TLS for Classic health checks; an HTTPS target is
-                // probed over plain HTTP against the same port rather than reported unknown.
-                case "HTTPS" -> new Target("http", port, path != null ? path : "/");
-                case "TCP", "SSL" -> new Target(null, port, null);
+                case "HTTPS" -> new Target("https", port, path != null ? path : "/");
+                case "TCP" -> new Target(null, port, null);
+                case "SSL" -> new Target("ssl", port, null);
                 default -> null;
             };
         }
