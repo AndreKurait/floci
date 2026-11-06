@@ -271,6 +271,16 @@ Set `floci.services.cloudformation.allow-stub-unsupported-resource-types` to `fa
 resource instead: it reaches `CREATE_FAILED` and the stack rolls back by default. Use it in a pipeline that
 must not pass over a resource it never got.
 
+## EC2 Key Pairs
+
+Stack deletion, replacement cleanup and rollback use the recorded `KeyPairId`. A key created
+outside the stack under a reused name remains untouched. Generated keys lose only their owned
+`/ec2/keypair/<KeyPairId>` parameter; imported keys do not own a private-key parameter.
+
+Pending cleanup preserves the key identity and parameter ownership across retries and reloads.
+Exhausting one cleanup entry does not discard another entry that still has attempts remaining.
+Cloud Control and legacy records without a key ID retain name-based deletion.
+
 ## SES Email Identities
 
 `AWS::SES::EmailIdentity` provisions an SES identity and supports in-place option updates and
