@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -88,7 +89,7 @@ public class DurableExecutionService implements Resettable {
     private final Executor launchExecutor;
     private final long invocationRetryDelayMillis;
     /** Striped, so a lookup of an unknown ARN never grows a map. Two executions may share a lock, never nest one. */
-    private final Object[] executionLocks = newLocks(LOCK_STRIPES);
+    private final StripedLocks executionLocks = new StripedLocks(LOCK_STRIPES);
     private final ConcurrentHashMap<String, Object> startLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<DurableExecution>> completions = new ConcurrentHashMap<>();
     /** Moves on reset and shutdown so an invocation result from before cannot be written afterwards. */
@@ -1086,15 +1087,7 @@ public class DurableExecutionService implements Resettable {
     }
 
     private Object lockFor(String accountId, String storeKey) {
-        return executionLocks[Math.floorMod(lockKey(accountId, storeKey).hashCode(), executionLocks.length)];
-    }
-
-    private static Object[] newLocks(int count) {
-        Object[] locks = new Object[count];
-        for (int i = 0; i < count; i++) {
-            locks[i] = new Object();
-        }
-        return locks;
+        return executionLocks.lockFor(lockKey(accountId, storeKey));
     }
 
     private Object startLock(String accountId, String region) {
