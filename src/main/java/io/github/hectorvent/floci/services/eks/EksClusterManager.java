@@ -7,6 +7,7 @@ import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Info;
+import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
@@ -908,6 +909,7 @@ public class EksClusterManager
         registerClusterNodeInstance(cluster, info.containerId());
         configureLinkLocalMetadataEndpoint(cluster, info.containerId());
         configurePodIdentityRelay(cluster, info.containerId());
+        registerPodIdentityWebhook(info.containerId(), cluster);
         activeClusters.put(clusterResourceName(cluster), cluster);
         configureVpcRoutes(cluster, info.containerId());
         attachClusterLogsFromNow(cluster);
@@ -2205,18 +2207,19 @@ public class EksClusterManager
         }
         String url = "https://" + dockerHostResolver.resolve() + ":" + config.port()
                 + podIdentityWebhookPath(clusterName, resolveClusterAccountId(cluster));
-        String manifest = buildPodIdentityWebhookConfiguration(url, certificateAuthority.caPem());
-        writeLocalCopy(Paths.get(config.services().eks().dataPath(), "webhook", clusterName,
-                POD_IDENTITY_MANIFEST_FILE), manifest, clusterName);
         try {
+            String manifest = buildPodIdentityWebhookConfiguration(url,
+                    ContainerCaBundle.endpointTrustPem(config, certificateAuthority.caPem()));
+            writeLocalCopy(Paths.get(config.services().eks().dataPath(), "webhook", clusterName,
+                    POD_IDENTITY_MANIFEST_FILE), manifest, clusterName);
             byte[] tar = tarSingleFile(POD_IDENTITY_MANIFEST_TAR_ENTRY, manifest);
             RetryingTarCopier.copyStreamed(lifecycleManager.getDockerClient(), containerId, K3S_DATA_DIR,
                     POD_IDENTITY_MANIFEST_FILE, out -> out.write(tar),
                     RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, archiveRetryBackoffMillis);
             LOG.infov("Registered the EKS Pod Identity mutating webhook ({0}) for cluster {1}", url, clusterName);
         } catch (Exception e) {
-            LOG.warnv("EKS cluster {0} gets no pod identity injection: could not copy {1} into the k3s "
-                    + "container: {2}", clusterName, POD_IDENTITY_MANIFEST_FILE, e.getMessage());
+            LOG.warnv(e, "EKS cluster {0} gets no pod identity injection: could not install {1} into the k3s "
+                    + "container", clusterName, POD_IDENTITY_MANIFEST_FILE);
         }
     }
 
@@ -2232,7 +2235,7 @@ public class EksClusterManager
     /**
      * Builds the {@code MutatingWebhookConfiguration} k3s auto-applies. Scoped to pod {@code CREATE}
      * alone, and {@code failurePolicy: Ignore} so an unreachable or failing Floci never blocks a pod
-     * from being created. The {@code caBundle} is Floci's local CA, base64 of the PEM as Kubernetes
+     * from being created. The {@code caBundle} trusts Floci's HTTPS endpoint and local CA, base64 of the PEM as Kubernetes
      * expects.
      *
      * <p>{@code timeoutSeconds} is 3, not the Kubernetes default of 10: Floci is a local process, so
