@@ -35,10 +35,14 @@ class AppConfigCfnIntegrationTest {
     private static final String TEMPLATE = """
             {
               "Resources": {
+                "Alarm": {"Type":"AWS::CloudWatch::Alarm","Properties":{
+                  "AlarmName":"configuration","Namespace":"AppConfigLifecycle","MetricName":"Errors",
+                  "Statistic":"Sum","Period":60,"EvaluationPeriods":1,"Threshold":1,
+                  "ComparisonOperator":"GreaterThanThreshold","ActionsEnabled":false}},
                 "Application": {"Type":"AWS::AppConfig::Application","Properties":{"Name":"cfn-configuration-test"}},
                 "Environment": {"Type":"AWS::AppConfig::Environment","Properties":{
                   "ApplicationId":{"Ref":"Application"},"Name":"testing",
-                  "Monitors":[{"AlarmArn":"arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration"}]}},
+                  "Monitors":[{"AlarmArn":{"Fn::GetAtt":["Alarm","Arn"]}}]}},
                 "Profile": {"Type":"AWS::AppConfig::ConfigurationProfile","Properties":{
                   "ApplicationId":{"Ref":"Application"},"Name":"settings","LocationUri":"hosted"}},
                 "Strategy": {"Type":"AWS::AppConfig::DeploymentStrategy","Properties":{

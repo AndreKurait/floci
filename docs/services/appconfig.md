@@ -12,7 +12,7 @@ their region explicitly in all storage modes.
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
 
 Environment creation retains up to five monitor definitions, including the optional alarm role.
-These definitions are returned by environment reads; alarm evaluation and automatic rollback are not implemented.
+These definitions are returned by environment reads and monitored during rollout and final bake.
 Deployment creation captures the selected profile's configuration name and location URI for subsequent deployment reads.
 Profiles whose `Type` is omitted report no type.
 
@@ -67,8 +67,7 @@ such as one from an S3 or SSM source, returns `ResourceNotFoundException`.
 
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
-Floci does not evaluate the alarms or trigger automatic rollback. More than five monitors, or an `AlarmRoleArn`
-that is not an IAM role ARN, returns `BadRequestException`.
+More than five monitors, or an `AlarmRoleArn` that is not an IAM role ARN, returns `BadRequestException`.
 `StartDeployment` and `GetDeployment` return the deployed profile's name and location URI as
 `ConfigurationName` and `ConfigurationLocationUri`. Deployments stored by earlier Floci versions did not
 record them, so on those neither is set.
@@ -80,15 +79,36 @@ A deployment stored by an earlier Floci version returns no strategy settings fro
 A configuration profile created without `Type` reports no type, as AWS documents no default.
 
 Deployment status follows the recorded strategy: `DEPLOYING` for its rollout duration,
-then `BAKING` at 100 percent for its final bake time, then `COMPLETE`. Get and list
-report linear or exponential growth in steps across the rollout. Completion timestamps
+then `BAKING` at 100 percent for its final bake time, then `COMPLETE`. Background ticks,
+get and list advance linear or exponential growth in steps across the rollout. Completion timestamps
 include both durations, use the API's ISO 8601 format and survive restart, even after
 the strategy is changed or deleted. A zero-duration rollout starts baking immediately;
 zero rollout and bake durations complete immediately.
 
 Configuration content still becomes available immediately to every client. Gradual
-per-client delivery and alarm evaluation are not implemented; reported deployment
+per-client delivery is not implemented; reported deployment
 progress does not yet control which clients receive the configuration.
+
+During rollout and final bake, an enabled monitor in `ALARM` or `INSUFFICIENT_DATA`
+automatically restores the previous configuration and records `ROLLBACK_STARTED` and
+`ROLLBACK_COMPLETED` events with the alarm ARN and `TriggeredBy: CLOUDWATCH_ALARM`.
+Disabled alarm actions suppress rollback. A background worker checks active deployments,
+including after restart, so data-plane clients do not need to poll deployment status.
+Completed deployments are no longer monitored.
+
+Monitors must reference existing alarms in the deployment's account, region and partition.
+With IAM enforcement enabled, `AlarmRoleArn` must identify a role in that account that
+trusts AppConfig and permits `cloudwatch:DescribeAlarms`. Metric alarms can use an alarm
+resource permission; composite alarms require `Resource: "*"`. This uses the role session's
+ordinary policy, boundary and organization checks.
+
+An unreadable monitor is rejected before a deployment starts. If access is lost later,
+Floci leaves progress unchanged, reports `BadRequestException` on progress reads, and
+retries in the background. That failure handling is a local safeguard; exact AWS behavior
+for mid-deployment permission revocation is not qualified. Explicit stop/revert bypasses
+monitor reads, preserving recovery when the monitoring role is broken.
+Monitoring consumes CloudWatch's reported state; it does not add support for
+[unimplemented metric-math alarm evaluation](cloudwatch.md).
 
 `StopDeployment` with `AllowRevert=true` returns an in-progress deployment as `ROLLED_BACK`
 or a completed deployment as `REVERTED`, restoring the previous available configuration
@@ -158,7 +178,8 @@ does not revert a newer one. Already reverted deployments and deployments outsid
 their 72-hour revert window need no further change. Other failures, including missing
 prior configuration content, propagate instead of reporting successful cleanup.
 `KmsKeyIdentifier`, `DynamicExtensionParameters` and deployment `Tags` are rejected.
-This lifecycle does not add alarm evaluation or gradual per-client content delivery.
+Alarm-triggered rollback fails an in-progress stack deployment and restores the previous
+configuration. This lifecycle does not add gradual per-client content delivery.
 
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
 description of an application, environment or configuration profile, an environment's `Monitors`, an application's

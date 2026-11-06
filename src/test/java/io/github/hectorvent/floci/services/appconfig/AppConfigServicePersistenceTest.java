@@ -53,7 +53,7 @@ class AppConfigServicePersistenceTest {
         String app;
         String profile;
         try {
-            AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"));
+            AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
             app = service.createApplication(Map.of("Name", "versions")).getId();
             profile = service.createConfigurationProfile(app, Map.of("Name", "settings", "LocationUri", "hosted")).getId();
             assertEquals(1, service.createHostedConfigurationVersion(app, profile, new byte[]{1}, "text/plain", null)
@@ -66,7 +66,7 @@ class AppConfigServicePersistenceTest {
         }
         StorageFactory second = newFactory();
         try {
-            AppConfigService service = new AppConfigService(second, new RegionResolver("us-east-1", "000000000000"));
+            AppConfigService service = new AppConfigService(second, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
             assertEquals(3, service.createHostedConfigurationVersion(app, profile, new byte[]{3}, "text/plain", null)
                     .getVersionNumber());
             assertArrayEquals(new byte[]{1}, service.getHostedConfigurationVersion(app, profile, 1).getContent());
@@ -79,7 +79,7 @@ class AppConfigServicePersistenceTest {
     void concurrentHostedVersionCreatesKeepEveryWritersContent() throws Exception {
         StorageFactory storage = newFactory();
         try (ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor()) {
-            AppConfigService service = new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"));
+            AppConfigService service = new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
             String app = service.createApplication(Map.of("Name", "versions")).getId();
             String profile = service.createConfigurationProfile(app, Map.of("Name", "settings", "LocationUri", "hosted"))
                     .getId();
@@ -134,7 +134,7 @@ class AppConfigServicePersistenceTest {
                   "State": "COMPLETE", "Description": null}}
                 """);
 
-        AppConfigService service = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"));
+        AppConfigService service = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
 
         Environment environment = service.getEnvironment("app1", "env1");
         assertEquals("stored-env", environment.getName());
@@ -167,7 +167,7 @@ class AppConfigServicePersistenceTest {
     @Test
     void deploymentStrategySettingsSurviveARestart() {
         StorageFactory first = newFactory();
-        AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"));
+        AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
         String appId = service.createApplication(Map.of("Name", "restarted-app")).getId();
         String environmentId = service.createEnvironment(appId, Map.of("Name", "restarted-env")).getId();
         String profileId = service.createConfigurationProfile(appId, Map.of(
@@ -181,7 +181,7 @@ class AppConfigServicePersistenceTest {
                 "DeploymentStrategyId", strategyId));
         first.shutdownAll();
 
-        AppConfigService restarted = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"));
+        AppConfigService restarted = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
         // With the strategy gone, the settings can only come from the stored deployment.
         restarted.deleteDeploymentStrategy(strategyId);
 
@@ -195,7 +195,7 @@ class AppConfigServicePersistenceTest {
     @Test
     void monitorsAndDeploymentLocationsSurviveARestart() {
         StorageFactory first = newFactory();
-        AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"));
+        AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
         String appId = service.createApplication(Map.of("Name", "restarted-app")).getId();
         String monitoredId = service.createEnvironment(appId, Map.of("Name", "monitored", "Monitors", List.of(
                 Map.of("AlarmArn", ALARM_ARN, "AlarmRoleArn", ALARM_ROLE_ARN),
@@ -209,7 +209,7 @@ class AppConfigServicePersistenceTest {
                 "DeploymentStrategyId", "AppConfig.AllAtOnce")).getDeploymentNumber();
         first.shutdownAll();
 
-        AppConfigService restarted = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"));
+        AppConfigService restarted = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
 
         assertEquals(List.of(new Monitor(ALARM_ARN, ALARM_ROLE_ARN), new Monitor(SECOND_ALARM_ARN, null)),
                 restarted.getEnvironment(appId, monitoredId).getMonitors());

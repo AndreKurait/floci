@@ -23,6 +23,7 @@ import static io.github.hectorvent.floci.testing.ThreadStates.awaitBlockedOrDone
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
 
 /**
  * The update methods CloudFormation uses read an entity, change it and write it back. A delete the
@@ -131,6 +132,6 @@ class AppConfigServiceUpdateRaceTest {
     /** An AppConfig service whose {@code fileName} store is {@code store} and every other store in memory. */
     private static AppConfigService serviceWithStore(String fileName, StorageBackend<String, ?> store) {
         return new AppConfigService(new InMemoryStorageFactory(ACCOUNT).withStore(fileName, store),
-                new RegionResolver("us-east-1", ACCOUNT));
+                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class));
     }
 }

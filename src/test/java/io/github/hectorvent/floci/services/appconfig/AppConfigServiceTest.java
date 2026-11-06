@@ -35,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -55,11 +56,11 @@ class AppConfigServiceTest {
 
     @BeforeEach
     void setUp() {
-        applicationStore = mock(AccountAwareStorageBackend.class);
-        environmentStore = mock(AccountAwareStorageBackend.class);
-        AccountAwareStorageBackend<ConfigurationProfile> profileStore = mock(AccountAwareStorageBackend.class);
-        deploymentStore = mock(AccountAwareStorageBackend.class);
-        activeConfigStore = mock(AccountAwareStorageBackend.class);
+        applicationStore = storage();
+        environmentStore = storage();
+        AccountAwareStorageBackend<ConfigurationProfile> profileStore = storage();
+        deploymentStore = storage();
+        activeConfigStore = storage();
         Map<String, Deployment> deployments = new HashMap<>();
         doAnswer(invocation -> {
             deployments.put(invocation.getArgument(0, String.class), invocation.getArgument(1, Deployment.class));
@@ -70,7 +71,7 @@ class AppConfigServiceTest {
         when(deploymentStore.keys()).thenAnswer(invocation -> Set.copyOf(deployments.keySet()));
         doAnswer(invocation -> deployments.remove(invocation.getArgument(0, String.class)))
                 .when(deploymentStore).delete(anyString());
-        AccountAwareStorageBackend<DeploymentStrategy> strategyStore = mock(AccountAwareStorageBackend.class);
+        AccountAwareStorageBackend<DeploymentStrategy> strategyStore = storage();
         Map<String, DeploymentStrategy> strategies = new HashMap<>();
         doAnswer(invocation -> {
             strategies.put(invocation.getArgument(0, String.class), invocation.getArgument(1, DeploymentStrategy.class));
@@ -89,7 +90,7 @@ class AppConfigServiceTest {
             case "appconfig-strategies.json" -> strategyStore;
             case "appconfig-deployments.json" -> deploymentStore;
             case "appconfig-active-configs.json" -> activeConfigStore;
-            default -> mock(AccountAwareStorageBackend.class);
+            default -> storage();
         }).when(storageFactory).create(anyString(), anyString(), any(TypeReference.class));
 
         Application application = new Application();
@@ -107,7 +108,16 @@ class AppConfigServiceTest {
         profile.setId("profile");
         profile.setApplicationId("app");
         when(profileStore.get("profile")).thenReturn(Optional.of(profile));
-        service = new AppConfigService(storageFactory, new RegionResolver("us-east-1", "000000000000"));
+        service = new AppConfigService(storageFactory, new RegionResolver("us-east-1", "000000000000"),
+                mock(AppConfigAlarmMonitor.class));
+    }
+
+    private static <V> AccountAwareStorageBackend<V> storage() {
+        AccountAwareStorageBackend<V> store = mock(AccountAwareStorageBackend.class);
+        when(store.accountId()).thenReturn("000000000000");
+        when(store.getForAccount(eq("000000000000"), anyString()))
+                .thenAnswer(invocation -> store.get(invocation.getArgument(1, String.class)));
+        return store;
     }
 
     @Test

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.appconfig.AppConfigAlarmMonitor;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
@@ -21,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
 
 class CloudFormationAppConfigDeploymentLifecycleTest {
     private static final String ACCOUNT = "000000000000";
@@ -38,7 +40,7 @@ class CloudFormationAppConfigDeploymentLifecycleTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        appconfig = new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT));
+        appconfig = new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class));
         cfn = CloudFormationServiceFixture.create(CfnProvisionerFixture.builder().appConfig(appconfig).build());
         app = appconfig.createApplication(Map.of("Name", "settings")).getId();
         environment = appconfig.createEnvironment(app, Map.of("Name", "test")).getId();
