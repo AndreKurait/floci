@@ -21,7 +21,7 @@ The management plane allows you to create and manage applications, environments,
 Environment creation retains up to five monitor definitions, including the optional alarm role.
 These definitions are returned by environment reads and monitored during rollout and final bake.
 Deployment creation captures the selected profile's configuration name and location URI for subsequent deployment reads.
-Profiles whose `Type` is omitted report no type.
+Hosted and S3 profiles default an omitted `Type` to `AWS.Freeform`. Other sources keep an omitted type unset.
 
 CloudFormation creates backing AppConfig resources. See [CloudFormation](#cloudformation)
 for supported types, updates, deletion and property limitations.
@@ -69,8 +69,19 @@ and `Configuration-Version`, without `Content-Type` or `Content-Length`. An empt
 that the caller has not received still returns HTTP 200 and its stored content type.
 A missing or undeployed environment returns `BadRequestException`; an unknown application or configuration profile
 returns `ResourceNotFoundException`.
-Only hosted configurations are served: a deployed version with no hosted configuration version behind it,
-such as one from an S3 or SSM source, returns `ResourceNotFoundException`.
+Hosted configurations and deployed S3 object versions are served. Other sources, including SSM,
+are not retrieved; a version without stored content returns `ResourceNotFoundException`.
+
+An S3 profile uses an `s3://bucket/key` URI or S3 object ARN as `LocationUri`, and an IAM
+`RetrievalRoleArn`. The source must belong to the application's AWS partition. `StartDeployment`
+retrieves the specified immutable object version before changing the active configuration. With IAM
+enforcement enabled, the role must trust AppConfig and allow `s3:GetBucketVersioning` and
+`s3:GetObjectVersion`; bucket policies, role boundaries, SCPs and version-specific object tags apply.
+Cross-account buckets require `FLOCI_SERVICES_S3_GLOBAL_BUCKET_NAMESPACE=true`.
+Missing versions, denied retrievals, unsupported storage classes and objects larger than 1 MB are rejected.
+The admitted bytes persist with the profile, so readers and rollback keep working after the source is
+deleted or retrieval permission changes. S3 configurations deployed before this support must be redeployed.
+SSE-S3 is supported. SSE-KMS, SSE-C, mutable `null` object versions and profile validators are not supported.
 
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
@@ -83,7 +94,7 @@ They also return the deployment strategy's `DeploymentDurationInMinutes`, `Final
 deployment with the profile name and strategy settings it recorded, also once its strategy is deleted.
 A deployment stored by an earlier Floci version returns no strategy settings from `GetDeployment`, and
 `ListDeployments` reports the strategy's current settings while the strategy exists.
-A configuration profile created without `Type` reports no type, as AWS documents no default.
+Reading an older profile does not backfill its stored `Type`.
 
 Deployment status follows the recorded strategy: `DEPLOYING` for its rollout duration,
 then `BAKING` at 100 percent for its final bake time, then `COMPLETE`. Background ticks,
@@ -189,7 +200,8 @@ Alarm-triggered rollback fails an in-progress stack deployment and restores the 
 configuration. This lifecycle does not add gradual per-client content delivery.
 
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
-description of an application, environment or configuration profile, an environment's `Monitors`, an application's
+description of an application, environment or configuration profile, a profile's `RetrievalRoleArn`,
+an environment's `Monitors`, an application's
 `Tags`, and a deployment strategy's description, duration, final bake time, growth factor and growth type. A property
 the template drops is cleared, or set back to its default (`FinalBakeTimeInMinutes` 0, `GrowthType` `LINEAR`). A
 change to a createOnly property (`ApplicationId` on an environment or configuration profile, `LocationUri` or `Type`
@@ -198,8 +210,8 @@ created and the old one is deleted once the stack update completes. A failed sta
 place and deletes what it created.
 
 Deleting an environment deletes its deployments, and deleting a configuration profile deletes its hosted configuration
-versions. Floci keeps tags on applications only, so `Tags` on the other three types are accepted and not stored, as
-`TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier`, `RetrievalRoleArn` and `Validators`,
+versions and admitted S3 content. Floci keeps tags on applications only, so `Tags` on the other three types are accepted
+and not stored, as `TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier` and `Validators`,
 and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
 `AWS::AppConfig::Extension` and `ExtensionAssociation` are not provisioned.
 

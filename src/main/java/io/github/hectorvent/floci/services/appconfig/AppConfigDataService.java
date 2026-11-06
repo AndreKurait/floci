@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
+import io.github.hectorvent.floci.services.appconfig.model.ConfigurationContent;
 import io.github.hectorvent.floci.services.appconfig.model.ConfigurationProfile;
 import io.github.hectorvent.floci.services.appconfig.model.ConfigurationSession;
 import io.github.hectorvent.floci.services.appconfig.model.Environment;
@@ -135,12 +136,15 @@ public class AppConfigDataService {
 
         String activeVersion = appConfigService.getActiveVersion(session.getEnvironmentId(), session.getConfigurationProfileId());
         
-        HostedConfigurationVersion version = null;
+        ConfigurationContent version = null;
+        ConfigurationProfile profile = null;
         if (activeVersion != null && !activeVersion.equals(session.getLastConfigurationVersion())) {
             try {
-                version = appConfigService.getHostedConfigurationVersion(session.getApplicationId(), session.getConfigurationProfileId(), Integer.parseInt(activeVersion));
+                profile = appConfigService.getConfigurationProfile(
+                        session.getApplicationId(), session.getConfigurationProfileId());
+                version = configurationContent(profile, activeVersion);
                 session.setLastConfigurationVersion(activeVersion);
-            } catch (Exception e) {
+            } catch (AwsException e) {
                 LOG.warnv("Active version {0} not found for session {1}", activeVersion, session.getId());
             }
         }
@@ -154,13 +158,14 @@ public class AppConfigDataService {
         byte[] content = new byte[0];
         String contentType = "application/octet-stream";
         if (version != null) {
-            ConfigurationProfile profile = appConfigService.getConfigurationProfile(
-                    session.getApplicationId(), session.getConfigurationProfileId());
             ResolvedContent resolved = resolveContent(profile, version, accept);
             content = resolved.bytes();
             contentType = resolved.contentType();
         }
-        String versionLabel = (version != null) ? String.valueOf(version.getVersionNumber()) : "";
+        String versionLabel = version != null ? activeVersion : "";
+        if (version != null && !AppConfigS3Source.matches(profile)) {
+            versionLabel = String.valueOf(hostedVersionNumber(activeVersion));
+        }
 
         return new ConfigurationData(content, contentType, versionLabel, nextToken,
                 pollInterval);
@@ -194,10 +199,9 @@ public class AppConfigDataService {
         if (active == null) {
             throw new AwsException("BadRequestException", "No configuration is deployed", 400);
         }
-        HostedConfigurationVersion version = appConfigService.getHostedConfigurationVersion(
-                app.getId(), profile.getId(), hostedVersionNumber(active));
+        ConfigurationContent version = configurationContent(profile, active);
         if (active.equals(clientVersion)) {
-            return new LegacyConfiguration(new byte[0], version.getContentType(), active);
+            return new LegacyConfiguration(new byte[0], version.contentType(), active);
         }
         ResolvedContent content = resolveContent(profile, version, accept);
         return new LegacyConfiguration(content.bytes(), content.contentType(), active);
@@ -212,22 +216,31 @@ public class AppConfigDataService {
         }
     }
 
-    private ResolvedContent resolveContent(ConfigurationProfile profile, HostedConfigurationVersion version,
+    private ConfigurationContent configurationContent(ConfigurationProfile profile, String version) {
+        if (AppConfigS3Source.matches(profile)) {
+            return appConfigService.getS3ConfigurationContent(profile.getApplicationId(), profile.getId(), version);
+        }
+        HostedConfigurationVersion hosted = appConfigService.getHostedConfigurationVersion(
+                profile.getApplicationId(), profile.getId(), hostedVersionNumber(version));
+        return new ConfigurationContent(hosted.getContent(), hosted.getContentType());
+    }
+
+    private ResolvedContent resolveContent(ConfigurationProfile profile, ConfigurationContent version,
                                            String accept) {
         if (!"AWS.AppConfig.FeatureFlags".equals(profile.getType())) {
-            return new ResolvedContent(version.getContent(), version.getContentType());
+            return new ResolvedContent(version.content(), version.contentType());
         }
         // As AWS does: a caller that accepts Ion gets variant flags whole, to evaluate against its own context.
-        if (acceptsFeatureFlagIon(accept) && FeatureFlagIonEncoder.hasVariants(version.getContent(), objectMapper)) {
-            byte[] ion = FeatureFlagIonEncoder.encode(version.getContent(), objectMapper);
+        if (acceptsFeatureFlagIon(accept) && FeatureFlagIonEncoder.hasVariants(version.content(), objectMapper)) {
+            byte[] ion = FeatureFlagIonEncoder.encode(version.content(), objectMapper);
             if (ion != null) {
                 return new ResolvedContent(ion, FeatureFlagIonEncoder.CONTENT_TYPE);
             }
             LOG.warnv("Feature flag profile {0} has variants Floci cannot encode as Ion; returning the stored JSON",
                     profile.getId());
         }
-        return new ResolvedContent(transformFeatureFlags(version.getContent(), objectMapper),
-                version.getContentType());
+        return new ResolvedContent(transformFeatureFlags(version.content(), objectMapper),
+                version.contentType());
     }
 
     static boolean acceptsFeatureFlagIon(String accept) {

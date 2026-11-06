@@ -254,7 +254,9 @@ public class CloudWatchMetricsQueryHandler {
             }
 
             queries.add(new CloudWatchMetricsService.MetricDataQuery(
-                    id, metricStat, expression, label, returnData));
+                    id, metricStat, expression, label, returnData,
+                    params.containsKey(prefix + ".Period") ? parseIntParam(params, prefix + ".Period", 0) : null,
+                    params.getFirst(prefix + ".AccountId")));
         }
         return queries;
     }

@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.core.storage.StorageOperations;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
+import io.github.hectorvent.floci.services.appconfig.model.ConfigurationContent;
 import io.github.hectorvent.floci.services.appconfig.model.ConfigurationProfile;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
 import io.github.hectorvent.floci.services.appconfig.model.DeploymentEvent;
@@ -49,10 +50,12 @@ public class AppConfigService {
     private final StorageBackend<String, HostedConfigurationVersion> versionStore;
     private final StorageBackend<String, Integer> versionCounters;
     private final AppConfigStorage<Deployment> deploymentStore;
+    private final StorageBackend<String, ConfigurationContent> sourceContentStore;
     private final StorageBackend<String, String> activeConfigStore; // envId::profileId -> versionNumber
     private final Clock clock;
     private final RegionResolver regions;
     private final AppConfigAlarmMonitor alarms;
+    private final AppConfigS3Source s3Source;
     private final Map<String, DeploymentPageToken> deploymentPageTokens = new ConcurrentHashMap<>();
     private final Map<AppConfigStorage.ScopedKey, String> monitorFailures = new ConcurrentHashMap<>();
     private static final int MAX_DEPLOYMENT_PAGE_TOKENS = 1000;
@@ -62,14 +65,17 @@ public class AppConfigService {
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
     @Inject
-    public AppConfigService(StorageFactory storageFactory, RegionResolver regions, AppConfigAlarmMonitor alarms) {
-        this(storageFactory, regions, Clock.systemUTC(), alarms);
+    public AppConfigService(StorageFactory storageFactory, RegionResolver regions, AppConfigAlarmMonitor alarms,
+                            AppConfigS3Source s3Source) {
+        this(storageFactory, regions, Clock.systemUTC(), alarms, s3Source);
     }
 
-    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock, AppConfigAlarmMonitor alarms) {
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock, AppConfigAlarmMonitor alarms,
+                     AppConfigS3Source s3Source) {
         this.clock = clock;
         this.regions = regions;
         this.alarms = alarms;
+        this.s3Source = s3Source;
         this.applicationStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-applications.json", new TypeReference<>() {});
         this.environmentStore = new AppConfigStorage<>(storageFactory, regions,
@@ -86,6 +92,8 @@ public class AppConfigService {
                 "appconfig", "appconfig-deployments.json", new TypeReference<>() {});
         this.activeConfigStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-active-configs.json", new TypeReference<>() {});
+        this.sourceContentStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-source-content.json", new TypeReference<>() {});
     }
 
     // ──────────────────────────── Application ────────────────────────────
@@ -302,7 +310,14 @@ public class AppConfigService {
         profile.setDescription((String) request.get("Description"));
         profile.setLocationUri((String) request.get("LocationUri"));
         String type = (String) request.get("Type");
-        profile.setType(type == null && "hosted".equals(profile.getLocationUri()) ? "AWS.Freeform" : type);
+        profile.setType(type == null && ("hosted".equals(profile.getLocationUri()) || AppConfigS3Source.matches(profile))
+                ? "AWS.Freeform" : type);
+        Object role = request.get("RetrievalRoleArn");
+        if (role != null && !(role instanceof String)) {
+            throw new AwsException("BadRequestException", "RetrievalRoleArn must be a string.", 400);
+        }
+        profile.setRetrievalRoleArn((String) role);
+        AppConfigS3Source.validateProfile(profile);
         profileStore.put(profile.getId(), profile);
         return profile;
     }
@@ -342,18 +357,18 @@ public class AppConfigService {
     }
 
     /**
-     * Sets the name and description of a configuration profile, as a CloudFormation update of
-     * {@code AWS::AppConfig::ConfigurationProfile} does: both are written, so a null description
-     * clears it. Floci serves no UpdateConfigurationProfile route; the CloudFormation provisioner is
-     * the only caller.
+     * Replaces mutable profile fields from a CloudFormation template, validating before storage.
      */
     public synchronized ConfigurationProfile updateConfigurationProfile(String applicationId, String profileId,
-                                                                        String name, String description) {
+                                                                        String name, String description,
+                                                                        String retrievalRoleArn) {
         ConfigurationProfile profile = copy(profileStore.get(profileId)
                 .filter(p -> applicationId.equals(p.getApplicationId()))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Configuration profile not found", 404)));
         profile.setName(name);
         profile.setDescription(description);
+        profile.setRetrievalRoleArn(retrievalRoleArn);
+        AppConfigS3Source.validateProfile(profile);
         profileStore.put(profile.getId(), profile);
         return profile;
     }
@@ -410,6 +425,7 @@ public class AppConfigService {
         // lifecycle - cascade the delete so a caller can't still fetch versions for a profile
         // that's supposedly gone.
         StorageOperations.deleteByPrefix(versionStore, appId + "::" + profileId + "::");
+        StorageOperations.deleteByPrefix(sourceContentStore, appId + "::" + profileId + "::");
         versionCounters.delete(appId + "::" + profileId);
         profileStore.delete(profileId);
     }
@@ -618,6 +634,8 @@ public class AppConfigService {
         DeploymentStrategy strategy = getDeploymentStrategy(strategyId);
         validateDeploymentTiming(strategy);
         alarms.rollbackCause(environment.getMonitors());
+        ConfigurationContent sourceContent = AppConfigS3Source.matches(profile)
+                ? Objects.requireNonNull(s3Source.retrieve(profile, version)) : null;
 
         Deployment deployment = new Deployment();
         deployment.setApplicationId(appId);
@@ -647,6 +665,9 @@ public class AppConfigService {
         }
         deployment.setDescription((String) request.get("Description"));
 
+        if (sourceContent != null) {
+            sourceContentStore.put(appId + "::" + profileId + "::" + version, sourceContent);
+        }
         deploymentStore.put(appId + "::" + envId + "::" + deployment.getDeploymentNumber(), deployment);
 
         // Update active configuration
@@ -722,6 +743,13 @@ public class AppConfigService {
             if ("hosted".equals(location) && !hasHostedConfigurationVersion(previous)) {
                 throw new AwsException("BadRequestException",
                         "The previous hosted configuration version is no longer available.", 400);
+            }
+            if (location != null && location.startsWith("s3://")
+                    && sourceContentStore.get(previous.getApplicationId() + "::"
+                            + previous.getConfigurationProfileId() + "::"
+                            + previous.getConfigurationVersion()).isEmpty()) {
+                throw new AwsException("BadRequestException",
+                        "The previous S3 configuration was not retrieved by a deployment.", 400);
             }
         }
         String activeKey = deployment.getEnvironmentId() + "::" + deployment.getConfigurationProfileId();
@@ -971,6 +999,14 @@ public class AppConfigService {
 
     public synchronized String getActiveVersion(String envId, String profileId) {
         return activeConfigStore.get(envId + "::" + profileId).orElse(null);
+    }
+
+    /** Reads a deployment's admitted S3 content without using its retrieval role again. */
+    public ConfigurationContent getS3ConfigurationContent(String applicationId, String profileId, String version) {
+        getConfigurationProfile(applicationId, profileId);
+        return sourceContentStore.get(applicationId + "::" + profileId + "::" + version)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "S3 configuration content was not retrieved by a deployment.", 404));
     }
 
     // ──────────────────────────── Tags ────────────────────────────

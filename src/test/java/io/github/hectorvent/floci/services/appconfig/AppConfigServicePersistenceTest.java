@@ -3,9 +3,11 @@ package io.github.hectorvent.floci.services.appconfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.appconfig.model.ConfigurationContent;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
 import io.github.hectorvent.floci.services.appconfig.model.DeploymentSummary;
 import io.github.hectorvent.floci.services.appconfig.model.Environment;
@@ -15,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -31,10 +34,14 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class AppConfigServicePersistenceTest {
@@ -53,7 +60,8 @@ class AppConfigServicePersistenceTest {
         String app;
         String profile;
         try {
-            AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+            AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+                    mock(AppConfigS3Source.class));
             app = service.createApplication(Map.of("Name", "versions")).getId();
             profile = service.createConfigurationProfile(app, Map.of("Name", "settings", "LocationUri", "hosted")).getId();
             assertEquals(1, service.createHostedConfigurationVersion(app, profile, new byte[]{1}, "text/plain", null)
@@ -66,7 +74,8 @@ class AppConfigServicePersistenceTest {
         }
         StorageFactory second = newFactory();
         try {
-            AppConfigService service = new AppConfigService(second, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+            AppConfigService service = new AppConfigService(second, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+                    mock(AppConfigS3Source.class));
             assertEquals(3, service.createHostedConfigurationVersion(app, profile, new byte[]{3}, "text/plain", null)
                     .getVersionNumber());
             assertArrayEquals(new byte[]{1}, service.getHostedConfigurationVersion(app, profile, 1).getContent());
@@ -79,7 +88,8 @@ class AppConfigServicePersistenceTest {
     void concurrentHostedVersionCreatesKeepEveryWritersContent() throws Exception {
         StorageFactory storage = newFactory();
         try (ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor()) {
-            AppConfigService service = new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+            AppConfigService service = new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+                    mock(AppConfigS3Source.class));
             String app = service.createApplication(Map.of("Name", "versions")).getId();
             String profile = service.createConfigurationProfile(app, Map.of("Name", "settings", "LocationUri", "hosted"))
                     .getId();
@@ -134,7 +144,8 @@ class AppConfigServicePersistenceTest {
                   "State": "COMPLETE", "Description": null}}
                 """);
 
-        AppConfigService service = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+        AppConfigService service = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
 
         Environment environment = service.getEnvironment("app1", "env1");
         assertEquals("stored-env", environment.getName());
@@ -167,7 +178,8 @@ class AppConfigServicePersistenceTest {
     @Test
     void deploymentStrategySettingsSurviveARestart() {
         StorageFactory first = newFactory();
-        AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+        AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
         String appId = service.createApplication(Map.of("Name", "restarted-app")).getId();
         String environmentId = service.createEnvironment(appId, Map.of("Name", "restarted-env")).getId();
         String profileId = service.createConfigurationProfile(appId, Map.of(
@@ -181,7 +193,8 @@ class AppConfigServicePersistenceTest {
                 "DeploymentStrategyId", strategyId));
         first.shutdownAll();
 
-        AppConfigService restarted = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+        AppConfigService restarted = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
         // With the strategy gone, the settings can only come from the stored deployment.
         restarted.deleteDeploymentStrategy(strategyId);
 
@@ -195,7 +208,8 @@ class AppConfigServicePersistenceTest {
     @Test
     void monitorsAndDeploymentLocationsSurviveARestart() {
         StorageFactory first = newFactory();
-        AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+        AppConfigService service = new AppConfigService(first, new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
         String appId = service.createApplication(Map.of("Name", "restarted-app")).getId();
         String monitoredId = service.createEnvironment(appId, Map.of("Name", "monitored", "Monitors", List.of(
                 Map.of("AlarmArn", ALARM_ARN, "AlarmRoleArn", ALARM_ROLE_ARN),
@@ -209,7 +223,8 @@ class AppConfigServicePersistenceTest {
                 "DeploymentStrategyId", "AppConfig.AllAtOnce")).getDeploymentNumber();
         first.shutdownAll();
 
-        AppConfigService restarted = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+        AppConfigService restarted = new AppConfigService(newFactory(), new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
 
         assertEquals(List.of(new Monitor(ALARM_ARN, ALARM_ROLE_ARN), new Monitor(SECOND_ALARM_ARN, null)),
                 restarted.getEnvironment(appId, monitoredId).getMonitors());
@@ -217,6 +232,58 @@ class AppConfigServicePersistenceTest {
         Deployment deployment = restarted.getDeployment(appId, monitoredId, deploymentNumber);
         assertEquals("service-settings", deployment.getConfigurationName());
         assertEquals("ssm-parameter://service-settings", deployment.getConfigurationLocationUri());
+    }
+
+    @Test
+    void s3RollbackAndRestartUseTheContentAdmittedBeforeTheSourceFailed() {
+        StorageFactory first = newFactory();
+        RegionResolver regions = new RegionResolver("us-east-1", "000000000000");
+        AppConfigS3Source source = mock(AppConfigS3Source.class);
+        byte[] content = "{\"limit\":10}".getBytes(StandardCharsets.UTF_8);
+        when(source.retrieve(any(), eq("source-one"))).thenReturn(new ConfigurationContent(content, "application/json"));
+        when(source.retrieve(any(), eq("source-two"))).thenReturn(new ConfigurationContent(new byte[]{2}, "text/plain"));
+        when(source.retrieve(any(), eq("missing"))).thenThrow(new AwsException("BadRequestException", "Denied", 400));
+        String app;
+        String profile;
+        String environment;
+        try {
+            AppConfigService service = new AppConfigService(first, regions, mock(AppConfigAlarmMonitor.class), source);
+            app = service.createApplication(Map.of("Name", "s3-configuration")).getId();
+            environment = service.createEnvironment(app, Map.of("Name", "test")).getId();
+            profile = service.createConfigurationProfile(app, Map.of("Name", "settings",
+                    "LocationUri", "s3://configuration-source/settings.json",
+                    "RetrievalRoleArn", ALARM_ROLE_ARN)).getId();
+            String strategy = service.createDeploymentStrategy(Map.of("Name", "immediate",
+                    "DeploymentDurationInMinutes", 0, "FinalBakeTimeInMinutes", 0,
+                    "GrowthFactor", 100, "ReplicateTo", "NONE")).getId();
+            service.startDeployment(app, environment, Map.of("ConfigurationProfileId", profile,
+                    "ConfigurationVersion", "source-one", "DeploymentStrategyId", strategy));
+            Deployment second = service.startDeployment(app, environment, Map.of("ConfigurationProfileId", profile,
+                    "ConfigurationVersion", "source-two", "DeploymentStrategyId", strategy));
+            assertThrows(AwsException.class, () -> service.startDeployment(app, environment,
+                    Map.of("ConfigurationProfileId", profile, "ConfigurationVersion", "missing",
+                            "DeploymentStrategyId", strategy)));
+            assertEquals("source-two", service.getActiveVersion(environment, profile));
+            assertEquals(2, service.listDeployments(app, environment, null, null).items().size());
+            service.stopDeployment(app, environment, second.getDeploymentNumber(), true);
+            assertEquals("source-one", service.getActiveVersion(environment, profile));
+        } finally {
+            first.shutdownAll();
+        }
+        StorageFactory second = newFactory();
+        AppConfigS3Source unavailable = mock(AppConfigS3Source.class);
+        try {
+            AppConfigService restarted = new AppConfigService(
+                    second, regions, mock(AppConfigAlarmMonitor.class), unavailable);
+            assertEquals("source-one", restarted.getActiveVersion(environment, profile));
+            assertEquals(ALARM_ROLE_ARN, restarted.getConfigurationProfile(app, profile).getRetrievalRoleArn());
+            assertArrayEquals(content, restarted.getS3ConfigurationContent(app, profile, "source-one").content());
+            verifyNoInteractions(unavailable);
+            restarted.deleteConfigurationProfile(app, profile);
+            assertThrows(AwsException.class, () -> restarted.getS3ConfigurationContent(app, profile, "source-one"));
+        } finally {
+            second.shutdownAll();
+        }
     }
 
     private StorageFactory newFactory() {

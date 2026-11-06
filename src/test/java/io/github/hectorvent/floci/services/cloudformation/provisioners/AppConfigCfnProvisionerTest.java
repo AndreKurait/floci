@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.appconfig.AppConfigAlarmMonitor;
+import io.github.hectorvent.floci.services.appconfig.AppConfigS3Source;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
 import io.github.hectorvent.floci.services.appconfig.model.ConfigurationProfile;
@@ -67,7 +68,8 @@ class AppConfigCfnProvisionerTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        service = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class)));
+        service = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class)));
         provisioner = new AppConfigCfnProvisioner(service);
         engine = CloudFormationTemplateEngine.standalone(ACCOUNT, REGION, STACK, MAPPER, value -> value);
     }
@@ -236,6 +238,25 @@ class AppConfigCfnProvisionerTest {
 
         assertEquals("BadRequestException", failure.getErrorCode());
         assertEquals("beta", service.getEnvironment(appId, env.getPhysicalId()).getName());
+    }
+
+    @Test
+    void s3RetrievalRolesChangeInPlaceAndRollBackWithTheProfile() {
+        String app = create(APPLICATION, props("Name", "configuration")).getPhysicalId();
+        Map<String, Object> properties = props("ApplicationId", app, "Name", "settings",
+                "LocationUri", "s3://configuration-source/settings.json", "RetrievalRoleArn", ALARM_ROLE);
+        StackResource resource = create(PROFILE, properties);
+        String id = resource.getPhysicalId();
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        properties.put("RetrievalRoleArn", ALARM_ROLE + "-replacement");
+        update(resource, properties);
+        assertEquals(id, resource.getPhysicalId());
+        assertEquals(ALARM_ROLE + "-replacement", service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        provisioner.rollbackUpdate(resource);
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        properties.remove("RetrievalRoleArn");
+        assertThrows(AwsException.class, () -> update(resource, properties));
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
     }
 
     @Test

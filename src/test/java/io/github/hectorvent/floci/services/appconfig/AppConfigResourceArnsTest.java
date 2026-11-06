@@ -73,7 +73,8 @@ class AppConfigResourceArnsTest {
     private static Fixture fixture(String region) {
         InMemoryStorageFactory storage = new InMemoryStorageFactory(ACCOUNT);
         RegionResolver regions = new RegionResolver(region, ACCOUNT);
-        AppConfigService service = new AppConfigService(storage, regions, mock(AppConfigAlarmMonitor.class));
+        AppConfigService service = new AppConfigService(storage, regions, mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
         AppConfigDataService data = new AppConfigDataService(storage, service, new ObjectMapper(), regions);
         String app = service.createApplication(Map.of("Name", "orders")).getId();
         String env = service.createEnvironment(app, Map.of("Name", "production")).getId();

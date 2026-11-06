@@ -27,3 +27,8 @@ cases remain in the default suite; both suites share owned fixtures and cleanup.
 regions. It checks implicit denial, scoped grants, explicit denial, name-to-ID
 resource resolution, configuration-token authorization without consuming a denied
 token, and `iam:PassRole` with the AppConfig service condition.
+
+`test_appconfig_s3_permissions.py` checks retrieval-role permission and trust
+failures and selected-version tag conditions. These cases require IAM enforcement;
+S3 source deployment, missing versions, rollback and CloudFormation cases remain
+in the default suite. Both suites share owned fixtures and cleanup.
