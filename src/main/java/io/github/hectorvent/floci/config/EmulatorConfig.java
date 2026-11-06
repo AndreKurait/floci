@@ -1633,6 +1633,12 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean lambdaIdentityVerificationEnabled();
 
+        /**
+         * Opt-in endpoint that returns SigV4 derived signing keys (never secrets) for sessions this
+         * Floci issued, to one configured caller. See {@code DerivedSigningKeyController}.
+         */
+        DerivedSigningKeysConfig derivedSigningKeys();
+
         @WithDefault("false")
         boolean seedDeployerPrincipal();
 
@@ -1645,6 +1651,28 @@ public interface EmulatorConfig {
 
         /** Optional local account-root ARN to service-principal membership JSON file, read at startup. */
         Optional<String> servicePrincipalMembershipsPath();
+    }
+
+    /** {@code floci.services.iam.derived-signing-keys.*}; nothing but {@code enabled} is read while it is false. */
+    interface DerivedSigningKeysConfig {
+        @WithDefault("false")
+        boolean enabled();
+
+        /** The one access key ID allowed to call the endpoint; never an IAM-store key. */
+        Optional<String> callerAccessKeyId();
+
+        /** File holding that caller's secret access key (owner-only permissions). */
+        Optional<String> callerSecretAccessKeyFile();
+
+        /** Exact regions a key may be derived for. */
+        Optional<List<String>> allowedRegions();
+
+        /** Exact SigV4 signing names a key may be derived for; names Floci serves are refused. */
+        Optional<List<String>> allowedServices();
+
+        /** {@code signing} (kSigning) and/or {@code service} (kService). */
+        @WithDefault("signing")
+        List<String> allowedLevels();
     }
 
     interface MskServiceConfig {

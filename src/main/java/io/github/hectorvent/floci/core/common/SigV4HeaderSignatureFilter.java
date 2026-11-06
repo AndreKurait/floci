@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.apigateway.ApiGatewayAwsExecuteContro
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayUserRequestController;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
+import io.github.hectorvent.floci.services.iam.DerivedSigningKeyController;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.RequestBodyReader;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
@@ -110,10 +111,14 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     private static final DateTimeFormatter AMZ_DATE =
             DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
 
-    /** Resources whose signatures another verifier owns; see the class comment. */
+    /**
+     * Resources whose signatures another verifier owns; see the class comment.
+     * {@link DerivedSigningKeyController} verifies its one configured caller itself.
+     */
     private static final Set<Class<?>> VERIFIED_ELSEWHERE = Set.of(S3Controller.class,
             ApiGatewayExecuteController.class, ApiGatewayAwsExecuteController.class,
-            ApiGatewayUserRequestController.class, AppSyncExecutionController.class);
+            ApiGatewayUserRequestController.class, AppSyncExecutionController.class,
+            DerivedSigningKeyController.class);
 
     /** REST-XML resources the catalog does not list: S3 Control answers in S3's XML. */
     private static final Set<Class<?>> UNCATALOGUED_REST_XML = Set.of(S3ControlController.class);

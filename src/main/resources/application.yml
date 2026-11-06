@@ -511,6 +511,13 @@ floci:
       enforcement-enabled: false
       issued-session-verification-enabled: false
       lambda-identity-verification-enabled: false
+      derived-signing-keys:
+        enabled: false                     # FLOCI_SERVICES_IAM_DERIVED_SIGNING_KEYS_ENABLED; docs/services/iam.md
+        # caller-access-key-id: ""         # the one caller's key ID (never an IAM key)
+        # caller-secret-access-key-file: /run/secrets/derived-key-caller   # owner-only file
+        # allowed-regions: us-east-1
+        # allowed-services: example-svc   # never a signing name Floci serves
+        # allowed-levels: signing          # signing and/or service
       seed-deployer-principal: false
       # service-principal-memberships-path: /config/service-principals.json
       # FLOCI_SERVICES_IAM_SERVICE_PRINCIPAL_MEMBERSHIPS_PATH; optional local fixture, read at startup.
