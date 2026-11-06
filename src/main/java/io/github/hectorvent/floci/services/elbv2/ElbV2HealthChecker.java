@@ -19,7 +19,9 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
 import java.net.Proxy;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.security.GeneralSecurityException;
@@ -223,7 +225,7 @@ public class ElbV2HealthChecker implements Resettable {
                                         targetId, port, outcome.cause().getMessage());
                             } else if (outcome.result() != null) {
                                 int statusCode = outcome.result();
-                                if (matchesStatusCode(statusCode, matcher)) {
+                                if ("TCP".equals(protocol) || matchesStatusCode(statusCode, matcher)) {
                                     state.consecutiveFailures = 0;
                                     state.consecutiveSuccesses++;
                                     boolean initialApplicationTarget = "initial".equals(state.status)
@@ -262,6 +264,13 @@ public class ElbV2HealthChecker implements Resettable {
     }
 
     private int probeOnce(String host, int port, String path, int timeoutSeconds, String protocol) throws IOException {
+        if ("TCP".equals(protocol)) {
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(ElbV2TargetResolver.resolveCheckedAddress(host), port),
+                        timeoutSeconds * 1000);
+                return 200;
+            }
+        }
         String scheme = "HTTPS".equals(protocol) ? "https" : "http";
         URL url = new URL(scheme, ElbV2TargetResolver.resolveCheckedAddress(host), port, path);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);

@@ -1328,6 +1328,68 @@ class ElbV2ServiceTest {
         assertEquals(timeout == 2 ? 120 : 2, group.getHealthCheckTimeoutSeconds());
     }
 
+    @ParameterizedTest
+    @CsvSource({"HTTP,ip,HTTP", "HTTPS,ip,HTTP", "TCP,ip,TCP", "TLS,ip,TCP", "UDP,ip,TCP",
+            "TCP_UDP,ip,TCP", "GENEVE,ip,TCP", "TCP,alb,HTTP"})
+    void healthCheckProtocolDefaultsFollowTheTargetProtocol(String protocol, String targetType, String expected) {
+        TargetGroup group = service.createTargetGroup(REGION, "default-check", protocol, null,
+                "GENEVE".equals(protocol) ? 6081 : 8080, "vpc-a", targetType, null, null, null, null,
+                null, null, null, null, null, null, Map.of());
+        assertEquals(expected, group.getHealthCheckProtocol());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"HTTP,ip,TCP", "HTTPS,ip,TCP", "TCP,ip,TLS", "TCP,ip,UDP", "TCP,alb,TCP"})
+    void invalidHealthCheckProtocolIsRejectedBeforePublication(String protocol, String targetType, String check) {
+        AwsException error = assertThrows(AwsException.class, () -> service.createTargetGroup(REGION,
+                "invalid-check", protocol, null, 8080, "vpc-a", targetType, check, null, null,
+                null, null, null, null, null, null, null, Map.of()));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertTrue(service.describeTargetGroups(REGION, null, List.of(), List.of()).isEmpty());
+        verifyNoInteractions(healthChecker, dataPlane);
+    }
+
+    @Test
+    void rejectedHealthProtocolChangeDoesNotChangeThePort() {
+        String arn = createTargetGroup("modify-check");
+        TargetGroup group = service.getTargetGroup(REGION, arn);
+        String originalPort = group.getHealthCheckPort();
+        clearInvocations(healthChecker, dataPlane);
+        assertThrows(AwsException.class, () -> service.modifyTargetGroup(REGION, arn,
+                "TCP", "8081", null, null, null, null, null, null, null));
+        assertEquals("HTTP", group.getHealthCheckProtocol());
+        assertEquals(originalPort, group.getHealthCheckPort());
+        verifyNoInteractions(healthChecker, dataPlane);
+    }
+
+    @ParameterizedTest
+    @CsvSource({",", "/,", ",200"})
+    void switchingTcpHealthToHttpRequiresExplicitPathAndMatcher(String path, String matcher) {
+        TargetGroup group = createTcpHealthGroup();
+        String originalPort = group.getHealthCheckPort();
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyTargetGroup(REGION,
+                group.getTargetGroupArn(), "HTTPS", "8081", null, path, null, null, null, null, matcher));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("TCP", group.getHealthCheckProtocol());
+        assertEquals(originalPort, group.getHealthCheckPort());
+    }
+
+    @Test
+    void switchingTcpHealthToHttpAcceptsExplicitPathAndMatcher() {
+        TargetGroup group = createTcpHealthGroup();
+        service.modifyTargetGroup(REGION, group.getTargetGroupArn(), "HTTPS", "8081", null,
+                "/ready", null, null, null, null, "200");
+        assertEquals("HTTPS", group.getHealthCheckProtocol());
+        assertEquals("8081", group.getHealthCheckPort());
+        assertEquals("/ready", group.getHealthCheckPath());
+        assertEquals("200", group.getMatcher());
+    }
+
+    private TargetGroup createTcpHealthGroup() {
+        return service.createTargetGroup(REGION, "tcp-health", "TCP", null, 8080, "vpc-a", "ip",
+                "TCP", null, null, null, null, null, null, null, null, null, Map.of());
+    }
+
     private String createTargetGroup(String name) {
         return service.createTargetGroup(
                 REGION, name, "HTTP", "HTTP1", 9999, "vpc-a", "instance",

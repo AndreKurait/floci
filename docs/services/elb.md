@@ -206,11 +206,17 @@ on the listener socket.
 
 ### Health checks
 
-For non-Lambda targets, the checker sends an HTTP or HTTPS GET to `HealthCheckPath`
-on `HealthCheckPort`, or the target's traffic port when configured as `traffic-port`.
-`HealthCheckProtocol` selects TLS independently of the target's application protocol.
-The response-code matcher and healthy/unhealthy thresholds affect target health.
-`HealthCheckProtocol=TCP` does not perform a TCP-only probe.
+For non-Lambda targets, TCP health checks open and close a connection without sending
+an application payload or evaluating the HTTP response-code matcher. HTTP and HTTPS
+checks send a GET to `HealthCheckPath`; HTTPS uses TLS independently of the target's
+application protocol. Checks use `HealthCheckPort`, or the target's traffic port when
+configured as `traffic-port`, and retain the configured health thresholds and deadline.
+
+TCP, TLS, UDP, TCP_UDP and GENEVE target groups default to TCP health checks. HTTP/HTTPS
+groups and target groups of type `alb` default to HTTP. TCP health checks are rejected
+for HTTP/HTTPS groups and target types `alb` and `lambda`; supported combinations are
+validated before creating or modifying the target group. Switching a TCP health check
+to HTTP or HTTPS requires an explicit health-check path and response-code matcher.
 Lambda targets are not actively probed. In ELBv2 mock mode, sockets
 and active monitoring are disabled. The proxy can route to initial targets and fails
 open to registered targets when none are healthy, so a successful request alone does

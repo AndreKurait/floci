@@ -13,11 +13,13 @@ import io.vertx.core.VertxOptions;
 import io.vertx.core.WorkerExecutor;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.net.NetServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -88,6 +90,50 @@ class ElbV2HealthCheckerTest {
             } finally {
                 isolated.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             }
+        }
+    }
+
+    @Test
+    void tcpProbeConnectsWithoutSendingHttpOrApplyingTheHttpMatcher() throws Exception {
+        CompletableFuture<Integer> received = new CompletableFuture<>();
+        AtomicInteger bytes = new AtomicInteger();
+        NetServer server = vertx.createNetServer().connectHandler(socket -> socket
+                .handler(buffer -> bytes.addAndGet(buffer.length()))
+                .closeHandler(ignored -> received.complete(bytes.get())))
+                .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        ElbV2HealthChecker checker = healthChecker();
+        try {
+            TargetGroup group = targetGroup(server.actualPort(), "404", 1, 1);
+            group.setProtocol("TCP");
+            group.setHealthCheckProtocol("TCP");
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            assertEquals(0, received.get(2, TimeUnit.SECONDS), "A TCP health check must send no HTTP payload");
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+        } finally {
+            checker.destroy();
+            server.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void tcpProbeRejectsAClosedPort() throws Exception {
+        int port;
+        try (ServerSocket listener = new ServerSocket(0)) {
+            port = listener.getLocalPort();
+        }
+        ElbV2HealthChecker checker = healthChecker();
+        try {
+            TargetGroup group = targetGroup(port, "200", 1, 1);
+            group.setProtocol("TCP");
+            group.setHealthCheckProtocol("TCP");
+            TargetDescription target = target("127.0.0.1", port);
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("unhealthy",
+                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+        } finally {
+            checker.destroy();
         }
     }
 

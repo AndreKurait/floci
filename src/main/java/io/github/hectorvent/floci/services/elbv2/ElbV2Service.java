@@ -496,6 +496,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                           String matcher, String ipAddressType,
                                           Map<String, String> initialTags) {
         validateHealthCheckTimeout(healthCheckTimeout);
+        String effectiveProtocol = protocol != null ? protocol : "HTTP";
+        String effectiveHealthProtocol = healthCheckProtocol != null ? healthCheckProtocol
+                : defaultHealthCheckProtocol(effectiveProtocol, targetType);
+        validateHealthCheckProtocol(effectiveProtocol, targetType, effectiveHealthProtocol);
         validatePort(port, "port");
         validateName(name, "target group");
         if (port == null && !"lambda".equals(targetType)) {
@@ -526,7 +530,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
         // health check defaults
         tg.setHealthCheckEnabled(healthCheckEnabled != null ? healthCheckEnabled : true);
-        tg.setHealthCheckProtocol(healthCheckProtocol != null ? healthCheckProtocol : "HTTP");
+        tg.setHealthCheckProtocol(effectiveHealthProtocol);
         tg.setHealthCheckPort(healthCheckPort != null ? healthCheckPort : "traffic-port");
         tg.setHealthCheckPath(healthCheckPath != null ? healthCheckPath : "/");
         tg.setHealthCheckIntervalSeconds(healthCheckInterval != null ? healthCheckInterval : 30);
@@ -597,6 +601,14 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         validateHealthCheckTimeout(healthCheckTimeout);
         TargetGroup tg = requireTargetGroup(region, arn);
         validateHealthCheckPort(healthCheckPort);
+        if (healthCheckProtocol != null) {
+            validateHealthCheckProtocol(tg.getProtocol(), tg.getTargetType(), healthCheckProtocol);
+            if ("TCP".equals(tg.getHealthCheckProtocol()) && !"TCP".equals(healthCheckProtocol)
+                    && (healthCheckPath == null || matcher == null)) {
+                throw new AwsException("ValidationError", "Path and return code are required for layer 7 health checks.",
+                        400);
+            }
+        }
         if (healthCheckProtocol != null) tg.setHealthCheckProtocol(healthCheckProtocol);
         if (healthCheckPort != null)     tg.setHealthCheckPort(healthCheckPort);
         if (healthCheckEnabled != null)  tg.setHealthCheckEnabled(healthCheckEnabled);
@@ -607,6 +619,27 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (unhealthyThreshold != null)  tg.setUnhealthyThresholdCount(unhealthyThreshold);
         if (matcher != null)             tg.setMatcher(matcher);
         persistRegion(targetGroups, region);
+    }
+
+    private static String defaultHealthCheckProtocol(String protocol, String targetType) {
+        if ("lambda".equals(targetType) || "alb".equals(targetType)) {
+            return "HTTP";
+        }
+        return switch (protocol) {
+            case "TCP", "TLS", "UDP", "TCP_UDP", "GENEVE" -> "TCP";
+            default -> "HTTP";
+        };
+    }
+
+    private static void validateHealthCheckProtocol(String targetProtocol, String targetType, String healthProtocol) {
+        boolean applicationTarget = "HTTP".equals(targetProtocol) || "HTTPS".equals(targetProtocol)
+                || "lambda".equals(targetType) || "alb".equals(targetType);
+        if (!("HTTP".equals(healthProtocol) || "HTTPS".equals(healthProtocol)
+                || "TCP".equals(healthProtocol) && !applicationTarget)) {
+            String supported = applicationTarget ? "HTTP, HTTPS" : "HTTP, HTTPS, TCP";
+            throw new AwsException("ValidationError", "Health check protocol '" + healthProtocol
+                    + "' must be one of '" + supported + "'", 400);
+        }
     }
 
     private static void validateHealthCheckTimeout(Integer timeout) {
