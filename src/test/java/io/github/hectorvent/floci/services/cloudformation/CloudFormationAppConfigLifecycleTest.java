@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
@@ -53,7 +54,7 @@ class CloudFormationAppConfigLifecycleTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        appConfig = spy(new AppConfigService(storage, null));
+        appConfig = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT)));
         CfnResourceDispatcher dispatcher = new CfnResourceDispatcher(MAPPER,
                 new CloudFormationResourceRegistry(List.of(new AppConfigCfnProvisioner(appConfig))), null, null);
         cfn = CloudFormationServiceFixture.create(dispatcher);
