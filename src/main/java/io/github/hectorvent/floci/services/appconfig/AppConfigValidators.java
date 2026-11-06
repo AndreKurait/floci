@@ -59,7 +59,6 @@ final class AppConfigValidators {
                     if ("AWS.AppConfig.FeatureFlags".equals(profileType)) {
                         throw invalid("JSON_SCHEMA validators require a free form configuration profile.");
                     }
-                    compile(content);
                 }
                 case "LAMBDA" -> {
                     // Preserve the declaration, but never report successful validation without invoking it.

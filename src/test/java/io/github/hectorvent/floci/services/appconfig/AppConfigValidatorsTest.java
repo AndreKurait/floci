@@ -60,8 +60,10 @@ class AppConfigValidatorsTest {
             "{\"maximum\":\"100\"}", "{\"required\":[]}", "{\"pattern\":\"[\"}",
             "{\"$ref\":\"#/definitions/missing\"}", "{\"$ref\":\"https://example.invalid/schema\"}",
             "{\"$schema\":\"http://json-schema.org/draft-07/schema#\"}"})
-    void malformedOrUnsupportedSchemasAreRefusedBeforeStorage(String declaration) {
-        assertInvalid(() -> schema(declaration));
+    void malformedOrUnsupportedSchemasAreStoredAndRefusedDuringValidation(String declaration) {
+        List<Validator> validators = schema(declaration);
+        assertEquals(declaration, validators.getFirst().content());
+        assertInvalid(() -> validate(validators, "{}"));
     }
 
     @ParameterizedTest

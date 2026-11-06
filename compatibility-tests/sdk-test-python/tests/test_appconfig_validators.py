@@ -131,15 +131,26 @@ def test_appconfig_schema_updates_preserve_omitted_fields_and_allow_removing_val
 
 
 @pytest.mark.parametrize("schema", ["{", '{"type":"not-a-json-type"}'])
-def test_appconfig_schema_rejects_invalid_schema_at_profile_creation(validator_scope, schema):
+def test_appconfig_schema_defers_invalid_schema_until_validation(validator_scope, schema):
     scope = validator_scope
+    profile = scope["appconfig"].create_configuration_profile(
+        ApplicationId=scope["app"], Name="bad-schema", LocationUri="hosted",
+        Validators=[{"Type": "JSON_SCHEMA", "Content": schema}])
+    scope["cleanup"].callback(scope["appconfig"].delete_configuration_profile,
+                              ApplicationId=scope["app"], ConfigurationProfileId=profile["Id"],
+                              DeletionProtectionCheck="BYPASS")
+    selected = {**scope, "profile": profile["Id"]}
+    version = _version(selected, {"limit": 10})
     with pytest.raises(ClientError) as failure:
-        profile = scope["appconfig"].create_configuration_profile(
-            ApplicationId=scope["app"], Name="bad-schema", LocationUri="hosted",
-            Validators=[{"Type": "JSON_SCHEMA", "Content": schema}])
-        scope["cleanup"].callback(scope["appconfig"].delete_configuration_profile,
-                                   ApplicationId=scope["app"], ConfigurationProfileId=profile["Id"],
-                                   DeletionProtectionCheck="BYPASS")
+        scope["appconfig"].validate_configuration(
+            ApplicationId=scope["app"], ConfigurationProfileId=profile["Id"], ConfigurationVersion=version)
+    assert failure.value.response["Error"]["Code"] == "BadRequestException"
+    request = {"ApplicationId": scope["app"], "ConfigurationProfileId": scope["profile"]}
+    scope["appconfig"].update_configuration_profile(
+        **request, Validators=[{"Type": "JSON_SCHEMA", "Content": schema}])
+    assert scope["appconfig"].get_configuration_profile(**request)["Validators"][0]["Content"] == schema
+    with pytest.raises(ClientError) as failure:
+        scope["appconfig"].validate_configuration(**request, ConfigurationVersion=_version(scope, {"limit": 10}))
     assert failure.value.response["Error"]["Code"] == "BadRequestException"
 
 
@@ -149,7 +160,7 @@ def _delete_stack(client, stack):
         StackName=stack, WaiterConfig={"Delay": 1, "MaxAttempts": 60})
 
 
-def test_appconfig_schema_cloudformation_rejects_an_invalid_validator(validator_scope):
+def test_appconfig_schema_cloudformation_stores_invalid_declarations(validator_scope):
     scope = validator_scope
     client = scope["cloudformation"]
     stack = scope["name"] + "-invalid-schema"
@@ -159,13 +170,18 @@ def test_appconfig_schema_cloudformation_rejects_an_invalid_validator(validator_
             "Validators": [{"Type": "JSON_SCHEMA", "Content": '{"type":"not-a-json-type"}'}]}}}}
     client.create_stack(StackName=stack, TemplateBody=json.dumps(template))
     scope["cleanup"].callback(_delete_stack, client, stack)
-    with pytest.raises(WaiterError):
-        client.get_waiter("stack_create_complete").wait(
-            StackName=stack, WaiterConfig={"Delay": 1, "MaxAttempts": 60})
-    assert client.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"] == "ROLLBACK_COMPLETE"
-    failures = [event for event in client.describe_stack_events(StackName=stack)["StackEvents"]
-                if event["LogicalResourceId"] == "Profile" and event["ResourceStatus"] == "CREATE_FAILED"]
-    assert failures and "schema" in failures[0]["ResourceStatusReason"].lower()
+    client.get_waiter("stack_create_complete").wait(
+        StackName=stack, WaiterConfig={"Delay": 1, "MaxAttempts": 60})
+    profile = client.describe_stack_resource(StackName=stack, LogicalResourceId="Profile")[
+        "StackResourceDetail"]["PhysicalResourceId"]
+    declaration = scope["appconfig"].get_configuration_profile(
+        ApplicationId=scope["app"], ConfigurationProfileId=profile)
+    assert declaration["Validators"][0]["Content"] == '{"type":"not-a-json-type"}'
+    version = _version({**scope, "profile": profile}, {"limit": 10})
+    with pytest.raises(ClientError) as failure:
+        scope["appconfig"].validate_configuration(
+            ApplicationId=scope["app"], ConfigurationProfileId=profile, ConfigurationVersion=version)
+    assert failure.value.response["Error"]["Code"] == "BadRequestException"
 
 
 def test_appconfig_schema_cloudformation_rollback_restores_rules_and_deployed_content(validator_scope):

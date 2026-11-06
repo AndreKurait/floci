@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.services.appconfig.model.Deployment;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -75,7 +77,7 @@ class AppConfigValidationServiceTest {
     void invalidProfileUpdatesAreAtomicAndClearingValidatorsTakesEffect() {
         ConfigurationProfile before = service.getConfigurationProfile(app, profile);
         assertBadRequest(() -> service.updateConfigurationProfile(app, profile,
-                Map.of("Name", "changed", "Validators", validators("{\"type\":\"not-a-type\"}"))));
+                Map.of("Name", "changed", "Validators", List.of(Map.of("Type", "UNKNOWN", "Content", "{}")))));
         assertEquals("settings", service.getConfigurationProfile(app, profile).getName());
         assertEquals(SCHEMA, service.getConfigurationProfile(app, profile).getValidators().getFirst().content());
 
@@ -85,6 +87,32 @@ class AppConfigValidationServiceTest {
         assertBadRequest(() -> deploy(profile, version("10")));
         service.updateConfigurationProfile(app, profile, Map.of("Validators", List.of()));
         assertDoesNotThrow(() -> deploy(profile, version("1000")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{", "{\"type\":\"not-a-json-type\"}"})
+    void malformedSchemasAreStoredButCannotReplaceActiveContent(String declaration) {
+        ConfigurationProfile created = service.createConfigurationProfile(app, Map.of("Name", "malformed",
+                "LocationUri", "hosted", "Validators", validators(declaration)));
+        assertEquals(declaration, service.getConfigurationProfile(app, created.getId())
+                .getValidators().getFirst().content());
+        service.createHostedConfigurationVersion(app, created.getId(), "10".getBytes(StandardCharsets.UTF_8),
+                "application/json", null);
+        assertBadRequest(() -> service.validateConfiguration(app, created.getId(), "1"));
+        assertBadRequest(() -> deploy(created.getId(), "1"));
+        assertTrue(service.listDeployments(app, environment, null, null).items().isEmpty());
+
+        String good = version("10");
+        deploy(profile, good);
+        service.updateConfigurationProfile(app, profile, Map.of("Validators", validators(declaration)));
+        assertEquals(declaration, service.getConfigurationProfile(app, profile).getValidators().getFirst().content());
+        assertEquals(good, service.getActiveVersion(environment, profile));
+        assertBadRequest(() -> service.validateConfiguration(app, profile, good));
+        assertBadRequest(() -> deploy(profile, version("20")));
+        assertEquals(good, service.getActiveVersion(environment, profile));
+        assertEquals(1, service.listDeployments(app, environment, null, null).items().size());
+        service.updateConfigurationProfile(app, profile, Map.of("Validators", validators(SCHEMA)));
+        assertDoesNotThrow(() -> service.validateConfiguration(app, profile, good));
     }
 
     @Test

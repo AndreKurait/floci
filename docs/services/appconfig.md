@@ -87,7 +87,9 @@ SSE-S3 is supported. SSE-KMS, SSE-C and mutable `null` object versions are not s
 
 Profiles retain up to two `Validators`. Inline `JSON_SCHEMA` validators use draft-04 for free form
 configuration, including local references, required fields, types, ranges and pattern properties.
-Invalid schema declarations are rejected when the profile is created or updated. `StartDeployment`
+Profile creation and update retain declarations after checking their shape, type and size. Schema
+compilation is deferred until content validation, so malformed schemas can be stored but cannot
+validate or deploy configuration. `StartDeployment`
 validates the retrieved hosted or S3 version before creating a deployment or changing active content.
 `ValidateConfiguration` performs the same validation without deploying and returns HTTP 204.
 
