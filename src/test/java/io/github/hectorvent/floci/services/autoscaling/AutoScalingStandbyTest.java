@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.testutil.LogCapture;
 import io.restassured.path.xml.XmlPath;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -29,9 +30,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -71,7 +72,7 @@ class AutoScalingStandbyTest {
     private Ec2Service ec2;
     private ElbV2Service elbV2;
     private ElbClassicService elbClassic;
-    private final Map<String, InstanceState> ec2States = new LinkedHashMap<>();
+    private final Map<String, InstanceState> ec2States = new ConcurrentHashMap<>();
     private final AtomicInteger launches = new AtomicInteger();
 
     @BeforeEach
@@ -135,6 +136,11 @@ class AutoScalingStandbyTest {
                     ec2States.put(id, InstanceState.running());
                     return reservation(List.of(instance(id, InstanceState.running())));
                 });
+    }
+
+    @AfterEach
+    void tearDown() {
+        reconciler.stop();
     }
 
     @ParameterizedTest
@@ -311,9 +317,9 @@ class AutoScalingStandbyTest {
 
         assertEquals("Standby", lifecycle("i-a"));
         assertEquals(List.of("i-a", "i-b", "i-replacement-1"), memberIds());
-        assertEquals("Pending", lifecycle("i-replacement-1"));
-        reconciler.reconcile(group());
-        assertEquals("InService", lifecycle("i-replacement-1"));
+        // The EC2 fixture is already running, so its notification may finish before Pending is observed.
+        await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
+                assertEquals("InService", lifecycle("i-replacement-1")));
         assertEquals("Standby", lifecycle("i-a"));
         assertEquals(1, launches.get());
     }

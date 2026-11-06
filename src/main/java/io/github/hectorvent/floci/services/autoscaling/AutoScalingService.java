@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.iam.PassedRoleLookup;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Event;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -43,6 +44,14 @@ public class AutoScalingService implements PassedRoleLookup {
 
     /** The tag Auto Scaling puts on every instance it launches or attaches, valued with the group's name. */
     static final String GROUP_NAME_TAG = "aws:autoscaling:groupName";
+    private final Event<AutoScalingGroupChanged> groupChanges;
+
+    private void requestReconciliation(AutoScalingGroup group) {
+        if (groupChanges != null) {
+            groupChanges.fire(new AutoScalingGroupChanged(
+                    regionResolver.getAccountId(), group.getRegion(), group.getAutoScalingGroupName()));
+        }
+    }
 
     private static final Logger LOG = Logger.getLogger(AutoScalingService.class);
     private static final String FULLY_FORMED_LAUNCH_TEMPLATE = "You must use a valid fully-formed launch template. ";
@@ -144,14 +153,20 @@ public class AutoScalingService implements PassedRoleLookup {
 
     @Inject
     public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService,
-                              EmulatorConfig config) {
+                              EmulatorConfig config, Event<AutoScalingGroupChanged> groupChanges) {
         this.config = config;
         this.elbV2Service = elbV2Service;
         this.elbClassicService = elbClassicService;
+        this.groupChanges = groupChanges;
+    }
+
+    public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService,
+                              EmulatorConfig config) {
+        this(elbV2Service, elbClassicService, config, null);
     }
 
     AutoScalingService() {
-        this(null, null, null);
+        this(null, null, null, null);
     }
 
     // region :: name → resource
@@ -394,59 +409,62 @@ public class AutoScalingService implements PassedRoleLookup {
                                                     Map<String, String> tags,
                                                     Map<String, Boolean> tagPropagateAtLaunch,
                                                     AsgOptionalFields optionalFields) {
-        String key = asgKey(region, name);
-        if (groups.containsKey(key)) {
-            throw new AwsException("AlreadyExists",
-                    "Auto Scaling group '" + name + "' already exists.", 400);
-        }
-        validateLaunchSource(launchConfigName, launchTemplateId, launchTemplateName, mixedInstancesPolicy);
-        if (launchConfigName == null && launchTemplateId == null && launchTemplateName == null
-                && mixedInstancesPolicy == null) {
-            throw new AwsException("ValidationError",
-                    "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, "
-                            + "InstanceId or MixedInstancesPolicy parameter.", 400);
-        }
-        validateEffectiveLaunchImage(region, launchConfigName, launchTemplateId, launchTemplateName,
-                launchTemplateVersion, mixedInstancesPolicy);
-        validateOptionalFields(optionalFields, region);
-        validateDesiredCapacityType(
-                optionalFields != null ? optionalFields.desiredCapacityType() : null,
-                mixedInstancesPolicy);
+        synchronized (lockFor(asgKey(region, name))) {
+            String key = asgKey(region, name);
+            if (groups.containsKey(key)) {
+                throw new AwsException("AlreadyExists",
+                        "Auto Scaling group '" + name + "' already exists.", 400);
+            }
+            validateLaunchSource(launchConfigName, launchTemplateId, launchTemplateName, mixedInstancesPolicy);
+            if (launchConfigName == null && launchTemplateId == null && launchTemplateName == null
+                    && mixedInstancesPolicy == null) {
+                throw new AwsException("ValidationError",
+                        "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, "
+                                + "InstanceId or MixedInstancesPolicy parameter.", 400);
+            }
+            validateEffectiveLaunchImage(region, launchConfigName, launchTemplateId, launchTemplateName,
+                    launchTemplateVersion, mixedInstancesPolicy);
+            validateOptionalFields(optionalFields, region);
+            validateDesiredCapacityType(
+                    optionalFields != null ? optionalFields.desiredCapacityType() : null,
+                    mixedInstancesPolicy);
 
-        AutoScalingGroup asg = new AutoScalingGroup();
-        asg.setAutoScalingGroupName(name);
-        asg.setAutoScalingGroupArn(
-                AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
-                        "autoScalingGroup:" + name).toString());
-        asg.setLaunchConfigurationName(launchConfigName);
-        asg.setLaunchTemplateId(launchTemplateId);
-        asg.setLaunchTemplateName(launchTemplateName);
-        asg.setLaunchTemplateVersion(launchTemplateVersion);
-        asg.setMixedInstancesPolicy(mixedInstancesPolicy);
-        asg.setMinSize(minSize);
-        asg.setMaxSize(maxSize);
-        asg.setDesiredCapacity(desiredCapacity);
-        asg.setDefaultCooldown(defaultCooldown > 0 ? defaultCooldown : 300);
-        asg.setAvailabilityZones(new ArrayList<>(resolveAvailabilityZones(region, availabilityZones, subnetIds)));
-        asg.setSubnetIds(subnetIds != null ? new ArrayList<>(subnetIds) : new ArrayList<>());
-        asg.setTargetGroupARNs(targetGroupArns != null ? new ArrayList<>(targetGroupArns) : new ArrayList<>());
-        asg.setLoadBalancerNames(lbNames != null ? new ArrayList<>(lbNames) : new ArrayList<>());
-        asg.setHealthCheckType(healthCheckType != null ? healthCheckType : "EC2");
-        asg.setHealthCheckGracePeriod(healthCheckGracePeriod);
-        asg.setTerminationPolicies(terminationPolicies != null ? new ArrayList<>(terminationPolicies) : List.of("Default"));
-        asg.setCreatedTime(Instant.now());
-        asg.setRegion(region);
-        if (tags != null) {
-            asg.getTags().putAll(tags);
+            AutoScalingGroup asg = new AutoScalingGroup();
+            asg.setAutoScalingGroupName(name);
+            asg.setAutoScalingGroupArn(
+                    AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
+                            "autoScalingGroup:" + name).toString());
+            asg.setLaunchConfigurationName(launchConfigName);
+            asg.setLaunchTemplateId(launchTemplateId);
+            asg.setLaunchTemplateName(launchTemplateName);
+            asg.setLaunchTemplateVersion(launchTemplateVersion);
+            asg.setMixedInstancesPolicy(mixedInstancesPolicy);
+            asg.setMinSize(minSize);
+            asg.setMaxSize(maxSize);
+            asg.setDesiredCapacity(desiredCapacity);
+            asg.setDefaultCooldown(defaultCooldown > 0 ? defaultCooldown : 300);
+            asg.setAvailabilityZones(new ArrayList<>(resolveAvailabilityZones(region, availabilityZones, subnetIds)));
+            asg.setSubnetIds(subnetIds != null ? new ArrayList<>(subnetIds) : new ArrayList<>());
+            asg.setTargetGroupARNs(targetGroupArns != null ? new ArrayList<>(targetGroupArns) : new ArrayList<>());
+            asg.setLoadBalancerNames(lbNames != null ? new ArrayList<>(lbNames) : new ArrayList<>());
+            asg.setHealthCheckType(healthCheckType != null ? healthCheckType : "EC2");
+            asg.setHealthCheckGracePeriod(healthCheckGracePeriod);
+            asg.setTerminationPolicies(terminationPolicies != null ? new ArrayList<>(terminationPolicies) : List.of("Default"));
+            asg.setCreatedTime(Instant.now());
+            asg.setRegion(region);
+            if (tags != null) {
+                asg.getTags().putAll(tags);
+            }
+            if (tagPropagateAtLaunch != null) {
+                asg.getTagPropagateAtLaunch().putAll(tagPropagateAtLaunch);
+            }
+            if (optionalFields != null) {
+                optionalFields.applyToNewGroup(asg);
+            }
+            groups.put(key, asg);
+            requestReconciliation(asg);
+            return asg;
         }
-        if (tagPropagateAtLaunch != null) {
-            asg.getTagPropagateAtLaunch().putAll(tagPropagateAtLaunch);
-        }
-        if (optionalFields != null) {
-            optionalFields.applyToNewGroup(asg);
-        }
-        groups.put(key, asg);
-        return asg;
     }
 
     public void updateAutoScalingGroup(String region, String name,
@@ -522,6 +540,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 optionalFields.applyToExistingGroup(asg);
             }
             groups.put(key, asg);
+            requestReconciliation(asg);
         }
     }
 
@@ -668,6 +687,11 @@ public class AutoScalingService implements PassedRoleLookup {
         return groupLocks.computeIfAbsent(regionResolver.getAccountId() + "::" + key, ignored -> new Object());
     }
 
+    Map<String, AccountAwareStorageBackend.AccountEntry<AutoScalingGroup>> repairInventoryPage(
+            String afterRawKey, int limit) {
+        return groupsStore == null ? Map.of() : groupsStore.scanAllAccountEntriesAfter(afterRawKey, limit);
+    }
+
     Set<String> autoScalingGroupAccountIds() {
         if (groupsStore == null) {
             return Set.of();
@@ -688,6 +712,7 @@ public class AutoScalingService implements PassedRoleLookup {
             }
             asg.setDesiredCapacity(desiredCapacity);
             groups.put(key, asg);
+            requestReconciliation(asg);
         }
     }
 
@@ -697,17 +722,23 @@ public class AutoScalingService implements PassedRoleLookup {
             String resourceType,
             Map<String, String> tags,
             Map<String, Boolean> tagPropagateAtLaunch) {
-        AutoScalingGroup asg = requireTaggableGroup(region, resourceId, resourceType);
-        asg.getTags().putAll(tags);
-        asg.getTagPropagateAtLaunch().putAll(tagPropagateAtLaunch);
-        groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
+        synchronized (lockFor(asgKey(region, resourceId))) {
+            AutoScalingGroup asg = requireTaggableGroup(region, resourceId, resourceType);
+            asg.getTags().putAll(tags);
+            asg.getTagPropagateAtLaunch().putAll(tagPropagateAtLaunch);
+            groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
+            requestReconciliation(asg);
+        }
     }
 
     public void deleteTags(String region, String resourceId, String resourceType, List<String> tagKeys) {
-        AutoScalingGroup asg = requireTaggableGroup(region, resourceId, resourceType);
-        tagKeys.forEach(asg.getTags()::remove);
-        tagKeys.forEach(asg.getTagPropagateAtLaunch()::remove);
-        groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
+        synchronized (lockFor(asgKey(region, resourceId))) {
+            AutoScalingGroup asg = requireTaggableGroup(region, resourceId, resourceType);
+            tagKeys.forEach(asg.getTags()::remove);
+            tagKeys.forEach(asg.getTagPropagateAtLaunch()::remove);
+            groups.put(asgKey(region, asg.getAutoScalingGroupName()), asg);
+            requestReconciliation(asg);
+        }
     }
 
     // AWS: values inside one filter are ORed, separate filters are ANDed; only these four
@@ -816,6 +847,7 @@ public class AutoScalingService implements PassedRoleLookup {
             times.keySet().retainAll(remaining);
             asg.updateSuspensionState(remaining, times);
             groups.put(key, asg);
+            requestReconciliation(asg);
         }
     }
 
@@ -840,26 +872,29 @@ public class AutoScalingService implements PassedRoleLookup {
 
     public void setInstanceProtection(String region, String groupName, List<String> instanceIds,
                                       boolean protectedFromScaleIn) {
-        if (instanceIds == null || instanceIds.isEmpty()) {
-            throw new AwsException("ValidationError", "At least one instance ID is required.", 400);
+        synchronized (lockFor(asgKey(region, groupName))) {
+            if (instanceIds == null || instanceIds.isEmpty()) {
+                throw new AwsException("ValidationError", "At least one instance ID is required.", 400);
+            }
+            AutoScalingGroup asg = requireGroup(region, groupName);
+            Set<String> requested = new HashSet<>(instanceIds);
+            Set<String> found = asg.getInstances().stream()
+                    .map(AsgInstance::getInstanceId)
+                    .filter(requested::contains)
+                    .collect(Collectors.toSet());
+            if (!found.containsAll(requested)) {
+                String missing = requested.stream()
+                        .filter(id -> !found.contains(id))
+                        .collect(Collectors.joining(", "));
+                throw new AwsException("ValidationError",
+                        "Instance(s) '" + missing + "' is/are not part of Auto Scaling group '" + groupName + "'.", 400);
+            }
+            asg.getInstances().stream()
+                    .filter(instance -> requested.contains(instance.getInstanceId()))
+                    .forEach(instance -> instance.setProtectedFromScaleIn(protectedFromScaleIn));
+            groups.put(asgKey(region, groupName), asg);
+            requestReconciliation(asg);
         }
-        AutoScalingGroup asg = requireGroup(region, groupName);
-        Set<String> requested = new HashSet<>(instanceIds);
-        Set<String> found = asg.getInstances().stream()
-                .map(AsgInstance::getInstanceId)
-                .filter(requested::contains)
-                .collect(Collectors.toSet());
-        if (!found.containsAll(requested)) {
-            String missing = requested.stream()
-                    .filter(id -> !found.contains(id))
-                    .collect(Collectors.joining(", "));
-            throw new AwsException("ValidationError",
-                    "Instance(s) '" + missing + "' is/are not part of Auto Scaling group '" + groupName + "'.", 400);
-        }
-        asg.getInstances().stream()
-                .filter(instance -> requested.contains(instance.getInstanceId()))
-                .forEach(instance -> instance.setProtectedFromScaleIn(protectedFromScaleIn));
-        groups.put(asgKey(region, groupName), asg);
     }
 
     /**
@@ -897,6 +932,7 @@ public class AutoScalingService implements PassedRoleLookup {
             }
             update.accept(asg);
             groups.put(key, asg);
+            requestReconciliation(asg);
         }
     }
 
@@ -982,6 +1018,7 @@ public class AutoScalingService implements PassedRoleLookup {
                     asg.setDesiredCapacity(counted);
                 }
                 groups.put(asgKey(region, name), asg);
+                requestReconciliation(asg);
             }
         }
     }
@@ -1052,6 +1089,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 asg.setDesiredCapacity(newDesired);
             }
             groups.put(key, asg);
+            requestReconciliation(asg);
         }
     }
 
@@ -1139,7 +1177,7 @@ public class AutoScalingService implements PassedRoleLookup {
         }
     }
 
-    /** Links each moving member to its activity, saves the group, then stores the activities. */
+    /** Stores the group and activities before requesting reconciliation, preserving the initial API response. */
     private List<ScalingActivity> startStandbyMoves(String key, AutoScalingGroup asg, List<AsgInstance> moving,
                                                     List<ScalingActivity> started, int newDesired) {
         for (int index = 0; index < moving.size(); index++) {
@@ -1152,6 +1190,7 @@ public class AutoScalingService implements PassedRoleLookup {
             activities.put(activity.getActivityId(), activity);
             response.add(copyOf(activity));
         }
+        requestReconciliation(asg);
         return response;
     }
 
@@ -1275,6 +1314,7 @@ public class AutoScalingService implements PassedRoleLookup {
                     "Started instance refresh " + refresh.getInstanceRefreshId() + ".",
                     "At " + now + " an instance refresh was started.",
                     "Successful");
+            requestReconciliation(asg);
             return refresh;
         }
     }
@@ -1351,19 +1391,25 @@ public class AutoScalingService implements PassedRoleLookup {
     // ── Load balancer attachment ───────────────────────────────────────────────
 
     public void attachLoadBalancerTargetGroups(String region, String name, List<String> tgArns) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        for (String arn : tgArns) {
-            if (!asg.getTargetGroupARNs().contains(arn)) {
-                asg.getTargetGroupARNs().add(arn);
+        synchronized (lockFor(asgKey(region, name))) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            for (String arn : tgArns) {
+                if (!asg.getTargetGroupARNs().contains(arn)) {
+                    asg.getTargetGroupARNs().add(arn);
+                }
             }
+            groups.put(asgKey(region, name), asg);
+            requestReconciliation(asg);
         }
-        groups.put(asgKey(region, name), asg);
     }
 
     public void detachLoadBalancerTargetGroups(String region, String name, List<String> tgArns) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        asg.getTargetGroupARNs().removeAll(tgArns);
-        groups.put(asgKey(region, name), asg);
+        synchronized (lockFor(asgKey(region, name))) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            asg.getTargetGroupARNs().removeAll(tgArns);
+            groups.put(asgKey(region, name), asg);
+            requestReconciliation(asg);
+        }
     }
 
     public List<String> describeLoadBalancerTargetGroups(String region, String name) {
@@ -1371,19 +1417,25 @@ public class AutoScalingService implements PassedRoleLookup {
     }
 
     public void attachLoadBalancers(String region, String name, List<String> lbNames) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        for (String lb : lbNames) {
-            if (!asg.getLoadBalancerNames().contains(lb)) {
-                asg.getLoadBalancerNames().add(lb);
+        synchronized (lockFor(asgKey(region, name))) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            for (String lb : lbNames) {
+                if (!asg.getLoadBalancerNames().contains(lb)) {
+                    asg.getLoadBalancerNames().add(lb);
+                }
             }
+            groups.put(asgKey(region, name), asg);
+            requestReconciliation(asg);
         }
-        groups.put(asgKey(region, name), asg);
     }
 
     public void detachLoadBalancers(String region, String name, List<String> lbNames) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        asg.getLoadBalancerNames().removeAll(lbNames);
-        groups.put(asgKey(region, name), asg);
+        synchronized (lockFor(asgKey(region, name))) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            asg.getLoadBalancerNames().removeAll(lbNames);
+            groups.put(asgKey(region, name), asg);
+            requestReconciliation(asg);
+        }
     }
 
     // ── Traffic sources ─────────────────────────────────────────────────────────────
@@ -1397,20 +1449,26 @@ public class AutoScalingService implements PassedRoleLookup {
     public record TrafficSourceIdentifier(String identifier, String type) {}
 
     public void attachTrafficSources(String region, String name, List<TrafficSourceIdentifier> sources) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        for (TrafficSourceIdentifier source : sources) {
-            asg.getTrafficSourceTypeByIdentifier().put(source.identifier(),
-                    source.type() != null ? source.type() : "elbv2");
+        synchronized (lockFor(asgKey(region, name))) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            for (TrafficSourceIdentifier source : sources) {
+                asg.getTrafficSourceTypeByIdentifier().put(source.identifier(),
+                        source.type() != null ? source.type() : "elbv2");
+            }
+            groups.put(asgKey(region, name), asg);
+            requestReconciliation(asg);
         }
-        groups.put(asgKey(region, name), asg);
     }
 
     public void detachTrafficSources(String region, String name, List<TrafficSourceIdentifier> sources) {
-        AutoScalingGroup asg = requireGroup(region, name);
-        for (TrafficSourceIdentifier source : sources) {
-            asg.getTrafficSourceTypeByIdentifier().remove(source.identifier());
+        synchronized (lockFor(asgKey(region, name))) {
+            AutoScalingGroup asg = requireGroup(region, name);
+            for (TrafficSourceIdentifier source : sources) {
+                asg.getTrafficSourceTypeByIdentifier().remove(source.identifier());
+            }
+            groups.put(asgKey(region, name), asg);
+            requestReconciliation(asg);
         }
-        groups.put(asgKey(region, name), asg);
     }
 
     public Map<String, String> describeTrafficSources(String region, String name, String trafficSourceType) {
