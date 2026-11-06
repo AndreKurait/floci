@@ -845,7 +845,7 @@ public class CloudWatchMetricsJsonHandler {
                 datum.setMaximum(statsValues.path("Maximum").asDouble(0));
             }
 
-            datums.add(datum);
+            datums.addAll(MetricValues.fromJson(item, datum));
         }
         return datums;
     }
