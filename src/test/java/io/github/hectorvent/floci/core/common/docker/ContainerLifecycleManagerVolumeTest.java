@@ -5,6 +5,8 @@ import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.CreateVolumeCmd;
 import com.github.dockerjava.api.command.CreateVolumeResponse;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectVolumeCmd;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesCmd;
@@ -14,6 +16,7 @@ import com.github.dockerjava.api.command.RemoveVolumeCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.command.WaitContainerCmd;
+import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.HostConfig;
@@ -23,6 +26,9 @@ import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -233,6 +239,62 @@ class ContainerLifecycleManagerVolumeTest {
         manager.stopAndRemoveStrict("container-id", () -> operations.add("logs"));
 
         assertEquals(List.of("logs"), operations);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void strictContainerCleanupConfirmsDaemonRemovalAfterAnExplicitRemovalFailure(boolean stopFails) {
+        String id = "a".repeat(64);
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(dockerClient.stopContainerCmd(id)).thenReturn(stop);
+        if (stopFails) {
+            doThrow(new DockerException("stop response lost", 500)).when(stop).exec();
+        }
+        when(dockerClient.removeContainerCmd(id)).thenReturn(remove);
+        doThrow(new ConflictException("removal already in progress")).when(remove).exec();
+        lenient().when(dockerClient.inspectContainerCmd(id)).thenReturn(inspect);
+        lenient().when(inspect.exec()).thenThrow(new NotFoundException("daemon removed runtime"));
+        List<String> operations = new ArrayList<>();
+
+        assertDoesNotThrow(() -> manager.stopAndRemoveStrict(id, () -> operations.add("logs")));
+
+        assertEquals(List.of("logs"), operations);
+        verify(dockerClient).inspectContainerCmd(id);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ContainerLifecycleManager.ContainerPresence.class,
+            names = {"RUNNING", "STOPPED", "UNKNOWN"})
+    void strictContainerCleanupPreservesTheRemovalFailureUntilAbsenceIsConfirmed(
+            ContainerLifecycleManager.ContainerPresence presence) {
+        String id = "b".repeat(64);
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(dockerClient.stopContainerCmd(id)).thenReturn(stop);
+        when(dockerClient.removeContainerCmd(id)).thenReturn(remove);
+        ConflictException removalFailure = new ConflictException("removal already in progress");
+        doThrow(removalFailure).when(remove).exec();
+        lenient().when(dockerClient.inspectContainerCmd(id)).thenReturn(inspect);
+        if (presence == ContainerLifecycleManager.ContainerPresence.UNKNOWN) {
+            lenient().when(inspect.exec()).thenThrow(new DockerException("inspect unavailable", 500));
+        } else {
+            InspectContainerResponse response = mock(InspectContainerResponse.class);
+            InspectContainerResponse.ContainerState state = mock(InspectContainerResponse.ContainerState.class);
+            lenient().when(inspect.exec()).thenReturn(response);
+            lenient().when(response.getState()).thenReturn(state);
+            lenient().when(state.getRunning()).thenReturn(
+                    presence == ContainerLifecycleManager.ContainerPresence.RUNNING);
+        }
+        List<String> operations = new ArrayList<>();
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.stopAndRemoveStrict(id, () -> operations.add("logs")));
+
+        assertSame(removalFailure, failure.getCause());
+        assertEquals(List.of(), operations);
     }
 
     @Test
