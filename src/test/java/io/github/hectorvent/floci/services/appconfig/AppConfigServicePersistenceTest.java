@@ -286,6 +286,49 @@ class AppConfigServicePersistenceTest {
         }
     }
 
+    @Test
+    void restartedProfilesStillEnforceTheirStoredSchemas() {
+        String schema = "{\"type\":\"integer\"}";
+        RegionResolver regions = new RegionResolver("us-east-1", "000000000000");
+        StorageFactory first = newFactory();
+        String app;
+        String profile;
+        String environment;
+        String strategy;
+        try {
+            AppConfigService service = new AppConfigService(first, regions, mock(AppConfigAlarmMonitor.class),
+                    mock(AppConfigS3Source.class));
+            app = service.createApplication(Map.of("Name", "validated")).getId();
+            environment = service.createEnvironment(app, Map.of("Name", "test")).getId();
+            profile = service.createConfigurationProfile(app, Map.of("Name", "settings", "LocationUri", "hosted",
+                    "Validators", List.of(Map.of("Type", "JSON_SCHEMA", "Content", schema)))).getId();
+            strategy = service.createDeploymentStrategy(Map.of("Name", "immediate",
+                    "DeploymentDurationInMinutes", 0, "FinalBakeTimeInMinutes", 0,
+                    "GrowthFactor", 100, "ReplicateTo", "NONE")).getId();
+            service.createHostedConfigurationVersion(app, profile, new byte[]{'1'}, "application/json", null);
+            service.createHostedConfigurationVersion(app, profile, new byte[]{'"', 'x', '"'}, "application/json", null);
+            service.startDeployment(app, environment, Map.of("ConfigurationProfileId", profile,
+                    "ConfigurationVersion", "1", "DeploymentStrategyId", strategy));
+        } finally {
+            first.shutdownAll();
+        }
+        StorageFactory second = newFactory();
+        try {
+            AppConfigService restarted = new AppConfigService(second, regions, mock(AppConfigAlarmMonitor.class),
+                    mock(AppConfigS3Source.class));
+            assertEquals(schema, restarted.getConfigurationProfile(app, profile).getValidators().getFirst().content());
+            AwsException failure = assertThrows(AwsException.class, () -> restarted.startDeployment(app, environment,
+                    Map.of("ConfigurationProfileId", profile, "ConfigurationVersion", "2",
+                            "DeploymentStrategyId", strategy)));
+            assertEquals("BadRequestException", failure.getErrorCode());
+            assertEquals("1", restarted.getActiveVersion(environment, profile));
+            assertEquals(1, restarted.listDeployments(app, environment, null, null).items().size());
+            restarted.validateConfiguration(app, profile, "1");
+        } finally {
+            second.shutdownAll();
+        }
+    }
+
     private StorageFactory newFactory() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.defaultAccountId()).thenReturn("000000000000");

@@ -76,7 +76,7 @@ class AppConfigServiceUpdateRaceTest {
                 Map.of("Name", "settings", "LocationUri", "hosted"));
 
         deleteWaitsForTheWrite(store,
-                () -> service.updateConfigurationProfile(app.getId(), profile.getId(), "renamed", null, null),
+                () -> service.updateConfigurationProfile(app.getId(), profile.getId(), Map.of("Name", "renamed")),
                 () -> service.deleteConfigurationProfile(app.getId(), profile.getId()));
 
         assertTrue(service.findConfigurationProfile(profile.getId()).isEmpty(), "the entity outlived its delete");

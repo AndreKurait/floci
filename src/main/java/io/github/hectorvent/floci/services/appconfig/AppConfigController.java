@@ -141,6 +141,26 @@ public class AppConfigController {
         return Response.ok(service.getConfigurationProfile(appId, profileId)).build();
     }
 
+    @PATCH
+    @Path("/applications/{appId}/configurationprofiles/{profileId}")
+    public Response updateConfigurationProfile(@PathParam("appId") String appId,
+                                                @PathParam("profileId") String profileId,
+                                                String body) throws IOException {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> request = objectMapper.readValue(body, Map.class);
+        return Response.ok(service.updateConfigurationProfile(appId, profileId, request)).build();
+    }
+
+    @POST
+    @Path("/applications/{appId}/configurationprofiles/{profileId}/validators")
+    @Consumes(MediaType.WILDCARD)
+    public Response validateConfiguration(@PathParam("appId") String appId,
+                                          @PathParam("profileId") String profileId,
+                                          @QueryParam("configuration_version") String version) {
+        service.validateConfiguration(appId, profileId, version);
+        return Response.noContent().build();
+    }
+
     @GET
     @Path("/applications/{appId}/configurationprofiles")
     public Response listConfigurationProfiles(@PathParam("appId") String appId) {
