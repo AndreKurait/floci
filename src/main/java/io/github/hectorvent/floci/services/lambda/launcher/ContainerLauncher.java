@@ -115,6 +115,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
+    private final LambdaDnsResolver dnsResolver;
     private final ContainerLogStreamer logStreamer;
     private final ImageResolver imageResolver;
     private final RuntimeApiServerFactory runtimeApiServerFactory;
@@ -139,6 +140,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LambdaExecutionRoleCredentials executionRoleCredentials) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
+        this.dnsResolver = new LambdaDnsResolver(containerBuilder, lifecycleManager, config);
         this.logStreamer = logStreamer;
         this.imageResolver = imageResolver;
         this.runtimeApiServerFactory = runtimeApiServerFactory;
@@ -218,6 +220,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // must be visible in the catch block below to release its in-flight reference on any
         // failure path, not just the one where useCodeVolume's block itself throws.
         String reservedCodeVolume = null;
+        String dnsResolverVolume = null;
         Optional<SessionCreds> roleCredentials = Optional.empty();
         try {
 
@@ -380,6 +383,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             specBuilder.withReadOnlyBind(hostPath, "/opt/aws-config");
         });
 
+        dnsResolverVolume = dnsResolver.prepare(specBuilder,
+                requestedDockerPlatform(fn, dockerFlags).orElse(null));
         ContainerSpec spec = specBuilder.build();
 
         // Create container without starting — provided.* runtimes exec
@@ -477,6 +482,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 containerId, fn.getFunctionName(), runtimeApiServer, ContainerState.WARM, fn.isHotReload(),
                 roleCredentials.map(SessionCreds::accessKeyId).orElse(null),
                 LambdaExecutionRoleCredentials.sessionAccountId(fn));
+        handle.setDnsResolverVolume(dnsResolverVolume);
 
         // Attach log streaming
         Closeable logHandle = logStreamer.attachForAccount(
@@ -496,9 +502,23 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     fn.getFunctionName(), e.getMessage());
             if (containerId != null) {
                 try {
-                    lifecycleManager.stopAndRemove(containerId, null);
+                    if (dnsResolverVolume == null) {
+                        lifecycleManager.stopAndRemove(containerId, null);
+                    } else {
+                        lifecycleManager.stopAndRemoveStrict(containerId, null);
+                    }
                 } catch (Exception cleanupError) {
                     LOG.warnv(cleanupError, "Could not remove failed Lambda container {0}", containerId);
+                    e.addSuppressed(cleanupError);
+                }
+            }
+            if (dnsResolverVolume != null) {
+                try {
+                    dnsResolver.remove(dnsResolverVolume, containerId);
+                } catch (RuntimeException cleanupError) {
+                    if (cleanupError != e) {
+                        e.addSuppressed(cleanupError);
+                    }
                 }
             }
             if (roleCredentials.isPresent()) {
@@ -625,9 +645,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     }
 
     public void stop(ContainerHandle handle) {
+        synchronized (handle) {
+            stopOwnedContainer(handle);
+        }
+    }
+
+    private void stopOwnedContainer(ContainerHandle handle) {
         LOG.infov("Stopping container {0}", handle.getContainerId());
         handle.setState(ContainerState.STOPPED);
 
+        if (handle.isRuntimeApiReleased()) {
+            removeResolver(handle);
+            return;
+        }
         RuntimeApiServer server = handle.getRuntimeApiServer();
 
         // Quiesce first: stop accepting new work, notify extensions, complete pending
@@ -670,7 +700,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             LOG.warnv(e, "RuntimeApiServer did not close cleanly for container {0}",
                     handle.getContainerId());
         } finally {
-            runtimeApiServerFactory.release(server);
+            try {
+                runtimeApiServerFactory.release(server);
+                handle.markRuntimeApiReleased();
+            } finally {
+                removeResolver(handle);
+            }
+        }
+    }
+
+    private void removeResolver(ContainerHandle handle) {
+        if (handle.getDnsResolverVolume() != null) {
+            dnsResolver.remove(handle.getDnsResolverVolume(), null);
+            handle.setDnsResolverVolume(null);
         }
     }
 
@@ -926,6 +968,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * `docker volume prune --filter label=floci` same as before this existed).
      */
     void cleanupSupersededVolumes() {
+        dnsResolver.retryCleanup();
         long cutoff = System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS;
         for (String volName : new ArrayList<>(volumesPendingCleanup.keySet())) {
             Long queuedAt = volumesPendingCleanup.get(volName);
