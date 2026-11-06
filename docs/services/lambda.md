@@ -949,7 +949,9 @@ invocation to time out.
 
 **Floci solves this automatically** by running an embedded DNS server (UDP/53)
 on its container IP. All Lambda containers launched by Floci are configured to
-use it as their DNS resolver. The embedded DNS server:
+use it as their DNS resolver. It binds that advertised IP so replies retain the
+queried source address even when the container has multiple network interfaces.
+The embedded DNS server:
 
 - Resolves `*.localhost.floci.io` → Floci's Docker network IP
 - Forwards all other queries to the upstream resolver(s) from `/etc/resolv.conf`,
@@ -1434,3 +1436,10 @@ remain in effect.
 
 Environment variables use the quoted map-key form, for example
 `FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__JAVA17_LINUX_ARM64__`.
+
+### Provisioned concurrency recovery
+
+Terminal runtime failures, failed leases, alias updates and completed teardown wake
+the serial capacity reconciler. A ten-second repair sweep covers unobserved changes.
+Replacement environments still finish actual initialization and obey account and
+function capacity limits before becoming available.
