@@ -315,6 +315,12 @@ public class CloudFrontServingController {
             return textError(403, "Invalid method.");
         }
 
+        Response protocolResponse = viewerProtocolResponse(config, normalized, viewerScheme, viewerHost,
+                rawViewerPath, method, currentVertxRequest.getCurrent().request());
+        if (protocolResponse != null) {
+            return protocolResponse;
+        }
+
         // The response-headers policy of the behavior that matches the request applies to the final
         // response CloudFront returns to the viewer, including any custom-error page substituted below.
         String policyId = CloudFrontRequestRouter.matchResponseHeadersPolicyId(config, normalized);
@@ -351,6 +357,27 @@ public class CloudFrontServingController {
             }
         }
         return toResponse(origin, includeBody, directives);
+    }
+
+    private Response viewerProtocolResponse(DistributionConfig config, String normalizedPath, String scheme,
+                                            String host, String rawPath, String method, HttpServerRequest request) {
+        if ("https".equalsIgnoreCase(scheme)) {
+            return null;
+        }
+        String policy = CloudFrontRequestRouter.matchViewerProtocolPolicy(config, normalizedPath);
+        if ("https-only".equals(policy)) {
+            return textError(403, "This distribution requires HTTPS.");
+        }
+        if (!"redirect-to-https".equals(policy)) {
+            return null;
+        }
+        boolean read = "GET".equals(method) || "HEAD".equals(method);
+        if (!read && request.version() == HttpVersion.HTTP_1_0) {
+            return textError(403, "Redirecting this method requires HTTP/1.1 or later.");
+        }
+        String authority = host.endsWith(":80") ? host.substring(0, host.length() - 3) : host;
+        String query = request.query() == null ? "" : "?" + request.query();
+        return Response.status(read ? 301 : 307).location(URI.create("https://" + authority + rawPath + query)).build();
     }
 
     /** Resolves the response-headers policy for a behavior into the headers it contributes, if any. */
@@ -930,6 +957,11 @@ public class CloudFrontServingController {
             String rawViewerPath = rawViewerPath(request.uri());
             String normalized = CloudFrontRequestRouter.normalizePath(decodedViewerPath(rawViewerPath));
             if (!CloudFrontRequestRouter.matchAllowedMethods(config, normalized).contains("GET")) {
+                return null;
+            }
+            String policy = CloudFrontRequestRouter.matchViewerProtocolPolicy(config, normalized);
+            if (!"https".equalsIgnoreCase(request.scheme())
+                    && ("https-only".equals(policy) || "redirect-to-https".equals(policy))) {
                 return null;
             }
             List<String> trustedKeyGroups = CloudFrontRequestRouter.trustedKeyGroupsFor(config, normalized);
