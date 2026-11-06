@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.dns.DnsLookupHelper;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -40,6 +41,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class Route53Service implements Resettable {
@@ -839,6 +842,47 @@ public class Route53Service implements Resettable {
                         .toList());
     }
 
+    public boolean isCoveredByPrivateZone(String qname, ClientVpc origin) {
+        return !privateDnsZones(qname, origin).isEmpty();
+    }
+
+    /** Includes only the most specific private zones associated with the querying VPC. */
+    public Set<String> privateDnsZoneIds(String qname, ClientVpc origin) {
+        return privateDnsZones(qname, origin).stream()
+                .map(owned -> owned.zone().getId()).collect(Collectors.toSet());
+    }
+
+    public List<ResourceRecordSet> findPrivateRecordsForName(String qname, ClientVpc origin) {
+        List<OwnedZone> zones = privateDnsZones(qname, origin);
+        return zones.isEmpty() ? List.of() : findRecordsForName(normalizeName(qname).toLowerCase(),
+                zones.stream().map(owned -> getRecordsForZoneAcrossAccounts(
+                        owned.accountId(), owned.zone().getId())).toList());
+    }
+
+    public boolean hasPrivateRecordsBeneath(String qname, ClientVpc origin) {
+        List<OwnedZone> zones = privateDnsZones(qname, origin);
+        if (zones.isEmpty()) {
+            return false;
+        }
+        String suffix = "." + normalizeName(qname).toLowerCase();
+        return zones.stream().flatMap(owned -> getRecordsForZoneAcrossAccounts(
+                        owned.accountId(), owned.zone().getId()).stream())
+                .anyMatch(record -> normalizeName(record.getName()).toLowerCase().endsWith(suffix));
+    }
+
+    private List<OwnedZone> privateDnsZones(String qname, ClientVpc origin) {
+        if (origin == null || qname == null || qname.isBlank()) {
+            return List.of();
+        }
+        return mostSpecificZones(normalizeName(qname).toLowerCase(), true, owned ->
+                owned.zone().getVpcAssociations().stream().anyMatch(association ->
+                        origin.vpcId().equals(association.getVpcId())
+                                && origin.region().equals(association.getVpcRegion())
+                                && origin.accountId().equals(association.getOwnerAccountId() != null
+                                ? association.getOwnerAccountId()
+                                : resolveVpcOwnerAccount(association).orElse(owned.accountId()))));
+    }
+
     private static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
                                                               List<List<ResourceRecordSet>> zoneRecords) {
         List<ResourceRecordSet> nameMatches = new ArrayList<>();
@@ -995,6 +1039,11 @@ public class Route53Service implements Resettable {
 
     /** The longest containing zones, so a parent never answers for a more specific child. */
     private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone) {
+        return mostSpecificZones(normalizedQname, privateZone, owned -> true);
+    }
+
+    private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone,
+                                             Predicate<OwnedZone> visible) {
         Map<String, Integer> names = zoneNameCounts(privateZone);
         if (names.isEmpty() || names.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
             return List.of();
@@ -1003,7 +1052,7 @@ public class Route53Service implements Resettable {
         int maxZoneLength = -1;
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
             HostedZone zone = owned.zone();
-            if (zone.isPrivateZone() != privateZone) {
+            if (zone.isPrivateZone() != privateZone || !visible.test(owned)) {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();

@@ -23,6 +23,11 @@ public interface DnsRecordSource {
         return Optional.empty();
     }
 
+    /** A null origin identifies a query outside any known VPC. */
+    default Optional<DnsAnswer> resolveAuthoritative(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        return resolveAuthoritative(name, type);
+    }
+
     /**
      * Resolves a query name to IPv4 addresses and their TTL. An empty optional means this
      * source does not own the name. The name arrives without a trailing dot and in the case the client sent.
@@ -33,5 +38,10 @@ public interface DnsRecordSource {
     default Optional<DnsAnswer> resolve(String name, int type) {
         return resolveIpv4(name).map(answer -> type == 1 ? answer
                 : answer.nameExists() ? DnsAnswer.noData() : DnsAnswer.nxDomain());
+    }
+
+    /** Private record sources must restrict their answers to the querying VPC's associations. */
+    default Optional<DnsAnswer> resolve(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        return resolve(name, type);
     }
 }

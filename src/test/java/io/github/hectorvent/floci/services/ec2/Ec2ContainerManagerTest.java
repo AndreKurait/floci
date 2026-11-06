@@ -41,6 +41,7 @@ import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
+import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -766,18 +767,20 @@ class Ec2ContainerManagerTest {
         assertEquals(expected, instance.getPublicIpAddress());
     }
 
-    @Test
-    void startOfAProtectedInstanceReusesTheHelperTransportAddress() throws Exception {
+    @ParameterizedTest
+    @CsvSource({"true,172.18.0.7", "false,172.17.0.7"})
+    void startOfAProtectedInstanceReusesTheHelperTransportAddress(boolean serviceNetwork, String expectedAddress)
+            throws Exception {
         Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
         Instance instance = startProtectedInstance(metadataServer, Map.of(
                 "floci.security-group-helper", "true",
                 "io.floci.service", "ec2",
                 "io.floci.resource-id", "i-protected",
-                "floci_owner_port", "4566"));
+                "floci_owner_port", "4566"), mock(DockerClient.class), serviceNetwork);
 
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(5));
-        verify(metadataServer, timeout(2000)).registerContainer("172.17.0.7", "i-protected", instance);
-        assertEquals("172.17.0.7", instance.getContainerBridgeIp(),
+        verify(metadataServer, timeout(2000)).registerContainer(expectedAddress, "i-protected", instance);
+        assertEquals(expectedAddress, instance.getContainerBridgeIp(),
                 "StartInstances must keep addressing the instance through its protected namespace");
     }
 
@@ -791,7 +794,7 @@ class Ec2ContainerManagerTest {
                 "io.floci.owner", "4566"));
 
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(5));
-        verify(metadataServer, timeout(2000)).registerContainer("172.17.0.7", "i-protected", instance);
+        verify(metadataServer, timeout(2000)).registerContainer("172.18.0.7", "i-protected", instance);
     }
 
     @Test
@@ -806,7 +809,7 @@ class Ec2ContainerManagerTest {
                 "floci_owner_port", "4566"));
 
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(5));
-        verify(metadataServer, timeout(2000)).registerContainer("172.17.0.7", "i-protected", instance);
+        verify(metadataServer, timeout(2000)).registerContainer("172.18.0.7", "i-protected", instance);
     }
 
     @Test
@@ -830,9 +833,11 @@ class Ec2ContainerManagerTest {
 
     private Instance startProtectedInstance(Ec2MetadataServer metadataServer, Map<String, String> helperLabels,
                                             DockerClient dockerClient) {
-        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
-        when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+        return startProtectedInstance(metadataServer, helperLabels, dockerClient, true);
+    }
 
+    private Instance startProtectedInstance(Ec2MetadataServer metadataServer, Map<String, String> helperLabels,
+                                             DockerClient dockerClient, boolean serviceNetwork) {
         when(dockerClient.startContainerCmd(TEST_CONTAINER_ID))
                 .thenReturn(mock(StartContainerCmd.class, RETURNS_SELF));
         // A workload in the helper's namespace has no Docker attachment of its own, so there is
@@ -850,8 +855,12 @@ class Ec2ContainerManagerTest {
         when(helperConfig.getLabels()).thenReturn(helperLabels);
         when(helper.getConfig()).thenReturn(helperConfig);
         NetworkSettings helperNetworks = mock(NetworkSettings.class);
-        when(helperNetworks.getNetworks())
-                .thenReturn(Map.of("bridge", new ContainerNetwork().withIpv4Address("172.17.0.7")));
+        Map<String, ContainerNetwork> attached = new LinkedHashMap<>();
+        attached.put("bridge", new ContainerNetwork().withIpv4Address("172.17.0.7"));
+        if (serviceNetwork) {
+            attached.put("floci-net", new ContainerNetwork().withIpv4Address("172.18.0.7"));
+        }
+        when(helperNetworks.getNetworks()).thenReturn(attached);
         when(helper.getNetworkSettings()).thenReturn(helperNetworks);
         InspectContainerCmd inspectHelper = mock(InspectContainerCmd.class);
         when(inspectHelper.exec()).thenReturn(helper);
@@ -860,9 +869,15 @@ class Ec2ContainerManagerTest {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.port()).thenReturn(4566);
         when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        ContainerLifecycleManager lifecycleManager = spy(new ContainerLifecycleManager(dockerClient,
+                mock(ImageCacheService.class), mock(ContainerDetector.class), config));
+        doReturn(true).when(lifecycleManager).isContainerRunning(TEST_CONTAINER_ID);
+        ContainerBuilder builder = mock(ContainerBuilder.class);
+        when(builder.resolveDockerNetwork(Optional.empty()))
+                .thenReturn(serviceNetwork ? Optional.of("floci-net") : Optional.empty());
 
         Ec2ContainerManager manager = new Ec2ContainerManager(
-                mock(ContainerBuilder.class),
+                builder,
                 lifecycleManager,
                 mock(ContainerLogStreamer.class),
                 mock(ContainerDetector.class),
