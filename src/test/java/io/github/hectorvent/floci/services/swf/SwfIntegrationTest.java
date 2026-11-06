@@ -670,8 +670,8 @@ class SwfIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void closingDecisionDistinguishesKnownWorkFromNewEvents(boolean newSignal) {
+    @ValueSource(strings = {"none", "signal", "activity-start", "activity-complete"})
+    void closingDecisionDistinguishesKnownWorkFromNewEvents(String event) {
         String domain = uniqueName("unhandled");
         registerDomain(domain);
         registerWorkflowType(domain, "TestWf", "1.0");
@@ -688,18 +688,28 @@ class SwfIntegrationTest {
                    }}]}
                 """.formatted(token)).then().statusCode(200);
 
-        // A successful ScheduleActivityTask does not itself schedule another decision task —
-        // the decider waits for the activity to close. A signal is what gets it a task while
-        // the activity is still open.
+        // A signal gives the decider a task while the known activity is still open.
         call("SignalWorkflowExecution", """
                 {"domain": "%s", "workflowId": "wf-unhandled", "signalName": "poke"}
                 """.formatted(domain)).then().statusCode(200);
 
         String second = pollDecisionToken(domain);
-        if (newSignal) {
+        if ("signal".equals(event)) {
             call("SignalWorkflowExecution", """
                     {"domain": "%s", "workflowId": "wf-unhandled", "signalName": "new"}
                     """.formatted(domain)).then().statusCode(200);
+        } else if (event.startsWith("activity-")) {
+            String activityToken = call("PollForActivityTask", """
+                    {"domain": "%s", "taskList": {"name": "floci-tl"}}
+                    """.formatted(domain)).then().statusCode(200)
+                    .body("activityId", equalTo("act-open"))
+                    .body("taskToken", not(equalTo("")))
+                    .extract().path("taskToken");
+            if ("activity-complete".equals(event)) {
+                call("RespondActivityTaskCompleted", """
+                        {"taskToken": "%s", "result": "done"}
+                        """.formatted(activityToken)).then().statusCode(200);
+            }
         }
         call("RespondDecisionTaskCompleted", """
                 {"taskToken": "%s", "decisions": [{
@@ -708,21 +718,32 @@ class SwfIntegrationTest {
                  }]}
                 """.formatted(second)).then().statusCode(200);
 
+        boolean unhandled = "signal".equals(event) || "activity-complete".equals(event);
         call("DescribeWorkflowExecution", """
                 {"domain": "%s", "execution": {"workflowId": "wf-unhandled", "runId": "%s"}}
                 """.formatted(domain, runId))
                 .then()
-                .body("executionInfo.executionStatus", equalTo(newSignal ? "OPEN" : "CLOSED"));
+                .body("executionInfo.executionStatus", equalTo(unhandled ? "OPEN" : "CLOSED"));
 
         Response history = call("GetWorkflowExecutionHistory", """
                 {"domain": "%s", "execution": {"workflowId": "wf-unhandled", "runId": "%s"}}
                 """.formatted(domain, runId))
                 .then().statusCode(200).extract().response();
         history.then().body("events.eventType",
-                hasItem(newSignal ? "CompleteWorkflowExecutionFailed" : "WorkflowExecutionCompleted"));
-        if (newSignal) {
+                hasItem(unhandled ? "CompleteWorkflowExecutionFailed" : "WorkflowExecutionCompleted"));
+        if (unhandled) {
             history.then().body("events.find { it.eventType == 'CompleteWorkflowExecutionFailed' }"
                     + ".completeWorkflowExecutionFailedEventAttributes.cause", equalTo("UNHANDLED_DECISION"));
+            call("RespondDecisionTaskCompleted", """
+                    {"taskToken": "%s", "decisions": [{
+                       "decisionType": "CompleteWorkflowExecution",
+                       "completeWorkflowExecutionDecisionAttributes": {}
+                     }]}
+                    """.formatted(pollDecisionToken(domain))).then().statusCode(200);
+            call("DescribeWorkflowExecution", """
+                    {"domain": "%s", "execution": {"workflowId": "wf-unhandled", "runId": "%s"}}
+                    """.formatted(domain, runId)).then().statusCode(200)
+                    .body("executionInfo.closeStatus", equalTo("COMPLETED"));
         }
     }
 
