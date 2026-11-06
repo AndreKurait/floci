@@ -6,9 +6,12 @@ import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
 import software.amazon.awssdk.services.autoscaling.model.AutoScalingException;
 import software.amazon.awssdk.services.autoscaling.model.Instance;
 import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.DescribeInstancesRequest;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
+import software.amazon.awssdk.services.ec2.waiters.Ec2Waiter;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,7 +50,10 @@ class AutoScalingMembershipTagTest {
                     .tagSpecifications(spec -> spec.resourceType(ResourceType.INSTANCE).tags(
                             tag -> tag.key("Shared").value("mine"), tag -> tag.key("Owner").value("me"))))
                     .instances().get(0).instanceId();
-            try {
+            try (Ec2Waiter waiter = ec2.waiter()) {
+                waiter.waitUntilInstanceRunning(DescribeInstancesRequest.builder().instanceIds(standalone).build(),
+                                TestFixtures.waiterOverride(Duration.ofMinutes(2)))
+                        .matched().response().orElseThrow();
                 autoScaling.createAutoScalingGroup(request -> request.autoScalingGroupName(name)
                         .launchTemplate(template -> template.launchTemplateName(name).version("1"))
                         .minSize(0).maxSize(2).desiredCapacity(1).availabilityZones(zone)

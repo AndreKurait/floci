@@ -7548,7 +7548,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * DescribeAvailabilityZones does not list would leave a client unable to pair the two, which
      * is the same inconsistency the hardcoded az1 produced, only quieter.
      */
-    private static String zoneNameForZoneId(String region, String availabilityZoneId) {
+    static String zoneNameForZoneId(String region, String availabilityZoneId) {
         int index = AvailabilityZoneIds.indexOf(region, availabilityZoneId);
         if (index >= 1 && index <= MODELLED_ZONE_SUFFIXES.length) {
             return region + MODELLED_ZONE_SUFFIXES[index - 1];

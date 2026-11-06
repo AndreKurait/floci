@@ -6,6 +6,7 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
+import software.amazon.awssdk.services.autoscaling.model.AutoScalingException;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.elasticloadbalancing.ElasticLoadBalancingClient;
 import software.amazon.awssdk.services.elasticloadbalancing.model.Instance;
@@ -15,6 +16,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
@@ -29,8 +31,9 @@ class AutoScalingDetachLoadBalancersIntegrationTest {
              AutoScalingClient scaling = AwsTestClients.create(AutoScalingClient.builder(), "000000000000", Region.US_EAST_1);
              ElasticLoadBalancingClient classic = AwsTestClients.create(
                      ElasticLoadBalancingClient.builder(), "000000000000", Region.US_EAST_1)) {
-            List<String> instanceIds = ec2.runInstances(request -> request.imageId("ami-12345678")
-                    .instanceType("t3.micro").minCount(3).maxCount(3)).instances().stream()
+            List<String> instanceIds = ec2.runInstances(request -> request.imageId("ami-amazonlinux2023")
+                    .instanceType("t3.micro").minCount(3).maxCount(3)
+                    .placement(placement -> placement.availabilityZone("us-east-1a"))).instances().stream()
                     .map(instance -> instance.instanceId()).toList();
             try (AutoCloseable instances = () -> ec2.terminateInstances(request -> request.instanceIds(instanceIds))) {
                 verifyDetach(scaling, classic, name, instanceIds);
@@ -47,7 +50,7 @@ class AutoScalingDetachLoadBalancersIntegrationTest {
                 .listeners(Listener.builder().protocol("HTTP").loadBalancerPort(80).instancePort(8080).build()));
         try (AutoCloseable loadBalancer = () -> classic.deleteLoadBalancer(request -> request.loadBalancerName(name))) {
             scaling.createLaunchConfiguration(request -> request.launchConfigurationName(name)
-                    .imageId("ami-12345678").instanceType("t3.micro"));
+                    .imageId("ami-amazonlinux2023").instanceType("t3.micro"));
             try (AutoCloseable launchConfiguration = () -> scaling.deleteLaunchConfiguration(
                     request -> request.launchConfigurationName(name))) {
                 createGroup(scaling, name, name);
@@ -65,6 +68,16 @@ class AutoScalingDetachLoadBalancersIntegrationTest {
                                 Instance.builder().instanceId(manual).build()));
 
                         reconciler.reconcileAll();
+                        AutoScalingException failure = assertThrows(AutoScalingException.class,
+                                () -> scaling.detachInstances(request -> request.autoScalingGroupName(name)
+                                        .instanceIds(owned, otherInstance).shouldDecrementDesiredCapacity(true)));
+                        assertEquals("ValidationError", failure.awsErrorDetails().errorCode());
+                        assertEquals(instanceIds, classic.describeLoadBalancers(request -> request.loadBalancerNames(name))
+                                .loadBalancerDescriptions().getFirst().instances().stream()
+                                .map(Instance::instanceId).toList());
+                        assertEquals(List.of(owned), scaling.describeAutoScalingGroups(
+                                request -> request.autoScalingGroupNames(name)).autoScalingGroups().getFirst()
+                                .instances().stream().map(instance -> instance.instanceId()).toList());
                         scaling.detachInstances(request -> request.autoScalingGroupName(name)
                                 .instanceIds(owned).shouldDecrementDesiredCapacity(true));
 

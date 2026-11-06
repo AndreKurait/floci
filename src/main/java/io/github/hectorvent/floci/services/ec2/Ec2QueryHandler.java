@@ -964,9 +964,23 @@ public class Ec2QueryHandler {
             }
         }
 
+        String availabilityZone = p.getFirst("Placement.AvailabilityZone");
+        String availabilityZoneId = p.getFirst("Placement.AvailabilityZoneId");
+        if (firstNonBlank(availabilityZone, availabilityZoneId) == null
+                && launchTemplateData != null && launchTemplateData.getPlacement() != null) {
+            availabilityZone = launchTemplateData.getPlacement().getAvailabilityZone();
+            availabilityZoneId = launchTemplateData.getPlacement().getAvailabilityZoneId();
+        }
+        if (availabilityZoneId != null && !availabilityZoneId.isBlank()) {
+            if (availabilityZone != null && !availabilityZone.isBlank()) {
+                throw new AwsException("InvalidParameterCombination",
+                        "You cannot specify both AvailabilityZone and AvailabilityZoneId", 400);
+            }
+            availabilityZone = Ec2Service.zoneNameForZoneId(region, availabilityZoneId);
+        }
         Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
-                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, Boolean.parseBoolean(p.getFirst("DryRun")),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification);

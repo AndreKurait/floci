@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
@@ -392,6 +393,7 @@ class AutoScalingStandbyTest {
     void attachInstancesCountsOnlyMembersOutsideStandby() {
         ok(enterStandby(true, "i-a"));
         reconciler.reconcile(group());
+        ec2States.put("i-c", InstanceState.running());
 
         MultivaluedHashMap<String, String> attach = params(GROUP);
         attach.add("InstanceIds.member.1", "i-c");
@@ -1099,6 +1101,7 @@ class AutoScalingStandbyTest {
         Instance instance = new Instance();
         instance.setInstanceId(id);
         instance.setState(state);
+        instance.setPlacement(new Placement(REGION + "a"));
         return instance;
     }
 
