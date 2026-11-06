@@ -160,7 +160,7 @@ class CloudFormationDeletionPolicyIntegrationTest {
     }
 
     @Test
-    void rollingBackAFailedCreateDeletesRetainExceptOnCreateButKeepsRetain() {
+    void rollingBackAFailedCreateDeletesRetainExceptOnCreateButKeepsRetain() throws InterruptedException {
         String suffix = Long.toString(System.nanoTime(), 36);
         String keptBucket = "cfn-rollback-retain-bucket-" + suffix;
         String rolledBackBucket = "cfn-rollback-reoc-bucket-" + suffix;
@@ -197,7 +197,7 @@ class CloudFormationDeletionPolicyIntegrationTest {
 
         String stackId = createStack(stackName, template);
 
-        assertThat(describeStacks(stackId), containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
+        awaitStackStatus(stackId, "ROLLBACK_COMPLETE");
         assertBucketExists(keptBucket);
         assertBucketDeleted(rolledBackBucket);
     }
@@ -732,7 +732,7 @@ class CloudFormationDeletionPolicyIntegrationTest {
 
         String parentStackId = createStack(stackName, template);
         try {
-            assertThat(describeStacks(parentStackId), containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
+            awaitStackStatus(parentStackId, "ROLLBACK_COMPLETE");
             assertBucketDeleted(bucketName);
         } finally {
             deleteStack(stackName);
