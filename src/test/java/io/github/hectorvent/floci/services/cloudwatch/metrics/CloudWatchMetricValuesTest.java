@@ -138,6 +138,35 @@ class CloudWatchMetricValuesTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void zeroWeightedExtremaRemainAvailableAsEndpointPercentiles(boolean useQuery) {
+        ObjectNode datum = weighted();
+        datum.putArray("Counts").add(0).add(1);
+        publish(useQuery, datum);
+        assertEquals(Map.of("p0", 7.0, "p100", 11.0), statistics("p0", "p100").getFirst().extendedStatistics());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void zeroWeightedMaximumIsNotReplacedByTheLastPositiveSample(boolean useQuery) {
+        ObjectNode datum = weighted();
+        datum.putArray("Counts").add(1).add(0);
+        publish(useQuery, datum);
+        assertEquals(Map.of("p0", 7.0, "p100", 11.0), statistics("p0", "p100").getFirst().extendedStatistics());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void allZeroWeightsExposeEndpointsWithoutInventingInteriorPercentiles(boolean useQuery) {
+        ObjectNode datum = weighted();
+        datum.putArray("Counts").add(0).add(0);
+        publish(useQuery, datum);
+        assertEquals(Map.of("p0", 7.0, "p100", 11.0),
+                statistics("p0", "p90", "p100").getFirst().extendedStatistics());
+        assertTrue(statistics("p90").isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void explicitZeroStatisticSetsRemainDistinctFromScalarZero(boolean useQuery) {
         ObjectNode datum = datum();
         datum.putObject("StatisticValues").put("SampleCount", 0).put("Sum", 0)
