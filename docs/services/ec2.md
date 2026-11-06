@@ -27,6 +27,11 @@ or instance-type restrictions.
 
 `RunInstances` launches a **real Docker container** for each instance. By default, the `minimal` guest runtime overrides the image's CMD with `tail -f /dev/null`. Catalog entries can instead select `systemd`, which starts `/sbin/init` with the mounts needed for a systemd-based cloud-image guest, or `image`, which preserves the image's own ENTRYPOINT and CMD.
 
+Cloud images whose native systemd requires the named cgroup v1 hierarchy can
+select `systemd-v1`. It starts the image's native init in a delegated service
+hierarchy and supports native guest reboots. See the
+[runtime requirements and qualification limits](../design/ec2-systemd-v1.md).
+
 | EC2 state | Docker operation |
 |---|---|
 | `pending → running` | Container created and started |
@@ -241,7 +246,9 @@ Both paths must be normalized absolute Linux paths, including when the Floci
 process runs on Windows. Sources must already exist on the Docker daemon host.
 Docker refuses a missing source without creating it.
 Duplicate targets and replacing the guest root are rejected before guest
-resources are allocated.
+resources are allocated. For systemd images, `/run`, `/run/lock`, and
+`/sys/fs/cgroup` are reserved for the runtime and cannot be bind targets.
+The `systemd-v1` runtime also reserves `/sys/hypervisor`.
 
 These mounts apply to EC2 guest containers in every runtime mode. Helpers retain
 their own configuration. Image ENTRYPOINT/CMD, process limits, metadata and
@@ -2419,3 +2426,12 @@ cannot split a move between its source and destination.
 
 A launch template with network interfaces cannot be combined with an instance-level
 `SubnetId`; place the subnet on the primary network interface instead.
+
+## Native cloud-init ownership
+
+When a catalog image declares `cloudInit: true` and uses `systemd`, `systemd-v1`,
+or `image`, its native startup process owns cloud-init, SSH configuration, and
+user-data execution. Floci exposes the original user data through metadata and
+does not also extract and execute shell scripts or inject an SSH key. The image
+must install and start cloud-init itself. Images without cloud-init and the
+`minimal` runtime retain the compatibility bootstrap.

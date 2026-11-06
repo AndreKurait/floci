@@ -170,10 +170,11 @@ class Ec2ContainerManagerTest {
             boolean transientFailure, boolean peerRefreshFailure) throws Exception {
         DockerClient docker = mock(DockerClient.class);
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
-        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
-        EmulatorConfig config = mock(EmulatorConfig.class);
-        when(config.port()).thenReturn(4566);
         when(firewall.enabled()).thenReturn(true);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.port()).thenReturn(4566);
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 mock(ContainerBuilder.class), lifecycle,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
@@ -1926,7 +1927,7 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void launchSystemdGuestUsesInitInsteadOfTail() throws Exception {
+    void launchSystemdGuestWithoutCloudInitUsesInitAndCompatibilityUserData() throws Exception {
         Ec2ContainerManager.containerBridgeIpAttempts = 1;
         Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
@@ -1941,7 +1942,7 @@ class Ec2ContainerManagerTest {
         instance.setUserData("#!/bin/sh\necho ready\n");
 
         harness.manager.launch(instance,
-                new ResolvedAmiImage("floci/ami-ubuntu:24.04-arm64", ResolvedAmiImage.SYSTEMD_RUNTIME, true,
+                new ResolvedAmiImage("floci/ami-ubuntu:24.04-arm64", ResolvedAmiImage.SYSTEMD_RUNTIME, false,
                         "linux/arm64"),
                 null,
                 "us-west-2");
@@ -1955,6 +1956,48 @@ class Ec2ContainerManagerTest {
         assertEquals(-1, commandIndex(harness.executedCommands, "/usr/sbin/sshd"),
                 "a systemd guest's init starts sshd; Floci must not start a second one");
         verify(harness.lifecycleManager).create(any(ContainerSpec.class), eq("linux/arm64"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"systemd,true", "image,true", "systemd,false", "image,false", "minimal,true", "minimal,false"})
+    void launchDelegatesBootstrapOnlyToAnActiveGuestCloudInit(String runtime, boolean cloudInit) throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_HELPER_ID)).thenReturn(inspect);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.11");
+        when(inspect.exec()).thenReturn(withIp);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        Instance instance = instance("i-cloud-init");
+        String userData = "#!/bin/sh\necho run-once\n";
+        instance.setUserData(userData);
+
+        try {
+            harness.manager.launch(instance, new ResolvedAmiImage("test/native-guest:1", runtime, cloudInit, null),
+                    "ssh-ed25519 AAAAtest", "us-west-2");
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "launch worker should finish");
+            assertEquals("running", instance.getState().getName());
+            assertEquals(userData, instance.getUserData(), "metadata retains the original user data");
+            boolean guestOwnsBootstrap = cloudInit && !"minimal".equals(runtime);
+            if (guestOwnsBootstrap) {
+                verify(harness.dockerClient, never()).execCreateCmd(TEST_CONTAINER_ID);
+                verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
+            } else {
+                assertTrue(commandIndex(harness.executedCommands, "/var/lib/user-data.sh") >= 0,
+                        "guests without an active cloud-init keep compatibility bootstrap");
+            }
+            if ("image".equals(runtime)) {
+                verify(harness.builder, never()).withCmd(List.of("tail", "-f", "/dev/null"));
+                verify(harness.builder, never()).withCmd(List.of("/sbin/init"));
+            } else if ("systemd".equals(runtime)) {
+                verify(harness.builder).withCmd(List.of("/sbin/init"));
+            }
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     @Test
@@ -3049,6 +3092,27 @@ class Ec2ContainerManagerTest {
         return container;
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unavailableDockerDuringReconciliationDoesNotPreventStartupOrRetry(boolean helperListingFails) {
+        LaunchHarness harness = reconcileHarness(true, 4680);
+        ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(harness.dockerClient.listContainersCmd()).thenReturn(listing);
+        if (helperListingFails) {
+            when(listing.exec()).thenReturn(List.of())
+                    .thenThrow(new IllegalStateException("Docker is unavailable"))
+                    .thenReturn(List.of());
+        } else {
+            when(listing.exec()).thenThrow(new IllegalStateException("Docker is unavailable"))
+                    .thenReturn(List.of());
+        }
+
+        assertEquals(0, harness.manager.reconcileOrphanedContainers((region, instance) -> false));
+        assertEquals(0, harness.manager.reconcileOrphanedContainers((region, instance) -> false));
+        verify(listing, times(helperListingFails ? 4 : 3)).exec();
+        verify(harness.lifecycleManager, never()).removeIfExists(anyString());
+    }
+
     @Test
     void reconcileOrphanedContainersDoesNothingWhenDisabled() {
         LaunchHarness harness = reconcileHarness(false, 4680);
@@ -3670,6 +3734,7 @@ class Ec2ContainerManagerTest {
         HostConfig host = createGuestHostConfig(spec);
 
         assertFalse(Boolean.TRUE.equals(host.getPrivileged()));
+        assertFalse(Boolean.TRUE.equals(host.getInit()));
         assertEquals(Set.of(Capability.NET_ADMIN, Capability.NET_RAW), Set.of(host.getCapDrop()));
         assertEquals("container:" + TEST_HELPER_ID, host.getNetworkMode());
         assertFalse(spec.env().stream().anyMatch(value -> value.startsWith("AWS_ACCESS_KEY_ID=")));
@@ -3770,6 +3835,50 @@ class Ec2ContainerManagerTest {
                 "example/worker:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"),
                 Map.of("FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", source,
                         "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/run", "/run/lock", "/sys/fs/cgroup"})
+    void systemdMountTargetsRefuseBeforePortsHelpersOrWorkload(String target) throws Exception {
+        assertNull(launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "minimal,/run", "minimal,/run/lock", "minimal,/sys/fs/cgroup",
+            "image,/run", "image,/run/lock", "image,/sys/fs/cgroup",
+            "systemd,/run/custom", "systemd,/run/lockfile", "systemd,/sys/fs/cgroup-extra"
+    })
+    void otherRuntimeMountTargetsRemainAvailable(String runtime, String target) throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", runtime, "systemd".equals(runtime), "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), false, false, false);
+
+        Mount bind = spec.mounts().stream().filter(mount -> mount.getType() == MountType.BIND)
+                .findFirst().orElseThrow();
+        assertEquals(target, bind.getTarget());
+        assertTrue(bind.getReadOnly());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/run", "/run/lock", "/sys/fs/cgroup", "/sys/hypervisor"})
+    void nativeRuntimeMountsRefuseBeforeAllocatingGuestResources(String target) throws Exception {
+        assertNull(launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME, true, "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SYS_ADMIN", "CAP_SYS_ADMIN", "sys_boot", "cap_sys_boot", "ALL"})
+    void nativeRuntimeRefusesMissingRequiredCapabilitiesBeforeAllocation(String capability) throws Exception {
+        assertNull(launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME, true, "linux/arm64"),
+                Map.of("FLOCI_SERVICES_EC2_CAP_DROP", capability), true, false, true));
     }
 
     @Test

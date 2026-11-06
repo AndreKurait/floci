@@ -121,6 +121,33 @@ class NativeImageResourceIncludesTest {
                         .reduce((a, b) -> a + "\n  " + b).orElse(""));
     }
 
+    @Test
+    void everyHelperBuildContextIsIncludedInTheNativeImage() throws IOException {
+        List<PathMatcher> includes = parseIncludes();
+        List<Path> resources = new ArrayList<>();
+        try (Stream<Path> files = Files.list(MAIN_RESOURCE_ROOT.resolve("docker"))) {
+            for (Path manifest : files.filter(p -> p.toString().endsWith(".Dockerfile.files")).toList()) {
+                resources.add(manifest);
+                for (String line : Files.readAllLines(manifest)) {
+                    String name = line.strip();
+                    if (!name.isEmpty()) {
+                        resources.add(manifest.resolveSibling(name));
+                    }
+                }
+            }
+        }
+        List<Path> offenders = new ArrayList<>();
+        for (Path resource : resources) {
+            assertTrue(Files.isRegularFile(resource), "Missing helper build-context resource: " + resource);
+            Path relative = MAIN_RESOURCE_ROOT.relativize(resource);
+            if (includes.stream().noneMatch(m -> m.matches(relative))) {
+                offenders.add(relative);
+            }
+        }
+        assertTrue(offenders.isEmpty(),
+                "Helper build-context manifests and their inputs need native-image includes: " + offenders);
+    }
+
     private static String readSource(Path javaFile) {
         try {
             return Files.readString(javaFile);

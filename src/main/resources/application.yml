@@ -68,7 +68,7 @@ quarkus:
       # parser reads its message bundles, Lambda Web Functions copy their
       # runtime (lambdaweb/index.mjs) into each environment, EMR writes its S3DistCp program
       # (emr/s3-dist-cp.py) into a step's container, EC2 security group enforcement builds
-      # its helper image from docker/*.Dockerfile, and API Gateway's Velocity
+      # its helper image from docker/ Dockerfiles and their declared build inputs, and API Gateway's Velocity
       # engine reads its default properties at runtime via
       # ClassLoader#getResourceAsStream. Quarkus's static resource analysis
       # cannot detect these dynamically-built paths, so they are registered
@@ -85,7 +85,7 @@ quarkus:
         - lambdaweb/*.mjs
         - emr/*.py
         - ec2/*.yaml
-        - docker/*.Dockerfile
+        - docker/**
         - sagemaker/*.yaml
         - kms/*.yaml
         - eks/*.json

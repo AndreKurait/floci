@@ -1484,6 +1484,9 @@ public class ContainerLifecycleManager {
             hostConfig.withPrivileged(true);
         }
         LinuxOptions linux = spec.linuxOptions();
+        if (linux.pidMode() != null && !linux.pidMode().isBlank()) {
+            hostConfig.withPidMode(linux.pidMode());
+        }
         if (!linux.networkSysctls().isEmpty()) {
             hostConfig.withSysctls(linux.networkSysctls());
         }
