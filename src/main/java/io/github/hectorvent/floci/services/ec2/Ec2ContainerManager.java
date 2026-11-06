@@ -175,10 +175,10 @@ public class Ec2ContainerManager {
 
     private volatile boolean dockerUnavailableLogged;
 
-    public void refreshSecurityGroups(String region, Map<String, SecurityGroup> groups,
+    public void refreshSecurityGroups(String accountId, String region, Map<String, SecurityGroup> groups,
                                       Map<String, List<String>> prefixLists) {
         if (firewallManager != null && firewallManager.enabled()) {
-            firewallManager.refreshPolicies(region, groups, prefixLists);
+            firewallManager.refreshPolicies(accountId, region, groups, prefixLists);
         }
     }
 
