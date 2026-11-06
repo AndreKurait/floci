@@ -5650,25 +5650,27 @@ class Ec2IntegrationTest {
         .then().statusCode(200)
             .extract().path("CreateRouteTableResponse.routeTable.routeTableId");
 
-        given()
-            .formParam("Action", "CreateRoute")
-            .formParam("RouteTableId", rt)
-            .formParam("DestinationCidrBlock", "0.0.0.0/0")
-            .formParam("NatGatewayId", "nat-0123456789abcdef0")
-            .header("Authorization", AUTH_HEADER)
-        .when().post("/")
-        .then().statusCode(200)
-            .body("CreateRouteResponse.return", equalTo("true"));
+        try (NatGatewayFixture nat = new NatGatewayFixture(AUTH_HEADER, vpc, "10.38.0.0/24")) {
+            given()
+                .formParam("Action", "CreateRoute")
+                .formParam("RouteTableId", rt)
+                .formParam("DestinationCidrBlock", "0.0.0.0/0")
+                .formParam("NatGatewayId", nat.id())
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200)
+                .body("CreateRouteResponse.return", equalTo("true"));
 
-        given()
-            .formParam("Action", "DescribeRouteTables")
-            .formParam("RouteTableId.1", rt)
-            .header("Authorization", AUTH_HEADER)
-        .when().post("/")
-        .then()
-            .statusCode(200)
-            .body("DescribeRouteTablesResponse.routeTableSet.item.routeSet.item.natGatewayId",
-                    equalTo("nat-0123456789abcdef0"));
+            given()
+                .formParam("Action", "DescribeRouteTables")
+                .formParam("RouteTableId.1", rt)
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeRouteTablesResponse.routeTableSet.item.routeSet.item.natGatewayId",
+                        equalTo(nat.id()));
+        }
     }
 
     @Test

@@ -7252,9 +7252,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private void blackholeRoutes(String region, Predicate<Route> targetsGateway) {
         for (RouteTable table : routeTables.scan(k -> k.startsWith(region + "::"))) {
-            if (table.getRoutes().stream().noneMatch(targetsGateway)) {
-                continue;
-            }
             synchronized (lockFor(key(region, table.getRouteTableId()))) {
                 RouteTable current = routeTables.get(key(region, table.getRouteTableId())).orElse(null);
                 if (current == null || current.getRoutes().stream().noneMatch(targetsGateway)) {
@@ -13929,6 +13926,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                 + " already exists", 400);
             }
             String effectiveInstanceOwnerId = resolveInstanceOwnerId(region, instanceId);
+            if (isSet(natGatewayId)) {
+                getRequiredNatGateway(region, natGatewayId);
+            }
             Route route = new Route(canonicalDestinationCidrBlock, gatewayId, "CreateRoute");
             route.setDestinationIpv6CidrBlock(destinationIpv6CidrBlock);
             route.setDestinationPrefixListId(destinationPrefixListId);
@@ -14002,10 +14002,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             String effectiveInstanceOwnerId = hasInstance
                     ? resolveInstanceOwnerId(region, instanceId)
                     : null;
-
             if (dryRun) {
                 throw new AwsException("DryRunOperation",
                         "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+            if (hasNatGateway) {
+                getRequiredNatGateway(region, natGatewayId);
             }
 
             // The target the request does not name is cleared rather than carried over from the
