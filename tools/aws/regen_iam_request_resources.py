@@ -157,7 +157,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
-NAMESPACES = ("access-analyzer", "acm", "application-autoscaling", "athena", "bcm-data-exports",
+NAMESPACES = ("access-analyzer", "acm", "appconfig", "application-autoscaling", "athena", "bcm-data-exports",
               "bcm-pricing-calculator", "budgets", "ce", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
               "cognito-idp", "cur", "datasync", "ecr", "elasticloadbalancing", "elasticmapreduce", "es", "events",
               "firehose", "globalaccelerator", "kinesisanalytics", "payment-cryptography", "redshift",
@@ -200,7 +200,6 @@ NOT_COVERED: dict[str, str] = {
     "account": _REST,
     "airflow": _REST,
     "app-integrations": _REST,
-    "appconfig": _REST,
     "appsync": _REST,
     "aps": _REST,
     "autoscaling": "not read yet: AWS's group and launch configuration ARNs carry an id the service mints, "
@@ -276,6 +275,9 @@ NOT_COVERED: dict[str, str] = {
                       "named in the path",
     "ses": _LATER,
     "signin": _REST,
+    "ssmmessages": "not read yet: the session resource applies to OpenDataChannel, which Floci does not serve; "
+                   "the served CreateControlChannel and OpenControlChannel operations are unscoped and "
+                   "authorized by SsmChannelAuthentication",
     "sso-oauth": _REST,
     "swf": "not read yet: the Service Reference gives a domain's ARN no Region, `swf::<account>:/domain/<name>`, "
            "while the SWF Developer Guide gives it as arn:aws:swf:Region:AccountID:/domain/DomainName, as Floci mints "
@@ -295,6 +297,20 @@ NOT_COVERED: dict[str, str] = {
 # them apart (EventBridge's `events` and EventBridge V2's `eventsv2`): Floci applies it only to a request the service
 # of that endpoint serves, never by a member a caller could add to a request of the other.
 CORRECTIONS: dict[str, tuple[list[dict], str]] = {
+    **{f"appconfig:{operation}": ([
+        {"type": "application", "fill": {"ApplicationId": "ApplicationId"}},
+        {"type": "configurationprofile", "fill": {
+            "ApplicationId": "ApplicationId", "ConfigurationProfileId": "ConfigurationProfileId"}},
+    ], "configurationprofile and hostedconfigurationversion have the same ARN format; the version number "
+       "does not change that profile ARN, so these resource types are aliases rather than alternatives")
+       for operation in ("GetHostedConfigurationVersion", "DeleteHostedConfigurationVersion")},
+    "appconfig:GetConfiguration": ([
+        {"type": "application", "fill": {"ApplicationId": "Application"}},
+        {"type": "environment", "fill": {"ApplicationId": "Application", "EnvironmentId": "Environment"}},
+        {"type": "configurationprofile", "fill": {
+            "ApplicationId": "Application", "ConfigurationProfileId": "Configuration"}},
+    ], "the legacy data API takes application, environment and configuration profile IDs or names in its path; "
+       "their fields omit the Id suffix, and AppConfig resolves names to the stored IDs before IAM evaluation"),
     "logs:PutDeliverySource": ([{"type": "delivery-source", "fill": {"DeliverySourceName": "name"}}],
                                "resourceArn is the ARN of the resource that sends the logs (an event bus, a load "
                                "balancer), never the delivery source's, which the request names by name"),
@@ -637,6 +653,10 @@ FOUND_BY: dict[str, tuple[list[str], str]] = {
 # and whose action acts on one of those types, names it through the member, and the reader asks the service for the
 # ARN of the caller's resource at the other end.
 THROUGH: dict[str, tuple[list[str], str]] = {
+    "appconfig:ConfigurationToken": (
+        ["configuration"],
+        "GetLatestConfiguration's token identifies the application, environment and configuration profile of "
+        "the session opened by StartConfigurationSession; AWS checks the resulting configuration ARN"),
     "redshift-data:SessionId": (
         ["cluster", "workgroup"],
         "a Data API session runs on the cluster or the serverless workgroup it was opened on (ListSessions filters "
@@ -742,6 +762,9 @@ def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
             shape = model["shapes"][member["shape"]]
             if _strings(model, shape) is not None:
                 found.setdefault(name, name + _strings(model, shape))
+            elif member.get("location") == "uri" and shape["type"] in ("integer", "long"):
+                # Numeric path labels are still strings on the wire, such as DeploymentNumber.
+                found.setdefault(name, name)
             for path in _nested_arns(model, name, shape):
                 found.setdefault(path.removesuffix("[]"), path)
     return found
@@ -758,7 +781,9 @@ def located_members(models: dict[str, dict], operation: str) -> dict[str, str]:
             continue
         for name, member in model["shapes"][spec["input"]["shape"]].get("members", {}).items():
             where = _located(member)
-            if where is None or _strings(model, model["shapes"][member["shape"]]) != "":
+            shape = model["shapes"][member["shape"]]
+            numeric_label = member.get("location") == "uri" and shape["type"] in ("integer", "long")
+            if where is None or (_strings(model, shape) != "" and not numeric_label):
                 continue
             if found.setdefault(name, where) != where:
                 raise ValueError(f"{operation}'s {name} is {found[name]} in one client and {where} in {client}")
