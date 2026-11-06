@@ -47,8 +47,11 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519_FINGERPRINT;
@@ -56,6 +59,7 @@ import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -65,7 +69,11 @@ import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -135,6 +143,163 @@ class Ec2ServicePersistenceTest {
         assertEquals("retained-container", restored.getDockerContainerId());
         assertEquals("10.73.1.11", restored.getContainerBridgeIp());
     }
+
+    @Test
+    void completedContainerPersistsWhenVolumeRestorationThrows(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        RuntimeException failure = new IllegalStateException("Volume mount unavailable");
+        doThrow(failure).when(launch.service()).restoreAttachedVolumesForInstance(REGION, launch.instance());
+        launch.instance().setDockerContainerId("started-container");
+        launch.instance().setState(InstanceState.running());
+
+        ExecutionException thrown = assertThrows(ExecutionException.class, () -> runOnWorker(launch.completion()));
+
+        assertSame(failure, thrown.getCause());
+        Instance restored = persistedInstance(dir, launch.instance());
+        assertEquals("running", restored.getState().getName());
+        assertEquals("started-container", restored.getDockerContainerId());
+    }
+
+    @Test
+    void lateContainerCompletionDoesNotRestoreAPrunedInstance(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.terminated());
+        launch.instance().setTerminatedAt(System.currentTimeMillis() - TimeUnit.HOURS.toMillis(2));
+        launch.service().pruneTerminatedInstances();
+
+        runOnWorker(launch.completion());
+
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+        verify(launch.service(), never()).restoreAttachedVolumesForInstance(any(), any());
+    }
+
+    @Test
+    void lateContainerCompletionDoesNotRestoreAnInstanceRemovedDuringReset(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.running());
+        launch.service().beforeReset();
+        try {
+            launch.service().deleteInstanceForTest(REGION, launch.instance().getInstanceId());
+            launch.service().clear();
+        } finally {
+            launch.service().afterReset();
+        }
+
+        runOnWorker(launch.completion());
+
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+        verify(launch.service(), never()).restoreAttachedVolumesForInstance(any(), any());
+    }
+
+    @Test
+    void containerCompletionPausesDuringResetAndResumesAfterwards(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.running());
+        launch.service().beforeReset();
+        try {
+            runOnWorker(launch.completion());
+            assertEquals("pending", persistedInstance(dir, launch.instance()).getState().getName());
+            verify(launch.service(), never()).restoreAttachedVolumesForInstance(any(), any());
+        } finally {
+            // A reset can fail before wiping storage; afterReset must resume publications.
+            launch.service().afterReset();
+        }
+        runOnWorker(launch.completion());
+        assertEquals("running", persistedInstance(dir, launch.instance()).getState().getName());
+        verify(launch.service()).restoreAttachedVolumesForInstance(REGION, launch.instance());
+    }
+
+    @Test
+    void resetDrainsAnActiveContainerCompletionBeforeStorageCanBeCleared(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.running());
+        CountDownLatch restoring = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch resetting = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            restoring.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(launch.service()).restoreAttachedVolumesForInstance(REGION, launch.instance());
+        FutureTask<Void> completion = new FutureTask<>(launch.completion(), null);
+        FutureTask<Void> reset = new FutureTask<>(() -> {
+            resetting.countDown();
+            launch.service().beforeReset();
+        }, null);
+        new Thread(completion).start();
+        try {
+            assertTrue(restoring.await(10, TimeUnit.SECONDS));
+            new Thread(reset).start();
+            assertTrue(resetting.await(10, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> reset.get(100, TimeUnit.MILLISECONDS));
+        } finally {
+            release.countDown();
+            completion.get(10, TimeUnit.SECONDS);
+            reset.get(10, TimeUnit.SECONDS);
+            launch.service().afterReset();
+        }
+        assertEquals("running", persistedInstance(dir, launch.instance()).getState().getName());
+    }
+
+    @Test
+    void pruningWaitsForAnActiveCompletionAndLeavesNoPersistedInstance(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.running());
+        CountDownLatch restoring = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch pruning = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            restoring.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(launch.service()).restoreAttachedVolumesForInstance(REGION, launch.instance());
+        FutureTask<Void> completion = new FutureTask<>(launch.completion(), null);
+        FutureTask<Void> prune = new FutureTask<>(() -> {
+            pruning.countDown();
+            launch.service().pruneTerminatedInstances();
+        }, null);
+        new Thread(completion).start();
+        try {
+            assertTrue(restoring.await(10, TimeUnit.SECONDS));
+            launch.instance().setState(InstanceState.terminated());
+            launch.instance().setTerminatedAt(System.currentTimeMillis() - TimeUnit.HOURS.toMillis(2));
+            new Thread(prune).start();
+            assertTrue(pruning.await(10, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> prune.get(100, TimeUnit.MILLISECONDS));
+        } finally {
+            release.countDown();
+            completion.get(10, TimeUnit.SECONDS);
+            prune.get(10, TimeUnit.SECONDS);
+        }
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+    }
+
+    @Test
+    void completionDoesNotReattachVolumesAfterTheInstanceHasStopped(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.stopped());
+
+        runOnWorker(launch.completion());
+
+        verify(launch.service(), never()).restoreAttachedVolumesForInstance(any(), any());
+        assertEquals("stopped", persistedInstance(dir, launch.instance()).getState().getName());
+    }
+
+    private PendingContainerLaunch pendingContainerLaunch(Path dir) {
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        AtomicReference<Runnable> completion = new AtomicReference<>();
+        doAnswer(invocation -> {
+            completion.set(invocation.getArgument(8));
+            return null;
+        }).when(containers).launch(any(), any(ResolvedAmiImage.class), isNull(), eq(REGION),
+                anySet(), anyList(), anyMap(), any(), any());
+        Ec2Service service = spy(newService(dir, containers));
+        Instance instance = service.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        return new PendingContainerLaunch(service, instance, completion.get());
+    }
+
+    private record PendingContainerLaunch(Ec2Service service, Instance instance, Runnable completion) {}
 
     private Instance persistedInstance(Path dir, Instance instance) {
         return load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})

@@ -292,6 +292,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final EmulatorConfig config;
     private final IamService iamService;
     private final Ec2ContainerManager containerManager;
+    private final Object containerCompletionLock = new Object();
+    private boolean resettingInstances;
     private final Ec2PortForwardManager portForwardManager;
     private final AmiImageResolver amiImageResolver;
     private final Ec2ImageCatalog imageCatalog;
@@ -488,7 +490,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     void deleteInstanceForTest(String region, String instanceId) {
-        instances.delete(key(region, instanceId));
+        synchronized (containerCompletionLock) {
+            instances.delete(key(region, instanceId));
+        }
     }
 
     void putVolumeForTest(Volume volume) {
@@ -1655,6 +1659,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     // ─── Default resource seeding ──────────────────────────────────────────────
+
+    @Override
+    public void beforeReset() {
+        synchronized (containerCompletionLock) {
+            resettingInstances = true;
+        }
+    }
+
+    @Override
+    public void afterReset() {
+        synchronized (containerCompletionLock) {
+            resettingInstances = false;
+        }
+    }
 
     // Storage is wiped before clear() runs, so the seeded-scope memory must go too or the default
     // VPC and subnets would never come back.
@@ -4733,10 +4751,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private void completeContainerStart(String region, Instance instance) {
-        restoreAttachedVolumesForInstance(region, instance);
-        // The worker updates the live model after RunInstances or StartInstances saved it.
-        // Persist its container identity and addresses without waiting for another API write.
-        instances.put(key(region, instance.getInstanceId()), instance);
+        synchronized (containerCompletionLock) {
+            String storeKey = key(region, instance.getInstanceId());
+            if (resettingInstances || instances.get(storeKey).orElse(null) != instance) {
+                return;
+            }
+            try {
+                if ("running".equals(instance.getState().getName())) {
+                    restoreAttachedVolumesForInstance(region, instance);
+                }
+            } finally {
+                // The worker updates the live model after the API saved its pending record.
+                // Preserve that update even when volume restoration fails.
+                instances.put(storeKey, instance);
+            }
+        }
     }
 
     private List<Ec2VolumeBlockDeviceManager.PreparedMount> prepareInstanceMounts(
@@ -6275,17 +6304,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /** Removes terminated instances older than 1 hour. Called periodically by lifecycle. */
     public void pruneTerminatedInstances() {
-        long cutoff = System.currentTimeMillis() - 3_600_000L;
-        for (String storeKey : new ArrayList<>(instances.keys())) {
-            Instance inst = instances.get(storeKey).orElse(null);
-            if (inst != null && !inst.isReplayProtected()
-                    && "terminated".equals(inst.getState().getName())
-                    && inst.getTerminatedAt() > 0
-                    && inst.getTerminatedAt() < cutoff) {
-                tags.delete(inst.getInstanceId());
-                instances.delete(storeKey);
-                if (inst.getRegion() != null) {
-                    removeTags(inst.getRegion(), inst.getInstanceId());
+        synchronized (containerCompletionLock) {
+            long cutoff = System.currentTimeMillis() - 3_600_000L;
+            for (String storeKey : new ArrayList<>(instances.keys())) {
+                Instance inst = instances.get(storeKey).orElse(null);
+                if (inst != null && !inst.isReplayProtected()
+                        && "terminated".equals(inst.getState().getName())
+                        && inst.getTerminatedAt() > 0
+                        && inst.getTerminatedAt() < cutoff) {
+                    tags.delete(inst.getInstanceId());
+                    instances.delete(storeKey);
+                    if (inst.getRegion() != null) {
+                        removeTags(inst.getRegion(), inst.getInstanceId());
+                    }
                 }
             }
         }
