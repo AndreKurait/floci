@@ -157,6 +157,7 @@ import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.lambda.LambdaCodeSigningConfigService;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.lambda.ProvisionedConcurrencyPool;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
 import io.github.hectorvent.floci.services.organizations.OrganizationsService;
@@ -182,6 +183,8 @@ import io.github.hectorvent.floci.services.wafv2.WafV2Service;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+
+import static org.mockito.Mockito.mock;
 
 /**
  * Builds {@link CfnResourceDispatcher} for tests without a wall of positional nulls.
@@ -443,7 +446,7 @@ final class CfnProvisionerFixture {
             if (lambdaService != null) {
                 discovered.add(new LambdaAddressingCfnProvisioner(lambdaService));
                 discovered.add(new LambdaEventInvokeConfigCfnProvisioner(lambdaService));
-                discovered.add(new LambdaVersionAliasCfnProvisioner(lambdaService));
+                discovered.add(new LambdaVersionAliasCfnProvisioner(lambdaService, mock(ProvisionedConcurrencyPool.class)));
                 discovered.add(new LambdaEventSourceMappingCfnProvisioner(lambdaService));
                 if (lambdaCodeSigningConfigService != null) {
                     discovered.add(new LambdaCodeSigningConfigCfnProvisioner(lambdaCodeSigningConfigService,
