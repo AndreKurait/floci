@@ -22,6 +22,7 @@ public class ContainerHandle {
     private Closeable logStream;
     private String dnsResolverVolume;
     private boolean runtimeApiReleased;
+    private LambdaExitWatcher exitWatcher;
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -65,6 +66,14 @@ public class ContainerHandle {
     void setDnsResolverVolume(String volume) { this.dnsResolverVolume = volume; }
     boolean isRuntimeApiReleased() { return runtimeApiReleased; }
     void markRuntimeApiReleased() { runtimeApiReleased = true; }
+
+    void setExitWatcher(LambdaExitWatcher exitWatcher) { this.exitWatcher = exitWatcher; }
+
+    void cancelExitWatcher() {
+        if (exitWatcher != null) {
+            exitWatcher.cancel();
+        }
+    }
 
     /**
      * True once an extension in this container reported an init or exit error. Real AWS treats
