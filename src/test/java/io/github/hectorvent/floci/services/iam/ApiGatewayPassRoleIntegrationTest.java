@@ -198,6 +198,37 @@ class ApiGatewayPassRoleIntegrationTest {
         }
     }
 
+    @Test
+    void accountLoggingRoleRequiresPassRoleAndRevocationPreservesState() {
+        try (Fixture f = new Fixture()) {
+            String original = f.rest.getAccount().cloudwatchRoleArn();
+            cleanup.register(() -> {
+                try (ApiGatewayClient admin = f.adminRest()) {
+                    admin.updateAccount(b -> b.patchOperations(PatchOperation.builder()
+                            .op(original == null ? Op.REMOVE : Op.REPLACE).path("/cloudwatchRoleArn")
+                            .value(original).build()));
+                }
+            });
+            PatchOperation assignment = PatchOperation.builder().op(Op.REPLACE)
+                    .path("/cloudwatchRoleArn").value(f.role).build();
+            assertEquals(403, assertThrows(ApiGatewayException.class,
+                    () -> f.rest.updateAccount(b -> b.patchOperations(assignment))).statusCode());
+            assertEquals(original, f.rest.getAccount().cloudwatchRoleArn());
+            f.policy("lambda.amazonaws.com");
+            assertEquals(403, assertThrows(ApiGatewayException.class,
+                    () -> f.rest.updateAccount(b -> b.patchOperations(assignment))).statusCode());
+            f.policy("apigateway.amazonaws.com");
+            assertEquals(f.role, f.rest.updateAccount(b -> b.patchOperations(assignment)).cloudwatchRoleArn());
+            f.policy(null);
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.updateAccount(b -> b.patchOperations(
+                    PatchOperation.builder().op(Op.REPLACE).path("/cloudwatchRoleArn").value(f.role + "other").build(),
+                    assignment))).statusCode());
+            assertEquals(f.role, f.rest.getAccount().cloudwatchRoleArn());
+            assertEquals(null, f.rest.updateAccount(b -> b.patchOperations(PatchOperation.builder()
+                    .op(Op.REMOVE).path("/cloudwatchRoleArn").build())).cloudwatchRoleArn());
+        }
+    }
+
     private ApiGatewayClient sessionClient(Credentials credentials) {
         return ApiGatewayClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsSessionCredentials.create(
