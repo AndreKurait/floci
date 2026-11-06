@@ -29,6 +29,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -477,6 +478,7 @@ public class AppConfigService {
         strategy.setFinalBakeTimeInMinutes((Integer) request.getOrDefault("FinalBakeTimeInMinutes", 0));
         strategy.setGrowthType((String) request.getOrDefault("GrowthType", "LINEAR"));
         strategy.setReplicateTo((String) request.getOrDefault("ReplicateTo", "NONE"));
+        validateDeploymentTiming(strategy);
         strategyStore.put(strategy.getId(), strategy);
         return strategy;
     }
@@ -522,8 +524,21 @@ public class AppConfigService {
         strategy.setFinalBakeTimeInMinutes(finalBakeTimeInMinutes);
         strategy.setGrowthFactor(growthFactor);
         strategy.setGrowthType(growthType);
+        validateDeploymentTiming(strategy);
         strategyStore.put(strategy.getId(), strategy);
         return strategy;
+    }
+
+    private static void validateDeploymentTiming(DeploymentStrategy strategy) {
+        if (strategy.getDeploymentDurationInMinutes() < 0 || strategy.getDeploymentDurationInMinutes() > 1440
+                || strategy.getFinalBakeTimeInMinutes() < 0 || strategy.getFinalBakeTimeInMinutes() > 1440
+                || !Float.isFinite(strategy.getGrowthFactor())
+                || strategy.getGrowthFactor() < 1 || strategy.getGrowthFactor() > 100
+                || !("LINEAR".equals(strategy.getGrowthType()) || "EXPONENTIAL".equals(strategy.getGrowthType()))) {
+            throw new AwsException("BadRequestException",
+                    "Deployment and bake durations must be 0 to 1440 minutes, growth factor 1 to 100, "
+                            + "and growth type LINEAR or EXPONENTIAL.", 400);
+        }
     }
 
     public synchronized void deleteDeploymentStrategy(String id) {
@@ -584,6 +599,7 @@ public class AppConfigService {
         String strategyId = (String) request.get("DeploymentStrategyId");
 
         DeploymentStrategy strategy = getDeploymentStrategy(strategyId);
+        validateDeploymentTiming(strategy);
 
         Deployment deployment = new Deployment();
         deployment.setApplicationId(appId);
@@ -604,8 +620,10 @@ public class AppConfigService {
         deployment.setDeploymentNumber(nextDeploymentNumber);
         Instant started = clock.instant();
         deployment.setStartedAt(started.toString());
-        deployment.setPercentageComplete(100.0f);
-        deployment.setState(strategy.getFinalBakeTimeInMinutes() > 0 ? "BAKING" : "COMPLETE");
+        boolean gradual = strategy.getDeploymentDurationInMinutes() > 0;
+        deployment.setPercentageComplete(gradual ? 0.0f : 100.0f);
+        deployment.setState(gradual ? "DEPLOYING"
+                : strategy.getFinalBakeTimeInMinutes() > 0 ? "BAKING" : "COMPLETE");
         if ("COMPLETE".equals(deployment.getState())) {
             deployment.setCompletedAt(started.toString());
         }
@@ -648,6 +666,7 @@ public class AppConfigService {
                 .filter(row -> deployment.getApplicationId().equals(row.getApplicationId()))
                 .filter(row -> deployment.getEnvironmentId().equals(row.getEnvironmentId()))
                 .filter(row -> deployment.getConfigurationProfileId().equals(row.getConfigurationProfileId()))
+                .map(this::refreshDeployment)
                 .filter(row -> List.of("BAKING", "COMPLETE", "DEPLOYING").contains(row.getState()))
                 .sorted(Comparator.comparingInt(Deployment::getDeploymentNumber).reversed())
                 .toList();
@@ -695,19 +714,56 @@ public class AppConfigService {
     }
 
     private Deployment refreshDeployment(Deployment deployment) {
-        if ("BAKING".equals(deployment.getState()) && deployment.getStartedAt() != null
-                && deployment.getFinalBakeTimeInMinutes() != null) {
-            Instant completed = Instant.parse(deployment.getStartedAt())
-                    .plus(Duration.ofMinutes(deployment.getFinalBakeTimeInMinutes()));
-            if (!clock.instant().isBefore(completed)) {
-                deployment = copy(deployment);
-                deployment.setState("COMPLETE");
-                deployment.setCompletedAt(completed.toString());
-                deploymentStore.put(deployment.getApplicationId() + "::" + deployment.getEnvironmentId()
-                        + "::" + deployment.getDeploymentNumber(), deployment);
-            }
+        if (!("DEPLOYING".equals(deployment.getState()) || "BAKING".equals(deployment.getState()))
+                || deployment.getStartedAt() == null) {
+            return deployment;
         }
-        return deployment;
+        Instant started = Instant.parse(deployment.getStartedAt());
+        int rolloutMinutes = deployment.getDeploymentDurationInMinutes() == null
+                ? 0 : deployment.getDeploymentDurationInMinutes();
+        int bakeMinutes = deployment.getFinalBakeTimeInMinutes() == null
+                ? 0 : deployment.getFinalBakeTimeInMinutes();
+        Instant rolledOut = started.plus(Duration.ofMinutes(rolloutMinutes));
+        Instant completed = rolledOut.plus(Duration.ofMinutes(bakeMinutes));
+        Instant now = clock.instant();
+        String state;
+        float percentage;
+        if ("DEPLOYING".equals(deployment.getState()) && now.isBefore(rolledOut)) {
+            state = "DEPLOYING";
+            percentage = rolloutPercentage(deployment, Duration.between(started, now).toMillis(),
+                    Duration.ofMinutes(rolloutMinutes).toMillis());
+            if (deployment.getPercentageComplete() != null) {
+                percentage = Math.max(percentage, deployment.getPercentageComplete());
+            }
+        } else {
+            state = now.isBefore(completed) ? "BAKING" : "COMPLETE";
+            percentage = 100.0f;
+        }
+        if (state.equals(deployment.getState()) && Objects.equals(percentage, deployment.getPercentageComplete())) {
+            return deployment;
+        }
+        Deployment refreshed = copy(deployment);
+        refreshed.setState(state);
+        refreshed.setPercentageComplete(percentage);
+        if ("COMPLETE".equals(state)) {
+            refreshed.setCompletedAt(completed.toString());
+        }
+        deploymentStore.put(refreshed.getApplicationId() + "::" + refreshed.getEnvironmentId()
+                + "::" + refreshed.getDeploymentNumber(), refreshed);
+        return refreshed;
+    }
+
+    /** Growth steps are evenly spaced across the rollout; final bake begins after its full duration. */
+    private static float rolloutPercentage(Deployment deployment, long elapsedMillis, long durationMillis) {
+        float growth = deployment.getGrowthFactor() == null ? 100.0f : deployment.getGrowthFactor();
+        boolean exponential = "EXPONENTIAL".equals(deployment.getGrowthType());
+        int steps = exponential ? (int) Math.ceil(Math.log(100.0 / growth) / Math.log(2)) + 1
+                : (int) Math.ceil(100.0 / growth);
+        long step = Math.max(0, elapsedMillis) * steps / durationMillis;
+        if (step == 0) {
+            return 0.0f;
+        }
+        return (float) Math.min(100.0, exponential ? growth * Math.pow(2, step - 1) : growth * step);
     }
 
     public synchronized DeploymentPage listDeployments(String applicationIdentifier,
