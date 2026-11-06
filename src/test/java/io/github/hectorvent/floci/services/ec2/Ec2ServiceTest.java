@@ -3162,6 +3162,59 @@ class Ec2ServiceTest {
                 .getFirst().getAssociationId());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "replace"})
+    void deletingNatGatewayBlackholesARouteWhoseTargetWasJustValidated(String operation) throws Exception {
+        ParkingStore<NatGateway> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<NatGateway> store =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-nat-gateways.json", store)));
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String allocation = service.allocateAddress(region).getAllocationId();
+        String nat = service.createNatGateway(region, subnet.getSubnetId(), allocation, null, null).getNatGatewayId();
+        String table = service.createRouteTable(region, subnet.getVpcId()).getRouteTableId();
+        if ("replace".equals(operation)) {
+            String gateway = service.describeInternetGateways(region, List.of(), Map.of())
+                    .getFirst().getInternetGatewayId();
+            service.createRoute(region, table, "0.0.0.0/0", null, null, gateway, null, null, null);
+        }
+        parking.parkNextRead();
+        AtomicReference<Thread> deletingThread = new AtomicReference<>();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> mutation = workers.submit(() -> {
+                if ("create".equals(operation)) {
+                    service.createRoute(region, table, "0.0.0.0/0", null, null, null, nat, null, null);
+                } else {
+                    service.replaceRoute(region, table, "0.0.0.0/0", null, null, null, nat, null);
+                }
+            });
+            assertTrue(parking.awaitParked(), "The route must have read its target before deletion");
+            Future<?> deletion = workers.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                service.deleteNatGateway(region, nat);
+            });
+            Awaitility.await().atMost(Duration.ofSeconds(5)).until(() ->
+                    store.get(region + "::" + nat).isEmpty() && (deletion.isDone()
+                            || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED));
+            parking.release();
+            mutation.get(5, TimeUnit.SECONDS);
+            deletion.get(5, TimeUnit.SECONDS);
+
+            assertEquals("blackhole", service.describeRouteTables(region, List.of(table), Map.of())
+                    .getFirst().getRoutes().stream().filter(route -> nat.equals(route.getNatGatewayId()))
+                    .findFirst().orElseThrow().getState());
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
     @Test
     void runInstancesRequiresImageIdInsteadOfDefaulting() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
