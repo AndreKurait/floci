@@ -1011,6 +1011,47 @@ class IamConditionContextResolverTest {
                         "Action=CreateTags&ResourceId.1=i-1&Tag.1.Key=CostCenter&Tag.1.Value=9999"))));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"ec2:DeleteSecurityGroup", "ec2:AuthorizeSecurityGroupIngress",
+            "ec2:AuthorizeSecurityGroupEgress", "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress"})
+    void securityGroupActionsEvaluateTheNamedGroupsCurrentTags(String action) {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"%s","Resource":"*",
+                   "Condition":{"StringEquals":{"aws:ResourceTag/Team":"payments"}}}
+                ]}""".formatted(action);
+        String body = "Action=" + action.substring("ec2:".length()) + "&GroupId=sg-target";
+
+        for (String value : List.of("payments", "engineering")) {
+            when(ec2Service.resourceTags("us-east-1", "sg-target")).thenReturn(List.of(new Tag("Team", value)));
+            assertEquals("payments".equals(value) ? Decision.ALLOW : Decision.DENY,
+                    evaluator.simulateCustomPolicy(List.of(policy), action, "*",
+                            resolver.resolve("ec2", action, formRequest(body))));
+        }
+        when(ec2Service.resourceTags("us-east-1", "sg-target")).thenReturn(List.of());
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy), action, "*",
+                resolver.resolve("ec2", action, formRequest(body))));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress"})
+    void securityGroupRevocationDoesNotInferTagsFromRuleIdsWithoutAGroup(String action) {
+        assertNull(resolver.resolve("ec2", action,
+                formRequest("Action=" + action.substring("ec2:".length()) + "&SecurityGroupRuleId.1=sgr-target")));
+    }
+
+    @Test
+    void securityGroupTagsUseTheRequestRegionAndGroupWhenRuleIdsArePresent() {
+        requestContext.setRegion("eu-west-1");
+        when(ec2Service.resourceTags("eu-west-1", "sg-target")).thenReturn(List.of(new Tag("Team", "payments")));
+        when(ec2Service.resourceTags("us-east-1", "sg-target")).thenReturn(List.of(new Tag("Team", "other")));
+        when(ec2Service.resourceTags("eu-west-1", "sgr-target")).thenReturn(List.of(new Tag("Team", "other")));
+
+        assertEquals(Map.of("aws:ResourceTag/Team", List.of("payments")),
+                resolver.resolve("ec2", "ec2:RevokeSecurityGroupIngress",
+                        formRequest("Action=RevokeSecurityGroupIngress&GroupId=sg-target&SecurityGroupRuleId.1=sgr-target")));
+    }
+
     @Test
     void resourceTagConditionOnABucketFollowsItsOwnerTag() {
         String policy = """
