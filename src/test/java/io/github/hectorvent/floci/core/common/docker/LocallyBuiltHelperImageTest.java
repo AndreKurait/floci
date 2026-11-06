@@ -7,14 +7,27 @@ import com.github.dockerjava.api.command.InfoCmd;
 import com.github.dockerjava.api.command.InspectImageCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Info;
+import io.github.hectorvent.floci.core.common.Digests;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -32,6 +45,7 @@ class LocallyBuiltHelperImageTest {
 
     private static final String DEFAULT_IMAGE = "floci/network-helper:local";
     private static final String DOCKERFILE = "/docker/network-helper.Dockerfile";
+    private static final String CONTEXT_DOCKERFILE = "/docker/native-platform-helper.Dockerfile";
 
     private DockerClient dockerClient;
     private ContainerBuilder containerBuilder;
@@ -81,6 +95,81 @@ class LocallyBuiltHelperImageTest {
         verify(build).withPlatform("linux/amd64");
         verify(build).withLabels(Map.of(LocallyBuiltHelperImage.RECIPE_LABEL, recipe()));
         verify(build).withPull(true);
+    }
+
+    @Test
+    void replacesDockerfileOnlyCacheAndSendsDeclaredFilesToDocker() throws Exception {
+        stubResolvedImage();
+        CachedImageStubs.image(dockerClient, DEFAULT_IMAGE, "linux", "amd64",
+                CachedImageStubs.recipe(CONTEXT_DOCKERFILE));
+        BuildImageCmd build = stubBuildReturning("sha256:context");
+
+        LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder,
+                DEFAULT_IMAGE, DEFAULT_IMAGE, CONTEXT_DOCKERFILE);
+
+        ArgumentCaptor<InputStream> captured = ArgumentCaptor.forClass(InputStream.class);
+        verify(dockerClient).buildImageCmd(captured.capture());
+        Map<String, byte[]> files = new HashMap<>();
+        try (TarArchiveInputStream archive = new TarArchiveInputStream(captured.getValue())) {
+            TarArchiveEntry entry;
+            while ((entry = archive.getNextEntry()) != null) {
+                files.put(entry.getName(), archive.readNBytes(Math.toIntExact(entry.getSize())));
+            }
+        }
+        assertEquals(Set.of("Dockerfile", "helper-context.txt"), files.keySet());
+        try (InputStream resource = getClass().getResourceAsStream("/docker/helper-context.txt")) {
+            assertArrayEquals(resource.readAllBytes(), files.get("helper-context.txt"));
+        }
+        verify(build).withLabels(Map.of(LocallyBuiltHelperImage.RECIPE_LABEL,
+                LocallyBuiltHelperImage.recipe(files)));
+    }
+
+    @Test
+    void reusesCacheWhenAllDeclaredFilesAndPlatformMatch() throws Exception {
+        stubResolvedImage();
+        Map<String, byte[]> context;
+        try (InputStream dockerfile = getClass().getResourceAsStream(CONTEXT_DOCKERFILE)) {
+            context = LocallyBuiltHelperImage.buildContext(CONTEXT_DOCKERFILE, dockerfile.readAllBytes());
+        }
+        CachedImageStubs.image(dockerClient, DEFAULT_IMAGE, "linux", "amd64",
+                LocallyBuiltHelperImage.recipe(context));
+
+        LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder,
+                DEFAULT_IMAGE, DEFAULT_IMAGE, CONTEXT_DOCKERFILE);
+
+        verify(dockerClient, never()).buildImageCmd(any(InputStream.class));
+    }
+
+    @Test
+    void recipeChangesWhenADeclaredFileChangesEvenIfDockerfileDoesNot() {
+        byte[] dockerfile = "FROM scratch\n".getBytes(StandardCharsets.UTF_8);
+        Map<String, byte[]> files = new HashMap<>();
+        files.put("Dockerfile", dockerfile);
+        assertEquals(Digests.sha256Hex(dockerfile), LocallyBuiltHelperImage.recipe(files));
+        files.put("message.txt", "hello\n".getBytes(StandardCharsets.UTF_8));
+        String recipe = LocallyBuiltHelperImage.recipe(files);
+        assertNotEquals(Digests.sha256Hex(dockerfile), recipe);
+        files.put("message.txt", "updated\n".getBytes(StandardCharsets.UTF_8));
+        assertNotEquals(recipe, LocallyBuiltHelperImage.recipe(files));
+    }
+
+    @Test
+    void recipeIsOrderIndependentAndMatchesThePublishedBuildVector() {
+        Map<String, byte[]> forward = new LinkedHashMap<>();
+        forward.put("Dockerfile", "FROM scratch\n".getBytes(StandardCharsets.UTF_8));
+        forward.put("message.txt", "hello\n".getBytes(StandardCharsets.UTF_8));
+        Map<String, byte[]> reverse = new LinkedHashMap<>();
+        reverse.put("message.txt", forward.get("message.txt"));
+        reverse.put("Dockerfile", forward.get("Dockerfile"));
+        assertEquals(LocallyBuiltHelperImage.recipe(forward), LocallyBuiltHelperImage.recipe(reverse));
+        assertEquals("9ebbd75b37d6c7247eb4d72616765a848b1482e313ae89048ed1ccbf30b16b30", LocallyBuiltHelperImage.recipe(forward));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"duplicate", "unsafe", "missing"})
+    void rejectsInvalidDeclaredContextBeforeDockerBuild(String fixture) {
+        assertThrows(IOException.class, () -> LocallyBuiltHelperImage.buildContext(
+                "/docker/" + fixture + "-context.Dockerfile", "FROM scratch\n".getBytes(StandardCharsets.UTF_8)));
     }
 
     @ParameterizedTest

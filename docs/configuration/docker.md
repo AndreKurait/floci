@@ -2,6 +2,23 @@
 
 Floci spawns real Docker containers for services that need them: Lambda, RDS, ElastiCache, OpenSearch, MSK, and ECS. All of these share the same Docker client configuration, controlled under `floci.docker`.
 
+## Built-in Helper Build Inputs
+
+Built-in helper Dockerfiles may declare additional source files in a sibling
+`<Dockerfile>.files` manifest, with one filename per line. The local builder includes
+those files from the Dockerfile's classpath directory in its Docker build context.
+Blank lines are ignored; duplicate, missing, and non-basename filenames fail the build.
+The publishing workflow stages the same declared files in an empty directory, so an
+undeclared `COPY` input fails in both build paths. Files use mode `0644`; set executable
+permissions in the Dockerfile when needed.
+
+The helper cache label covers the Dockerfile and every declared file, so changing
+source invalidates the cached image even when the Dockerfile is unchanged. Local
+and published builds use the same digest: for multiple files, hash the concatenated
+`filename`, NUL, content SHA-256, and newline records in filename order. Dockerfile-only
+helpers keep their existing Dockerfile SHA-256 label. Custom image references remain
+the caller's responsibility and do not trigger a local build.
+
 ## Docker Daemon Socket
 
 By default Floci connects to the local Docker daemon via the Unix socket. Override it with `docker-host` when needed (e.g. a remote Docker host or a non-standard socket path):
