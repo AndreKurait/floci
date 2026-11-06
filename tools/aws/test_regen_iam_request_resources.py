@@ -810,6 +810,17 @@ def test_a_member_two_clients_locate_apart_is_an_error():
         r.located_members({"one": one, "two": two}, "GetThing")
 
 
+@pytest.mark.parametrize("kind", ["integer", "long"])
+def test_numeric_uri_labels_name_resources_but_body_and_query_numbers_do_not(kind):
+    svc = rest_model(
+        {"GetDeployment": {"DeploymentNumber": "Number", "Limit": "Number", "Count": "Number"}},
+        {"GetDeployment": {"DeploymentNumber": "uri:DeploymentNumber", "Limit": "querystring:limit"}})
+    svc["shapes"]["Number"] = {"type": kind}
+    assert r.request_members({"svc": svc}, "GetDeployment") == {"DeploymentNumber": "DeploymentNumber"}
+    assert r.located_members({"svc": svc}, "GetDeployment") == {"DeploymentNumber": "{DeploymentNumber}"}
+
+
+
 def test_a_located_member_must_be_a_path_label_or_a_query_parameter(corrections, tmp_path):
     write_models(tmp_path, {"svc": rest_model({"GetThing": {"ThingName": "String"}, "ListThings": {}},
                                               {"GetThing": {"ThingName": "uri:ThingName"}})})

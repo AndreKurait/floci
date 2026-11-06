@@ -140,6 +140,8 @@ public class ResolvedServiceCatalog {
                     "iot-jobs-data", "iot",
                     "monitoring", "cloudwatch",
                     "awsssoportal", "sso",
+                    // The data API's catalog key is appconfigdata; both SDKs authorize as appconfig.
+                    "appconfigdata", "appconfig",
                     "eventsv2", "events");
 
     private final ServiceCatalog catalog;
