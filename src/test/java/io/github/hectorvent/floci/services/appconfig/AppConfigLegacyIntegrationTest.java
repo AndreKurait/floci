@@ -206,12 +206,7 @@ class AppConfigLegacyIntegrationTest {
     }
 
     @Test
-    void deployedVersionWithoutHostedContentIsNotFound() {
-        String s3Profile = createProfile(Map.of("Name", "s3-settings", "LocationUri", "s3://bucket/settings.json"));
-        deploy(environment, s3Profile, "3sL4kqtJlcpXroDTDmJ");
-        given().queryParam("client_id", "reader").get(path(environment, s3Profile))
-                .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
-
+    void deletedHostedContentIsNotFound() {
         given().delete("/applications/" + application + "/configurationprofiles/" + profile
                 + "/hostedconfigurationversions/1").then().statusCode(204);
         given().queryParam("client_id", "reader").get(path())

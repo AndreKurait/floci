@@ -18,3 +18,8 @@ The AppConfig alarm cases refuse deployment when the monitor role lacks
 `cloudwatch:DescribeAlarms` or does not trust AppConfig. They verify that refusal
 leaves the prior configuration active and creates no deployment. Alarm lifecycle
 cases remain in the default suite; both suites share owned fixtures and cleanup.
+
+`test_appconfig_s3_permissions.py` checks retrieval-role permission and trust
+failures and selected-version tag conditions. These cases require IAM enforcement;
+S3 source deployment, missing versions, rollback and CloudFormation cases remain
+in the default suite. Both suites share owned fixtures and cleanup.
