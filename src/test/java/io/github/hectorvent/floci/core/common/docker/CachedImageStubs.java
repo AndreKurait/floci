@@ -4,7 +4,6 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectImageCmd;
 import com.github.dockerjava.api.command.InspectImageResponse;
 import com.github.dockerjava.api.model.ContainerConfig;
-import io.github.hectorvent.floci.core.common.Digests;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -36,7 +35,8 @@ public final class CachedImageStubs {
             if (stream == null) {
                 throw new IllegalArgumentException("Missing fixture Dockerfile: " + dockerfile);
             }
-            return Digests.sha256Hex(stream.readAllBytes());
+            return LocallyBuiltHelperImage.recipe(
+                    LocallyBuiltHelperImage.buildContext(dockerfile, stream.readAllBytes()));
         } catch (IOException failure) {
             throw new UncheckedIOException("Cannot read fixture Dockerfile: " + dockerfile, failure);
         }
