@@ -5,12 +5,14 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.lambda.ProvisionedConcurrencyPool;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
@@ -33,10 +35,21 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
     private static final Logger LOG = Logger.getLogger(LambdaVersionAliasCfnProvisioner.class);
 
     private final LambdaService lambdaService;
+    private final ProvisionedConcurrencyPool provisionedConcurrency;
+    private final Duration readinessTimeout;
 
     @Inject
-    public LambdaVersionAliasCfnProvisioner(LambdaService lambdaService) {
+    public LambdaVersionAliasCfnProvisioner(LambdaService lambdaService,
+                                           ProvisionedConcurrencyPool provisionedConcurrency) {
+        this(lambdaService, provisionedConcurrency, Duration.ofMinutes(5));
+    }
+
+    LambdaVersionAliasCfnProvisioner(LambdaService lambdaService,
+                                     ProvisionedConcurrencyPool provisionedConcurrency,
+                                     Duration readinessTimeout) {
         this.lambdaService = lambdaService;
+        this.provisionedConcurrency = provisionedConcurrency;
+        this.readinessTimeout = readinessTimeout;
     }
 
     @Override
@@ -135,6 +148,7 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
         String description = ctx.resolveOptional(props, "Description");
 
         Map<String, Double> routingConfig = parseRoutingConfig(props, ctx);
+        Integer provisionedCount = provisionedCount(props, ctx);
 
         LambdaAlias alias;
         try {
@@ -155,6 +169,57 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
 
         r.setPhysicalId(alias.getAliasArn());
         r.getAttributes().put("AliasArn", alias.getAliasArn());
+        if (provisionedCount != null) {
+            ProvisionedConcurrencyPool.Status requested = provisionedConcurrency.put(
+                    ctx.region(), functionName, aliasName, provisionedCount, ctx.accountId());
+            awaitProvisionedConcurrency(functionName, aliasName, provisionedCount, requested, ctx);
+        } else if (ctx.previouslyDeclared("ProvisionedConcurrencyConfig")) {
+            provisionedConcurrency.delete(ctx.region(), functionName, aliasName, ctx.accountId());
+        }
+    }
+
+    private Integer provisionedCount(JsonNode props, ProvisionContext ctx) {
+        JsonNode raw = props.get("ProvisionedConcurrencyConfig");
+        if (raw == null || raw.isNull()) {
+            return null;
+        }
+        JsonNode config = ctx.engine().resolveNodeOmittingNoValue(raw);
+        if (config == null || config.isNull() || config.isMissingNode()) {
+            return null;
+        }
+        if (!config.isObject()) {
+            throw new AwsException("ValidationError", "ProvisionedConcurrencyConfig must be an object.", 400);
+        }
+        Integer count = ctx.resolveOptionalInt(config, "ProvisionedConcurrentExecutions");
+        if (count == null || count < 1) {
+            throw new AwsException("ValidationError",
+                    "ProvisionedConcurrencyConfig requires a positive ProvisionedConcurrentExecutions.", 400);
+        }
+        return count;
+    }
+
+    private void awaitProvisionedConcurrency(String functionName, String aliasName, int requested,
+                                            ProvisionedConcurrencyPool.Status status, ProvisionContext ctx) {
+        long deadline = System.nanoTime() + readinessTimeout.toNanos();
+        while (true) {
+            if ("READY".equals(status.status()) && status.requested() == requested
+                    && status.allocated() == requested) {
+                return;
+            }
+            if ("FAILED".equals(status.status()) || System.nanoTime() >= deadline) {
+                throw new AwsException("InternalFailure", "Provisioned concurrency for alias " + aliasName
+                        + " did not become READY (status " + status.status() + "): "
+                        + (status.reason() == null ? "initialization deadline exceeded" : status.reason()), 500);
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new AwsException("InternalFailure",
+                        "Interrupted while initializing provisioned concurrency for alias " + aliasName, 500);
+            }
+            status = provisionedConcurrency.get(ctx.region(), functionName, aliasName, ctx.accountId());
+        }
     }
 
     /**

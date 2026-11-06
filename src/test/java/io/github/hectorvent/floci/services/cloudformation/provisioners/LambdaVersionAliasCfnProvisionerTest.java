@@ -7,16 +7,19 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.lambda.ProvisionedConcurrencyPool;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -35,7 +38,8 @@ class LambdaVersionAliasCfnProvisionerTest {
             "arn:aws:lambda:us-east-1:000000000000:function:my-fn:production";
 
     private final LambdaService lambda = mock(LambdaService.class);
-    private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(lambda);
+    private final ProvisionedConcurrencyPool concurrency = mock(ProvisionedConcurrencyPool.class);
+    private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(lambda, concurrency);
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
@@ -46,6 +50,7 @@ class LambdaVersionAliasCfnProvisionerTest {
             JsonNode node = inv.getArgument(0);
             return node == null ? null : node.asText();
         });
+        when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
     }
 
@@ -114,6 +119,104 @@ class LambdaVersionAliasCfnProvisionerTest {
 
         assertEquals(ALIAS_ARN, r.getPhysicalId());
         assertEquals(ALIAS_ARN, r.getAttributes().get("AliasArn"));
+    }
+
+    @Test
+    void invalidProvisionedConcurrencyFailsBeforeCreatingTheAlias() throws Exception {
+        when(lambda.createAlias(any(), any(), any(), any(), any(), any())).thenReturn(alias("3"));
+        JsonNode props = mapper.readTree("""
+            {"FunctionName":"my-fn","Name":"production","FunctionVersion":"3",
+             "ProvisionedConcurrencyConfig":{"ProvisionedConcurrentExecutions":"invalid"}}
+            """);
+        StackResource r = resource("AWS::Lambda::Alias", "MyFuncAliasproduction");
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+        verifyNoInteractions(lambda);
+    }
+
+    private JsonNode provisionedProperties() throws Exception {
+        when(lambda.createAlias(any(), any(), any(), any(), any(), any())).thenReturn(alias("3"));
+        return mapper.readTree("""
+            {"FunctionName":"my-fn","Name":"production","FunctionVersion":"3",
+             "ProvisionedConcurrencyConfig":{"ProvisionedConcurrentExecutions":2}}
+            """);
+    }
+
+    private ProvisionedConcurrencyPool.Status capacity(String state, int allocated, String reason) {
+        return new ProvisionedConcurrencyPool.Status(2, allocated, allocated, state, reason, "2026-01-01T00:00:00Z");
+    }
+
+    @Test
+    void aliasWaitsForTheDeclaredCapacityToInitialize() throws Exception {
+        JsonNode props = provisionedProperties();
+        when(concurrency.put("us-east-1", "my-fn", "production", 2, "000000000000"))
+                .thenReturn(capacity("IN_PROGRESS", 0, null));
+        when(concurrency.get("us-east-1", "my-fn", "production", "000000000000"))
+                .thenReturn(capacity("READY", 2, null));
+        StackResource r = resource("AWS::Lambda::Alias", "Alias");
+        provisioner.provision(r, props, ctx());
+        verify(concurrency).get("us-east-1", "my-fn", "production", "000000000000");
+        assertEquals(ALIAS_ARN, r.getPhysicalId());
+    }
+
+    @Test
+    void aliasInitializationFailureDoesNotReportSuccessfulProvisioning() throws Exception {
+        JsonNode props = provisionedProperties();
+        when(concurrency.put("us-east-1", "my-fn", "production", 2, "000000000000"))
+                .thenReturn(capacity("FAILED", 0, "runtime initialization failed"));
+        StackResource r = resource("AWS::Lambda::Alias", "Alias");
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+        assertEquals("InternalFailure", failure.getErrorCode());
+        assertTrue(failure.getMessage().contains("runtime initialization failed"));
+        assertEquals(ALIAS_ARN, r.getPhysicalId(), "Failed initialization retains the alias identity for cleanup");
+    }
+
+    @Test
+    void aliasInitializationHasABoundedDeadline() throws Exception {
+        JsonNode props = provisionedProperties();
+        when(concurrency.put("us-east-1", "my-fn", "production", 2, "000000000000"))
+                .thenReturn(capacity("IN_PROGRESS", 0, null));
+        LambdaVersionAliasCfnProvisioner bounded = new LambdaVersionAliasCfnProvisioner(
+                lambda, concurrency, Duration.ZERO);
+        assertThrows(AwsException.class,
+                () -> bounded.provision(resource("AWS::Lambda::Alias", "Alias"), props, ctx()));
+        Mockito.verify(concurrency, Mockito.never()).get(any(), any(), any(), any());
+    }
+
+    @Test
+    void interruptedInitializationPreservesTheInterruptAndFailsProvisioning() throws Exception {
+        JsonNode props = provisionedProperties();
+        when(concurrency.put("us-east-1", "my-fn", "production", 2, "000000000000"))
+                .thenReturn(capacity("IN_PROGRESS", 0, null));
+        boolean preserved;
+        Thread.currentThread().interrupt();
+        try {
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> provisioner.provision(resource("AWS::Lambda::Alias", "Alias"), props, ctx()));
+            assertTrue(failure.getMessage().contains("Interrupted"));
+        } finally {
+            preserved = Thread.interrupted();
+        }
+        assertTrue(preserved);
+    }
+
+    @Test
+    void removingTheDeclaredPropertyDeletesItsAllocation() throws Exception {
+        JsonNode prior = provisionedProperties();
+        ObjectNode next = prior.deepCopy();
+        next.remove("ProvisionedConcurrencyConfig");
+        ProvisionContext create = ctx();
+        ProvisionContext update = new ProvisionContext(create.engine(), create.region(), create.accountId(),
+                create.stackName(), ALIAS_ARN, event -> {}, prior);
+        provisioner.provision(resource("AWS::Lambda::Alias", "Alias"), next, update);
+        verify(concurrency).delete("us-east-1", "my-fn", "production", "000000000000");
+    }
+
+    @Test
+    void anUndeclaredPropertyDoesNotDeleteAnExternalAllocation() throws Exception {
+        ObjectNode props = provisionedProperties().deepCopy();
+        props.remove("ProvisionedConcurrencyConfig");
+        provisioner.provision(resource("AWS::Lambda::Alias", "Alias"), props, ctx());
+        verifyNoInteractions(concurrency);
     }
 
     @Test
