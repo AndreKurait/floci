@@ -146,6 +146,25 @@ public class IssuedSessionVerifier {
         return List.copyOf(result);
     }
 
+    /**
+     * Current sessions of this exact access key that the derived signing key endpoint may derive for:
+     * the snapshots this verifier admits, where an EC2 instance-profile session must also carry the
+     * in-process issuance mark that live IMDS minting sets (never restored from storage).
+     */
+    List<Snapshot> eligible(String accessKeyId) {
+        List<Snapshot> result = new ArrayList<>();
+        for (SessionCredential candidate : iam.issuedSessionCandidates(accessKeyId)) {
+            Snapshot snapshot = snapshot(candidate);
+            if (snapshot == null || !accessKeyId.equals(snapshot.accessKey())
+                    || ("EC2_INSTANCE_PROFILE".equals(snapshot.kind()) && candidate.getEc2InstanceArn() == null)) {
+                continue;
+            }
+            result.add(snapshot);
+            require(result.size() <= 128);
+        }
+        return List.copyOf(result);
+    }
+
     private Snapshot snapshot(SessionCredential session) {
         return snapshot(session, false);
     }

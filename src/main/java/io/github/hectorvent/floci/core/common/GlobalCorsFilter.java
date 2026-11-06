@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.iam.DerivedSigningKeyController;
 import jakarta.annotation.Priority;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Priorities;
@@ -91,7 +92,8 @@ public class GlobalCorsFilter implements ContainerRequestFilter, ContainerRespon
         // The API Gateway data plane owns CORS for deployed routes. REST APIs dispatch
         // OPTIONS to an integration, while HTTP APIs answer from CorsConfiguration in
         // ApiGatewayExecuteController; neither should be short-circuited here (#1928).
-        if (isDeployedApiPath(requestContext.getUriInfo().getPath())) {
+        if (isDeployedApiPath(requestContext.getUriInfo().getPath())
+                || DerivedSigningKeyController.isKeyPath(requestContext.getUriInfo().getPath())) {
             return;
         }
 
@@ -131,8 +133,10 @@ public class GlobalCorsFilter implements ContainerRequestFilter, ContainerRespon
         }
 
         // See filter(request): deployed API Gateway responses carry either integration-owned
-        // REST CORS headers or API-owned HTTP API CORS headers.
-        if (isDeployedApiPath(requestContext.getUriInfo().getPath())) {
+        // REST CORS headers or API-owned HTTP API CORS headers. Derived signing key responses
+        // carry key material, so no browser origin is ever granted them.
+        if (isDeployedApiPath(requestContext.getUriInfo().getPath())
+                || DerivedSigningKeyController.isKeyPath(requestContext.getUriInfo().getPath())) {
             return;
         }
 
