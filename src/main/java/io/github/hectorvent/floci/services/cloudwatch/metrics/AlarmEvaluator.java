@@ -121,17 +121,19 @@ public class AlarmEvaluator {
         long oldestBucket = lastCompleteBucket - (long) period * (range - 1);
         Instant start = Instant.ofEpochSecond(oldestBucket);
         Instant end = Instant.ofEpochSecond(lastCompleteBucket + period - 1);
+        String statistic = alarm.getExtendedStatistic() != null
+                ? alarm.getExtendedStatistic() : alarm.getStatistic();
 
         List<CloudWatchMetricsService.Datapoint> retrieved = metricsService.getMetricStatistics(
                 alarm.getNamespace(), alarm.getMetricName(), alarm.getDimensions(),
-                start, end, period, List.of(alarm.getStatistic()), alarm.getUnit(), region);
+                start, end, period, List.of(statistic), alarm.getUnit(), region);
 
         Double[] buckets = new Double[range];
         for (CloudWatchMetricsService.Datapoint dp : retrieved) {
             long bucket = (dp.timestamp().getEpochSecond() / period) * period;
             int index = (int) ((bucket - oldestBucket) / period);
             if (index >= 0 && index < range) {
-                buckets[index] = CloudWatchMetricsService.resolveStatValue(dp, alarm.getStatistic());
+                buckets[index] = CloudWatchMetricsService.resolveStatValue(dp, statistic);
             }
         }
 
@@ -282,6 +284,7 @@ public class AlarmEvaluator {
                 && alarm.getMetricName() != null && !alarm.getMetricName().isBlank()
                 && alarm.getPeriod() != null && alarm.getPeriod() > 0
                 && alarm.getEvaluationPeriods() > 0
+                && (alarm.getStatistic() != null || alarm.getExtendedStatistic() != null)
                 && alarm.getComparisonOperator() != null;
     }
 

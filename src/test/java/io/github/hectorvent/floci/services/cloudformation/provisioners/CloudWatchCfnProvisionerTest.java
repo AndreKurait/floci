@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
@@ -17,11 +18,13 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** {@code AWS::CloudWatch::Alarm}. */
@@ -131,6 +134,33 @@ class CloudWatchCfnProvisionerTest {
 
         assertEquals(5, alarm.getEvaluationPeriods());
         assertEquals(2, alarm.getDatapointsToAlarm());
+    }
+
+    @Test
+    void metricQueriesRetainTheirPercentilesAndExpressionsWithoutASingleMetricPeriod() {
+        MetricAlarm alarm = provisionAndCapture("""
+                {"AlarmName": "latency", "Metrics": [
+                  {"Id": "sample", "ReturnData": false, "MetricStat": {
+                    "Metric": {"Namespace": "Example", "MetricName": "Latency"},
+                    "Period": 60, "Stat": "p90"}},
+                  {"Id": "scaled", "Expression": "sample * 2", "ReturnData": true}
+                ]}
+                """);
+        assertNull(alarm.getPeriod());
+        assertEquals(2, alarm.getMetrics().size());
+        assertEquals("p90", alarm.getMetrics().getFirst().metricStat().stat());
+        assertEquals("Example", alarm.getMetrics().getFirst().metricStat().metric().namespace());
+        assertEquals("sample * 2", alarm.getMetrics().getLast().expression());
+        assertTrue(alarm.getMetrics().getLast().returnData());
+    }
+
+    @Test
+    void extendedStatisticAndMetricQueriesAreRejectedBeforeCallingTheService() {
+        assertThrows(AwsException.class, () -> provisionAndCapture("""
+                {"AlarmName": "latency", "ExtendedStatistic": "p90",
+                 "Metrics": [{"Id": "sample", "Expression": "1"}]}
+                """));
+        verifyNoInteractions(metrics);
     }
 
     /** ActionsEnabled is true on AWS unless explicitly disabled, so an absent property means true. */
