@@ -2952,6 +2952,7 @@ class Ec2IntegrationTest {
             .formParam("LaunchTemplate.Version", "$Default")
             .formParam("ImageId", "ami-sample-override")
             .formParam("InstanceType", "c7g.large")
+            .formParam("SubnetId", subnetId)
             .formParam("MinCount", "1")
             .formParam("MaxCount", "1")
             .formParam("TagSpecification.1.ResourceType", "instance")
@@ -2986,6 +2987,7 @@ class Ec2IntegrationTest {
         launched.response().then()
             .body("RunInstancesResponse.instancesSet.item.imageId", equalTo("ami-sample-override"))
             .body("RunInstancesResponse.instancesSet.item.instanceType", equalTo("c7g.large"))
+            .body("RunInstancesResponse.instancesSet.item.subnetId", equalTo(subnetId))
             .body("RunInstancesResponse.instancesSet.item.keyName", equalTo("test-key"))
             .body("RunInstancesResponse.instancesSet.item.iamInstanceProfile.arn",
                     equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"))
@@ -2997,18 +2999,29 @@ class Ec2IntegrationTest {
             .body("RunInstancesResponse.instancesSet.item.tagSet.item.find { it.key == 'sample-name' }.value",
                     equalTo("sample-local"));
 
-        given()
-            .formParam("Action", "DescribeInstances")
-            .formParam("InstanceId.1", launchedInstanceId)
-            .header("Authorization", AUTH_HEADER)
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200)
-            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId",
-                    equalTo(launchedInstanceId))
-            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.iamInstanceProfile.arn",
-                    equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"));
+        try {
+            given()
+                .formParam("Action", "DescribeInstances")
+                .formParam("InstanceId.1", launchedInstanceId)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId",
+                        equalTo(launchedInstanceId))
+                .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.iamInstanceProfile.arn",
+                        equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"));
+        } finally {
+            given()
+                .formParam("Action", "TerminateInstances")
+                .formParam("InstanceId.1", launchedInstanceId)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+        }
     }
 
     @Test
