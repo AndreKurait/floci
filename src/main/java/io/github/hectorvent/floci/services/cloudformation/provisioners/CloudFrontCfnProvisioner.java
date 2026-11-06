@@ -524,6 +524,7 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
             config.setHttpVersion(cfnTextOrDefault(dc, "HttpVersion", engine, "http2"));
             config.setPriceClass(cfnTextOrDefault(dc, "PriceClass", engine, "PriceClass_All"));
             config.setAliases(cfnStringList(dc.path("Aliases"), engine));
+            config.setViewerCertificate(cfnViewerCertificate(dc.path("ViewerCertificate"), engine));
             config.setOrigins(cfnOrigins(dc, engine));
             config.setDefaultCacheBehavior(cfnDefaultCacheBehavior(dc.path("DefaultCacheBehavior"), engine));
             config.setCacheBehaviors(cfnCacheBehaviors(dc, engine));
@@ -545,6 +546,23 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("DomainName", dist.getDomainName());
         r.getAttributes().put("Arn", dist.getArn());
     }
+    private Map<String, String> cfnViewerCertificate(JsonNode node, CloudFormationTemplateEngine engine) {
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw new AwsException("ValidationError", "DistributionConfig.ViewerCertificate must be an object", 400);
+        }
+        Map<String, String> certificate = new LinkedHashMap<>();
+        Map.of("AcmCertificateArn", "ACMCertificateArn",
+                "IamCertificateId", "IAMCertificateId",
+                "SslSupportMethod", "SSLSupportMethod",
+                "MinimumProtocolVersion", "MinimumProtocolVersion",
+                "CloudFrontDefaultCertificate", "CloudFrontDefaultCertificate")
+                .forEach((property, field) -> putIfPresent(certificate, field, cfnText(node, property, engine)));
+        return certificate;
+    }
+
     private List<Origin> cfnOrigins(JsonNode dc, CloudFormationTemplateEngine engine) {
         List<Origin> origins = new ArrayList<>();
         JsonNode items = dc.path("Origins");
@@ -661,7 +679,7 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
         }
         return result;
     }
-    private static void putIfPresent(Map<String, Object> map, String key, String value) {
+    private static void putIfPresent(Map<String, ? super String> map, String key, String value) {
         if (value != null && !value.isEmpty()) {
             map.put(key, value);
         }
