@@ -116,6 +116,9 @@ class CfnCreateOnlyPropertiesTest {
         assertEquals(Set.of("ApplicationId", "ConfigurationProfileId", "Content", "ContentType", "Description",
                         "LatestVersionNumber", "VersionLabel"),
                 CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::HostedConfigurationVersion"));
+        assertEquals(Set.of("ApplicationId", "ConfigurationProfileId", "ConfigurationVersion", "DeploymentStrategyId",
+                        "Description", "DynamicExtensionParameters", "EnvironmentId", "KmsKeyIdentifier", "Tags"),
+                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::Deployment"));
     }
 
     @Test
