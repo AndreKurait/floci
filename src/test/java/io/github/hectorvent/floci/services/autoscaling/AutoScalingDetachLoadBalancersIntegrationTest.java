@@ -3,7 +3,7 @@ package io.github.hectorvent.floci.services.autoscaling;
 import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.RepeatedTest;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
 import software.amazon.awssdk.services.ec2.Ec2Client;
@@ -22,7 +22,7 @@ class AutoScalingDetachLoadBalancersIntegrationTest {
     @Inject
     AutoScalingReconciler reconciler;
 
-    @Test
+    @RepeatedTest(3)
     void sdkDetachPreservesOtherGroupAndManualClassicRegistrations() throws Exception {
         String name = "detach-" + UUID.randomUUID().toString().substring(0, 12);
         try (Ec2Client ec2 = AwsTestClients.create(Ec2Client.builder(), "000000000000", Region.US_EAST_1);

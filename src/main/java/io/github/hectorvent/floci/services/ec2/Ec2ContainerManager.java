@@ -1560,6 +1560,8 @@ public class Ec2ContainerManager {
             serviceNetworkRetries.remove(instance.getInstanceId());
             serviceNetworkLookups.remove(instance.getInstanceId());
         }
+        Runnable firewallCleanup = firewallManager != null && firewallManager.enabled() && firewallEniId != null
+                ? firewallManager.captureUnregister(firewallEniId) : null;
         executor.submit(() -> {
             // The post-teardown hook's only precondition; see the Javadoc above for why.
             boolean containerGone = false;
@@ -1586,8 +1588,8 @@ public class Ec2ContainerManager {
                         Thread.currentThread().interrupt();
                     }
                 }
-                if (firewallManager != null && firewallManager.enabled() && firewallEniId != null) {
-                    firewallManager.unregister(firewallEniId);
+                if (firewallCleanup != null) {
+                    firewallCleanup.run();
                 }
                 if (sshHostPort > 0) {
                     portAllocator.release(sshHostPort);
