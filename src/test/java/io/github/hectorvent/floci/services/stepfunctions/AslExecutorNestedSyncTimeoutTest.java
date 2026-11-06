@@ -123,6 +123,22 @@ class AslExecutorNestedSyncTimeoutTest {
     }
 
     @Test
+    void standardExecutionQuotaEndsAnUnboundedTaskAndAbortsItsChild() {
+        AtomicLong nanos = new AtomicLong();
+        nestedWaiter = (subscription, observed, remaining) -> nanos.addAndGet(Duration.ofDays(365).toNanos());
+        when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
+
+        Execution execution = run(newExecutor(
+                pause -> nanos.addAndGet(Duration.ofDays(365).toNanos()), nanos::get),
+                ".sync:2", 0, false, 0, true);
+
+        assertEquals("TIMED_OUT", execution.getStatus());
+        assertTrue(history.stream().anyMatch(event -> "ExecutionTimedOut".equals(event.getType())));
+        assertTrue(history.stream().noneMatch(event -> "TaskTimedOut".equals(event.getType())));
+        verify(sfnService).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
+    }
+
+    @Test
     void executionBudgetEndsTheParentTimedOutAndAbortsTheChild() {
         when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
 
