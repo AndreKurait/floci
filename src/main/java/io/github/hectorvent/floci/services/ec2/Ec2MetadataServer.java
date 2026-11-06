@@ -29,10 +29,12 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -67,6 +69,7 @@ public class Ec2MetadataServer {
     private final EmulatorConfig config;
     private final Ec2InstanceCredentials credentials;
     private final Clock clock;
+    private final Map<String, String> metadataCategories = new ConcurrentHashMap<>();
 
     /** IMDSv2: token value → Instance */
     private final Map<String, SessionToken> tokens = new ConcurrentHashMap<>();
@@ -235,6 +238,8 @@ public class Ec2MetadataServer {
         // Metadata endpoints
         metadataGet(router, "meta-data/instance-id", "1.0").handler(ctx -> handleText(ctx, inst -> inst.getInstanceId()));
         metadataGet(router, "meta-data/ami-id", "1.0").handler(ctx -> handleText(ctx, inst -> inst.getImageId()));
+        metadataGet(router, "meta-data/ami-launch-index", "1.0").handler(ctx ->
+                handleText(ctx, inst -> Integer.toString(inst.getAmiLaunchIndex())));
         metadataGet(router, "meta-data/instance-type", "2007-08-29")
                 .handler(ctx -> handleText(ctx, inst -> inst.getInstanceType()));
         metadataGet(router, "meta-data/local-ipv4", "1.0").handler(ctx -> handleText(ctx, inst -> inst.getPrivateIpAddress()));
@@ -253,33 +258,49 @@ public class Ec2MetadataServer {
                         : config.defaultAvailabilityZone()));
         metadataGet(router, "meta-data/placement/region", "2019-10-01")
                 .handler(ctx -> handleText(ctx, inst -> inst.getRegion()));
-        metadataGet(router, "meta-data/services", "2014-02-25").handler(this::handleServicesListing);
-        metadataGet(router, "meta-data/services/", "2014-02-25").handler(this::handleServicesListing);
+        versionedGet(router, "meta-data/services", "2014-02-25").handler(this::handleServicesListing);
+        versionedGet(router, "meta-data/services/", "2014-02-25").handler(this::handleServicesListing);
         metadataGet(router, "meta-data/services/partition", "2015-10-20")
                 .handler(ctx -> handleText(ctx, inst -> AwsRegions.partitionFor(inst.getRegion())));
         metadataGet(router, "meta-data/services/domain", "2014-02-25")
                 .handler(ctx -> handleText(ctx, inst -> AwsRegions.dnsSuffixFor(inst.getRegion())));
         metadataGet(router, "meta-data/iam/info", "2012-01-12").handler(ctx -> handleIamInfo(ctx));
+        versionedGet(router, "meta-data/iam/security-credentials", "2012-01-12")
+                .handler(ctx -> handleCredentialsList(ctx));
         metadataGet(router, "meta-data/iam/security-credentials/", "2012-01-12").handler(ctx -> handleCredentialsList(ctx));
         metadataGet(router, "meta-data/iam/security-credentials/:role", "2012-01-12").handler(ctx -> handleCredentials(ctx));
-        metadataGet(router, "meta-data/identity-credentials", "2018-03-28").handler(ctx -> handleListing(ctx, "ec2/"));
-        metadataGet(router, "meta-data/identity-credentials/", "2018-03-28").handler(ctx -> handleListing(ctx, "ec2/"));
-        metadataGet(router, "meta-data/identity-credentials/ec2", "2018-03-28")
+        versionedGet(router, "meta-data/identity-credentials", "2018-03-28").handler(ctx -> handleListing(ctx, "ec2/"));
+        versionedGet(router, "meta-data/identity-credentials/", "2018-03-28").handler(ctx -> handleListing(ctx, "ec2/"));
+        versionedGet(router, "meta-data/identity-credentials/ec2", "2018-03-28")
                 .handler(ctx -> handleListing(ctx, "info\nsecurity-credentials/"));
-        metadataGet(router, "meta-data/identity-credentials/ec2/", "2018-03-28")
+        versionedGet(router, "meta-data/identity-credentials/ec2/", "2018-03-28")
                 .handler(ctx -> handleListing(ctx, "info\nsecurity-credentials/"));
         metadataGet(router, "meta-data/identity-credentials/ec2/info", "2018-03-28").handler(ctx -> handleIdentityInfo(ctx));
-        metadataGet(router, "meta-data/identity-credentials/ec2/security-credentials", "2018-03-28")
+        versionedGet(router, "meta-data/identity-credentials/ec2/security-credentials", "2018-03-28")
                 .handler(ctx -> handleListing(ctx, IDENTITY_ROLE));
-        metadataGet(router, "meta-data/identity-credentials/ec2/security-credentials/", "2018-03-28")
+        versionedGet(router, "meta-data/identity-credentials/ec2/security-credentials/", "2018-03-28")
                 .handler(ctx -> handleListing(ctx, IDENTITY_ROLE));
         metadataGet(router, "meta-data/identity-credentials/ec2/security-credentials/" + IDENTITY_ROLE, "2018-03-28")
                 .handler(ctx -> handleIdentityCredentials(ctx));
-        metadataGet(router, "meta-data/tags/instance", "2021-03-23").handler(ctx -> handleInstanceTagKeys(ctx));
+        versionedGet(router, "meta-data/tags/instance", "2021-03-23").handler(ctx -> handleInstanceTagKeys(ctx));
         metadataGet(router, "meta-data/tags/instance/", "2021-03-23").handler(ctx -> handleInstanceTagKeys(ctx));
         metadataGet(router, "meta-data/tags/instance/*", "2021-03-23").handler(ctx -> handleInstanceTagValue(ctx));
         metadataGet(router, "user-data", "1.0").handler(ctx -> handleUserData(ctx));
         metadataGet(router, "dynamic/instance-identity/document", "2009-04-04").handler(ctx -> handleIdentityDocument(ctx));
+        metadataGet(router, "meta-data/public-keys/0/openssh-key", "1.0").handler(ctx ->
+                handleText(ctx, inst -> inst.getKeyPairPublicKey()));
+        Set<String> directories = new TreeSet<>();
+        for (String category : metadataCategories.keySet()) {
+            for (int separator = category.lastIndexOf('/'); separator > 0;
+                    separator = category.lastIndexOf('/', separator - 1)) {
+                directories.add(category.substring(0, separator + 1));
+            }
+        }
+        for (String directory : directories) {
+            router.get("/:metadataVersion" + directory).handler(this::handleDirectory);
+            router.get("/:metadataVersion" + directory.substring(0, directory.length() - 1))
+                    .handler(this::handleDirectory);
+        }
 
         httpServer = vertx.createHttpServer();
         httpServer.requestHandler(router).listen(port, result -> {
@@ -294,7 +315,14 @@ public class Ec2MetadataServer {
         return future;
     }
 
-    private static Route metadataGet(Router router, String path, String firstVersion) {
+    private Route metadataGet(Router router, String path, String firstVersion) {
+        if (!path.contains(":") && !path.contains("*")) {
+            metadataCategories.put("/" + path, firstVersion);
+        }
+        return versionedGet(router, path, firstVersion);
+    }
+
+    private static Route versionedGet(Router router, String path, String firstVersion) {
         return router.get("/:metadataVersion/" + path).handler(ctx -> {
             if (supportsVersion(ctx, firstVersion)) {
                 ctx.next();
@@ -325,6 +353,60 @@ public class Ec2MetadataServer {
             httpServer.close();
             httpServer = null;
         }
+    }
+
+    private void handleDirectory(RoutingContext ctx) {
+        if (!supportsVersion(ctx, "1.0")) {
+            ctx.response().setStatusCode(404).end();
+            return;
+        }
+        Instance instance = resolveInstance(ctx);
+        if (instance == null) {
+            return;
+        }
+        String pathWithVersion = ctx.normalizedPath();
+        String category = pathWithVersion.substring(pathWithVersion.indexOf('/', 1));
+        String directory = category.endsWith("/") ? category : category + "/";
+        Set<String> entries = new TreeSet<>();
+        for (Map.Entry<String, String> entry : metadataCategories.entrySet()) {
+            String path = entry.getKey();
+            if (!path.startsWith(directory) || path.equals(directory)
+                    || !supportsVersion(ctx, entry.getValue())
+                    || !metadataAvailable(instance, path)) {
+                continue;
+            }
+            String child = path.substring(directory.length());
+            int separator = child.indexOf('/');
+            entries.add(separator < 0 ? child : child.substring(0, separator + 1));
+        }
+        if (directory.equals("/meta-data/public-keys/") && !entries.isEmpty()) {
+            entries = Set.of("0=" + instance.getKeyName());
+        }
+        if (entries.isEmpty()) {
+            ctx.response().setStatusCode(404).end();
+            return;
+        }
+        ctx.response().putHeader("content-type", "text/plain").end(String.join("\n", entries) + "\n");
+    }
+
+    private boolean metadataAvailable(Instance instance, String category) {
+        return switch (category) {
+            case "/meta-data/ami-id" -> instance.getImageId() != null;
+            case "/meta-data/instance-type" -> instance.getInstanceType() != null;
+            case "/meta-data/local-ipv4" -> instance.getPrivateIpAddress() != null;
+            case "/meta-data/public-ipv4" -> instance.getPublicIpAddress() != null;
+            case "/meta-data/public-hostname" -> instance.getPublicDnsName() != null;
+            case "/meta-data/hostname", "/meta-data/local-hostname" -> instance.getPrivateDnsName() != null;
+            case "/meta-data/public-keys/0/openssh-key" ->
+                    instance.getKeyName() != null && instance.getKeyPairPublicKey() != null;
+            case "/meta-data/iam/info" -> credentials.profile(instance).isPresent()
+                    || synthesizedProfiles.contains(instance) && instance.getIamInstanceProfileArn() != null
+                    && !credentials.holdsProfile(instance);
+            case "/meta-data/iam/security-credentials/" -> credentials.role(instance).isPresent();
+            case "/meta-data/tags/instance/" ->
+                    "enabled".equals(instance.effectiveMetadataOptions().getInstanceMetadataTags());
+            default -> true;
+        };
     }
 
     // ── Token (IMDSv2) ────────────────────────────────────────────────────────

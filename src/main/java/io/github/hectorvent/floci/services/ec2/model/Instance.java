@@ -36,6 +36,7 @@ public class Instance {
     // interface the caller created. AutomaticPublicAddress decides from it in every mode.
     private boolean associatePublicIp = false;
     private String keyName;
+    private String keyPairPublicKey;
     private List<GroupIdentifier> securityGroups = new ArrayList<>();
     private List<InstanceNetworkInterface> networkInterfaces = new ArrayList<>();
     private String architecture;
@@ -179,6 +180,8 @@ public class Instance {
 
     public String getKeyName() { return keyName; }
     public void setKeyName(String keyName) { this.keyName = keyName; }
+    public String getKeyPairPublicKey() { return keyPairPublicKey; }
+    public void setKeyPairPublicKey(String keyPairPublicKey) { this.keyPairPublicKey = keyPairPublicKey; }
 
     public List<GroupIdentifier> getSecurityGroups() { return securityGroups; }
     public void setSecurityGroups(List<GroupIdentifier> securityGroups) { this.securityGroups = securityGroups; }

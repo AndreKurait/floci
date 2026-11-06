@@ -4581,6 +4581,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             inst.setPrivateIpAddress(privateIp);
                             inst.setPrivateDnsName(AwsRegions.ec2PrivateIpDnsName(privateIp, region));
                             inst.setKeyName(keyName);
+                            KeyPair launchKeyPair = keyName == null ? null : findKeyPair(region, keyName);
+                            inst.setKeyPairPublicKey(launchKeyPair == null ? null : launchKeyPair.getPublicKey());
                             inst.setSecurityGroups(new ArrayList<>(sgIdentifiers));
                             inst.setArchitecture(architecture);
                             inst.setLaunchTime(Instant.now());
@@ -6744,6 +6746,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         copy.setPublicDnsName(source.getPublicDnsName());
         copy.setAssociatePublicIp(source.isAssociatePublicIp());
         copy.setKeyName(source.getKeyName());
+        copy.setKeyPairPublicKey(source.getKeyPairPublicKey());
         copy.setArchitecture(source.getArchitecture());
         copy.setHypervisor(source.getHypervisor());
         copy.setVirtualizationType(source.getVirtualizationType());

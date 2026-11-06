@@ -5,6 +5,7 @@ import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.xml.XmlPath;
+import io.vertx.core.json.JsonObject;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -72,6 +73,19 @@ class Ec2CreateKeyPairLaunchIntegrationTest {
             verify(containerManager).launch(eq(instance), any(), injected.capture(), anyString(),
                     any(), any(), any(), any(), any());
             assertEquals("ssh-ed25519 " + Base64.getEncoder().encodeToString(blob), injected.getValue());
+            deleteKeyPair(created.getString("CreateKeyPairResponse.keyPairId"));
+            // Restored instance metadata retains the launch key after its EC2 key-pair record is deleted.
+            Instance restored = JsonObject.mapFrom(instance).mapTo(Instance.class);
+            try (Ec2MetadataTestFixture metadata = new Ec2MetadataTestFixture()) {
+                metadata.start();
+                metadata.server().registerContainer(Ec2MetadataTestFixture.CALLER_IP,
+                        restored.getInstanceId(), restored);
+                String token = metadata.putToken("60").body();
+                assertEquals("0=" + name + "\n", metadata.get("/latest/meta-data/public-keys/", token).body());
+                assertEquals("openssh-key\n", metadata.get("/latest/meta-data/public-keys/0/", token).body());
+                assertEquals(injected.getValue(),
+                        metadata.get("/latest/meta-data/public-keys/0/openssh-key", token).body());
+            }
         } finally {
             // The application is shared with another class: the key pair goes, and the instance gives
             // back its address and volume, though the mocked container manager leaves its record pending.
