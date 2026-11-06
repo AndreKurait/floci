@@ -49,10 +49,8 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
     private static final CreateOnlyInputs CREATE_ONLY_INPUTS =
             new CreateOnlyInputs("__FlociKeyPairInputs", "__FlociKeyPairPriorInputs");
     /**
-     * The keys CreateKeyPair made that the resource no longer names but still owes a delete, by
-     * name to id: those a rename displaced and a replacement a rollback undoes. The cleanup deletes
-     * them by name alone, so this keeps the id whose parameter goes too when the key is already gone.
-     * An entry leaves once its delete succeeds.
+     * Created or imported keys still owed a delete, by name to immutable id. Cleanup must not
+     * rediscover a different key that reused the name. An entry leaves once its delete succeeds.
      */
     private static final String CREATED_KEYS_ATTR = "__FlociKeyPairCreatedKeys";
     private static final String UNOWNED_PARAMETERS_ATTR = "__FlociKeyPairUnownedParameters";
@@ -97,7 +95,6 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
         ObjectNode inputs = inputs(name, keyType, keyFormat, publicKeyMaterial, tags);
 
         Map<String, String> attributesBefore = new HashMap<>(r.getAttributes());
-        Set<String> unownedParameterIds = CfnTrackedSets.read(r, UNOWNED_PARAMETERS_ATTR);
         // A dispatcher stub created nothing, so a key that takes over its id is a create.
         if (ctx.isUpdate() && !CfnResourceDispatcher.isStub(ctx.priorPhysicalId(), attributesBefore)) {
             if (madeFrom(readInputs(CREATE_ONLY_INPUTS.read(attributesBefore), r), inputs)) {
@@ -122,16 +119,11 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("KeyFingerprint", key.getKeyFingerprint());
         CREATE_ONLY_INPUTS.record(r, ctx, attributesBefore, inputs.toString());
         if (ctx.isUpdate()) {
-            String priorCreatedId = createdKeyId(attributesBefore, r);
-            if (priorCreatedId != null) {
-                Map<String, String> owed = createdKeys(r);
-                owed.put(ctx.priorPhysicalId(), priorCreatedId);
-                putCreatedKeys(r, owed);
-            }
+            rememberKey(r, ctx.priorPhysicalId(), attributesBefore.get("KeyPairId"),
+                    createdKeyId(attributesBefore, r) != null);
         }
         if (publicKeyMaterial == null) {
-            unownedParameterIds.add(key.getKeyPairId());
-            CfnTrackedSets.write(r, UNOWNED_PARAMETERS_ATTR, unownedParameterIds);
+            recordParameterOwnership(r, key.getKeyPairId(), ParameterOwnership.UNOWNED);
         }
         try {
             CfnRollback.guarded(r, ctx, true,
@@ -146,11 +138,8 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
                         }
                     });
         } catch (RuntimeException failure) {
-            if (publicKeyMaterial == null
-                    && "true".equals(r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR))) {
-                Map<String, String> owed = createdKeys(r);
-                owed.put(key.getKeyName(), key.getKeyPairId());
-                putCreatedKeys(r, owed);
+            if ("true".equals(r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR))) {
+                rememberKey(r, key.getKeyName(), key.getKeyPairId(), publicKeyMaterial == null);
             }
             throw failure;
         }
@@ -268,11 +257,8 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Deletes the key the resource's name holds, as a Cloud Control DeleteResource names it by that
-     * identifier alone, with its parameter first when CreateKeyPair made it. The name is all this
-     * goes by, so once this resource's key was deleted outside the stack, a key made under the same
-     * name since then is the one deleted. When the name no longer holds the key this resource
-     * recorded, the recorded key's parameter is deleted as well, so no private key outlives its key.
+     * Deletes the recorded key ID and its owned private-key parameter without deleting a newer key
+     * that reused the physical name. Legacy state without an ID uses the name-only deletion path.
      */
     @Override
     public void delete(StackResource resource, String region) {
@@ -280,33 +266,29 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
         if (CfnResourceDispatcher.isStub(resource.getPhysicalId(), resource.getAttributes())) {
             return;
         }
-        deleteNamed(resource.getPhysicalId(), createdKeyId(resource.getAttributes(), resource), region,
-                CfnTrackedSets.read(resource, UNOWNED_PARAMETERS_ATTR));
+        String keyId = resource.getAttributes().get("KeyPairId");
+        if (keyId == null) {
+            deleteNamed(resource.getPhysicalId(), region,
+                    CfnTrackedSets.read(resource, UNOWNED_PARAMETERS_ATTR));
+            return;
+        }
+        String generatedId = createdKeyId(resource.getAttributes(), resource);
+        deleteRecordedKey(keyId, region, generatedId != null
+                && !CfnTrackedSets.read(resource, UNOWNED_PARAMETERS_ATTR).contains(generatedId));
     }
 
     /**
-     * Deletes the key the name holds, which is all a displaced or rolled-back key is recorded by, and
-     * first the parameter holding its private key when CreateKeyPair made it: an imported key has
-     * none. A key or parameter that is already gone counts as deleted; any other failure keeps the
-     * key, so a retry still finds it.
+     * Name-only deletion for Cloud Control and legacy state without a recorded key id.
      */
     @Override
     public void delete(String resourceType, String physicalId, String region) {
-        deleteNamed(physicalId, null, region, Set.of());
+        deleteNamed(physicalId, region, Set.of());
     }
 
-    /**
-     * Deletes the key {@code name} holds, and, when {@code createdKeyId} names a key CreateKeyPair made
-     * for this resource that the name no longer holds, that key's parameter too.
-     */
-    private void deleteNamed(String name, String createdKeyId, String region, Set<String> unownedParameters) {
+    private void deleteNamed(String name, String region, Set<String> unownedParameters) {
         KeyPair current = findKeyPair(name, region);
         if (current != null) {
             deleteKeyPair(current, region, unownedParameters);
-        }
-        if (createdKeyId != null && !unownedParameters.contains(createdKeyId)
-                && (current == null || !createdKeyId.equals(current.getKeyPairId()))) {
-            deletePrivateKeyParameter(createdKeyId, region);
         }
     }
 
@@ -335,14 +317,31 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
+    private static void rememberKey(StackResource r, String name, String keyId, boolean generated) {
+        if (keyId == null) {
+            return;
+        }
+        Map<String, String> owed = createdKeys(r);
+        owed.put(name, keyId);
+        putCreatedKeys(r, owed);
+        if (!generated) {
+            recordParameterOwnership(r, keyId, ParameterOwnership.UNOWNED);
+        }
+    }
+
     /**
-     * Deletes a key the cleanup names, with the parameter of the created key recorded under that
-     * name, and drops the record once the delete succeeds.
+     * Deletes the recorded key and its owned parameter, dropping the record once deletion succeeds.
      */
     private ReplacementCleanup.Deleter owedDeleter(StackResource r) {
         return (type, name, region) -> {
             Map<String, String> owed = createdKeys(r);
-            deleteNamed(name, owed.get(name), region, CfnTrackedSets.read(r, UNOWNED_PARAMETERS_ATTR));
+            String keyId = owed.get(name);
+            Set<String> unowned = CfnTrackedSets.read(r, UNOWNED_PARAMETERS_ATTR);
+            if (keyId == null) {
+                deleteNamed(name, region, unowned);
+            } else {
+                deleteRecordedKey(keyId, region, !unowned.contains(keyId));
+            }
             if (owed.remove(name) != null) {
                 putCreatedKeys(r, owed);
             }
@@ -362,10 +361,15 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void deleteKeyPair(KeyPair key, String region, Set<String> unownedParameters) {
-        if (key.getKeyMaterial() != null && !unownedParameters.contains(key.getKeyPairId())) {
-            deletePrivateKeyParameter(key.getKeyPairId(), region);
+        deleteRecordedKey(key.getKeyPairId(), region,
+                key.getKeyMaterial() != null && !unownedParameters.contains(key.getKeyPairId()));
+    }
+
+    private void deleteRecordedKey(String keyId, String region, boolean ownsParameter) {
+        if (ownsParameter) {
+            deletePrivateKeyParameter(keyId, region);
         }
-        ec2Service.deleteKeyPair(region, null, key.getKeyPairId());
+        ec2Service.deleteKeyPair(region, null, keyId);
     }
 
     @Override
@@ -387,9 +391,13 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
     @Override
     public void clearUpdate(StackResource resource) {
         CREATE_ONLY_INPUTS.clearPrior(resource);
-        resource.getAttributes().remove(CREATED_KEYS_ATTR);
-        resource.getAttributes().remove(UNOWNED_PARAMETERS_ATTR);
         ReplacementCleanup.clear(resource);
+        Map<String, String> owed = createdKeys(resource);
+        owed.keySet().retainAll(ReplacementCleanup.owedPhysicalIds(resource));
+        putCreatedKeys(resource, owed);
+        if (owed.isEmpty()) {
+            resource.getAttributes().remove(UNOWNED_PARAMETERS_ATTR);
+        }
     }
 
     @Override
@@ -416,11 +424,9 @@ public class Ec2KeyPairCfnProvisioner implements CfnResourceProvisioner {
     public boolean rollbackUpdate(StackResource resource) {
         String replacement = resource.getPhysicalId();
         boolean hasPriorInputs = CREATE_ONLY_INPUTS.hasPrior(resource);
-        String replacementCreatedId = createdKeyId(resource.getAttributes(), resource);
-        if (hasPriorInputs && replacementCreatedId != null) {
-            Map<String, String> owed = createdKeys(resource);
-            owed.put(replacement, replacementCreatedId);
-            putCreatedKeys(resource, owed);
+        if (hasPriorInputs) {
+            rememberKey(resource, replacement, resource.getAttributes().get("KeyPairId"),
+                    createdKeyId(resource.getAttributes(), resource) != null);
         }
         try {
             ReplacementCleanup.rollback(resource, owedDeleter(resource));
