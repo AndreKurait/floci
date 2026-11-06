@@ -45,6 +45,11 @@ pytest tests/test_s3.py
 just test-python
 ```
 
+`iam/test_eventbridge_lambda_permissions.py` runs with IAM enforcement enabled.
+It uses real Python 3.12 Lambda handlers on default and custom event buses to
+check qualified grants, revocation, recovery and `NO_PERMISSIONS` dead letters
+while another SQS target continues receiving events.
+
 ## Legacy DynamoDB client
 
 `legacy/test_dynamodb_20111205.py` exercises the 2011-12-05 API with Boto 2,
