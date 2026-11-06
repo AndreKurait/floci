@@ -18,6 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -112,12 +113,34 @@ class ApiGatewayCustomDomainOwnerServiceTest {
         assertNull(service.findDomainByRegionalHostname(DOMAIN));
     }
 
+    @Test
+    void dnsReadsThePublishedTargetAcrossOwnersWithoutGrantingManagementAccess() {
+        putDomain(OWNER, OTHER_REGION);
+        assertEquals(new ApiGatewayService.DomainDnsTarget("owner-zone"),
+                service.findDomainDnsTarget((DOMAIN + ".regional.local.").toUpperCase()).orElseThrow());
+        assertTrue(service.findDomainDnsTarget("other." + DOMAIN + ".regional.local").isEmpty());
+        assertTrue(service.findDomainDnsTarget(DOMAIN).isEmpty());
+        assertEquals("NotFoundException",
+                assertThrows(AwsException.class, () -> service.getDomainName(OTHER_REGION, DOMAIN)).getErrorCode());
+    }
+
+    @Test
+    void dnsRefusesConflictingPublicTargetsInsteadOfChoosingAnOwner() {
+        putDomain(OWNER, REGION);
+        putDomain(OTHER_ACCOUNT, OTHER_REGION);
+        assertEquals("ConflictException", assertThrows(AwsException.class,
+                () -> service.findDomainDnsTarget(DOMAIN + ".regional.local")).getErrorCode());
+    }
+
     @SuppressWarnings("unchecked")
     private void putDomain(String account, String region) {
         AccountAwareStorageBackend<CustomDomain> domains =
                 (AccountAwareStorageBackend<CustomDomain>) stores.get("apigateway-domains.json");
         CustomDomain domain = new CustomDomain();
         domain.setDomainName(DOMAIN);
+        domain.setEndpointConfigurationType("REGIONAL");
+        domain.setRegionalDomainName(DOMAIN + ".regional.local");
+        domain.setRegionalHostedZoneId("owner-zone");
         domains.putForAccount(account, region + "::" + DOMAIN, domain);
     }
 

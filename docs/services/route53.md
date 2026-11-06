@@ -210,3 +210,21 @@ the record. DELETE still requires matching record values and routing properties.
 - DNSSEC (key signing keys, enabling/disabling)
 - `TestDNSAnswer`
 - Public authoritative record types other than simple TXT, NS, and SOA; public routing policies, delegation referrals, and DNS-over-TCP
+
+### API Gateway alias DNS
+
+Public A aliases can target an existing API Gateway REGIONAL or EDGE custom domain.
+Use the target DNS name and hosted-zone ID returned by API Gateway. The embedded
+DNS listener answers with its own IPv4 address and a 60-second TTL; the original
+Host header selects the native API and base-path mapping.
+
+The resolver verifies the stored target across accounts without changing management
+API authorization. Unknown, deleted, ambiguous, or mismatched-zone targets are
+refused. It does not infer a target from a hostname suffix. Native zone authority,
+delegation checks, and private-zone precedence remain in effect. An A-only name
+returns no AAAA data; removing its alias while retaining its zone returns NXDOMAIN.
+Simple public A/AAAA records also use the existing typed DNS encoder. Weighted,
+health-evaluated and other unsupported alias policies remain refused.
+
+This path does not implement private API Gateway domains or external CloudFront
+distributions, and does not provide additional routing into managed VPCs.

@@ -187,14 +187,13 @@ class Route53DnsPacketIntegrationTest {
         change(id, "CREATE", weighted);
         change(id, "CREATE", record("alias." + name, "CNAME", 60, "target.example."));
         change(id, "CREATE", record("delegated." + name, "NS", 60, "other.example."));
-        for (int type : List.of(1, 28, 15, 5)) {
+        for (int type : List.of(15, 5)) {
             assertTrue(source.resolveAuthoritative(name, type).isEmpty());
         }
         String awsName = uniqueName() + ".amazonaws.com";
         createZone(awsName);
         byte[] address = query(request(awsName, 1));
-        assertArrayEquals(new byte[]{127, 0, 0, 1},
-                Arrays.copyOfRange(address, address.length - 4, address.length));
+        assertNegative(address, awsName, 0, 900);
         for (String label : List.of("weighted", "alias", "leaf.delegated")) {
             assertHeader(query(request(label + "." + name, 16)), 5, false, 0, 0);
         }
