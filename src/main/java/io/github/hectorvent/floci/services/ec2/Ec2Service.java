@@ -28,6 +28,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog.CatalogIns
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.CapacityReservation;
+import io.github.hectorvent.floci.services.ec2.model.CapacityReservationMove;
 import io.github.hectorvent.floci.services.ec2.model.DhcpConfiguration;
 import io.github.hectorvent.floci.services.ec2.model.DhcpOptions;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
@@ -148,6 +149,7 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
@@ -230,7 +232,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // A first launch may need to pull a large AMI-backed image. Keep a finite CloudFormation
     // bound, but allow enough time for that legitimate cold-start path before cancellation.
     private static final Duration CONTAINER_LAUNCH_TIMEOUT = Duration.ofMinutes(5);
-    private static final long CONTAINER_LAUNCH_POLL_MILLIS = 50;
     private static final Set<String> VPN_GATEWAY_FILTERS = Set.of(
             "amazon-side-asn", "attachment.state", "attachment.vpc-id", "availability-zone",
             "state", "tag-key", "tag-value", "type", "vpn-gateway-id");
@@ -4018,11 +4019,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 sgIdentifiers.add(new GroupIdentifier(sg.getGroupId(), sg.getGroupName()));
             }
         } else {
-            // Use default SG
-            SecurityGroup defaultSg = securityGroups.get(key(region, resolveDefaultSecurityGroupId(region))).orElse(null);
-            if (defaultSg != null) {
-                sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName()));
-            }
+            defaultSecurityGroupOf(region, vpcId).ifPresent(defaultSg ->
+                    sgIdentifiers.add(new GroupIdentifier(defaultSg.getGroupId(), defaultSg.getGroupName())));
         }
 
         String reservationId = "r-" + randomHex(17);
@@ -4331,24 +4329,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         long deadline = System.nanoTime() + timeout.toNanos();
         while (true) {
-            String state = instance.getState() != null ? instance.getState().getName() : null;
-            if ("running".equals(state)) {
-                return;
-            }
-            if ("terminated".equals(state)) {
-                throw launchFailure(instance, "its container terminated during launch");
-            }
-            if (System.nanoTime() - deadline >= 0) {
-                if (containerManager.cancelLaunch(instance)) {
-                    throw launchFailure(instance, "it did not reach running state before the launch timeout");
+            synchronized (instance) {
+                String state = instance.getState() != null ? instance.getState().getName() : null;
+                if ("running".equals(state)) {
+                    return;
+                }
+                if ("terminated".equals(state)) {
+                    throw launchFailure(instance, "its container terminated during launch");
+                }
+                long remaining = deadline - System.nanoTime();
+                if (remaining > 0) {
+                    try {
+                        TimeUnit.NANOSECONDS.timedWait(instance, remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AwsException("InternalError", "Interrupted while waiting for EC2 instance "
+                                + instance.getInstanceId() + " to launch", 500);
+                    }
+                    continue;
                 }
             }
-            try {
-                Thread.sleep(CONTAINER_LAUNCH_POLL_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AwsException("InternalError", "Interrupted while waiting for EC2 instance "
-                        + instance.getInstanceId() + " to launch", 500);
+            // Cleanup can block in Docker; never hold the instance monitor while removing it.
+            if (containerManager.cancelLaunch(instance)) {
+                throw launchFailure(instance, "it did not reach running state before the launch timeout");
             }
         }
     }
@@ -6461,17 +6464,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             egressOnlyInternetGateways.delete(key(region, eigwId));
             removeTags(region, eigwId);
         }
+        blackholeRoutes(region, route -> eigwId.equals(route.getEgressOnlyInternetGatewayId()));
+    }
+
+    private void blackholeRoutes(String region, Predicate<Route> targetsGateway) {
         for (RouteTable table : routeTables.scan(k -> k.startsWith(region + "::"))) {
-            if (table.getRoutes().stream().noneMatch(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))) {
+            if (table.getRoutes().stream().noneMatch(targetsGateway)) {
                 continue;
             }
             synchronized (lockFor(key(region, table.getRouteTableId()))) {
                 RouteTable current = routeTables.get(key(region, table.getRouteTableId())).orElse(null);
-                if (current == null) {
+                if (current == null || current.getRoutes().stream().noneMatch(targetsGateway)) {
                     continue;
                 }
                 current.getRoutes().stream()
-                        .filter(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))
+                        .filter(targetsGateway)
                         .forEach(r -> r.setState("blackhole"));
                 routeTables.put(key(region, current.getRouteTableId()), current);
                 notifyRouteTableUpdated(region, current);
@@ -11589,6 +11596,184 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return instanceCount;
     }
 
+    public record CapacityReservationMoveResult(CapacityReservation source,
+                                                CapacityReservation destination, int instanceCount) {
+    }
+
+    /**
+     * Transfers capacity and associated instances. Completed tokens are retained on the source reservation,
+     * including its cancelled tombstone, using the same account-aware persistent store.
+     */
+    public CapacityReservationMoveResult moveCapacityReservationInstances(String region, String sourceId,
+            String destinationId, Integer instanceCount, String clientToken) {
+        if (instanceCount == null) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter InstanceCount.", 400);
+        }
+        requireCapacityMoveId(sourceId, "SourceCapacityReservationId");
+        synchronized (capacityReservationLock) {
+            requireCapacityMoveSource(region, sourceId);
+            requireCapacityMoveId(destinationId, "DestinationCapacityReservationId");
+            if (sourceId.equals(destinationId)) {
+                throw new AwsException("InvalidParameterCombination",
+                        "The source and destination Capacity Reservations must be different.", 400);
+            }
+            if (instanceCount < 1 || instanceCount > 1000) {
+                throw new AwsException("InvalidParameterValue",
+                        "The instance count to move must be between 1 and 1000.", 400);
+            }
+            int count = instanceCount;
+            reconcileCapacityMembership(region);
+            CapacityReservation source = getRequiredCapacityReservation(region, sourceId);
+            CapacityReservationMove requested = new CapacityReservationMove(sourceId, destinationId, count);
+            boolean retry = false;
+            if (clientToken != null) {
+                for (CapacityReservation reservation : capacityReservations.scan(k -> true)) {
+                    if (!region.equals(reservation.getRegion())) {
+                        continue;
+                    }
+                    CapacityReservationMove completed = reservation.getCompletedMoves().get(clientToken);
+                    if (completed != null) {
+                        if (!completed.equals(requested)) {
+                            throw new AwsException("IdempotentParameterMismatch",
+                                    "The parameters do not match the previous request with this client token.", 400);
+                        }
+                        retry = true;
+                        break;
+                    }
+                }
+            }
+            if ("active".equals(source.getState()) && count > source.getAvailableInstanceCount()
+                    && capacityReservations.get(key(region, destinationId)).isEmpty()
+                    && capacityReservations instanceof AccountAwareStorageBackend<?> accountAware
+                    && accountAware.findAnyAccountEntry(key(region, destinationId)).isPresent()) {
+                throw new AwsException("InvalidParameterValue",
+                        "Consumed capacity cannot be moved to a Capacity Reservation owned by another account.", 400);
+            }
+            CapacityReservation destination = getRequiredCapacityReservation(region, destinationId);
+            if (!"active".equals(source.getState()) || !"active".equals(destination.getState())) {
+                throw new AwsException("Unsupported",
+                        "Both Capacity Reservations must be active.", 400);
+            }
+            if (!Objects.equals(source.getOwnerId(), destination.getOwnerId())
+                    || !Objects.equals(source.getOwnerId(), callerAccountId())) {
+                throw new AwsException("InvalidParameterValue",
+                        "Both Capacity Reservations must be owned by the calling account.", 400);
+            }
+            Instant now = capacityReservationNow();
+            if (source.getCommitmentEndDate() != null && now.isBefore(source.getCommitmentEndDate())
+                    || destination.getCommitmentEndDate() != null && now.isBefore(destination.getCommitmentEndDate())) {
+                throw new AwsException("Unsupported",
+                        "Capacity cannot be moved during a Capacity Reservation commitment period.", 400);
+            }
+            if (retry) {
+                return capacityMoveResult(region, requested);
+            }
+            int consumed = Math.max(0, count - source.getAvailableInstanceCount());
+            if (count > source.getTotalInstanceCount() || consumed > 0
+                    && (!"open".equals(source.getInstanceMatchCriteria())
+                    || !"open".equals(destination.getInstanceMatchCriteria())
+                    || consumed > source.getInstanceIds().size())) {
+                throw new AwsException("InvalidParameterValue",
+                        "There is insufficient available capacity in the source Capacity Reservation.", 400);
+            }
+            validateCapacityMoveAttributes(region, source, destination);
+            List<String> eligibleInstances = source.getInstanceIds().stream()
+                    .filter(id -> instances.get(key(region, id))
+                            .map(instance -> instance.getCapacityReservationTarget() == null
+                                    && "open".equals(instance.getCapacityReservationPreference()))
+                            .orElse(false))
+                    .toList();
+            if (eligibleInstances.size() < consumed) {
+                throw new AwsException("Unsupported",
+                        "There are insufficient eligible instances to move from the source Capacity Reservation.", 400);
+            }
+            if ((long) destination.getTotalInstanceCount() + count > Integer.MAX_VALUE
+                    || (long) destination.getAvailableInstanceCount() + count > Integer.MAX_VALUE) {
+                throw new AwsException("InvalidParameterValue",
+                        "The destination Capacity Reservation instance count is too large.", 400);
+            }
+            source = new CapacityReservation(source);
+            destination = new CapacityReservation(destination);
+            source.setTotalInstanceCount(source.getTotalInstanceCount() - count);
+            List<String> transferred = new ArrayList<>(eligibleInstances.subList(0, consumed));
+            source.getInstanceIds().removeAll(transferred);
+            destination.getInstanceIds().addAll(transferred);
+            source.setAvailableInstanceCount(source.getAvailableInstanceCount() - count + consumed);
+            destination.setTotalInstanceCount(destination.getTotalInstanceCount() + count);
+            destination.setAvailableInstanceCount(destination.getAvailableInstanceCount() + count - consumed);
+            if (source.getTotalInstanceCount() == 0) {
+                source.setState("cancelled");
+            }
+            if (clientToken != null) {
+                source.getCompletedMoves().put(clientToken, requested);
+            }
+            try {
+                capacityReservations.putAllAtomically(
+                        Map.of(key(region, sourceId), source, key(region, destinationId), destination));
+            } catch (RuntimeException failure) {
+                LOG.errorv(failure, "Failed to persist capacity move from {0} to {1}", sourceId, destinationId);
+                AwsException error = new AwsException("InternalError", "Could not persist the capacity move.", 500);
+                error.initCause(failure);
+                throw error;
+            }
+            return capacityMoveResult(region, requested);
+        }
+    }
+
+    private CapacityReservationMoveResult capacityMoveResult(String region, CapacityReservationMove move) {
+        return new CapacityReservationMoveResult(
+                new CapacityReservation(getRequiredCapacityReservation(region, move.sourceId())),
+                new CapacityReservation(getRequiredCapacityReservation(region, move.destinationId())),
+                move.instanceCount());
+    }
+
+    private void requireCapacityMoveSource(String region, String sourceId) {
+        String storageKey = key(region, sourceId);
+        if (capacityReservations.get(storageKey).isPresent()) {
+            return;
+        }
+        if (capacityReservations instanceof AccountAwareStorageBackend<?> accountAware
+                && accountAware.findAnyAccountEntry(storageKey).isPresent()) {
+            return;
+        }
+        getRequiredCapacityReservation(region, sourceId);
+    }
+
+    private void requireCapacityMoveId(String value, String parameter) {
+        if (value == null || (!value.isEmpty() && value.isBlank())) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter " + parameter + ".", 400);
+        }
+        if (!value.matches("cr-[0-9a-fA-F]{17}") || value.equals("cr-00000000000000000")) {
+            throw new AwsException("InvalidCapacityReservationId.Malformed",
+                    "Capacity Reservation ID '" + value + "' is malformed", 400);
+        }
+    }
+
+    private void validateCapacityMoveAttributes(String region, CapacityReservation source,
+                                                CapacityReservation destination) {
+        if (!Objects.equals(source.getInstanceType(), destination.getInstanceType())
+                || !Objects.equals(source.getInstancePlatform(), destination.getInstancePlatform())) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different instance types or platforms is not supported.", 400);
+        }
+        if (!Objects.equals(source.getTenancy(), destination.getTenancy())
+                || !Objects.equals(source.getPlacementGroupArn(), destination.getPlacementGroupArn())) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different tenancy or placement groups is not supported.", 400);
+        }
+        if (!Objects.equals(capacityReservationZone(region, source), capacityReservationZone(region, destination))) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different Availability Zones is not supported.", 400);
+        }
+        if (!Objects.equals(source.getEndDateType(), destination.getEndDateType())
+                || (!"unlimited".equals(source.getEndDateType())
+                        && !Objects.equals(source.getEndDate(), destination.getEndDate()))) {
+            throw new AwsException("Unsupported",
+                    "Moving capacity between reservations with different end dates is not supported.", 400);
+        }
+    }
+
     private String capacityReservationZone(String region, CapacityReservation reservation) {
         if (!isSet(reservation.getAvailabilityZoneId())) {
             return reservation.getAvailabilityZone();
@@ -11839,11 +12024,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public void deleteRouteTable(String region, String routeTableId) {
         ensureDefaultResources(region);
-        RouteTable rt = routeTables.get(key(region, routeTableId)).orElse(null);
-        if (rt == null) {
-            throw new AwsException("InvalidRouteTableID.NotFound", "The route table '" + routeTableId + "' does not exist", 400);
+        RouteTable rt;
+        synchronized (lockFor(key(region, routeTableId))) {
+            rt = routeTables.get(key(region, routeTableId)).orElse(null);
+            if (rt == null) {
+                throw new AwsException("InvalidRouteTableID.NotFound",
+                        "The route table '" + routeTableId + "' does not exist", 400);
+            }
+            routeTables.delete(key(region, routeTableId));
         }
-        routeTables.delete(key(region, routeTableId));
         notifyRouteTableUpdated(region, rt);
     }
 
@@ -13230,6 +13419,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             natGateways.delete(key(region, natGatewayId));
             removeTags(region, natGatewayId);
             natGateway.getNatGatewayAddresses().forEach(a -> removeTags(region, a.getNetworkInterfaceId()));
+            blackholeRoutes(region, route -> natGatewayId.equals(route.getNatGatewayId()));
             return natGateway;
         }
     }

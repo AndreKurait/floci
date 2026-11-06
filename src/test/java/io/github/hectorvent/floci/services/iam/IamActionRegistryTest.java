@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iam;
 import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.WireProtocol;
+import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -197,6 +198,17 @@ class IamActionRegistryTest {
         when(info.getResourceMethod()).thenReturn(Arrays.stream(Route53Controller.class.getMethods())
                 .filter(candidate -> candidate.getName().equals(method)).findFirst().orElseThrow());
         assertEquals("route53:" + operation, registry.resolveMatchedRoute("route53", info));
+        assertNull(registry.resolveMatchedRoute("s3", info));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"startConfigurationSession,StartConfigurationSession", "getLatestConfiguration,GetLatestConfiguration"})
+    void matchedAppConfigDataMethodsKeepTheAppConfigPermissionNamespace(String method, String operation) {
+        ResourceInfo info = Mockito.mock(ResourceInfo.class);
+        Mockito.doReturn(AppConfigDataController.class).when(info).getResourceClass();
+        when(info.getResourceMethod()).thenReturn(Arrays.stream(AppConfigDataController.class.getMethods())
+                .filter(candidate -> candidate.getName().equals(method)).findFirst().orElseThrow());
+        assertEquals("appconfig:" + operation, registry.resolveMatchedRoute("appconfig", info));
         assertNull(registry.resolveMatchedRoute("s3", info));
     }
 

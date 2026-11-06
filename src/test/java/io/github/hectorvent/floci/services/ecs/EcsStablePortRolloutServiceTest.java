@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ecs;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
@@ -47,6 +48,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -418,6 +420,8 @@ class EcsStablePortRolloutServiceTest {
     private record NamespaceStops(DockerClient docker, SecurityGroupFirewallManager firewall) {
         private void register(String eniId, String helperId, String address) {
             when(docker.inspectContainerCmd(helperId).exec().getState().getRunning()).thenReturn(true);
+            CopyArchiveToContainerCmd copy = mock(CopyArchiveToContainerCmd.class, RETURNS_SELF);
+            when(docker.copyArchiveToContainerCmd(helperId)).thenReturn(copy);
             ContainerExecStubs.completeEveryExec(docker, helperId, 0, "", "");
             SecurityGroup group = new SecurityGroup();
             group.setGroupId("sg-local");

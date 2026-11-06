@@ -27,7 +27,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Resolves private IPv4 records and public TXT/NS/SOA records for the embedded DNS server.
+ * Resolves private IPv4 records and public A/AAAA/TXT/NS/SOA records for the embedded DNS server.
  *
  * <p>Discovered via CDI as a {@link DnsRecordSource} implementation, keeping
  * the embedded DNS server decoupled from Route 53 service classes.
@@ -45,6 +45,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
 
     private final Route53Service route53Service;
     private final DnsLookupHelper dnsLookupHelper;
+    private final EmbeddedDnsServer dnsServer;
     private final Set<String> flociSuffixes = new LinkedHashSet<>();
 
     public Route53DnsRecordSource(Route53Service route53Service) {
@@ -55,10 +56,16 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         this(route53Service, config, new DnsLookupHelper(config));
     }
 
-    @Inject
     public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper) {
+        this(route53Service, config, dnsLookupHelper, null);
+    }
+
+    @Inject
+    public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config,
+                                  DnsLookupHelper dnsLookupHelper, EmbeddedDnsServer dnsServer) {
         this.route53Service = route53Service;
         this.dnsLookupHelper = dnsLookupHelper != null ? dnsLookupHelper : new DnsLookupHelper(config);
+        this.dnsServer = dnsServer;
         this.flociSuffixes.addAll(BUILTIN_SUFFIXES);
         if (config != null) {
             config.hostname().ifPresent(this.flociSuffixes::add);
@@ -70,7 +77,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
 
     @Override
     public Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
-        if (name == null || name.isBlank() || (type != 2 && type != 6 && type != 16)) {
+        if (name == null || name.isBlank() || (type != 1 && type != 2 && type != 6 && type != 16 && type != 28)) {
             return Optional.empty();
         }
         if (route53Service.isCoveredByPrivateZone(name)) {
@@ -106,16 +113,36 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         try {
             for (ResourceRecordSet record : zone.matchingRecords()) {
                 if (!record.getType().equals(switch (type) {
+                    case 1 -> "A";
+                    case 28 -> "AAAA";
                     case 2 -> "NS";
                     case 6 -> "SOA";
                     default -> "TXT";
                 })) {
                     continue;
                 }
-                if (record.getSetIdentifier() != null || record.getAliasTarget() != null
+                if (record.getSetIdentifier() != null
                         || record.getWeight() != null || record.getRegion() != null
-                        || record.getFailover() != null || record.getHealthCheckId() != null
-                        || record.getRecords() == null) {
+                        || record.getFailover() != null || record.getHealthCheckId() != null) {
+                    return Optional.of(DnsAnswer.refused());
+                }
+                AliasTarget alias = record.getAliasTarget();
+                if (alias != null) {
+                    if (dnsServer == null || alias.isEvaluateTargetHealth() || record.getTtl() != null
+                            || record.getRecords() != null && !record.getRecords().isEmpty()) {
+                        return Optional.of(DnsAnswer.refused());
+                    }
+                    DnsAnswer target = dnsServer.resolveAliasTarget(
+                            alias.getDnsName(), alias.getHostedZoneId(), type)
+                            .orElseGet(DnsAnswer::refused);
+                    if (target.responseCode() != 0) {
+                        return Optional.of(DnsAnswer.refused());
+                    }
+                    answers.addAll(target.records());
+                    ttl = Math.min(ttl, target.ttlSeconds());
+                    continue;
+                }
+                if (record.getRecords() == null) {
                     return Optional.of(DnsAnswer.refused());
                 }
                 for (ResourceRecord value : record.getRecords()) {
@@ -123,6 +150,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                         return Optional.of(DnsAnswer.refused());
                     }
                     DnsRecord answer = switch (type) {
+                        case 1, 28 -> new DnsRecord.Address(type, value.getValue());
                         case 2 -> new DnsRecord.Ns(value.getValue());
                         case 6 -> new DnsRecord.Soa(value.getValue());
                         default -> new DnsRecord.Txt(value.getValue());
@@ -287,6 +315,9 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     }
 
     private Optional<String> getLocalFlociAddress() {
+        if (dnsServer != null && dnsServer.getServerIp().isPresent()) {
+            return dnsServer.getServerIp();
+        }
         try {
             return Optional.of(InetAddress.getLocalHost().getHostAddress());
         } catch (Exception e) {

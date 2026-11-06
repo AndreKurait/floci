@@ -111,6 +111,11 @@ public class CloudFormationQueryHandler {
     // ── CreateStack ───────────────────────────────────────────────────────────
 
     private Response createStack(MultivaluedMap<String, String> params, String region) {
+        if (params.containsKey("DisableRollback") && params.containsKey("OnFailure")) {
+            throw new AwsException("ValidationError",
+                    "DisableRollback and OnFailure cannot both be specified.", 400);
+        }
+        boolean disableRollback = Boolean.parseBoolean(params.getFirst("DisableRollback"));
         String stackName = params.getFirst("StackName");
         String templateBody = params.getFirst("TemplateBody");
         String templateUrl = params.getFirst("TemplateURL");
@@ -125,7 +130,7 @@ public class CloudFormationQueryHandler {
                 templateBody, templateUrl, parameters, capabilities, tags, region,
                 terminationProtection, stackPolicy);
         try {
-            cfnService.executeChangeSet(initial.getStackId(), initial.getChangeSetId(), region);
+            cfnService.executeCreateChangeSet(initial.getStackId(), initial.getChangeSetId(), region, disableRollback);
         } catch (AwsException e) {
             if (terminationProtection) {
                 cfnService.clearProtectionAfterRejectedCreate(stackName, initial, region);
@@ -688,6 +693,7 @@ public class CloudFormationQueryHandler {
                 .elem("StackId", s.getStackId())
                 .elem("StackName", s.getStackName())
                 .elem("StackStatus", s.getStatus())
+                .elem("DisableRollback", String.valueOf(s.isDisableRollback()))
                 .elem("EnableTerminationProtection", String.valueOf(s.isEnableTerminationProtection()))
                 .elem("CreationTime", ISO.format(s.getCreationTime()));
         if (s.getLastUpdatedTime() != null) {

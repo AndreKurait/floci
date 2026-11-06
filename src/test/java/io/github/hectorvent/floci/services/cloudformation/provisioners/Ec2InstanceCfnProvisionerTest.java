@@ -14,6 +14,8 @@ import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -61,6 +63,189 @@ class Ec2InstanceCfnProvisionerTest {
     private final Ec2Service ec2 = mock(Ec2Service.class);
     private final Ec2InstanceCfnProvisioner provisioner = new Ec2InstanceCfnProvisioner(ec2);
     private final ObjectMapper mapper = new ObjectMapper();
+
+    @Test
+    void primaryInterfacePlacementUsesDeviceIndexRatherThanListOrder() throws Exception {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        stubLaunch(instance);
+
+        provisioner.provision(resource("Server"), props("""
+                {"ImageId": "ami-1", "NetworkInterfaces": [
+                  {"DeviceIndex": 1, "SubnetId": "subnet-secondary", "AssociatePublicIpAddress": true},
+                  {"DeviceIndex": 0, "SubnetId": "subnet-primary", "AssociatePublicIpAddress": false}
+                ]}
+                """), ctx());
+
+        verify(ec2).runInstances(eq("us-east-1"), eq("ami-1"), eq("t3.micro"), eq(1), eq(1), isNull(),
+                anyList(), eq("subnet-primary"), isNull(), anyList(), isNull(), isNull(), eq(false), isNull(),
+                eq(0), isNull(), isNull(), isNull(), isNull(), eq(false), isNull(), isNull(), isNull(),
+                eq(false), isNull());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"true", "null"})
+    void primaryInterfacePublicIpIsForwardedWhenTrueOrOmitted(String publicIp) throws Exception {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        stubLaunch(instance);
+        String publicIpProperty = "null".equals(publicIp) ? "" : ",\"AssociatePublicIpAddress\":true";
+
+        provisioner.provision(resource("Server"), props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-primary"%s}
+                ]}
+                """.formatted(publicIpProperty)), ctx());
+
+        ArgumentCaptor<Boolean> publicIpArgument = ArgumentCaptor.forClass(Boolean.class);
+        verify(ec2).runInstances(eq("us-east-1"), eq("ami-1"), eq("t3.micro"), eq(1), eq(1), isNull(),
+                anyList(), eq("subnet-primary"), isNull(), anyList(), isNull(), isNull(),
+                publicIpArgument.capture(), isNull(), eq(0), isNull(), isNull(), isNull(), isNull(),
+                eq(false), isNull(), isNull(), isNull(), eq(false), isNull());
+        assertEquals("null".equals(publicIp) ? null : Boolean.TRUE, publicIpArgument.getValue());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{}", "{\"DeviceIndex\":null}", "\"scalar\"", "null", "[]"})
+    void everyInterfaceIsValidatedAfterAValidPrimary(String invalidInterface) throws Exception {
+        StackResource resource = resource("Server");
+        resource.getAttributes().put("existing", "preserved");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(resource, props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-primary"},%s
+                ]}
+                """.formatted(invalidInterface)), ctx()));
+
+        assertEquals(Map.of("existing", "preserved"), resource.getAttributes());
+        assertNull(resource.getPhysicalId());
+        verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void changingThePrimaryInterfaceSubnetReplacesTheInstance() throws Exception {
+        Instance previous = reusable("i-before");
+        previous.setSubnetId("subnet-before");
+        Instance replacement = new Instance();
+        replacement.setInstanceId("i-after");
+        replacement.setImageId("ami-1");
+        replacement.setSubnetId("subnet-after");
+        stubLaunch(replacement);
+        StackResource resource = resource("Server");
+
+        provisioner.provision(resource, props("""
+                {"ImageId": "ami-1", "NetworkInterfaces": [
+                  {"DeviceIndex": 0, "SubnetId": "subnet-after"}
+                ]}
+                """), ctx("i-before"));
+
+        assertEquals("i-after", resource.getPhysicalId());
+        assertTrue(provisioner.hasReplacementUpdate(resource));
+        assertEquals("i-before", provisioner.updateCleanupPhysicalId(resource));
+    }
+
+    @Test
+    void primaryInterfaceGroupsArePassedToTheLaunch() throws Exception {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        stubLaunch(instance);
+
+        provisioner.provision(resource("Server"), props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-1","GroupSet":["sg-primary"]}
+                ]}
+                """), ctx());
+
+        verify(ec2).runInstances(eq("us-east-1"), eq("ami-1"), eq("t3.micro"), eq(1), eq(1), isNull(),
+                eq(List.of("sg-primary")), eq("subnet-1"), isNull(), anyList(), isNull(), isNull(),
+                isNull(), isNull(), eq(0), isNull(), isNull(), isNull(), isNull(),
+                eq(false), isNull(), isNull(), isNull(), eq(false), isNull());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SecurityGroupIds", "SecurityGroups"})
+    void instanceGroupsCannotOverrideThePrimaryInterface(String property) throws Exception {
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(resource("Server"),
+                props("""
+                        {"ImageId":"ami-1","%s":["sg-override"],"NetworkInterfaces":[
+                          {"DeviceIndex":0,"SubnetId":"subnet-1","GroupSet":["sg-primary"]}
+                        ]}
+                        """.formatted(property)), ctx()));
+
+        assertEquals("InvalidParameterCombination", error.getErrorCode());
+        verifyNoInteractions(ec2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{}", "\"sg-primary\""})
+    void primaryInterfaceGroupSetMustBeAList(String groups) throws Exception {
+        assertThrows(AwsException.class, () -> provisioner.provision(resource("Server"), props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-1","GroupSet":%s}
+                ]}
+                """.formatted(groups)), ctx()));
+
+        verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void rollingBackPrimaryInterfaceRemovalRestoresItsDeclaration() throws Exception {
+        Instance previous = reusable("i-before");
+        previous.setSubnetId("subnet-before");
+        stubLaunch(previous);
+        StackResource resource = resource("Server");
+        provisioner.provision(resource, props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-before"}
+                ]}
+                """), ctx());
+        Map<String, String> declared = declarations(resource);
+        Instance replacement = new Instance();
+        replacement.setInstanceId("i-after");
+        replacement.setState(InstanceState.terminated());
+        stubLaunch(replacement);
+
+        provisioner.provision(resource, props("{\"ImageId\":\"ami-1\"}"), ctx("i-before"));
+
+        assertEquals("i-after", resource.getPhysicalId());
+        assertTrue(provisioner.hasReplacementUpdate(resource));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertEquals("i-before", resource.getPhysicalId());
+        assertEquals(declared, declarations(resource));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "{}",
+            "[{\"DeviceIndex\":1,\"SubnetId\":\"subnet-1\"}]",
+            "[{\"DeviceIndex\":0,\"SubnetId\":\"subnet-1\"},{\"DeviceIndex\":0,\"SubnetId\":\"subnet-2\"}]"
+    })
+    void invalidPrimaryInterfaceDeclarationsFailBeforeEc2Calls(String interfaces) throws Exception {
+        StackResource resource = resource("Server");
+        resource.getAttributes().put("existing", "preserved");
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(resource,
+                props("{\"ImageId\":\"ami-1\",\"NetworkInterfaces\":" + interfaces + "}"), ctx()));
+
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        assertEquals(Map.of("existing", "preserved"), resource.getAttributes());
+        assertNull(resource.getPhysicalId());
+        verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void instanceSubnetAndPrimaryInterfaceAreRejectedBeforeEc2Calls() throws Exception {
+        StackResource resource = resource("Server");
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(resource, props("""
+                {"ImageId":"ami-1","SubnetId":"subnet-1",
+                 "NetworkInterfaces":[{"DeviceIndex":0,"SubnetId":"subnet-1"}]}
+                """), ctx()));
+
+        assertEquals("InvalidParameterCombination", error.getErrorCode());
+        verifyNoInteractions(ec2);
+        assertTrue(resource.getAttributes().isEmpty());
+    }
 
     @Test
     void launchPublishesTheInstanceAttributes() throws Exception {
@@ -1309,6 +1494,7 @@ class Ec2InstanceCfnProvisionerTest {
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
         when(engine.omitNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", priorPhysicalId);
     }
 

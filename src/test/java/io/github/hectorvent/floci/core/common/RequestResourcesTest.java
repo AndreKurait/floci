@@ -31,6 +31,37 @@ class RequestResourcesTest {
     private static final String MACHINE = "arn:aws:states:us-east-1:000000000000:stateMachine:orders";
 
     @Test
+    void aConfigurationNamesTheCanonicalApplicationEnvironmentAndProfileTogether() {
+        StoredResourceArns stored = new StoredResourceArns() {
+            @Override
+            public String namespace() {
+                return "appconfig";
+            }
+
+            @Override
+            public Optional<String> find(String type, List<String> names, String region) {
+                throw new AssertionError("A compound identity must retain its variable names");
+            }
+
+            @Override
+            public Optional<String> findByVariables(String type, Map<String, String> variables, String region) {
+                assertEquals("configuration", type);
+                assertEquals("cn-north-1", region);
+                assertEquals(Map.of("ApplicationId", "orders", "EnvironmentId", "production",
+                        "ConfigurationProfileId", "settings"), variables);
+                return Optional.of("arn:aws-cn:appconfig:cn-north-1:111122223333:"
+                        + "application/app1234/environment/env1234/configuration/cfg1234");
+            }
+        };
+        assertEquals(List.of("arn:aws-cn:appconfig:cn-north-1:111122223333:"
+                        + "application/app1234/environment/env1234/configuration/cfg1234"),
+                RequestResources.of("appconfig:StartConfigurationSession", json("""
+                        {"ApplicationIdentifier":"orders","EnvironmentIdentifier":"production",
+                         "ConfigurationProfileIdentifier":"settings"}
+                        """), "aws-cn", "cn-north-1", "111122223333", stored));
+    }
+
+    @Test
     void listTablesCorrectionReadsTheCollectionAndLeavesOtherDynamoOperationsHandBuilt() {
         assertTrue(RequestResources.reads("dynamodb:ListTables"));
         assertFalse(RequestResources.reads("dynamodb:BatchWriteItem"));

@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.config.TlsConfigSource;
 import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import io.quarkus.runtime.Startup;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -22,6 +23,7 @@ import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.InetAddress;
 import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -144,7 +146,8 @@ public class EmbeddedDnsServer {
     public EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
                              Instance<DnsRecordSource> recordSources,
                              Instance<DnsForwardingRuleSource> forwardingRuleSources,
-                             Instance<DnsClientVpcSource> clientVpcSources) {
+                             Instance<DnsClientVpcSource> clientVpcSources,
+                             CurrentContainerNetworkResolver networkResolver) {
         this.recordSources = recordSources;
         this.forwardingRuleSources = forwardingRuleSources;
         this.clientVpcSources = clientVpcSources;
@@ -152,7 +155,7 @@ public class EmbeddedDnsServer {
             return;
         }
         try {
-            String myIp = InetAddress.getLocalHost().getHostAddress();
+            String myIp = resolveServerIp(config, networkResolver);
             upstreamDnsServers = composeUpstreams(readResolvConfNameservers(),
                     config.dns().containerFallbackServers());
 
@@ -177,6 +180,28 @@ public class EmbeddedDnsServer {
         }
     }
 
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        DnsAnswer resolved = null;
+        if (recordSources != null) {
+            for (DnsRecordSource source : recordSources) {
+                try {
+                    Optional<DnsAnswer> candidate = source.resolveAliasTarget(name, hostedZoneId, type);
+                    if (candidate.isPresent()) {
+                        if (resolved != null) {
+                            return Optional.of(DnsAnswer.refused());
+                        }
+                        resolved = candidate.orElseThrow();
+                    }
+                } catch (RuntimeException failure) {
+                    LOG.debugv("DNS alias source {0} failed to resolve {1}: {2}",
+                            source.getClass().getSimpleName(), name, failure.getMessage());
+                    return Optional.of(DnsAnswer.refused());
+                }
+            }
+        }
+        return Optional.ofNullable(resolved);
+    }
+
     public Optional<String> getServerIp() {
         return Optional.ofNullable(serverIp);
     }
@@ -190,6 +215,18 @@ public class EmbeddedDnsServer {
             serverIp = address;
             return bound;
         });
+    }
+
+    static String resolveServerIp(EmulatorConfig config, CurrentContainerNetworkResolver networkResolver)
+            throws UnknownHostException {
+        Optional<String> address = networkResolver.resolveContainerIp();
+        if (address.isPresent()) {
+            return address.get();
+        }
+        if (config.services().dockerNetwork().isPresent()) {
+            throw new IllegalStateException("Cannot resolve the configured services Docker network for DNS");
+        }
+        return InetAddress.getLocalHost().getHostAddress();
     }
 
     // ── packet handling ───────────────────────────────────────────────────────
