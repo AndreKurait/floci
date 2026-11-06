@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ec2;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -45,12 +46,19 @@ class Ec2DuplicateRouteTest {
     private static final String PREFIX_LIST = "pl-0dup0route0test0";
     private static final String INTERNET_GATEWAY = "igw-0dup0route0test0";
     private static final String OTHER_GATEWAY = "igw-0dup0route0othr0";
-    private static final String NAT_GATEWAY = "nat-0dup0route0test0";
 
     private static final String ROUTE_COUNT =
             "count(//*[local-name()='routeSet']/*[local-name()='item'])";
 
     private static String routeTableId;
+    private static NatGatewayFixture natGateway;
+
+    @AfterAll
+    static void retireNatGateway() {
+        if (natGateway != null) {
+            natGateway.close();
+        }
+    }
 
     private static RequestSpecification ec2() {
         return given().header("Authorization", AUTH_HEADER);
@@ -101,6 +109,7 @@ class Ec2DuplicateRouteTest {
         .then()
             .statusCode(200)
             .extract().path("CreateVpcResponse.vpc.vpcId");
+        natGateway = new NatGatewayFixture(AUTH_HEADER, vpcId, VPC_CIDR);
 
         routeTableId = ec2()
             .formParam("Action", "CreateRouteTable")
@@ -156,7 +165,7 @@ class Ec2DuplicateRouteTest {
                     .formParam("Action", "CreateRoute")
                     .formParam("RouteTableId", routeTableId)
                     .formParam("DestinationCidrBlock", IPV4_ROUTE)
-                    .formParam("NatGatewayId", NAT_GATEWAY),
+                    .formParam("NatGatewayId", natGateway.id()),
                 IPV4_ROUTE);
     }
 
@@ -260,7 +269,7 @@ class Ec2DuplicateRouteTest {
             .formParam("Action", "ReplaceRoute")
             .formParam("RouteTableId", routeTableId)
             .formParam("DestinationCidrBlock", VPC_CIDR)
-            .formParam("NatGatewayId", NAT_GATEWAY)
+            .formParam("NatGatewayId", natGateway.id())
         .when()
             .post("/")
         .then()
