@@ -156,6 +156,7 @@ floci:
       enabled: true
       timeout-sweep-enabled: true
       timeout-sweep-interval-seconds: 1
+      timeout-sweep-interval-millis: 0
 ```
 
 | Setting | Env var | Default | Description |
@@ -163,6 +164,12 @@ floci:
 | `enabled` | `FLOCI_SERVICES_SWF_ENABLED` | `true` | Enable the service |
 | `timeout-sweep-enabled` | `FLOCI_SERVICES_SWF_TIMEOUT_SWEEP_ENABLED` | `true` | Run the background timeout sweep |
 | `timeout-sweep-interval-seconds` | `FLOCI_SERVICES_SWF_TIMEOUT_SWEEP_INTERVAL_SECONDS` | `1` | Sweep interval |
+| `timeout-sweep-interval-millis` | `FLOCI_SERVICES_SWF_TIMEOUT_SWEEP_INTERVAL_MILLIS` | `0` | A positive value overrides the seconds interval; non-positive values keep it |
+
+For example, a `100` millisecond sweep observes expired timers and timeouts more
+frequently. It does not shorten activity, decision, workflow or timer deadlines.
+This setting does not change how workflow workers poll for tasks or how long a
+request may wait.
 
 ## Example
 
