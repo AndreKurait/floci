@@ -85,10 +85,16 @@ A deployment stored by an earlier Floci version returns no strategy settings fro
 `ListDeployments` reports the strategy's current settings while the strategy exists.
 A configuration profile created without `Type` reports no type, as AWS documents no default.
 
-Configuration content becomes available immediately. A positive `FinalBakeTimeInMinutes`
-keeps the deployment in `BAKING` at 100 percent until that time has elapsed; get and list
-readback then report `COMPLETE`. Started and completed timestamps use the API's ISO 8601
-format and survive restart. Gradual per-client rollout and alarm evaluation are not implemented.
+Deployment status follows the recorded strategy: `DEPLOYING` for its rollout duration,
+then `BAKING` at 100 percent for its final bake time, then `COMPLETE`. Get and list
+report linear or exponential growth in steps across the rollout. Completion timestamps
+include both durations, use the API's ISO 8601 format and survive restart, even after
+the strategy is changed or deleted. A zero-duration rollout starts baking immediately;
+zero rollout and bake durations complete immediately.
+
+Configuration content still becomes available immediately to every client. Gradual
+per-client delivery and alarm evaluation are not implemented; reported deployment
+progress does not yet control which clients receive the configuration.
 
 `StopDeployment` with `AllowRevert=true` returns an in-progress deployment as `ROLLED_BACK`
 or a completed deployment as `REVERTED`, restoring the previous available configuration
