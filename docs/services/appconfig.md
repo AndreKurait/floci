@@ -146,6 +146,11 @@ The data plane is used by applications to retrieve the active configuration for 
 - `StartConfigurationSession`
 - `GetLatestConfiguration`
 
+Missing applications, environments and profiles during session creation return HTTP 404 with
+the SDK-modeled `ResourceType` and `ReferencedBy` fields. Polling after the application or
+environment is deleted identifies the missing `Configuration` through `ConfigurationToken`,
+without consuming the token. Starting a new session identifies the specific missing resource.
+
 Basic `AWS.AppConfig.FeatureFlags` profiles are returned in AWS retrieval-time JSON format.
 
 Feature flags with variants are returned, as AWS does, in Amazon Ion (`application/ion; type=AWS.AppConfig.FeatureFlags`)
