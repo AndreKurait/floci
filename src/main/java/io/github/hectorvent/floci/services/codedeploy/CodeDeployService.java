@@ -742,9 +742,10 @@ public class CodeDeployService {
         AtomicBoolean stopFlag = new AtomicBoolean(false);
         stopFlags.put(deploymentId, stopFlag);
 
-        String finalEffectiveConfig = effectiveConfig;
+        String accountId = regionResolver.getAccountId();
         Thread.ofVirtual().name("codedeploy-" + deploymentId).start(
-                () -> runStateMachine(region, deployment, appSpec, lambdaTargetMap, stopFlag, finalEffectiveConfig));
+                () -> RequestScopes.runAs(accountId, region,
+                        () -> runStateMachine(region, deployment, appSpec, lambdaTargetMap, stopFlag, effectiveConfig)));
 
         return deploymentId;
     }
