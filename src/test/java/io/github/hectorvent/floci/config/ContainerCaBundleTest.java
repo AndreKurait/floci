@@ -60,6 +60,23 @@ class ContainerCaBundleTest {
     }
 
     @Test
+    void endpointTrustKeepsLocalCaWithoutAnActiveConfiguredCertificate() throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.tls().certPath()).thenReturn(Optional.of("unreadable.pem"));
+        when(config.tls().keyPath()).thenReturn(Optional.of("server.key"));
+        when(config.tls().enabled()).thenReturn(false);
+        assertEquals("local-ca", ContainerCaBundle.endpointTrustPem(config, "local-ca"));
+        when(config.tls().enabled()).thenReturn(true);
+        when(config.tls().keyPath()).thenReturn(Optional.of(" "));
+        assertEquals("local-ca", ContainerCaBundle.endpointTrustPem(config, "local-ca"));
+        when(config.tls().keyPath()).thenReturn(Optional.of("server.key"));
+        when(config.tls().certPath()).thenReturn(Optional.of(" "));
+        assertEquals("local-ca", ContainerCaBundle.endpointTrustPem(config, "local-ca"));
+        when(config.tls().certPath()).thenReturn(Optional.empty());
+        assertEquals("local-ca", ContainerCaBundle.endpointTrustPem(config, "local-ca"));
+    }
+
+    @Test
     void writeProducesTheSystemRootsFollowedByTheAnchor() throws Exception {
         Path tlsDir = tempDir.resolve("tls");
         FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(tlsDir);
