@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /** Builds only rules for an endpoint's private nftables table. Docker's tables are untouched. */
 public final class SecurityGroupNftCompiler {
@@ -96,6 +97,17 @@ public final class SecurityGroupNftCompiler {
     public static String compile(Endpoint target, Collection<Endpoint> peers,
                                   Map<String, List<String>> prefixLists, List<String> vpcResolvers,
                                   boolean isolatedAddressSpaces) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, peer -> true);
+    }
+
+    /**
+     * Compiles {@code target}'s policy, granting security-group accepts only to {@code admitted} peers.
+     * A managed peer that is not admitted keeps its drop rules, so the result never accepts more
+     * than the policy compiled with every peer admitted: it only withholds accepts toward peers.
+     */
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces, Predicate<Endpoint> admitted) {
         if (target == null || target.groups() == null || target.groups().isEmpty()) {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
@@ -161,7 +173,7 @@ public final class SecurityGroupNftCompiler {
                         continue;
                     }
                     for (Endpoint peer : managed) {
-                        if (target.sameVpc(peer)
+                        if (admitted.test(peer) && target.sameVpc(peer)
                                 && SecurityGroupPolicy.matchesPeer(group, permission, peer.peer(), prefixLists)) {
                             for (String address : peer.transportAddresses()) {
                                 appendRule(rules, chain, addressField, address, protocol);

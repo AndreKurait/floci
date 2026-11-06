@@ -119,9 +119,11 @@ public class LambdaVpcNetworkManager {
             if (control.isEmpty()) {
                 // Install the VPC DNS exception before resolving names inside this namespace.
                 // host.docker.internal is supplied by Docker here, not by the host JVM's resolver.
+                // Only this namespace's own policy is needed to resolve; the registration below
+                // waits for peers, so a launch burst refreshes them once instead of per launch.
                 firewall.register(new SecurityGroupNftCompiler.Endpoint(account, region, eni.getVpcId(), eniId,
                         eni.getPrivateIpAddress(), namespace.transportAddress(), Set.copyOf(groupIds), groups,
-                        List.of(), false, privateAddresses), namespace.helperId(), prefixLists);
+                        List.of(), false, privateAddresses), namespace.helperId(), prefixLists, false);
                 control = runtimeConnections(namespace.helperId(), runtimeHost, runtimePort);
             }
             firewall.register(new SecurityGroupNftCompiler.Endpoint(account, region, eni.getVpcId(), eniId,

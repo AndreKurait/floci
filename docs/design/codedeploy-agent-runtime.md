@@ -21,7 +21,11 @@ they must receive the command or encounter the normal agent-start deadline.
 `OneAtATime` sends work to one instance at a time, stops after an early failure,
 and permits the documented last-instance failure when preceding instances
 succeeded. `AllAtOnce` starts all selected hosts and requires at least one
-successful deployment. Half-at-a-time and custom health policies, target-group
+successful deployment. `HalfAtATime` takes up to half the selected instances
+offline concurrently, rounding down. Failed hosts consume that unavailable-host
+budget, so subsequent concurrency decreases after a failure. It stops when no
+further host can be taken offline, and requires all hosts to have been attempted
+with at least half succeeding, rounding up. Custom health policies, target-group
 traffic control, and blue/green Server deployments are rejected before queuing
 agent commands.
 Prior revision-health scheduling and Auto Scaling launch hooks are not

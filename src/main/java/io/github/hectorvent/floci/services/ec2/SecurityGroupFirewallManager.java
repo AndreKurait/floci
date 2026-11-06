@@ -36,6 +36,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -45,7 +46,10 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 /** Owns the protected namespace and the Floci-only nftables table for each managed ENI. */
 @ApplicationScoped
@@ -61,6 +65,18 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private final Map<String, Set<String>> pendingHelperCleanup = new HashMap<>();
     private final ConcurrentMap<String, DnsOrigin> dnsOrigins = new ConcurrentHashMap<>();
     private boolean peerPoliciesNeedRefresh;
+    /** What each admitted helper's nftables table currently enforces, recorded only after it installed. */
+    private final Map<String, Applied> applied = new HashMap<>();
+    /** Registrations that entered {@link #register} and have not installed their own policy yet. */
+    private final AtomicInteger arriving = new AtomicInteger();
+    private boolean peerRefreshScheduled;
+    private long peerRefreshFailures;
+    private RuntimeException lastPeerRefreshFailure;
+    private Arrival currentArrival;
+    /** A registration burst waits at most this long for its own policies before peers refresh. */
+    private static final long COALESCE_NANOS = TimeUnit.SECONDS.toNanos(2);
+    private static final long ADMISSION_TIMEOUT_NANOS = TimeUnit.MINUTES.toNanos(5);
+    private Executor peerRefresh = task -> Thread.ofVirtual().name("security-group-peer-refresh").start(task);
     @Inject
     Instance<VpcRoutingManager> vpcRouting;
     private final SweepWorker dnsOriginObserver = new SweepWorker(
@@ -288,9 +304,58 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 "/docker/network-helper.Dockerfile");
     }
 
-    /** Registers only after the default-deny table exists, before workload startup. */
-    public synchronized void register(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
-                                      Map<String, List<String>> prefixLists) {
+    /**
+     * Registers only after the default-deny table exists, before workload startup. Returns once the
+     * endpoint and every peer enforce their complete policies toward each other, as a full reconcile
+     * would leave them.
+     */
+    public void register(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
+                         Map<String, List<String>> prefixLists) {
+        register(endpoint, helperId, prefixLists, true);
+    }
+
+    /**
+     * {@link #register} that, with {@code awaitPeers} false, returns once the endpoint's own policy is
+     * installed. Peers learn the endpoint in one coalesced refresh per registration burst. Until a peer
+     * enforces the endpoint's identity, the endpoint's own policy withholds every accept toward that
+     * peer, so no pair is ever more permissive than its complete policies allow.
+     */
+    public void register(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
+                         Map<String, List<String>> prefixLists, boolean awaitPeers) {
+        Arrival arrival = new Arrival();
+        arriving.incrementAndGet();
+        try {
+            registerQueued(endpoint, helperId, prefixLists, awaitPeers, arrival);
+        } finally {
+            arrived(arrival);
+            clearArrival(arrival);
+        }
+    }
+
+    private synchronized void clearArrival(Arrival arrival) {
+        if (currentArrival == arrival) {
+            currentArrival = null;
+        }
+    }
+
+    /** One registration's place in {@link #arriving}; it leaves exactly once. */
+    private static final class Arrival {
+        private boolean left;
+    }
+
+    private synchronized void arrived(Arrival arrival) {
+        if (arrival != null && !arrival.left) {
+            arrival.left = true;
+            arriving.decrementAndGet();
+            notifyAll();
+        }
+    }
+
+    private synchronized void registerQueued(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
+                                             Map<String, List<String>> prefixLists, boolean awaitPeers,
+                                             Arrival arrival) {
+        // The monitor is held from here until admit() has installed this endpoint's own policy.
+        currentArrival = arrival;
         List<String> addresses = endpoint.transportAddresses();
         if (endpoints.values().stream().map(ProtectedEndpoint::endpoint)
                 .anyMatch(existing -> !existing.eniId().equals(endpoint.eniId())
@@ -311,13 +376,13 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             addresses = List.of(endpoint.transportAddress());
         }
-        ProtectedEndpoint previous = endpoints.put(endpoint.eniId(),
-                new ProtectedEndpoint(endpoint, helperId, Map.copyOf(prefixLists),
-                        new DnsOrigin(endpoint.eniId(), helperId,
-                                new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()),
-                                addresses, nativeNetwork)));
+        ProtectedEndpoint registered = new ProtectedEndpoint(endpoint, helperId, Map.copyOf(prefixLists),
+                new DnsOrigin(endpoint.eniId(), helperId,
+                        new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()),
+                        addresses, nativeNetwork));
+        ProtectedEndpoint previous = endpoints.put(endpoint.eniId(), registered);
         try {
-            reconcileAll();
+            admit(endpoint.eniId(), awaitPeers);
             if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
                 vpcRouting.get().register(endpoint, helperId, vpcResolvers());
             }
@@ -331,13 +396,98 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 pendingHelperCleanup.values().removeIf(Set::isEmpty);
             }
         } catch (RuntimeException e) {
-            if (previous == null) {
-                endpoints.remove(endpoint.eniId());
-            } else {
-                endpoints.put(endpoint.eniId(), previous);
+            // Revert only this registration: a concurrent one for the same ENI may have replaced it.
+            if (endpoints.get(endpoint.eniId()) == registered) {
+                if (previous == null) {
+                    endpoints.remove(endpoint.eniId());
+                    applied.remove(endpoint.eniId());
+                } else {
+                    endpoints.put(endpoint.eniId(), previous);
+                }
             }
             quarantine(helperId);
+            // Peers may still enforce rules for the reverted identity, and a restored previous
+            // registration on this helper was just flushed: converge them again.
+            schedulePeerRefresh();
             throw e;
+        }
+    }
+
+    /**
+     * Installs the registered endpoint's own policy, then (with {@code awaitPeers}) waits for the
+     * coalesced peer refresh to leave the endpoint and its peers with their complete policies.
+     */
+    void admit(String eniId, boolean awaitPeers) {
+        ProtectedEndpoint target = endpoints.get(eniId);
+        install(target, peerEndpoints(), vpcResolvers(), false);
+        Arrival arrival = currentArrival;
+        currentArrival = null;
+        arrived(arrival);
+        if (!awaitPeers) {
+            schedulePeerRefresh();
+            return;
+        }
+        long failures = peerRefreshFailures;
+        long deadline = System.nanoTime() + ADMISSION_TIMEOUT_NANOS;
+        while (true) {
+            ProtectedEndpoint current = endpoints.get(eniId);
+            if (current == null || !current.helperId().equals(target.helperId())) {
+                throw new IllegalStateException("Protected endpoint " + eniId + " was retired before admission");
+            }
+            if (complete(current)) {
+                return;
+            }
+            if (peerRefreshFailures != failures) {
+                throw new IllegalStateException("Peer security-group policies could not be refreshed",
+                        lastPeerRefreshFailure);
+            }
+            schedulePeerRefresh();
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                throw new IllegalStateException("Protected endpoint " + eniId + " was not admitted by its peers");
+            }
+            try {
+                TimeUnit.NANOSECONDS.timedWait(this, remaining);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted awaiting peer security-group policies", e);
+            }
+        }
+    }
+
+    private void schedulePeerRefresh() {
+        if (!peerRefreshScheduled) {
+            peerRefreshScheduled = true;
+            try {
+                peerRefresh.execute(this::refreshPeers);
+            } catch (RuntimeException e) {
+                peerRefreshScheduled = false;
+                throw e;
+            }
+        }
+    }
+
+    /** One coalesced pass: lets queued registrations install their own policies first (bounded). */
+    synchronized void refreshPeers() {
+        long deadline = System.nanoTime() + COALESCE_NANOS;
+        try {
+            long remaining;
+            while (arriving.get() > 0 && (remaining = deadline - System.nanoTime()) > 0) {
+                TimeUnit.NANOSECONDS.timedWait(this, remaining);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        peerRefreshScheduled = false;
+        try {
+            retireStoppedHelpers();
+            converge(false);
+        } catch (RuntimeException e) {
+            peerRefreshFailures++;
+            lastPeerRefreshFailure = e;
+            LOG.errorv(e, "Could not refresh peer security-group policies");
+        } finally {
+            notifyAll();
         }
     }
 
@@ -370,6 +520,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             vpcRouting.get().unregister(eniId);
         }
         ProtectedEndpoint removed = endpoints.remove(eniId);
+        applied.remove(eniId);
         if (removed != null) {
             removeDnsOrigin(removed);
             pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(removed.helperId());
@@ -412,6 +563,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     public synchronized void reconcileAll() {
+        retireStoppedHelpers();
+        converge(true);
+    }
+
+    private void retireStoppedHelpers() {
         for (Map.Entry<String, ProtectedEndpoint> entry : new ArrayList<>(endpoints.entrySet())) {
             boolean running;
             try {
@@ -429,20 +585,112 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 quarantine(entry.getValue().helperId());
             }
         }
-        List<SecurityGroupNftCompiler.Endpoint> peers = endpoints.values().stream()
-                .map(ProtectedEndpoint::endpoint).toList();
+    }
+
+    /**
+     * Brings every endpoint to its complete policy. Each install admits only peers that already
+     * enforce the target's current identity, so the order of installs never opens a pair wider than
+     * its complete policies. Endpoints whose identity peers do not know yet install first, withdrawing
+     * their own accepts before peers learn them. {@code force} re-installs unchanged policies too.
+     */
+    private void converge(boolean force) {
         List<String> vpcResolvers = vpcResolvers();
-        for (ProtectedEndpoint protectedEndpoint : new ArrayList<>(endpoints.values())) {
-            try {
-                String rules = SecurityGroupNftCompiler.compile(protectedEndpoint.endpoint(), peers,
-                        protectedEndpoint.prefixLists(), vpcResolvers, isolatedAddressSpaces());
-                apply(protectedEndpoint.helperId(), rules);
-            } catch (RuntimeException e) {
-                endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
-                throw e;
+        try {
+            for (int round = 0; round < 3; round++) {
+                List<SecurityGroupNftCompiler.Endpoint> peers = peerEndpoints();
+                List<ProtectedEndpoint> order = new ArrayList<>(endpoints.values());
+                order.sort(Comparator.comparing((ProtectedEndpoint target) -> knownByAllPeers(target))
+                        .thenComparing(target -> target.endpoint().eniId()));
+                boolean changed = false;
+                for (ProtectedEndpoint target : order) {
+                    changed |= install(target, peers, vpcResolvers, force && round == 0);
+                }
+                if (!changed && endpoints.values().stream().allMatch(this::complete)) {
+                    return;
+                }
             }
+            throw new IllegalStateException("Security-group policies did not converge");
+        } catch (RuntimeException e) {
+            endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
+            throw e;
         }
     }
+
+    /** Every registered endpoint in ENI order, so a policy's text depends only on its inputs. */
+    private List<SecurityGroupNftCompiler.Endpoint> peerEndpoints() {
+        return endpoints.values().stream().map(ProtectedEndpoint::endpoint)
+                .sorted(Comparator.comparing(SecurityGroupNftCompiler.Endpoint::eniId)).toList();
+    }
+
+    /** Installs {@code target}'s policy toward the peers that enforce its identity; true when Docker ran. */
+    private boolean install(ProtectedEndpoint target, List<SecurityGroupNftCompiler.Endpoint> peers,
+                            List<String> vpcResolvers, boolean force) {
+        String eniId = target.endpoint().eniId();
+        Set<String> admitted = endpoints.values().stream()
+                .filter(peer -> peer != target && knows(peer, target))
+                .map(peer -> peer.endpoint().eniId())
+                .collect(Collectors.toSet());
+        String rules = SecurityGroupNftCompiler.compile(target.endpoint(), peers, target.prefixLists(),
+                vpcResolvers, isolatedAddressSpaces(), peer -> admitted.contains(peer.eniId()));
+        Map<String, PeerView> known = endpoints.values().stream()
+                .filter(peer -> !peer.endpoint().eniId().equals(eniId))
+                .collect(Collectors.toMap(peer -> peer.endpoint().eniId(), PeerView::of));
+        Applied current = applied.get(eniId);
+        boolean unchanged = current != null && current.helperId().equals(target.helperId())
+                && current.rules().equals(rules);
+        if (!unchanged || force) {
+            applied.remove(eniId);
+            apply(target.helperId(), rules);
+        }
+        applied.put(eniId, new Applied(target.helperId(), rules, Map.copyOf(known), Set.copyOf(admitted)));
+        return !unchanged || force;
+    }
+
+    /** Whether {@code holder}'s installed table enforces {@code subject}'s current identity. */
+    private boolean knows(ProtectedEndpoint holder, ProtectedEndpoint subject) {
+        Applied state = applied.get(holder.endpoint().eniId());
+        return state != null && state.helperId().equals(holder.helperId())
+                && PeerView.of(subject).equals(state.known().get(subject.endpoint().eniId()));
+    }
+
+    private boolean knownByAllPeers(ProtectedEndpoint target) {
+        return endpoints.values().stream()
+                .filter(peer -> peer != target)
+                .allMatch(peer -> knows(peer, target));
+    }
+
+    /** The endpoint and every peer enforce their complete policies toward each other. */
+    private boolean complete(ProtectedEndpoint target) {
+        Applied state = applied.get(target.endpoint().eniId());
+        if (state == null || !state.helperId().equals(target.helperId())) {
+            return false;
+        }
+        for (ProtectedEndpoint peer : endpoints.values()) {
+            if (peer == target) {
+                continue;
+            }
+            Applied peerState = applied.get(peer.endpoint().eniId());
+            if (!knows(target, peer) || !state.admitted().contains(peer.endpoint().eniId())
+                    || !knows(peer, target) || peerState == null
+                    || !peerState.admitted().contains(target.endpoint().eniId())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The parts of an endpoint's identity that its peers' compiled policies depend on. */
+    private record PeerView(String helperId, String accountId, String region, String vpcId,
+                            String transportAddress, List<String> transportAddresses,
+                            SecurityGroupPolicy.Peer peer) {
+        static PeerView of(ProtectedEndpoint endpoint) {
+            SecurityGroupNftCompiler.Endpoint identity = endpoint.endpoint();
+            return new PeerView(endpoint.helperId(), identity.accountId(), identity.region(), identity.vpcId(),
+                    identity.transportAddress(), identity.transportAddresses(), identity.peer());
+        }
+    }
+
+    private record Applied(String helperId, String rules, Map<String, PeerView> known, Set<String> admitted) {}
 
     private record DnsOrigin(String eniId, String helperId, ClientVpc vpc, List<String> transportAddresses,
                              String nativeNetwork) {}
@@ -484,6 +732,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     private void quarantine(String helperId) {
+        applied.values().removeIf(state -> state.helperId().equals(helperId));
         try {
             apply(helperId, "flush chain inet floci_sg ingress\nflush chain inet floci_sg egress\n");
         } catch (Exception e) {

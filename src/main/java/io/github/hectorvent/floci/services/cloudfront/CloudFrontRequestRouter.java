@@ -106,6 +106,19 @@ public final class CloudFrontRequestRouter {
         return dflt != null ? dflt.getTargetOriginId() : null;
     }
 
+    public static String matchViewerProtocolPolicy(DistributionConfig config, String normalizedPath) {
+        List<CacheBehavior> behaviors = config.getCacheBehaviors();
+        if (behaviors != null) {
+            for (CacheBehavior behavior : behaviors) {
+                if (pathPatternMatches(behavior.getPathPattern(), normalizedPath)) {
+                    return behavior.getViewerProtocolPolicy();
+                }
+            }
+        }
+        DefaultCacheBehavior dflt = config.getDefaultCacheBehavior();
+        return dflt != null ? dflt.getViewerProtocolPolicy() : null;
+    }
+
     /**
      * Returns the {@code ResponseHeadersPolicyId} of the cache behavior that serves a normalized path,
      * evaluating ordered behaviors first (first match wins) and the default behavior last, or

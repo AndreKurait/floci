@@ -12,8 +12,10 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * Builds a Floci-recipe helper image for the workload daemon's platform when needed,
@@ -35,7 +37,8 @@ public final class LocallyBuiltHelperImage {
      * @param defaultImage the caller's own built-in default; a caller pointed anywhere else is
      *        responsible for that image being pullable, so nothing is built for it here
      * @param dockerfileResourcePath classpath location of the Dockerfile to build, e.g.
-     *        {@code "/docker/network-helper.Dockerfile"}
+     *        {@code "/docker/network-helper.Dockerfile"}. An optional sibling {@code .files}
+     *        manifest lists additional files from the same directory.
      */
     public static synchronized void ensureBuilt(DockerClient dockerClient, ContainerBuilder containerBuilder,
                                                 String configuredImage, String defaultImage,
@@ -50,7 +53,8 @@ public final class LocallyBuiltHelperImage {
                 throw new IllegalStateException("Floci helper Dockerfile is missing: " + dockerfileResourcePath);
             }
             byte[] content = dockerfile.readAllBytes();
-            String recipe = Digests.sha256Hex(content);
+            Map<String, byte[]> context = buildContext(dockerfileResourcePath, content);
+            String recipe = recipe(context);
             try {
                 InspectImageResponse cached = dockerClient.inspectImageCmd(image).exec();
                 if (DockerPlatform.matches(cached, platform) && cached.getConfig() != null
@@ -63,11 +67,13 @@ public final class LocallyBuiltHelperImage {
             }
             ByteArrayOutputStream archive = new ByteArrayOutputStream(content.length + 1024);
             try (TarArchiveOutputStream tar = new TarArchiveOutputStream(archive)) {
-                TarArchiveEntry entry = new TarArchiveEntry("Dockerfile");
-                entry.setSize(content.length);
-                tar.putArchiveEntry(entry);
-                tar.write(content);
-                tar.closeArchiveEntry();
+                for (Map.Entry<String, byte[]> file : context.entrySet()) {
+                    TarArchiveEntry entry = new TarArchiveEntry(file.getKey());
+                    entry.setSize(file.getValue().length);
+                    tar.putArchiveEntry(entry);
+                    tar.write(file.getValue());
+                    tar.closeArchiveEntry();
+                }
             }
             try (BuildImageResultCallback callback = new BuildImageResultCallback()) {
                 String built = dockerClient.buildImageCmd(new ByteArrayInputStream(archive.toByteArray()))
@@ -80,5 +86,42 @@ public final class LocallyBuiltHelperImage {
         } catch (IOException e) {
             throw new IllegalStateException("Cannot build the Floci helper image: " + image, e);
         }
+    }
+
+    static Map<String, byte[]> buildContext(String dockerfile, byte[] content) throws IOException {
+        Map<String, byte[]> context = new TreeMap<>();
+        context.put("Dockerfile", content);
+        try (InputStream manifest = LocallyBuiltHelperImage.class.getResourceAsStream(dockerfile + ".files")) {
+            if (manifest == null) {
+                return context;
+            }
+            String directory = dockerfile.substring(0, dockerfile.lastIndexOf('/') + 1);
+            for (String line : new String(manifest.readAllBytes(), StandardCharsets.UTF_8).split("\\R")) {
+                String name = line.strip();
+                if (name.isEmpty()) {
+                    continue;
+                }
+                if (!name.matches("[A-Za-z0-9][A-Za-z0-9._-]*") || context.containsKey(name)) {
+                    throw new IOException("Invalid helper build-context filename: " + name);
+                }
+                try (InputStream file = LocallyBuiltHelperImage.class.getResourceAsStream(directory + name)) {
+                    if (file == null) {
+                        throw new IOException("Missing helper build-context file: " + directory + name);
+                    }
+                    context.put(name, file.readAllBytes());
+                }
+            }
+        }
+        return context;
+    }
+
+    static String recipe(Map<String, byte[]> context) {
+        if (context.size() == 1) {
+            return Digests.sha256Hex(context.get("Dockerfile"));
+        }
+        StringBuilder manifest = new StringBuilder();
+        new TreeMap<>(context).forEach((name, content) ->
+                manifest.append(name).append('\0').append(Digests.sha256Hex(content)).append('\n'));
+        return Digests.sha256Hex(manifest.toString().getBytes(StandardCharsets.UTF_8));
     }
 }

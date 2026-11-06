@@ -260,6 +260,53 @@ class AppConfigCfnProvisionerTest {
     }
 
     @Test
+    void profileCreationStoresMalformedSchemaUntilContentValidation() {
+        String app = create(APPLICATION, props("Name", "deferred-validation")).getPhysicalId();
+        for (String declaration : List.of("{", "{\"type\":\"not-a-json-type\"}")) {
+            StackResource resource = create(PROFILE, props("ApplicationId", app, "Name", "settings",
+                    "LocationUri", "hosted", "Validators",
+                    List.of(Map.of("Type", "JSON_SCHEMA", "Content", declaration))));
+            String id = resource.getPhysicalId();
+            assertEquals(declaration, service.getConfigurationProfile(app, id).getValidators().getFirst().content());
+            service.createHostedConfigurationVersion(app, id, new byte[]{'1'}, "application/json", null);
+            assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        }
+    }
+
+    @Test
+    void profileValidatorsChangeInPlaceAndRollbackRestoresEnforcement() {
+        String app = create(APPLICATION, props("Name", "validated")).getPhysicalId();
+        List<Map<String, String>> original = List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"integer\"}"));
+        Map<String, Object> properties = props("ApplicationId", app, "Name", "settings",
+                "LocationUri", "hosted", "Validators", original);
+        StackResource resource = create(PROFILE, properties);
+        String id = resource.getPhysicalId();
+        service.createHostedConfigurationVersion(app, id, new byte[]{'1'}, "application/json", null);
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+
+        properties.put("Validators", List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"string\"}")));
+        update(resource, properties);
+        assertEquals(id, resource.getPhysicalId());
+        assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+
+        properties.put("Validators", List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"unknown\"}")));
+        update(resource, properties);
+        assertEquals("{\"type\":\"unknown\"}",
+                service.getConfigurationProfile(app, id).getValidators().getFirst().content());
+        assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+        properties.remove("Validators");
+        update(resource, properties);
+        assertNull(service.getConfigurationProfile(app, id).getValidators());
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertEquals("{\"type\":\"integer\"}",
+                service.getConfigurationProfile(app, id).getValidators().getFirst().content());
+    }
+
+    @Test
     void movingAnEnvironmentToAnotherApplicationReplacesItAndTheCommittedUpdateDeletesTheOldOne() {
         String first = create(APPLICATION, props("Name", "orders")).getPhysicalId();
         String second = create(APPLICATION, props("Name", "billing")).getPhysicalId();

@@ -121,7 +121,7 @@ class AutoScalingStandbyIntegrationTest {
         }
     }
 
-    private static void deleteOwned(Runnable delete, String missingMessage) {
+    static void deleteOwned(Runnable delete, String missingMessage) {
         try {
             delete.run();
         } catch (AutoScalingException expected) {

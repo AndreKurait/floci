@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudfront;
 
 import io.github.hectorvent.floci.core.common.RequestHost;
 import io.github.hectorvent.floci.core.common.RequestUriRewrite;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontService.ViewerHostMatch;
 import io.github.hectorvent.floci.services.cloudfront.model.Distribution;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.inject.Instance;
@@ -61,7 +62,12 @@ public class CloudFrontDistributionFilter implements ContainerRequestFilter {
             return;
         }
 
-        Distribution dist = cloudFront.findByHost(host);
+        ViewerHostMatch match = cloudFront.matchViewerHost(host);
+        if (match.ambiguous()) {
+            requestContext.abortWith(Response.status(404).build());
+            return;
+        }
+        Distribution dist = match.distribution();
         if (dist == null) {
             return;
         }

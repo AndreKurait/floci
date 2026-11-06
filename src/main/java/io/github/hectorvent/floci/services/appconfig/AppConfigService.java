@@ -318,6 +318,7 @@ public class AppConfigService {
         }
         profile.setRetrievalRoleArn((String) role);
         AppConfigS3Source.validateProfile(profile);
+        profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
         profileStore.put(profile.getId(), profile);
         return profile;
     }
@@ -356,21 +357,70 @@ public class AppConfigService {
         return profileStore.get(profileId);
     }
 
-    /**
-     * Replaces mutable profile fields from a CloudFormation template, validating before storage.
-     */
-    public synchronized ConfigurationProfile updateConfigurationProfile(String applicationId, String profileId,
-                                                                        String name, String description,
-                                                                        String retrievalRoleArn) {
-        ConfigurationProfile profile = copy(profileStore.get(profileId)
-                .filter(p -> applicationId.equals(p.getApplicationId()))
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Configuration profile not found", 404)));
-        profile.setName(name);
-        profile.setDescription(description);
-        profile.setRetrievalRoleArn(retrievalRoleArn);
+    /** Applies only supplied fields, validating the complete profile before storage. */
+    public synchronized ConfigurationProfile updateConfigurationProfile(String applicationIdentifier,
+                                                                        String profileIdentifier,
+                                                                        Map<String, Object> request) {
+        String appId = resolveApplication(applicationIdentifier).getId();
+        ConfigurationProfile profile = copy(resolveConfigurationProfile(appId, profileIdentifier));
+        if (request.containsKey("Name")) {
+            profile.setName(profileText(request, "Name", 1, 128, false));
+        }
+        if (request.containsKey("Description")) {
+            profile.setDescription(profileText(request, "Description", 0, 1024, true));
+        }
+        if (request.containsKey("RetrievalRoleArn")) {
+            profile.setRetrievalRoleArn(profileText(request, "RetrievalRoleArn", 1, 2048, true));
+        }
+        if (request.containsKey("Validators")) {
+            profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
+        }
+        if (request.get("KmsKeyIdentifier") != null) {
+            throw new AwsException("BadRequestException", "KmsKeyIdentifier is not currently supported.", 400);
+        }
         AppConfigS3Source.validateProfile(profile);
         profileStore.put(profile.getId(), profile);
         return profile;
+    }
+
+    private static String profileText(Map<String, Object> request, String field, int minimum,
+                                      int maximum, boolean nullable) {
+        Object value = request.get(field);
+        if (value == null && nullable) {
+            return null;
+        }
+        if (!(value instanceof String text) || text.length() < minimum || text.length() > maximum) {
+            throw new AwsException("BadRequestException",
+                    field + " must be a string of " + minimum + " to " + maximum + " characters.", 400);
+        }
+        return text;
+    }
+
+    public synchronized void validateConfiguration(String applicationIdentifier, String profileIdentifier,
+                                                    String version) {
+        String appId = resolveApplication(applicationIdentifier).getId();
+        ConfigurationProfile profile = resolveConfigurationProfile(appId, profileIdentifier);
+        ConfigurationContent source = AppConfigS3Source.matches(profile) ? s3Source.retrieve(profile, version) : null;
+        AppConfigValidators.validate(profile.getValidators(), validationContent(profile, version, source));
+    }
+
+    private byte[] validationContent(ConfigurationProfile profile, String version, ConfigurationContent source) {
+        if (version == null || version.isEmpty() || version.length() > 1024) {
+            throw new AwsException("BadRequestException", "ConfigurationVersion must contain 1 to 1024 characters.", 400);
+        }
+        if (source != null) {
+            return source.content();
+        }
+        if ("hosted".equals(profile.getLocationUri())) {
+            int number;
+            try {
+                number = Integer.parseInt(version);
+            } catch (NumberFormatException e) {
+                throw new AwsException("BadRequestException", "Hosted ConfigurationVersion must be a version number.", 400);
+            }
+            return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), number).getContent();
+        }
+        throw new AwsException("BadRequestException", "This configuration source cannot currently be validated.", 400);
     }
 
     public synchronized void deleteConfigurationProfile(String applicationIdentifier, String profileIdentifier) {
@@ -636,6 +686,9 @@ public class AppConfigService {
         alarms.rollbackCause(environment.getMonitors());
         ConfigurationContent sourceContent = AppConfigS3Source.matches(profile)
                 ? Objects.requireNonNull(s3Source.retrieve(profile, version)) : null;
+        if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
+            AppConfigValidators.validate(profile.getValidators(), validationContent(profile, version, sourceContent));
+        }
 
         Deployment deployment = new Deployment();
         deployment.setApplicationId(appId);

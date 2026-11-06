@@ -48,6 +48,7 @@ public class CodeDeployAgentDeployment {
             "ApplicationStop", "DownloadBundle", "BeforeInstall", "Install", "AfterInstall",
             "ApplicationStart", "ValidateService", "BeforeAllowTraffic", "AllowTraffic", "AfterAllowTraffic");
     private static final String ONE_AT_A_TIME = "CodeDeployDefault.OneAtATime";
+    private static final String HALF_AT_A_TIME = "CodeDeployDefault.HalfAtATime";
     private static final String ALL_AT_ONCE = "CodeDeployDefault.AllAtOnce";
     private static final List<String> DIAGNOSTIC_CODES = List.of("Success", "ScriptMissing",
             "ScriptNotExecutable", "ScriptTimedOut", "ScriptFailed", "UnknownError");
@@ -94,8 +95,8 @@ public class CodeDeployAgentDeployment {
                     "fileExistsBehavior must be DISALLOW, OVERWRITE or RETAIN", 400);
         }
         String effectiveConfig = config == null ? ONE_AT_A_TIME : config;
-        if (!Set.of(ONE_AT_A_TIME, ALL_AT_ONCE).contains(effectiveConfig)) {
-            throw unsupported("S3 agent deployments currently support OneAtATime and AllAtOnce");
+        if (!Set.of(ONE_AT_A_TIME, HALF_AT_A_TIME, ALL_AT_ONCE).contains(effectiveConfig)) {
+            throw unsupported("S3 agent deployments require a predefined Server deployment configuration");
         }
         Map<String, Object> style = group.getDeploymentStyle();
         Object option = style == null ? "WITHOUT_TRAFFIC_CONTROL"
@@ -236,25 +237,36 @@ public class CodeDeployAgentDeployment {
             deployment.setStartTime(now());
             deployment.setStatus("InProgress");
             int succeeded = 0;
-            if (ALL_AT_ONCE.equals(prepared.config())) {
-                for (Map<String, Object> target : targets) {
-                    CompletableFuture<Boolean> result = new CompletableFuture<>();
-                    workers.add(result);
-                    Thread.ofVirtual().name("codedeploy-agent-" + target.get("targetId")).start(() -> {
-                        try {
-                            result.complete(runHost(prepared, session, target, cancelled));
-                        } catch (Throwable failure) {
-                            result.completeExceptionally(failure);
-                        }
-                    });
-                }
-                List<CompletableFuture<Boolean>> pending = new ArrayList<>(workers);
-                while (!pending.isEmpty()) {
+            if (!ONE_AT_A_TIME.equals(prepared.config())) {
+                int unavailableLimit = HALF_AT_A_TIME.equals(prepared.config()) ? targets.size() / 2 : targets.size();
+                int next = 0;
+                int failed = 0;
+                List<CompletableFuture<Boolean>> pending = new ArrayList<>();
+                while (next < targets.size() || !pending.isEmpty()) {
+                    while (next < targets.size() && pending.size() < unavailableLimit - failed
+                            && !cancelled.getAsBoolean()) {
+                        Map<String, Object> target = targets.get(next++);
+                        CompletableFuture<Boolean> result = new CompletableFuture<>();
+                        workers.add(result);
+                        pending.add(result);
+                        Thread.ofVirtual().name("codedeploy-agent-" + target.get("targetId")).start(() -> {
+                            try {
+                                result.complete(runHost(prepared, session, target, cancelled));
+                            } catch (Throwable failure) {
+                                result.completeExceptionally(failure);
+                            }
+                        });
+                    }
+                    if (pending.isEmpty()) {
+                        break;
+                    }
                     CompletableFuture.anyOf(pending.toArray(CompletableFuture[]::new)).get();
                     for (CompletableFuture<Boolean> worker : List.copyOf(pending)) {
                         if (worker.isDone()) {
                             if (worker.get()) {
                                 succeeded++;
+                            } else {
+                                failed++;
                             }
                             pending.remove(worker);
                         }
@@ -271,7 +283,11 @@ public class CodeDeployAgentDeployment {
             if (stop.get()) {
                 outcome = new Outcome("Stopped", null, null);
             } else {
-                int required = ALL_AT_ONCE.equals(prepared.config()) ? 1 : Math.max(1, targets.size() - 1);
+                int required = switch (prepared.config()) {
+                    case ALL_AT_ONCE -> 1;
+                    case HALF_AT_A_TIME -> Math.max(1, targets.size() - targets.size() / 2);
+                    default -> Math.max(1, targets.size() - 1);
+                };
                 boolean complete = succeeded >= required
                         && targets.stream().noneMatch(target -> "Pending".equals(target.get("status")));
                 outcome = new Outcome(complete ? "Succeeded" : "Failed",

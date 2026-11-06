@@ -43,6 +43,8 @@ It returns only the deployed version, its content type and `Configuration-Versio
 - `DeleteEnvironment`
 - `CreateConfigurationProfile`
 - `GetConfigurationProfile`
+- `UpdateConfigurationProfile`
+- `ValidateConfiguration`
 - `ListConfigurationProfiles`
 - `DeleteConfigurationProfile`
 - `CreateHostedConfigurationVersion`
@@ -81,7 +83,22 @@ Cross-account buckets require `FLOCI_SERVICES_S3_GLOBAL_BUCKET_NAMESPACE=true`.
 Missing versions, denied retrievals, unsupported storage classes and objects larger than 1 MB are rejected.
 The admitted bytes persist with the profile, so readers and rollback keep working after the source is
 deleted or retrieval permission changes. S3 configurations deployed before this support must be redeployed.
-SSE-S3 is supported. SSE-KMS, SSE-C, mutable `null` object versions and profile validators are not supported.
+SSE-S3 is supported. SSE-KMS, SSE-C and mutable `null` object versions are not supported.
+
+Profiles retain up to two `Validators`. Inline `JSON_SCHEMA` validators use draft-04 for free form
+configuration, including local references, required fields, types, ranges and pattern properties.
+Profile creation and update retain declarations after checking their shape, type and size. Schema
+compilation is deferred until content validation, so malformed schemas can be stored but cannot
+validate or deploy configuration. `StartDeployment`
+validates the retrieved hosted or S3 version before creating a deployment or changing active content.
+`ValidateConfiguration` performs the same validation without deploying and returns HTTP 204.
+
+`UpdateConfigurationProfile` changes only supplied fields. An empty `Validators` list clears validation;
+a schema update does not change already deployed bytes. CloudFormation updates replace mutable fields,
+clear validators omitted from the template, and restore the prior schema on rollback. Stored validators
+survive restart. External schema references and other inline schema drafts are refused. Lambda validator
+declarations are retained, but validation and deployment requiring them fail explicitly because invoking
+Lambda validators is not implemented. `UpdateConfigurationProfile` rejects `KmsKeyIdentifier`.
 
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
@@ -205,7 +222,7 @@ Alarm-triggered rollback fails an in-progress stack deployment and restores the 
 configuration. This lifecycle does not add gradual per-client content delivery.
 
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
-description of an application, environment or configuration profile, a profile's `RetrievalRoleArn`,
+description of an application, environment or configuration profile, a profile's `RetrievalRoleArn` and `Validators`,
 an environment's `Monitors`, an application's
 `Tags`, and a deployment strategy's description, duration, final bake time, growth factor and growth type. A property
 the template drops is cleared, or set back to its default (`FinalBakeTimeInMinutes` 0, `GrowthType` `LINEAR`). A
@@ -216,7 +233,7 @@ place and deletes what it created.
 
 Deleting an environment deletes its deployments, and deleting a configuration profile deletes its hosted configuration
 versions and admitted S3 content. Floci keeps tags on applications only, so `Tags` on the other three types are accepted
-and not stored, as `TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier` and `Validators`,
+and not stored, as `TagResource` treats them; so is a configuration profile's `KmsKeyIdentifier`,
 and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
 `AWS::AppConfig::Extension` and `ExtensionAssociation` are not provisioned.
 
