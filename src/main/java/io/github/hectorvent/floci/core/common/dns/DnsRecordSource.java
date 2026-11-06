@@ -13,6 +13,11 @@ import java.util.Optional;
  */
 public interface DnsRecordSource {
 
+    /** Resolve an alias only when a native resource owns its DNS name and hosted-zone identity. */
+    default Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        return Optional.empty();
+    }
+
     /** Stored public authority data only; this lookup must not perform recursive resolution. */
     default Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
         return Optional.empty();
