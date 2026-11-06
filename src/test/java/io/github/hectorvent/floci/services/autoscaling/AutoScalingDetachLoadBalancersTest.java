@@ -22,7 +22,7 @@ class AutoScalingDetachLoadBalancersTest {
     private static final String REGION = "us-east-1";
     private final ElbV2Service targets = mock(ElbV2Service.class);
     private final ElbClassicService classic = mock(ElbClassicService.class);
-    private final AutoScalingService service = new AutoScalingService(targets, classic);
+    private final AutoScalingService service = new AutoScalingService(targets, classic, null);
     private final AutoScalingGroup group = new AutoScalingGroup();
     private final AsgInstance owned = member("i-owned");
     private final AsgInstance retained = member("i-retained");

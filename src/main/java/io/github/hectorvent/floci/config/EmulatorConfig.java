@@ -1299,6 +1299,11 @@ public interface EmulatorConfig {
     interface AutoScalingServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        Optional<List<String>> multipleCapacityReservationScopes();
+
+        @WithDefault("1")
+        int maxCapacityReservationIds();
     }
 
     interface ApplicationAutoScalingServiceConfig {
