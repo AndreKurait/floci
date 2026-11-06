@@ -211,7 +211,6 @@ AWS::EC2::Instance	PlacementGroupName	accepted and ignored
 AWS::EC2::Instance	PrivateDnsNameOptions	accepted and ignored
 AWS::EC2::Instance	PropagateTagsToVolumeOnCreation	accepted and ignored
 AWS::EC2::Instance	RamdiskId	accepted and ignored
-AWS::EC2::Instance	SecurityGroups	accepted and ignored
 AWS::EC2::Instance	SourceDestCheck	accepted and ignored
 AWS::EC2::Instance	SsmAssociations	accepted and ignored
 AWS::EC2::Instance	Tenancy	accepted and ignored
