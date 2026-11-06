@@ -736,7 +736,6 @@ public class SwfService implements Resettable {
             // Rejected before anything is mutated: the live service answers 400 and leaves
             // the task outstanding, so the decider can retry with a corrected batch.
             requireValidBatch(decisions);
-            boolean unhandledEvents = execution.getEvents().getLast().getEventId() > task.getStartedEventId();
 
             SwfHistoryEvent completed = appendEvent(execution, "DecisionTaskCompleted");
             completed.attr("executionContext", executionContext)
@@ -751,7 +750,7 @@ public class SwfService implements Resettable {
                 execution.setLatestExecutionContext(executionContext);
             }
 
-            applyDecisions(execution, decisions, queued, decisionEventId, unhandledEvents);
+            applyDecisions(execution, decisions, queued, decisionEventId);
 
             if (execution.isOpen() && execution.isDecisionNeeded()) {
                 execution.setDecisionNeeded(false);
@@ -811,7 +810,7 @@ public class SwfService implements Resettable {
     }
 
     private void applyDecisions(SwfWorkflowExecution execution, List<Decision> decisions,
-                                List<PendingLambda> queued, long decisionEventId, boolean unhandledEvents) {
+                                List<PendingLambda> queued, long decisionEventId) {
         if (decisions == null) {
             return;
         }
@@ -821,7 +820,7 @@ public class SwfService implements Resettable {
                         decision.type(), execution.getRunId());
                 return;
             }
-            if (unhandledEvents && SwfConstants.CLOSING_DECISIONS.contains(decision.type())) {
+            if (execution.isDecisionNeeded() && SwfConstants.CLOSING_DECISIONS.contains(decision.type())) {
                 appendEvent(execution, decision.type() + "Failed")
                         .attr("cause", "UNHANDLED_DECISION")
                         .attr("decisionTaskCompletedEventId", decisionEventId);

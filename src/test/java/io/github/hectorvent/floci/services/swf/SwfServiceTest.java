@@ -578,28 +578,36 @@ class SwfServiceTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"CompleteWorkflowExecution,COMPLETED", "FailWorkflowExecution,FAILED",
-            "CancelWorkflowExecution,CANCELED", "ContinueAsNewWorkflowExecution,CONTINUED_AS_NEW"})
-    void closingDecisionClosesKnownActivitiesAndTimers(String closing, String status) {
+    @CsvSource({"CompleteWorkflowExecution,COMPLETED,false", "FailWorkflowExecution,FAILED,false",
+            "CancelWorkflowExecution,CANCELED,false", "ContinueAsNewWorkflowExecution,CONTINUED_AS_NEW,false",
+            "CompleteWorkflowExecution,COMPLETED,true", "FailWorkflowExecution,FAILED,true",
+            "CancelWorkflowExecution,CANCELED,true", "ContinueAsNewWorkflowExecution,CONTINUED_AS_NEW,true"})
+    void closingDecisionClosesKnownActivitiesAndTimers(String closing, String status, boolean startAfterDecision) {
         String runId = start("wf-known-work");
         SwfDecisionTask first = pollFor("wf-known-work");
         service.respondDecisionTaskCompleted(first.getTaskToken(), List.of(
                 new Decision("ScheduleActivityTask", Map.of("activityId", "known",
                         "activityType", Map.of("name", "A", "version", "1"))),
                 new Decision("StartTimer", Map.of("timerId", "known", "startToFireTimeout", "300"))), null);
-        SwfActivityTask activity = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
+        SwfActivityTask activity = startAfterDecision ? null
+                : service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
         SwfDecisionTask task = pokeForDecision("wf-known-work");
+        if (startAfterDecision) {
+            activity = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
+        }
+        String activityToken = activity.getTaskToken();
         service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(
                 new Decision("RecordMarker", Map.of("markerName", "before-close")),
                 new Decision(closing, Map.of())), null);
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-known-work", runId);
+        assertEquals("CLOSED", execution.getExecutionStatus());
         assertEquals(status, execution.getCloseStatus());
         assertEquals("before-close", lastAttribute(execution, "MarkerRecorded", "markerName"));
         assertEquals(0, service.openActivityCount(execution));
         assertEquals(0, service.openTimerCount(execution));
         assertEquals("UnknownResourceFault", assertThrows(AwsException.class,
-                () -> service.respondActivityTaskCompleted(activity.getTaskToken(), "late")).getErrorCode());
+                () -> service.respondActivityTaskCompleted(activityToken, "late")).getErrorCode());
     }
 
     @ParameterizedTest
@@ -640,6 +648,25 @@ class SwfServiceTest {
         assertEquals(task.getStartedEventId(), next.getPreviousStartedEventId());
         service.respondDecisionTaskCompleted(next.getTaskToken(), List.of(new Decision(closing, Map.of())), null);
         assertFalse(service.describeWorkflowExecution(REGION, DOMAIN, "wf-new-event", runId).isOpen());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"CompleteWorkflowExecution", "FailWorkflowExecution",
+            "CancelWorkflowExecution", "ContinueAsNewWorkflowExecution"})
+    void closingDecisionDefersFailureFromEarlierDecisionInBatch(String closing) {
+        String runId = start("wf-batch-failure");
+        SwfDecisionTask task = pollFor("wf-batch-failure");
+        service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(
+                new Decision("CancelTimer", Map.of("timerId", "missing")),
+                new Decision(closing, Map.of())), null);
+
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-batch-failure", runId);
+        assertEquals("OPEN", execution.getExecutionStatus());
+        assertEquals("TIMER_ID_UNKNOWN", lastAttribute(execution, "CancelTimerFailed", "cause"));
+        assertEquals("UNHANDLED_DECISION", lastAttribute(execution, closing + "Failed", "cause"));
+        SwfDecisionTask next = pollFor("wf-batch-failure");
+        service.respondDecisionTaskCompleted(next.getTaskToken(), List.of(new Decision(closing, Map.of())), null);
+        assertFalse(service.describeWorkflowExecution(REGION, DOMAIN, "wf-batch-failure", runId).isOpen());
     }
 
     @ParameterizedTest
