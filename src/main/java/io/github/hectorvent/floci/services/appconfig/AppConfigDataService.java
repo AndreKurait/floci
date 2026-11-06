@@ -24,6 +24,7 @@ import java.math.BigDecimal;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Function;
 
 @ApplicationScoped
 public class AppConfigDataService {
@@ -52,9 +53,12 @@ public class AppConfigDataService {
         requireIdentifier(profileId, "ConfigurationProfileIdentifier");
 
         // Like AWS, each identifier is either the resource's ID or its name.
-        Application application = appConfigService.resolveApplication(appId);
-        Environment environment = appConfigService.resolveEnvironment(application.getId(), envId);
-        ConfigurationProfile profile = appConfigService.resolveConfigurationProfile(application.getId(), profileId);
+        Application application = resource("Application", "ApplicationIdentifier", appId,
+                appConfigService::resolveApplication);
+        Environment environment = resource("Environment", "EnvironmentIdentifier", envId,
+                identifier -> appConfigService.resolveEnvironment(application.getId(), identifier));
+        ConfigurationProfile profile = resource("ConfigurationProfile", "ConfigurationProfileIdentifier", profileId,
+                identifier -> appConfigService.resolveConfigurationProfile(application.getId(), identifier));
         appId = application.getId();
         envId = environment.getId();
         profileId = profile.getId();
@@ -99,6 +103,18 @@ public class AppConfigDataService {
                 "RequiredMinimumPollIntervalInSeconds must be an integer between 15 and 86400", 400);
     }
 
+    private static <T> T resource(String type, String parameter, String identifier, Function<String, T> lookup) {
+        try {
+            return lookup.apply(identifier);
+        } catch (AwsException error) {
+            if ("ResourceNotFoundException".equals(error.getErrorCode())) {
+                throw new AwsException(error.getErrorCode(), error.getMessage(), error.getHttpStatus(),
+                        Map.of("ResourceType", type, "ReferencedBy", Map.of(parameter, identifier)));
+            }
+            throw error;
+        }
+    }
+
     public ConfigurationData getLatestConfiguration(String token) {
         return getLatestConfiguration(token, null);
     }
@@ -129,7 +145,10 @@ public class AppConfigDataService {
     }
 
     private ConfigurationData pollConfiguration(ConfigurationSession session, String token, String accept) {
-        appConfigService.getEnvironment(session.getApplicationId(), session.getEnvironmentId());
+        resource("Configuration", "ConfigurationToken", token, ignored -> {
+            appConfigService.getApplication(session.getApplicationId());
+            return appConfigService.getEnvironment(session.getApplicationId(), session.getEnvironmentId());
+        });
 
         int pollInterval = normalizePollInterval(session.getRequiredMinimumPollIntervalInSeconds());
         session.setRequiredMinimumPollIntervalInSeconds(pollInterval);
