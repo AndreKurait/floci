@@ -2,6 +2,12 @@
 
 Floci supports both CloudWatch Logs and CloudWatch Metrics.
 
+CloudWatch Logs accepts gzip-compressed JSON `PutLogEvents` requests from the log
+agent. Floci verifies the signature over the compressed bytes, then decodes the
+body before IAM checks the target log stream and its owning group's tags.
+Plain and compressed publications honor the same scoped grants and denies.
+Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
+
 ---
 
 ## CloudWatch Logs

@@ -789,7 +789,7 @@ class ResourceArnBuilderTest {
 
     @Test
     void logStreamTargetsUseTheServingActionAndRequestPartition() {
-        for (String action : List.of("logs:CreateLogStream", "logs:DeleteLogStream")) {
+        for (String action : List.of("logs:CreateLogStream", "logs:DeleteLogStream", "logs:PutLogEvents")) {
             for (String region : List.of("us-east-1", "cn-north-1", "us-gov-west-1")) {
                 setJsonBody("{\"logGroupName\":\" /group \",\"logStreamName\":42}");
                 when(ctx.getHeaderString("X-Amz-Target")).thenReturn("Logs_20140328.DeleteLogGroup");
@@ -859,8 +859,8 @@ class ResourceArnBuilderTest {
     }
 
     @Test
-    void excludedLogsActionsKeepWildcardResources() {
-        for (String action : List.of("logs:PutLogEvents")) {
+    void unscopedLogsActionsKeepWildcardResources() {
+        for (String action : List.of("logs:DescribeLogGroups", "logs:StopQuery", "logs:StopLiveTail")) {
             setJsonBody("{\"logGroupName\":\"group\",\"logStreamName\":\"stream\"}");
             assertEquals(List.of("*"), builder.buildLogResources(action, ctx, "us-east-1", ACCOUNT, "aws"));
         }

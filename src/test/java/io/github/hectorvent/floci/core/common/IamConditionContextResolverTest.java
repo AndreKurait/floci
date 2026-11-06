@@ -177,7 +177,7 @@ class IamConditionContextResolverTest {
                 .thenReturn(mapper.readTree("{\"logGroupName\":\" group \",\"logStreamName\":42}"));
         when(logsService.listTagsLogGroup(" group ", "eu-west-1")).thenReturn(Map.of("team", "blue"));
         requestContext.setRegion("eu-west-1");
-        for (String action : List.of("logs:CreateLogStream", "logs:DeleteLogStream")) {
+        for (String action : List.of("logs:CreateLogStream", "logs:DeleteLogStream", "logs:PutLogEvents")) {
             assertEquals(Map.of("aws:ResourceTag/team", List.of("blue")), resolver.resolve("logs", action, request));
         }
         requestContext.setRegion(null);
