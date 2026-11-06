@@ -16,6 +16,8 @@ floci:
     vpc-routing:
       enabled: false
       public-aws-api: false
+      public-aws-api-upstream-http-port: 80
+      public-aws-api-upstream-https-port: 443
     security-group-enforcement:
       enabled: true
       helper-image: floci/network-helper:local

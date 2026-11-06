@@ -9,6 +9,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class EmbeddedDnsPublicAwsApiTest {
     private static final String CLIENT = "10.87.1.10";
@@ -81,13 +82,61 @@ class EmbeddedDnsPublicAwsApiTest {
                 addresses(dns, "EC2.US-EAST-1.AMAZONAWS.COM", CLIENT));
     }
 
+    @Test
+    void declaredPeerNamesUseThePublicDestinationOnlyForKnownVpcClients() {
+        EmbeddedDnsServer dns = server(true, List.of(), List.of(), VPC, List.of("API.PEER.EXAMPLE."));
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                addresses(dns, "api.peer.example", CLIENT));
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                addresses(dns, "API.PEER.EXAMPLE", CLIENT));
+        for (String other : List.of("child.api.peer.example", "notapi.peer.example", "other.example")) {
+            assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM, dns.planQuery(other, CLIENT, CONTROL, 1));
+        }
+        assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                dns.planQuery("api.peer.example", "172.17.0.20", CONTROL, 1));
+        assertTrue(dns.planQuery("api.peer.example", CLIENT, CONTROL, 28)
+                .answer().orElseThrow().addresses().isEmpty());
+        assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                server(false, List.of(), List.of(), VPC, List.of("api.peer.example"))
+                        .planQuery("api.peer.example", CLIENT, CONTROL, 1));
+    }
+
+    @Test
+    void nativeRecordsAndForwardingRulesPrecedeDeclaredPeerDefaults() {
+        DnsRecordSource records = name -> "api.peer.example".equals(name)
+                ? Optional.of(DnsAnswer.records(List.of("10.87.2.7"), 30)) : Optional.empty();
+        EmbeddedDnsServer dns = server(true, List.of(records), List.of(), VPC, List.of("api.peer.example"));
+        assertEquals(List.of("10.87.2.7"), addresses(dns, "api.peer.example", CLIENT));
+        DnsForwardingRule rule = DnsForwardingRule.forwardTo("peer.example",
+                List.of(new DnsForwardingRule.Target("10.87.0.53")));
+        DnsForwardingRuleSource source = (account, region, vpc) -> List.of(rule);
+        assertEquals(rule.targets(), server(true, List.of(records), List.of(source), VPC,
+                List.of("api.peer.example")).planQuery("api.peer.example", CLIENT, CONTROL, 1).ruleTargets());
+    }
+
+    @Test
+    void publicPeerNamesRejectWildcardsAddressesAndMalformedConfiguration() {
+        for (String invalid : List.of("*", "*.peer.example", "https://peer.example", "127.0.0.1",
+                "peer.example:443", "-peer.example", "peer-.example", "peer..example", "peer.example\n",
+                "x".repeat(64) + ".example")) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> server(true, List.of(), List.of(), VPC, List.of(invalid)), invalid);
+        }
+    }
+
     private static EmbeddedDnsServer server(boolean enabled, List<DnsRecordSource> records,
                                             List<DnsForwardingRuleSource> rules,
                                             DnsClientVpcSource.ClientVpc identity) {
+        return server(enabled, records, rules, identity, List.of());
+    }
+
+    private static EmbeddedDnsServer server(boolean enabled, List<DnsRecordSource> records,
+                                            List<DnsForwardingRuleSource> rules,
+                                            DnsClientVpcSource.ClientVpc identity, List<String> publicHosts) {
         DnsClientVpcSource clients = address -> CLIENT.equals(address)
                 ? Optional.of(identity) : Optional.empty();
         return new EmbeddedDnsServer(List.copyOf(TlsConfigSource.awsEndpointSuffixes()),
-                records, rules, List.of(clients), enabled);
+                records, rules, List.of(clients), enabled, publicHosts);
     }
 
     private static List<String> addresses(EmbeddedDnsServer server, String name, String client) {

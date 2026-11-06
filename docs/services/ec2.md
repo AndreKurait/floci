@@ -2009,6 +2009,10 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL` | `false` | Create internal Docker VPC networks without external connectivity through that network |
 | `FLOCI_NETWORK_VPC_ROUTING_ENABLED` | `false` | Enforce native IPv4 routes and public NAT for protected workloads reaching managed Classic frontends |
 | `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API` | `false` | Route spoofed AWS API destinations from private workloads through their native public NAT and internet gateway |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HOST` | unset | Optional exact IPv4 front door for the public TCP bridge; unset retains Floci's API listener |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HTTP_PORT` | `80` | HTTP port at the explicitly selected front door |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HTTPS_PORT` | `443` | TLS port at that front door; clients retain certificate verification |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` | unset | Comma-separated exact peer DNS names that use the public destination for known VPC clients, after native DNS records and forwarding rules |
 
 ## VPC Docker networks
 

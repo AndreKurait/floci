@@ -158,13 +158,13 @@ final class VpcRoutingCommands {
         return script.append(nft(rules.toString())).toString();
     }
 
-    static String publicApi(String publicAddress, String backendAddress, int backendPort,
+    static String publicApi(String publicAddress, String backendAddress, int httpPort, int httpsPort,
                             String publicDevice, List<Hop> callers) {
         String external = VpcRouteSelection.ipv4(publicAddress);
         String backend = VpcRouteSelection.ipv4(backendAddress);
         String outside = device(publicDevice);
-        if (backendPort < 1 || backendPort > 65535 || external.equals(backend)) {
-            throw new IllegalArgumentException("Public AWS APIs require a distinct backend and one TCP port");
+        if (httpPort < 1 || httpPort > 65535 || httpsPort < 1 || httpsPort > 65535 || external.equals(backend)) {
+            throw new IllegalArgumentException("Public AWS APIs require a distinct backend and valid TCP ports");
         }
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush default dev ")
                 .append(outside).append("\nip -4 route flush proto 186\n")
@@ -177,11 +177,13 @@ final class VpcRoutingCommands {
                 flush chain inet floci_public_api egress
                 add rule inet floci_public_api ingress iifname lo counter accept
                 add rule inet floci_public_api egress oifname lo counter accept
-                """)
-                .append("add rule inet floci_public_api ingress ip saddr ").append(backend)
-                .append(" tcp sport ").append(backendPort).append(" ct state established,related counter accept\n")
-                .append("add rule inet floci_public_api egress ip daddr ").append(backend)
-                .append(" tcp dport ").append(backendPort).append(" counter accept\n");
+                """);
+        for (int port : List.of(httpPort, httpsPort).stream().distinct().toList()) {
+            rules.append("add rule inet floci_public_api ingress ip saddr ").append(backend)
+                    .append(" tcp sport ").append(port).append(" ct state established,related counter accept\n")
+                    .append("add rule inet floci_public_api egress ip daddr ").append(backend)
+                    .append(" tcp dport ").append(port).append(" counter accept\n");
+        }
         for (Hop caller : callers) {
             if (!outside.equals(caller.device()) || !caller.replyOnly()) {
                 throw new IllegalArgumentException("Public API return routes require the public interface");

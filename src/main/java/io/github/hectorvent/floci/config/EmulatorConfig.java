@@ -140,6 +140,18 @@ public interface EmulatorConfig {
         /** Routes spoofed AWS API names from known VPC clients through their public NAT gateways. */
         @WithDefault("false")
         boolean publicAwsApi();
+
+        /** Optional explicit IPv4 front door for the public endpoint TCP bridge. */
+        Optional<String> publicAwsApiUpstreamHost();
+
+        @WithDefault("80")
+        int publicAwsApiUpstreamHttpPort();
+
+        @WithDefault("443")
+        int publicAwsApiUpstreamHttpsPort();
+
+        /** Exact additional peer names served by the selected public endpoint front door. */
+        Optional<List<String>> publicAwsApiHosts();
     }
 
     interface SecurityGroupEnforcementConfig {
