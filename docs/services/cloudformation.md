@@ -255,7 +255,7 @@ Resource type AWS::Fake::Thing is not supported by Floci. It was stubbed and not
 
 Set `floci.services.cloudformation.allow-stub-unsupported-resource-types` to `false`
 (`FLOCI_SERVICES_CLOUDFORMATION_ALLOW_STUB_UNSUPPORTED_RESOURCE_TYPES=false`) to fail such a
-resource instead: it reaches `CREATE_FAILED` and the stack rolls back. Use it in a pipeline that
+resource instead: it reaches `CREATE_FAILED` and the stack rolls back by default. Use it in a pipeline that
 must not pass over a resource it never got.
 
 ## SES Email Identities
@@ -985,6 +985,17 @@ template and the parameter values it already ran gets its prior tags back, its d
 inherited tags included. A nested stack the update re-deployed with a different template or
 different parameter values, including in a descendant, is not restored: the stack ends `UPDATE_ROLLBACK_FAILED` rather than
 claiming a nested deployment rollback Floci does not implement yet.
+
+## Preserving failed creations
+
+`CreateStack` honors `DisableRollback=true`: a resource failure leaves the stack in
+`CREATE_FAILED` and preserves the resources already created. Inspect the stack events to find
+the failing resource; a later `DeleteStack` removes the retained deployment normally. An omitted
+or false option retains the default create rollback. `DescribeStacks` reports the saved
+`DisableRollback` value, including after a storage reload.
+
+`DisableRollback` and `OnFailure` cannot both be supplied to `CreateStack`, even when
+`DisableRollback` is false. The creation option does not disable a later update's normal rollback.
 
 ## Failed update rollbacks
 
