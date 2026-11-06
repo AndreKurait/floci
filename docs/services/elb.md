@@ -47,6 +47,14 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 
 HTTPS listeners require a default certificate. Supply one when creating a listener or changing an HTTP listener to HTTPS; an omitted certificate list on an existing HTTPS listener keeps its default.
 
+With Floci TLS enabled, an ALB HTTPS listener on the AWS HTTPS proxy port
+(normally `443`) shares that socket with AWS API callbacks. TLS SNI must uniquely
+identify a listener by its load-balancer DNS name, host rules or certificate
+hostnames. The selected ALB serves its own certificate and configured actions;
+unmatched names and clients without SNI continue to the API backend. The public
+Floci API port and non-HTTPS proxy-port collisions remain reserved. See
+[TLS shared-port routing](../configuration/tls.md) for limits.
+
 Listener responses omit `Certificates` when the listener has none. Configured certificates
 remain present in create, describe and modify responses.
 
