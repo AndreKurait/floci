@@ -143,3 +143,12 @@ docker run --rm --network host floci-sdk-python
 # Custom endpoint (macOS/Windows)
 docker run --rm -e FLOCI_ENDPOINT=http://host.docker.internal:4566 floci-sdk-python
 ```
+
+The isolated ALB/Route 53 tests in `tests/test_elbv2_route53_alias_routing.py`
+use `FLOCI_ALB_ALIAS_TEST_IMAGE` to start their own Floci servers through the Docker CLI.
+Their HTTP/TCP echo target runs in a separate container on the same network.
+When pytest runs in a container, connect it to a Docker network and pass that network's
+name as `FLOCI_ALB_ALIAS_TEST_NETWORK`; the tests leave that shared network in place.
+Without it, each fixture creates and removes its own internal network for a host runner.
+`FLOCI_ALB_ALIAS_ECHO_IMAGE` can select a preloaded Python 3.12 image; the default is
+`python:3.12-slim`.

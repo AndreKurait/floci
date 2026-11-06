@@ -167,6 +167,11 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                         .formParam("Actions.member.1.FixedResponseConfig.MessageBody", "local-only")
                         .when().post("/").then().statusCode(200);
             }
+            given().header("Host", loadBalancer.dnsName() + ":" + HTTP_PORT)
+                    .when().get("/").then().statusCode(200).body(equalTo("fallback"));
+            Response sharedHttps = given().header("Host", loadBalancer.dnsName() + ":" + HTTPS_PORT)
+                    .when().get("/");
+            assertNotEquals(200, sharedHttps.statusCode(), "Shared HTTP must not execute an HTTPS listener action");
             awaitPlainResponse(host, HTTP_PORT, "local-only");
             awaitHttpsMaterial(host, 200, "local-only", certificate, certificate);
             Certificate expected = certificate;
