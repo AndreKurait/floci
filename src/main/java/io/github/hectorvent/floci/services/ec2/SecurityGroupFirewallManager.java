@@ -32,6 +32,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /** Owns the protected namespace and the Floci-only nftables table for each managed ENI. */
@@ -39,6 +43,7 @@ import java.util.concurrent.TimeUnit;
 public class SecurityGroupFirewallManager {
 
     private static final Logger LOG = Logger.getLogger(SecurityGroupFirewallManager.class);
+    private static final int POLICY_INSTALL_WORKERS = 8;
     private final DockerClient dockerClient;
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -247,15 +252,43 @@ public class SecurityGroupFirewallManager {
         List<SecurityGroupNftCompiler.Endpoint> peers = endpoints.values().stream()
                 .map(ProtectedEndpoint::endpoint).toList();
         List<String> vpcResolvers = vpcResolvers();
-        for (ProtectedEndpoint protectedEndpoint : new ArrayList<>(endpoints.values())) {
-            try {
+        try {
+            List<PolicyInstallation> installations = new ArrayList<>();
+            for (ProtectedEndpoint protectedEndpoint : endpoints.values()) {
                 String rules = SecurityGroupNftCompiler.compile(protectedEndpoint.endpoint(), peers,
                         protectedEndpoint.prefixLists(), vpcResolvers);
-                apply(protectedEndpoint.helperId(), rules);
-            } catch (RuntimeException e) {
-                endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
-                throw e;
+                installations.add(new PolicyInstallation(protectedEndpoint.helperId(), rules));
             }
+            installPolicies(installations);
+        } catch (RuntimeException e) {
+            endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
+            throw e;
+        }
+    }
+
+    private record PolicyInstallation(String helperId, String rules) {}
+
+    private void installPolicies(List<PolicyInstallation> installations) {
+        if (installations.size() < 2) {
+            installations.forEach(policy -> apply(policy.helperId(), policy.rules()));
+            return;
+        }
+        // The manager's monitor still serializes policy generations. Only Docker I/O on distinct
+        // namespaces overlaps. Joining every task before quarantine prevents a late installer from
+        // restoring permissive rules after another namespace's installation failed.
+        try (ExecutorService workers = Executors.newFixedThreadPool(
+                Math.min(POLICY_INSTALL_WORKERS, installations.size()),
+                Thread.ofVirtual().name("security-group-policy-", 0).factory())) {
+            CompletableFuture<?>[] pending = installations.stream()
+                    .map(policy -> CompletableFuture.runAsync(
+                            () -> apply(policy.helperId(), policy.rules()), workers))
+                    .toArray(CompletableFuture<?>[]::new);
+            CompletableFuture.allOf(pending).join();
+        } catch (CompletionException failure) {
+            if (failure.getCause() instanceof RuntimeException cause) {
+                throw cause;
+            }
+            throw new IllegalStateException("Failed to install security-group policies", failure.getCause());
         }
     }
 
