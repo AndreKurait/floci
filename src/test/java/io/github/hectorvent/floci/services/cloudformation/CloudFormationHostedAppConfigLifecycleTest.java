@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.appconfig.AppConfigAlarmMonitor;
+import io.github.hectorvent.floci.services.appconfig.AppConfigS3Source;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
@@ -35,7 +36,8 @@ class CloudFormationHostedAppConfigLifecycleTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        appconfig = new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class));
+        appconfig = new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
         cfn = CloudFormationServiceFixture.create(CfnProvisionerFixture.builder().appConfig(appconfig).build());
     }
 

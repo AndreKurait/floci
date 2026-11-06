@@ -76,7 +76,7 @@ class AppConfigServiceUpdateRaceTest {
                 Map.of("Name", "settings", "LocationUri", "hosted"));
 
         deleteWaitsForTheWrite(store,
-                () -> service.updateConfigurationProfile(app.getId(), profile.getId(), "renamed", null),
+                () -> service.updateConfigurationProfile(app.getId(), profile.getId(), "renamed", null, null),
                 () -> service.deleteConfigurationProfile(app.getId(), profile.getId()));
 
         assertTrue(service.findConfigurationProfile(profile.getId()).isEmpty(), "the entity outlived its delete");
@@ -132,6 +132,7 @@ class AppConfigServiceUpdateRaceTest {
     /** An AppConfig service whose {@code fileName} store is {@code store} and every other store in memory. */
     private static AppConfigService serviceWithStore(String fileName, StorageBackend<String, ?> store) {
         return new AppConfigService(new InMemoryStorageFactory(ACCOUNT).withStore(fileName, store),
-                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class));
+                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
     }
 }

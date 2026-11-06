@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.appconfig.AppConfigAlarmMonitor;
+import io.github.hectorvent.floci.services.appconfig.AppConfigS3Source;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
@@ -40,7 +41,8 @@ class CloudFormationAppConfigDeploymentLifecycleTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        appconfig = new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class));
+        appconfig = new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
         cfn = CloudFormationServiceFixture.create(CfnProvisionerFixture.builder().appConfig(appconfig).build());
         app = appconfig.createApplication(Map.of("Name", "settings")).getId();
         environment = appconfig.createEnvironment(app, Map.of("Name", "test")).getId();

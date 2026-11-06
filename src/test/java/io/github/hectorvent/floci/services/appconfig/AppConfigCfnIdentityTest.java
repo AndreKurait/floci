@@ -33,7 +33,8 @@ class AppConfigCfnIdentityTest {
         RegionResolver regions = mock(RegionResolver.class);
         when(regions.getRegion()).thenReturn("us-east-1");
         when(regions.getDefaultRegion()).thenReturn("us-east-1");
-        service = new AppConfigService(factory, regions, mock(AppConfigAlarmMonitor.class));
+        service = new AppConfigService(factory, regions, mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
         provisioner = new AppConfigCfnProvisioner(service);
     }
 

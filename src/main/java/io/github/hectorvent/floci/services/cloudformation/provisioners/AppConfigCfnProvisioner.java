@@ -37,7 +37,7 @@ import java.util.Set;
  *
  * <p>Floci keeps AppConfig tags on applications only, so {@code Tags} on the other three types are
  * accepted and not stored, as Floci's AppConfig TagResource treats them. So are a profile's
- * {@code KmsKeyIdentifier}, {@code RetrievalRoleArn} and {@code Validators}, and the
+ * {@code KmsKeyIdentifier} and {@code Validators}, and the
  * {@code DeletionProtectionCheck} of an environment or profile, which Floci's create operations do
  * not keep either.
  */
@@ -171,6 +171,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         String locationUri = requiredText(PROFILE, props, "LocationUri", LOCATION_URI_MAX_LENGTH, ctx);
         String type = text(props, "Type", ctx);
         String description = optionalText(PROFILE, props, "Description", DESCRIPTION_MAX_LENGTH, ctx);
+        String retrievalRoleArn = optionalText(PROFILE, props, "RetrievalRoleArn", 2048, ctx);
         allowed(PROFILE, "DeletionProtectionCheck", text(props, "DeletionProtectionCheck", ctx),
                 DELETION_PROTECTION_CHECKS);
         ObjectNode createOnly = MAPPER.createObjectNode()
@@ -182,7 +183,8 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                             "Configuration profile not found", 404));
             snapshotBeforeUpdate(r, current);
-            service.updateConfigurationProfile(current.getApplicationId(), current.getId(), name, description);
+            service.updateConfigurationProfile(current.getApplicationId(), current.getId(),
+                    name, description, retrievalRoleArn);
             return;
         }
         Map<String, Object> request = new HashMap<>();
@@ -190,6 +192,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         request.put("Description", description);
         request.put("LocationUri", locationUri);
         request.put("Type", type);
+        request.put("RetrievalRoleArn", retrievalRoleArn);
         ConfigurationProfile profile = service.createConfigurationProfile(applicationId, request);
         r.setPhysicalId(profile.getId());
         r.getAttributes().put("ConfigurationProfileId", profile.getId());
@@ -507,7 +510,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
             case PROFILE -> {
                 ConfigurationProfile prior = MAPPER.treeToValue(snapshot, ConfigurationProfile.class);
                 service.updateConfigurationProfile(prior.getApplicationId(), prior.getId(), prior.getName(),
-                        prior.getDescription());
+                        prior.getDescription(), prior.getRetrievalRoleArn());
             }
             case STRATEGY -> {
                 DeploymentStrategy prior = MAPPER.treeToValue(snapshot, DeploymentStrategy.class);
