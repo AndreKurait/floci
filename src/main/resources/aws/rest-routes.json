@@ -1,5 +1,5 @@
 {
-  "_source": {"generator": "tools/aws/regen_rest_routes.py", "botocore": "botocore 1.43.118 (local/aws/botocore)"},
+  "_source": {"generator": "tools/aws/regen_rest_routes.py", "botocore": "botocore 1.43.118 (installed package)"},
   "handRouted": {
     "apigateway": "API Gateway's management API is authorized by HTTP method, apigateway:GET, apigateway:POST and so on, on the resource path a route names, not by its operations' names, and the registry's rules give every route its method's action",
     "s3": "S3 tells apart the operations it serves on one route by their query parameters and headers, which the registry's S3 rules and sub-resource overrides read, and an S3 Control route Floci does not serve runs as the S3 data plane, checked as the bucket or object operation that runs"
@@ -287,6 +287,76 @@
         "UpdateRouteResponse": {"method": "PATCH", "requestUri": "/v2/apis/{apiId}/routes/{routeId}/routeresponses/{routeResponseId}"},
         "UpdateStage": {"method": "PATCH", "requestUri": "/v2/apis/{apiId}/stages/{stageName}"},
         "UpdateVpcLink": {"method": "PATCH", "requestUri": "/v2/vpclinks/{vpcLinkId}"}
+      }
+    },
+    "appconfig": {
+      "credentialScope": "appconfig",
+      "apiVersion": "2019-10-09",
+      "operations": {
+        "CreateApplication": {"method": "POST", "requestUri": "/applications"},
+        "CreateConfigurationProfile": {"method": "POST", "requestUri": "/applications/{ApplicationId}/configurationprofiles"},
+        "CreateDeploymentStrategy": {"method": "POST", "requestUri": "/deploymentstrategies"},
+        "CreateEnvironment": {"method": "POST", "requestUri": "/applications/{ApplicationId}/environments"},
+        "CreateExperimentDefinition": {"method": "POST", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions"},
+        "CreateExtension": {"method": "POST", "requestUri": "/extensions"},
+        "CreateExtensionAssociation": {"method": "POST", "requestUri": "/extensionassociations"},
+        "CreateHostedConfigurationVersion": {"method": "POST", "requestUri": "/applications/{ApplicationId}/configurationprofiles/{ConfigurationProfileId}/hostedconfigurationversions"},
+        "DeleteApplication": {"method": "DELETE", "requestUri": "/applications/{ApplicationId}"},
+        "DeleteConfigurationProfile": {"method": "DELETE", "requestUri": "/applications/{ApplicationId}/configurationprofiles/{ConfigurationProfileId}"},
+        "DeleteDeploymentStrategy": {"method": "DELETE", "requestUri": "/deployementstrategies/{DeploymentStrategyId}"},
+        "DeleteEnvironment": {"method": "DELETE", "requestUri": "/applications/{ApplicationId}/environments/{EnvironmentId}"},
+        "DeleteExperimentDefinition": {"method": "DELETE", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}"},
+        "DeleteExtension": {"method": "DELETE", "requestUri": "/extensions/{ExtensionIdentifier}"},
+        "DeleteExtensionAssociation": {"method": "DELETE", "requestUri": "/extensionassociations/{ExtensionAssociationId}"},
+        "DeleteHostedConfigurationVersion": {"method": "DELETE", "requestUri": "/applications/{ApplicationId}/configurationprofiles/{ConfigurationProfileId}/hostedconfigurationversions/{VersionNumber}"},
+        "GetAccountSettings": {"method": "GET", "requestUri": "/settings"},
+        "GetApplication": {"method": "GET", "requestUri": "/applications/{ApplicationId}"},
+        "GetConfiguration": {"method": "GET", "requestUri": "/applications/{Application}/environments/{Environment}/configurations/{Configuration}"},
+        "GetConfigurationProfile": {"method": "GET", "requestUri": "/applications/{ApplicationId}/configurationprofiles/{ConfigurationProfileId}"},
+        "GetDeployment": {"method": "GET", "requestUri": "/applications/{ApplicationId}/environments/{EnvironmentId}/deployments/{DeploymentNumber}"},
+        "GetDeploymentStrategy": {"method": "GET", "requestUri": "/deploymentstrategies/{DeploymentStrategyId}"},
+        "GetEnvironment": {"method": "GET", "requestUri": "/applications/{ApplicationId}/environments/{EnvironmentId}"},
+        "GetExperimentDefinition": {"method": "GET", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}"},
+        "GetExperimentRun": {"method": "GET", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns/{Run}"},
+        "GetExtension": {"method": "GET", "requestUri": "/extensions/{ExtensionIdentifier}"},
+        "GetExtensionAssociation": {"method": "GET", "requestUri": "/extensionassociations/{ExtensionAssociationId}"},
+        "GetHostedConfigurationVersion": {"method": "GET", "requestUri": "/applications/{ApplicationId}/configurationprofiles/{ConfigurationProfileId}/hostedconfigurationversions/{VersionNumber}"},
+        "ListApplications": {"method": "GET", "requestUri": "/applications"},
+        "ListConfigurationProfiles": {"method": "GET", "requestUri": "/applications/{ApplicationId}/configurationprofiles"},
+        "ListDeploymentStrategies": {"method": "GET", "requestUri": "/deploymentstrategies"},
+        "ListDeployments": {"method": "GET", "requestUri": "/applications/{ApplicationId}/environments/{EnvironmentId}/deployments"},
+        "ListEnvironments": {"method": "GET", "requestUri": "/applications/{ApplicationId}/environments"},
+        "ListExperimentDefinitions": {"method": "GET", "requestUri": "/experimentdefinitions"},
+        "ListExperimentRunEvents": {"method": "GET", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns/{Run}/events"},
+        "ListExperimentRuns": {"method": "GET", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns"},
+        "ListExtensionAssociations": {"method": "GET", "requestUri": "/extensionassociations"},
+        "ListExtensions": {"method": "GET", "requestUri": "/extensions"},
+        "ListHostedConfigurationVersions": {"method": "GET", "requestUri": "/applications/{ApplicationId}/configurationprofiles/{ConfigurationProfileId}/hostedconfigurationversions"},
+        "ListTagsForResource": {"method": "GET", "requestUri": "/tags/{ResourceArn}"},
+        "StartDeployment": {"method": "POST", "requestUri": "/applications/{ApplicationId}/environments/{EnvironmentId}/deployments"},
+        "StartExperimentRun": {"method": "POST", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns"},
+        "StopDeployment": {"method": "DELETE", "requestUri": "/applications/{ApplicationId}/environments/{EnvironmentId}/deployments/{DeploymentNumber}"},
+        "StopExperimentRun": {"method": "PATCH", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns/{Run}/stop"},
+        "TagResource": {"method": "POST", "requestUri": "/tags/{ResourceArn}"},
+        "UntagResource": {"method": "DELETE", "requestUri": "/tags/{ResourceArn}"},
+        "UpdateAccountSettings": {"method": "PATCH", "requestUri": "/settings"},
+        "UpdateApplication": {"method": "PATCH", "requestUri": "/applications/{ApplicationId}"},
+        "UpdateConfigurationProfile": {"method": "PATCH", "requestUri": "/applications/{ApplicationId}/configurationprofiles/{ConfigurationProfileId}"},
+        "UpdateDeploymentStrategy": {"method": "PATCH", "requestUri": "/deploymentstrategies/{DeploymentStrategyId}"},
+        "UpdateEnvironment": {"method": "PATCH", "requestUri": "/applications/{ApplicationId}/environments/{EnvironmentId}"},
+        "UpdateExperimentDefinition": {"method": "PATCH", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}"},
+        "UpdateExperimentRun": {"method": "PATCH", "requestUri": "/applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns/{Run}/update"},
+        "UpdateExtension": {"method": "PATCH", "requestUri": "/extensions/{ExtensionIdentifier}"},
+        "UpdateExtensionAssociation": {"method": "PATCH", "requestUri": "/extensionassociations/{ExtensionAssociationId}"},
+        "ValidateConfiguration": {"method": "POST", "requestUri": "/applications/{ApplicationId}/configurationprofiles/{ConfigurationProfileId}/validators"}
+      }
+    },
+    "appconfigdata": {
+      "credentialScope": "appconfig",
+      "apiVersion": "2021-11-11",
+      "operations": {
+        "GetLatestConfiguration": {"method": "GET", "requestUri": "/configuration"},
+        "StartConfigurationSession": {"method": "POST", "requestUri": "/configurationsessions"}
       }
     },
     "dsql": {
