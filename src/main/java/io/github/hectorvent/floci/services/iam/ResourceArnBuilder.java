@@ -206,6 +206,7 @@ public class ResourceArnBuilder {
             case "kinesis"        -> List.of(buildKinesisArn(ctx, region, accountId));
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "iam"            -> buildIamArns(ctx, region, accountId);
+            case "elasticloadbalancing" -> List.of(buildProvisionedCapacityArn(ctx));
             case "resource-groups" -> List.of(buildResourceGroupArn(ctx, region, accountId));
             case "scheduler"      -> List.of(buildSchedulerArn(path, ctx, region, accountId, partition));
             case "pipes"          -> List.of(buildPipesArn(path, ctx, region, accountId, partition));
@@ -219,6 +220,16 @@ public class ResourceArnBuilder {
             case "bedrock"        -> List.of(buildBedrockArn(path, ctx));
             default               -> namedResources(credentialScope, operation, ctx, region, accountId, partition);
         };
+    }
+
+    private String buildProvisionedCapacityArn(ContainerRequestContext ctx) {
+        String action = AwsQueryServiceResolver.action(RequestBodyReader.formField(ctx, "Action"),
+                RequestBodyReader.formField(ctx, "Operation"));
+        if (!"DescribeProvisionedCapacity".equals(action)) {
+            return "*";
+        }
+        String arn = RequestBodyReader.formField(ctx, "LoadBalancerArn");
+        return arn == null || arn.isBlank() ? "*" : arn;
     }
 
     /**

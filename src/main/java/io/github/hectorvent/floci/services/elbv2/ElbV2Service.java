@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
@@ -430,6 +431,36 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         requireLoadBalancer(region, arn);
         // Floci does not reserve load balancer capacity, so there is never a reservation to report.
         return new CapacityReservation(null, null, null);
+    }
+
+    public record ProvisionedCapacity(int minimumLBCapacityUnits, String status, int decreasesRemaining) {}
+
+    /** Legacy capacity view for an application load balancer without a reservation. */
+    public ProvisionedCapacity describeProvisionedCapacity(String region, String arn) {
+        AwsArnUtils.Arn parsed;
+        try {
+            parsed = AwsArnUtils.parse(arn);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("ValidationError", "A valid LoadBalancerArn must be specified.", 400);
+        }
+        if (!"elasticloadbalancing".equals(parsed.service())
+                || !parsed.accountId().matches("[0-9]{12}")
+                || !parsed.resource().matches("loadbalancer/app/[A-Za-z0-9-]{1,32}/[0-9a-f]{16}")
+                || !region.equals(parsed.region())
+                // Match createLoadBalancer's ARN derivation, including persisted custom-region ARNs.
+                || !AwsRegions.partitionFor(region).equals(parsed.partition())) {
+            throw new AwsException("ValidationError",
+                    "LoadBalancerArn must identify an application load balancer in the request region.", 400);
+        }
+        if (!regionResolver.getAccountId().equals(parsed.accountId())) {
+            throw new AwsException("LoadBalancerNotFound", "One or more load balancers not found.", 400);
+        }
+        LoadBalancer lb = requireLoadBalancer(region, arn);
+        if (!"application".equals(lb.getType())) {
+            throw new AwsException("ValidationError", "LoadBalancerArn must identify an application load balancer.", 400);
+        }
+        // Capacity is never reserved in Floci, so none of the four daily decreases has been consumed.
+        return new ProvisionedCapacity(0, "disabled", 4);
     }
 
     public void setSecurityGroups(String region, String arn, List<String> sgIds) {
