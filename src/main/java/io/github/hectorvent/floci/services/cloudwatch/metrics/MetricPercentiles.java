@@ -83,7 +83,19 @@ final class MetricPercentiles {
         }
         Map<String, Double> values = new LinkedHashMap<>();
         for (String statistic : percentiles) {
-            double rank = percentile(statistic) / 100 * count;
+            double percentile = percentile(statistic);
+            if (percentile == 0) {
+                values.put(statistic, ordered.getFirst().getMinimum());
+                continue;
+            }
+            if (percentile == 100) {
+                values.put(statistic, ordered.getLast().getMinimum());
+                continue;
+            }
+            if (count == 0) {
+                continue;
+            }
+            double rank = percentile / 100 * count;
             double seen = 0;
             double value = ordered.getLast().getMinimum();
             for (MetricDatum sample : ordered) {
@@ -102,7 +114,7 @@ final class MetricPercentiles {
         double value = sample.getMinimum();
         double expectedSum = value * sample.getSampleCount();
         return Double.isFinite(value) && value >= 0 && value == sample.getMaximum()
-                && Double.isFinite(sample.getSampleCount()) && sample.getSampleCount() > 0
+                && Double.isFinite(sample.getSampleCount()) && sample.getSampleCount() >= 0
                 && Double.isFinite(expectedSum) && Double.isFinite(sample.getSum())
                 && Math.abs(sample.getSum() - expectedSum) <= Math.ulp(expectedSum) * 4;
     }

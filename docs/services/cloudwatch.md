@@ -540,6 +540,16 @@ with `Metrics`, is rejected before changing the alarm.
 `GetMetricStatistics` accepts either `Statistics` or `ExtendedStatistics`, with up to ten
 percentiles from `p0` through `p100`, and returns the latter in each datapoint's
 `ExtendedStatistics` map. `GetMetricData` accepts the same percentiles in `MetricStat.Stat`.
+`PutMetricData` accepts `Values` with optional nonnegative `Counts` through Query and JSON/CBOR,
+including metric data nested under `EntityMetricData`. Omitted counts mean one occurrence per value.
+Zero counts contribute no samples or sum but retain their values in the period's minimum and maximum,
+including an all-zero batch. Explicit statistic sets with zero sample count and sum stay statistic
+sets rather than becoming scalar samples.
+Both arrays must have matching lengths and contain at most 150 entries. Each distinct value becomes
+one existing statistic set with equal minimum and maximum; large occurrence counts are not expanded
+into individual samples. Malformed weighted data rejects the request before any of its samples are
+published. See the [MetricDatum contract](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_MetricDatum.html).
+
 Floci computes weighted nearest-rank percentiles from nonnegative scalar samples and statistic
 sets whose minimum and maximum are equal and whose sum agrees with the sample count.
 It does not expand repeated samples in memory. Periods containing negative values or statistic
