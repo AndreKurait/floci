@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.model.Frame;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
@@ -23,6 +26,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.extension.TestExecutionExceptionHandler;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
@@ -65,6 +69,16 @@ class EksRegistryHostsDockerIntegrationTest {
 
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
+
+    private String diagnosticContainerId;
+
+    @RegisterExtension
+    final TestExecutionExceptionHandler diagnostics = (context, failure) -> {
+        if (diagnosticContainerId != null) {
+            logWorkloadFailure(diagnosticContainerId);
+        }
+        throw failure;
+    };
 
     @ConfigProperty(name = "quarkus.http.test-port", defaultValue = "8081")
     int httpPort;
@@ -114,6 +128,7 @@ class EksRegistryHostsDockerIntegrationTest {
         cleanup.register(() -> eksService.deleteCluster(clusterName));
 
         Cluster cluster = eksService.describeCluster(clusterName);
+        diagnosticContainerId = cluster.getContainerId();
         assertNotNull(cluster.getContainerId(), "Container ID must not be null");
         waitUntilReady(cluster);
         eksClusterManager.finalizeCluster(cluster);
@@ -172,6 +187,7 @@ class EksRegistryHostsDockerIntegrationTest {
         // Re-read cluster and container ID: applying the first node group replaces the k3s container
         // to apply node capacity limits, invalidating the previous container ID.
         cluster = eksService.describeCluster(clusterName);
+        diagnosticContainerId = cluster.getContainerId();
         assertNotNull(cluster.getContainerId(), "Container ID must not be null after node group creation");
         waitUntilReady(cluster);
         containerId = cluster.getContainerId();
@@ -411,6 +427,60 @@ class EksRegistryHostsDockerIntegrationTest {
             return true;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /** Capture the failed workload before the cleanup extension removes its cluster. */
+    private void logWorkloadFailure(String containerId) {
+        try {
+            InspectContainerResponse.ContainerState state = dockerClient.inspectContainerCmd(containerId).exec().getState();
+            LOG.warnv("Registry container diagnostics: status={0}, running={1}, OOMKilled={2}, exit={3}, error={4}",
+                    state.getStatus(), state.getRunning(), state.getOOMKilled(), state.getExitCodeLong(), state.getError());
+        } catch (RuntimeException failure) {
+            LOG.warn("Cannot inspect failed registry cluster container", failure);
+        }
+        try (ResultCallback.Adapter<Frame> logs = new ResultCallback.Adapter<>() {
+            @Override
+            public void onNext(Frame frame) {
+                LOG.warnv("Registry container log: {0}", new String(frame.getPayload(), StandardCharsets.UTF_8));
+            }
+        }) {
+            dockerClient.logContainerCmd(containerId).withStdOut(true).withStdErr(true).withTail(80)
+                    .withFollowStream(false).exec(logs).awaitCompletion(4, TimeUnit.SECONDS);
+        } catch (Exception failure) {
+            if (failure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            LOG.warn("Cannot read failed registry cluster container logs", failure);
+        }
+        List<String[]> commands = List.of(
+                new String[]{"kubectl", "--request-timeout=2s", "get", "pod", "registry-hosts-pod", "-o", "json"},
+                new String[]{"kubectl", "--request-timeout=2s", "describe", "pod", "registry-hosts-pod"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "events",
+                        "--field-selector=involvedObject.name=registry-hosts-pod", "--sort-by=.lastTimestamp"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "nodes", "-o", "json"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "clusterrole,clusterrolebinding",
+                        "k3s-cloud-controller-manager", "-o", "json"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "leases", "-n", "kube-system", "-o", "json"},
+                new String[]{"kubectl", "--request-timeout=2s", "get", "addons.k3s.cattle.io", "ccm",
+                        "-n", "kube-system", "-o", "json"},
+                new String[]{"sh", "-c", """
+                        printf '%s' '{"apiVersion":"authorization.k8s.io/v1","kind":"SubjectAccessReview",
+                        "spec":{"user":"k3s-cloud-controller-manager",
+                        "resourceAttributes":{"namespace":"kube-system","verb":"watch",
+                        "resource":"endpointslices","group":"discovery.k8s.io"}}}' | \
+                        kubectl --kubeconfig=/var/lib/rancher/k3s/server/cred/supervisor.kubeconfig \
+                        --request-timeout=2s create --raw /apis/authorization.k8s.io/v1/subjectaccessreviews -f -
+                        """},
+                new String[]{"sh", "-c", "tail -n 80 /var/lib/rancher/k3s/agent/containerd/containerd.log"});
+        for (String[] command : commands) {
+            try {
+                ContainerExec.Result result = ContainerExec.run(dockerClient, containerId, command, 4);
+                LOG.warnv("Registry workload diagnostics [{0}] exit={1}, timedOut={2}:\n{3}",
+                        String.join(" ", command), result.exitCode(), result.timedOut(), result.summary());
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Cannot collect registry workload diagnostics: {0}", String.join(" ", command));
+            }
         }
     }
 

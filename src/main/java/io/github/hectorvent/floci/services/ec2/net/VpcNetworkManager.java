@@ -547,7 +547,8 @@ public class VpcNetworkManager {
      * Attaching as a second network keeps published ports working while making the VPC address
      * the one Floci reports, and the one instances in the same VPC use to reach each other.
      *
-     * @return the network name on success, empty when the instance stays on the bridge only
+     * @return the network name on success, empty when no VPC attachment is configured or planned
+     * @throws IllegalStateException when a requested attachment cannot be confirmed
      */
     public Optional<String> attach(String region, String vpcId, String subnetId,
                                    String containerId, String address) {
@@ -581,10 +582,22 @@ public class VpcNetworkManager {
             LOG.infov("Attached container {0} to VPC network {1} at {2}", containerId, networkName, address);
             return Optional.of(networkName);
         } catch (Exception e) {
-            LOG.warnv("Could not attach container {0} to VPC network {1} at {2}: {3}. The instance keeps "
-                            + "its bridge address and its reported private IP will not be reachable.",
-                    containerId, networkName, address, e.getMessage());
-            return Optional.empty();
+            // A lost response can follow a successful attach. Read the endpoint before failing launch.
+            try {
+                InspectContainerResponse inspection = dockerClient.inspectContainerCmd(containerId).exec();
+                Map<String, ContainerNetwork> networks = inspection.getNetworkSettings() == null
+                        ? null : inspection.getNetworkSettings().getNetworks();
+                ContainerNetwork endpoint = networks == null ? null : networks.get(networkName);
+                if (endpoint != null && address.equals(endpoint.getIpAddress())) {
+                    LOG.infov("Confirmed container {0} on VPC network {1} at {2} after an attach error",
+                            containerId, networkName, address);
+                    return Optional.of(networkName);
+                }
+            } catch (Exception inspectionFailure) {
+                e.addSuppressed(inspectionFailure);
+            }
+            throw new IllegalStateException("Cannot confirm container " + containerId
+                    + " on VPC network " + networkName + " at " + address, e);
         }
     }
 
