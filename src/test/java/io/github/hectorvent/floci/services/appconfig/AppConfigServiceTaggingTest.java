@@ -20,6 +20,7 @@ import static io.github.hectorvent.floci.testing.ThreadStates.awaitBlockedOrDone
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
 
 /**
  * TagResource and UntagResource on an application read it, change its tags and write it back. They
@@ -35,7 +36,7 @@ class AppConfigServiceTaggingTest {
     @Test
     void anApplicationReadBeforeATagOrUntagKeepsItsPriorTags() {
         AppConfigService service = new AppConfigService(new InMemoryStorageFactory(ACCOUNT),
-                new RegionResolver("us-east-1", ACCOUNT));
+                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class));
         Application created = service.createApplication(Map.of("Name", "orders"));
         service.tagApplication(created.getId(), Map.of("team", "payments"));
         Application beforeTag = service.getApplication(created.getId());
@@ -93,6 +94,6 @@ class AppConfigServiceTaggingTest {
     /** An AppConfig service whose application store is {@code store} and every other store in memory. */
     private static AppConfigService serviceWithApplicationStore(StorageBackend<String, Application> store) {
         return new AppConfigService(new InMemoryStorageFactory(ACCOUNT).withStore(APPLICATIONS, store),
-                new RegionResolver("us-east-1", ACCOUNT));
+                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class));
     }
 }

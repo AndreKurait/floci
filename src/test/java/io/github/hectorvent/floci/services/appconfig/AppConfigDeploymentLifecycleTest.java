@@ -59,7 +59,7 @@ class AppConfigDeploymentLifecycleTest {
         Clock clock = mock(Clock.class);
         when(clock.instant()).thenReturn(START);
         AppConfigService service = new AppConfigService(storage,
-                new RegionResolver("us-east-1", "000000000000"), clock);
+                new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class));
         Scope scope = scope(service);
         String strategy = service.createDeploymentStrategy(Map.of(
                 "Name", "gradual", "DeploymentDurationInMinutes", rolloutMinutes,
@@ -109,7 +109,7 @@ class AppConfigDeploymentLifecycleTest {
         Clock clock = mock(Clock.class);
         when(clock.instant()).thenReturn(START);
         AppConfigService service = new AppConfigService(storage,
-                new RegionResolver("us-east-1", "000000000000"), clock);
+                new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class));
         Scope scope = scope(service);
         String strategy = service.createDeploymentStrategy(Map.of(
                 "Name", "gradual", "DeploymentDurationInMinutes", minutes,
@@ -155,7 +155,7 @@ class AppConfigDeploymentLifecycleTest {
         Clock clock = mock(Clock.class);
         when(clock.instant()).thenReturn(START);
         AppConfigService service = new AppConfigService(storage,
-                new RegionResolver("us-east-1", "000000000000"), clock);
+                new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class));
         Scope scope = scope(service);
         deploy(service, scope, "1", scope.fast());
         String strategy = service.createDeploymentStrategy(Map.of(
@@ -179,7 +179,7 @@ class AppConfigDeploymentLifecycleTest {
         Clock clock = mock(Clock.class);
         when(clock.instant()).thenReturn(START);
         AppConfigService service = new AppConfigService(storage,
-                new RegionResolver("us-east-1", "000000000000"), clock);
+                new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class));
         Scope scope = scope(service);
         String strategy = service.createDeploymentStrategy(Map.of(
                 "Name", "gradual", "DeploymentDurationInMinutes", 1, "GrowthFactor", 50)).getId();
@@ -288,7 +288,7 @@ class AppConfigDeploymentLifecycleTest {
         Clock clock = mock(Clock.class);
         when(clock.instant()).thenReturn(START);
         AppConfigService service = new AppConfigService(storage,
-                new RegionResolver("us-east-1", "000000000000"), clock);
+                new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class));
         Scope scope = scope(service);
         Deployment deployment = deploy(service, scope, "1", scope.fast());
         when(clock.instant()).thenReturn(START.plus(Duration.ofHours(72)).plusNanos(1));
@@ -421,7 +421,7 @@ class AppConfigDeploymentLifecycleTest {
         StorageFactory storage = factory();
         Clock clock = mock(Clock.class);
         when(clock.instant()).thenReturn(START);
-        AppConfigService service = new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"), clock);
+        AppConfigService service = new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class));
         Scope scope = scope(service);
         Deployment baking = deploy(service, scope, "1", scope.bake());
         Deployment response = service.getDeployment(scope.app(), scope.env(), baking.getDeploymentNumber());
@@ -497,7 +497,7 @@ class AppConfigDeploymentLifecycleTest {
     }
 
     private AppConfigService service(StorageFactory storage, Instant time) {
-        return new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"), Clock.fixed(time, ZoneOffset.UTC));
+        return new AppConfigService(storage, new RegionResolver("us-east-1", "000000000000"), Clock.fixed(time, ZoneOffset.UTC), mock(AppConfigAlarmMonitor.class));
     }
 
     private StorageFactory factory() {

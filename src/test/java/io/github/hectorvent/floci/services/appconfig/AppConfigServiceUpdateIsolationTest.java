@@ -14,6 +14,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.mockito.Mockito.mock;
 
 /**
  * The update methods CloudFormation uses write a new copy of the entity rather than change the
@@ -26,7 +27,7 @@ class AppConfigServiceUpdateIsolationTest {
     private static final String ALARM = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration-errors";
 
     private final AppConfigService service = new AppConfigService(new InMemoryStorageFactory("000000000000"),
-            new RegionResolver("us-east-1", "000000000000"));
+            new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
 
     @Test
     void aStrategyReadBeforeAnUpdateKeepsItsPriorSettings() {
