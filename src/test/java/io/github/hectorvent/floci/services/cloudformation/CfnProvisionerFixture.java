@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewa
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayV2CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayV2DomainCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AppConfigCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.AppConfigHostedVersionCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AppSyncCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApplicationAutoScalingCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AutoScalingGroupCfnProvisioner;
@@ -345,6 +346,7 @@ final class CfnProvisionerFixture {
             discovered.add(new CdkMetadataCfnProvisioner());
             if (appConfigService != null) {
                 discovered.add(new AppConfigCfnProvisioner(appConfigService));
+                discovered.add(new AppConfigHostedVersionCfnProvisioner(appConfigService));
             }
             if (codeDeployService != null) {
                 discovered.add(new CodeDeployCfnProvisioner(codeDeployService));

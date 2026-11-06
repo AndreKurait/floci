@@ -360,6 +360,7 @@ class CloudFormationServiceRollbackTest {
     @BeforeEach
     void setUp() {
         provisioner = mock(CfnResourceDispatcher.class);
+        when(provisioner.referenceValue(anyString(), anyString())).thenAnswer(invocation -> invocation.getArgument(1));
         // What the registry and the real provisioners say of a type: an unregistered Custom:: type
         // goes to the generic custom-resource handler, Custom::DynamoDBReplica has its own, and the
         // provisioners of the types whose ids relate to a parent's say how.

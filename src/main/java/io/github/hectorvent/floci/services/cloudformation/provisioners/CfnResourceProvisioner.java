@@ -27,6 +27,11 @@ public interface CfnResourceProvisioner {
 
     Set<String> resourceTypes();
 
+    /** Ref can expose one part of a resource's compound physical identity. */
+    default String referenceValue(String physicalId) {
+        return physicalId;
+    }
+
     /**
      * Replacement rules that depend on the desired properties, which may still contain unresolved
      * expressions. This read-only preview cannot override unconditional create-only schema properties.
