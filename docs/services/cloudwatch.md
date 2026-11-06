@@ -415,7 +415,11 @@ requests use the account and region in their credential scope.
 
 Use `Version=2010-08-01` for current GET operations. Omitting the version selects the
 legacy `2009-05-15` API, which supports only `ListMetrics` and `GetMetricStatistics`.
-An invalid version or action returns HTTP 404 `InvalidAction`; an absent action returns
+`Version=2013-01-16` supports `ListMetrics`, `GetMetricStatistics` and `DescribeAlarms`
+over GET and POST, using the requested version's XML namespace and the shared input
+members listed below. Unimplemented legacy operations, other input members and alarm
+listings containing metric-math definitions return HTTP 400 `UnsupportedOperation`.
+An invalid GET version or legacy action returns HTTP 404 `InvalidAction`; an absent action returns
 HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
 
 JSON `PutMetricData` accepts a gzip-compressed body (`Content-Encoding: gzip`), which the AWS
@@ -436,9 +440,12 @@ four operations on the same metrics and alarms, with these request members: `Lis
 (`Namespace`, `MetricName`, `Dimensions`, `NextToken`), `DescribeAlarms` (`AlarmNames`,
 `AlarmNamePrefix`, `MaxRecords`, `NextToken`), `GetMetricStatistics` (`Namespace`, `MetricName`,
 `Dimensions`, `StartTime`, `EndTime`, `Period`, `Statistics`, `Unit`) and `DeleteAlarms`
-(`AlarmNames`). Every result comes back at once, so `MaxRecords` and `NextToken` change nothing.
-It returns HTTP 400 `UnsupportedOperation` for every other operation, such as the console's
-`GetMetricData` with `Defaults` and `Metrics`; for a request that sets any other member, such as
+(`AlarmNames`). `ListMetrics` supports `NextToken`; `DescribeAlarms` returns every result
+at once, so its `MaxRecords` and `NextToken` change nothing.
+Unknown legacy operation names return HTTP 404 `UnknownOperationException` before
+body parsing. Recognized operations outside the supported set return HTTP 400
+`UnsupportedOperation`, including the console's `GetMetricData` with `Defaults` and
+`Metrics`. Supported operations also return that error for a request that sets any other member, such as
 `StateValue`, `ExtendedStatistics` or the console's `CountOnlyRequest`, to a value other than
 `false` or `null`; and for a `DescribeAlarms` answer that would list an alarm defined with
 `Metrics`, whose items the console's API shapes differently. Such an alarm makes every listing

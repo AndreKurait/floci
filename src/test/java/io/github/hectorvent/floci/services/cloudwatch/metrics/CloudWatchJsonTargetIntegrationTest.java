@@ -130,16 +130,17 @@ class CloudWatchJsonTargetIntegrationTest {
 
     @ParameterizedTest
     @CsvSource(delimiter = '|', textBlock = """
-            PutMetricData       | {"Namespace":"Example/JsonTarget","MetricData":[{"MetricName":"Requests","Value":1}]}
-            SetAlarmState       | {"AlarmName":"json-target-none","StateValue":"OK","StateReason":"test"}
-            PutDashboard        | {"DashboardName":"json-target-none","DashboardBody":"{}"}
-            ListTagsForResource | {"ResourceARN":"arn:aws:cloudwatch:us-east-1:000000000000:alarm:json-target-none"}
-            ListMetricStreams   | {}
-            getMetricData       | {}
+            PutMetricData       | {"Namespace":"Example/JsonTarget","MetricData":[{"MetricName":"Requests","Value":1}]} | 400 | UnsupportedOperation
+            SetAlarmState       | {"AlarmName":"json-target-none","StateValue":"OK","StateReason":"test"} | 400 | UnsupportedOperation
+            PutDashboard        | {"DashboardName":"json-target-none","DashboardBody":"{}"} | 400 | UnsupportedOperation
+            ListTagsForResource | {"ResourceARN":"arn:aws:cloudwatch:us-east-1:000000000000:alarm:json-target-none"} | 404 | UnknownOperationException
+            ListMetricStreams   | {} | 404 | UnknownOperationException
+            getMetricData       | {} | 404 | UnknownOperationException
             """)
-    void operationsTheConsoleTargetDoesNotShareAreRefused(String operation, String body) {
-        json(CONSOLE_TARGET, operation, body).then().statusCode(400)
-                .body("__type", equalTo("UnsupportedOperation"));
+    void operationsTheConsoleTargetDoesNotShareAreRefused(String operation, String body,
+                                                        int status, String errorCode) {
+        json(CONSOLE_TARGET, operation, body).then().statusCode(status)
+                .body("__type", equalTo(errorCode));
     }
 
     @ParameterizedTest

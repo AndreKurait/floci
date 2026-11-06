@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 import io.github.hectorvent.floci.services.bcmpricingcalculator.BcmPricingCalculatorJsonHandler;
 import io.github.hectorvent.floci.services.cloudcontrol.CloudControlJsonHandler;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchLegacyProtocol;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbRequestShapes;
@@ -148,6 +149,10 @@ public class AwsJsonController {
 
         String serviceKey = targetMatch.descriptor().externalKey();
         String action = targetMatch.action();
+        if ("monitoring".equals(serviceKey) && targetMatch.jsonOnly()
+                && !CloudWatchLegacyProtocol.operations().contains(action)) {
+            return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
+        }
         LOG.debugv("{0} JSON action: {1}", serviceKey, action);
 
         JsonNode request;

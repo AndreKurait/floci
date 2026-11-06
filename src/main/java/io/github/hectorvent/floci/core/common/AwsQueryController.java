@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingQueryHandler;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchLegacyProtocol;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsQueryHandler;
 import io.github.hectorvent.floci.services.cognito.CognitoJsonHandler;
 import io.github.hectorvent.floci.services.docdb.DocDbQueryHandler;
@@ -181,6 +182,12 @@ public class AwsQueryController {
     private Response dispatchToHandler(String service, String action,
                                        MultivaluedMap<String, String> formParams,
                                        String authorization, String region) {
+        if ("monitoring".equals(service)
+                && CloudWatchLegacyProtocol.VERSION.equals(formParams.getFirst("Version"))
+                && !CloudWatchLegacyProtocol.operations().contains(action)) {
+            return xmlErrorResponse("InvalidAction", "Could not find operation " + action + " for version "
+                    + CloudWatchLegacyProtocol.VERSION, 404);
+        }
         return switch (service) {
             case "sqs" -> sqsQueryHandler.handle(action, formParams, region);
             case "sns" -> snsQueryHandler.handle(action, formParams, region);
@@ -418,6 +425,7 @@ public class AwsQueryController {
         Set<String> actions = switch (version) {
             case "2009-05-15" -> Set.of("ListMetrics", "GetMetricStatistics");
             case CLOUDWATCH_API_VERSION -> QueryServiceModels.of("monitoring").operations();
+            case CloudWatchLegacyProtocol.VERSION -> CloudWatchLegacyProtocol.operations();
             default -> Set.of();
         };
         if (!actions.contains(action)) {
@@ -465,6 +473,8 @@ public class AwsQueryController {
             QueryService.modeled("elasticache", "ValidateIamAuthToken"),
             QueryService.modeled("rds"),
             QueryService.modeled("monitoring"),
+            new QueryService("monitoring", Set.of(CloudWatchLegacyProtocol.VERSION),
+                    CloudWatchLegacyProtocol.operations()),
             QueryService.modeled("cloudformation"),
             QueryService.modeled("email"),
             new QueryService("cognito-idp", Set.of(), COGNITO_ACTIONS),
