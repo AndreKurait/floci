@@ -952,8 +952,18 @@ reservations, while a recipient cannot move it even when Describe exposes the re
 A move to a foreign-owned destination returns `InvalidCapacityReservationId.NotFound`
 when it only needs unused capacity, but `InvalidParameterValue` when it needs consumed
 capacity. Rejected moves preserve membership, counts and retry tokens.
-Shared used capacity and Capacity Blocks are not modeled by the move operation. The consumed-sharing
-and inflight compatibility matrix remains incomplete.
+Shared reservations admit recipients only through an active RAM share with an accepted
+account invitation or an authorized organization principal. Pending invitations provide
+RAM discovery metadata, not EC2 admission. Reservation mutation remains owner-only.
+Accepted open shares also adopt matching, unassociated running recipient instances with
+an `open` preference when capacity membership is reconciled.
+Membership records retain the instance account across storage recovery. Removing a share
+prevents new admissions; existing membership remains until the instance stops or terminates,
+or the reservation is cancelled or expires. Restart checks current sharing authorization.
+Consumed capacity moves retain member ownership and require the recipient to be authorized
+to use the destination. Capacity updates across owners publish in one atomic storage batch.
+Capacity Blocks are not modeled by the move operation. The consumed-sharing and inflight
+compatibility matrix remains incomplete.
 
 Capacity reservation zone IDs must be among those returned by `DescribeAvailabilityZones`.
 
