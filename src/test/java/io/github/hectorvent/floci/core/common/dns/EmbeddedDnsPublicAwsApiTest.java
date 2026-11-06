@@ -8,8 +8,8 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EmbeddedDnsPublicAwsApiTest {
     private static final String CLIENT = "10.87.1.10";
@@ -112,6 +112,20 @@ class EmbeddedDnsPublicAwsApiTest {
         DnsForwardingRuleSource source = (account, region, vpc) -> List.of(rule);
         assertEquals(rule.targets(), server(true, List.of(records), List.of(source), VPC,
                 List.of("api.peer.example")).planQuery("api.peer.example", CLIENT, CONTROL, 1).ruleTargets());
+    }
+
+    @Test
+    void exactPeerNamesSupportSingleLabelsAndUnderscoresWithoutSuffixExpansion() {
+        for (String name : List.of("peer", "peer_service.example", "_peer", "123",
+                "1.2.3.999", "x".repeat(63) + ".example")) {
+            EmbeddedDnsServer dns = server(true, List.of(), List.of(), VPC, List.of(name));
+            assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                    addresses(dns, name, CLIENT));
+            assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                    dns.planQuery("child." + name, CLIENT, CONTROL, 1));
+            assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                    dns.planQuery(name, "172.17.0.20", CONTROL, 1));
+        }
     }
 
     @Test

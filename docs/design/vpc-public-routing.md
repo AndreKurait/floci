@@ -58,7 +58,8 @@ limited to the selected address and ports. It does not give guests a route to
 the upstream's Docker address or a general internet route.
 
 Additional explicitly named public hosts may use this same destination for
-known VPC clients. Exact names do not imply suffix or wildcard matches.
+known VPC clients. Exact names may contain underscores or a single label;
+literal IP addresses are not names. Exact names do not imply suffix or wildcard matches.
 Native DNS records and forwarding rules retain precedence; non-VPC lookups
 retain their existing resolution. This configuration supplies a transport
 destination, not an implementation of any peer protocol or authorization.

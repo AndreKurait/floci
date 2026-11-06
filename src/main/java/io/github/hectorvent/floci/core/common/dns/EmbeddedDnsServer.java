@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
+import io.netty.util.NetUtil;
 import io.quarkus.runtime.Startup;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -486,9 +487,10 @@ public class EmbeddedDnsServer {
         if (host.endsWith(".")) {
             host = host.substring(0, host.length() - 1);
         }
-        if (host.length() > 253 || !host.contains(".")
-                || !host.matches("[a-z0-9-]+(?:\\.[a-z0-9-]+)+")
-                || host.matches("[0-9.]+")
+        if (host.length() > 253
+                || !host.matches("[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?"
+                        + "(?:\\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*")
+                || NetUtil.isValidIpV4Address(host)
                 || Arrays.stream(host.split("\\.")).anyMatch(label ->
                         label.length() > 63 || label.startsWith("-") || label.endsWith("-"))) {
             throw new IllegalArgumentException("Public endpoint host must be an exact DNS name");
