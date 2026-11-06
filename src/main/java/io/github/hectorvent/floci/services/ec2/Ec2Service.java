@@ -4721,7 +4721,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         policyGroups, policyPrefixLists(region, policyGroups),
                         () -> RequestScopes.callAs(accountId, region,
                                 () -> prepareInstanceMounts(region, inst, resolvedImage.volumeMounts())), () ->
-                                RequestScopes.runAs(accountId, region, () -> restoreAttachedVolumesForInstance(region, inst)));
+                                RequestScopes.runAs(accountId, region, () -> completeContainerStart(region, inst)));
             }
         }
 
@@ -4730,6 +4730,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
 
         return reservation;
+    }
+
+    private void completeContainerStart(String region, Instance instance) {
+        restoreAttachedVolumesForInstance(region, instance);
+        // The worker updates the live model after RunInstances or StartInstances saved it.
+        // Persist its container identity and addresses without waiting for another API write.
+        instances.put(key(region, instance.getInstanceId()), instance);
     }
 
     private List<Ec2VolumeBlockDeviceManager.PreparedMount> prepareInstanceMounts(
@@ -6172,7 +6179,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 String accountId = callerAccountId();
                 containerManager.start(inst, () ->
                         RequestScopes.runAs(accountId, region, () -> verifyInstanceMounts(region, inst)), () ->
-                        RequestScopes.runAs(accountId, region, () -> restoreAttachedVolumesForInstance(region, inst)));
+                        RequestScopes.runAs(accountId, region, () -> completeContainerStart(region, inst)));
             }
             instances.put(key(region, id), inst);
             Map<String, String> entry = new LinkedHashMap<>();

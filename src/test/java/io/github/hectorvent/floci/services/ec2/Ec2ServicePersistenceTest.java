@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.ec2.model.DhcpOptions;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
@@ -46,6 +47,9 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519_FINGERPRINT;
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519_KEY;
@@ -54,6 +58,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -71,6 +82,72 @@ import static org.mockito.Mockito.when;
 class Ec2ServicePersistenceTest {
 
     private static final String REGION = "us-east-1";
+
+    @Test
+    void completedContainerLaunchSurvivesRestartWithoutAnUnrelatedWrite(@TempDir Path dir) throws Exception {
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        AtomicReference<Runnable> completion = new AtomicReference<>();
+        doAnswer(invocation -> {
+            completion.set(invocation.getArgument(8));
+            return null;
+        }).when(containers).launch(any(), any(ResolvedAmiImage.class), isNull(), eq(REGION),
+                anySet(), anyList(), anyMap(), any(), any());
+        Ec2Service original = newService(dir, containers);
+        Instance launched = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        assertNull(persistedInstance(dir, launched).getDockerContainerId());
+
+        // Docker finishes on a worker after RunInstances has written its pending record.
+        launched.setDockerContainerId("native-container");
+        launched.setContainerBridgeIp("10.73.1.10");
+        launched.setState(InstanceState.running());
+        runOnWorker(completion.get());
+
+        Instance restored = persistedInstance(dir, launched);
+        assertEquals("running", restored.getState().getName());
+        assertEquals("native-container", restored.getDockerContainerId());
+        assertEquals("10.73.1.10", restored.getContainerBridgeIp());
+    }
+
+    @Test
+    void completedContainerStartPersistsItsNewAddressAndRunningState(@TempDir Path dir) throws Exception {
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        AtomicReference<Runnable> completion = new AtomicReference<>();
+        doAnswer(invocation -> {
+            completion.set(invocation.getArgument(2));
+            return null;
+        }).when(containers).start(any(), any(), any());
+        Ec2Service original = newService(dir, containers);
+        Instance instance = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setDockerContainerId("retained-container");
+        instance.setContainerBridgeIp("10.73.1.10");
+        instance.setState(InstanceState.stopped());
+        original.startInstances(REGION, List.of(instance.getInstanceId()));
+        assertEquals("pending", persistedInstance(dir, instance).getState().getName());
+
+        instance.setContainerBridgeIp("10.73.1.11");
+        instance.setState(InstanceState.running());
+        runOnWorker(completion.get());
+
+        Instance restored = persistedInstance(dir, instance);
+        assertEquals("running", restored.getState().getName());
+        assertEquals("retained-container", restored.getDockerContainerId());
+        assertEquals("10.73.1.11", restored.getContainerBridgeIp());
+    }
+
+    private Instance persistedInstance(Path dir, Instance instance) {
+        return load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})
+                .get(REGION + "::" + instance.getInstanceId()).orElseThrow();
+    }
+
+    private static void runOnWorker(Runnable completion) throws Exception {
+        FutureTask<Void> worker = new FutureTask<>(completion, null);
+        Thread thread = new Thread(worker);
+        thread.start();
+        worker.get(10, TimeUnit.SECONDS);
+        thread.join();
+    }
 
     @Test
     void deletedLatestLaunchTemplateVersionIsNotReusedAfterRestart(@TempDir Path dir) {
@@ -953,16 +1030,20 @@ class Ec2ServicePersistenceTest {
     }
 
     private Ec2Service newService(Path dir) {
+        return newService(dir, null);
+    }
+
+    private Ec2Service newService(Path dir, Ec2ContainerManager containers) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
-        when(ec2.mock()).thenReturn(true);
+        when(ec2.mock()).thenReturn(containers == null);
         when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
         Ec2ImageCatalog imageCatalog = new Ec2ImageCatalog();
-        return new Ec2Service(config, null, mock(Ec2PortForwardManager.class),
+        return new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
                 new AmiImageResolver(imageCatalog), imageCatalog,
                 new Ec2InstanceTypeCatalog(),
                 load(dir, "ec2-vpcs.json", new TypeReference<Map<String, Vpc>>() {}),
