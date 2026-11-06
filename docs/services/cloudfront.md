@@ -156,6 +156,10 @@ PUT, PATCH and DELETE).
   method; any other method returns 403 `Invalid method.`. A behavior without `AllowedMethods` allows
   GET and HEAD. Origin forwarding preserves the raw path, including `%25` for a literal percent
   sign, on generated domains and aliases. Custom-origin redirects are not followed.
+- Viewer host lookup spans accounts, while management APIs remain account-scoped. Policy and key
+  references resolve in the distribution's owning account without replacing the viewer identity
+  used for origin authorization. Equally specific conflicting stored host claims are not routed.
+  Cross-account S3 origins use the existing `FLOCI_SERVICES_S3_GLOBAL_BUCKET_NAMESPACE=true` setting.
 - POST, PUT, PATCH and DELETE are forwarded to custom origins with the viewer request body and its
   `Content-Type`. The body is streamed to the origin with the viewer's `Content-Length`, or chunked
   when the viewer sent it chunked or, as HTTP/2 allows, with no length, so it is never held in

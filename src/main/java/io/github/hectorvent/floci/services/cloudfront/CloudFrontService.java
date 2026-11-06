@@ -8,9 +8,11 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.CloudFrontEdgeDomain;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
@@ -137,7 +139,6 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
     private final StorageBackend<String, FieldLevelEncryptionConfig> fleConfigStore;
     private final StorageBackend<String, FieldLevelEncryptionProfile> fleProfileStore;
     private final StorageBackend<String, MonitoringSubscription> monitoringStore;
-    private final String accountId;
     private final RegionResolver regionResolver;
     private final IamService iamService;
     private final CertificateReferenceResolver certificates;
@@ -197,7 +198,6 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
                 new TypeReference<Map<String, FieldLevelEncryptionProfile>>() {});
         this.monitoringStore = factory.create("cloudfront", "cloudfront-monitoring-subscriptions.json",
                 new TypeReference<Map<String, MonitoringSubscription>>() {});
-        this.accountId = config.defaultAccountId();
         this.regionResolver = regionResolver;
         this.configuredDomainSuffix = config.services().cloudfront().domainSuffix().orElse(null);
         this.localDeliverySuffixes = localDeliverySuffixes(config);
@@ -571,49 +571,63 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
      * ({@code <id>.cloudfront.net}), one of its alternate domain names (CNAME aliases), or one of
      * the local delivery hostnames {@code <id>.cloudfront.localhost.floci.io} and
      * {@code <id>.cloudfront.localhost}. Any port suffix is ignored and matching is
-     * case-insensitive. Returns {@code null} when nothing matches.
+     * case-insensitive. Viewer hosts are resolved across accounts. Returns {@code null} when nothing
+     * matches or stored distributions claim the same equally specific host.
      */
     public Distribution findByHost(String host) {
+        return matchViewerHost(host).distribution();
+    }
+
+    record ViewerHostMatch(Distribution distribution, boolean ambiguous) {}
+
+    ViewerHostMatch matchViewerHost(String host) {
         if (host == null || host.isBlank()) {
-            return null;
+            return new ViewerHostMatch(null, false);
         }
         String hostname = stripPort(host);
-        List<Distribution> distributions = distStore.scan(k -> true);
-        for (Distribution dist : distributions) {
-            if (hostname.equalsIgnoreCase(dist.getDomainName())) {
-                return dist;
-            }
-        }
-        for (Distribution dist : distributions) {
-            DistributionConfig cfg = dist.getConfig();
-            if (cfg != null && cfg.getAliases() != null) {
-                for (String alias : cfg.getAliases()) {
-                    if (hostname.equalsIgnoreCase(alias)) {
-                        return dist;
-                    }
-                }
-            }
-        }
-        for (Distribution dist : distributions) {
-            if (matchesLocalDeliveryHost(hostname, dist.getId())) {
-                return dist;
-            }
-        }
         Distribution best = null;
         int bestSpecificity = -1;
-        for (Distribution dist : distributions) {
-            DistributionConfig cfg = dist.getConfig();
-            if (cfg == null || cfg.getAliases() == null) {
-                continue;
-            }
-            for (String alias : cfg.getAliases()) {
-                if (wildcardAliasMatches(alias, hostname) && alias.length() > bestSpecificity) {
-                    best = dist;
-                    bestSpecificity = alias.length();
-                }
+        boolean ambiguous = false;
+        for (Distribution dist : distStore.scanAllAccounts()) {
+            int specificity = viewerHostSpecificity(hostname, dist);
+            if (specificity > bestSpecificity) {
+                best = dist;
+                bestSpecificity = specificity;
+                ambiguous = false;
+            } else if (specificity >= 0 && specificity == bestSpecificity) {
+                ambiguous = true;
             }
         }
-        return best;
+        return new ViewerHostMatch(ambiguous ? null : best, ambiguous);
+    }
+
+    private int viewerHostSpecificity(String hostname, Distribution distribution) {
+        if (hostname.equalsIgnoreCase(distribution.getDomainName())) {
+            return Integer.MAX_VALUE;
+        }
+        DistributionConfig config = distribution.getConfig();
+        List<String> aliases = config != null && config.getAliases() != null ? config.getAliases() : List.of();
+        if (aliases.stream().anyMatch(hostname::equalsIgnoreCase)) {
+            return Integer.MAX_VALUE - 1;
+        }
+        if (matchesLocalDeliveryHost(hostname, distribution.getId())) {
+            return Integer.MAX_VALUE - 2;
+        }
+        return aliases.stream().filter(alias -> wildcardAliasMatches(alias, hostname))
+                .mapToInt(String::length).max().orElse(-1);
+    }
+
+    /**
+     * Reads the distribution's policies and keys in their owning account. Only configuration reads
+     * use this scope; origin authorization must retain the original viewer's identity.
+     * Storage owns this association, including persisted distributions with an older incorrect ARN.
+     */
+    <T> T readViewerConfiguration(Distribution distribution, Supplier<T> read) {
+        List<AccountEntry<Distribution>> owners = distStore.findAllAccountEntries(distribution.getId());
+        if (owners.size() != 1) {
+            throw new AwsException("NoSuchDistribution", "The specified distribution does not exist.", 404);
+        }
+        return RequestScopes.callAs(owners.getFirst().accountId(), read);
     }
 
     /**
@@ -656,7 +670,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
             if (requested == null || requested.isBlank()) {
                 continue;
             }
-            for (Distribution existing : distStore.scan(k -> true)) {
+            for (Distribution existing : distStore.scanAllAccounts()) {
                 if (existing.getId().equals(currentDistributionId) || existing.getConfig() == null
                         || existing.getConfig().getAliases() == null) {
                     continue;
@@ -2416,7 +2430,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
 
     /** A CloudFront ARN: global, so it carries no region and takes the request's partition. */
     public String arn(String resource) {
-        return regionResolver.buildGlobalArn("cloudfront", accountId, resource);
+        return regionResolver.buildGlobalArn("cloudfront", resource);
     }
 
     private static String generateDistributionId() {
