@@ -24,10 +24,12 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.core.storage.WriteProfile;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Alarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.AlarmHistoryItem;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
+import io.github.hectorvent.floci.services.servicequotas.ServiceQuotasService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -86,6 +88,7 @@ public class CloudWatchMetricsService {
     private final StorageBackend<String, AlarmHistoryItem> historyStore;
     private final RegionResolver regionResolver;
     private final AlarmSnsNotifier alarmSnsNotifier;
+    private final ServiceQuotasService serviceQuotas;
     private long lastHistorySequence;
     private Instant nextHistoryPrune = Instant.MIN;
 
@@ -93,9 +96,14 @@ public class CloudWatchMetricsService {
         this(storageFactory, regionResolver, null);
     }
 
-    @Inject
     public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
                                     AlarmSnsNotifier alarmSnsNotifier) {
+        this(storageFactory, regionResolver, alarmSnsNotifier, null);
+    }
+
+    @Inject
+    public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                    AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas) {
         // Services publish into this store every minute, SQS for every active queue, so under
         // persistent mode it is journaled rather than rewritten in full on every datum.
         this.metricStore = storageFactory.create("cloudwatchmetrics", "cwmetrics.json",
@@ -106,6 +114,7 @@ public class CloudWatchMetricsService {
                 new TypeReference<Map<String, AlarmHistoryItem>>() {}, WriteProfile.APPEND_HEAVY);
         this.regionResolver = regionResolver;
         this.alarmSnsNotifier = alarmSnsNotifier;
+        this.serviceQuotas = serviceQuotas;
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
@@ -129,6 +138,7 @@ public class CloudWatchMetricsService {
         this.historyStore = historyStore;
         this.regionResolver = regionResolver;
         this.alarmSnsNotifier = alarmSnsNotifier;
+        this.serviceQuotas = null;
     }
 
     public void putMetricData(String namespace, List<MetricDatum> datums, String region) {
@@ -301,8 +311,14 @@ public class CloudWatchMetricsService {
             MetricStat metricStat,
             String expression,
             String label,
-            boolean returnData
-    ) {}
+            boolean returnData,
+            Integer period,
+            String accountId
+    ) {
+        public MetricDataQuery(String id, MetricStat metricStat, String expression, String label, boolean returnData) {
+            this(id, metricStat, expression, label, returnData, null, null);
+        }
+    }
 
     public record MetricDataResult(
             String id,
@@ -384,34 +400,78 @@ public class CloudWatchMetricsService {
             Instant endTime,
             String region) {
 
-        List<MetricDataResult> results = new ArrayList<>();
+        return metricMathData(metricMath(queries), startTime, endTime, region);
+    }
 
+    private MetricMath metricMath(List<MetricDataQuery> queries) {
         for (MetricDataQuery query : queries) {
-            if (!query.returnData()) {
-                continue;
+            if (query != null && query.accountId() != null
+                    && !query.accountId().equals(regionResolver.getAccountId())) {
+                throw CloudWatchMetricsException.invalidParameterValue(
+                        "Cross-account metric math is not currently supported.");
             }
-            if (query.metricStat() != null) {
-                MetricStat stat = query.metricStat();
-                int period = stat.period() > 0 ? stat.period() : 60;
-
-                List<Datapoint> datapoints = getMetricStatistics(
-                        stat.namespace(), stat.metricName(), stat.dimensions(),
-                        startTime, endTime, period,
-                        List.of(stat.stat()), stat.unit(), region);
-
-                List<Instant> timestamps = new ArrayList<>();
-                List<Double> values = new ArrayList<>();
-                for (Datapoint dp : datapoints) {
-                    timestamps.add(dp.timestamp());
-                    values.add(resolveStatValue(dp, stat.stat()));
-                }
-
-                String label = query.label() != null ? query.label() : stat.metricName();
-                results.add(new MetricDataResult(query.id(), label, timestamps, values, "Complete"));
-            }
-            // Expression-based queries are out of scope for this implementation
         }
-        return results;
+        MetricMath plan = new MetricMath(queries);
+        plan.quotaMetrics().forEach(CloudWatchMetricsService::validateQuotaMetric);
+        return plan;
+    }
+
+    MetricMath alarmMath(MetricAlarm alarm) {
+        List<MetricDataQuery> queries = new ArrayList<>();
+        for (AlarmMetricDataQuery query : alarm.getMetrics()) {
+            if (query == null) {
+                throw CloudWatchMetricsException.invalidParameterValue("Metric queries cannot be null.");
+            }
+            MetricStat stat = null;
+            if (query.metricStat() != null) {
+                AlarmMetricDataQuery.MetricStat supplied = query.metricStat();
+                AlarmMetricDataQuery.Metric metric = supplied.metric();
+                if (metric == null) {
+                    throw CloudWatchMetricsException.invalidParameterValue("MetricStat requires a Metric.");
+                }
+                List<Dimension> dimensions = metric.dimensions() == null ? List.of()
+                        : metric.dimensions().stream().map(dimension ->
+                                new Dimension(dimension.name(), dimension.value())).toList();
+                stat = new MetricStat(metric.namespace(), metric.metricName(), dimensions,
+                        supplied.period() == null ? 0 : supplied.period(), supplied.stat(), supplied.unit());
+            }
+            queries.add(new MetricDataQuery(query.id(), stat, query.expression(), query.label(),
+                    !Boolean.FALSE.equals(query.returnData()), query.period(), query.accountId()));
+        }
+        MetricMath plan = metricMath(queries);
+        plan.alarmPeriod();
+        return plan;
+    }
+
+    List<MetricDataResult> metricMathData(MetricMath plan, Instant startTime, Instant endTime, String region) {
+        if (startTime == null || endTime == null || !startTime.isBefore(endTime)) {
+            throw CloudWatchMetricsException.invalidParameterValue("StartTime must be before EndTime.");
+        }
+        return plan.evaluate(startTime, endTime, stat -> {
+            Map<Instant, Double> values = new LinkedHashMap<>();
+            for (Datapoint point : getMetricStatistics(stat.namespace(), stat.metricName(), stat.dimensions(),
+                    startTime, endTime.minusNanos(1), stat.period(), List.of(stat.stat()), stat.unit(), region)) {
+                values.put(point.timestamp(), resolveStatValue(point, stat.stat()));
+            }
+            return values;
+        }, stat -> quotaValue(stat, region));
+    }
+
+    private static void validateQuotaMetric(MetricStat metric) {
+        if (!"AWS/Lambda".equals(metric.namespace()) || !"ConcurrentExecutions".equals(metric.metricName())
+                || (metric.dimensions() != null && !metric.dimensions().isEmpty())) {
+            throw CloudWatchMetricsException.invalidParameterValue(
+                    "SERVICE_QUOTA currently supports account-wide AWS/Lambda ConcurrentExecutions.");
+        }
+    }
+
+    private double quotaValue(MetricStat metric, String region) {
+        validateQuotaMetric(metric);
+        if (serviceQuotas == null) {
+            throw CloudWatchMetricsException.invalidParameterValue("The Service Quotas reader is unavailable.");
+        }
+        return serviceQuotas.getServiceQuota("lambda", "L-B99A9384", region, regionResolver.getAccountId())
+                .path("Quota").path("Value").asDouble(Double.NaN);
     }
 
     /** Shared with {@link AlarmEvaluator}, which resolves the same statistic against
@@ -443,6 +503,14 @@ public class CloudWatchMetricsService {
      * a child changes state.
      */
     public synchronized void putMetricAlarm(MetricAlarm alarm, String region) {
+        if (!alarm.getMetrics().isEmpty()) {
+            if (alarm.getNamespace() != null || alarm.getMetricName() != null || alarm.getStatistic() != null
+                    || alarm.getExtendedStatistic() != null) {
+                throw CloudWatchMetricsException.invalidParameterCombination(
+                        "Metrics cannot be combined with Namespace, MetricName, Statistic or ExtendedStatistic.");
+            }
+            alarmMath(alarm);
+        }
         if (alarm.getExtendedStatistic() != null) {
             if (alarm.getStatistic() != null || !alarm.getMetrics().isEmpty()) {
                 throw CloudWatchMetricsException.invalidParameterCombination(
