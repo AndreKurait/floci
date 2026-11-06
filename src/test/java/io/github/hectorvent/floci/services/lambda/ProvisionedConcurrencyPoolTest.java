@@ -54,6 +54,23 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 class ProvisionedConcurrencyPoolTest {
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "1", "1234567890", "0001"})
+    void publishedVersionAcceptsAsciiDigits(String value) {
+        assertTrue(ProvisionedConcurrencyPool.isPublishedVersion(value));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "$LATEST", "live", "+1", "-1", "1.0", " 1", "1 ", "1\n", "١", "１"})
+    void publishedVersionRejectsNonDigitQualifiers(String value) {
+        assertFalse(ProvisionedConcurrencyPool.isPublishedVersion(value));
+    }
+
+    @Test
+    void publishedVersionRejectsMissingQualifier() {
+        assertFalse(ProvisionedConcurrencyPool.isPublishedVersion(null));
+    }
+
     @TempDir
     Path storagePath;
 
@@ -780,7 +797,7 @@ class ProvisionedConcurrencyPoolTest {
                 storage, Clock.systemUTC(), 4, 8, false, 15, scheduler);
         pool.start();
         ArgumentCaptor<Runnable> repair = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).scheduleWithFixedDelay(repair.capture(), eq(0L), eq(1L), eq(TimeUnit.SECONDS));
+        verify(scheduler).scheduleWithFixedDelay(repair.capture(), eq(0L), eq(10L), eq(TimeUnit.SECONDS));
         repair.getValue().run();
         await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
                 verify(aliasLookup, times(1)).getForAccount(ACCOUNT, REGION, "example", "live"));
@@ -800,6 +817,58 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
+    void failedLeaseTriggersReplacementWithoutAReadOrRepairTick() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertSame(first.handle, pool.acquire(version, "live"));
+        assertTrue(pool.release(first.handle, true));
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(3)).until(() -> replacement.handle.getState() == ContainerState.WARM);
+        assertEquals(2, launcher.starts.get());
+    }
+
+    @Test
+    void retiringBusyAliasReplenishesWhenItsLeaseReleasesCapacity() throws Exception {
+        pool.shutdown();
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, storage,
+                Clock.systemUTC(), 1, 1, false, 15);
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertSame(first.handle, pool.acquire(version, "live"));
+        function(ACCOUNT, REGION, "2");
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+        pool.reconcile();
+        assertEquals(1, launcher.starts.get());
+
+        assertTrue(pool.release(first.handle, false));
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(3)).until(() -> replacement.handle.getState() == ContainerState.WARM);
+        assertEquals(2, launcher.starts.get());
+    }
+
+    @Test
+    void aliasChangeSignalInitializesReplacementWithoutAReadOrRepairTick() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        function(ACCOUNT, REGION, "2");
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+        pool.requestReconciliation();
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(3)).until(() -> replacement.handle.getState() == ContainerState.WARM);
+        assertEquals(1, first.stops.get());
+        assertEquals(2, launcher.starts.get());
+    }
+
+    @Test
     void failedEnvironmentIsReplacedAfterReady() throws Exception {
         put(1);
         Environment first = launched();
@@ -812,6 +881,23 @@ class ProvisionedConcurrencyPoolTest {
         replacement.initialized.complete(null);
         ready();
         assertEquals(1, first.stops.get());
+    }
+
+    @Test
+    void idleRuntimeFailureTriggersReplacementWithoutRepairTickOrRead() throws Exception {
+        launcher.rejectHealthChecks = true;
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        first.faulted.set(true);
+        first.runtimeFailure.complete(null);
+
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(3)).until(() -> replacement.handle.getState() == ContainerState.WARM);
+        assertEquals(1, first.stops.get());
+        assertEquals(2, launcher.starts.get());
     }
 
     @Test
@@ -1515,6 +1601,7 @@ class ProvisionedConcurrencyPoolTest {
     private static final class Environment {
         final RuntimeApiServer runtime = mock(RuntimeApiServer.class);
         final CompletableFuture<Void> initialized = new CompletableFuture<>();
+        final CompletableFuture<Void> runtimeFailure = new CompletableFuture<>();
         final AtomicInteger stops = new AtomicInteger();
         final AtomicBoolean faulted = new AtomicBoolean();
         final ContainerHandle handle;
@@ -1529,6 +1616,10 @@ class ProvisionedConcurrencyPoolTest {
             }).when(runtime).awaitInitialization(anyLong());
             when(runtime.isInitialized()).thenAnswer(call ->
                     initialized.isDone() && !initialized.isCompletedExceptionally() && alive && !faulted.get());
+            doAnswer(call -> {
+                runtimeFailure.thenRun(call.getArgument(0, Runnable.class));
+                return null;
+            }).when(runtime).onRuntimeFailure(any(Runnable.class));
         }
     }
 
