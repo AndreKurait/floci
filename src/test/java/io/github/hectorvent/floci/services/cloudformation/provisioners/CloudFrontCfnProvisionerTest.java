@@ -17,6 +17,10 @@ import io.github.hectorvent.floci.services.cloudfront.model.OriginRequestPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.PublicKey;
 import io.github.hectorvent.floci.services.cloudfront.model.ResponseHeadersPolicy;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
@@ -28,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -172,6 +177,7 @@ class CloudFrontCfnProvisionerTest {
         // Defaults the monolith applied and that must survive the move.
         assertEquals("http2", config.getHttpVersion());
         assertEquals("PriceClass_All", config.getPriceClass());
+        assertNull(config.getViewerCertificate());
         Origin origin = config.getOrigins().getFirst();
         assertEquals("o1", origin.getId());
         assertEquals("b.s3.amazonaws.com", origin.getDomainName());
@@ -181,6 +187,75 @@ class CloudFrontCfnProvisionerTest {
         assertEquals(3, origin.getConnectionAttempts());
         assertEquals(10, origin.getConnectionTimeout());
         assertEquals("redirect-to-https", config.getDefaultCacheBehavior().getViewerProtocolPolicy());
+    }
+
+    static Stream<Arguments> viewerCertificates() {
+        return Stream.of(
+                Arguments.of(
+                        Map.of("AcmCertificateArn", "arn:aws:acm:us-east-1:000000000000:certificate/current",
+                                "SslSupportMethod", "sni-only", "MinimumProtocolVersion", "TLSv1.2_2021"),
+                        Map.of("ACMCertificateArn", "arn:aws:acm:us-east-1:000000000000:certificate/current",
+                                "SSLSupportMethod", "sni-only", "MinimumProtocolVersion", "TLSv1.2_2021")),
+                Arguments.of(
+                        Map.of("IamCertificateId", "ASCAEXAMPLE", "SslSupportMethod", "sni-only",
+                                "MinimumProtocolVersion", "TLSv1.2_2021"),
+                        Map.of("IAMCertificateId", "ASCAEXAMPLE", "SSLSupportMethod", "sni-only",
+                                "MinimumProtocolVersion", "TLSv1.2_2021")),
+                Arguments.of(Map.of("CloudFrontDefaultCertificate", true),
+                        Map.of("CloudFrontDefaultCertificate", "true")));
+    }
+
+    @ParameterizedTest
+    @MethodSource("viewerCertificates")
+    void preservesViewerCertificateOnCreateAndUpdate(Map<String, Object> properties, Map<String, String> expected) {
+        Distribution existing = distribution("E1DIST", "d111.cloudfront.net");
+        DistributionConfig previous = new DistributionConfig();
+        previous.setViewerCertificate(Map.of("ACMCertificateArn", "previous-certificate"));
+        existing.setConfig(previous);
+        when(cloudFront.createDistribution(any(), any())).thenReturn(existing);
+        when(cloudFront.getDistribution(existing.getId())).thenReturn(existing);
+        when(cloudFront.updateDistribution(eq(existing.getId()), eq(ETAG), any())).thenReturn(existing);
+        JsonNode props = mapper.valueToTree(Map.of("DistributionConfig", Map.of("ViewerCertificate", properties)));
+
+        provisioner.provision(resource(DISTRIBUTION), props, distributionCtx(null));
+        provisioner.provision(resource(DISTRIBUTION), props, distributionCtx(existing.getId()));
+
+        ArgumentCaptor<Distribution> created = ArgumentCaptor.forClass(Distribution.class);
+        verify(cloudFront).createDistribution(created.capture(), any());
+        ArgumentCaptor<Distribution> updated = ArgumentCaptor.forClass(Distribution.class);
+        verify(cloudFront).updateDistribution(eq(existing.getId()), eq(ETAG), updated.capture());
+        assertEquals(expected, created.getValue().getConfig().getViewerCertificate());
+        assertEquals(expected, updated.getValue().getConfig().getViewerCertificate());
+        assertEquals(Map.of("ACMCertificateArn", "previous-certificate"), previous.getViewerCertificate());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{}", "{\"ViewerCertificate\":null}"})
+    void absentViewerCertificateClearsThePreviousConfigurationOnUpdate(String config) throws Exception {
+        Distribution existing = distribution("E1DIST", "d111.cloudfront.net");
+        DistributionConfig previous = new DistributionConfig();
+        previous.setViewerCertificate(Map.of("ACMCertificateArn", "previous-certificate"));
+        existing.setConfig(previous);
+        when(cloudFront.getDistribution(existing.getId())).thenReturn(existing);
+        when(cloudFront.updateDistribution(eq(existing.getId()), eq(ETAG), any())).thenReturn(existing);
+
+        provisioner.provision(resource(DISTRIBUTION), json("{\"DistributionConfig\":" + config + "}"),
+                distributionCtx(existing.getId()));
+
+        ArgumentCaptor<Distribution> updated = ArgumentCaptor.forClass(Distribution.class);
+        verify(cloudFront).updateDistribution(eq(existing.getId()), eq(ETAG), updated.capture());
+        assertNull(updated.getValue().getConfig().getViewerCertificate());
+        assertEquals(Map.of("ACMCertificateArn", "previous-certificate"), previous.getViewerCertificate());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"true", "[]", "\"certificate\""})
+    void invalidViewerCertificateFailsBeforeCreatingDistribution(String value) throws Exception {
+        JsonNode props = json("{\"DistributionConfig\":{\"ViewerCertificate\":" + value + "}}");
+        AwsException error = assertThrows(AwsException.class,
+                () -> provisioner.provision(resource(DISTRIBUTION), props, distributionCtx(null)));
+        assertEquals("ValidationError", error.getErrorCode());
+        verify(cloudFront, never()).createDistribution(any(), any());
     }
 
     @Test
