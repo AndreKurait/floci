@@ -197,9 +197,71 @@ class Ec2RegisterImageTagCleanupTest {
         assertThat(recording.deletions).containsExactly("deregister:ami-1", "snapshot:ami-1-snapshot-1", "snapshot:ami-1-snapshot-2");
     }
 
+    @Test
+    void sourceRecoversAllocationWhenRegistrationResponseIsLost() {
+        RecordingClient recording = new RecordingClient();
+        recording.imageNames.put("ami-unrelated", "unrelated");
+        RuntimeException response = recording.fail("registerImageResponse");
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> {
+            try (Ec2RegisterImageTagTest.ImageSource source = recording.source()) {
+                source.register(source.registration("owned").build());
+            }
+        });
+        assertThat(thrown).isSameAs(response);
+        assertThat(recording.images).isEqualTo(1);
+        assertThat(recording.deletions).containsExactly("deregister:ami-1", "snapshot:snap-source", "volume:vol-source");
+    }
+
+    @Test
+    void copiesRecoverAllocationWhenCopyResponseIsLost() {
+        RecordingClient recording = new RecordingClient();
+        RuntimeException response = recording.fail("copyImageResponse");
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> {
+            try (Ec2RegisterImageTagTest.CopiedImages copies = new Ec2RegisterImageTagTest.CopiedImages(recording.client)) {
+                copies.copy(CopyImageRequest.builder().name("owned-copy").build());
+            }
+        });
+        assertThat(thrown).isSameAs(response);
+        assertThat(recording.images).isEqualTo(1);
+        assertThat(recording.deletions).containsExactly("deregister:ami-1", "snapshot:ami-1-snapshot-1", "snapshot:ami-1-snapshot-2");
+    }
+
+    @Test
+    void failedRegistrationRecoveryStillAttemptsSnapshotAndVolumeCleanup() {
+        RecordingClient recording = new RecordingClient();
+        RuntimeException response = recording.fail("registerImageResponse");
+        RuntimeException lookup = recording.fail("describeFilteredImages");
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> {
+            try (Ec2RegisterImageTagTest.ImageSource source = recording.source()) {
+                source.register(source.registration("owned").build());
+            }
+        });
+        assertThat(thrown).isSameAs(response);
+        assertThat(thrown.getSuppressed()).containsExactly(lookup);
+        assertThat(recording.deletions).containsExactly("snapshot:snap-source", "volume:vol-source");
+    }
+
+    @Test
+    void failedCopyRecoveryStillCleansTheKnownCopy() {
+        RecordingClient recording = new RecordingClient();
+        RuntimeException response = new IllegalStateException("lost second response");
+        RuntimeException lookup = recording.fail("describeFilteredImages");
+        RuntimeException thrown = assertThrows(RuntimeException.class, () -> {
+            try (Ec2RegisterImageTagTest.CopiedImages copies = new Ec2RegisterImageTagTest.CopiedImages(recording.client)) {
+                copies.copy(CopyImageRequest.builder().name("known").build());
+                recording.failures.put("copyImageResponse", response);
+                copies.copy(CopyImageRequest.builder().name("unknown").build());
+            }
+        });
+        assertThat(thrown).isSameAs(response);
+        assertThat(thrown.getSuppressed()).containsExactly(lookup);
+        assertThat(recording.deletions).containsExactly("deregister:ami-1", "snapshot:ami-1-snapshot-1", "snapshot:ami-1-snapshot-2");
+    }
+
     private static final class RecordingClient implements Ec2Client {
         private final Map<String, RuntimeException> failures = new LinkedHashMap<>();
         private final List<String> deletions = new ArrayList<>();
+        private final Map<String, String> imageNames = new LinkedHashMap<>();
         private final Ec2Client client = this;
         private int images;
         private int filteredReads;
@@ -271,13 +333,19 @@ class Ec2RegisterImageTagCleanupTest {
         @Override
         public RegisterImageResponse registerImage(RegisterImageRequest request) {
             call("registerImage");
-            return RegisterImageResponse.builder().imageId("ami-" + ++images).build();
+            String imageId = "ami-" + ++images;
+            imageNames.put(imageId, request.name());
+            call("registerImageResponse");
+            return RegisterImageResponse.builder().imageId(imageId).build();
         }
 
         @Override
         public CopyImageResponse copyImage(CopyImageRequest request) {
             call("copyImage");
-            return CopyImageResponse.builder().imageId("ami-" + ++images).build();
+            String imageId = "ami-" + ++images;
+            imageNames.put(imageId, request.name());
+            call("copyImageResponse");
+            return CopyImageResponse.builder().imageId(imageId).build();
         }
 
         @Override
@@ -302,9 +370,14 @@ class Ec2RegisterImageTagCleanupTest {
         public DescribeImagesResponse describeImages(DescribeImagesRequest request) {
             if (request.imageIds().isEmpty()) {
                 filteredReads++;
+                call("describeFilteredImages");
+                assertThat(request.owners()).containsExactly("self");
+                assertThat(request.filters()).hasSize(1);
+                assertThat(request.filters().get(0).name()).isEqualTo("name");
+                assertThat(request.filters().get(0).values()).hasSize(1);
                 List<Image> allocated = new ArrayList<>();
-                for (int index = 1; index <= images; index++) {
-                    allocated.add(image("ami-" + index));
+                for (String imageId : imageNames.keySet()) {
+                    allocated.add(image(imageId));
                 }
                 return DescribeImagesResponse.builder().images(allocated).build();
             }
@@ -313,7 +386,7 @@ class Ec2RegisterImageTagCleanupTest {
         }
 
         private Image image(String id) {
-            return Image.builder().imageId(id).blockDeviceMappings(
+            return Image.builder().imageId(id).name(imageNames.get(id)).blockDeviceMappings(
                     BlockDeviceMapping.builder().ebs(EbsBlockDevice.builder().snapshotId(id + "-snapshot-1").build()).build(),
                     BlockDeviceMapping.builder().ebs(EbsBlockDevice.builder().snapshotId(id + "-snapshot-2").build()).build(),
                     BlockDeviceMapping.builder().virtualName("ephemeral0").build()).build();

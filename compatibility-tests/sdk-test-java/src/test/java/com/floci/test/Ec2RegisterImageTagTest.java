@@ -3,11 +3,16 @@ package com.floci.test;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.core.interceptor.Context;
+import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
+import software.amazon.awssdk.core.interceptor.ExecutionInterceptor;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.ArchitectureValues;
 import software.amazon.awssdk.services.ec2.model.BlockDeviceMapping;
 import software.amazon.awssdk.services.ec2.model.CopyImageRequest;
+import software.amazon.awssdk.services.ec2.model.CopyImageResponse;
 import software.amazon.awssdk.services.ec2.model.CreateVolumePermission;
 import software.amazon.awssdk.services.ec2.model.CreateVolumePermissionModifications;
 import software.amazon.awssdk.services.ec2.model.DescribeSnapshotsRequest;
@@ -19,14 +24,19 @@ import software.amazon.awssdk.services.ec2.model.Image;
 import software.amazon.awssdk.services.ec2.model.LaunchPermission;
 import software.amazon.awssdk.services.ec2.model.LaunchPermissionModifications;
 import software.amazon.awssdk.services.ec2.model.RegisterImageRequest;
+import software.amazon.awssdk.services.ec2.model.RegisterImageResponse;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
+import software.amazon.awssdk.services.ec2.model.Snapshot;
 import software.amazon.awssdk.services.ec2.model.Tag;
 import software.amazon.awssdk.services.ec2.model.TagSpecification;
 import software.amazon.awssdk.services.ec2.model.VirtualizationType;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -140,6 +150,65 @@ class Ec2RegisterImageTagTest {
         }
     }
 
+    @Test
+    void registrationCleanupFindsTheImageWhenTheSdkDoesNotReturnItsId() {
+        String name = TestFixtures.uniqueName("register-image-lost-response");
+        AtomicReference<String> allocatedId = new AtomicReference<>();
+        try (Ec2Client verifier = client("111111111111", TestFixtures.region());
+                Ec2Client caller = client("111111111111", TestFixtures.region(), loseImageResponse(allocatedId))) {
+            try (ImageSource source = new ImageSource(caller, name)) {
+                assertThrows(SdkClientException.class, () -> source.register(source.registration(name).build()));
+                assertThat(allocatedId.get()).isNotBlank();
+                assertThat(verifier.describeImages().images()).extracting(Image::imageId).contains(allocatedId.get());
+            }
+            assertThat(verifier.describeImages().images()).extracting(Image::imageId).doesNotContain(allocatedId.get());
+        }
+    }
+
+    @Test
+    void copyCleanupFindsTheImageAndSnapshotWhenTheSdkDoesNotReturnItsId() {
+        String name = TestFixtures.uniqueName("copy-image-lost-response");
+        Region region = TestFixtures.region();
+        AtomicReference<String> allocatedId = new AtomicReference<>();
+        try (Ec2Client verifier = client("111111111111", region);
+                Ec2Client caller = client("111111111111", region, loseImageResponse(allocatedId));
+                ImageSource source = new ImageSource(verifier, name)) {
+            String sourceId = source.register(source.registration(name).build());
+            String snapshotId;
+            try (CopiedImages copies = new CopiedImages(caller)) {
+                assertThrows(SdkClientException.class, () -> copies.copy(CopyImageRequest.builder()
+                        .sourceRegion(region.id()).sourceImageId(sourceId).name(name + "-copy").build()));
+                assertThat(allocatedId.get()).isNotBlank();
+                Image copy = verifier.describeImages().images().stream()
+                        .filter(image -> allocatedId.get().equals(image.imageId())).findFirst().orElseThrow();
+                snapshotId = copy.blockDeviceMappings().get(0).ebs().snapshotId();
+                assertThat(snapshotId).isNotBlank().isNotEqualTo(source.snapshotId);
+                assertThat(verifier.describeSnapshots().snapshots())
+                        .extracting(Snapshot::snapshotId).contains(snapshotId);
+            }
+            assertThat(verifier.describeImages().images()).extracting(Image::imageId)
+                    .contains(sourceId).doesNotContain(allocatedId.get());
+            assertThat(verifier.describeSnapshots().snapshots()).extracting(Snapshot::snapshotId)
+                    .contains(source.snapshotId).doesNotContain(snapshotId);
+        }
+    }
+
+    private static ExecutionInterceptor loseImageResponse(AtomicReference<String> allocatedId) {
+        return new ExecutionInterceptor() {
+            @Override
+            public void afterExecution(Context.AfterExecution context, ExecutionAttributes attributes) {
+                if (context.response() instanceof RegisterImageResponse response) {
+                    allocatedId.set(response.imageId());
+                } else if (context.response() instanceof CopyImageResponse response) {
+                    allocatedId.set(response.imageId());
+                } else {
+                    return;
+                }
+                throw SdkClientException.create("Simulated loss of image allocation response");
+            }
+        };
+    }
+
     private static RuntimeException attemptCleanup(RuntimeException failure, Runnable cleanup) {
         try {
             cleanup.run();
@@ -154,23 +223,44 @@ class Ec2RegisterImageTagTest {
         return failure;
     }
 
+    private static RuntimeException recoverImageIds(Ec2Client ec2, Set<String> names,
+                                                   List<String> imageIds, RuntimeException failure) {
+        for (String name : names) {
+            if (name == null || name.isBlank()) {
+                continue;
+            }
+            failure = attemptCleanup(failure, () -> {
+                for (Image image : ec2.describeImages(read -> read.owners("self").filters(
+                        Filter.builder().name("name").values(name).build())).images()) {
+                    if (name.equals(image.name()) && !imageIds.contains(image.imageId())) {
+                        imageIds.add(image.imageId());
+                    }
+                }
+            });
+        }
+        return failure;
+    }
+
     static final class CopiedImages implements AutoCloseable {
         private final Ec2Client ec2;
         private final List<String> imageIds = new ArrayList<>();
+        private final Set<String> unresolvedNames = new LinkedHashSet<>();
 
         CopiedImages(Ec2Client ec2) {
             this.ec2 = ec2;
         }
 
         String copy(CopyImageRequest request) {
+            unresolvedNames.add(request.name());
             String imageId = ec2.copyImage(request).imageId();
             imageIds.add(imageId);
+            unresolvedNames.remove(request.name());
             return imageId;
         }
 
         @Override
         public void close() {
-            RuntimeException failure = null;
+            RuntimeException failure = recoverImageIds(ec2, unresolvedNames, imageIds, null);
             for (int index = imageIds.size() - 1; index >= 0; index--) {
                 String imageId = imageIds.get(index);
                 List<String> snapshots = new ArrayList<>();
@@ -193,15 +283,21 @@ class Ec2RegisterImageTagTest {
         }
     }
 
-    private static Ec2Client client(String account, Region region) {
+    private static Ec2Client client(String account, Region region, ExecutionInterceptor... interceptors) {
         return Ec2Client.builder().endpointOverride(TestFixtures.endpoint()).region(region)
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(account, "test")))
+                .overrideConfiguration(configuration -> {
+                    for (ExecutionInterceptor interceptor : interceptors) {
+                        configuration.addExecutionInterceptor(interceptor);
+                    }
+                })
                 .build();
     }
 
     static final class ImageSource implements AutoCloseable {
         private final Ec2Client ec2;
         private final List<String> imageIds = new ArrayList<>();
+        private final Set<String> unresolvedNames = new LinkedHashSet<>();
         private String volumeId;
         private String snapshotId;
 
@@ -228,8 +324,10 @@ class Ec2RegisterImageTagTest {
         }
 
         String register(RegisterImageRequest request) {
+            unresolvedNames.add(request.name());
             String imageId = ec2.registerImage(request).imageId();
             imageIds.add(imageId);
+            unresolvedNames.remove(request.name());
             return imageId;
         }
 
@@ -243,7 +341,7 @@ class Ec2RegisterImageTagTest {
 
         @Override
         public void close() {
-            RuntimeException failure = null;
+            RuntimeException failure = recoverImageIds(ec2, unresolvedNames, imageIds, null);
             for (int index = imageIds.size() - 1; index >= 0; index--) {
                 String imageId = imageIds.get(index);
                 failure = attemptCleanup(failure, () -> ec2.deregisterImage(request -> request.imageId(imageId)));
