@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.ec2.model.Address;
@@ -47,12 +48,14 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519_FINGERPRINT;
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519_KEY;
@@ -300,6 +303,84 @@ class Ec2ServicePersistenceTest {
     }
 
     private record PendingContainerLaunch(Ec2Service service, Instance instance, Runnable completion) {}
+
+    @Test
+    void portForwardCallbackCannotReinsertAnInstanceRemovedAfterOwnerLookup(@TempDir Path dir) {
+        StorageBackend<String, Instance> delegate = load(dir, "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        AccountAwareStorageBackend<Instance> instances = spy(
+                new AccountAwareStorageBackend<>(delegate, null, "000000000000"));
+        AtomicReference<Consumer<Instance>> persister = new AtomicReference<>();
+        Ec2PortForwardManager ports = mock(Ec2PortForwardManager.class);
+        doAnswer(invocation -> {
+            persister.set(invocation.getArgument(0));
+            return null;
+        }).when(ports).setPersister(any());
+        Ec2Service original = newService(dir, null, instances, ports);
+        Instance instance = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        original.restoreMetadataRegistrations();
+        String storageKey = REGION + "::" + instance.getInstanceId();
+        doAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            Optional<AccountAwareStorageBackend.OwnedEntry<Instance>> owner =
+                    (Optional<AccountAwareStorageBackend.OwnedEntry<Instance>>) invocation.callRealMethod();
+            instances.clear();
+            return owner;
+        }).when(instances).findAnyAccountEntry(storageKey);
+
+        persister.get().accept(instance);
+
+        assertTrue(delegate.isEmpty());
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+    }
+
+    @Test
+    void portForwardCallbackCannotReinsertADeletedUnwrappedInstance(@TempDir Path dir) {
+        StorageBackend<String, Instance> instances = load(dir, "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        AtomicReference<Consumer<Instance>> persister = new AtomicReference<>();
+        Ec2PortForwardManager ports = mock(Ec2PortForwardManager.class);
+        doAnswer(invocation -> {
+            persister.set(invocation.getArgument(0));
+            return null;
+        }).when(ports).setPersister(any());
+        Ec2Service original = newService(dir, null, instances, ports);
+        Instance instance = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        original.restoreMetadataRegistrations();
+        instances.delete(REGION + "::" + instance.getInstanceId());
+
+        persister.get().accept(instance);
+
+        assertTrue(instances.isEmpty());
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+    }
+
+    @Test
+    void portForwardCallbackPersistsTheCurrentOwnedInstance(@TempDir Path dir) throws Exception {
+        StorageBackend<String, Instance> delegate = load(dir, "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        AccountAwareStorageBackend<Instance> instances =
+                new AccountAwareStorageBackend<>(delegate, null, "000000000000");
+        AtomicReference<Consumer<Instance>> persister = new AtomicReference<>();
+        Ec2PortForwardManager ports = mock(Ec2PortForwardManager.class);
+        doAnswer(invocation -> {
+            persister.set(invocation.getArgument(0));
+            return null;
+        }).when(ports).setPersister(any());
+        Ec2Service original = newService(dir, null, instances, ports);
+        Instance instance = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        original.restoreMetadataRegistrations();
+        instance.setContainerBridgeIp("10.73.1.14");
+
+        runOnWorker(() -> persister.get().accept(instance));
+
+        Instance restored = load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})
+                .get("000000000000/" + REGION + "::" + instance.getInstanceId()).orElseThrow();
+        assertEquals("10.73.1.14", restored.getContainerBridgeIp());
+    }
 
     private Instance persistedInstance(Path dir, Instance instance) {
         return load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})
@@ -1199,6 +1280,16 @@ class Ec2ServicePersistenceTest {
     }
 
     private Ec2Service newService(Path dir, Ec2ContainerManager containers) {
+        return newService(dir, containers,
+                load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}));
+    }
+
+    private Ec2Service newService(Path dir, Ec2ContainerManager containers, StorageBackend<String, Instance> instances) {
+        return newService(dir, containers, instances, mock(Ec2PortForwardManager.class));
+    }
+
+    private Ec2Service newService(Path dir, Ec2ContainerManager containers, StorageBackend<String, Instance> instances,
+                                 Ec2PortForwardManager ports) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
@@ -1208,7 +1299,7 @@ class Ec2ServicePersistenceTest {
         when(ec2.mock()).thenReturn(containers == null);
         when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
         Ec2ImageCatalog imageCatalog = new Ec2ImageCatalog();
-        return new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+        return new Ec2Service(config, containers, ports,
                 new AmiImageResolver(imageCatalog), imageCatalog,
                 new Ec2InstanceTypeCatalog(),
                 load(dir, "ec2-vpcs.json", new TypeReference<Map<String, Vpc>>() {}),
@@ -1219,7 +1310,7 @@ class Ec2ServicePersistenceTest {
                 load(dir, "ec2-route-tables.json", new TypeReference<Map<String, RouteTable>>() {}),
                 load(dir, "ec2-key-pairs.json", new TypeReference<Map<String, KeyPair>>() {}),
                 load(dir, "ec2-addresses.json", new TypeReference<Map<String, Address>>() {}),
-                load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}),
+                instances,
                 load(dir, "ec2-volumes.json", new TypeReference<Map<String, Volume>>() {}),
                 load(dir, "ec2-registered-images.json", new TypeReference<Map<String, Image>>() {}),
                 load(dir, "ec2-snapshots.json", new TypeReference<Map<String, Snapshot>>() {}),

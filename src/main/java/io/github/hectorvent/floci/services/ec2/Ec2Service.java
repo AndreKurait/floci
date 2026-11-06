@@ -14257,10 +14257,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             Optional<AccountAwareStorageBackend.OwnedEntry<Instance>> owner = accountAware.findAnyAccountEntry(storageKey);
             // No owner means the instance was terminated and deleted meanwhile; writing it would
             // leave a copy in the default account.
-            owner.ifPresent(found -> accountAware.putForAccount(found.account(), storageKey, instance));
+            owner.ifPresent(found -> accountAware.persistIfCurrentForAccount(found.account(), storageKey, instance));
             return;
         }
-        instances.put(storageKey, instance);
+        instances.persistIfCurrent(storageKey, instance);
     }
 
     private Optional<AccountAwareStorageBackend.OwnedEntry<Vpc>> findAnyVpcEntry(String region, String vpcId) {

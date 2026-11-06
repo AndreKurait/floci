@@ -69,6 +69,15 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public boolean persistIfCurrent(String key, V value) {
+        return persistIfCurrentForAccount(prefix(), key, value);
+    }
+
+    public boolean persistIfCurrentForAccount(String accountId, String key, V value) {
+        return delegate.persistIfCurrent(accountId + "/" + key, value);
+    }
+
+    @Override
     public void put(String key, V value) {
         String account = prefix();
         delegate.put(account + "/" + key, value);

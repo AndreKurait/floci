@@ -17,6 +17,15 @@ public interface StorageBackend<K, V> {
     void put(K key, V value);
 
     /**
+     * Persist a live value only while this exact object remains stored under the key.
+     * Coordinate the identity check with deletion, clearing and replacement. This never
+     * inserts a missing record and retains the backend's normal write durability.
+     */
+    default boolean persistIfCurrent(K key, V value) {
+        throw new UnsupportedOperationException("Conditional persistence is not supported by this backend");
+    }
+
+    /**
      * Store several entries as one logical write. Backends that can persist a batch more
      * efficiently should override this method; the default preserves compatibility for
      * lightweight and service-specific implementations.
