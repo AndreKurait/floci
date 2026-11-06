@@ -17,7 +17,8 @@ import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager
 import io.quarkus.arc.Arc;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.List;
@@ -37,8 +38,9 @@ class Ec2StartRequestScopeIntegrationTest {
     @Inject
     RegionResolver resolver;
 
-    @Test
-    void backgroundStartUsesEachInstancesOwnerAndRegionAndClearsItsScopeAfterFailure() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void backgroundStartUsesOwnerOrCallerAndClearsItsScopeAfterFailure(boolean ownerless) throws Exception {
         try (ExecutorService worker = Executors.newSingleThreadExecutor();
              ExecutorService retries = Executors.newSingleThreadExecutor()) {
             Ec2ContainerManager manager = new Ec2ContainerManager(
@@ -55,7 +57,7 @@ class Ec2StartRequestScopeIntegrationTest {
                 Instance instance = new Instance();
                 instance.setInstanceId("i-" + owner.account());
                 instance.setDockerContainerId("container-" + owner.account());
-                instance.setOwnerId(owner.account());
+                instance.setOwnerId(ownerless ? null : owner.account());
                 instance.setRegion(owner.region());
                 CompletableFuture<Scope> observed = new CompletableFuture<>();
 
@@ -68,7 +70,9 @@ class Ec2StartRequestScopeIntegrationTest {
                     assertEquals(caller, scope(), "Scheduling must preserve the caller's context");
                 });
 
-                assertEquals(owner, observed.get(5, TimeUnit.SECONDS));
+                Scope expected = new Scope(ownerless ? caller.account() : owner.account(),
+                        owner.region(), owner.partition());
+                assertEquals(expected, observed.get(5, TimeUnit.SECONDS));
                 assertFalse(worker.submit(() -> Arc.container().requestContext().isActive())
                         .get(5, TimeUnit.SECONDS), "A failed start must not leak its context to the next task");
                 assertEquals("stopped", instance.getState().getName());
