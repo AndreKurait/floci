@@ -4,12 +4,15 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
+import io.github.hectorvent.floci.core.storage.StorageBackedMap;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgOptionalFields;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
 import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
+import io.github.hectorvent.floci.services.autoscaling.model.ScalingPolicy;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -35,6 +38,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -925,7 +929,8 @@ class AutoScalingRefreshStorageTest {
 
     @ParameterizedTest
     @CsvSource({"persistent,true", "persistent,false", "hybrid,true", "hybrid,false", "wal,true", "wal,false"})
-    void detachWaitsForReplacementIdentityPublication(String mode, boolean decrement) throws Exception {
+    void pendingDetachWaitsForReplacementIdentityPublicationAndPreservesOwnership(String mode, boolean decrement)
+            throws Exception {
         setUp(mode);
         InstanceRefresh refresh = service.startInstanceRefresh(REGION, "suspended-group", new InstanceRefresh());
         service = spy(service);
@@ -961,18 +966,247 @@ class AutoScalingRefreshStorageTest {
             try {
                 reconciling.get(5, TimeUnit.SECONDS);
                 if (detaching != null) {
-                    detaching.get(5, TimeUnit.SECONDS);
+                    Future<?> pendingDetach = detaching;
+                    ExecutionException failure = assertThrows(ExecutionException.class,
+                            () -> pendingDetach.get(5, TimeUnit.SECONDS));
+                    assertInstanceOf(AwsException.class, failure.getCause());
+                    assertEquals("ValidationError", ((AwsException) failure.getCause()).getErrorCode());
                 }
             } finally {
                 executor.shutdownNow();
                 assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
             }
         }
+        assertEquals(List.of("i-replacement"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals("i-replacement", refresh.getReplacements().getFirst().getReplacementInstanceId());
+        group.getInstances().getFirst().setLifecycleState("InService");
+        service.detachInstances(REGION, "suspended-group", List.of("i-replacement"), decrement);
         assertTrue(group.getInstances().isEmpty());
         assertTrue(refresh.getReplacements().isEmpty(), "Detached replacement retained refresh ownership");
+        assertEquals("Successful", refresh.getStatus());
+        assertNotNull(refresh.getEndTime());
         restart(mode);
-        assertTrue(service.activeInstanceRefresh(group).getReplacements().isEmpty());
+        assertNull(service.activeInstanceRefresh(group));
+        InstanceRefresh restored = service.describeInstanceRefreshes(REGION, "suspended-group",
+                List.of(refresh.getInstanceRefreshId()), null, null).instanceRefreshes().getFirst();
+        assertEquals("Successful", restored.getStatus());
+        assertEquals(100, restored.getPercentageComplete());
+        assertEquals(0, restored.getInstancesToUpdate());
+        assertNotNull(restored.getEndTime());
+        assertTrue(restored.getReplacements().isEmpty());
         assertEquals(decrement ? 0 : 1, group.getDesiredCapacity());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void refreshSelectionDoesNotMakeATerminatedOriginalDetachable(String mode) {
+        setUp(mode);
+        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "suspended-group", new InstanceRefresh());
+        Reservation terminated = reservation("i-original");
+        terminated.getInstances().getFirst().setState(InstanceState.terminated());
+        when(ec2.describeInstances(eq(REGION), anyList(), isNull())).thenReturn(List.of(terminated));
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "suspended-group", List.of("i-original"), true));
+
+        assertEquals("ValidationError", failure.getErrorCode());
+        assertEquals(List.of("i-original"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, group.getDesiredCapacity());
+        assertEquals("i-original", refresh.getReplacements().getFirst().getOriginalInstanceId());
+        verify(ec2, never()).deleteSystemTag(anyString(), anyList(), anyString(), anyString());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"persistent,InvalidInstanceID.NotFound", "hybrid,InvalidInstanceID.NotFound",
+            "wal,InvalidInstanceID.NotFound", "persistent,InternalError", "hybrid,InternalError",
+            "wal,InternalError", "persistent,UnauthorizedOperation", "hybrid,UnauthorizedOperation",
+            "wal,UnauthorizedOperation"})
+    void selectedRefreshLookupFailurePreservesMembership(String mode, String code) throws IOException {
+        setUp(mode);
+        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "suspended-group", new InstanceRefresh());
+        AwsException lookupFailure = new AwsException(code, "EC2 lookup failed", 400);
+        when(ec2.describeInstances(eq(REGION), anyList(), isNull())).thenThrow(lookupFailure);
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "suspended-group", List.of("i-original"), true));
+
+        if ("InvalidInstanceID.NotFound".equals(code)) {
+            assertEquals("ValidationError", failure.getErrorCode());
+            assertTrue(failure.getMessage().contains("not in InService or Standby"));
+        } else {
+            assertSame(lookupFailure, failure);
+        }
+        assertEquals(List.of("i-original"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, group.getDesiredCapacity());
+        assertEquals("i-original", refresh.getReplacements().getFirst().getOriginalInstanceId());
+        verify(ec2, never()).deleteSystemTag(anyString(), anyList(), anyString(), anyString());
+        restart(mode);
+        assertEquals(List.of("i-original"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, group.getDesiredCapacity());
+        assertEquals("i-original", service.activeInstanceRefresh(group).getReplacements().getFirst()
+                .getOriginalInstanceId());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"persistent,true", "persistent,false", "hybrid,true", "hybrid,false", "wal,true", "wal,false"})
+    void runningLegacyRefreshOriginalRemainsDetachableAfterRestart(String mode, boolean decrement)
+            throws IOException {
+        setUp(mode);
+        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "suspended-group", new InstanceRefresh());
+        refresh.setReplacements(null);
+        service.saveInstanceRefresh(refresh);
+        restart(mode);
+        assertNull(service.activeInstanceRefresh(group).getReplacements());
+
+        service.detachInstances(REGION, "suspended-group", List.of("i-original"), decrement);
+
+        assertTrue(group.getInstances().isEmpty());
+        assertEquals(decrement ? 0 : 1, group.getDesiredCapacity());
+        verify(ec2).deleteSystemTag(REGION, List.of("i-original"),
+                AutoScalingService.GROUP_NAME_TAG, "suspended-group");
+        verify(ec2, never()).terminateInstances(anyString(), anyList());
+        restart(mode);
+        assertTrue(group.getInstances().isEmpty());
+        assertEquals(decrement ? 0 : 1, group.getDesiredCapacity());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"persistent,terminated", "hybrid,terminated", "wal,terminated",
+            "persistent,missing", "hybrid,missing", "wal,missing"})
+    void legacyRefreshOriginalMustStillBeRunningToDetach(String mode, String state) throws IOException {
+        setUp(mode);
+        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "suspended-group", new InstanceRefresh());
+        refresh.setReplacements(null);
+        service.saveInstanceRefresh(refresh);
+        restart(mode);
+        if ("missing".equals(state)) {
+            when(ec2.describeInstances(eq(REGION), anyList(), isNull()))
+                    .thenThrow(new AwsException("InvalidInstanceID.NotFound", "Instance absent", 400));
+        } else {
+            Reservation terminated = reservation("i-original");
+            terminated.getInstances().getFirst().setState(InstanceState.terminated());
+            when(ec2.describeInstances(eq(REGION), anyList(), isNull())).thenReturn(List.of(terminated));
+        }
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "suspended-group", List.of("i-original"), true));
+
+        assertEquals("ValidationError", failure.getErrorCode());
+        assertEquals(List.of("i-original"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, group.getDesiredCapacity());
+        verify(ec2, never()).deleteSystemTag(anyString(), anyList(), anyString(), anyString());
+        restart(mode);
+        assertEquals(List.of("i-original"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, group.getDesiredCapacity());
+        assertNull(service.activeInstanceRefresh(group).getReplacements());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void attachedTargetRegistrationRemainsRetryableAfterStorageReload(String mode) throws IOException {
+        setUp(mode);
+        group.getInstances().clear();
+        group.setDesiredCapacity(0);
+        group.setTargetGroupARNs(List.of("attached-targets"));
+        service.saveAutoScalingGroupIfPresent(group);
+        Reservation standalone = reservation("i-original");
+        standalone.getInstances().getFirst().setPlacement(new Placement(REGION + "a"));
+        when(ec2.describeInstances(eq(REGION), anyList(), isNull())).thenReturn(List.of(standalone));
+        service.attachInstances(REGION, "suspended-group", List.of("i-original"));
+        ElbV2Service targets = mock(ElbV2Service.class);
+        doThrow(new AwsException("InternalFailure", "retry registration", 500))
+                .when(targets).registerTargets(eq(REGION), eq("attached-targets"), anyList());
+        reconciler = new AutoScalingReconciler(service, ec2, targets);
+        reconciler.reconcile(group);
+
+        restart(mode);
+        assertEquals("Pending", group.getInstances().getFirst().getLifecycleState());
+        targets = mock(ElbV2Service.class);
+        reconciler = new AutoScalingReconciler(service, ec2, targets);
+        reconciler.reconcile(group);
+
+        assertEquals("InService", group.getInstances().getFirst().getLifecycleState());
+        verify(targets).registerTargets(eq(REGION), eq("attached-targets"), anyList());
+        assertEquals(List.of("Attaching an EC2 instance: i-original"),
+                service.describeScalingActivities(REGION, "suspended-group").stream()
+                        .map(ScalingActivity::getDescription).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    @SuppressWarnings("unchecked")
+    void failedPolicyDeletionKeepsTheGroupUntilCleanupCanResumeAfterRestart(String mode) throws Exception {
+        setUp(mode);
+        service.putScalingPolicy(REGION, "suspended-group", "owned-policy", "SimpleScaling",
+                "ChangeInCapacity", 1, 60, null, null);
+        service.putScheduledUpdateGroupAction(REGION, "suspended-group", "owned-schedule",
+                null, null, "0 0 * * *", null, 0, 3, 1);
+        Field policiesField = AutoScalingService.class.getDeclaredField("policies");
+        policiesField.setAccessible(true);
+        StorageBackedMap<ScalingPolicy> policies = (StorageBackedMap<ScalingPolicy>) policiesField.get(service);
+        Field storageField = StorageBackedMap.class.getDeclaredField("storage");
+        storageField.setAccessible(true);
+        StorageBackend<String, ScalingPolicy> original =
+                (StorageBackend<String, ScalingPolicy>) storageField.get(policies);
+        StorageBackend<String, ScalingPolicy> failing = spy(original);
+        IllegalStateException unavailable = new IllegalStateException("policy delete persistence unavailable");
+        doThrow(unavailable).when(failing).delete(anyString());
+        storageField.set(policies, failing);
+        try {
+            assertSame(unavailable, assertThrows(IllegalStateException.class,
+                    () -> service.deleteAutoScalingGroup(REGION, "suspended-group", true)));
+            assertEquals("Delete in progress", service.requireGroup(REGION, "suspended-group").getStatus());
+            assertEquals(1, service.describeScheduledActions(REGION, "suspended-group", null).size());
+        } finally {
+            storageField.set(policies, original);
+        }
+
+        restart(mode);
+        clearInvocations(ec2);
+        reconciler.reconcile(group);
+        verifyNoInteractions(ec2);
+        assertEquals("Delete in progress", group.getStatus());
+        service.deleteAutoScalingGroup(REGION, "suspended-group", true);
+
+        assertTrue(service.describeAutoScalingGroups(REGION, List.of("suspended-group")).isEmpty());
+        assertTrue(service.describePolicies(REGION, "suspended-group", null).isEmpty());
+        assertTrue(service.describeScheduledActions(REGION, "suspended-group", null).isEmpty());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"persistent,true", "persistent,false", "hybrid,true", "hybrid,false", "wal,true", "wal,false"})
+    void failedMembershipTagCleanupRetainsRefreshOwnershipForRetry(String mode, boolean decrement)
+            throws IOException {
+        setUp(mode);
+        service.startInstanceRefresh(REGION, "suspended-group", new InstanceRefresh());
+        AwsException failure = new AwsException("InternalError", "Membership tag persistence failed", 500);
+        doThrow(failure).when(ec2).deleteSystemTag(
+                REGION, List.of("i-original"), AutoScalingService.GROUP_NAME_TAG, "suspended-group");
+
+        assertSame(failure, assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "suspended-group", List.of("i-original"), decrement)));
+
+        assertEquals(List.of("i-original"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, group.getDesiredCapacity());
+        assertEquals(List.of("i-original"), service.activeInstanceRefresh(group).getReplacements().stream()
+                .map(replacement -> replacement.getOriginalInstanceId()).toList());
+        restart(mode);
+        assertEquals(List.of("i-original"), service.activeInstanceRefresh(group).getReplacements().stream()
+                .map(replacement -> replacement.getOriginalInstanceId()).toList());
+        assertEquals(1, group.getDesiredCapacity());
+        doNothing().when(ec2).deleteSystemTag(
+                REGION, List.of("i-original"), AutoScalingService.GROUP_NAME_TAG, "suspended-group");
+
+        service.detachInstances(REGION, "suspended-group", List.of("i-original"), decrement);
+
+        assertTrue(group.getInstances().isEmpty());
+        assertEquals(decrement ? 0 : 1, group.getDesiredCapacity());
+        assertTrue(service.activeInstanceRefresh(group).getReplacements().isEmpty());
+        restart(mode);
+        assertTrue(group.getInstances().isEmpty());
+        assertEquals(decrement ? 0 : 1, group.getDesiredCapacity());
+        assertTrue(service.activeInstanceRefresh(group).getReplacements().isEmpty());
+        verify(ec2, never()).terminateInstances(anyString(), anyList());
     }
 
     @ParameterizedTest

@@ -1094,6 +1094,13 @@ These members of `RequestLaunchTemplateData` are stored and read back unchanged 
 Within `NetworkInterfaces`, `ConnectionTrackingSpecification` is stored and read back with all
 three of its timeout members.
 
+`RunInstances` accepts either `Placement.AvailabilityZone` or `Placement.AvailabilityZoneId`.
+The request's selector takes precedence over either selector in the selected launch template;
+when neither is requested, the template supplies the zone. Zone IDs must be published by
+`DescribeAvailabilityZones`, and specifying both selectors is rejected. An explicit subnet or
+existing primary network interface must belong to the selected zone; invalid or contradictory
+placement is rejected before launch, including dry runs.
+
 At launch, `RunInstances` and `CreateFleet` apply the template's `BlockDeviceMappings` under the
 request's, field by field: a request entry for a `DeviceName` the template maps, spelled `xvdf` or
 `/dev/xvdf`, changes only the members it sets, and the rest keep the template's values; devices

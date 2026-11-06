@@ -23,6 +23,8 @@ public class AsgInstance {
     private String standbyActivityId;
     // The activity returned by an explicit termination request, completed when the member leaves the group.
     private String terminationActivityId;
+    // An attached instance stays Pending until its load-balancer registration succeeds.
+    private boolean pendingAttachment;
 
     public AsgInstance() {}
 
@@ -61,4 +63,7 @@ public class AsgInstance {
 
     public String getTerminationActivityId() { return terminationActivityId; }
     public void setTerminationActivityId(String v) { this.terminationActivityId = v; }
+
+    public boolean isPendingAttachment() { return pendingAttachment; }
+    public void setPendingAttachment(boolean v) { this.pendingAttachment = v; }
 }

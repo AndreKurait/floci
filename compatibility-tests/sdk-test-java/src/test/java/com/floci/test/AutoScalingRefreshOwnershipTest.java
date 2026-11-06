@@ -10,7 +10,12 @@ import software.amazon.awssdk.services.autoscaling.model.InstanceRefresh;
 import software.amazon.awssdk.services.autoscaling.model.ResumeProcessesRequest;
 import software.amazon.awssdk.services.autoscaling.model.SuspendProcessesRequest;
 import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.DescribeInstancesRequest;
+import software.amazon.awssdk.services.ec2.model.Instance;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
+import software.amazon.awssdk.services.ec2.waiters.Ec2Waiter;
+
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -27,22 +32,26 @@ class AutoScalingRefreshOwnershipTest {
             autoScaling.createLaunchConfiguration(request -> request.launchConfigurationName(name)
                     .imageId("ami-amazonlinux2023").instanceType("t3.micro"));
             try {
-                String instanceId = ec2.runInstances(request -> request.imageId("ami-amazonlinux2023")
+                Instance instance = ec2.runInstances(request -> request.imageId("ami-amazonlinux2023")
                         .instanceType(InstanceType.T3_MICRO).minCount(1).maxCount(1))
-                        .instances().get(0).instanceId();
-                try {
+                        .instances().get(0);
+                String instanceId = instance.instanceId();
+                try (Ec2Waiter waiter = ec2.waiter()) {
+                    waiter.waitUntilInstanceRunning(DescribeInstancesRequest.builder().instanceIds(instanceId).build(),
+                                    TestFixtures.waiterOverride(Duration.ofMinutes(2)))
+                            .matched().response().orElseThrow();
                     autoScaling.createAutoScalingGroup(request -> request.autoScalingGroupName(name)
                             .launchConfigurationName(name).minSize(0).maxSize(1).desiredCapacity(0)
-                            .availabilityZones("us-east-1a"));
+                            .availabilityZones(instance.placement().availabilityZone()));
                     try {
+                        autoScaling.attachInstances(request -> request.autoScalingGroupName(name)
+                                .instanceIds(instanceId));
                         SuspendProcessesRequest.Builder suspend = SuspendProcessesRequest.builder()
                                 .autoScalingGroupName(name);
                         if (!allProcesses) {
                             suspend.scalingProcesses("InstanceRefresh");
                         }
                         autoScaling.suspendProcesses(suspend.build());
-                        autoScaling.attachInstances(request -> request.autoScalingGroupName(name)
-                                .instanceIds(instanceId));
                         String refreshId = autoScaling.startInstanceRefresh(request ->
                                 request.autoScalingGroupName(name)).instanceRefreshId();
                         assertThat(refreshId).isNotBlank();

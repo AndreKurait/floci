@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import jakarta.enterprise.event.Event;
@@ -246,8 +247,19 @@ class AutoScalingChangeNotificationTest {
         service.ec2Service = launchTemplateService();
         AutoScalingGroup group = service.createAutoScalingGroup(
                 CHANGE.region(), CHANGE.name(), null, "lt-template", null, "1", null,
-                0, 4, 1, 300, List.of(), List.of(), List.of(), List.of(),
+                0, 4, 1, 300, List.of("eu-west-1a"), List.of(), List.of(), List.of(),
                 "EC2", 0, List.of(), null, null, null);
+        Instance attached = new Instance();
+        attached.setInstanceId("i-attached");
+        attached.setInstanceType("t3.micro");
+        attached.setState(InstanceState.running());
+        Placement placement = new Placement();
+        placement.setAvailabilityZone("eu-west-1a");
+        attached.setPlacement(placement);
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(attached));
+        when(service.ec2Service.describeInstances(CHANGE.region(), List.of(attached.getInstanceId()), null))
+                .thenReturn(List.of(reservation));
         service.createAutoScalingGroup(
                 CHANGE.region(), "other", null, "lt-template", null, "1", null,
                 0, 4, 1, 300, List.of(), List.of(), List.of(), List.of(),
