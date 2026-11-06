@@ -1665,6 +1665,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         synchronized (containerCompletionLock) {
             resettingInstances = true;
         }
+        if (!config.services().ec2().enabled()) {
+            return;
+        }
+        // Reset discards ownership records, so even persistent guests must finish teardown first.
+        if (!config.services().ec2().mock()) {
+            for (AccountAwareStorageBackend.AccountEntry<Instance> entry : entriesOfEveryAccount(instances)) {
+                Instance instance = entry.value();
+                if (instance != null) {
+                    RequestScopes.runAs(entry.accountId(), instance.getRegion(),
+                            () -> containerManager.terminateForShutdown(instance));
+                }
+            }
+        }
+        if (vpcNetworkManager != null) {
+            vpcNetworkManager.resetNetworks();
+        }
     }
 
     @Override

@@ -920,6 +920,27 @@ public class VpcNetworkManager {
 
     // ─── Teardown ────────────────────────────────────────────────────────────
 
+    /** Retires this deployment's networks after guest teardown, before reset discards their records. */
+    public void resetNetworks() {
+        if (enabled()) {
+            for (Network network : listVpcNetworks()) {
+                Map<String, String> labels = network.getLabels() == null ? Map.of() : network.getLabels();
+                if (!ALIASES.consistent(network.getName(), labels) || !ownedByThisDeployment(labels)) {
+                    continue;
+                }
+                disconnectAll(network);
+                try {
+                    dockerClient.removeNetworkCmd(network.getId()).exec();
+                } catch (NotFoundException alreadyGone) {
+                    // Another teardown already removed this owned network.
+                }
+            }
+        }
+        bindings.clear();
+        subnetOwner.clear();
+        networksFromPreviousRun.clear();
+    }
+
     public void forgetSubnet(String region, String subnetId) {
         String vpcKey = subnetOwner.remove(key(region, subnetId));
         if (vpcKey == null) {
@@ -1037,16 +1058,7 @@ public class VpcNetworkManager {
         boolean reap = config.services().ec2().vpcNetworks().reconcileOnStartup();
         int removed = 0;
         try {
-            List<Network> networks = ALIASES.listByLabels(
-                    Map.of(ContainerStorageHelper.SERVICE_LABEL, SERVICE_VALUE,
-                            ContainerStorageHelper.COMPONENT_LABEL, COMPONENT_VALUE),
-                    filter -> dockerClient.listNetworksCmd()
-                            .withFilter("label", filter.entrySet().stream()
-                                    .map(entry -> entry.getKey() + "=" + entry.getValue())
-                                    .toList())
-                            .exec(),
-                    Network::getId);
-            for (Network network : networks) {
+            for (Network network : listVpcNetworks()) {
                 Map<String, String> labels = network.getLabels() == null ? Map.of() : network.getLabels();
                 if (!ALIASES.consistent(network.getName(), labels) || !ownedByThisDeployment(labels)) {
                     continue;
@@ -1085,6 +1097,18 @@ public class VpcNetworkManager {
         if (removed > 0) {
             LOG.infov("Removed {0} orphaned VPC network(s)", String.valueOf(removed));
         }
+    }
+
+    private List<Network> listVpcNetworks() {
+        return ALIASES.listByLabels(
+                Map.of(ContainerStorageHelper.SERVICE_LABEL, SERVICE_VALUE,
+                        ContainerStorageHelper.COMPONENT_LABEL, COMPONENT_VALUE),
+                filter -> dockerClient.listNetworksCmd()
+                        .withFilter("label", filter.entrySet().stream()
+                                .map(entry -> entry.getKey() + "=" + entry.getValue())
+                                .toList())
+                        .exec(),
+                Network::getId);
     }
 
     /**
