@@ -25,6 +25,7 @@ import software.amazon.awssdk.services.ec2.model.TagSpecification;
 import software.amazon.awssdk.services.ec2.model.VirtualizationType;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,8 +47,8 @@ class Ec2RegisterImageTagTest {
                 Ec2Client otherAccount = client("222222222222", home);
                 Ec2Client otherRegion = client("111111111111", other);
                 ImageSource source = new ImageSource(ec2, name)) {
-            String imageId = ec2.registerImage(source.registration(name).tagSpecifications(
-                    TagSpecification.builder().resourceType(ResourceType.IMAGE).tags(tags).build()).build()).imageId();
+            String imageId = source.register(source.registration(name).tagSpecifications(
+                    TagSpecification.builder().resourceType(ResourceType.IMAGE).tags(tags).build()).build());
             Image image = ec2.describeImages(request -> request.imageIds(imageId)).images().get(0);
             assertThat(image.ownerId()).isEqualTo("111111111111");
             assertThat(image.publicLaunchPermissions()).isFalse();
@@ -65,7 +66,7 @@ class Ec2RegisterImageTagTest {
         String name = TestFixtures.uniqueName("register-image-invalid-tags");
         try (Ec2Client ec2 = client("111111111111", TestFixtures.region());
                 ImageSource source = new ImageSource(ec2, name)) {
-            Ec2Exception error = assertThrows(Ec2Exception.class, () -> ec2.registerImage(
+            Ec2Exception error = assertThrows(Ec2Exception.class, () -> source.register(
                     source.registration(name).tagSpecifications(TagSpecification.builder()
                             .resourceType(ResourceType.INSTANCE)
                             .tags(Tag.builder().key("SdkImageProbe").value(name).build()).build()).build()));
@@ -91,18 +92,18 @@ class Ec2RegisterImageTagTest {
                 Ec2Client ownerDestination = client("111111111111", destination);
                 Ec2Client recipient = client("222222222222", destination);
                 Ec2Client recipientHome = client("222222222222", home);
-                ImageSource source = new ImageSource(owner, name)) {
-            String sourceId = owner.registerImage(source.registration(name).tagSpecifications(
-                    TagSpecification.builder().resourceType(ResourceType.IMAGE).tags(privateTag).build()).build())
-                    .imageId();
+                ImageSource source = new ImageSource(owner, name);
+                CopiedImages copies = new CopiedImages(recipient)) {
+            String sourceId = source.register(source.registration(name).tagSpecifications(
+                    TagSpecification.builder().resourceType(ResourceType.IMAGE).tags(privateTag).build()).build());
             CopyImageRequest request = CopyImageRequest.builder().sourceImageId(sourceId)
                     .sourceRegion(home.id()).name(name + "-copy").copyImageTags(true).build();
-            Ec2Exception denied = assertThrows(Ec2Exception.class, () -> recipient.copyImage(request));
+            Ec2Exception denied = assertThrows(Ec2Exception.class, () -> copies.copy(request));
             assertThat(denied.awsErrorDetails().errorCode()).isEqualTo("AuthFailure");
             owner.modifyImageAttribute(change -> change.imageId(sourceId).launchPermission(
                     LaunchPermissionModifications.builder().add(
                             LaunchPermission.builder().userId("222222222222").build()).build()));
-            denied = assertThrows(Ec2Exception.class, () -> recipient.copyImage(request));
+            denied = assertThrows(Ec2Exception.class, () -> copies.copy(request));
             assertThat(denied.awsErrorDetails().errorCode()).isEqualTo("AuthFailure");
             owner.modifySnapshotAttribute(change -> change.snapshotId(source.snapshotId).createVolumePermission(
                     CreateVolumePermissionModifications.builder().add(
@@ -117,48 +118,77 @@ class Ec2RegisterImageTagTest {
                     change -> change.resources(sourceId).tags(shared.toBuilder().value("spoofed").build())));
             assertThat(sharedTagError.statusCode()).isEqualTo(403);
             assertThat(sharedTagError.awsErrorDetails().errorCode()).isEqualTo("AccessDenied");
-            String copyId = null;
-            String untaggedCopyId = null;
-            try {
-                untaggedCopyId = recipient.copyImage(request.toBuilder().copyImageTags(false)
-                        .name(name + "-untagged").build()).imageId();
-                String ownedUntaggedCopyId = untaggedCopyId;
-                assertThat(recipient.describeImages(read -> read.imageIds(ownedUntaggedCopyId))
-                        .images().get(0).tags()).isEmpty();
-                copyId = recipient.copyImage(request).imageId();
-                String ownedCopyId = copyId;
-                Image copy = recipient.describeImages(read -> read.imageIds(ownedCopyId)).images().get(0);
-                assertThat(copy.ownerId()).isEqualTo("222222222222");
-                assertThat(copy.publicLaunchPermissions()).isFalse();
-                assertThat(copy.tags()).containsExactlyInAnyOrder(shared, recipientTag);
-                assertThat(copy.blockDeviceMappings().get(0).ebs().snapshotId()).isNotEqualTo(source.snapshotId);
-                assertThat(recipient.describeSnapshots(read -> read.snapshotIds(
-                        copy.blockDeviceMappings().get(0).ebs().snapshotId())).snapshots().get(0).ownerId())
-                        .isEqualTo("222222222222");
-                assertThat(recipientHome.describeImages(read -> read.filters(
-                        Filter.builder().name("name").values(name + "-copy").build())).images()).isEmpty();
-                assertThat(ownerDestination.describeImages(read -> read.filters(
-                        Filter.builder().name("name").values(name + "-copy").build())).images()).isEmpty();
-            } finally {
-                try {
-                    if (copyId != null) {
-                        deleteImageAndSnapshots(recipient, copyId);
-                    }
-                } finally {
-                    if (untaggedCopyId != null) {
-                        deleteImageAndSnapshots(recipient, untaggedCopyId);
-                    }
-                }
-            }
+            String untaggedCopyId = copies.copy(request.toBuilder().copyImageTags(false)
+                    .name(name + "-untagged").build());
+            String ownedUntaggedCopyId = untaggedCopyId;
+            assertThat(recipient.describeImages(read -> read.imageIds(ownedUntaggedCopyId))
+                    .images().get(0).tags()).isEmpty();
+            String copyId = copies.copy(request);
+            String ownedCopyId = copyId;
+            Image copy = recipient.describeImages(read -> read.imageIds(ownedCopyId)).images().get(0);
+            assertThat(copy.ownerId()).isEqualTo("222222222222");
+            assertThat(copy.publicLaunchPermissions()).isFalse();
+            assertThat(copy.tags()).containsExactlyInAnyOrder(shared, recipientTag);
+            assertThat(copy.blockDeviceMappings().get(0).ebs().snapshotId()).isNotEqualTo(source.snapshotId);
+            assertThat(recipient.describeSnapshots(read -> read.snapshotIds(
+                    copy.blockDeviceMappings().get(0).ebs().snapshotId())).snapshots().get(0).ownerId())
+                    .isEqualTo("222222222222");
+            assertThat(recipientHome.describeImages(read -> read.filters(
+                    Filter.builder().name("name").values(name + "-copy").build())).images()).isEmpty();
+            assertThat(ownerDestination.describeImages(read -> read.filters(
+                    Filter.builder().name("name").values(name + "-copy").build())).images()).isEmpty();
         }
     }
 
-    private static void deleteImageAndSnapshots(Ec2Client ec2, String imageId) {
-        Image image = ec2.describeImages(read -> read.imageIds(imageId)).images().get(0);
-        ec2.deregisterImage(change -> change.imageId(imageId));
-        for (BlockDeviceMapping mapping : image.blockDeviceMappings()) {
-            if (mapping.ebs() != null) {
-                ec2.deleteSnapshot(change -> change.snapshotId(mapping.ebs().snapshotId()));
+    private static RuntimeException attemptCleanup(RuntimeException failure, Runnable cleanup) {
+        try {
+            cleanup.run();
+        } catch (RuntimeException error) {
+            if (failure == null) {
+                return error;
+            }
+            if (failure != error) {
+                failure.addSuppressed(error);
+            }
+        }
+        return failure;
+    }
+
+    static final class CopiedImages implements AutoCloseable {
+        private final Ec2Client ec2;
+        private final List<String> imageIds = new ArrayList<>();
+
+        CopiedImages(Ec2Client ec2) {
+            this.ec2 = ec2;
+        }
+
+        String copy(CopyImageRequest request) {
+            String imageId = ec2.copyImage(request).imageId();
+            imageIds.add(imageId);
+            return imageId;
+        }
+
+        @Override
+        public void close() {
+            RuntimeException failure = null;
+            for (int index = imageIds.size() - 1; index >= 0; index--) {
+                String imageId = imageIds.get(index);
+                List<String> snapshots = new ArrayList<>();
+                failure = attemptCleanup(failure, () -> {
+                    Image image = ec2.describeImages(read -> read.imageIds(imageId)).images().get(0);
+                    for (BlockDeviceMapping mapping : image.blockDeviceMappings()) {
+                        if (mapping.ebs() != null && mapping.ebs().snapshotId() != null) {
+                            snapshots.add(mapping.ebs().snapshotId());
+                        }
+                    }
+                });
+                failure = attemptCleanup(failure, () -> ec2.deregisterImage(change -> change.imageId(imageId)));
+                for (String snapshot : snapshots) {
+                    failure = attemptCleanup(failure, () -> ec2.deleteSnapshot(change -> change.snapshotId(snapshot)));
+                }
+            }
+            if (failure != null) {
+                throw failure;
             }
         }
     }
@@ -169,15 +199,14 @@ class Ec2RegisterImageTagTest {
                 .build();
     }
 
-    private static final class ImageSource implements AutoCloseable {
+    static final class ImageSource implements AutoCloseable {
         private final Ec2Client ec2;
-        private final String name;
+        private final List<String> imageIds = new ArrayList<>();
         private String volumeId;
         private String snapshotId;
 
-        private ImageSource(Ec2Client ec2, String name) {
+        ImageSource(Ec2Client ec2, String name) {
             this.ec2 = ec2;
-            this.name = name;
             try {
                 String zone = ec2.describeAvailabilityZones().availabilityZones().get(0).zoneName();
                 volumeId = ec2.createVolume(request -> request.availabilityZone(zone).size(1)).volumeId();
@@ -190,13 +219,21 @@ class Ec2RegisterImageTagTest {
                 try {
                     close();
                 } catch (RuntimeException cleanup) {
-                    error.addSuppressed(cleanup);
+                    if (error != cleanup) {
+                        error.addSuppressed(cleanup);
+                    }
                 }
                 throw error;
             }
         }
 
-        private RegisterImageRequest.Builder registration(String imageName) {
+        String register(RegisterImageRequest request) {
+            String imageId = ec2.registerImage(request).imageId();
+            imageIds.add(imageId);
+            return imageId;
+        }
+
+        RegisterImageRequest.Builder registration(String imageName) {
             return RegisterImageRequest.builder().name(imageName).architecture(ArchitectureValues.X86_64)
                     .virtualizationType(VirtualizationType.HVM.toString()).rootDeviceName("/dev/sda1")
                     .blockDeviceMappings(BlockDeviceMapping.builder().deviceName("/dev/sda1")
@@ -206,19 +243,19 @@ class Ec2RegisterImageTagTest {
 
         @Override
         public void close() {
-            try {
-                ec2.describeImages(request -> request.filters(Filter.builder().name("name").values(name).build()))
-                        .images().forEach(image -> ec2.deregisterImage(request -> request.imageId(image.imageId())));
-            } finally {
-                try {
-                    if (snapshotId != null) {
-                        ec2.deleteSnapshot(request -> request.snapshotId(snapshotId));
-                    }
-                } finally {
-                    if (volumeId != null) {
-                        ec2.deleteVolume(request -> request.volumeId(volumeId));
-                    }
-                }
+            RuntimeException failure = null;
+            for (int index = imageIds.size() - 1; index >= 0; index--) {
+                String imageId = imageIds.get(index);
+                failure = attemptCleanup(failure, () -> ec2.deregisterImage(request -> request.imageId(imageId)));
+            }
+            if (snapshotId != null) {
+                failure = attemptCleanup(failure, () -> ec2.deleteSnapshot(request -> request.snapshotId(snapshotId)));
+            }
+            if (volumeId != null) {
+                failure = attemptCleanup(failure, () -> ec2.deleteVolume(request -> request.volumeId(volumeId)));
+            }
+            if (failure != null) {
+                throw failure;
             }
         }
     }
