@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.core.common.SweepWorker;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
@@ -334,6 +335,17 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     .filter(address -> address != null && !address.isBlank())
                     .findFirst().orElseThrow(() -> new IllegalStateException("Firewall helper has no Docker IP"));
             apply(helperId, SecurityGroupNftCompiler.initialRuleset());
+            String resolver = embeddedDnsServer.getServerIp().orElse(null);
+            if (resolver != null) {
+                // Docker's resolver does not forward from internal networks. Workloads inherit
+                // this file, so finish configuring the VPC resolver before admitting any workload.
+                ContainerExec.Result result = ContainerExec.run(dockerClient, helperId, new String[]{
+                        "sh", "-c", "printf 'nameserver %s\\noptions ndots:0\\n' \"$1\" > /etc/resolv.conf",
+                        "floci-vpc-dns", resolver}, 10).throwIfTimedOut(helperId);
+                if (result.exitCode() != 0) {
+                    throw new IllegalStateException("Cannot configure namespace DNS: " + result.summary());
+                }
+            }
             return new Namespace(helperId, ip);
         } catch (Exception e) {
             if (helperId != null) {
