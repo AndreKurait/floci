@@ -400,6 +400,7 @@ floci:
     elbv2:
       enabled: true
       mock: true
+      alb-zone-rule: aws
     codebuild:
       enabled: true
       # docker-network: floci-network
