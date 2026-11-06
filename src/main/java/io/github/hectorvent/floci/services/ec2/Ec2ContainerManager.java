@@ -210,9 +210,11 @@ public class Ec2ContainerManager {
                 || !ALIASES.matches(labels, LABEL_OWNER, ownerIdentity())) {
             throw new IllegalStateException("EC2 workload network namespace is not Floci protected");
         }
-        String address = helper.getNetworkSettings().getNetworks().values().stream()
-                .map(network -> network.getIpAddress()).filter(ip -> ip != null && !ip.isBlank())
-                .findFirst().orElseThrow(() -> new IllegalStateException("EC2 firewall helper has no Docker IP"));
+        String address = lifecycleManager.resolveContainerNetworkIp(helperId,
+                containerBuilder.resolveDockerNetwork(Optional.empty()).orElse(null));
+        if (address == null || address.isBlank()) {
+            throw new IllegalStateException("EC2 firewall helper has no Docker IP");
+        }
         return new ProtectedNamespace(helperId, address);
     }
 
