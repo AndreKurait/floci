@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.services.codeartifact;
 
+import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.AuthorizationTokenScope;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.github.hectorvent.floci.testing.SidecarContainersProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -16,6 +18,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Retains a real NuGet package version from the real, live {@code public:nuget-org} repository
@@ -39,12 +42,20 @@ class CodeArtifactNuGetExternalConnectionDockerIntegrationTest {
     private static final String LOWER_ID = "newtonsoft.json";
     private static final String VERSION = "13.0.3";
 
+    @Inject
+    CodeArtifactService service;
+
+    @Inject
+    BagetterSidecarClient bagetter;
+
     private static String bearerToken;
+    private static boolean initialRetentionVerified;
 
     @BeforeAll
     static void setUp() {
         SidecarContainersProfile.requireDockerAndImage("floci.services.codeartifact.nuget-image");
         RestAssuredJsonUtils.configureAwsContentTypes();
+        initialRetentionVerified = false;
     }
 
     @Test
@@ -72,6 +83,17 @@ class CodeArtifactNuGetExternalConnectionDockerIntegrationTest {
                 .post("/v1/authorization-token?domain=" + DOMAIN)
                 .then().statusCode(200)
                 .extract().jsonPath().getString("authorizationToken");
+
+        AuthorizationTokenScope scope = service.resolveAuthorizationToken(bearerToken, DOMAIN).orElseThrow();
+        for (String repository : new String[]{REPO, BLOCKED_REPO}) {
+            String repoId = service.resolveContainerIdAndBeginUse("nuget", scope.region(), DOMAIN, scope.owner(),
+                    repository, bagetter);
+            try {
+                bagetter.ensureReady(repoId, null);
+            } finally {
+                bagetter.endUse(repoId);
+            }
+        }
     }
 
     @Test
@@ -102,11 +124,13 @@ class CodeArtifactNuGetExternalConnectionDockerIntegrationTest {
                 .then().statusCode(200)
                 .extract().jsonPath().getLong("domain.assetSizeBytes");
         assertEquals(assetSizeBytesBefore + fetched.length, assetSizeBytesAfter);
+        initialRetentionVerified = true;
     }
 
     @Test
     @Order(2)
     void refetchingTheSameVersionServesItWithoutRetainingItAgain() {
+        assumeTrue(initialRetentionVerified, "Initial retention must finish before checking refetch accounting");
         long assetSizeBytesBefore = given().header("Authorization", AUTH)
                 .get("/v1/domain?domain=" + DOMAIN)
                 .then().statusCode(200)
@@ -172,6 +196,7 @@ class CodeArtifactNuGetExternalConnectionDockerIntegrationTest {
     @Test
     @Order(5)
     void aRetainedVersionReportsAnExternalOriginNotInternal() {
+        assumeTrue(initialRetentionVerified, "Initial retention must finish before checking its origin");
         given().header("Authorization", AUTH)
                 .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=nuget&package="
                         + LOWER_ID)
