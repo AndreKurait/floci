@@ -87,8 +87,17 @@ final class Ec2GuestReboots implements AutoCloseable {
         if (guest.phase.get() == Phase.RESTARTING) {
             return true;
         }
+        InspectContainerResponse current;
         try {
-            InspectContainerResponse current = docker.inspectContainerCmd(container).exec();
+            current = docker.inspectContainerCmd(container).exec();
+        } catch (NotFoundException missing) {
+            guests.remove(container, guest);
+            return false;
+        } catch (RuntimeException failure) {
+            LOG.debugv(failure, "Could not inspect native EC2 guest for reboot; will retry: {0}", container);
+            return false;
+        }
+        try {
             if (!requestedReboot(current)) {
                 return false;
             }
