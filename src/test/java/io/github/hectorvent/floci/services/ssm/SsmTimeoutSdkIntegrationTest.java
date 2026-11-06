@@ -37,7 +37,7 @@ class SsmTimeoutSdkIntegrationTest extends SsmCommandIntegrationFixture {
     @Inject EmulatorConfig config;
 
     @ParameterizedTest
-    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20"})
+    @ValueSource(strings = {"busybox:stable", "public.ecr.aws/lambda/nodejs:20", "ubuntu:24.04"})
     void sdkDistinguishesReservedFailuresFromExecutionDeadline(String image) {
         String instanceId = "i-timeout-" + UUID.randomUUID();
         String name = ContainerStorageHelper.resourceName(config, "ssm-timeout", null, UUID.randomUUID().toString());
