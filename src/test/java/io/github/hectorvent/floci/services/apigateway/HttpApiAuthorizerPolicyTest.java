@@ -182,7 +182,7 @@ class HttpApiAuthorizerPolicyTest {
         routeContext.routeToHttpApi("us-east-1");
         return new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", "000000000000"), mapper, null, null, null, null, null,
-                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), null);
+                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), null, null);
     }
 
     private InvokeResult result(String payload) {

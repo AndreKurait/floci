@@ -256,7 +256,7 @@ of choosing one. Domain and mapping management remain scoped to the requesting a
 Once a mapping resolves, invocation keeps its API type, account and region even if an
 API with the same ID exists elsewhere. Without a mapping, a signed request can select the
 caller's own API in its signing region; requests without a matching scope reject ambiguous IDs.
-This routing lookup does not add IAM identity or resource-policy evaluation.
+Route authorization follows this owner lookup.
 
 ### IAM Authorization (`AWS_IAM`) {#iam-authorization}
 
@@ -269,7 +269,7 @@ from another account use the same resource lookup and still undergo signature
 verification. Management requests remain scoped to the requesting account.
 When an API ID is ambiguous, signed callers retain access to their own account's API in
 the signing region; requests without a matching caller scope are rejected.
-This lookup does not add IAM identity or resource-policy evaluation.
+Route authorization follows this owner lookup.
 Before the integration runs, the signature is verified against the request as it arrived (method,
 path, query string, the headers named in `SignedHeaders`, and the SHA-256 of the body). A request
 that reaches the API through a [custom domain](#custom-domain-names) or an `execute-api` virtual
@@ -321,10 +321,22 @@ handling; a hand-rolled signer must include it.
 > the full check.
 
 > [!NOTE]
-> Floci authenticates the caller but does not authorize the call: it does not evaluate
-> `execute-api:Invoke` against the caller's IAM policies or a resource policy, so any validly
-> signed, known caller is let through. `principalOrgId` and `cognitoIdentity` are always null -
-> Organizations membership and identity-pool federation are not modelled.
+> HTTP and WebSocket IAM routes authenticate signatures without evaluating caller or resource
+> policies. `principalOrgId` and `cognitoIdentity` are always null; identity-pool federation is
+> not modeled.
+
+With IAM enforcement enabled, REST `AWS_IAM` methods also require `execute-api:Invoke` on the
+API owner, region, stage, concrete HTTP method and requested path. The shared IAM evaluator
+combines current identity, session, permissions-boundary, SCP and stored REST resource policies.
+Cross-account access requires identity and resource grants. Explicit denials take precedence,
+including for the verified local `test` credential. Denied requests do not invoke the backend.
+IAM-disabled REST routes retain signature validation without requiring policy grants.
+
+Stored policy resources using `execute-api:/stage/METHOD/path` are expanded during evaluation
+without changing stored readback. AWS expands this shorthand when saving the policy. Floci uses
+live API policy storage here; deployment-snapshot policy activation is not modeled. Resource
+policies for unsigned, CUSTOM and Cognito routes, full inbound condition context, and Lambda
+integration permissions remain separate work.
 
 ### Request Model Validation
 

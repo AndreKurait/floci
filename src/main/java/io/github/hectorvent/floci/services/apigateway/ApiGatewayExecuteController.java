@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.CookieHeaders;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
@@ -50,6 +51,7 @@ import io.github.hectorvent.floci.services.apigatewayv2.websocket.WebSocketConne
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -142,6 +144,7 @@ public class ApiGatewayExecuteController {
     private final RestLambdaAuthorizer restLambdaAuthorizer;
     private final AuthorizerPolicyEvaluator authorizerPolicyEvaluator;
     private final CloudMapInstanceResolver cloudMapInstanceResolver;
+    private final CallerCallAuthorizer callerCallAuthorizer;
 
     @Inject
     public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, CognitoUserPoolAuthorizer cognitoAuthorizer,
@@ -157,7 +160,8 @@ public class ApiGatewayExecuteController {
                                        RequestContext requestContext,
                                        ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
-                                       CloudMapInstanceResolver cloudMapInstanceResolver) {
+                                       CloudMapInstanceResolver cloudMapInstanceResolver,
+                                       CallerCallAuthorizer callerCallAuthorizer) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
@@ -180,6 +184,7 @@ public class ApiGatewayExecuteController {
         this.restLambdaAuthorizer = restLambdaAuthorizer;
         this.authorizerPolicyEvaluator = authorizerPolicyEvaluator;
         this.cloudMapInstanceResolver = cloudMapInstanceResolver;
+        this.callerCallAuthorizer = callerCallAuthorizer;
     }
 
     /** Matches an ELBv2 listener ARN (ALB {@code app/} or NLB {@code net/}); group 1 = region. */
@@ -494,6 +499,14 @@ public class ApiGatewayExecuteController {
                 return restIamRejection(scope, iamResult);
             }
             iamIdentity = iamResult.identity();
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod, path);
+            if (callerCallAuthorizer.authorize(iamIdentity == null ? null : iamIdentity.accessKey(),
+                    iamIdentity == null ? null : iamIdentity.accountId(),
+                    iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,
+                    AwsArnUtils.parse(invokeArn).partition()) != Decision.ALLOW) {
+                return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                        "User is not authorized to access this resource");
+            }
         }
 
         scope = scope.withIdentity(resolvedApiKey, iamIdentity);
