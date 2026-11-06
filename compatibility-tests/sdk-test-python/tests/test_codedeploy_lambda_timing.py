@@ -51,11 +51,26 @@ def rollout(aws_config, client_config):
                 bundle.writestr("index.py", f"def handler(event, context):\n    return {version}\n")
             return archive.getvalue()
 
-        original = functions.create_function(
+        function = functions.create_function(
             FunctionName=name, Runtime="python3.12", Handler="index.handler",
             Role=role, Code={"ZipFile": code(1)}, Publish=True,
-        )["Version"]
+        )
+        original = function["Version"]
         cleanup.callback(functions.delete_function, FunctionName=name)
+        function_arn = function["FunctionArn"].removesuffix(":" + original)
+        iam.put_role_policy(
+            RoleName=name, PolicyName="AliasDeployment",
+            PolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": ["lambda:GetAlias", "lambda:UpdateAlias"],
+                     "Resource": function_arn + ":live"},
+                    {"Effect": "Allow", "Action": "lambda:InvokeFunction",
+                     "Resource": function_arn + "-missing-hook"},
+                ],
+            }),
+        )
+        cleanup.callback(iam.delete_role_policy, RoleName=name, PolicyName="AliasDeployment")
         target = functions.update_function_code(
             FunctionName=name, ZipFile=code(2), Publish=True,
         )["Version"]

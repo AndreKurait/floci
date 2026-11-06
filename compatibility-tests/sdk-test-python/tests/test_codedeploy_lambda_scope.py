@@ -92,11 +92,23 @@ def test_lambda_worker_updates_only_the_request_account(
                 }),
             )["Role"]["Arn"]
             cleanup.callback(iam.delete_role, RoleName=name)
-            original = functions.create_function(
+            function = functions.create_function(
                 FunctionName=name, Runtime="python3.12", Handler="index.handler",
                 Role=role, Code={"ZipFile": code(1)}, Publish=True,
-            )["Version"]
+            )
+            original = function["Version"]
             cleanup.callback(functions.delete_function, FunctionName=name)
+            iam.put_role_policy(
+                RoleName=name, PolicyName="AliasDeployment",
+                PolicyDocument=json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow", "Action": ["lambda:GetAlias", "lambda:UpdateAlias"],
+                        "Resource": function["FunctionArn"].removesuffix(":" + original) + ":live",
+                    }],
+                }),
+            )
+            cleanup.callback(iam.delete_role_policy, RoleName=name, PolicyName="AliasDeployment")
             target = functions.update_function_code(
                 FunctionName=name, ZipFile=code(2), Publish=True,
             )["Version"]

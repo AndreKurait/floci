@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -164,7 +165,7 @@ class CodeDeployServicePersistenceTest {
         CodeDeployService service = new CodeDeployService(
                 mock(LambdaService.class), mock(EcsService.class), mock(ElbV2Service.class),
                 mock(SsmCommandService.class), mock(Ec2Service.class), new ObjectMapper(),
-                new RegionResolver(REGION, "000000000000"), storage, agent);
+                new RegionResolver(REGION, "000000000000"), storage, agent, mock(ServiceRoleCallAuthorizer.class));
         service.initializeStorage();
         return service;
     }

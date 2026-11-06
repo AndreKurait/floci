@@ -6,11 +6,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -25,6 +27,8 @@ import io.github.hectorvent.floci.services.ecs.model.CreateTaskSetRequest;
 import io.github.hectorvent.floci.services.ecs.model.TaskSet;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
+import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -69,6 +73,7 @@ public class CodeDeployService {
     private final SsmCommandService ssmCommandService;
     private final Ec2Service ec2Service;
     private final CodeDeployAgentDeployment agentDeployment;
+    private final ServiceRoleCallAuthorizer roleAuthorizer;
     private final ObjectMapper mapper;
     private final ObjectMapper yamlMapper;
     private final RegionResolver regionResolver;
@@ -80,22 +85,25 @@ public class CodeDeployService {
     public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
                              ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
                              Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
-                              StorageFactory storageFactory, CodeDeployAgentDeployment agentDeployment) {
+                              StorageFactory storageFactory, CodeDeployAgentDeployment agentDeployment,
+                              ServiceRoleCallAuthorizer roleAuthorizer) {
         this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
-                regionResolver, storageFactory, DEFAULT_HOOK_CALLBACK_TIMEOUT, Clock.systemUTC(), agentDeployment);
+                regionResolver, storageFactory, DEFAULT_HOOK_CALLBACK_TIMEOUT, Clock.systemUTC(),
+                agentDeployment, roleAuthorizer);
     }
 
     CodeDeployService(LambdaService lambdaService, EcsService ecsService,
                       ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
                       Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
                        StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
-                       CodeDeployAgentDeployment agentDeployment) {
+                       CodeDeployAgentDeployment agentDeployment, ServiceRoleCallAuthorizer roleAuthorizer) {
         this.lambdaService = lambdaService;
         this.ecsService = ecsService;
         this.elbV2Service = elbV2Service;
         this.ssmCommandService = ssmCommandService;
         this.ec2Service = ec2Service;
         this.agentDeployment = agentDeployment;
+        this.roleAuthorizer = roleAuthorizer;
         this.mapper = mapper;
         this.yamlMapper = new ObjectMapper(new YAMLFactory());
         this.regionResolver = regionResolver;
@@ -743,9 +751,11 @@ public class CodeDeployService {
         stopFlags.put(deploymentId, stopFlag);
 
         String accountId = regionResolver.getAccountId();
+        String serviceRoleArn = group.getServiceRoleArn();
         Thread.ofVirtual().name("codedeploy-" + deploymentId).start(
                 () -> RequestScopes.runAs(accountId, region,
-                        () -> runStateMachine(region, deployment, appSpec, lambdaTargetMap, stopFlag, effectiveConfig)));
+                        () -> runStateMachine(region, deployment, appSpec, lambdaTargetMap, stopFlag,
+                                effectiveConfig, serviceRoleArn)));
 
         return deploymentId;
     }
@@ -1872,7 +1882,8 @@ public class CodeDeployService {
     }
 
     private void runStateMachine(String region, Deployment deployment, AppSpecInfo appSpec,
-                                  Map<String, Object> lambdaTargetMap, AtomicBoolean stopFlag, String configName) {
+                                  Map<String, Object> lambdaTargetMap, AtomicBoolean stopFlag, String configName,
+                                  String serviceRoleArn) {
         String deploymentId = deployment.getDeploymentId();
         try {
             deployment.setStatus("InProgress");
@@ -1881,7 +1892,11 @@ public class CodeDeployService {
 
             if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
 
+            requireLambdaPermission(region, serviceRoleArn, appSpec.functionName, appSpec.aliasName, "GetAlias");
+            lambdaService.getAlias(region, appSpec.functionName, appSpec.aliasName);
+
             if (appSpec.beforeAllowTraffic != null) {
+                requireLambdaPermission(region, serviceRoleArn, appSpec.beforeAllowTraffic, null, "InvokeFunction");
                 boolean ok = invokeHook(region, deployment, appSpec.beforeAllowTraffic,
                         "BeforeAllowTraffic", lambdaTargetMap, stopFlag);
                 if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
@@ -1891,11 +1906,12 @@ public class CodeDeployService {
 
             if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
 
-            executeAllowTraffic(region, deployment, appSpec, configName, lambdaTargetMap, stopFlag);
+            executeAllowTraffic(region, deployment, appSpec, configName, lambdaTargetMap, stopFlag, serviceRoleArn);
 
             if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
 
             if (appSpec.afterAllowTraffic != null) {
+                requireLambdaPermission(region, serviceRoleArn, appSpec.afterAllowTraffic, null, "InvokeFunction");
                 boolean ok = invokeHook(region, deployment, appSpec.afterAllowTraffic,
                         "AfterAllowTraffic", lambdaTargetMap, stopFlag);
                 if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
@@ -1912,7 +1928,9 @@ public class CodeDeployService {
             finishStopped(deployment, lambdaTargetMap);
         } catch (Exception e) {
             LOG.warnv("Deployment {0} failed: {1}", deploymentId, e.getMessage());
-            finishFailed(deployment, lambdaTargetMap, "DeploymentFailed", e.getMessage());
+            String code = e instanceof AwsException failure && "IAM_ROLE_PERMISSIONS".equals(failure.getErrorCode())
+                    ? failure.getErrorCode() : "DeploymentFailed";
+            finishFailed(deployment, lambdaTargetMap, code, e.getMessage());
         } finally {
             stopFlags.remove(deploymentId);
         }
@@ -1920,7 +1938,7 @@ public class CodeDeployService {
 
     private void executeAllowTraffic(String region, Deployment deployment, AppSpecInfo appSpec,
                                       String configName, Map<String, Object> lambdaTargetMap,
-                                      AtomicBoolean stopFlag) throws InterruptedException {
+                                      AtomicBoolean stopFlag, String serviceRoleArn) throws InterruptedException {
         TrafficRoutingInfo trc = getTrafficRoutingInfo(region, configName);
         Map<String, Object> event = addLifecycleEvent(lambdaTargetMap, "AllowTraffic");
 
@@ -1930,8 +1948,7 @@ public class CodeDeployService {
                     // Step 1: shift canaryPercentage to targetVersion
                     double canaryWeight = trc.percentage / 100.0;
                     Map<String, Double> routing = Map.of(appSpec.targetVersion, canaryWeight);
-                    lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                            appSpec.currentVersion, null, routing);
+                    updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.currentVersion, routing);
 
                     if (!waitForTrafficInterval(trc.intervalSeconds, stopFlag)) {
                         finishLifecycleEvent(event, "Skipped");
@@ -1939,8 +1956,7 @@ public class CodeDeployService {
                     }
 
                     // Step 2: flip 100% to targetVersion
-                    lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                            appSpec.targetVersion, null, Map.of());
+                    updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.targetVersion, Map.of());
                 }
                 case "TimeBasedLinear" -> {
                     int steps = (int) Math.ceil(100.0 / trc.percentage);
@@ -1951,12 +1967,11 @@ public class CodeDeployService {
                         }
                         int pct = Math.min(step * trc.percentage, 100);
                         if (pct >= 100) {
-                            lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                                    appSpec.targetVersion, null, Map.of());
+                            updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.targetVersion, Map.of());
                         } else {
                             double weight = pct / 100.0;
-                            lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                                    appSpec.currentVersion, null, Map.of(appSpec.targetVersion, weight));
+                            updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.currentVersion,
+                                    Map.of(appSpec.targetVersion, weight));
                             if (!waitForTrafficInterval(trc.intervalSeconds, stopFlag)) {
                                 finishLifecycleEvent(event, "Skipped");
                                 return;
@@ -1966,14 +1981,35 @@ public class CodeDeployService {
                 }
                 default -> {
                     // AllAtOnce: flip immediately
-                    lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                            appSpec.targetVersion, null, Map.of());
+                    updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.targetVersion, Map.of());
                 }
             }
             finishLifecycleEvent(event, "Succeeded");
         } catch (Exception e) {
             finishLifecycleEvent(event, "Failed");
             throw e;
+        }
+    }
+
+    private void updateLambdaAlias(String region, String roleArn, AppSpecInfo appSpec, String version,
+                                    Map<String, Double> routing) {
+        requireLambdaPermission(region, roleArn, appSpec.functionName, appSpec.aliasName, "UpdateAlias");
+        lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName, version, null, routing);
+    }
+
+    private void requireLambdaPermission(String region, String roleArn, String function, String qualifier,
+                                           String operation) {
+        LambdaArnUtils.resolveWithRegion(region, function, qualifier);
+        String account = regionResolver.getAccountId();
+        String partition = AwsRegions.partitionFor(region);
+        String arn = LambdaArnUtils.functionArn(function, partition, region, account);
+        if (qualifier != null && LambdaArnUtils.resolve(function).qualifier() == null) {
+            arn += ":" + qualifier;
+        }
+        if (roleAuthorizer.authorizeWithoutSourceContext("codedeploy", roleArn, "lambda:" + operation,
+                arn, account, partition) != Decision.ALLOW) {
+            throw new AwsException("IAM_ROLE_PERMISSIONS",
+                    "The CodeDeploy service role cannot perform lambda:" + operation + " for " + arn, 403);
         }
     }
 
