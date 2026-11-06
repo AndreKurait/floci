@@ -714,6 +714,9 @@ public class IamConditionContextResolver {
             case "ec2:DeleteTags" -> ec2ResourceTagConditionContext(ctx, "ResourceId.1");
             case "ec2:TerminateInstances", "ec2:DescribeInstances" ->
                     ec2ResourceTagConditionContext(ctx, "InstanceId.1");
+            case "ec2:DeleteSecurityGroup", "ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress",
+                    "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress" ->
+                    ec2ResourceTagConditionContext(ctx, "GroupId");
             default -> null;
         };
     }
