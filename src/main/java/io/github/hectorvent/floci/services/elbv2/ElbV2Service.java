@@ -13,7 +13,9 @@ import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -87,6 +89,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     // region → ARN → resource
     private Map<String, Map<String, LoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
+    private StorageBackend<String, Map<String, LoadBalancer>> loadBalancerStore;
     private Map<String, Map<String, TargetGroup>> targetGroups = new ConcurrentHashMap<>();
     private Map<String, Map<String, Listener>> listeners = new ConcurrentHashMap<>();
     private Map<String, Map<String, Rule>> rules = new ConcurrentHashMap<>();
@@ -143,8 +146,9 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (storageFactory == null) {
             return;
         }
-        this.loadBalancers = storageBacked("elbv2-load-balancers.json",
+        this.loadBalancerStore = storageFactory.create("elbv2", "elbv2-load-balancers.json",
                 new TypeReference<Map<String, Map<String, LoadBalancer>>>() {});
+        this.loadBalancers = new StorageBackedMap<>(loadBalancerStore);
         this.targetGroups = storageBacked("elbv2-target-groups.json",
                 new TypeReference<Map<String, Map<String, TargetGroup>>>() {});
         this.listeners = storageBacked("elbv2-listeners.json",
@@ -425,6 +429,24 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             return EmbeddedDnsServer.DEFAULT_SUFFIX;
         }
         return config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+    }
+
+    /** DNS selects the resource owner independently of a management request's account. */
+    List<LoadBalancer> findByDnsName(String name) {
+        if (name == null || name.isBlank()) {
+            return List.of();
+        }
+        String normalized = name.endsWith(".") ? name.substring(0, name.length() - 1) : name;
+        if (normalized.regionMatches(true, 0, "dualstack.", 0, "dualstack.".length())) {
+            normalized = normalized.substring("dualstack.".length());
+        }
+        String target = normalized;
+        Collection<Map<String, LoadBalancer>> regions =
+                loadBalancerStore instanceof AccountAwareStorageBackend<Map<String, LoadBalancer>> aware
+                        ? aware.scanAllAccounts() : loadBalancers.values();
+        return regions.stream().flatMap(region -> region.values().stream())
+                .filter(lb -> target.equalsIgnoreCase(lb.getDnsName()))
+                .toList();
     }
 
     public List<LoadBalancer> describeLoadBalancers(String region, List<String> arns, List<String> names,
