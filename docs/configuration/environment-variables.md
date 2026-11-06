@@ -105,6 +105,8 @@ See [Storage Modes](./storage.md) for a full explanation of each mode.
 
 This foundation release provides opt-in security-group filtering for EC2 Docker instances and ECS `awsvpc` tasks. A rootful Linux Docker daemon with nftables support is required. Before enabling it, terminate existing EC2 instances and ECS tasks, then launch replacements so their namespaces are prepared before application code starts. Restart Floci after changing this setting. Mock mode remains a control-plane simulation and does not filter packets.
 
+Policy reconciliation installs rules on up to eight namespaces concurrently. Registration waits for every installation to finish before admitting the workload. If an installation fails, Floci waits for the other installations to settle and then quarantines the managed namespaces; a delayed installation cannot undo that quarantine.
+
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED` | `false` | Opt in to filtering Docker-backed EC2 and ECS `awsvpc` traffic by attached security groups |
