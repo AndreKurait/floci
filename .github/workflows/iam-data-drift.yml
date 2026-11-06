@@ -72,6 +72,7 @@ on:
       - 'tools/aws/regen_partitions.py'
       - 'tools/aws/regen_query_services.py'
       - '.github/workflows/iam-data-drift.yml'
+      - 'tools/aws/test_iam_data_verify.py'
   schedule:
     # Mondays at 06:00 UTC, before the working week rather than during it.
     - cron: '0 6 * * 1'
@@ -105,18 +106,22 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Test verifier selection
+        run: python3 tools/aws/test_iam_data_verify.py
+
       # IAM role-tag coverage also depends on which operations name a role in pinned botocore.
       - name: Install the pinned botocore
         run: pip install -r tools/aws/requirements.txt
 
       # A pull request checks the files it changes; the weekly and manual runs check every file. A
-      # diff that cannot be read leaves CHANGED empty, which checks every file too.
+      # unreadable diff fails the step; an empty manifest checks every file too.
       - name: Check the vendored IAM files still match upstream
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "$EVENT_NAME" = pull_request ]; then
-            make iam-data-verify CHANGED="$(git diff --name-only HEAD^1 HEAD | tr '\n' ' ')"
+            git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/iam-changed-files.txt"
+            make iam-data-verify CHANGED_FILE="$RUNNER_TEMP/iam-changed-files.txt"
           else
             make iam-data-verify
           fi
