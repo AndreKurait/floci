@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
+import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -45,8 +46,6 @@ class AutoScalingStandbyLifecycleIntegrationTest {
     private String name;
     private String targetGroup;
     private List<String> instanceIds;
-    private boolean configurationCreated;
-    private boolean groupCreated;
 
     @BeforeEach
     void createGroup() {
@@ -67,33 +66,72 @@ class AutoScalingStandbyLifecycleIntegrationTest {
                 .post("/").then().statusCode(200);
         client.createLaunchConfiguration(request -> request.launchConfigurationName(name)
                 .imageId("ami-amazonlinux2023").instanceType("t3.micro"));
-        configurationCreated = true;
         client.createAutoScalingGroup(request -> request.autoScalingGroupName(name).launchConfigurationName(name)
                 .minSize(0).maxSize(4).desiredCapacity(2).availabilityZones(REGION + "a")
                 .targetGroupARNs(targetGroup).loadBalancerNames(name));
-        groupCreated = true;
         awaitActiveInstances(2);
         instanceIds = group().instances().stream().map(instance -> instance.instanceId()).toList();
     }
 
     @AfterEach
     void cleanUp() {
-        try {
-            if (groupCreated) {
-                client.deleteAutoScalingGroup(request -> request.autoScalingGroupName(name).forceDelete(true));
-            }
-            if (configurationCreated) {
-                client.deleteLaunchConfiguration(request -> request.launchConfigurationName(name));
-            }
-            if (name != null) {
-                elb("DeleteLoadBalancer", "2012-06-01").formParam("LoadBalancerName", name).post("/");
-            }
-            if (targetGroup != null) {
-                elb("DeleteTargetGroup", "2015-12-01").formParam("TargetGroupArn", targetGroup).post("/");
-            }
-        } finally {
-            client.close();
+        if (client == null) {
+            return;
         }
+        cleanResources(() -> {
+            if (name != null) {
+                AutoScalingStandbyIntegrationTest.deleteOwned(
+                        () -> client.deleteAutoScalingGroup(request -> request.autoScalingGroupName(name).forceDelete(true)),
+                        "Auto Scaling group '" + name + "' not found.");
+            }
+        }, () -> {
+            if (name != null) {
+                AutoScalingStandbyIntegrationTest.deleteOwned(
+                        () -> client.deleteLaunchConfiguration(request -> request.launchConfigurationName(name)),
+                        "Launch configuration '" + name + "' not found.");
+            }
+        }, () -> {
+            if (name != null) {
+                elb("DeleteLoadBalancer", "2012-06-01").formParam("LoadBalancerName", name)
+                        .post("/").then().statusCode(200);
+            }
+        }, this::deleteTargetGroup, client::close);
+    }
+
+    private void deleteTargetGroup() {
+        if (name == null) {
+            return;
+        }
+        if (targetGroup == null) {
+            Response response = elb("DescribeTargetGroups", "2015-12-01")
+                    .formParam("Names.member.1", name).post("/");
+            if (response.statusCode() == 400
+                    && "TargetGroupNotFound".equals(response.xmlPath().getString("ErrorResponse.Error.Code"))) {
+                return;
+            }
+            response.then().statusCode(200);
+            targetGroup = response.xmlPath().getString(
+                    "DescribeTargetGroupsResponse.DescribeTargetGroupsResult.TargetGroups.member.TargetGroupArn");
+        }
+        if (targetGroup != null && !targetGroup.isBlank()) {
+            elb("DeleteTargetGroup", "2015-12-01").formParam("TargetGroupArn", targetGroup)
+                    .post("/").then().statusCode(200);
+        }
+    }
+
+    static void cleanResources(Runnable group, Runnable configuration, Runnable loadBalancer,
+                               Runnable targetGroup, Runnable closeClient) {
+        try (Cleanup clientCleanup = closeClient::run;
+             Cleanup targetCleanup = targetGroup::run;
+             Cleanup loadBalancerCleanup = loadBalancer::run;
+             Cleanup configurationCleanup = configuration::run) {
+            group.run();
+        }
+    }
+
+    private interface Cleanup extends AutoCloseable {
+        @Override
+        void close();
     }
 
     @Test
@@ -262,8 +300,8 @@ class AutoScalingStandbyLifecycleIntegrationTest {
         assertTrue(classicMembers.containsAll(expected));
     }
 
-    private static RequestSpecification elb(String action, String version) {
-        return given().header("Authorization", "AWS4-HMAC-SHA256 Credential=" + ACCOUNT
+    private RequestSpecification elb(String action, String version) {
+        return given().baseUri(endpoint.toString()).header("Authorization", "AWS4-HMAC-SHA256 Credential=" + ACCOUNT
                         + "/20261028/" + REGION + "/elasticloadbalancing/aws4_request")
                 .formParam("Action", action).formParam("Version", version);
     }
