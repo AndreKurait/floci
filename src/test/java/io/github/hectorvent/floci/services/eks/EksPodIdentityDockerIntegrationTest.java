@@ -46,6 +46,7 @@ class EksPodIdentityDockerIntegrationTest {
                     "floci.tls.aws-https-port", "0",
                     "quarkus.http.test-port", "4510",
                     "quarkus.http.test-ssl-port", "4511",
+                    "quarkus.http.proxy.use-proxy-protocol", "true",
                     "floci.port", "4595",
                     "floci.base-url", "http://localhost:4595");
         }
