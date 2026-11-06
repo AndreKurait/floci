@@ -39,6 +39,8 @@ import io.github.hectorvent.floci.services.ec2.model.PrefixList;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListId;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.ec2.model.Route;
+import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
@@ -61,6 +63,7 @@ import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
 import io.github.hectorvent.floci.services.ec2.model.VpcEndpointSubnetConfiguration;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
+import io.github.hectorvent.floci.testing.ParkingStore;
 import io.github.hectorvent.floci.testing.ParkingStore;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
@@ -160,6 +163,71 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ServiceTest {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void routeTableDeleteWaitsForGatewayRetirementWithoutResurrection(boolean nat) throws Exception {
+        String region = "us-east-1";
+        ParkingStore<RouteTable> parked = new ParkingStore<>();
+        AccountAwareStorageBackend<RouteTable> tables =
+                new AccountAwareStorageBackend<>(parked, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-route-tables.json", tables)));
+        String vpc = service.createVpc(region, "10.134.0.0/16", false).getVpcId();
+        String gateway;
+        if (nat) {
+            String subnet = service.createSubnet(region, vpc, "10.134.1.0/24", region + "a").getSubnetId();
+            gateway = service.createNatGateway(region, subnet, null, "private", List.of()).getNatGatewayId();
+        } else {
+            gateway = service.createEgressOnlyInternetGateway(region, vpc, null, List.of())
+                    .getEgressOnlyInternetGatewayId();
+        }
+        RouteTable table = service.createRouteTable(region, vpc);
+        Route route =
+                new Route();
+        route.setDestinationCidrBlock("0.0.0.0/0");
+        route.setState("active");
+        if (nat) {
+            route.setNatGatewayId(gateway);
+        } else {
+            route.setEgressOnlyInternetGatewayId(gateway);
+        }
+        table.getRoutes().add(route);
+        tables.put(region + "::" + table.getRouteTableId(), table);
+        parked.parkNextWrite();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> retirement = pool.submit(() -> {
+                if (nat) {
+                    service.deleteNatGateway(region, gateway);
+                } else {
+                    service.deleteEgressOnlyInternetGateway(region, gateway);
+                }
+            });
+            assertTrue(parked.awaitParked(), "gateway retirement must reach the route write");
+            AtomicReference<Thread> deleting = new AtomicReference<>();
+            Future<?> deletion = pool.submit(() -> {
+                deleting.set(Thread.currentThread());
+                service.deleteRouteTable(region, table.getRouteTableId());
+            });
+            awaitBlockedOrDone(deleting, deletion);
+            assertFalse(deletion.isDone(), "deletion must wait for the in-flight route write");
+            parked.release();
+            retirement.get(2, TimeUnit.SECONDS);
+            deletion.get(2, TimeUnit.SECONDS);
+            assertTrue(tables.get(region + "::" + table.getRouteTableId()).isEmpty());
+            assertTrue(service.describeRouteTables(region, List.of(table.getRouteTableId()), Map.of()).isEmpty());
+            AwsException missing = assertThrows(AwsException.class,
+                    () -> service.deleteRouteTable(region, table.getRouteTableId()));
+            assertEquals("InvalidRouteTableID.NotFound", missing.getErrorCode());
+        } finally {
+            parked.release();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
 
     @ParameterizedTest
     @CsvSource({
