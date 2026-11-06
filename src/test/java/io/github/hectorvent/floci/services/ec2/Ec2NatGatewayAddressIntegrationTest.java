@@ -419,23 +419,35 @@ class Ec2NatGatewayAddressIntegrationTest {
                     equalTo("Elastic IP address " + heldByGateway + " is already associated"))
             .body(not(containsString("<networkInterfaceId>")));
 
-        String heldByInstance = allocate();
-        ec2("AssociateAddress", ACCOUNT_ID, REGION)
-            .formParam("AllocationId", heldByInstance).formParam("InstanceId", "i-0123456789abcdef0").post("/")
-        .then().statusCode(200);
-        createNat(heldByInstance).then().statusCode(200)
-            .body("CreateNatGatewayResponse.natGateway.state", equalTo("failed"))
-            .body("CreateNatGatewayResponse.natGateway.failureCode", equalTo("Resource.AlreadyAssociated"));
-        String instanceAssociation = ec2("DescribeAddresses", ACCOUNT_ID, REGION)
-            .formParam("AllocationId.1", heldByInstance).post("/")
+        String instanceId = ec2("RunInstances", ACCOUNT_ID, REGION)
+            .formParam("ImageId", "ami-amazonlinux2023")
+            .formParam("InstanceType", "t3.micro")
+            .formParam("MinCount", "1").formParam("MaxCount", "1")
+            .formParam("SubnetId", subnetId()).post("/")
         .then().statusCode(200)
-            .body("DescribeAddressesResponse.addressesSet.item.instanceId", equalTo("i-0123456789abcdef0"))
-            .extract().path("DescribeAddressesResponse.addressesSet.item.associationId");
-        // The failed gateway does not hold the address: once the instance lets go it can be released.
-        ec2("DisassociateAddress", ACCOUNT_ID, REGION).formParam("AssociationId", instanceAssociation).post("/")
-        .then().statusCode(200);
-        ec2("ReleaseAddress", ACCOUNT_ID, REGION).formParam("AllocationId", heldByInstance).post("/")
-        .then().statusCode(200);
+            .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
+        try {
+            String heldByInstance = allocate();
+            ec2("AssociateAddress", ACCOUNT_ID, REGION)
+                .formParam("AllocationId", heldByInstance).formParam("InstanceId", instanceId).post("/")
+            .then().statusCode(200);
+            createNat(heldByInstance).then().statusCode(200)
+                .body("CreateNatGatewayResponse.natGateway.state", equalTo("failed"))
+                .body("CreateNatGatewayResponse.natGateway.failureCode", equalTo("Resource.AlreadyAssociated"));
+            String instanceAssociation = ec2("DescribeAddresses", ACCOUNT_ID, REGION)
+                .formParam("AllocationId.1", heldByInstance).post("/")
+            .then().statusCode(200)
+                .body("DescribeAddressesResponse.addressesSet.item.instanceId", equalTo(instanceId))
+                .extract().path("DescribeAddressesResponse.addressesSet.item.associationId");
+            // The failed gateway claimed nothing; the instance can release its address.
+            ec2("DisassociateAddress", ACCOUNT_ID, REGION)
+                .formParam("AssociationId", instanceAssociation).post("/").then().statusCode(200);
+            ec2("ReleaseAddress", ACCOUNT_ID, REGION)
+                .formParam("AllocationId", heldByInstance).post("/").then().statusCode(200);
+        } finally {
+            ec2("TerminateInstances", ACCOUNT_ID, REGION)
+                .formParam("InstanceId.1", instanceId).post("/").then().statusCode(200);
+        }
 
         // The failed gateway claimed nothing, and deleting it leaves the first gateway's association alone.
         String held = ec2("DescribeAddresses", ACCOUNT_ID, REGION).formParam("AllocationId.1", heldByGateway).post("/")
