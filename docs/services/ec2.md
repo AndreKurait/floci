@@ -2419,3 +2419,16 @@ cannot split a move between its source and destination.
 
 A launch template with network interfaces cannot be combined with an instance-level
 `SubnetId`; place the subnet on the primary network interface instead.
+
+## Instance metadata discovery
+
+Metadata directory reads list implemented categories available for the requested
+metadata build and instance. Native cloud-init can traverse `meta-data/`,
+`placement/`, `public-keys/`, and `dynamic/instance-identity/` using the same
+IMDSv2 token as individual metadata values. Unavailable optional categories are
+omitted. Directory requests retain metadata disablement, token validation, and
+token expiry; they do not redirect to another metadata build.
+
+The SSH public key is captured when the instance launches and retained in its
+metadata after the EC2 key-pair record is deleted. The private key is never part
+of instance metadata.
