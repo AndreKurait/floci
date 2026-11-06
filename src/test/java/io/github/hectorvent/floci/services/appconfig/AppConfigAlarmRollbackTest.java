@@ -266,7 +266,8 @@ class AppConfigAlarmRollbackTest {
         when(clock.instant()).thenReturn(START);
         CloudWatchMetricsService cloudWatch = new CloudWatchMetricsService(storage, regions);
         return new Fixture(new AppConfigService(storage, regions, clock,
-                new AppConfigAlarmMonitor(cloudWatch, authorizer, regions)), cloudWatch, authorizer, regions, clock);
+                new AppConfigAlarmMonitor(cloudWatch, authorizer, regions),
+                mock(AppConfigS3Source.class)), cloudWatch, authorizer, regions, clock);
     }
 
     private static Scope scope(Fixture fixture) {

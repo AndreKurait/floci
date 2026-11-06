@@ -3154,6 +3154,75 @@ HTTP 403 with `IssuedSessionVerificationFailed`. Tokens and proof inputs are not
 logged or echoed. Posting `{}` distinguishes an enabled handler from an older or
 disabled implementation without sending any credential material.
 
+## Local derived signing keys
+
+`POST /_floci/iam/derived-signing-keys/derive` returns the SigV4 derived signing key of a session
+this Floci issued, so a request verifier running outside Floci can check that session's
+signatures itself. It never returns a secret access key. It is disabled by default, is not an AWS
+API operation, and answers exactly one configured caller.
+
+Settings (`floci.services.iam.derived-signing-keys.*`):
+
+| Setting | Meaning |
+|---|---|
+| `enabled` | Off by default. While off, nothing else is read and the endpoint answers 404. |
+| `caller-access-key-id` | The one access key ID allowed to call, `[A-Z0-9]{16,128}`. It is not an IAM key: it exists only for this endpoint and must never name a Floci credential. |
+| `caller-secret-access-key-file` | A file holding that caller's secret (40-128 printable ASCII characters, at least 16 distinct). It must grant no group or other permission (that refuses startup), so it must be owned by and readable by the user Floci runs as (uid 1001 in the Floci image). A symlink is judged by its target. A Kubernetes secret volume (root-owned, or group-readable with `fsGroup`) does not meet this as mounted; copy the secret into an owner-only file first, for example in an init container. Generate it with, for example, `openssl rand -base64 30`, and give the same file to the caller. Rotating it means a restart. |
+| `allowed-regions` | Exact regions a key may be derived for. |
+| `allowed-services` | Exact SigV4 signing names a key may be derived for. A name Floci itself serves is refused at startup. |
+| `allowed-levels` | `signing` (default; the `kSigning` key) and/or `service` (the `kService` key one step earlier, for verifiers that derive further keys from it). |
+
+When enabled, an invalid setting refuses startup with a message naming the setting.
+
+**Caller authentication.** Every request must carry an `Authorization: AWS4-HMAC-SHA256` header
+for the configured key, scoped `<date>/<region>/floci/aws4_request`, signing at least `host` and
+`x-amz-date`, within 15 minutes of Floci's clock. The body hash is always checked; an
+`x-amz-content-sha256` header, if sent, must be its lowercase hex. Query-string signatures,
+SigV4a, unsigned payloads, `Content-Encoding`, session tokens and repeated `Authorization`,
+`Host` or `x-amz-date` headers are refused. Each accepted signature works once: a repeat is
+refused, so give every request a fresh `correlationId` and re-sign retries. The replay set
+holds up to 10,000 signatures, each until its `x-amz-date` plus 15 minutes (the last moment it
+could be accepted); when it is full, new requests get 429 `DerivedSigningKeyRateExceeded` until
+entries expire. It uses the host clock, so keep that clock monotonic. This check applies
+whatever `floci.auth.validate-signatures` is.
+
+The path is exactly `/_floci/iam/derived-signing-keys/derive`, with no trailing slash.
+The replay set lives in memory, so a restart forgets it: keep the transport private.
+
+**Request.** A JSON body of at most 16,384 bytes with exactly these string fields:
+`correlationId` (`[A-Za-z0-9_-]{1,128}`), `accessKeyId` (`ASIA` plus 16 characters),
+`sessionToken` (the session's token), `date` (`YYYYMMDD`), `region`, `service` and `level`.
+The date must be the current UTC date, or the neighbouring one within 15 minutes of midnight.
+
+**Eligible sessions.** The ones the issued-session endpoints above admit, issued in this
+process: AssumeRole sessions (including those chained from a Lambda execution role) and EC2
+instance-profile sessions minted through IMDS. IAM user keys, ECS task-role, Lambda execution,
+GetSessionToken, federation, web-identity, SAML and identity-role credentials, and any session
+restored after a restart, are refused.
+
+**Response.** `correlationId`, `accessKeyId`, `credentialKind`, `date`, `region`, `service`,
+`level`, `derivedKey` (base64, 32 bytes) and `credentialExpiresAt`, with `Cache-Control: no-store`.
+A derived key stays a valid HMAC key for its whole date, so a verifier must stop using it at
+`credentialExpiresAt`. This endpoint does not return identity: for the principal, call
+`/_floci/iam/issued-sessions/lookup` (its own setting) as a second step.
+
+Errors contain only `{"code":"..."}`: 404 `DerivedSigningKeysDisabled`; 400
+`InvalidDerivedSigningKeyRequest`; 403 `DerivedSigningKeyCallerRefused`,
+`DerivedSigningKeyReplayed`, `DerivedSigningKeyScopeNotAllowed` or `DerivedSigningKeyRefused`;
+429 `DerivedSigningKeyRateExceeded`.
+A wrong method or content type gets the framework's own 405 or 415, without key material.
+Nothing on this path is logged; do not enable `quarkus.http.access-log` or Quarkus's own
+`quarkus.http.cors` with it (Floci's CORS filter never grants this path; Quarkus's would).
+
+**Security notes.**
+
+* Whoever holds the caller secret can sign requests as any eligible session for the listed
+  services. List only the signing names your verifier fronts.
+* Keep Floci on loopback, or on a private network with `floci.tls.enabled`. Startup warns when the
+  endpoint is enabled on a non-loopback listener without TLS.
+* Never log the caller's `Authorization` header.
+* Give each Floci instance its own caller secret.
+
 ## Local Lambda execution identity
 
 `FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED=true` enables

@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
@@ -70,6 +71,67 @@ class Ec2NatGatewayRouteRetirementIntegrationTest {
             }
             network.deleteGateway(gateway);
             assertEquals("blackhole", network.route(table, "0.0.0.0/0").stateAsString());
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "create, missing", "replace, missing",
+            "create, deleted", "replace, deleted",
+            "create, other-account", "replace, other-account",
+            "create, other-region", "replace, other-region"
+    })
+    void routeMutationRejectsUnavailableNatTargetsWithoutChangingTheTable(String operation, String unavailable) {
+        try (Topology network = new Topology("814540000001", Region.US_EAST_1);
+             Topology otherAccount = new Topology("814540000002", Region.US_EAST_1);
+             Topology otherRegion = new Topology("814540000001", Region.EU_WEST_1)) {
+            String table = network.routeTable();
+            network.route(table, "0.0.0.0/0", network.gateway("private"));
+            String target = switch (unavailable) {
+                case "missing" -> "nat-fffffffffffffffff";
+                case "deleted" -> {
+                    String deleted = network.gateway("private");
+                    network.deleteGateway(deleted);
+                    yield deleted;
+                }
+                case "other-account" -> otherAccount.gateway("private");
+                case "other-region" -> otherRegion.gateway("private");
+                default -> throw new IllegalArgumentException(unavailable);
+            };
+            List<Route> before = network.routes(table);
+
+            Ec2Exception failure = assertThrows(Ec2Exception.class, () -> {
+                if ("create".equals(operation)) {
+                    network.route(table, "192.0.2.0/24", target);
+                } else {
+                    network.client.replaceRoute(request -> request.routeTableId(table)
+                            .destinationCidrBlock("0.0.0.0/0").natGatewayId(target));
+                }
+            });
+
+            assertEquals("NatGatewayNotFound", failure.awsErrorDetails().errorCode());
+            assertEquals(400, failure.statusCode());
+            assertEquals(before, network.routes(table), "A rejected target must leave every route unchanged");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "valid"})
+    void replaceDryRunDoesNotResolveNatTargetsOrMutateRoutes(String targetState) {
+        try (Topology network = new Topology("814540000004", Region.US_EAST_1)) {
+            String table = network.routeTable();
+            String gateway = network.gateway("private");
+            network.route(table, "0.0.0.0/0", gateway);
+            String target = "missing".equals(targetState) ? "nat-fffffffffffffffff" : gateway;
+            List<Route> before = network.routes(table);
+
+            Ec2Exception failure = assertThrows(Ec2Exception.class,
+                    () -> network.client.replaceRoute(request -> request.routeTableId(table)
+                            .destinationCidrBlock("0.0.0.0/0").natGatewayId(target).dryRun(true)));
+
+            assertEquals("DryRunOperation", failure.awsErrorDetails().errorCode());
+            assertEquals(412, failure.statusCode());
+            assertEquals(before, network.routes(table), "DryRun must preserve every route");
         }
     }
 

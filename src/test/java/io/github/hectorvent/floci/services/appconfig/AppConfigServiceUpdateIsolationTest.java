@@ -27,7 +27,8 @@ class AppConfigServiceUpdateIsolationTest {
     private static final String ALARM = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration-errors";
 
     private final AppConfigService service = new AppConfigService(new InMemoryStorageFactory("000000000000"),
-            new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class));
+            new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+            mock(AppConfigS3Source.class));
 
     @Test
     void aStrategyReadBeforeAnUpdateKeepsItsPriorSettings() {
@@ -91,7 +92,7 @@ class AppConfigServiceUpdateIsolationTest {
                 Map.of("Name", "settings", "LocationUri", "hosted", "Type", "AWS.Freeform"));
         ConfigurationProfile before = service.getConfigurationProfile(appId, created.getId());
 
-        service.updateConfigurationProfile(appId, created.getId(), "renamed", "Now described");
+        service.updateConfigurationProfile(appId, created.getId(), "renamed", "Now described", null);
 
         assertEquals("settings", before.getName());
         assertNull(before.getDescription());

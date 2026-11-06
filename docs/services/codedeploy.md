@@ -72,6 +72,11 @@ Lambda deployment workers retain the requesting account and region while
 resolving deployment configurations, invoking lifecycle hooks, and shifting
 alias traffic. Identically named functions in another account remain separate.
 
+Lambda canary and linear deployments honor their configured intervals in minutes. The deployment
+stays `InProgress` between traffic shifts. Stop requests are observed during the wait, leave
+later shifts unexecuted, and mark the interrupted `AllowTraffic` event `Skipped`.
+`LambdaAllAtOnce` moves traffic immediately.
+
 ### Tagging
 
 | Operation | Notes |

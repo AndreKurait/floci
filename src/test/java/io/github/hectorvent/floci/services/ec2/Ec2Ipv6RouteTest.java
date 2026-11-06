@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ec2;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -36,7 +37,6 @@ class Ec2Ipv6RouteTest {
     private static final String IPV4_ROUTE = "0.0.0.0/0";
     private static final String IPV6_ROUTE = "::/0";
     private static final String INTERNET_GATEWAY = "igw-0ipv6route0test0";
-    private static final String NAT_GATEWAY = "nat-0ipv6route0test0";
     private static final String ROUTE_SET =
             "DescribeRouteTablesResponse.routeTableSet.item.routeSet.item";
     private static final String IPV6_NODE =
@@ -45,6 +45,14 @@ class Ec2Ipv6RouteTest {
             ROUTE_SET + ".find { it.destinationCidrBlock == '" + IPV4_ROUTE + "' }";
 
     private static String routeTableId;
+    private static NatGatewayFixture natGateway;
+
+    @AfterAll
+    static void retireNatGateway() {
+        if (natGateway != null) {
+            natGateway.close();
+        }
+    }
 
     private static RequestSpecification ec2() {
         return given().header("Authorization", AUTH_HEADER);
@@ -71,6 +79,7 @@ class Ec2Ipv6RouteTest {
         .then()
             .statusCode(200)
             .extract().path("CreateVpcResponse.vpc.vpcId");
+        natGateway = new NatGatewayFixture(AUTH_HEADER, vpcId, VPC_CIDR);
 
         routeTableId = ec2()
             .formParam("Action", "CreateRouteTable")
@@ -188,7 +197,7 @@ class Ec2Ipv6RouteTest {
             .formParam("Action", "ReplaceRoute")
             .formParam("RouteTableId", routeTableId)
             .formParam("DestinationIpv6CidrBlock", IPV6_ROUTE)
-            .formParam("NatGatewayId", NAT_GATEWAY)
+            .formParam("NatGatewayId", natGateway.id())
         .when()
             .post("/")
         .then()
@@ -196,7 +205,7 @@ class Ec2Ipv6RouteTest {
             .body("ReplaceRouteResponse.return", equalTo("true"));
 
         describe()
-            .body(IPV6_NODE + ".natGatewayId", equalTo(NAT_GATEWAY))
+            .body(IPV6_NODE + ".natGatewayId", equalTo(natGateway.id()))
             // Replace, not merge: the gateway the route used to carry is gone...
             .body(hasXPath("count(//*[local-name()='item']"
                     + "[*[local-name()='destinationIpv6CidrBlock']='" + IPV6_ROUTE + "']"
@@ -230,7 +239,7 @@ class Ec2Ipv6RouteTest {
             .body(hasXPath("count(//*[local-name()='destinationCidrBlock'][text()='"
                     + IPV4_ROUTE + "'])", equalTo("0")))
             // The IPv6 route is untouched.
-            .body(IPV6_NODE + ".natGatewayId", equalTo(NAT_GATEWAY));
+            .body(IPV6_NODE + ".natGatewayId", equalTo(natGateway.id()));
     }
 
     @Test
@@ -395,7 +404,7 @@ class Ec2Ipv6RouteTest {
             .formParam("RouteTableId", routeTableId)
             .formParam("DestinationIpv6CidrBlock", "2001:db8:1::/48")
             .formParam("EgressOnlyInternetGatewayId", "eigw-0ipv6route0test")
-            .formParam("NatGatewayId", NAT_GATEWAY)
+            .formParam("NatGatewayId", natGateway.id())
         .when()
             .post("/")
         .then()

@@ -36,7 +36,8 @@ class AppConfigServiceTaggingTest {
     @Test
     void anApplicationReadBeforeATagOrUntagKeepsItsPriorTags() {
         AppConfigService service = new AppConfigService(new InMemoryStorageFactory(ACCOUNT),
-                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class));
+                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
         Application created = service.createApplication(Map.of("Name", "orders"));
         service.tagApplication(created.getId(), Map.of("team", "payments"));
         Application beforeTag = service.getApplication(created.getId());
@@ -94,6 +95,7 @@ class AppConfigServiceTaggingTest {
     /** An AppConfig service whose application store is {@code store} and every other store in memory. */
     private static AppConfigService serviceWithApplicationStore(StorageBackend<String, Application> store) {
         return new AppConfigService(new InMemoryStorageFactory(ACCOUNT).withStore(APPLICATIONS, store),
-                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class));
+                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
     }
 }

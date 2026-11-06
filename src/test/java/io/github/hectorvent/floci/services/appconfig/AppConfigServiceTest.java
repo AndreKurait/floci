@@ -109,7 +109,8 @@ class AppConfigServiceTest {
         profile.setApplicationId("app");
         when(profileStore.get("profile")).thenReturn(Optional.of(profile));
         service = new AppConfigService(storageFactory, new RegionResolver("us-east-1", "000000000000"),
-                mock(AppConfigAlarmMonitor.class));
+                mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
     }
 
     private static <V> AccountAwareStorageBackend<V> storage() {
