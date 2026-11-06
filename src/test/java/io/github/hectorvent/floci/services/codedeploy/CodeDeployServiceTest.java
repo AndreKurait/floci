@@ -15,6 +15,8 @@ import io.github.hectorvent.floci.services.ssm.SsmCommandService;
 import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -31,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -188,6 +191,34 @@ class CodeDeployServiceTest {
     }
 
     // ---- Lambda platform hooks ----------------------------------------------------------
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "CodeDeployDefault.LambdaCanary10Percent5Minutes",
+            "CodeDeployDefault.LambdaLinear10PercentEvery1Minute"
+    })
+    void lambdaTrafficIntervalRemainsPendingAndStopsWithoutAnotherShift(String config) {
+        createLambdaAppAndGroup("timed-app", "timed-group");
+        String deploymentId = service.createDeployment(REGION, "timed-app", "timed-group", config,
+                lambdaRevision(null, null), "traffic interval");
+        try {
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
+                    verify(lambdaService).updateAlias(eq(REGION), eq("myFunc"), eq("live"),
+                            eq("1"), isNull(), eq(Map.of("2", 0.1))));
+            await().during(Duration.ofSeconds(6)).atMost(Duration.ofSeconds(8))
+                    .pollInterval(Duration.ofMillis(25))
+                    .until(() -> "InProgress".equals(service.getDeployment(REGION, deploymentId).getStatus()));
+
+            service.stopDeployment(REGION, deploymentId);
+            assertEquals("Stopped", awaitTerminal(deploymentId, Duration.ofSeconds(2)).getStatus());
+            assertEquals("Skipped", lambdaTargetEvent(deploymentId, "AllowTraffic").get("status"));
+            verify(lambdaService, never()).updateAlias(eq(REGION), eq("myFunc"), eq("live"),
+                    eq("2"), any(), any());
+        } finally {
+            service.stopDeployment(REGION, deploymentId);
+            awaitTerminal(deploymentId, Duration.ofSeconds(5));
+        }
+    }
 
     @Test
     void lambdaHookInvocationFailureMarksHookFailed() {
