@@ -342,7 +342,8 @@ public class ResourceArnBuilder {
         if (RequestResources.reads(action)) {
             return namedResources("logs", action, ctx, region, accountId, partition);
         }
-        boolean stream = "logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action);
+        boolean stream = "logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
+                || "logs:PutLogEvents".equals(action);
         boolean group = switch (action) {
             case "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy",
                     "logs:DeleteRetentionPolicy" -> true;
