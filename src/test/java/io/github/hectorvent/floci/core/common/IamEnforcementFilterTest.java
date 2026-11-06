@@ -37,6 +37,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
@@ -425,6 +426,10 @@ class IamEnforcementFilterTest {
     @Test
     void restRouteAuthorizesTheServiceThatMatchedTheRequest() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(containerRequest.getUriInfo()).thenReturn(uriInfo);
+        when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost/"));
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/restapis"));
         String auth = "AWS4-HMAC-SHA256 Credential=AKIAUSER/20260924/us-east-1/iam/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
         requestContext.setAccountId("000000000000");
