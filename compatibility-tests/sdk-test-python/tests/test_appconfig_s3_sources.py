@@ -2,6 +2,7 @@
 import json
 
 import pytest
+from botocore.exceptions import ClientError
 
 from appconfig_s3_fixtures import _assert_rejected_deployment, _deploy, _read, s3_source_scope
 
@@ -97,3 +98,30 @@ def test_s3_source_cloudformation_deploys_real_content(s3_source_scope, object_a
     assert actual["RetrievalRoleArn"] == scope["role"]
     assert _read({**scope, "profile": profile}) == scope["content"]
     assert _read({**scope, "profile": profile}, legacy=True) == scope["content"]
+
+
+def test_s3_source_schema_rejection_preserves_content_and_allows_recovery(s3_source_scope):
+    scope = s3_source_scope
+    client = scope["appconfig"]
+    request = {"ApplicationId": scope["app"], "ConfigurationProfileId": scope["profile"]}
+    schema = {"type": "object", "required": ["limit"], "additionalProperties": False,
+              "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}}}
+    client.update_configuration_profile(
+        **request, Validators=[{"Type": "JSON_SCHEMA", "Content": json.dumps(schema)}])
+    assert client.validate_configuration(**request, ConfigurationVersion=scope["version"])[
+        "ResponseMetadata"]["HTTPStatusCode"] == 204
+    assert not client.list_deployments(ApplicationId=scope["app"], EnvironmentId=scope["env"])["Items"]
+    _deploy(scope, scope["version"])
+    bad = scope["s3"].put_object(Bucket=scope["bucket"], Key=scope["key"],
+                                  Body=b'{"limit":"unlimited"}', ContentType="application/json")["VersionId"]
+    for call in (lambda: client.validate_configuration(**request, ConfigurationVersion=bad),
+                 lambda: _deploy(scope, bad)):
+        with pytest.raises(ClientError) as failure:
+            call()
+        assert failure.value.response["Error"]["Code"] == "BadRequestException"
+    assert _read(scope) == scope["content"]
+    assert _read(scope, legacy=True) == scope["content"]
+    good = scope["s3"].put_object(Bucket=scope["bucket"], Key=scope["key"],
+                                   Body=b'{"limit":20}', ContentType="application/json")["VersionId"]
+    _deploy(scope, good)
+    assert _read(scope) == b'{"limit":20}'

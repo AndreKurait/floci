@@ -92,7 +92,8 @@ class AppConfigServiceUpdateIsolationTest {
                 Map.of("Name", "settings", "LocationUri", "hosted", "Type", "AWS.Freeform"));
         ConfigurationProfile before = service.getConfigurationProfile(appId, created.getId());
 
-        service.updateConfigurationProfile(appId, created.getId(), "renamed", "Now described", null);
+        service.updateConfigurationProfile(appId, created.getId(),
+                Map.of("Name", "renamed", "Description", "Now described"));
 
         assertEquals("settings", before.getName());
         assertNull(before.getDescription());
