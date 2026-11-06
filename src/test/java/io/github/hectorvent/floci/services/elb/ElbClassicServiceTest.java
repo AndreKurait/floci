@@ -22,6 +22,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,9 +44,12 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -407,6 +411,69 @@ class ElbClassicServiceTest {
         ClassicLoadBalancer lb = create("my-elb");
         service.createLoadBalancerListeners(REGION, "my-elb", List.of(httpListener()));
         assertEquals(1, lb.getListeners().size());
+    }
+
+    @Test
+    void restoresHealthAndHostedZonesWithoutMovingAnotherAccountsBalancer() {
+        RequestContext context = new RequestContext();
+        context.setAccountId("111111111111");
+        @SuppressWarnings("unchecked")
+        Instance<RequestContext> contexts = mock(Instance.class);
+        when(contexts.get()).thenReturn(context);
+        AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> storage =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), contexts, "111111111111");
+        StorageFactory factory = mock(StorageFactory.class);
+        doReturn(storage).when(factory).create(eq("elb"), eq("elb-load-balancers.json"), any());
+        ClassicLoadBalancer own = new ClassicLoadBalancer();
+        ClassicLoadBalancer foreign = new ClassicLoadBalancer();
+        own.setDnsName("restored.elb.example.test");
+        foreign.setDnsName(own.getDnsName());
+        foreign.setInstanceIds(List.of("i-foreign"));
+        storage.putForAccount("111111111111", REGION, Map.of("same-name", own));
+        storage.putForAccount("222222222222", REGION, Map.of("same-name", foreign));
+        service = new ElbClassicService(ec2Service, healthChecker, factory, null);
+        service.initializeStorage();
+
+        service.restorePersistedRuntime();
+
+        assertEquals(AwsRegionFacts.classicElbHostedZoneId(REGION).orElseThrow(),
+                foreign.getCanonicalHostedZoneNameId());
+        assertEquals(Map.of("same-name", own), storage.getForAccount("111111111111", REGION).orElseThrow());
+        assertEquals(Map.of("same-name", foreign), storage.getForAccount("222222222222", REGION).orElseThrow());
+        assertInstanceOf(ConcurrentHashMap.class,
+                storage.getForAccount("111111111111", REGION).orElseThrow());
+        assertInstanceOf(ConcurrentHashMap.class,
+                storage.getForAccount("222222222222", REGION).orElseThrow());
+        verify(healthChecker).startMonitoring(own);
+        verify(healthChecker).startMonitoring(foreign);
+        verify(healthChecker).registerInstances(foreign, List.of("i-foreign"));
+        assertEquals(2, service.findByDnsName("RESTORED.elb.example.test.").size());
+        service.deleteLoadBalancer(REGION, "same-name");
+        assertEquals(List.of(foreign), service.findByDnsName("restored.elb.example.test."));
+        context.setAccountId("222222222222");
+        service.deleteLoadBalancer(REGION, "same-name");
+        assertTrue(service.findByDnsName("restored.elb.example.test.").isEmpty());
+    }
+
+    @Test
+    void unrelatedAndDeletedDnsNamesDoNotScanStoredLoadBalancers() {
+        AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> storage =
+                spy(AccountAwareStorageBackend.<Map<String, ClassicLoadBalancer>>inMemory("111111111111"));
+        StorageFactory factory = mock(StorageFactory.class);
+        doReturn(storage).when(factory).create(eq("elb"), eq("elb-load-balancers.json"), any());
+        service = new ElbClassicService(ec2Service, healthChecker, factory, null);
+        service.initializeStorage();
+        service.restorePersistedRuntime();
+        clearInvocations(storage);
+
+        assertTrue(service.findByDnsName("unrelated.example.test.").isEmpty());
+        verify(storage, never()).scanAllAccounts();
+        ClassicLoadBalancer created = create("indexed-elb");
+        assertEquals(List.of(created), service.findByDnsName(created.getDnsName().toUpperCase(Locale.ROOT) + "."));
+        service.deleteLoadBalancer(REGION, created.getLoadBalancerName());
+        clearInvocations(storage);
+        assertTrue(service.findByDnsName(created.getDnsName() + ".").isEmpty());
+        verify(storage, never()).scanAllAccounts();
     }
 
     /** A balancer stored before the zone was looked up per region carries the old fixed zone. */
