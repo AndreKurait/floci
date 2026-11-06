@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
@@ -446,7 +447,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 || !parsed.accountId().matches("[0-9]{12}")
                 || !parsed.resource().matches("loadbalancer/app/[A-Za-z0-9-]{1,32}/[0-9a-f]{16}")
                 || !region.equals(parsed.region())
-                || !regionResolver.partitionForRegion(region).equals(parsed.partition())) {
+                // Match createLoadBalancer's ARN derivation, including persisted custom-region ARNs.
+                || !AwsRegions.partitionFor(region).equals(parsed.partition())) {
             throw new AwsException("ValidationError",
                     "LoadBalancerArn must identify an application load balancer in the request region.", 400);
         }
