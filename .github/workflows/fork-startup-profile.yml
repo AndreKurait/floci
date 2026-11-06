@@ -1,0 +1,95 @@
+name: Fork startup profile
+
+on:
+  push:
+    branches:
+      - 'ci-profile/**'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    if: github.repository == 'AndreKurait/floci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      SHARD_TOTAL: 5
+      SHARD_INDEX: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Compute the normal shard
+        run: |
+          cd src/test/java
+          find . \( -name '*Test.java' -o -name 'Test*.java' \
+                    -o -name '*Tests.java' -o -name '*TestCase.java' \) \
+            | sed 's|^\./||; s|\.java$||' | LC_ALL=C sort \
+            > "$GITHUB_WORKSPACE/all-classes.txt"
+          cd "$GITHUB_WORKSPACE"
+          .github/ci/partition.sh all-classes.txt "$SHARD_TOTAL" "$SHARD_INDEX" > shard.txt
+          test -s shard.txt
+
+      - name: Prefetch normal shard images
+        run: .github/ci/prefetch-images.sh shard.txt || true
+
+      - name: Compile with launch-time recording
+        run: >-
+          python3 .github/ci/profile-from-launch.py --output "$RUNNER_TEMP/profile-compile"
+          -- ./mvnw test-compile -B
+
+      - name: Verify the compiled class inventory
+        run: |
+          cd target/test-classes
+          find . \( -name '*Test.class' -o -name 'Test*.class' \
+                    -o -name '*Tests.class' -o -name '*TestCase.class' \) \
+                  ! -name '*$*' \
+            | sed 's|^\./||; s|\.class$||' | LC_ALL=C sort \
+            > "$RUNNER_TEMP/compiled-classes.txt"
+          cd "$GITHUB_WORKSPACE"
+          cmp all-classes.txt "$RUNNER_TEMP/compiled-classes.txt"
+
+      - name: Run the complete selected shard with launch-time recording
+        run: >-
+          python3 .github/ci/profile-from-launch.py --output "$RUNNER_TEMP/profile-tests"
+          -- ./mvnw surefire:test -B
+          -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt"
+          -Dsurefire.failIfNoTests=true
+          -Dsurefire.timeout=1500
+
+      - name: Summarize recordings without exporting raw JFR
+        if: always()
+        run: |
+          python3 .github/ci/summarize-startup-profile.py \
+            --recordings "$RUNNER_TEMP/profile-compile" --output profile-summary/compile.json
+          python3 .github/ci/summarize-startup-profile.py \
+            --recordings "$RUNNER_TEMP/profile-tests" --output profile-summary/tests.json
+          printf '%s\n' "$GITHUB_SHA" > profile-summary/source-sha.txt
+          printf '%s/%s\n' "$SHARD_INDEX" "$SHARD_TOTAL" > profile-summary/shard.txt
+
+      - name: Upload summaries and normal test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: startup-profile-shard-2
+          path: |
+            profile-summary/
+            shard.txt
+            all-classes.txt
+            target/surefire-reports/
+          retention-days: 7
+          if-no-files-found: error
