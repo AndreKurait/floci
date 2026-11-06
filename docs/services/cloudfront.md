@@ -129,6 +129,12 @@ PUT, PATCH and DELETE).
 
 ## Behavior
 
+- The matching cache behavior's `ViewerProtocolPolicy` applies to HTTP and WebSocket viewers.
+  `https-only` rejects HTTP with 403. `redirect-to-https` returns 301 for GET/HEAD and 307 for
+  other allowed HTTP/1.1-or-later methods; those other methods receive 403 over HTTP/1.0.
+  Redirects preserve the raw path and query. All three policies accept HTTPS, and denied or
+  redirected requests do not reach the origin. Local delivery URLs retain explicit ports other
+  than the default HTTP port 80.
 - All distributions are immediately set to `Deployed` state (no async `InProgress` delay).
 - Distribution IDs are 14 uppercase alphanumeric characters starting with `E` (e.g. `E1Z2X3C4V5B6N7`).
 - Distribution domain names follow the pattern `{id}.cloudfront.net`, with the id lower-cased as AWS
