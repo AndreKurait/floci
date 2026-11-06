@@ -5,8 +5,7 @@ package io.github.hectorvent.floci.core.common.dns;
 
 import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
-import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupDnsFixture;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.quarkus.test.junit.QuarkusTest;
@@ -32,9 +31,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.spy;
 
 /**
  * Drives the whole packet path with a forwarding rule in place: the query really leaves the DNS
@@ -72,11 +69,7 @@ class ResolverRuleDnsPacketTest {
 
     @Test
     void protectedNamespaceRegistrationControlsWhichDnsPacketsUseTheVpcRule() throws Exception {
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(mock(DockerClient.class),
-                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config,
-                mock(EmbeddedDnsServer.class)));
-        // This test exercises UDP DNS and registry ownership; the Docker suite owns nftables enforcement.
-        doNothing().when(manager).reconcileAll();
+        SecurityGroupFirewallManager manager = SecurityGroupDnsFixture.manager(mock(DockerClient.class), config);
         DnsClientVpcSource origin = assertInstanceOf(DnsClientVpcSource.class, manager);
         byte[] request = buildQuery("db.corp.internal");
         byte[] targetAnswer = answerFor(request, "10.4.0.11");
