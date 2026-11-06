@@ -348,13 +348,13 @@ clock ends the state the same way: an `ActivityTimedOut` event — `TaskTimedOut
 reads `FAILED` with that same error. A `Catch` on a heartbeat expiry matches under
 `States.HeartbeatTimeout` and under `States.Timeout` alike. Neither timeout carries a cause:
 `DescribeExecution` and the `ExecutionFailed` event both leave the key out, where every other
-failure reports one. A `Task` that declares no `TimeoutSeconds` uses AWS's default of
-99,999,999 seconds, constrained by the workflow's execution budget.
+failure reports one. Activities and `.waitForTaskToken` callbacks that declare no
+`TimeoutSeconds` can wait until the workflow's execution budget expires.
 
 A `Task` that waits for a `.sync` job runs under the same two clocks and no other: the execution's
 budget ends it `TIMED_OUT`, its own `TimeoutSeconds` ends it `FAILED` with a `TaskTimedOut` event
 carrying `States.Timeout` and no cause, and a job that takes longer than either simply runs until
-the earlier clock fires. The same default applies here when the state declares none.
+the earlier clock fires. When the state declares no timeout, only the execution budget applies.
 When the `Task`'s own clock fires, the job it was waiting on is stopped the way AWS stops it: the
 ECS task reads `stopCode: UserInitiated`, the child execution reads `ABORTED` with no error, and
 both carry the cause `The Task state in AWS Step Functions execution [<arn>] which was managing

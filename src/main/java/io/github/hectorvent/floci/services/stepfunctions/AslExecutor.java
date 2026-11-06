@@ -171,7 +171,7 @@ public class AslExecutor {
     }
 
     private static final Logger LOG = Logger.getLogger(AslExecutor.class);
-    // AWS's default Task budget, still bounded by the workflow's maximum execution time.
+    // This fallback exceeds every supported workflow budget, which bounds an omitted Task timeout.
     private static final int DEFAULT_TASK_TIMEOUT_SECONDS = 99_999_999;
     private static final Duration STANDARD_MAX_EXECUTION_TIME = Duration.ofDays(365);
     // AWS's hard quota on an Express execution, synchronous or not.
@@ -1199,8 +1199,8 @@ public class AslExecutor {
 
     /**
      * The instant a Task's own {@code TimeoutSeconds} runs out, counted from now: the bound on a
-     * task-token wait and on a {@code .sync} job wait alike. A state that declares none gets AWS's
-     * default, constrained by the execution's own deadline.
+     * task-token wait and on a {@code .sync} job wait alike. With no Task timeout, the fallback
+     * exceeds the execution's own deadline, which remains the effective bound.
      */
     private long taskDeadlineNanos(JsonNode stateDef) {
         int timeoutSeconds = stateDef.path("TimeoutSeconds").asInt(0);
