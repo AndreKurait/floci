@@ -48,6 +48,16 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     private static final String DEFAULT_SSL_POLICY = "ELBSecurityPolicy-2016-08";
     /** {@code LoadBalancerTypeEnum}, in the model's order. */
     private static final List<String> LOAD_BALANCER_TYPES = List.of("application", "network", "gateway");
+    private final ElbV2VpcNetworkManager vpcNetworks;
+
+    public ElbV2Service() {
+        this(null);
+    }
+
+    @Inject
+    public ElbV2Service(ElbV2VpcNetworkManager vpcNetworks) {
+        this.vpcNetworks = vpcNetworks;
+    }
 
     @Inject
     ElbV2DataPlane dataPlane;
@@ -224,6 +234,22 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     public void restorePersistedRuntime()
     {
         refreshCanonicalHostedZones();
+        if (vpcNetworks != null) {
+            for (Map.Entry<String, Map<String, LoadBalancer>> entry : loadBalancers.entrySet()) {
+                for (LoadBalancer balancer : entry.getValue().values()) {
+                    try {
+                        vpcNetworks.reconcile(balancer, () -> persistRegion(loadBalancers, entry.getKey()));
+                        if (vpcNetworks.enabled() && "application".equals(balancer.getType())) {
+                            balancer.setState("active");
+                            persistRegion(loadBalancers, entry.getKey());
+                        }
+                    } catch (RuntimeException failure) {
+                        LOG.warnv(failure, "ELBv2 backend network could not be restored for {0}",
+                                balancer.getLoadBalancerArn());
+                    }
+                }
+            }
+        }
         if (healthChecker != null) {
             for (Map<String, TargetGroup> regionTargetGroups : targetGroups.values()) {
                 for (TargetGroup targetGroup : regionTargetGroups.values()) {
@@ -277,8 +303,30 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (type != null && !LOAD_BALANCER_TYPES.contains(type)) {
             throw SmithyValidationErrors.validationError(SmithyValidationErrors.notInEnum(type, "type", LOAD_BALANCER_TYPES));
         }
-        return ec2Service.supplyWithSubnetReferencesHeld(region, () -> createLoadBalancerWithSubnetsHeld(
+        LoadBalancer balancer = ec2Service.supplyWithSubnetReferencesHeld(region, () -> createLoadBalancerWithSubnetsHeld(
                 region, name, scheme, type, ipAddressType, subnets, securityGroups, initialTags));
+        if (vpcNetworks != null) {
+            synchronized (balancer) {
+                if (loadBalancers.getOrDefault(region, Map.of()).get(balancer.getLoadBalancerArn()) != balancer) {
+                    throw new AwsException("LoadBalancerNotFound", "The load balancer was deleted.", 400);
+                }
+                try {
+                    vpcNetworks.reconcile(balancer, () -> persistRegion(loadBalancers, region));
+                    balancer.setState("active");
+                    persistRegion(loadBalancers, region);
+                } catch (RuntimeException failure) {
+                    balancer.setState("failed");
+                    persistRegion(loadBalancers, region);
+                    try {
+                        deleteLoadBalancer(region, balancer.getLoadBalancerArn());
+                    } catch (RuntimeException cleanupFailure) {
+                        failure.addSuppressed(cleanupFailure);
+                    }
+                    throw failure;
+                }
+            }
+        }
+        return balancer;
     }
 
     private LoadBalancer createLoadBalancerWithSubnetsHeld(String region, String name, String scheme,
@@ -312,7 +360,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         lb.setLoadBalancerName(name);
         lb.setScheme(lbScheme);
         lb.setVpcId(vpcId);
-        lb.setState("active");
+        lb.setState(vpcNetworks != null && vpcNetworks.enabled() && "application".equals(lbType)
+                ? "provisioning" : "active");
         lb.setType(lbType);
         lb.setIpAddressType(ipType);
         lb.setRegion(region);
@@ -413,6 +462,12 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         }
         List<String> listenerArns;
         synchronized (lb) {
+            if (regionLbs.get(arn) != lb) {
+                return;
+            }
+            if (vpcNetworks != null) {
+                vpcNetworks.release(lb, () -> persistRegion(loadBalancers, region));
+            }
             if (!regionLbs.remove(arn, lb)) {
                 return;
             }
@@ -519,8 +574,31 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     public void setSecurityGroups(String region, String arn, List<String> sgIds) {
         LoadBalancer lb = requireLoadBalancer(region, arn);
-        lb.setSecurityGroups(new ArrayList<>(sgIds));
-        persistRegion(loadBalancers, region);
+        synchronized (lb) {
+            if (loadBalancers.getOrDefault(region, Map.of()).get(arn) != lb) {
+                throw new AwsException("LoadBalancerNotFound", "The load balancer was deleted.", 400);
+            }
+            List<String> previous = lb.getSecurityGroups();
+            lb.setSecurityGroups(new ArrayList<>(sgIds));
+            try {
+                if (vpcNetworks != null) {
+                    vpcNetworks.reconcile(lb, () -> persistRegion(loadBalancers, region));
+                }
+                persistRegion(loadBalancers, region);
+            } catch (RuntimeException failure) {
+                lb.setSecurityGroups(previous);
+                try {
+                    if (vpcNetworks != null) {
+                        vpcNetworks.reconcile(lb, () -> persistRegion(loadBalancers, region));
+                    }
+                    persistRegion(loadBalancers, region);
+                } catch (RuntimeException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                    retainFailedBackend(lb, region, failure);
+                }
+                throw failure;
+            }
+        }
     }
 
     /**
@@ -545,6 +623,40 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * moves a balancer an earlier Floci version saved without subnets back onto none.
      */
     public void setSubnets(String region, String arn, List<String> subnets) {
+        LoadBalancer balancer = requireLoadBalancer(region, arn);
+        synchronized (balancer) {
+            List<AvailabilityZone> previous = List.copyOf(balancer.getAvailabilityZones());
+            String previousVpc = balancer.getVpcId();
+            setSubnetsWithBalancerHeld(region, arn, subnets);
+            try {
+                if (vpcNetworks != null) {
+                    vpcNetworks.reconcile(balancer, () -> persistRegion(loadBalancers, region));
+                }
+            } catch (RuntimeException failure) {
+                balancer.setAvailabilityZones(new ArrayList<>(previous));
+                balancer.setVpcId(previousVpc);
+                try {
+                    persistRegion(loadBalancers, region);
+                    vpcNetworks.reconcile(balancer, () -> persistRegion(loadBalancers, region));
+                } catch (RuntimeException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                    retainFailedBackend(balancer, region, failure);
+                }
+                throw failure;
+            }
+        }
+    }
+
+    private void retainFailedBackend(LoadBalancer balancer, String region, RuntimeException failure) {
+        balancer.setState("failed");
+        try {
+            persistRegion(loadBalancers, region);
+        } catch (RuntimeException persistenceFailure) {
+            failure.addSuppressed(persistenceFailure);
+        }
+    }
+
+    private void setSubnetsWithBalancerHeld(String region, String arn, List<String> subnets) {
         ec2Service.runWithSubnetReferencesHeld(region, () -> {
             LoadBalancer lb = requireLoadBalancer(region, arn);
             // Counted as on create, before any subnet is looked up; an empty list is taken, as above.

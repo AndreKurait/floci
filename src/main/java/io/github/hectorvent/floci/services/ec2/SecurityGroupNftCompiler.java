@@ -20,13 +20,23 @@ public final class SecurityGroupNftCompiler {
     public record Endpoint(String accountId, String region, String vpcId, String eniId,
                            String logicalAddress, String transportAddress, Set<String> groupIds,
                            List<SecurityGroup> groups, List<ControlConnection> controlConnections,
-                           boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses) {
+                           boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses,
+                           List<ControlListener> controlListeners) {
         public Endpoint {
             controlConnections = List.copyOf(controlConnections);
             additionalTransportAddresses = Set.copyOf(additionalTransportAddresses);
+            controlListeners = List.copyOf(controlListeners);
             if (additionalTransportAddresses.stream().anyMatch(address -> !literal(address))) {
                 throw new IllegalArgumentException("Transport addresses must be literal IP addresses");
             }
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                        boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses) {
+            this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups,
+                    controlConnections, instanceMetadataAllowed, additionalTransportAddresses, List.of());
         }
 
         public Endpoint(String accountId, String region, String vpcId, String eniId,
@@ -73,6 +83,15 @@ public final class SecurityGroupNftCompiler {
         public ControlConnection {
             if (!literal(address) || port < 1 || port > 65535) {
                 throw new IllegalArgumentException("Control connections require a literal IP and one TCP port");
+            }
+        }
+    }
+
+    /** A service-owned listener reached only from its controller's literal address. */
+    public record ControlListener(String controllerAddress, int port) {
+        public ControlListener {
+            if (!literal(controllerAddress) || port < 1 || port > 65535) {
+                throw new IllegalArgumentException("Control listeners require a literal controller IP and one TCP port");
             }
         }
     }
@@ -129,6 +148,10 @@ public final class SecurityGroupNftCompiler {
         for (ControlConnection connection : target.controlConnections()) {
             appendRule(rules, "egress", "daddr", connection.address(),
                     "tcp dport " + connection.port() + " accept");
+        }
+        for (ControlListener listener : target.controlListeners()) {
+            appendRule(rules, "ingress", "saddr", listener.controllerAddress(),
+                    "tcp dport " + listener.port() + " accept");
         }
         rules.append("add rule inet floci_sg egress udp sport 68 udp dport 67 accept\n")
                 .append("add rule inet floci_sg ingress udp sport 67 udp dport 68 accept\n");

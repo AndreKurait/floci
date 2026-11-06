@@ -351,7 +351,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 .toList();
         String script = VpcRoutingCommands.endpoint(identity.logicalAddress(), local, hops, endpoint.resolvers,
                 identity.controlConnections(), identity.instanceMetadataAllowed(), own == null ? null : own.device,
-                inbound);
+                inbound, identity.controlListeners());
         if (!script.equals(endpoint.applied)) {
             run(endpoint.helper, VpcRoutingCommands.endpointGuard());
             endpoint.applied = null;

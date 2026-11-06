@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2.net;
 
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler.ControlConnection;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler.ControlListener;
 
 import java.util.List;
 import java.util.Objects;
@@ -35,6 +36,14 @@ final class VpcRoutingCommands {
     static String endpoint(String privateAddress, List<LocalRoute> localRoutes, List<Hop> hops,
                            List<String> resolvers, List<ControlConnection> controls,
                            boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources) {
+        return endpoint(privateAddress, localRoutes, hops, resolvers, controls, instanceMetadataAllowed,
+                publicDevice, inboundPublicSources, List.of());
+    }
+
+    static String endpoint(String privateAddress, List<LocalRoute> localRoutes, List<Hop> hops,
+                           List<String> resolvers, List<ControlConnection> controls,
+                           boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources,
+                           List<ControlListener> listeners) {
         String source = VpcRouteSelection.ipv4(privateAddress);
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush proto 186\n");
         for (Hop hop : hops) {
@@ -76,6 +85,14 @@ final class VpcRoutingCommands {
                         .append(VpcRouteSelection.ipv4(control.address())).append(" tcp dport ")
                         .append(control.port()).append(" counter accept\n");
             }
+        }
+        for (ControlListener listener : listeners) {
+            String family = listener.controllerAddress().contains(":") ? "ip6" : "ip";
+            rules.append("add rule inet floci_vpc_routes egress ").append(family).append(" daddr ")
+                    .append(listener.controllerAddress()).append(" tcp sport ").append(listener.port())
+                    .append(" ct direction reply ct original ").append(family).append(" saddr ")
+                    .append(listener.controllerAddress()).append(" ct original proto-dst ")
+                    .append(listener.port()).append(" counter accept\n");
         }
         for (Hop hop : hops) {
             rules.append("add rule inet floci_vpc_routes egress ip daddr ").append(hop.destination())
