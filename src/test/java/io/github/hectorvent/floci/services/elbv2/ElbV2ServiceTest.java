@@ -1314,6 +1314,42 @@ class ElbV2ServiceTest {
     }
 
     @ParameterizedTest
+    @ValueSource(ints = {-1, 0, 4, 301, Integer.MAX_VALUE})
+    void invalidHealthIntervalLeavesGroupAndMonitoringUntouched(int interval) {
+        String arn = createTargetGroup("interval-state");
+        TargetGroup group = service.describeTargetGroups(REGION, null, List.of(arn), null).getFirst();
+        clearInvocations(healthChecker, dataPlane);
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyTargetGroup(
+                REGION, arn, "HTTPS", "443", false, "/changed", interval, 10, 3, 4, "204"));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("HTTP", group.getHealthCheckProtocol());
+        assertEquals("traffic-port", group.getHealthCheckPort());
+        assertTrue(group.getHealthCheckEnabled());
+        assertEquals("/v1/ready", group.getHealthCheckPath());
+        assertEquals(30, group.getHealthCheckIntervalSeconds());
+        assertEquals(5, group.getHealthCheckTimeoutSeconds());
+        assertEquals(5, group.getHealthyThresholdCount());
+        assertEquals(2, group.getUnhealthyThresholdCount());
+        assertEquals("200", group.getMatcher());
+        verifyNoInteractions(healthChecker, dataPlane);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {5, 300})
+    void healthIntervalBoundariesAndOmittedUpdateRemainValid(int interval) {
+        TargetGroup group = service.createTargetGroup(REGION, "interval-boundary", "HTTP", "HTTP1", 80,
+                "vpc-a", "ip", "HTTP", "traffic-port", true, "/", interval, 5, 5, 2,
+                "200", "ipv4", Map.of());
+        assertEquals(interval, group.getHealthCheckIntervalSeconds());
+        service.modifyTargetGroup(REGION, group.getTargetGroupArn(), null, null, null,
+                "/changed", null, null, null, null, null);
+        assertEquals(interval, group.getHealthCheckIntervalSeconds());
+        service.modifyTargetGroup(REGION, group.getTargetGroupArn(), null, null, null,
+                null, interval == 5 ? 300 : 5, null, null, null, null);
+        assertEquals(interval == 5 ? 300 : 5, group.getHealthCheckIntervalSeconds());
+    }
+
+    @ParameterizedTest
     @ValueSource(ints = {2, 120})
     void healthTimeoutBoundariesAndOmittedUpdateRemainValid(int timeout) {
         TargetGroup group = service.createTargetGroup(REGION, "timeout-boundary", "HTTP", "HTTP1", 80,

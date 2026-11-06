@@ -115,23 +115,36 @@ def test_stack_initializes_resizes_and_removes_declared_capacity(
 
 
 @pytest.mark.parametrize("sam", [False, True], ids=["lambda-alias", "sam"])
-def test_failed_initialization_rolls_back_the_declaring_stack(
-    cloudformation_client, lambda_client, unique_name, sam
+@pytest.mark.parametrize("disable_rollback", [False, True], ids=["rollback", "retain"])
+def test_failed_initialization_respects_the_requested_failure_policy(
+    cloudformation_client, lambda_client, unique_name, sam, disable_rollback
 ):
     stack, function = unique_name + "-stack", unique_name + "-function"
     cloudformation_client.create_stack(
         StackName=stack, TemplateBody=template(function, sam, broken=True),
-        Capabilities=["CAPABILITY_IAM"],
+        Capabilities=["CAPABILITY_IAM"], DisableRollback=disable_rollback,
     )
     try:
-        assert settled(cloudformation_client, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        expected = "CREATE_FAILED" if disable_rollback else "ROLLBACK_COMPLETE"
+        assert settled(cloudformation_client, stack)["StackStatus"] == expected
         events = cloudformation_client.describe_stack_events(StackName=stack)["StackEvents"]
         assert any(event["ResourceType"] == "AWS::Lambda::Alias"
                    and event["ResourceStatus"] == "CREATE_FAILED"
                    and "initialization" in event.get("ResourceStatusReason", "").lower()
                    for event in events), events
-        with pytest.raises(ClientError) as missing:
-            lambda_client.get_function(FunctionName=function)
-        assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        if disable_rollback:
+            assert lambda_client.get_function(FunctionName=function)["Configuration"]["FunctionName"] == function
+            assert lambda_client.get_alias(FunctionName=function, Name="live")["FunctionVersion"] == "1"
+            allocation = lambda_client.get_provisioned_concurrency_config(
+                FunctionName=function, Qualifier="live"
+            )
+            assert allocation["Status"] == "FAILED", allocation
+        else:
+            with pytest.raises(ClientError) as missing:
+                lambda_client.get_function(FunctionName=function)
+            assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
     finally:
         remove_stack(cloudformation_client, stack)
+    with pytest.raises(ClientError) as missing:
+        lambda_client.get_function(FunctionName=function)
+    assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"

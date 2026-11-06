@@ -55,7 +55,7 @@ class ElbV2StickinessIntegrationTest {
         loadBalancerArn = createLoadBalancer("sticky-lb");
         targetGroupArn = query("CreateTargetGroup", "Name", "sticky-tg", "Protocol", "HTTP",
                 "Port", first.actualPort(), "TargetType", "ip", "HealthCheckPath", "/health",
-                "HealthCheckIntervalSeconds", 1, "HealthyThresholdCount", 1, "UnhealthyThresholdCount", 1)
+                "HealthCheckIntervalSeconds", 5, "HealthyThresholdCount", 1, "UnhealthyThresholdCount", 1)
                 .xmlPath().getString("CreateTargetGroupResponse.CreateTargetGroupResult.TargetGroups.member.TargetGroupArn");
         registerTarget(targetGroupArn, "127.0.0.1", first.actualPort());
         registerTarget(targetGroupArn, "127.0.0.1", second.actualPort());
@@ -127,7 +127,8 @@ class ElbV2StickinessIntegrationTest {
         enableStickiness(true);
         Response initial = request(null);
         unhealthy.set(initial.asString());
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        // The admission probe can defer the next check past the first five-second group tick.
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
             List<String> states = query("DescribeTargetHealth", "TargetGroupArn", targetGroupArn).xmlPath()
                     .getList("DescribeTargetHealthResponse.DescribeTargetHealthResult"
                             + ".TargetHealthDescriptions.member.TargetHealth.State");

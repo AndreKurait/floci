@@ -2,7 +2,7 @@
   "_source": {
     "generator": "tools/aws/regen_iam_authorized_actions.py",
     "reference": "https://servicereference.us-east-1.amazonaws.com/",
-    "retrieved": "2026-11-03",
+    "retrieved": "2026-11-06",
     "note": "make iam-authorized-actions-verify checks every entry against AWS."
   },
   "authorizedActions": {
@@ -338,6 +338,19 @@
       "ListPolicyGenerations",
       "StartPolicyGeneration",
       "ValidatePolicy"
+    ],
+    "appconfig": [
+      "CreateApplication",
+      "CreateDeploymentStrategy",
+      "CreateExtension",
+      "CreateExtensionAssociation",
+      "GetAccountSettings",
+      "ListApplications",
+      "ListDeploymentStrategies",
+      "ListExperimentDefinitions",
+      "ListExtensionAssociations",
+      "ListExtensions",
+      "UpdateAccountSettings"
     ],
     "dsql": [
       "InjectError",

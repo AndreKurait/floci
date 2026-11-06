@@ -157,6 +157,7 @@ floci:
       enabled: true
       container-drain-timeout-seconds: 15
       docker-flags: ""
+      # additional-docker-networks: []
       honour-architectures: false
       zip-max-entries: 100000
       async-retry-delay-seconds: 1
@@ -402,6 +403,7 @@ floci:
     elbv2:
       enabled: true
       mock: true
+      max-health-check-interval-millis: 0
     codebuild:
       enabled: true
       # docker-network: floci-network

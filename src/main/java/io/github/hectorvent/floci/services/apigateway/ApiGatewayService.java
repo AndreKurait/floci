@@ -3074,6 +3074,28 @@ public class ApiGatewayService implements ResourceProvider {
 
     public record CustomDomainRoute(String accountId, String region, String domainName) {}
 
+    public record DomainDnsTarget(String hostedZoneId) {}
+
+    /** Read the actual target across owners; a DNS query has no management account. */
+    public Optional<DomainDnsTarget> findDomainDnsTarget(String target) {
+        if (target == null) {
+            return Optional.empty();
+        }
+        String normalized = target.endsWith(".") ? target.substring(0, target.length() - 1) : target;
+        List<DomainDnsTarget> matches = domainStore.scanAllAccountEntries(key -> true).stream()
+                .map(AccountAwareStorageBackend.AccountEntry::value)
+                .filter(domain -> "REGIONAL".equals(domain.getEndpointConfigurationType())
+                        ? normalized.equalsIgnoreCase(domain.getRegionalDomainName())
+                        : "EDGE".equals(domain.getEndpointConfigurationType())
+                                && normalized.equalsIgnoreCase(domain.getDistributionDomainName()))
+                .map(domain -> new DomainDnsTarget("REGIONAL".equals(domain.getEndpointConfigurationType())
+                        ? domain.getRegionalHostedZoneId() : domain.getDistributionHostedZoneId())).toList();
+        if (matches.size() > 1) {
+            throw new AwsException("ConflictException", "Custom domain DNS target is ambiguous", 409);
+        }
+        return matches.stream().findFirst();
+    }
+
     /**
      * Resolves a custom domain by its regionalDomainName (e.g., "my-domain.regional.local").
      * Derives the domain name from the regionalDomainName and performs a key-based lookup.
