@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.codedeploy;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
@@ -84,7 +85,8 @@ class CodeDeployHookTimeoutTest {
         CodeDeployService service = new CodeDeployService(
                 mock(LambdaService.class), mock(EcsService.class), mock(ElbV2Service.class),
                 ssm, mock(Ec2Service.class), new ObjectMapper(),
-                new RegionResolver(region, "000000000000"), null, mock(CodeDeployAgentDeployment.class));
+                new RegionResolver(region, "000000000000"), null, mock(CodeDeployAgentDeployment.class),
+                mock(ServiceRoleCallAuthorizer.class));
         service.createApplication(region, "app", "Server", null);
         service.createDeploymentGroup(region, "app", "group", null, "role", null);
         return service;
