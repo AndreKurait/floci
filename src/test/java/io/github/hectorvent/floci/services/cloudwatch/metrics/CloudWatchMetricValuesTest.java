@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 import io.github.hectorvent.floci.services.cloudwatch.metricstreams.CloudWatchMetricStreamsService;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -105,6 +106,77 @@ class CloudWatchMetricValuesTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void zeroWeightsRetainExtremaWithoutInventingSamples(boolean useQuery) {
+        ObjectNode datum = weighted();
+        datum.putArray("Counts").add(0).add(1);
+        publish(useQuery, datum);
+        CloudWatchMetricsService.Datapoint point = statistics("Sum").getFirst();
+        assertEquals(1, point.sampleCount());
+        assertEquals(11, point.sum());
+        assertEquals(7, point.minimum());
+        assertEquals(11, point.maximum());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void allZeroWeightsAggregateWithLaterScalarSamples(boolean useQuery) {
+        ObjectNode datum = weighted();
+        datum.putArray("Counts").add(0).add(0);
+        publish(useQuery, datum);
+        CloudWatchMetricsService.Datapoint empty = statistics("Sum").getFirst();
+        assertEquals(0, empty.sampleCount());
+        assertEquals(0, empty.sum());
+        assertEquals(7, empty.minimum());
+        assertEquals(11, empty.maximum());
+        publish(useQuery, datum().put("Value", 9));
+        CloudWatchMetricsService.Datapoint combined = statistics("Sum").getFirst();
+        assertEquals(1, combined.sampleCount());
+        assertEquals(9, combined.sum());
+        assertEquals(7, combined.minimum());
+        assertEquals(11, combined.maximum());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void explicitZeroStatisticSetsRemainDistinctFromScalarZero(boolean useQuery) {
+        ObjectNode datum = datum();
+        datum.putObject("StatisticValues").put("SampleCount", 0).put("Sum", 0)
+                .put("Minimum", 7).put("Maximum", 11);
+        publish(useQuery, datum);
+        CloudWatchMetricsService.Datapoint point = statistics("Sum").getFirst();
+        assertEquals(0, point.sampleCount());
+        assertEquals(0, point.sum());
+        assertEquals(7, point.minimum());
+        assertEquals(11, point.maximum());
+        publish(useQuery, datum().put("Value", 0));
+        CloudWatchMetricsService.Datapoint combined = statistics("Sum").getFirst();
+        assertEquals(1, combined.sampleCount());
+        assertEquals(0, combined.sum());
+        assertEquals(0, combined.minimum());
+        assertEquals(11, combined.maximum());
+    }
+
+    @ParameterizedTest
+    @ValueSource(doubles = {0, 0.5})
+    void statisticPresenceSurvivesStoredDatumRoundTrip(double count) throws Exception {
+        MetricDatum datum = MetricDatum.of("Latency", "Milliseconds", 7, List.of(), START.getEpochSecond());
+        datum.setSampleCount(count);
+        datum.setSum(7 * count);
+        datum.setMinimum(7);
+        datum.setMaximum(7);
+        String stored = MAPPER.writeValueAsString(datum);
+        assertTrue(!stored.contains("sampleCountSet") && !stored.contains("hasSampleCount"));
+        MetricDatum restored = MAPPER.readValue(stored, MetricDatum.class);
+        service.putMetricData(NAMESPACE, List.of(restored), REGION);
+        CloudWatchMetricsService.Datapoint point = statistics("Sum").getFirst();
+        assertEquals(count, point.sampleCount());
+        assertEquals(7 * count, point.sum());
+        assertEquals(7, point.minimum());
+        assertEquals(7, point.maximum());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void repeatedCountsDoNotExpandIntoIndividualSamples(boolean useQuery) {
         ObjectNode datum = weighted();
         datum.putArray("Counts").add(1_000_000_000).add(1);
@@ -166,7 +238,7 @@ class CloudWatchMetricValuesTest {
             datum.putArray("Values").add(value);
             assertThrows(AwsException.class, () -> publish(useQuery, datum));
         }
-        for (double count : new double[] {0, -1, Double.NaN, Double.POSITIVE_INFINITY}) {
+        for (double count : new double[] {-1, Double.NaN, Double.POSITIVE_INFINITY}) {
             ObjectNode datum = datum();
             datum.putArray("Values").add(7);
             datum.putArray("Counts").add(count);

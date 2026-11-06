@@ -101,9 +101,9 @@ final class MetricValues {
                 throw CloudWatchMetricsException.invalidParameterValue(
                         "Values must be finite numbers between -2^360 and 2^360.");
             }
-            if (!Double.isFinite(count) || count <= 0 || !Double.isFinite(value * count)) {
+            if (!Double.isFinite(count) || count < 0 || !Double.isFinite(value * count)) {
                 throw CloudWatchMetricsException.invalidParameterValue(
-                        "Counts must be positive finite numbers with a finite weighted sum.");
+                        "Counts must be nonnegative finite numbers with a finite weighted sum.");
             }
             MetricDatum sample = MetricDatum.of(template.getMetricName(), template.getUnit(), value,
                     List.copyOf(template.getDimensions()), template.getTimestamp());
