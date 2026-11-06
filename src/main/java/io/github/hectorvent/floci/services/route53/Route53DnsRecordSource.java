@@ -315,6 +315,9 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     }
 
     private Optional<String> getLocalFlociAddress() {
+        if (dnsServer != null && dnsServer.getServerIp().isPresent()) {
+            return dnsServer.getServerIp();
+        }
         try {
             return Optional.of(InetAddress.getLocalHost().getHostAddress());
         } catch (Exception e) {
