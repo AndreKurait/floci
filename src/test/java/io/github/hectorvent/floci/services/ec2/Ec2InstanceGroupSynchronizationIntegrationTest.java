@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @QuarkusTest
@@ -33,16 +34,17 @@ class Ec2InstanceGroupSynchronizationIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void replacementUpdatesStoredAndEmbeddedGroupsWithoutChangingInterfaceMetadata(boolean primaryAtLaunch) {
+    void instanceReplacementChangesOnlyThePrimaryInterfaceGroups(boolean primaryAtLaunch) {
         Fixture fixture = fixture(primaryAtLaunch);
         NetworkInterface before = networkInterface(fixture);
 
         replace(fixture, fixture.replacement());
 
-        assertEquals(List.of(fixture.replacement()), groupIds(networkInterface(fixture).groups()));
+        String expectedInterfaceGroup = primaryAtLaunch ? fixture.replacement() : fixture.original();
+        assertEquals(List.of(expectedInterfaceGroup), groupIds(networkInterface(fixture).groups()));
         Instance instance = instance(fixture);
         assertEquals(List.of(fixture.replacement()), groupIds(instance.securityGroups()));
-        assertEquals(List.of(fixture.replacement()), groupIds(instance.networkInterfaces().stream()
+        assertEquals(List.of(expectedInterfaceGroup), groupIds(instance.networkInterfaces().stream()
                 .filter(eni -> fixture.eni().equals(eni.networkInterfaceId())).findFirst().orElseThrow().groups()));
         NetworkInterface after = networkInterface(fixture);
         assertEquals(before.toBuilder().groups(after.groups()).build(), after,
@@ -51,29 +53,43 @@ class Ec2InstanceGroupSynchronizationIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void detachedInterfaceProtectsReplacementAfterInstanceReferenceIsRemoved(boolean primaryAtLaunch) {
+    void retainedInterfaceProtectsItsGroupAfterInstanceReferenceIsRemoved(boolean primaryAtLaunch) {
         Fixture fixture = fixture(primaryAtLaunch);
         replace(fixture, fixture.replacement());
-        fixture.client().detachNetworkInterface(request -> request.attachmentId(fixture.attachment()));
-        // Leave no instance reference to the replacement: only the standalone ENI protects it.
-        replace(fixture, fixture.original());
+        String protectedGroup = primaryAtLaunch ? fixture.replacement() : fixture.original();
+        if (primaryAtLaunch) {
+            fixture.client().terminateInstances(request -> request.instanceIds(fixture.instance()));
+            assertEquals("terminated", instance(fixture).state().nameAsString());
+        } else {
+            fixture.client().detachNetworkInterface(request -> request.attachmentId(fixture.attachment()));
+            assertEquals(List.of(fixture.replacement()), groupIds(instance(fixture).securityGroups()));
+        }
+        NetworkInterface retained = networkInterface(fixture);
+        assertNull(retained.attachment());
+        assertEquals("available", retained.statusAsString());
+        // The terminated instance or remaining primary interface does not protect this group.
 
         Ec2Exception error = assertThrows(Ec2Exception.class, () -> fixture.client()
-                .deleteSecurityGroup(request -> request.groupId(fixture.replacement())));
+                .deleteSecurityGroup(request -> request.groupId(protectedGroup)));
 
         assertEquals("DependencyViolation", error.awsErrorDetails().errorCode());
-        assertEquals(List.of(fixture.replacement()), groupIds(networkInterface(fixture).groups()));
+        assertEquals(List.of(protectedGroup), groupIds(networkInterface(fixture).groups()));
     }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void replacementReleasesThePreviousGroupForDeletion(boolean primaryAtLaunch) {
+    void instanceReplacementReleasesOnlyThePreviousPrimaryGroup(boolean primaryAtLaunch) {
         Fixture fixture = fixture(primaryAtLaunch);
         replace(fixture, fixture.replacement());
-
-        fixture.client().deleteSecurityGroup(request -> request.groupId(fixture.original()));
-
-        assertEquals(List.of(fixture.replacement()), groupIds(networkInterface(fixture).groups()));
+        if (primaryAtLaunch) {
+            fixture.client().deleteSecurityGroup(request -> request.groupId(fixture.original()));
+            assertEquals(List.of(fixture.replacement()), groupIds(networkInterface(fixture).groups()));
+        } else {
+            Ec2Exception inUse = assertThrows(Ec2Exception.class, () -> fixture.client()
+                    .deleteSecurityGroup(request -> request.groupId(fixture.original())));
+            assertEquals("DependencyViolation", inUse.awsErrorDetails().errorCode());
+            assertEquals(List.of(fixture.original()), groupIds(networkInterface(fixture).groups()));
+        }
     }
 
     @Test
@@ -145,7 +161,7 @@ class Ec2InstanceGroupSynchronizationIntegrationTest {
         cleanup.register(() -> {
             NetworkInterface current = client.describeNetworkInterfaces(request -> request.networkInterfaceIds(eni))
                     .networkInterfaces().getFirst();
-            if (current.attachment() != null) {
+            if (current.attachment() != null && current.attachment().deviceIndex() != 0) {
                 client.detachNetworkInterface(request -> request.attachmentId(current.attachment().attachmentId()));
             }
         });
