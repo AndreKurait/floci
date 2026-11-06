@@ -52,6 +52,7 @@ import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.stream.Collectors;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -315,7 +316,10 @@ class SwfServiceTest {
             assertThrows(TimeoutException.class, () -> poll.get(100, TimeUnit.MILLISECONDS));
             switch (action) {
                 case "interrupt" -> thread.get().interrupt();
-                case "reset" -> service.clear();
+                case "reset" -> await().atMost(Duration.ofSeconds(5)).until(() -> {
+                    service.clear();
+                    return poll.isDone();
+                });
                 case "shutdown" -> service.stopPolling();
                 default -> throw new AssertionError(action);
             }
