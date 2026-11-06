@@ -1366,12 +1366,15 @@ public class CloudFormationService implements ResourceProvider {
                         }
                         Set<String> propertyDependencies = new LinkedHashSet<>();
                         collectDependencies(newDef.path("Properties"), allResourceIds, propertyDependencies, newConditions);
+                        collectDependencies(newDef.path("UpdatePolicy"), allResourceIds, propertyDependencies, newConditions);
 
                         boolean dependsOnReplaced = propertyDependencies.stream().anyMatch(replacements::containsKey);
                         boolean referencesChangedAttr = false;
                         if (!dependsOnReplaced) {
                             for (Map.Entry<String, Set<String>> entry : inPlaceChangedAttributes.entrySet()) {
-                                if (referencesAnyAttribute(newDef.path("Properties"), entry.getKey(), entry.getValue(), newConditions)) {
+                                if (referencesAnyAttribute(newDef.path("Properties"), entry.getKey(), entry.getValue(), newConditions)
+                                        || referencesAnyAttribute(newDef.path("UpdatePolicy"), entry.getKey(),
+                                                entry.getValue(), newConditions)) {
                                     referencesChangedAttr = true;
                                     break;
                                 }
@@ -2791,7 +2794,7 @@ public class CloudFormationService implements ResourceProvider {
                     : changedResourceIds(stack, templateBody, params, region);
             JsonNode previousResources = isCreate
                     ? objectMapper.missingNode()
-                    : previousResources(stack, previousState, region, accountId);
+                    : previousResources(stack, previousState, region, accountId, identity);
             JsonNode template = parseTemplate(templateBody);
             stack.setOriginalTemplateBody(templateBody);
 
@@ -2962,7 +2965,7 @@ public class CloudFormationService implements ResourceProvider {
                                                 event.getResourceStatus(), event.getResourceStatusReason());
                                     }
                                 },
-                                priorProps);
+                                priorProps, resDef.get("UpdatePolicy"), previousDefinition.get("UpdatePolicy"));
                     }
                     resource.setUpdateReplacePolicy(
                             resDef.path("UpdateReplacePolicy").asText(null));
@@ -3923,33 +3926,58 @@ public class CloudFormationService implements ResourceProvider {
      * longer parses: the update then proceeds as if nothing had been declared.
      */
     private JsonNode previousResources(Stack stack, StackUpdateSnapshot previousState, String region,
-                                       String accountId) {
+                                       String accountId, ExecutionIdentity identity) {
         if (previousState.templateBody() == null) {
             return objectMapper.missingNode();
         }
+        JsonNode previousTemplate;
+        Map<String, Boolean> conditions;
+        // As the change-set preview does: raw parameters for a stack persisted before
+        // resolvedParameters existed.
+        Map<String, String> previousParams = previousState.resolvedParameters().isEmpty()
+                ? previousState.parameters() : previousState.resolvedParameters();
         try {
-            JsonNode previousTemplate = parseTemplate(previousState.templateBody());
-            // As the change-set preview does: raw parameters for a stack persisted before
-            // resolvedParameters existed.
-            Map<String, String> previousParams = previousState.resolvedParameters().isEmpty()
-                    ? previousState.parameters() : previousState.resolvedParameters();
-            Map<String, Boolean> conditions = resolveConditions(previousTemplate, previousParams, stack, region,
-                    accountId);
-            ObjectNode resources = objectMapper.createObjectNode();
-            for (Map.Entry<String, JsonNode> entry : previousTemplate.path("Resources").properties()) {
-                JsonNode definition = entry.getValue();
-                ObjectNode applied = resources.putObject(entry.getKey());
-                applied.set("Type", definition.path("Type"));
-                if (definition.path("Properties").isObject()) {
-                    applied.set("Properties", appliedProperties(definition.path("Properties"), conditions));
-                }
-            }
-            return resources;
+            previousTemplate = parseTemplate(previousState.templateBody());
+            conditions = resolveConditions(previousTemplate, previousParams, stack, region, accountId);
         } catch (Exception e) {
             LOG.warnv("Previous template of stack {0} could not be evaluated ({1}); its updated resources see no prior properties",
                     stack.getStackName(), e.getMessage());
             return objectMapper.missingNode();
         }
+        Map<String, String> physicalIds = new HashMap<>();
+        Map<String, Map<String, String>> attributes = new HashMap<>();
+        for (StackResource resource : previousState.resources().values()) {
+            if (resource.getPhysicalId() != null) {
+                physicalIds.put(resource.getLogicalId(), resource.getPhysicalId());
+            }
+            attributes.put(resource.getLogicalId(), resource.getAttributes());
+        }
+        Map<String, JsonNode> mappings = new HashMap<>();
+        previousTemplate.path("Mappings").properties().forEach(entry ->
+                mappings.put(entry.getKey(), entry.getValue()));
+        CloudFormationTemplateEngine previousEngine = new CloudFormationTemplateEngine(
+                accountId, region, stack.getStackName(), stack.getStackId(), previousParams,
+                physicalIds, attributes, conditions, mappings, objectMapper,
+                name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
+                value -> dynamicReferences.resolveDynamicReferences(value, region, false),
+                (name, output, outputRegion, roleArn) ->
+                        resolveStackOutput(accountId, name, output, outputRegion, roleArn, identity),
+                parameterTypes(previousTemplate),
+                resourceValueResolver(previousTemplate.path("Resources")));
+        ObjectNode resources = objectMapper.createObjectNode();
+        for (Map.Entry<String, JsonNode> entry : previousTemplate.path("Resources").properties()) {
+            JsonNode definition = entry.getValue();
+            ObjectNode applied = resources.putObject(entry.getKey());
+            applied.set("Type", definition.path("Type"));
+            if (definition.path("Properties").isObject()) {
+                applied.set("Properties", appliedProperties(definition.path("Properties"), conditions));
+            }
+            if (definition.has("UpdatePolicy")) {
+                applied.set("UpdatePolicy",
+                        previousEngine.resolveNodeOmittingNoValue(definition.get("UpdatePolicy")));
+            }
+        }
+        return resources;
     }
 
     /**
@@ -5981,6 +6009,7 @@ public class CloudFormationService implements ResourceProvider {
                                                     Map<String, Boolean> conditions) {
         Set<String> deps = new LinkedHashSet<>();
         collectDependencies(resDef.path("Properties"), allIds, deps, conditions);
+        collectDependencies(resDef.path("UpdatePolicy"), allIds, deps, conditions);
 
         JsonNode dependsOn = resDef.path("DependsOn");
         if (dependsOn.isTextual()) {
