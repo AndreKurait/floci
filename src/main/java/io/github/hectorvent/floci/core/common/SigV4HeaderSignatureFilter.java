@@ -11,6 +11,8 @@ import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteControlle
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayUserRequestController;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.IssuedSessionController;
+import io.github.hectorvent.floci.services.iam.LambdaIssuedIdentityController;
 import io.github.hectorvent.floci.services.iam.RequestBodyReader;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import io.github.hectorvent.floci.services.s3.S3ControlController;
@@ -28,6 +30,7 @@ import jakarta.ws.rs.container.ResourceInfo;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedMap;
+import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 import org.jboss.logging.Logger;
 
@@ -102,6 +105,7 @@ import java.util.function.UnaryOperator;
 public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
 
     private static final Logger LOG = Logger.getLogger(SigV4HeaderSignatureFilter.class);
+    private static final String LOCAL_LOOKUP_PROPERTY = SigV4HeaderSignatureFilter.class.getName() + ".localLookup";
 
     private static final Duration MAX_CLOCK_SKEW = Duration.ofMinutes(15);
     private static final long MAX_EXPIRY_SECONDS = 604800;
@@ -152,14 +156,23 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     public void filter(ContainerRequestContext ctx) throws IOException {
         if (verifiedRequest != null) {
             verifiedRequest.setVerifiedSession(null, null, null);
+            verifiedRequest.setVerifiedAccountId(null);
         }
         EmulatorConfig config = configProvider.get();
-        boolean validateAll = config.auth().validateSignatures();
+        Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
+        boolean localLookup = config.services().iam().enabled()
+                && resourceInfo != null && resourceInfo.getResourceMethod() != null
+                && "lookup".equals(resourceInfo.getResourceMethod().getName())
+                && (resource == IssuedSessionController.class
+                && config.services().iam().issuedSessionVerificationEnabled()
+                || resource == LambdaIssuedIdentityController.class
+                && config.services().iam().lambdaIdentityVerificationEnabled());
+        ctx.setProperty(LOCAL_LOOKUP_PROPERTY, localLookup);
+        boolean validateAll = config.auth().validateSignatures() || localLookup;
         boolean lambdaIdentity = config.services().iam().lambdaIdentityVerificationEnabled();
         if (!validateAll && !lambdaIdentity) {
             return;
         }
-        Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
         if (resource != null && VERIFIED_ELSEWHERE.contains(resource)) {
             return;
         }
@@ -237,7 +250,8 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
                 return;
             }
         }
-        Optional<String> secretKey = resolveSecretKey(scope.accessKeyId(), token);
+        Optional<String> secretKey = localLookup ? iamService.findSecretKey(scope.accessKeyId(), token)
+                : resolveSecretKey(scope.accessKeyId(), token);
         if (secretKey.isEmpty()) {
             LOG.debugv("Refusing {0} request signed with unknown access key {1}",
                     scope.service(), SigV4RequestValidator.sanitizeForLog(scope.accessKeyId()));
@@ -299,6 +313,9 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             signatureDoesNotMatch(ctx, resource, MISMATCH_MESSAGE);
         } else if (verifiedRequest != null) {
             verifiedRequest.setVerifiedSession(nativeSession, secretKey.get(), token);
+            if (localLookup) {
+                verifiedRequest.setVerifiedAccountId(iamService.resolveAccountId(scope.accessKeyId()).orElse(null));
+            }
         }
     }
 
@@ -466,6 +483,13 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
      */
     private void abort(ContainerRequestContext ctx, Class<?> resource, int status, String queryCode,
                        String jsonCode, String message) {
+        if (Boolean.TRUE.equals(ctx.getProperty(LOCAL_LOOKUP_PROPERTY))) {
+            String code = resource == LambdaIssuedIdentityController.class
+                    ? "LambdaIdentityVerificationFailed" : "IssuedSessionVerificationFailed";
+            ctx.abortWith(Response.status(403).entity(Map.of("code", code))
+                    .header("Cache-Control", "no-store").build());
+            return;
+        }
         String contentType = requestContentType(ctx);
         if (isCbor(ctx, contentType)) {
             ctx.abortWith(CborErrorResponses.of(new AwsException(jsonCode, message, status),

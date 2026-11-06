@@ -59,9 +59,13 @@ public class LambdaIssuedIdentityVerifier {
                                LambdaExecutionBinding binding) {}
 
     Identity observe(Map<String, String> request, boolean verify) {
+        return observe(request, verify, null);
+    }
+
+    Identity observe(Map<String, String> request, boolean verify, String accountId) {
         String selector = verify ? "accessKeyId" : request.keySet().stream()
                 .filter(key -> !key.equals("correlationId")).findFirst().orElseThrow();
-        Observation before = unique(selector, request.get(selector));
+        Observation before = unique(selector, request.get(selector), accountId);
         Instant expires = clock.instant().plusSeconds(60);
         if (verify) {
             Instant signed = IssuedSessionVerifier.verifyProof(before.current(), request, clock, 60, 5);
@@ -69,7 +73,7 @@ public class LambdaIssuedIdentityVerifier {
         }
         expires = earlier(expires, before.current().expiry());
         expires = earlier(expires, before.original().expiry());
-        require(before.equals(unique(selector, request.get(selector))) && expires.isAfter(clock.instant()));
+        require(before.equals(unique(selector, request.get(selector), accountId)) && expires.isAfter(clock.instant()));
         LambdaExecutionBinding binding = before.binding();
         IssuedSessionVerifier.Snapshot current = before.current();
         IssuedSessionVerifier.Snapshot root = before.original();
@@ -82,11 +86,15 @@ public class LambdaIssuedIdentityVerifier {
                 !verify && selector.equals("accessKeyId") ? current.accessKey() : null);
     }
 
-    private Observation unique(String selector, String value) {
+    private Observation unique(String selector, String value, String accountId) {
         List<Observation> matches = new ArrayList<>();
         for (SessionCredential candidate : iam.issuedSessionCandidates(selector.equals("accessKeyId") ? value : null)) {
             SessionCredential root = candidate.isLambdaExecutionRole() ? candidate : candidate.getLambdaParentSession();
             if (root == null || !root.isLambdaExecutionRole() || root.getLambdaParentSession() != null) {
+                continue;
+            }
+            if (accountId != null && (root.getLambdaExecution() == null
+                    || !accountId.equals(root.getLambdaExecution().accountId()))) {
                 continue;
             }
             IssuedSessionVerifier.Snapshot current = sessions.snapshot(candidate, candidate == root);

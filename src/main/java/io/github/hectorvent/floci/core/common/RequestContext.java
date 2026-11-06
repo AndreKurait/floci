@@ -23,6 +23,15 @@ public class RequestContext {
     private SessionCredential verifiedSession;
     private String verifiedSecret;
     private String verifiedToken;
+    private String verifiedAccountId;
+
+    public String getVerifiedAccountId() {
+        return verifiedAccountId;
+    }
+
+    public void setVerifiedAccountId(String accountId) {
+        verifiedAccountId = accountId;
+    }
 
     public SessionCredential getVerifiedSession() {
         return verifiedSession != null && Objects.equals(verifiedSecret, verifiedSession.getSecretAccessKey())

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.POST;
@@ -20,11 +21,14 @@ import java.util.Map;
 public class LambdaIssuedIdentityController {
     private final LambdaIssuedIdentityVerifier verifier;
     private final boolean enabled;
+    private final RequestContext requestContext;
 
     @Inject
-    public LambdaIssuedIdentityController(LambdaIssuedIdentityVerifier verifier, EmulatorConfig config) {
+    public LambdaIssuedIdentityController(LambdaIssuedIdentityVerifier verifier,
+                                          EmulatorConfig config, RequestContext requestContext) {
         this.verifier = verifier;
         this.enabled = config.services().iam().enabled() && config.services().iam().lambdaIdentityVerificationEnabled();
+        this.requestContext = requestContext;
     }
 
     @POST
@@ -45,8 +49,12 @@ public class LambdaIssuedIdentityController {
         } catch (IOException | IllegalArgumentException error) {
             return error(400, "InvalidIssuedSessionRequest");
         }
+        if (!verify && requestContext.getVerifiedAccountId() == null) {
+            return error(403, "LambdaIdentityVerificationFailed");
+        }
         try {
-            return Response.ok(verifier.observe(request, verify)).header("Cache-Control", "no-store").build();
+            return Response.ok(verifier.observe(request, verify,
+                    verify ? null : requestContext.getVerifiedAccountId())).header("Cache-Control", "no-store").build();
         } catch (RuntimeException error) {
             return error(403, "LambdaIdentityVerificationFailed");
         }

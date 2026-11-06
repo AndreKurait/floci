@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
@@ -34,7 +35,8 @@ class IssuedSessionIntegrationTest {
     public static class Enabled implements QuarkusTestProfile {
         @Override
         public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.iam.issued-session-verification-enabled", "true");
+            return Map.of("floci.services.iam.issued-session-verification-enabled", "true",
+                    "floci.auth.validate-signatures", "false");
         }
     }
 
@@ -75,7 +77,8 @@ class IssuedSessionIntegrationTest {
         assertFalse(response.contains(token));
         assertFalse(response.contains(secret));
         for (Map.Entry<String, String> selector : Map.of("accessKeyId", key, "principalArn", arn, "principalId", principal).entrySet()) {
-            Map<String, Object> identity = given().contentType("application/json").body(Map.of("correlationId", "cold",
+            Map<String, Object> identity = given().filter(signed(assumed)).contentType("application/json")
+                    .body(Map.of("correlationId", "cold",
                     selector.getKey(), selector.getValue())).post(BASE + "lookup")
                     .then().statusCode(200).body("operation", equalTo("Lookup"))
                     .body("principalArn", equalTo(arn)).body("principalId", equalTo(principal)).extract().as(Map.class);
@@ -110,9 +113,36 @@ class IssuedSessionIntegrationTest {
     void restrictionPresenceIsExplicitForBothInlineAndManagedRequests() {
         for (boolean managed : List.of(false, true)) {
             ValidatableResponse assumed = assume(managed ? null : "{\"Version\":\"2012-10-17\",\"Statement\":[]}", managed);
-            given().contentType("application/json").body(Map.of("correlationId", "restricted", "accessKeyId",
+            given().filter(signed(assumed)).contentType("application/json")
+                    .body(Map.of("correlationId", "restricted", "accessKeyId",
                     field(assumed, "Credentials.AccessKeyId"))).post(BASE + "lookup")
                     .then().statusCode(200).body("sessionPolicyPresent", equalTo(true));
+        }
+    }
+
+    @Test
+    void lookupRequiresKnownSignedCredentialsEvenWhenGlobalValidationIsOff() {
+        ValidatableResponse assumed = assume(null, false);
+        String key = field(assumed, "Credentials.AccessKeyId");
+        Map<String, String> selectors = Map.of("accessKeyId", key,
+                "principalArn", field(assumed, "AssumedRoleUser.Arn"),
+                "principalId", field(assumed, "AssumedRoleUser.AssumedRoleId"));
+        for (Map.Entry<String, String> selector : selectors.entrySet()) {
+            Map<String, String> request = Map.of("correlationId", "authentication",
+                    selector.getKey(), selector.getValue());
+            given().filter(signed(assumed)).contentType("application/json").body(request)
+                    .post(BASE + "lookup").then().statusCode(200);
+            given().contentType("application/json").body(request).post(BASE + "lookup")
+                    .then().statusCode(403).header("Cache-Control", "no-store")
+                    .body("code", equalTo("IssuedSessionVerificationFailed"));
+            for (AwsRequestSigner caller : List.of(signed(assumed).withSecret("wrong-secret"),
+                    signed(assumed).withSessionToken("wrong-token"),
+                    AwsRequestSigner.signedAs("123456789012", "test", "iam"),
+                    AwsRequestSigner.signedAs("test", "test", "iam"))) {
+                given().filter(caller).contentType("application/json").body(request).post(BASE + "lookup")
+                        .then().statusCode(403).header("Cache-Control", "no-store")
+                        .body("code", equalTo("IssuedSessionVerificationFailed"));
+            }
         }
     }
 
@@ -126,6 +156,12 @@ class IssuedSessionIntegrationTest {
         String secret = issued.extract().path(prefix + "SecretAccessKey");
         given().contentType("application/json").body(proof(key, token, secret)).post(BASE + "verify")
                 .then().statusCode(403).body("code", equalTo("IssuedSessionVerificationFailed"));
+    }
+
+    private static AwsRequestSigner signed(ValidatableResponse assumed) {
+        return AwsRequestSigner.signedAs(field(assumed, "Credentials.AccessKeyId"),
+                field(assumed, "Credentials.SecretAccessKey"), "iam")
+                .withSessionToken(field(assumed, "Credentials.SessionToken"));
     }
 
     private ValidatableResponse assume(String policy, boolean managed) {

@@ -100,9 +100,13 @@ public class IssuedSessionVerifier {
     }
 
     Identity lookup(Map<String, String> request) {
+        return lookup(request, null);
+    }
+
+    Identity lookup(Map<String, String> request, String accountId) {
         String selector = request.keySet().stream().filter(key -> !key.equals("correlationId"))
                 .findFirst().orElseThrow(IssuedSessionVerifier::refused);
-        List<Snapshot> initial = snapshots(selector, request.get(selector));
+        List<Snapshot> initial = snapshots(selector, request.get(selector), accountId);
         require(!initial.isEmpty() && initial.size() <= 128);
         Snapshot first = initial.getFirst();
         Identity reference = first.identity("", "Lookup", Instant.EPOCH, false);
@@ -110,7 +114,7 @@ public class IssuedSessionVerifier {
             require(reference.equals(candidate.identity("", "Lookup", Instant.EPOCH, false)));
         }
         Instant expiry = initial.stream().map(Snapshot::expiry).min(Comparator.naturalOrder()).orElseThrow();
-        require(initial.equals(snapshots(selector, request.get(selector))));
+        require(initial.equals(snapshots(selector, request.get(selector), accountId)));
         return first.identity(request.get("correlationId"), "Lookup", expiry, selector.equals("accessKeyId"));
     }
 
@@ -124,11 +128,15 @@ public class IssuedSessionVerifier {
     }
 
     private List<Snapshot> snapshots(String selector, String value) {
+        return snapshots(selector, value, null);
+    }
+
+    private List<Snapshot> snapshots(String selector, String value, String accountId) {
         List<Snapshot> result = new ArrayList<>();
         for (SessionCredential candidate : iam.issuedSessionCandidates(
                 selector.equals("accessKeyId") ? value : null)) {
             Snapshot snapshot = snapshot(candidate);
-            if (snapshot == null) {
+            if (snapshot == null || accountId != null && !accountId.equals(snapshot.account())) {
                 continue;
             }
             String selected = switch (selector) {
