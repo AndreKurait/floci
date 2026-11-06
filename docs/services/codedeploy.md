@@ -103,7 +103,9 @@ deployment group's service-role permissions and owning account. Target-group
 traffic control remains unsupported.
 
 S3 Server deployments support `DEPLOYMENT_FAILURE` rollback and explicit
-stop-and-rollback. Recovery is a new deployment of the group's last successful
+stop-and-rollback. Stop cancels queued commands and waits for acknowledged
+commands to finish within their existing deadlines before starting recovery.
+Recovery is a new deployment of the group's last successful
 revision and its file handling policy; the original result remains visible.
 Per-deployment rollback settings override the group's settings. Successful
 revision history persists across restarts and is scoped to the account, Region

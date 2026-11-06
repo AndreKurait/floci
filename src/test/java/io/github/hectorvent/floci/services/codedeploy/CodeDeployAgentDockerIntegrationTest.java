@@ -99,17 +99,28 @@ class CodeDeployAgentDockerIntegrationTest extends CodeDeployAgentDockerFixture 
                         targets.stream().filter(target -> guest(target, "test", "-p",
                                 "/var/lib/floci-agent-gate").exitCode() == 0).findFirst().orElse(null),
                 Objects::nonNull);
-        deployments.stopDeployment(request -> request.deploymentId(stopped));
+        assertEquals("Pending", deployments.stopDeployment(request -> request.deploymentId(stopped)
+                .autoRollbackEnabled(true)).statusAsString());
+        try {
+            await().during(Duration.ofMillis(350)).atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                    assertEquals(DeploymentStatus.IN_PROGRESS, deployments.getDeployment(
+                            request -> request.deploymentId(stopped)).deploymentInfo().status()));
+        } finally {
+            // The native agent finishes its running script before rollback can start.
+            output(blockedTarget, "sh", "-c", "printf resume > /var/lib/floci-agent-gate");
+        }
         assertDeployment(deployments, stopped, DeploymentStatus.STOPPED);
         for (String target : targets) {
             String events = output(target, "cat", "/var/lib/floci-agent-events");
             assertFalse(events.contains(stopped + " ApplicationStart"));
             assertFalse(events.contains(stopped + " ValidateService"));
         }
-        // Stopping the deployment does not kill an already executing guest script.
-        output(blockedTarget, "sh", "-c", "printf resume > /var/lib/floci-agent-gate");
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
                 assertEquals("released", output(blockedTarget, "cat", "/var/lib/floci-agent-released")));
+        String stoppedRollback = deployments.getDeployment(request -> request.deploymentId(stopped))
+                .deploymentInfo().rollbackInfo().rollbackDeploymentId();
+        assertNotNull(stoppedRollback);
+        assertDeployment(deployments, stoppedRollback, DeploymentStatus.SUCCEEDED);
         String afterStop = deploy(deployments, name,
                 upload(s3, name, "after-stop.zip", bundle("after-stop", false)));
         assertDeployment(deployments, afterStop, DeploymentStatus.SUCCEEDED);

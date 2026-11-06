@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
@@ -274,18 +275,93 @@ class CodeDeployAgentDeploymentTest {
         assertThrows(AwsException.class, () -> commands.complete(ACCOUNT, REGION, id, "Succeeded", "{}"));
     }
 
-    @Test
-    void stoppingAnInFlightCommandDoesNotQueueTheNextPhase() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"Succeeded", "Failed"})
+    void stoppingAnAcknowledgedCommandWaitsForItsCompletionWithoutQueuingAnotherPhase(String completion)
+            throws Exception {
         Running run = start(prepare(null));
         String id = pending(FIRST, "ApplicationStop");
         commands.acknowledge(ACCOUNT, REGION, id);
         run.stop().set(true);
+        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        assertEquals("InProgress", run.deployment().getStatus());
+        assertEquals("InProgress", commands.update(ACCOUNT, REGION, id).get("CommandStatus"));
+        commands.complete(ACCOUNT, REGION, id, completion, "{}");
         done(run);
         assertEquals("Stopped", run.deployment().getStatus());
         assertEquals(1, events(run, FIRST).size());
-        assertEquals("Skipped", events(run, FIRST).getFirst().get("status"));
-        assertThrows(AwsException.class, () -> commands.complete(ACCOUNT, REGION, id, "Succeeded", "{}"));
+        assertEquals(completion, events(run, FIRST).getFirst().get("status"));
         assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
+    }
+
+    @Test
+    void stopCancelsAQueuedCommandWithoutWaitingForTheStartDeadline() throws Exception {
+        Running run = start(prepare(null));
+        String id = pending(FIRST, "ApplicationStop");
+        run.stop().set(true);
+        done(run);
+        assertEquals("Stopped", run.deployment().getStatus());
+        assertEquals("Skipped", events(run, FIRST).getFirst().get("status"));
+        assertEquals("Failed", commands.acknowledge(ACCOUNT, REGION, id).get("CommandStatus"));
+        assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
+    }
+
+    @Test
+    void allAtOnceStopWaitsForTheActiveHostAfterCancellingAQueuedPeer() throws Exception {
+        members(FIRST, SECOND);
+        Running run = start(prepare("CodeDeployDefault.AllAtOnce"));
+        String active = pending(FIRST, "ApplicationStop");
+        commands.acknowledge(ACCOUNT, REGION, active);
+        pending(SECOND, "ApplicationStop");
+        run.stop().set(true);
+        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        assertEquals("InProgress", run.deployment().getStatus());
+        assertTrue(commands.poll(ACCOUNT, REGION, host(SECOND)).isEmpty());
+        commands.complete(ACCOUNT, REGION, active, "Succeeded", "{}");
+        done(run);
+        assertEquals("Stopped", run.deployment().getStatus());
+        assertEquals("Succeeded", events(run, FIRST).getFirst().get("status"));
+        assertEquals("Skipped", events(run, SECOND).getFirst().get("status"));
+    }
+
+    @Test
+    void allAtOnceStopWaitsForEveryAcknowledgedCommand() throws Exception {
+        members(FIRST, SECOND);
+        Running run = start(prepare("CodeDeployDefault.AllAtOnce"));
+        String first = pending(FIRST, "ApplicationStop");
+        String second = pending(SECOND, "ApplicationStop");
+        commands.acknowledge(ACCOUNT, REGION, first);
+        commands.acknowledge(ACCOUNT, REGION, second);
+        run.stop().set(true);
+        commands.complete(ACCOUNT, REGION, first, "Succeeded", "{}");
+        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        assertEquals("InProgress", commands.update(ACCOUNT, REGION, second).get("CommandStatus"));
+        commands.complete(ACCOUNT, REGION, second, "Succeeded", "{}");
+        done(run);
+        assertEquals("Stopped", run.deployment().getStatus());
+        assertEquals(1, events(run, FIRST).size());
+        assertEquals(1, events(run, SECOND).size());
+    }
+
+    @Test
+    void allAtOncePermissionFailureWaitsForAnAcknowledgedPeerBeforeReleasingTheGroup() throws Exception {
+        useTraffic();
+        members(FIRST, SECOND);
+        doAnswer(call -> {
+            throw new AwsException("IAM_ROLE_PERMISSIONS", "Service role denied traffic change", 403);
+        }).when(traffic).change(any(), eq(FIRST), eq(false), any(), any());
+        Running run = start(prepare("CodeDeployDefault.AllAtOnce"));
+        String active = pending(SECOND, "BeforeBlockTraffic");
+        commands.acknowledge(ACCOUNT, REGION, active);
+        complete(FIRST, "BeforeBlockTraffic", "Succeeded", "{}");
+        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        assertEquals("InProgress", commands.update(ACCOUNT, REGION, active).get("CommandStatus"));
+        commands.complete(ACCOUNT, REGION, active, "Succeeded", "{}");
+        done(run);
+        assertEquals("Failed", run.deployment().getStatus());
+        assertEquals("IAM_ROLE_PERMISSIONS", run.deployment().getErrorInformation().get("code"));
+        assertEquals("Succeeded", events(run, SECOND).getFirst().get("status"));
+        assertEquals(1, events(run, SECOND).size());
     }
 
     @Test

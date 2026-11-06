@@ -142,6 +142,45 @@ class CodeDeployAgentRollbackIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void anActiveHookKeepsStopPendingAndTheGroupReservedUntilItsAgentCompletes(boolean rollbackRequested) {
+        Fixture selected = fixture();
+        String first = deploy(selected, revision("good"), "DISALLOW", null);
+        succeed(selected);
+        terminal(selected, first);
+        String stopped = deploy(selected, revision("active"), "DISALLOW", null);
+        String command = (String) poll(selected, "ApplicationStop").get("HostCommandIdentifier");
+        commands.acknowledge(selected.account(), selected.region(), command);
+        assertEquals("Pending", selected.client().stopDeployment(request -> request.deploymentId(stopped)
+                .autoRollbackEnabled(rollbackRequested)).statusAsString());
+        try {
+            await().during(Duration.ofMillis(350)).atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
+                assertEquals("InProgress", info(selected, stopped).statusAsString());
+                assertNull(info(selected, stopped).rollbackInfo());
+                assertEquals(2, ids(selected).size());
+            });
+            CodeDeployException conflict = assertThrows(CodeDeployException.class,
+                    () -> deploy(selected, revision("overlap"), "DISALLOW", null));
+            assertEquals("DeploymentLimitExceededException", conflict.awsErrorDetails().errorCode());
+        } finally {
+            if ("InProgress".equals(commands.update(selected.account(), selected.region(), command)
+                    .get("CommandStatus"))) {
+                commands.complete(selected.account(), selected.region(), command, "Succeeded", "{\"error_code\":0}");
+            }
+        }
+        DeploymentInfo result = terminal(selected, stopped);
+        assertEquals("Stopped", result.statusAsString());
+        if (rollbackRequested) {
+            String recovery = result.rollbackInfo().rollbackDeploymentId();
+            succeed(selected);
+            assertEquals("Succeeded", terminal(selected, recovery).statusAsString());
+        } else {
+            assertNull(result.rollbackInfo());
+            assertEquals(2, ids(selected).size());
+        }
+    }
+
     @Test
     void theFirstFailureHasNoPreviousRevisionToRedeploy() {
         Fixture selected = fixture();

@@ -46,9 +46,12 @@ another automatic rollback. A first failure with no successful revision records
 that recovery is unavailable.
 
 `StopDeployment(autoRollbackEnabled=false)` stops without recovery. Explicit
-`true` schedules the last successful revision after the old controller workers
-have settled. Already executing guest scripts remain under the stock agent's
-control. A recovery uses the normal agent and traffic phases; cancellation
+`true` schedules the last successful revision after all old controller workers
+have settled. Stop remains pending while acknowledged commands complete within
+their existing lifecycle deadline. Queued commands are cancelled atomically
+with acknowledgement, and no subsequent phase starts. The agent's completion
+and diagnostics remain visible before the group is released for recovery.
+A recovery uses the normal agent and traffic phases; cancellation
 itself never restores load-balancer membership. Automatic alarm and
 `DEPLOYMENT_STOP_ON_REQUEST` policy triggers remain unsupported.
 
@@ -115,10 +118,10 @@ identity.
 Command state is bound to the deployment's account, Region and selected host.
 Retries must not run a completed command again, acknowledge another tenant's
 command, or change a terminal result. A deployment group has one active
-deployment; independent groups may deploy to the same host. Cancellation
-releases that group's reservation and invalidates its unfinished commands.
-It stops issuing phases; it does not claim to kill a script already executing
-inside the agent.
+deployment; independent groups may deploy to the same host. Stop cancels queued
+work and retains the group's reservation until active commands settle.
+It does not kill a script already executing inside the agent. Shutdown and
+expired lifecycle deadlines still invalidate unfinished commands.
 
 Polling waits up to 60 seconds for eligible work and wakes when a command is
 queued or its state changes. A delivered command stays unavailable for five

@@ -203,6 +203,16 @@ public class CodeDeployAgentCommands {
         notifyAll();
     }
 
+    /** Cancel queued work atomically with acknowledgement, preserving an agent's active command. */
+    public synchronized boolean cancelPending(Session session, String host) {
+        Command command = session.current.get(host);
+        if (command != null && "Pending".equals(command.status)) {
+            cancel(session, host);
+            return true;
+        }
+        return false;
+    }
+
     public synchronized void cancel(Session session, String host) {
         Command command = session.current.get(host);
         if (command != null && !command.result.isDone()) {
