@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.elb;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RequestHost;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -20,14 +21,14 @@ class ElbClassicDataPlaneTest {
             "localhost.localstack.cloud", "custom.floci.test", "s3.custom.floci.test",
             "configured-base.test", "service.extra.test", "s3.amazonaws.com"})
     void emulatorAuthoritiesCannotBeClaimedByPublicAliases(String host) {
-        assertTrue(ElbClassicDataPlane.isEmulatorHost(host, config()));
+        assertTrue(RequestHost.isEmulatorHost(host, config()));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"public.example.test", "localhost.floci.io.outside.test",
             "notlocalhost", "extra.test.outside.test"})
     void customerAuthoritiesRemainEligibleForPublicAliases(String host) {
-        assertFalse(ElbClassicDataPlane.isEmulatorHost(host, config()));
+        assertFalse(RequestHost.isEmulatorHost(host, config()));
     }
 
     private static EmulatorConfig config() {

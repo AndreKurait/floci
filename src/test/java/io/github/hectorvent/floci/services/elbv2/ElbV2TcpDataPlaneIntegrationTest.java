@@ -1,10 +1,12 @@
 package io.github.hectorvent.floci.services.elbv2;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
+import io.github.hectorvent.floci.testing.TestAccounts;
 import io.github.hectorvent.floci.testutil.LogCapture;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -23,6 +25,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
@@ -494,6 +497,57 @@ class ElbV2TcpDataPlaneIntegrationTest {
         client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
                 .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("120").build()));
         assertEquals(120_000L, dataPlane.tcpIdleTimeoutMillis(listenerArn, "us-east-1"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"eu-west-1", "cn-north-1"})
+    void unsignedTcpConnectionsUseTheListenerOwnersTargetsAndTimeout(String region) throws Exception {
+        String owner = TestAccounts.randomId();
+        try (ElasticLoadBalancingV2Client member = ElasticLoadBalancingV2Client.builder()
+                .endpointOverride(endpoint).region(Region.of(region))
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(owner, "test")))
+                .httpClientBuilder(UrlConnectionHttpClient.builder()).build()) {
+            String balancer = member.createLoadBalancer(request -> request.name("member-tcp")
+                    .type(LoadBalancerTypeEnum.NETWORK).subnets(Ec2Service.defaultSubnetId(region, "a")))
+                    .loadBalancers().getFirst().loadBalancerArn();
+            String group = null;
+            try {
+                group = member.createTargetGroup(request -> request.name("member-tcp-target")
+                        .protocol(ProtocolEnum.TCP).port(backend.actualPort()).targetType(TargetTypeEnum.IP)
+                        .vpcId(Ec2Service.defaultVpcId(region))).targetGroups().getFirst().targetGroupArn();
+                String targetGroup = group;
+                member.registerTargets(request -> request.targetGroupArn(targetGroup)
+                        .targets(TargetDescription.builder().id("127.0.0.1").port(backend.actualPort()).build()));
+                int port;
+                try (ServerSocket reservation = new ServerSocket(0)) {
+                    port = reservation.getLocalPort();
+                }
+                String listener = member.createListener(request -> request.loadBalancerArn(balancer)
+                        .protocol(ProtocolEnum.TCP).port(port).defaultActions(Action.builder()
+                                .type(ActionTypeEnum.FORWARD).targetGroupArn(targetGroup).build()))
+                        .listeners().getFirst().listenerArn();
+                assertEquals(owner, AwsArnUtils.parse(listener).accountId());
+                assertEquals(region, AwsArnUtils.parse(listener).region());
+                member.modifyListenerAttributes(request -> request.listenerArn(listener)
+                        .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("120").build()));
+                await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class).untilAsserted(() -> {
+                    try (Socket socket = connect(port)) {
+                        assertEcho(socket, new byte[]{0, 1, 2, 3, (byte) 255});
+                    }
+                });
+                // This is the same lookup the asynchronous connect callback makes outside a request scope.
+                assertEquals(120_000L, dataPlane.tcpIdleTimeoutMillis(listener, region));
+            } finally {
+                String targetGroup = group;
+                assertAll("Remove the member account's listener, load balancer and target group",
+                        () -> member.deleteLoadBalancer(request -> request.loadBalancerArn(balancer)),
+                        () -> {
+                            if (targetGroup != null) {
+                                member.deleteTargetGroup(request -> request.targetGroupArn(targetGroup));
+                            }
+                        });
+            }
+        }
     }
 
     private void replaceBackend(NetServerOptions options, Handler<NetSocket> handler) throws Exception {

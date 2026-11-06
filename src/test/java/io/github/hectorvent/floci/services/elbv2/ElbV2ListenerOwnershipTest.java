@@ -18,7 +18,12 @@ import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.net.NetServer;
+import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.SSLOptions;
+import io.vertx.ext.web.Route;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -59,6 +64,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -67,6 +73,35 @@ class ElbV2ListenerOwnershipTest {
     private static final String REGION = "us-west-2";
     private static final String HOST = "shared.example.test";
     private static final String CERTIFICATE = "arn:aws:acm:us-west-2:000000000000:certificate/shared";
+
+    @ParameterizedTest
+    @CsvSource({"HTTP,true", "HTTPS,false", "TCP,false"})
+    void sharedEdgeDispatchesOnlyHttpListeners(String protocol, boolean dispatch) {
+        Fixture fixture = new Fixture(new Registry());
+        Listener listener = listener("edge", 8443, "HTTPS".equals(protocol));
+        listener.setProtocol(protocol);
+        try {
+            publishRuntime(fixture.plane, listener, REGION, null, List.of(rule("edge")));
+            fixture.sharedEdge(HOST + ":8443", dispatch);
+            if (!"TCP".equals(protocol)) {
+                fixture.serves(8443, "edge");
+            }
+        } finally {
+            fixture.plane.shutdown();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"shared.example.test,true", "shared.example.test:80,true", "shared.example.test:0,false"})
+    void sharedEdgeDistinguishesAnOmittedPortFromExplicitZero(String authority, boolean dispatch) {
+        Fixture fixture = new Fixture(new Registry());
+        try {
+            publishRuntime(fixture.plane, listener("edge", 80, false), REGION, null, List.of(rule("edge")));
+            fixture.sharedEdge(authority, dispatch);
+        } finally {
+            fixture.plane.shutdown();
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -636,6 +671,7 @@ class ElbV2ListenerOwnershipTest {
             when(plane.config.services()).thenReturn(services);
             when(services.elbv2()).thenReturn(config);
             when(config.mock()).thenReturn(false);
+            when(config.enabled()).thenReturn(true);
             when(plane.config.port()).thenReturn(4566);
             plane.tlsProxyServer = mock(TlsProxyServer.class);
             when(plane.tlsProxyServer.reservesPort(anyInt())).thenReturn(false);
@@ -657,6 +693,11 @@ class ElbV2ListenerOwnershipTest {
             });
             when(plane.vertx.cancelTimer(anyLong())).thenAnswer(call ->
                     timers.remove(call.<Long>getArgument(0)) != null);
+            NetServer tcpServer = mock(NetServer.class);
+            when(tcpServer.connectHandler(any())).thenReturn(tcpServer);
+            when(tcpServer.listen()).thenReturn(Future.succeededFuture(tcpServer));
+            when(tcpServer.close()).thenReturn(Future.succeededFuture());
+            when(plane.vertx.createNetServer(any(NetServerOptions.class))).thenReturn(tcpServer);
             when(plane.vertx.createHttpServer(any(HttpServerOptions.class))).thenAnswer(call -> {
                 int port = ((HttpServerOptions) call.getArgument(0)).getPort();
                 created.computeIfAbsent(port, ignored -> new AtomicInteger()).incrementAndGet();
@@ -698,6 +739,35 @@ class ElbV2ListenerOwnershipTest {
         private int closes(int port) {
             AtomicInteger count = closed.get(port);
             return count == null ? 0 : count.get();
+        }
+
+        private void sharedEdge(String authority, boolean dispatch) {
+            Router router = mock(Router.class);
+            Route route = mock(Route.class);
+            AtomicReference<Handler<RoutingContext>> handler = new AtomicReference<>();
+            when(router.route()).thenReturn(route);
+            when(route.order(anyInt())).thenReturn(route);
+            when(route.handler(any())).thenAnswer(call -> {
+                handler.set(call.getArgument(0));
+                return route;
+            });
+            plane.register(router);
+            RoutingContext context = mock(RoutingContext.class);
+            HttpServerRequest request = mock(HttpServerRequest.class);
+            HttpServerResponse response = mock(HttpServerResponse.class);
+            when(context.request()).thenReturn(request);
+            when(request.getHeader("Host")).thenReturn(authority);
+            when(request.host()).thenReturn(authority);
+            when(request.response()).thenReturn(response);
+            when(response.setStatusCode(anyInt())).thenReturn(response);
+            handler.get().handle(context);
+            if (dispatch) {
+                verify(response).end("edge");
+                verify(context, never()).next();
+            } else {
+                verify(context).next();
+                verify(response, never()).end(anyString());
+            }
         }
 
         private void serves(int port, String body) {
