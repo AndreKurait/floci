@@ -4,8 +4,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY conftest.py pytest.ini ./
+COPY conftest.py pytest.ini appconfig_alarm_fixtures.py ./
 COPY tests/ tests/
+COPY iam/ iam/
 
 ENV FLOCI_ENDPOINT=http://floci:4566
 

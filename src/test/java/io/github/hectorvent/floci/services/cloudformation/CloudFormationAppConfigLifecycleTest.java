@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.services.appconfig.AppConfigAlarmMonitor;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
@@ -30,6 +31,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
@@ -54,7 +56,7 @@ class CloudFormationAppConfigLifecycleTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        appConfig = spy(new AppConfigService(storage, new RegionResolver("us-east-1", ACCOUNT)));
+        appConfig = spy(new AppConfigService(storage, new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class)));
         CfnResourceDispatcher dispatcher = new CfnResourceDispatcher(MAPPER,
                 new CloudFormationResourceRegistry(List.of(new AppConfigCfnProvisioner(appConfig))), null, null);
         cfn = CloudFormationServiceFixture.create(dispatcher);

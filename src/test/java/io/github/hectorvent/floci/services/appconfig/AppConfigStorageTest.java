@@ -3,9 +3,15 @@ package io.github.hectorvent.floci.services.appconfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
+import jakarta.enterprise.inject.Instance;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -62,6 +68,52 @@ class AppConfigStorageTest {
         } finally {
             factory.shutdownAll();
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void backgroundKeysRetainOwnersAndDeduplicateDefaultRegionLegacyKeys(String mode) {
+        StorageFactory factory = factory(directory, mode);
+        try {
+            AccountAwareStorageBackend<String> raw = (AccountAwareStorageBackend<String>) factory
+                    .<String>create("appconfig", "records.json", new TypeReference<>() {});
+            raw.putForAccount("111111111111", "existing", "legacy");
+            raw.putForAccount("111111111111", "us-east-1/existing", "current");
+            raw.putForAccount("111111111111", "us-west-2/existing", "west");
+            raw.putForAccount("222222222222", "cn-north-1/existing", "china");
+            raw.putForAccount("222222222222", "us-east-1/invalid/nested", "invalid");
+            AppConfigStorage<String> store = store(factory, "us-east-1");
+            assertEquals(Set.of(
+                    new AppConfigStorage.ScopedKey("111111111111", "us-east-1", "existing"),
+                    new AppConfigStorage.ScopedKey("111111111111", "us-west-2", "existing"),
+                    new AppConfigStorage.ScopedKey("222222222222", "cn-north-1", "existing")),
+                    store.scopedKeys(value -> true));
+            assertEquals(Set.of(new AppConfigStorage.ScopedKey("111111111111", "us-west-2", "existing")),
+                    store.scopedKeys(value -> value.equals("west")));
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void preAccountRecordsCannotBeClaimedByAnotherAccountReadingFirst() {
+        InMemoryStorage<String, String> raw = new InMemoryStorage<>();
+        raw.put("existing", "default-account");
+        RequestContext context = mock(RequestContext.class);
+        when(context.getAccountId()).thenReturn("111111111111");
+        Instance<RequestContext> contexts = mock(Instance.class);
+        when(contexts.get()).thenReturn(context);
+        AccountAwareStorageBackend<String> accounts = new AccountAwareStorageBackend<>(
+                raw, contexts, "000000000000");
+        StorageFactory factory = new InMemoryStorageFactory("000000000000").withStore("records.json", accounts);
+        AppConfigStorage<String> store = store(factory, "us-east-1");
+        assertEquals(Optional.empty(), store.get("existing"));
+        assertEquals(Optional.of("default-account"), raw.get("existing"));
+        when(context.getAccountId()).thenReturn("000000000000");
+        assertEquals(Optional.of("default-account"), store.get("existing"));
+        assertEquals(Optional.empty(), raw.get("existing"));
+        assertEquals(Optional.of("default-account"), raw.get("000000000000/existing"));
     }
 
     private static AppConfigStorage<String> store(StorageFactory factory, String region) {
