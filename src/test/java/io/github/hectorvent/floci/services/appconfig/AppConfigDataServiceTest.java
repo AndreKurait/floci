@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.appconfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.appconfig.model.ConfigurationSession;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
@@ -36,7 +37,8 @@ class AppConfigDataServiceTest {
     void concurrentPollsConsumeAConfigurationTokenOnlyOnce() throws Exception {
         InMemoryStorageFactory factory = new InMemoryStorageFactory("000000000000");
         AppConfigService appConfig = mock(AppConfigService.class);
-        AppConfigDataService service = new AppConfigDataService(factory, appConfig, MAPPER);
+        AppConfigDataService service = new AppConfigDataService(factory, appConfig, MAPPER,
+                new RegionResolver("us-east-1", "000000000000"));
         AccountAwareStorageBackend<ConfigurationSession> sessions = factory.create("appconfigdata",
                 "appconfigdata-sessions.json", new TypeReference<Map<String, ConfigurationSession>>() {});
         ConfigurationSession session = new ConfigurationSession();
@@ -91,7 +93,7 @@ class AppConfigDataServiceTest {
             AppConfigDataService.ConfigurationData accepted = (AppConfigDataService.ConfigurationData) results.stream()
                     .filter(AppConfigDataService.ConfigurationData.class::isInstance).findFirst().orElseThrow();
             assertTrue(sessions.get("initial").isEmpty());
-            assertTrue(sessions.get(accepted.nextPollConfigurationToken()).isPresent());
+            assertTrue(sessions.get("us-east-1/" + accepted.nextPollConfigurationToken()).isPresent());
             assertEquals("BadRequestException", assertThrows(AwsException.class,
                     () -> service.getLatestConfiguration("initial")).getErrorCode());
         } finally {

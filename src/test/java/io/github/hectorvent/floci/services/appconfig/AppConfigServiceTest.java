@@ -1,8 +1,8 @@
 package io.github.hectorvent.floci.services.appconfig;
 
 import com.fasterxml.jackson.core.type.TypeReference;
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
@@ -65,7 +65,8 @@ class AppConfigServiceTest {
             deployments.put(invocation.getArgument(0, String.class), invocation.getArgument(1, Deployment.class));
             return null;
         }).when(deploymentStore).put(anyString(), any(Deployment.class));
-        when(deploymentStore.scan(any())).thenAnswer(invocation -> List.copyOf(deployments.values()));
+        when(deploymentStore.get(anyString())).thenAnswer(invocation ->
+                Optional.ofNullable(deployments.get(invocation.getArgument(0, String.class))));
         when(deploymentStore.keys()).thenAnswer(invocation -> Set.copyOf(deployments.keySet()));
         doAnswer(invocation -> deployments.remove(invocation.getArgument(0, String.class)))
                 .when(deploymentStore).delete(anyString());
@@ -106,7 +107,7 @@ class AppConfigServiceTest {
         profile.setId("profile");
         profile.setApplicationId("app");
         when(profileStore.get("profile")).thenReturn(Optional.of(profile));
-        service = new AppConfigService(storageFactory, mock(EmulatorConfig.class));
+        service = new AppConfigService(storageFactory, new RegionResolver("us-east-1", "000000000000"));
     }
 
     @Test
@@ -115,7 +116,7 @@ class AppConfigServiceTest {
 
         assertEquals("orders-v2", updated.getName());
         assertEquals("Order processing", updated.getDescription());
-        verify(applicationStore).put("app", updated);
+        verify(applicationStore).put("us-east-1/app", updated);
     }
 
     @Test
@@ -392,7 +393,7 @@ class AppConfigServiceTest {
                 "DeploymentStrategyId", "AppConfig.AllAtOnce"));
 
         assertEquals(4, deployment.getDeploymentNumber());
-        assertEquals(Set.of("app::env::1", "app::env::3", "app::env::4"), deploymentStore.keys());
+        assertEquals(Set.of("app::env::1", "app::env::3", "us-east-1/app::env::4"), deploymentStore.keys());
     }
 
     @Test
