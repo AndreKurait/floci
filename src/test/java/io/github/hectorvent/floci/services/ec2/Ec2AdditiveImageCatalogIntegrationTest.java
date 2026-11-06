@@ -80,34 +80,30 @@ class Ec2AdditiveImageCatalogIntegrationTest {
         try (Ec2Client ec2 = ec2()) {
             String source = ec2.registerImage(request -> request.name("native-worker-release").architecture("arm64"))
                     .imageId();
-            String copy = null;
-            String instanceId = null;
-            try {
-                copy = ec2.copyImage(request -> request.sourceRegion(Region.US_EAST_1.id()).sourceImageId(source)
+            try (Cleanup sourceCleanup = () -> ec2.deregisterImage(request -> request.imageId(source))) {
+                String copy = ec2.copyImage(request -> request.sourceRegion(Region.US_EAST_1.id()).sourceImageId(source)
                         .name("copied-native-" + UUID.randomUUID())).imageId();
-                String selected = copy;
-                assertEquals("arm64", ec2.describeImages(request -> request.imageIds(selected))
-                        .images().getFirst().architectureAsString());
-                instanceId = ec2.runInstances(request -> request.imageId(selected).instanceType("t4g.micro")
-                        .minCount(1).maxCount(1)).instances().getFirst().instanceId();
-                String ownedInstance = instanceId;
-                assertEquals(copy, ec2.describeInstances(request -> request.instanceIds(ownedInstance))
-                        .reservations().getFirst().instances().getFirst().imageId());
-            } finally {
-                if (instanceId != null) {
-                    String ownedInstance = instanceId;
-                    ec2.terminateInstances(request -> request.instanceIds(ownedInstance));
+                try (Cleanup copyCleanup = () -> ec2.deregisterImage(request -> request.imageId(copy))) {
+                    assertEquals("arm64", ec2.describeImages(request -> request.imageIds(copy))
+                            .images().getFirst().architectureAsString());
+                    String instanceId = ec2.runInstances(request -> request.imageId(copy).instanceType("t4g.micro")
+                            .minCount(1).maxCount(1)).instances().getFirst().instanceId();
+                    try (Cleanup instanceCleanup = () -> ec2.terminateInstances(
+                            request -> request.instanceIds(instanceId))) {
+                        assertEquals(copy, ec2.describeInstances(request -> request.instanceIds(instanceId))
+                                .reservations().getFirst().instances().getFirst().imageId());
+                    }
                 }
-                if (copy != null) {
-                    String ownedCopy = copy;
-                    ec2.deregisterImage(request -> request.imageId(ownedCopy));
-                }
-                ec2.deregisterImage(request -> request.imageId(source));
             }
         }
     }
 
-    private Ec2Client ec2() {
+    private interface Cleanup extends AutoCloseable {
+        @Override
+        void close();
+    }
+
+    Ec2Client ec2() {
         return Ec2Client.builder().endpointOverride(URI.create("http://localhost:" + RestAssured.port))
                 .region(Region.US_EAST_1).httpClientBuilder(UrlConnectionHttpClient.builder())
                 .credentialsProvider(StaticCredentialsProvider.create(
