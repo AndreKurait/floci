@@ -5,6 +5,7 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,6 +54,7 @@ public class CapacityReservation {
     private String region;
     private List<Tag> tags = new ArrayList<>();
     private List<String> instanceIds = new ArrayList<>();
+    private Map<String, CapacityReservationMove> completedMoves = new HashMap<>();
 
     public CapacityReservation() {}
 
@@ -86,6 +88,7 @@ public class CapacityReservation {
         placementGroupArn = other.placementGroupArn;
         region = other.region;
         tags = new ArrayList<>(other.tags);
+        completedMoves = new HashMap<>(other.completedMoves);
         instanceIds = new ArrayList<>(other.instanceIds);
     }
 
@@ -173,4 +176,8 @@ public class CapacityReservation {
     public List<String> getInstanceIds() { return instanceIds; }
     public void setInstanceIds(List<String> instanceIds) { this.instanceIds = instanceIds; }
 
+    public Map<String, CapacityReservationMove> getCompletedMoves() { return completedMoves; }
+    public void setCompletedMoves(Map<String, CapacityReservationMove> completedMoves) {
+        this.completedMoves = completedMoves;
+    }
 }
