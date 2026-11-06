@@ -20,6 +20,7 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -44,6 +45,8 @@ import java.util.function.ToDoubleFunction;
  */
 @ApplicationScoped
 public class SwfJsonHandler {
+
+    static final Duration POLL_TIMEOUT = Duration.ofSeconds(60);
 
     private final SwfService service;
     private final ObjectMapper objectMapper;
@@ -477,6 +480,7 @@ public class SwfJsonHandler {
      * claiming another.
      */
     private Response pollForDecisionTask(JsonNode request, String region) {
+        int pageSize = service.pageSize(optionalInt(request, "maximumPageSize"));
         String pageToken = text(request, "nextPageToken");
         SwfDecisionTask task;
         int offset;
@@ -490,7 +494,7 @@ public class SwfJsonHandler {
         } else {
             Optional<SwfDecisionTask> maybeTask = service.pollForDecisionTask(region,
                     text(request, "domain"), nested(request, "taskList", "name"),
-                    text(request, "identity"));
+                    text(request, "identity"), POLL_TIMEOUT);
             if (maybeTask.isEmpty()) {
                 return Response.ok(emptyPollResponse()).build();
             }
@@ -509,7 +513,6 @@ public class SwfJsonHandler {
             events = events.stream().filter(e -> e.getEventId() >= from).toList();
         }
 
-        int pageSize = service.pageSize(optionalInt(request, "maximumPageSize"));
         int end = Math.min(offset + pageSize, events.size());
 
         ObjectNode response = objectMapper.createObjectNode();
@@ -546,7 +549,7 @@ public class SwfJsonHandler {
 
     private Response pollForActivityTask(JsonNode request, String region) {
         Optional<SwfActivityTask> maybeTask = service.pollForActivityTask(region, text(request, "domain"),
-                nested(request, "taskList", "name"), text(request, "identity"));
+                nested(request, "taskList", "name"), text(request, "identity"), POLL_TIMEOUT);
         if (maybeTask.isEmpty()) {
             ObjectNode response = objectMapper.createObjectNode();
             response.put("taskToken", "");
