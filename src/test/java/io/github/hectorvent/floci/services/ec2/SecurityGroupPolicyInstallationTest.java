@@ -29,6 +29,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
+import java.util.function.IntFunction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -80,6 +81,34 @@ class SecurityGroupPolicyInstallationTest {
     }
 
     @Test
+    void endpointsSharingANamespaceKeepTheirInstallationsSerial() throws Exception {
+        CountDownLatch sharedEntered = new CountDownLatch(1);
+        CountDownLatch otherEntered = new CountDownLatch(1);
+        AtomicInteger activeShared = new AtomicInteger();
+        AtomicInteger sharedCalls = new AtomicInteger();
+        SecurityGroupFirewallManager manager = manager(3, (helper, quarantine) -> {
+            assertFalse(quarantine);
+            if (helper.equals("helper-shared")) {
+                assertEquals(1, activeShared.incrementAndGet(), "one namespace has one policy writer");
+                try {
+                    sharedCalls.incrementAndGet();
+                    sharedEntered.countDown();
+                    await(otherEntered);
+                } finally {
+                    activeShared.decrementAndGet();
+                }
+            } else {
+                await(sharedEntered);
+                otherEntered.countDown();
+            }
+        }, index -> index < 2 ? "helper-shared" : "helper-other");
+        try (ExecutorService caller = Executors.newVirtualThreadPerTaskExecutor()) {
+            caller.submit(manager::reconcileAll).get(20, TimeUnit.SECONDS);
+        }
+        assertEquals(2, sharedCalls.get());
+    }
+
+    @Test
     void failedGenerationWaitsForDelayedInstallerBeforeQuarantiningEveryNamespace() throws Exception {
         CountDownLatch delayedStarted = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
@@ -113,6 +142,11 @@ class SecurityGroupPolicyInstallationTest {
     }
 
     private static SecurityGroupFirewallManager manager(int count, BiConsumer<String, Boolean> installation) {
+        return manager(count, installation, index -> "helper-" + index);
+    }
+
+    private static SecurityGroupFirewallManager manager(int count, BiConsumer<String, Boolean> installation,
+                                                       IntFunction<String> namespace) {
         DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
         EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
         when(dns.getServerIp()).thenReturn(Optional.empty());
@@ -122,7 +156,7 @@ class SecurityGroupPolicyInstallationTest {
         doNothing().when(manager).reconcileAll();
         Map<String, Boolean> scripts = new ConcurrentHashMap<>();
         for (int index = 0; index < count; index++) {
-            String helper = "helper-" + index;
+            String helper = namespace.apply(index);
             when(docker.inspectContainerCmd(helper).exec().getState().getRunning()).thenReturn(true);
             CopyArchiveToContainerCmd copy = mock(CopyArchiveToContainerCmd.class, RETURNS_SELF);
             when(docker.copyArchiveToContainerCmd(helper)).thenReturn(copy);

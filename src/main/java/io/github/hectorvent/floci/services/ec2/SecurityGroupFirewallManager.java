@@ -27,6 +27,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -269,7 +270,10 @@ public class SecurityGroupFirewallManager {
     private record PolicyInstallation(String helperId, String rules) {}
 
     private void installPolicies(List<PolicyInstallation> installations) {
-        if (installations.size() < 2) {
+        Map<String, List<PolicyInstallation>> namespaces = new LinkedHashMap<>();
+        installations.forEach(policy -> namespaces.computeIfAbsent(policy.helperId(),
+                ignored -> new ArrayList<>()).add(policy));
+        if (namespaces.size() < 2) {
             installations.forEach(policy -> apply(policy.helperId(), policy.rules()));
             return;
         }
@@ -277,11 +281,11 @@ public class SecurityGroupFirewallManager {
         // namespaces overlaps. Joining every task before quarantine prevents a late installer from
         // restoring permissive rules after another namespace's installation failed.
         try (ExecutorService workers = Executors.newFixedThreadPool(
-                Math.min(POLICY_INSTALL_WORKERS, installations.size()),
+                Math.min(POLICY_INSTALL_WORKERS, namespaces.size()),
                 Thread.ofVirtual().name("security-group-policy-", 0).factory())) {
-            CompletableFuture<?>[] pending = installations.stream()
-                    .map(policy -> CompletableFuture.runAsync(
-                            () -> apply(policy.helperId(), policy.rules()), workers))
+            CompletableFuture<?>[] pending = namespaces.values().stream()
+                    .map(policies -> CompletableFuture.runAsync(
+                            () -> policies.forEach(policy -> apply(policy.helperId(), policy.rules())), workers))
                     .toArray(CompletableFuture<?>[]::new);
             CompletableFuture.allOf(pending).join();
         } catch (CompletionException failure) {
