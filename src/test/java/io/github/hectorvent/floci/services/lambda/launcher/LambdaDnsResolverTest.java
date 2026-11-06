@@ -32,6 +32,7 @@ class LambdaDnsResolverTest {
     private final DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
     private final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
     private ContainerBuilder containers;
+    private LambdaDnsResolver resolver;
 
     @BeforeEach
     void setup() {
@@ -42,6 +43,7 @@ class LambdaDnsResolverTest {
         when(network.getInternal()).thenReturn(true);
         when(docker.inspectNetworkCmd().withNetworkId("isolated").exec()).thenReturn(network);
         containers = new ContainerBuilder(config, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class));
+        resolver = new LambdaDnsResolver(containers, lifecycle, config);
         clearInvocations(docker);
     }
 
@@ -59,10 +61,9 @@ class LambdaDnsResolverTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"/etc/resolv.conf", "/etc", "/"})
+    @ValueSource(strings = {"/etc/resolv.conf", "/etc", "/", "/etc/./resolv.conf", "/etc/", "/etc/sub/../resolv.conf", "//etc//resolv.conf"})
     void explicitResolverMountIsPreserved(String path) {
-        assertNull(LambdaDnsResolver.prepare(workload().withReadOnlyBind("/caller/file", path),
-                containers, lifecycle, config, null));
+        assertNull(resolver.prepare(workload().withReadOnlyBind("/caller/file", path), null));
         verify(lifecycle, never()).ensureVolume(anyString(), anyMap());
     }
 
@@ -77,13 +78,12 @@ class LambdaDnsResolverTest {
     }
 
     @Test
-    void resolverUsesOnlyDeclaredAddressesAndRejectsInjectedDirectives() {
+    void resolverKeepsDockerAliasesAndDeclaredAddressesAndRejectsInjectedDirectives() {
         ContainerSpec spec = workload().withDnsServer("2001:db8::53").build();
-        assertEquals("nameserver 192.0.2.53\nnameserver 2001:db8::53\noptions ndots:0\n",
+        assertEquals("nameserver 127.0.0.11\nnameserver 192.0.2.53\nnameserver 2001:db8::53\noptions ndots:0\n",
                 new String(LambdaDnsResolver.resolverContent(spec), StandardCharsets.UTF_8));
-        assertThrows(IllegalArgumentException.class, () -> LambdaDnsResolver.prepare(
-                workload().withDnsServer("192.0.2.54\nnameserver 8.8.8.8"),
-                containers, lifecycle, config, null));
+        assertThrows(IllegalArgumentException.class, () -> resolver.prepare(
+                workload().withDnsServer("192.0.2.54\nnameserver 8.8.8.8"), null));
         verify(lifecycle, never()).ensureVolume(anyString(), anyMap());
     }
 
@@ -93,7 +93,7 @@ class LambdaDnsResolverTest {
         when(docker.inspectVolumeCmd(anyString()).exec().getMountpoint()).thenReturn("/daemon/volumes/resolver");
         ContainerBuilder.Builder workload = workload();
 
-        String volume = LambdaDnsResolver.prepare(workload, containers, lifecycle, config, "linux/arm64");
+        String volume = resolver.prepare(workload, "linux/arm64");
 
         ContainerSpec prepared = workload.build();
         assertNotNull(volume);
@@ -114,6 +114,7 @@ class LambdaDnsResolverTest {
         order.verify(lifecycle).create(helper.capture(), eq("linux/arm64"));
         order.verify(lifecycle).removeIfExistsStrict("resolver-helper", true);
         assertEquals("none", helper.getValue().networkMode());
+        assertEquals(List.of("/floci-resolver-not-executed"), helper.getValue().entrypoint());
         verify(lifecycle, never()).startCreated(anyString(), any());
         verify(lifecycle, never()).removeVolumeStrict(anyString());
     }
@@ -127,7 +128,7 @@ class LambdaDnsResolverTest {
         ContainerBuilder.Builder workload = workload();
 
         RuntimeException failure = assertThrows(RuntimeException.class,
-                () -> LambdaDnsResolver.prepare(workload, containers, lifecycle, config, null));
+                () -> resolver.prepare(workload, null));
 
         assertEquals("copy rejected", failure.getCause().getMessage());
         InOrder order = inOrder(lifecycle);
@@ -138,14 +139,32 @@ class LambdaDnsResolverTest {
     }
 
     @Test
+    void cleanupRetriesFailedVolumeDeletionAndStopsAfterConfirmedRemoval() {
+        doThrow(new IllegalStateException("daemon unavailable")).doNothing()
+                .when(lifecycle).removeVolumeStrict("failed-launch-resolver");
+        assertThrows(IllegalStateException.class,
+                () -> resolver.remove("failed-launch-resolver", "failed-runtime"));
+        resolver.retryCleanup();
+        resolver.retryCleanup();
+        verify(lifecycle, times(2)).removeIfExistsStrict("failed-runtime", true);
+        verify(lifecycle, times(2)).removeVolumeStrict("failed-launch-resolver");
+    }
+
+    @Test
     void failedHelperRemovalIsRetriedAndRemainsAVisibleFailure() {
         when(lifecycle.create(any())).thenReturn("resolver-helper");
         when(docker.inspectVolumeCmd(anyString()).exec().getMountpoint()).thenReturn("/daemon/volume");
         doThrow(new IllegalStateException("remove rejected"))
                 .when(lifecycle).removeIfExistsStrict("resolver-helper", true);
         assertThrows(IllegalStateException.class,
-                () -> LambdaDnsResolver.prepare(workload(), containers, lifecycle, config, null));
+                () -> resolver.prepare(workload(), null));
         verify(lifecycle, times(2)).removeIfExistsStrict("resolver-helper", true);
+        verify(lifecycle, never()).removeVolumeStrict(anyString());
+        doNothing().when(lifecycle).removeIfExistsStrict("resolver-helper", true);
+        resolver.retryCleanup();
+        verify(lifecycle, times(3)).removeIfExistsStrict("resolver-helper", true);
+        verify(lifecycle).removeVolumeStrict(anyString());
+        resolver.retryCleanup();
         verify(lifecycle).removeVolumeStrict(anyString());
     }
 }

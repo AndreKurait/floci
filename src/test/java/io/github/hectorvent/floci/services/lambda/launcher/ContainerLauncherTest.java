@@ -1352,6 +1352,13 @@ class ContainerLauncherTest {
         order.verify(runtimeApiServer).close();
         order.verify(runtimeApiServerFactory).release(runtimeApiServer);
         order.verify(lifecycleManager).removeVolumeStrict("owned-resolver");
+        doNothing().when(lifecycleManager).removeVolumeStrict("owned-resolver");
+        launcher.stop(handle);
+        launcher.stop(handle);
+        verify(runtimeApiServerFactory, times(1)).release(runtimeApiServer);
+        verify(runtimeApiServer, times(1)).close();
+        verify(lifecycleManager, times(2)).removeVolumeStrict("owned-resolver");
+        assertNull(handle.getDnsResolverVolume());
     }
 
     @Test

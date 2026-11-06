@@ -21,6 +21,7 @@ public class ContainerHandle {
     private volatile long lastUsedMs;
     private Closeable logStream;
     private String dnsResolverVolume;
+    private boolean runtimeApiReleased;
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -62,6 +63,8 @@ public class ContainerHandle {
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
     String getDnsResolverVolume() { return dnsResolverVolume; }
     void setDnsResolverVolume(String volume) { this.dnsResolverVolume = volume; }
+    boolean isRuntimeApiReleased() { return runtimeApiReleased; }
+    void markRuntimeApiReleased() { runtimeApiReleased = true; }
 
     /**
      * True once an extension in this container reported an init or exit error. Real AWS treats
