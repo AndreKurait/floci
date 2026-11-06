@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.ec2.model.Address;
@@ -14,6 +15,7 @@ import io.github.hectorvent.floci.services.ec2.model.DhcpOptions;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
@@ -46,15 +48,35 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519_FINGERPRINT;
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519_KEY;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -71,6 +93,307 @@ import static org.mockito.Mockito.when;
 class Ec2ServicePersistenceTest {
 
     private static final String REGION = "us-east-1";
+
+    @Test
+    void completedContainerLaunchSurvivesRestartWithoutAnUnrelatedWrite(@TempDir Path dir) throws Exception {
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        AtomicReference<Runnable> completion = new AtomicReference<>();
+        doAnswer(invocation -> {
+            completion.set(invocation.getArgument(8));
+            return null;
+        }).when(containers).launch(any(), any(ResolvedAmiImage.class), isNull(), eq(REGION),
+                anySet(), anyList(), anyMap(), any(), any());
+        Ec2Service original = newService(dir, containers);
+        Instance launched = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        assertNull(persistedInstance(dir, launched).getDockerContainerId());
+
+        // Docker finishes on a worker after RunInstances has written its pending record.
+        launched.setDockerContainerId("native-container");
+        launched.setContainerBridgeIp("10.73.1.10");
+        launched.setState(InstanceState.running());
+        runOnWorker(completion.get());
+
+        Instance restored = persistedInstance(dir, launched);
+        assertEquals("running", restored.getState().getName());
+        assertEquals("native-container", restored.getDockerContainerId());
+        assertEquals("10.73.1.10", restored.getContainerBridgeIp());
+    }
+
+    @Test
+    void completedContainerStartPersistsItsNewAddressAndRunningState(@TempDir Path dir) throws Exception {
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        AtomicReference<Runnable> completion = new AtomicReference<>();
+        doAnswer(invocation -> {
+            completion.set(invocation.getArgument(2));
+            return null;
+        }).when(containers).start(any(), any(), any());
+        Ec2Service original = newService(dir, containers);
+        Instance instance = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setDockerContainerId("retained-container");
+        instance.setContainerBridgeIp("10.73.1.10");
+        instance.setState(InstanceState.stopped());
+        original.startInstances(REGION, List.of(instance.getInstanceId()));
+        assertEquals("pending", persistedInstance(dir, instance).getState().getName());
+
+        instance.setContainerBridgeIp("10.73.1.11");
+        instance.setState(InstanceState.running());
+        runOnWorker(completion.get());
+
+        Instance restored = persistedInstance(dir, instance);
+        assertEquals("running", restored.getState().getName());
+        assertEquals("retained-container", restored.getDockerContainerId());
+        assertEquals("10.73.1.11", restored.getContainerBridgeIp());
+    }
+
+    @Test
+    void completedContainerPersistsWhenVolumeRestorationThrows(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        RuntimeException failure = new IllegalStateException("Volume mount unavailable");
+        doThrow(failure).when(launch.service()).restoreAttachedVolumesForInstance(REGION, launch.instance());
+        launch.instance().setDockerContainerId("started-container");
+        launch.instance().setState(InstanceState.running());
+
+        ExecutionException thrown = assertThrows(ExecutionException.class, () -> runOnWorker(launch.completion()));
+
+        assertSame(failure, thrown.getCause());
+        Instance restored = persistedInstance(dir, launch.instance());
+        assertEquals("running", restored.getState().getName());
+        assertEquals("started-container", restored.getDockerContainerId());
+    }
+
+    @Test
+    void lateContainerCompletionDoesNotRestoreAPrunedInstance(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.terminated());
+        launch.instance().setTerminatedAt(System.currentTimeMillis() - TimeUnit.HOURS.toMillis(2));
+        launch.service().pruneTerminatedInstances();
+
+        runOnWorker(launch.completion());
+
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+        verify(launch.service(), never()).restoreAttachedVolumesForInstance(any(), any());
+    }
+
+    @Test
+    void lateContainerCompletionDoesNotRestoreAnInstanceRemovedDuringReset(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.running());
+        launch.service().beforeReset();
+        try {
+            launch.service().deleteInstanceForTest(REGION, launch.instance().getInstanceId());
+            launch.service().clear();
+        } finally {
+            launch.service().afterReset();
+        }
+
+        runOnWorker(launch.completion());
+
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+        verify(launch.service(), never()).restoreAttachedVolumesForInstance(any(), any());
+    }
+
+    @Test
+    void containerCompletionPausesDuringResetAndResumesAfterwards(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.running());
+        launch.service().beforeReset();
+        try {
+            runOnWorker(launch.completion());
+            assertEquals("pending", persistedInstance(dir, launch.instance()).getState().getName());
+            verify(launch.service(), never()).restoreAttachedVolumesForInstance(any(), any());
+        } finally {
+            // A reset can fail before wiping storage; afterReset must resume publications.
+            launch.service().afterReset();
+        }
+        runOnWorker(launch.completion());
+        assertEquals("running", persistedInstance(dir, launch.instance()).getState().getName());
+        verify(launch.service()).restoreAttachedVolumesForInstance(REGION, launch.instance());
+    }
+
+    @Test
+    void resetDrainsAnActiveContainerCompletionBeforeStorageCanBeCleared(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.running());
+        CountDownLatch restoring = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch resetting = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            restoring.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(launch.service()).restoreAttachedVolumesForInstance(REGION, launch.instance());
+        FutureTask<Void> completion = new FutureTask<>(launch.completion(), null);
+        FutureTask<Void> reset = new FutureTask<>(() -> {
+            resetting.countDown();
+            launch.service().beforeReset();
+        }, null);
+        new Thread(completion).start();
+        try {
+            assertTrue(restoring.await(10, TimeUnit.SECONDS));
+            new Thread(reset).start();
+            assertTrue(resetting.await(10, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> reset.get(100, TimeUnit.MILLISECONDS));
+        } finally {
+            release.countDown();
+            completion.get(10, TimeUnit.SECONDS);
+            reset.get(10, TimeUnit.SECONDS);
+            launch.service().afterReset();
+        }
+        assertEquals("running", persistedInstance(dir, launch.instance()).getState().getName());
+    }
+
+    @Test
+    void pruningWaitsForAnActiveCompletionAndLeavesNoPersistedInstance(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.running());
+        CountDownLatch restoring = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch pruning = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            restoring.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(launch.service()).restoreAttachedVolumesForInstance(REGION, launch.instance());
+        FutureTask<Void> completion = new FutureTask<>(launch.completion(), null);
+        FutureTask<Void> prune = new FutureTask<>(() -> {
+            pruning.countDown();
+            launch.service().pruneTerminatedInstances();
+        }, null);
+        new Thread(completion).start();
+        try {
+            assertTrue(restoring.await(10, TimeUnit.SECONDS));
+            launch.instance().setState(InstanceState.terminated());
+            launch.instance().setTerminatedAt(System.currentTimeMillis() - TimeUnit.HOURS.toMillis(2));
+            new Thread(prune).start();
+            assertTrue(pruning.await(10, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> prune.get(100, TimeUnit.MILLISECONDS));
+        } finally {
+            release.countDown();
+            completion.get(10, TimeUnit.SECONDS);
+            prune.get(10, TimeUnit.SECONDS);
+        }
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+    }
+
+    @Test
+    void completionDoesNotReattachVolumesAfterTheInstanceHasStopped(@TempDir Path dir) throws Exception {
+        PendingContainerLaunch launch = pendingContainerLaunch(dir);
+        launch.instance().setState(InstanceState.stopped());
+
+        runOnWorker(launch.completion());
+
+        verify(launch.service(), never()).restoreAttachedVolumesForInstance(any(), any());
+        assertEquals("stopped", persistedInstance(dir, launch.instance()).getState().getName());
+    }
+
+    private PendingContainerLaunch pendingContainerLaunch(Path dir) {
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        AtomicReference<Runnable> completion = new AtomicReference<>();
+        doAnswer(invocation -> {
+            completion.set(invocation.getArgument(8));
+            return null;
+        }).when(containers).launch(any(), any(ResolvedAmiImage.class), isNull(), eq(REGION),
+                anySet(), anyList(), anyMap(), any(), any());
+        Ec2Service service = spy(newService(dir, containers));
+        Instance instance = service.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        return new PendingContainerLaunch(service, instance, completion.get());
+    }
+
+    private record PendingContainerLaunch(Ec2Service service, Instance instance, Runnable completion) {}
+
+    @Test
+    void portForwardCallbackCannotReinsertAnInstanceRemovedAfterOwnerLookup(@TempDir Path dir) {
+        StorageBackend<String, Instance> delegate = load(dir, "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        AccountAwareStorageBackend<Instance> instances = spy(
+                new AccountAwareStorageBackend<>(delegate, null, "000000000000"));
+        AtomicReference<Consumer<Instance>> persister = new AtomicReference<>();
+        Ec2PortForwardManager ports = mock(Ec2PortForwardManager.class);
+        doAnswer(invocation -> {
+            persister.set(invocation.getArgument(0));
+            return null;
+        }).when(ports).setPersister(any());
+        Ec2Service original = newService(dir, null, instances, ports);
+        Instance instance = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        original.restoreMetadataRegistrations();
+        String storageKey = REGION + "::" + instance.getInstanceId();
+        doAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            Optional<AccountAwareStorageBackend.OwnedEntry<Instance>> owner =
+                    (Optional<AccountAwareStorageBackend.OwnedEntry<Instance>>) invocation.callRealMethod();
+            instances.clear();
+            return owner;
+        }).when(instances).findAnyAccountEntry(storageKey);
+
+        persister.get().accept(instance);
+
+        assertTrue(delegate.isEmpty());
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+    }
+
+    @Test
+    void portForwardCallbackCannotReinsertADeletedUnwrappedInstance(@TempDir Path dir) {
+        StorageBackend<String, Instance> instances = load(dir, "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        AtomicReference<Consumer<Instance>> persister = new AtomicReference<>();
+        Ec2PortForwardManager ports = mock(Ec2PortForwardManager.class);
+        doAnswer(invocation -> {
+            persister.set(invocation.getArgument(0));
+            return null;
+        }).when(ports).setPersister(any());
+        Ec2Service original = newService(dir, null, instances, ports);
+        Instance instance = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        original.restoreMetadataRegistrations();
+        instances.delete(REGION + "::" + instance.getInstanceId());
+
+        persister.get().accept(instance);
+
+        assertTrue(instances.isEmpty());
+        assertTrue(load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}).isEmpty());
+    }
+
+    @Test
+    void portForwardCallbackPersistsTheCurrentOwnedInstance(@TempDir Path dir) throws Exception {
+        StorageBackend<String, Instance> delegate = load(dir, "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        AccountAwareStorageBackend<Instance> instances =
+                new AccountAwareStorageBackend<>(delegate, null, "000000000000");
+        AtomicReference<Consumer<Instance>> persister = new AtomicReference<>();
+        Ec2PortForwardManager ports = mock(Ec2PortForwardManager.class);
+        doAnswer(invocation -> {
+            persister.set(invocation.getArgument(0));
+            return null;
+        }).when(ports).setPersister(any());
+        Ec2Service original = newService(dir, null, instances, ports);
+        Instance instance = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        original.restoreMetadataRegistrations();
+        instance.setContainerBridgeIp("10.73.1.14");
+
+        runOnWorker(() -> persister.get().accept(instance));
+
+        Instance restored = load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})
+                .get("000000000000/" + REGION + "::" + instance.getInstanceId()).orElseThrow();
+        assertEquals("10.73.1.14", restored.getContainerBridgeIp());
+    }
+
+    private Instance persistedInstance(Path dir, Instance instance) {
+        return load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})
+                .get(REGION + "::" + instance.getInstanceId()).orElseThrow();
+    }
+
+    private static void runOnWorker(Runnable completion) throws Exception {
+        FutureTask<Void> worker = new FutureTask<>(completion, null);
+        Thread thread = new Thread(worker);
+        thread.start();
+        worker.get(10, TimeUnit.SECONDS);
+        thread.join();
+    }
 
     @Test
     void deletedLatestLaunchTemplateVersionIsNotReusedAfterRestart(@TempDir Path dir) {
@@ -953,16 +1276,30 @@ class Ec2ServicePersistenceTest {
     }
 
     private Ec2Service newService(Path dir) {
+        return newService(dir, null);
+    }
+
+    private Ec2Service newService(Path dir, Ec2ContainerManager containers) {
+        return newService(dir, containers,
+                load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}));
+    }
+
+    private Ec2Service newService(Path dir, Ec2ContainerManager containers, StorageBackend<String, Instance> instances) {
+        return newService(dir, containers, instances, mock(Ec2PortForwardManager.class));
+    }
+
+    private Ec2Service newService(Path dir, Ec2ContainerManager containers, StorageBackend<String, Instance> instances,
+                                 Ec2PortForwardManager ports) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
-        when(ec2.mock()).thenReturn(true);
+        when(ec2.mock()).thenReturn(containers == null);
         when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
         Ec2ImageCatalog imageCatalog = new Ec2ImageCatalog();
-        return new Ec2Service(config, null, mock(Ec2PortForwardManager.class),
+        return new Ec2Service(config, containers, ports,
                 new AmiImageResolver(imageCatalog), imageCatalog,
                 new Ec2InstanceTypeCatalog(),
                 load(dir, "ec2-vpcs.json", new TypeReference<Map<String, Vpc>>() {}),
@@ -973,7 +1310,7 @@ class Ec2ServicePersistenceTest {
                 load(dir, "ec2-route-tables.json", new TypeReference<Map<String, RouteTable>>() {}),
                 load(dir, "ec2-key-pairs.json", new TypeReference<Map<String, KeyPair>>() {}),
                 load(dir, "ec2-addresses.json", new TypeReference<Map<String, Address>>() {}),
-                load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}),
+                instances,
                 load(dir, "ec2-volumes.json", new TypeReference<Map<String, Volume>>() {}),
                 load(dir, "ec2-registered-images.json", new TypeReference<Map<String, Image>>() {}),
                 load(dir, "ec2-snapshots.json", new TypeReference<Map<String, Snapshot>>() {}),

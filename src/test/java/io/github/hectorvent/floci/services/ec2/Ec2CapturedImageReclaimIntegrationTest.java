@@ -289,6 +289,11 @@ class Ec2CapturedImageReclaimIntegrationTest {
         verify(containerManager).launch(eq(instance), any(), any(), eq(REGION), any(), any(), any(), any(),
                 postLaunch.capture());
 
+        assertEquals("pending", instance.getState().getName());
+        RequestScopes.runAs(foreign, postLaunch.getValue());
+        verify(volumeDevices, never()).attachVolume(any(), any(), any());
+
+        instance.setState(InstanceState.running());
         RequestScopes.runAs(foreign, postLaunch.getValue());
 
         verify(volumeDevices).attachVolume(ownData, instance, "/dev/xvdf");

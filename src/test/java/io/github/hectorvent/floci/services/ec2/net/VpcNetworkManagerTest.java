@@ -49,6 +49,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -1116,6 +1117,66 @@ class VpcNetworkManagerTest {
     }
 
     // ─── Startup reconciliation ──────────────────────────────────────────────
+
+    @Test
+    void resetRetiresOnlyOwnedNetworksAndClearsPlansWithStartupReconciliationDisabled() {
+        manager.declareVpc(REGION, "vpc-reset", "10.7.0.0/16");
+        manager.declareSubnet(REGION, "vpc-reset", "subnet-reset", "10.7.1.0/24");
+        existingNetwork("vpc-reset", "10.7.0.0/16", newLabels("vpc-reset", "4650"),
+                Map.of("emulator", new Network.ContainerNetworkConfig()));
+        existingNetwork("vpc-legacy", "10.8.0.0/16", ourLabels("vpc-legacy", "4650"));
+        Map<String, String> nativeLabels = new LinkedHashMap<>(newLabels("vpc-native-account", "4650"));
+        nativeLabels.put(VpcNetworkManager.ADDRESS_SPACE_LABEL, "native-ipv4");
+        nativeLabels.put("io.floci.account", "111122223333");
+        existingNetwork("vpc-native-account", "10.11.0.0/16", nativeLabels);
+        existingNetwork("vpc-other-owner", "10.9.0.0/16", newLabels("vpc-other-owner", "4620"));
+        existingNetwork("user-network", "10.10.0.0/16", Map.of());
+        when(config.services().ec2().vpcNetworks().reconcileOnStartup()).thenReturn(false);
+
+        manager.resetNetworks();
+
+        assertEquals(List.of("vpc-reset", "vpc-legacy", "vpc-native-account"), removedNetworks);
+        verify(docker).disconnectFromNetworkCmd();
+        assertTrue(manager.effectiveVpcCidr(REGION, "vpc-reset").isEmpty());
+        assertTrue(manager.effectiveSubnetCidr(REGION, "subnet-reset").isEmpty());
+    }
+
+    @Test
+    void resetRetainsPlansAfterRemovalFailureAndAllowsRetryWhenTheNetworkIsGone() {
+        manager.declareVpc(REGION, "vpc-reset", "10.7.0.0/16");
+        existingNetwork("vpc-reset", "10.7.0.0/16", newLabels("vpc-reset", "4650"));
+        RemoveNetworkCmd remove = mock(RemoveNetworkCmd.class, RETURNS_SELF);
+        doThrow(new IllegalStateException("daemon refused"))
+                .doThrow(new NotFoundException("already gone")).when(remove).exec();
+        when(docker.removeNetworkCmd("vpc-reset")).thenReturn(remove);
+
+        assertThrows(IllegalStateException.class, manager::resetNetworks);
+        assertEquals("10.7.0.0/16", manager.effectiveVpcCidr(REGION, "vpc-reset").orElseThrow());
+
+        manager.resetNetworks();
+
+        verify(remove, times(2)).exec();
+        assertTrue(manager.effectiveVpcCidr(REGION, "vpc-reset").isEmpty());
+    }
+
+    @Test
+    void resetRetainsPlansWhenOwnedNetworksCannotBeListed() {
+        manager.declareVpc(REGION, "vpc-reset", "10.7.0.0/16");
+        when(docker.listNetworksCmd().exec()).thenThrow(new IllegalStateException("daemon unavailable"));
+
+        assertThrows(IllegalStateException.class, manager::resetNetworks);
+
+        assertEquals("10.7.0.0/16", manager.effectiveVpcCidr(REGION, "vpc-reset").orElseThrow());
+    }
+
+    @Test
+    void resetDoesNotContactDockerWhenVpcNetworksAreDisabled() {
+        when(config.services().ec2().vpcNetworks().enabled()).thenReturn(false);
+
+        manager.resetNetworks();
+
+        verifyNoInteractions(docker);
+    }
 
     @Test
     void reconcileRemovesOnlyThisEmulatorsOwnOrphans() {
