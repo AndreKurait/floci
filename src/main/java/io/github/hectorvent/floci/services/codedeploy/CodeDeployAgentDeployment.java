@@ -291,10 +291,10 @@ public class CodeDeployAgentDeployment {
                     "IAM_ROLE_PERMISSIONS".equals(code) ? cause.getMessage() : null);
         } finally {
             terminating.set(true);
-            commands.close(session);
             for (CompletableFuture<Boolean> worker : workers) {
                 worker.handle((result, failure) -> null).join();
             }
+            commands.close(session);
             targets.stream().filter(target -> Set.of("Pending", "InProgress").contains(target.get("status")))
                     .forEach(target -> update(target, "Skipped"));
         }
@@ -325,10 +325,13 @@ public class CodeDeployAgentDeployment {
                     continue;
                 }
                 CodeDeployAgentCommands.Ticket ticket = commands.enqueue(session, host, phase);
-                await(ticket.accepted(), startTimeout, cancelled);
+                await(ticket.accepted(), startTimeout,
+                        () -> cancelled.getAsBoolean() && commands.cancelPending(session, host));
                 event.put("startTime", now());
                 event.put("status", "InProgress");
-                CodeDeployAgentCommands.Result result = await(ticket.result(), phaseTimeout, cancelled);
+                // Stop prevents subsequent events; an acknowledged event retains its completion deadline.
+                CodeDeployAgentCommands.Result result = ticket.result().toCompletableFuture()
+                        .get(phaseTimeout.toNanos(), TimeUnit.NANOSECONDS);
                 if (result.diagnostics() != null) {
                     event.put("diagnostics", diagnostics(result.diagnostics()));
                 }

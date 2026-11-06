@@ -106,6 +106,36 @@ class CodeDeployAgentCommandsTest {
     }
 
     @Test
+    void cancellingQueuedWorkPreventsALateAcknowledgementFromStartingIt() {
+        CodeDeployAgentCommands.Session session = open("d-pending-stop", HOST);
+        CodeDeployAgentCommands.Ticket ticket = mailbox.enqueue(session, HOST, "Install");
+        String command = identifier(mailbox.poll(ACCOUNT, REGION, HOST));
+
+        assertTrue(mailbox.cancelPending(session, HOST));
+        assertEquals(Map.of("CommandStatus", "Failed"), mailbox.acknowledge(ACCOUNT, REGION, command));
+        assertTrue(ticket.accepted().toCompletableFuture().isCompletedExceptionally());
+        assertCancelled(ticket.result());
+        assertEquals(Map.of(), mailbox.poll(ACCOUNT, REGION, HOST));
+        assertThrows(AwsException.class, () -> mailbox.complete(ACCOUNT, REGION, command, "Succeeded", ""));
+    }
+
+    @Test
+    void acknowledgementBeforeCancellationPreservesTheActiveCommandAndItsCompletion() {
+        CodeDeployAgentCommands.Session session = open("d-active-stop", HOST);
+        CodeDeployAgentCommands.Ticket ticket = mailbox.enqueue(session, HOST, "Install");
+        String command = identifier(mailbox.poll(ACCOUNT, REGION, HOST));
+        mailbox.acknowledge(ACCOUNT, REGION, command);
+
+        assertFalse(mailbox.cancelPending(session, HOST));
+        assertEquals(Map.of("CommandStatus", "InProgress"), mailbox.update(ACCOUNT, REGION, command));
+        assertFalse(ticket.result().toCompletableFuture().isDone());
+        mailbox.complete(ACCOUNT, REGION, command, "Succeeded", "completed after stop");
+        assertEquals(new CodeDeployAgentCommands.Result("Succeeded", "completed after stop"),
+                ticket.result().toCompletableFuture().join());
+        assertFalse(mailbox.cancelPending(session, HOST));
+    }
+
+    @Test
     void cancellationReleasesTheHostAndRejectsLateCompletionFromThePreviousDeployment() {
         CodeDeployAgentCommands.Session first = open("d-stopped", HOST);
         CompletionStage<CodeDeployAgentCommands.Result> pending = mailbox.enqueue(first, HOST, "Install").result();
