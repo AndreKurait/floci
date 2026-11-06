@@ -121,7 +121,7 @@ class Route53DnsResolutionTest {
         String zone = uniqueZone();
         String id = createPublicZone(zone);
         addAlias(id, zone, "A", "owned.elb.example.");
-        Mockito.when(dnsServer.resolveAliasTarget("owned.elb.example.", id, 1, null))
+        Mockito.when(dnsServer.resolvePublicAliasTarget(zone + ".", "owned.elb.example.", id, 1, null))
                 .thenReturn(Optional.of(DnsAnswer.records(List.of("198.51.100.4", "198.51.100.5"), 60)));
 
         DnsAnswer answer = dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow();
@@ -140,7 +140,7 @@ class Route53DnsResolutionTest {
         String zone = uniqueZone();
         String id = createPublicZone(zone);
         addAlias(id, zone, "A", "unowned.localhost.floci.io.");
-        Mockito.when(dnsServer.resolveAliasTarget("unowned.localhost.floci.io.", id, 1, null))
+        Mockito.when(dnsServer.resolvePublicAliasTarget(zone + ".", "unowned.localhost.floci.io.", id, 1, null))
                 .thenReturn(Optional.empty());
 
         assertEquals(5, dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow().responseCode());
@@ -152,7 +152,7 @@ class Route53DnsResolutionTest {
         String zone = uniqueZone();
         String id = createPublicZone(zone);
         addAlias(id, zone, "A", "owned.elb.example.");
-        Mockito.when(dnsServer.resolveAliasTarget("owned.elb.example.", id, 1, null))
+        Mockito.when(dnsServer.resolvePublicAliasTarget(zone + ".", "owned.elb.example.", id, 1, null))
                 .thenReturn(Optional.of(DnsAnswer.noData()));
 
         DnsAnswer answer = dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow();

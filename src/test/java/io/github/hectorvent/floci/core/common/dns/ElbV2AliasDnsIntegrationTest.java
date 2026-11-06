@@ -12,7 +12,7 @@ import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.datagram.DatagramSocketOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.apache5.Apache5HttpClient;
@@ -60,8 +60,8 @@ class ElbV2AliasDnsIntegrationTest {
     URI endpoint;
 
     @ParameterizedTest
-    @ValueSource(strings = {"internal", "internet-facing"})
-    void publicAliasFindsItsNativeAlbAcrossAccounts(String scheme) throws Exception {
+    @CsvSource({"internal,false", "internet-facing,false", "internal,true", "internet-facing,true"})
+    void publicAliasFindsItsNativeAlbAcrossAccounts(String scheme, boolean declaredPublicRoute) throws Exception {
         StaticCredentialsProvider owner =
                 StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000001", "test"));
         StaticCredentialsProvider zoneOwner =
@@ -97,7 +97,11 @@ class ElbV2AliasDnsIntegrationTest {
                 zone = route53.createHostedZone(r -> r.name(name).callerReference(UUID.randomUUID().toString()))
                         .hostedZone().id();
                 List<DnsRecordSource> sources = new ArrayList<>();
-                EmbeddedDnsServer dns = spy(new EmbeddedDnsServer(List.of(), sources));
+                DnsClientVpcSource clients = address -> Optional.of(
+                        new DnsClientVpcSource.ClientVpc("730000000001", "eu-west-1", vpc));
+                EmbeddedDnsServer dns = spy(new EmbeddedDnsServer(
+                        List.of(), sources, List.of(), List.of(clients), declaredPublicRoute,
+                        declaredPublicRoute ? List.of(name) : List.of()));
                 doReturn(Optional.of("127.0.0.1")).when(dns).getServerIp();
                 sources.add(new Route53DnsRecordSource(zones, config, new DnsLookupHelper(), dns));
                 sources.add(new ElbV2DnsRecordSource(loadBalancers, dns));
@@ -111,14 +115,23 @@ class ElbV2AliasDnsIntegrationTest {
                 byte[] response = query(listener, name, 1);
                 assertEquals(0, rcode(response));
                 assertEquals(1, ByteBuffer.wrap(response).getShort(6));
-                assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(response));
+                String expectedAddress = declaredPublicRoute
+                        ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : "127.0.0.1";
+                assertArrayEquals(InetAddress.getByName(expectedAddress).getAddress(), address(response));
                 assertTrue((ByteBuffer.wrap(response).getShort(2) & 0x0400) != 0);
                 assertEquals(0, rcode(query(listener, name, 28)));
                 assertEquals(0, ByteBuffer.wrap(query(listener, name, 28)).getShort(6));
 
+                installed = ResourceRecordSet.builder().name(name).type("A").ttl(60L)
+                        .resourceRecords(record -> record.value("127.0.0.1")).build();
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(listener, name, 1)),
+                        "A literal public record keeps its published value even for a declared endpoint name");
                 installed = alias(name, "dualstack." + target.dnsName().toUpperCase(), target.canonicalHostedZoneId());
                 change(route53, zone, ChangeAction.UPSERT, installed);
-                assertEquals(0, rcode(query(listener, name.toUpperCase() + ".", 1)));
+                byte[] uppercase = query(listener, name.toUpperCase() + ".", 1);
+                assertEquals(0, rcode(uppercase));
+                assertArrayEquals(InetAddress.getByName(expectedAddress).getAddress(), address(uppercase));
                 installed = alias(name, target.dnsName(), "WRONG");
                 change(route53, zone, ChangeAction.UPSERT, installed);
                 assertEquals(5, rcode(query(listener, name, 1)));

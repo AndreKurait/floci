@@ -64,6 +64,14 @@ Native DNS records and forwarding rules retain precedence; non-VPC lookups
 retain their existing resolution. This configuration supplies a transport
 destination, not an implementation of any peer protocol or authorization.
 
+For an explicitly declared public hostname, a public Route 53 alias to an owned
+listener also uses the configured public transport for known VPC clients. The
+alias target and canonical zone must validate before its emulator listener
+address is translated. This preserves the caller's NAT and security-group
+checks. Undeclared aliases, literal address records, private-zone answers and
+failed alias lookups retain their existing behavior. This configured front-door
+handoff does not implement general native Application Load Balancer frontends.
+
 Qualification must prove a real peer response over verified TLS and a signed
 AWS request through the selected front door, then repeat route withdrawal and
 security-group denial with successful recovery. Source compilation or DNS

@@ -138,8 +138,8 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                             || record.getRecords() != null && !record.getRecords().isEmpty()) {
                         return Optional.of(DnsAnswer.refused());
                     }
-                    DnsAnswer target = dnsServer.resolveAliasTarget(
-                            alias.getDnsName(), alias.getHostedZoneId(), type, origin)
+                    DnsAnswer target = dnsServer.resolvePublicAliasTarget(
+                            normalized, alias.getDnsName(), alias.getHostedZoneId(), type, origin)
                             .orElseGet(DnsAnswer::refused);
                     if (target.responseCode() != 0) {
                         return Optional.of(DnsAnswer.refused());
