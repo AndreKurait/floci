@@ -88,7 +88,7 @@ class CodeBuildRunnerSourceFailureTest {
                 .when(lifecycle).stopAndRemove(eq("container"), nullable(Closeable.class));
 
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
-        when(logStreamer.attach(eq("container"), anyString(), anyString(), anyString(), anyString()))
+        when(logStreamer.attachForAccount(eq("000000000000"), eq("container"), anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(mock(Closeable.class));
 
         S3Service s3 = mock(S3Service.class);
