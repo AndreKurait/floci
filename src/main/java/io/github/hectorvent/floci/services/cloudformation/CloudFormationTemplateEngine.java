@@ -61,6 +61,10 @@ public class CloudFormationTemplateEngine {
     @FunctionalInterface
     public interface AttributeValueResolver {
         JsonNode resolve(String logicalId, String attributeName, String value);
+
+        default String referenceValue(String logicalId, String physicalId) {
+            return physicalId;
+        }
     }
 
     private final String accountId;
@@ -489,7 +493,9 @@ public class CloudFormationTemplateEngine {
             case "AWS::NoValue" -> "";
             default -> {
                 if (physicalIds.containsKey(name)) {
-                    yield physicalIds.get(name);
+                    String physicalId = physicalIds.get(name);
+                    yield attributeValueResolver == null ? physicalId
+                            : attributeValueResolver.referenceValue(name, physicalId);
                 }
                 if (parameters.containsKey(name)) {
                     yield parameters.get(name);

@@ -43,6 +43,7 @@ public class AppConfigService {
     private final StorageBackend<String, ConfigurationProfile> profileStore;
     private final StorageBackend<String, DeploymentStrategy> strategyStore;
     private final StorageBackend<String, HostedConfigurationVersion> versionStore;
+    private final StorageBackend<String, Integer> versionCounters;
     private final StorageBackend<String, Deployment> deploymentStore;
     private final StorageBackend<String, String> activeConfigStore; // envId::profileId -> versionNumber
     private final Clock clock;
@@ -72,6 +73,8 @@ public class AppConfigService {
                 "appconfig", "appconfig-strategies.json", new TypeReference<>() {});
         this.versionStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-versions.json", new TypeReference<>() {});
+        this.versionCounters = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-version-counters.json", new TypeReference<>() {});
         this.deploymentStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-deployments.json", new TypeReference<>() {});
         this.activeConfigStore = new AppConfigStorage<>(storageFactory, regions,
@@ -400,21 +403,27 @@ public class AppConfigService {
         // lifecycle - cascade the delete so a caller can't still fetch versions for a profile
         // that's supposedly gone.
         StorageOperations.deleteByPrefix(versionStore, appId + "::" + profileId + "::");
+        versionCounters.delete(appId + "::" + profileId);
         profileStore.delete(profileId);
     }
 
     // ──────────────────────────── Hosted Configuration Version ────────────────────────────
 
-    public HostedConfigurationVersion createHostedConfigurationVersion(String applicationIdentifier,
+    public synchronized HostedConfigurationVersion createHostedConfigurationVersion(String applicationIdentifier,
                                                                          String profileIdentifier,
                                                                          byte[] content,
                                                                          String contentType,
                                                                          String description) {
         String appId = resolveApplication(applicationIdentifier).getId();
         String profileId = resolveConfigurationProfile(appId, profileIdentifier).getId();
-        String prefix = appId + "::" + profileId + "::";
-        int nextVersion = versionStore.scan(k -> k.startsWith(prefix))
-                .stream().mapToInt(HostedConfigurationVersion::getVersionNumber).max().orElse(0) + 1;
+        String key = appId + "::" + profileId;
+        String prefix = key + "::";
+        int previous = versionCounters.get(key).orElseGet(() -> versionStore.scan(k -> k.startsWith(prefix))
+                .stream().mapToInt(HostedConfigurationVersion::getVersionNumber).max().orElse(0));
+        if (previous == Integer.MAX_VALUE) {
+            throw new AwsException("ServiceQuotaExceededException", "Hosted configuration version limit reached.", 400);
+        }
+        int nextVersion = previous + 1;
 
         HostedConfigurationVersion version = new HostedConfigurationVersion();
         version.setApplicationId(appId);
@@ -424,6 +433,7 @@ public class AppConfigService {
         version.setContentType(contentType);
         version.setDescription(description);
 
+        versionCounters.put(key, nextVersion);
         versionStore.put(prefix + nextVersion, version);
         return version;
     }
