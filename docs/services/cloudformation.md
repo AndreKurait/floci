@@ -3,6 +3,19 @@
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 **Endpoint:** `POST http://localhost:4566/`
 
+## EC2 instance network placement
+
+`AWS::EC2::Instance` uses the resolved `NetworkInterfaces` entry with `DeviceIndex`
+`0` for its subnet, `GroupSet` security groups and launch-time
+`AssociatePublicIpAddress` setting. Changing or removing the resolved primary
+interface replaces the instance, including changes supplied through parameters.
+The prior declaration is restored on rollback. As specified by the
+[CloudFormation instance contract](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ec2-instance.html#cfn-ec2-instance-subnetid),
+declare the subnet and security groups inside the interface when using
+`NetworkInterfaces`; combining interfaces with instance-level `SubnetId`,
+`SecurityGroupIds` or `SecurityGroups` is rejected. Existing ENI attachment and
+secondary-interface provisioning remain outside this implementation.
+
 ## Mapping values
 
 `Fn::FindInMap` preserves both string and list values from `Mappings`. Mapped lists
@@ -255,8 +268,18 @@ Resource type AWS::Fake::Thing is not supported by Floci. It was stubbed and not
 
 Set `floci.services.cloudformation.allow-stub-unsupported-resource-types` to `false`
 (`FLOCI_SERVICES_CLOUDFORMATION_ALLOW_STUB_UNSUPPORTED_RESOURCE_TYPES=false`) to fail such a
-resource instead: it reaches `CREATE_FAILED` and the stack rolls back. Use it in a pipeline that
+resource instead: it reaches `CREATE_FAILED` and the stack rolls back by default. Use it in a pipeline that
 must not pass over a resource it never got.
+
+## EC2 Key Pairs
+
+Stack deletion, replacement cleanup and rollback use the recorded `KeyPairId`. A key created
+outside the stack under a reused name remains untouched. Generated keys lose only their owned
+`/ec2/keypair/<KeyPairId>` parameter; imported keys do not own a private-key parameter.
+
+Pending cleanup preserves the key identity and parameter ownership across retries and reloads.
+Exhausting one cleanup entry does not discard another entry that still has attempts remaining.
+Cloud Control and legacy records without a key ID retain name-based deletion.
 
 ## SES Email Identities
 
@@ -985,6 +1008,17 @@ template and the parameter values it already ran gets its prior tags back, its d
 inherited tags included. A nested stack the update re-deployed with a different template or
 different parameter values, including in a descendant, is not restored: the stack ends `UPDATE_ROLLBACK_FAILED` rather than
 claiming a nested deployment rollback Floci does not implement yet.
+
+## Preserving failed creations
+
+`CreateStack` honors `DisableRollback=true`: a resource failure leaves the stack in
+`CREATE_FAILED` and preserves the resources already created. Inspect the stack events to find
+the failing resource; a later `DeleteStack` removes the retained deployment normally. An omitted
+or false option retains the default create rollback. `DescribeStacks` reports the saved
+`DisableRollback` value, including after a storage reload.
+
+`DisableRollback` and `OnFailure` cannot both be supplied to `CreateStack`, even when
+`DisableRollback` is false. The creation option does not disable a later update's normal rollback.
 
 ## Failed update rollbacks
 

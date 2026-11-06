@@ -460,6 +460,38 @@ jobs:
             $EXTRA_ARGS \
             compat-${{ matrix.test }}
 
+      - name: Run signed Python SDK IAM permissions
+        if: matrix.test == 'sdk-test-python'
+        run: |
+          docker logs floci > test-results/floci-default.log 2>&1
+          docker rm -f floci
+          docker run -d --name floci --network compat-net \
+            -e FLOCI_BASE_URL=http://floci:4566 \
+            -e FLOCI_HOSTNAME=floci \
+            -e FLOCI_AUTH_VALIDATE_SIGNATURES=true \
+            -e FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true \
+            -e FLOCI_SERVICES_CLOUDFORMATION_ALLOW_STUB_UNSUPPORTED_RESOURCE_TYPES=false \
+            floci:test-native
+          health=starting
+          for _ in $(seq 1 60); do
+            health=$(docker inspect -f '{{.State.Health.Status}}' floci)
+            if [ "$health" = healthy ] || [ "$health" = unhealthy ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$health" != healthy ]; then
+            echo "::error::IAM-enabled floci did not report healthy (last status: $health)"
+            docker inspect -f '{{json .State.Health}}' floci
+            docker logs --tail 50 floci
+            exit 1
+          fi
+          docker run --rm --network compat-net \
+            -e FLOCI_ENDPOINT=http://floci:4566 \
+            -v "$(pwd)/test-results:/results" \
+            --entrypoint pytest compat-sdk-test-python \
+            iam/ -v --junit-xml=/results/iam-junit.xml
+
       - name: Generate test summary
         if: always() && steps.tests.outcome != 'skipped'
         uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5 # v2

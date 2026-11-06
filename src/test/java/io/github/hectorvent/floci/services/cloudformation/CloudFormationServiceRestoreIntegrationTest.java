@@ -16,6 +16,8 @@ import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.AdditionalAnswers;
 import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
@@ -85,8 +87,9 @@ class CloudFormationServiceRestoreIntegrationTest {
         QuarkusMock.installMockForType(blockingProvisioner, CfnResourceDispatcher.class);
     }
 
-    @Test
-    void rejectedExecutionRestoresStackAndChangeSetState() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rejectedExecutionRestoresStackAndChangeSetState(boolean disableRollback) throws Exception {
         String targetStack = uniqueStackName("target");
         createChangeSet(targetStack);
         String policy = "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"Update:*\",\"Principal\":\"*\",\"Resource\":\"*\"}]}";
@@ -95,12 +98,13 @@ class CloudFormationServiceRestoreIntegrationTest {
         List<Future<?>> runningOperations = fillExecutor();
         try {
             AwsException rejected = assertThrows(AwsException.class,
-                    () -> service.executeChangeSet(targetStack, "initial", REGION));
+                    () -> service.executeCreateChangeSet(targetStack, "initial", REGION, disableRollback));
             assertEquals("LimitExceededException", rejected.getErrorCode());
 
             Stack restored = service.describeStacks(targetStack, REGION).getFirst();
             assertEquals("REVIEW_IN_PROGRESS", restored.getStatus());
             assertNull(restored.getStackPolicyBody());
+            assertFalse(restored.isDisableRollback(), "A rejected execution must restore its prior creation policy");
             ChangeSet restoredChangeSet = service.describeChangeSet(targetStack, "initial", REGION);
             assertEquals("CREATE_COMPLETE", restoredChangeSet.getStatus());
             assertEquals("AVAILABLE", restoredChangeSet.getExecutionStatus());
@@ -108,10 +112,11 @@ class CloudFormationServiceRestoreIntegrationTest {
             release(runningOperations);
         }
 
-        Future<?> retry = service.executeChangeSet(targetStack, "initial", REGION);
+        Future<?> retry = service.executeCreateChangeSet(targetStack, "initial", REGION, disableRollback);
         retry.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         assertEquals("CREATE_COMPLETE", service.describeStacks(targetStack, REGION).getFirst().getStatus());
         assertEquals(policy, service.describeStacks(targetStack, REGION).getFirst().getStackPolicyBody());
+        assertEquals(disableRollback, service.describeStacks(targetStack, REGION).getFirst().isDisableRollback());
         assertEquals("EXECUTE_COMPLETE",
                 service.describeChangeSet(targetStack, "initial", REGION).getExecutionStatus());
     }

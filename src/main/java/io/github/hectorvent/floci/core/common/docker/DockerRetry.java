@@ -5,6 +5,7 @@ import org.jboss.logging.Logger;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.SocketTimeoutException;
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.NoSuchFileException;
 import java.util.Locale;
@@ -91,7 +92,8 @@ public final class DockerRetry {
         // too long to answer, not that the pool is exhausted or the thread was interrupted) and
         // must stay retryable, so it's excluded from this exclusion.
         for (Throwable c = t; c != null; c = c.getCause()) {
-            if (c instanceof InterruptedIOException && !(c instanceof SocketTimeoutException)) {
+            if (c instanceof ClosedByInterruptException
+                    || c instanceof InterruptedIOException && !(c instanceof SocketTimeoutException)) {
                 return false;
             }
             if (c instanceof LocalFailure) {

@@ -9,6 +9,8 @@ import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.stubbing.Answer;
 
 import java.nio.charset.StandardCharsets;
@@ -138,7 +140,7 @@ class AslExecutorSyncTimeoutTest {
     }
 
     @Test
-    void standardExecutionStartedAsynchronouslyHasNoSuchLimit() {
+    void standardExecutionIsNotLimitedToTheExpressBudget() {
         StateMachine stateMachine = stateMachine(WAIT_THEN_PASS);
         stateMachine.setType("STANDARD");
         Execution execution = execution(stateMachine);
@@ -148,6 +150,25 @@ class AslExecutorSyncTimeoutTest {
 
         awaitTerminalEvent();
         assertEquals("SUCCEEDED", execution.getStatus());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"31535999, SUCCEEDED", "31536000, TIMED_OUT"})
+    void standardExecutionHasAOneYearQuota(long elapsedSeconds, String expectedStatus) {
+        lambdaAnswers(invocation -> {
+            advance(Duration.ofSeconds(elapsedSeconds));
+            return new InvokeResult(200, null, bytes("{}"), null, "completed");
+        });
+        StateMachine stateMachine = stateMachine(lambdaTask());
+        Execution execution = execution(stateMachine);
+
+        executor.executeAsync(stateMachine, execution, history, (updated, events) -> {
+        });
+
+        awaitTerminalEvent();
+        assertEquals(expectedStatus, execution.getStatus());
+        assertEquals(expectedStatus.equals("TIMED_OUT") ? "ExecutionTimedOut" : "ExecutionSucceeded",
+                history.getLast().getType());
     }
 
     @Test

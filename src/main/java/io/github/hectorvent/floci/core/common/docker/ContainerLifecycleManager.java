@@ -1182,7 +1182,10 @@ public class ContainerLifecycleManager {
         try {
             InspectContainerResponse.ContainerState state =
                     dockerClient.inspectContainerCmd(containerId).exec().getState();
-            boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+            Boolean running = state != null ? state.getRunning() : null;
+            if (running == null) {
+                return ContainerPresence.UNKNOWN;
+            }
             return running ? ContainerPresence.RUNNING : ContainerPresence.STOPPED;
         } catch (NotFoundException e) {
             return ContainerPresence.ABSENT;
@@ -1483,7 +1486,11 @@ public class ContainerLifecycleManager {
     }
 
     private HostConfig buildHostConfig(ContainerSpec spec) {
-        HostConfig hostConfig = HostConfig.newHostConfig();
+        // Lambda output and exit streams are registered before start; the daemon can therefore
+        // finish removing their captured runtime IDs even after Floci's shutdown budget expires.
+        // EC2, other services, and the unlabelled code-volume helpers keep their containers.
+        HostConfig hostConfig = HostConfig.newHostConfig().withAutoRemove(
+                "lambda".equals(ContainerStorageHelper.labelValue(spec.labels(), ContainerStorageHelper.SERVICE_LABEL)));
 
         // Privileged mode (required for e.g. k3s containers)
         if (spec.privileged()) {

@@ -171,9 +171,9 @@ public class AslExecutor {
     }
 
     private static final Logger LOG = Logger.getLogger(AslExecutor.class);
-    // How long a Task waits for its token, or for a .sync job to end, when the state declares no
-    // TimeoutSeconds. AWS lets it run for a year; the emulator would rather free the worker thread.
-    private static final int DEFAULT_TASK_TIMEOUT_SECONDS = 300;
+    // This fallback exceeds every supported workflow budget, which bounds an omitted Task timeout.
+    private static final int DEFAULT_TASK_TIMEOUT_SECONDS = 99_999_999;
+    private static final Duration STANDARD_MAX_EXECUTION_TIME = Duration.ofDays(365);
     // AWS's hard quota on an Express execution, synchronous or not.
     private static final Duration EXPRESS_MAX_EXECUTION_TIME = Duration.ofMinutes(5);
     private static final Set<String> TERMINAL_STATUSES = Set.of("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED");
@@ -514,11 +514,9 @@ public class AslExecutor {
                              MockedTestCase mockedTestCase,
                              BiConsumer<Execution, List<HistoryEvent>> onUpdate) {
         registerMocks(exec, mockedTestCase);
-        // An Express execution has the same maximum execution time however it was started; a
-        // Standard one is allowed a year, which the emulator does not enforce.
-        long maxExecutionDeadlineNanos = "EXPRESS".equals(sm.getType())
-                ? nanoTime.getAsLong() + expressMaxExecutionTime.toNanos()
-                : Long.MAX_VALUE;
+        Duration maxExecutionTime = "EXPRESS".equals(sm.getType())
+                ? expressMaxExecutionTime : STANDARD_MAX_EXECUTION_TIME;
+        long maxExecutionDeadlineNanos = nanoTime.getAsLong() + maxExecutionTime.toNanos();
         executor.submit(() -> {
             try {
                 runUnderExecutionAccount(sm,
@@ -632,7 +630,7 @@ public class AslExecutor {
             JsonNode currentInput = parseInput(exec.getInput());
             // The state machine's total budget, computed once so every state measures against the
             // same instant: the earlier of its TimeoutSeconds and the maximum execution time its
-            // workflow type allows. Long.MAX_VALUE stands for neither.
+            // workflow type allows.
             int timeoutSeconds = definition.path("TimeoutSeconds").asInt(0);
             if (timeoutSeconds > 0) {
                 executionDeadlineNanos = Math.min(
@@ -1201,8 +1199,8 @@ public class AslExecutor {
 
     /**
      * The instant a Task's own {@code TimeoutSeconds} runs out, counted from now: the bound on a
-     * task-token wait and on a {@code .sync} job wait alike. A state that declares none gets the
-     * emulator's default rather than the year AWS allows.
+     * task-token wait and on a {@code .sync} job wait alike. With no Task timeout, the fallback
+     * exceeds the execution's own deadline, which remains the effective bound.
      */
     private long taskDeadlineNanos(JsonNode stateDef) {
         int timeoutSeconds = stateDef.path("TimeoutSeconds").asInt(0);

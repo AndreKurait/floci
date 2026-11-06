@@ -84,6 +84,27 @@ class ScalingPolicyAlarmActionHandlerTest {
     }
 
     @Test
+    void lambdaDoesNotInheritTheEcsDefaultScaleInCooldown() {
+        ScalingPolicy policy = targetTrackingPolicy(0.5, null);
+        policy.setServiceNamespace("lambda");
+        policy.setScalableDimension("lambda:function:ProvisionedConcurrency");
+        policy.setResourceId("function:worker:live");
+        policy.setLastScaleInTime(System.currentTimeMillis() / 1000.0 - 1);
+        ScalableTarget target = target(1, 10);
+        target.setScalableDimension(policy.getScalableDimension());
+        target.setResourceId(policy.getResourceId());
+        when(service.findPolicyByArn(POLICY_ARN, REGION)).thenReturn(Optional.of(policy));
+        when(service.findTarget(REGION, "lambda", policy.getResourceId(), policy.getScalableDimension()))
+                .thenReturn(Optional.of(target));
+        when(adjuster.supports(policy.getScalableDimension())).thenReturn(true);
+        when(adjuster.getCurrentCapacity(policy.getResourceId(), REGION)).thenReturn(4);
+
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 0.5), 0.2, REGION);
+
+        verify(adjuster).setCapacity(policy.getResourceId(), 2, REGION);
+    }
+
+    @Test
     void scalesOutProportionallyToTargetRatio() {
         ScalingPolicy policy = targetTrackingPolicy(50.0, null);
         stub(policy, target(1, 10), 4);

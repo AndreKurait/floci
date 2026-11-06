@@ -338,6 +338,23 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void runInstancesWithoutGroupsGetsItsSubnetVpcsDefaultGroup() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.94.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpcId, "10.94.1.0/24", region + "a");
+
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet.getSubnetId(), null, List.of(), null, null).getInstances().getFirst();
+
+        List<String> expected = List.of(service.defaultSecurityGroupOf(region, vpcId).orElseThrow().getGroupId());
+        assertEquals(vpcId, instance.getVpcId());
+        assertEquals(expected, instance.getSecurityGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        assertEquals(expected, instance.getNetworkInterfaces().getFirst().getGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+    }
+
+    @Test
     void defaultSecurityGroupOfIsEmptyWhenTheStoredDefaultGroupIsMissing() {
         AccountAwareStorageBackend<SecurityGroup> groups = AccountAwareStorageBackend.inMemory("000000000000");
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
@@ -2440,6 +2457,38 @@ class Ec2ServiceTest {
         for (String filter : List.of("association.ip-owner-id", "association.public-ip")) {
             assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
                     Map.of(filter, List.of("*")), 0, null).networkInterfaces().isEmpty());
+        }
+    }
+
+    @Test
+    void awaitContainerLaunchWakesAllWaitersOnRunningWithoutPolling() throws Exception {
+        Ec2Service service = new Ec2Service(mockConfig(false), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Instance instance = spy(new Instance());
+        CountDownLatch waiting = new CountDownLatch(2);
+        Set<Thread> readers = new HashSet<>();
+        doAnswer(call -> {
+            assertTrue(Thread.holdsLock(instance));
+            if (readers.add(Thread.currentThread())) {
+                waiting.countDown();
+            }
+            return call.callRealMethod();
+        }).when(instance).getState();
+        instance.setInstanceId("i-signalled");
+        instance.setState(InstanceState.pending());
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<?> first = executor.submit(() -> service.awaitContainerLaunch(instance));
+            Future<?> second = executor.submit(() -> service.awaitContainerLaunch(instance));
+            assertTrue(waiting.await(2, TimeUnit.SECONDS));
+            // Both readers release the instance monitor only when they enter timedWait.
+            instance.setState(InstanceState.running());
+            first.get(2, TimeUnit.SECONDS);
+            second.get(2, TimeUnit.SECONDS);
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS));
         }
     }
 

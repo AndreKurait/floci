@@ -5,19 +5,29 @@ import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.WaitContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.api.model.WaitResponse;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.Closeable;
 import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class LambdaExitWatcherTest {
@@ -31,15 +41,19 @@ class LambdaExitWatcherTest {
     private long now;
     private DockerClient docker;
     private InspectContainerCmd inspect;
+    private WaitContainerCmd wait;
+    private Closeable transport;
 
     @BeforeEach
     void setUp() {
         docker = mock(DockerClient.class);
-        WaitContainerCmd wait = mock(WaitContainerCmd.class);
+        wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+        transport = mock(Closeable.class);
         when(docker.waitContainerCmd(CONTAINER)).thenReturn(wait);
         when(wait.exec(any())).thenAnswer(invocation -> {
             WaitContainerResultCallback callback = invocation.getArgument(0);
             armed.add(callback);
+            callback.onStart(transport);
             return callback;
         });
         inspect = mock(InspectContainerCmd.class);
@@ -115,14 +129,120 @@ class LambdaExitWatcherTest {
     }
 
     @Test
-    void aStreamThatFailsAfterTheContainerWasRemovedReportsNothing() {
+    void aStreamThatFailsAfterAutoRemovalReportsAnUnknownExitInsteadOfTimingOut() {
         when(inspect.exec()).thenThrow(new NotFoundException("No such container"));
         watch();
 
         failLatestStream("Read timed out");
 
         assertEquals(1, armed.size());
+        assertEquals(List.of(-1), exits);
+    }
+
+    @Test
+    void prearmedNextExitKeepsTheExitStatusEvenAfterAutoRemoval() {
+        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+                docker, CONTAINER, exits::add, Duration.ZERO);
+        verify(wait).withCondition(WaitContainerCondition.NEXT_EXIT);
+        assertEquals(List.of(), exits, "Created is not an exit");
+
+        armed.getFirst().onNext(exited(37));
+        armed.getFirst().onComplete();
+        watcher.containerStarted();
+        armed.getFirst().onError(new NotFoundException("Already auto-removed"));
+
+        assertEquals(List.of(37), exits);
+        verify(docker, never()).inspectContainerCmd(CONTAINER);
+    }
+
+    @Test
+    void missingOrFailedWaitRegistrationRefusesLaunchWithoutInventingAnExit() {
+        doThrow(new NotFoundException("Captured container is absent")).when(wait).exec(any());
+
+        assertThrows(IllegalStateException.class, () -> LambdaExitWatcher.watchBeforeStart(
+                docker, CONTAINER, exits::add, Duration.ZERO));
+
         assertEquals(List.of(), exits);
+        verify(docker, never()).inspectContainerCmd(CONTAINER);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void waitWithoutHealthyResponseHeadersCannotAuthorizeStart(boolean error) throws Exception {
+        List<WaitContainerResultCallback> callbacks = new ArrayList<>();
+        doAnswer(call -> {
+            WaitContainerResultCallback callback = call.getArgument(0);
+            callbacks.add(callback);
+            if (error) {
+                callback.onError(new SocketTimeoutException("Failed before headers"));
+            }
+            return callback;
+        }).when(wait).exec(any());
+        assertThrows(IllegalStateException.class, () -> LambdaExitWatcher.watchBeforeStart(
+                docker, CONTAINER, exits::add, Duration.ZERO));
+        Closeable lateTransport = mock(Closeable.class);
+        callbacks.getFirst().onStart(lateTransport);
+
+        verify(lateTransport).close();
+        assertEquals(List.of(), exits);
+        verify(docker, never()).inspectContainerCmd(CONTAINER);
+    }
+
+    @Test
+    void errorAfterWaitAcknowledgmentStillRefusesLaunch() {
+        doAnswer(call -> {
+            WaitContainerResultCallback callback = call.getArgument(0);
+            callback.onStart(transport);
+            callback.onError(new SocketTimeoutException("Failed after response headers"));
+            return callback;
+        }).when(wait).exec(any());
+
+        assertThrows(IllegalStateException.class, () -> LambdaExitWatcher.watchBeforeStart(
+                docker, CONTAINER, exits::add, Duration.ZERO));
+        assertEquals(List.of(), exits);
+        verify(docker, never()).inspectContainerCmd(CONTAINER);
+    }
+
+    @Test
+    void intentionalCancellationClosesItsCapturedStreamAndSuppressesLateExitAndError() throws Exception {
+        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+                docker, CONTAINER, exits::add, Duration.ZERO);
+        watcher.containerStarted();
+        watcher.cancel();
+        armed.getFirst().onNext(exited(143));
+        armed.getFirst().onError(new NotFoundException("Intentional removal"));
+
+        assertEquals(List.of(), exits);
+        verify(transport).close();
+        verify(docker, never()).inspectContainerCmd(CONTAINER);
+    }
+
+    @Test
+    void failureDuringStartIsHandedOverOnceEvenIfTheRuntimeAlreadyDisappeared() {
+        when(inspect.exec()).thenThrow(new NotFoundException("Auto-removed during start"));
+        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+                docker, CONTAINER, exits::add, Duration.ZERO);
+        armed.getFirst().onError(new SocketTimeoutException("Failed while start was in flight"));
+        assertEquals(List.of(), exits, "A created container must not be reported as an exited runtime");
+
+        watcher.containerStarted();
+        watcher.containerStarted();
+
+        assertEquals(List.of(-1), exits);
+        verify(docker).inspectContainerCmd(CONTAINER);
+    }
+
+    @Test
+    void anEmptyTerminalWaitAfterStartDoesNotSilentlyLoseAnAutoRemovedExit() {
+        when(inspect.exec()).thenThrow(new NotFoundException("Auto-removed runtime"));
+        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+                docker, CONTAINER, exits::add, Duration.ZERO);
+        watcher.containerStarted();
+
+        armed.getFirst().onComplete();
+
+        assertEquals(List.of(-1), exits);
+        verify(docker).inspectContainerCmd(CONTAINER);
     }
 
     // Catches: quick re-arms spent back to back, which exhaust the budget within milliseconds of the
