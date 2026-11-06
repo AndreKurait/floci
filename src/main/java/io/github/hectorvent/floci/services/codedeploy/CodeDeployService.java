@@ -1932,12 +1932,10 @@ public class CodeDeployService {
                     lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
                             appSpec.currentVersion, null, routing);
 
-                    // Wait the canary interval (capped at 5s for emulator speed)
-                    long waitMs = Math.min(trc.intervalSeconds * 1000L, 5000L);
-                    if (waitMs > 0 && !stopFlag.get()) {
-                        Thread.sleep(waitMs);
+                    if (!waitForTrafficInterval(trc.intervalSeconds, stopFlag)) {
+                        finishLifecycleEvent(event, "Skipped");
+                        return;
                     }
-                    if (stopFlag.get()) { return; }
 
                     // Step 2: flip 100% to targetVersion
                     lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
@@ -1945,7 +1943,11 @@ public class CodeDeployService {
                 }
                 case "TimeBasedLinear" -> {
                     int steps = (int) Math.ceil(100.0 / trc.percentage);
-                    for (int step = 1; step <= steps && !stopFlag.get(); step++) {
+                    for (int step = 1; step <= steps; step++) {
+                        if (stopFlag.get()) {
+                            finishLifecycleEvent(event, "Skipped");
+                            return;
+                        }
                         int pct = Math.min(step * trc.percentage, 100);
                         if (pct >= 100) {
                             lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
@@ -1954,9 +1956,9 @@ public class CodeDeployService {
                             double weight = pct / 100.0;
                             lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
                                     appSpec.currentVersion, null, Map.of(appSpec.targetVersion, weight));
-                            long waitMs = Math.min(trc.intervalSeconds * 1000L, 2000L);
-                            if (waitMs > 0) {
-                                Thread.sleep(waitMs);
+                            if (!waitForTrafficInterval(trc.intervalSeconds, stopFlag)) {
+                                finishLifecycleEvent(event, "Skipped");
+                                return;
                             }
                         }
                     }
@@ -1972,6 +1974,20 @@ public class CodeDeployService {
             finishLifecycleEvent(event, "Failed");
             throw e;
         }
+    }
+
+    private boolean waitForTrafficInterval(int intervalSeconds, AtomicBoolean stopFlag)
+            throws InterruptedException {
+        long duration = TimeUnit.SECONDS.toNanos(intervalSeconds);
+        long started = System.nanoTime();
+        while (!stopFlag.get()) {
+            long remaining = duration - (System.nanoTime() - started);
+            if (remaining <= 0) {
+                return true;
+            }
+            TimeUnit.NANOSECONDS.sleep(Math.min(remaining, STOP_POLL_INTERVAL.toNanos()));
+        }
+        return false;
     }
 
     private boolean invokeHook(String region, Deployment deployment, String hookFunctionName,

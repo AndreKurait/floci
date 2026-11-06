@@ -68,6 +68,11 @@ existing application storage and region visibility.
 | `BatchGetDeploymentTargets` | Returns target details including lifecycle event status |
 | `PutLifecycleEventHookExecutionStatus` | Called by lifecycle hook Lambda to report `Succeeded` or `Failed`; failure triggers auto-rollback |
 
+Lambda canary and linear deployments honor their configured intervals in minutes. The deployment
+stays `InProgress` between traffic shifts. Stop requests are observed during the wait, leave
+later shifts unexecuted, and mark the interrupted `AllowTraffic` event `Skipped`.
+`LambdaAllAtOnce` moves traffic immediately.
+
 ### Tagging
 
 | Operation | Notes |
