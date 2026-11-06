@@ -7,6 +7,13 @@ the calling account and region. Persisted records from older versions that did n
 record a region remain available only in `floci.default-region`. New writes store
 their region explicitly in all storage modes.
 
+With IAM enforcement enabled, AppConfig and AppConfigData requests require the
+caller's `appconfig:` permissions. Scoped policies use canonical resource IDs even
+when the request uses names. Configuration sessions authorize both creation and
+polling against the application/environment/configuration ARN; a denied poll does
+not consume its token. Passing retrieval or monitor roles also requires
+`iam:PassRole` for the AppConfig service. IAM enforcement remains disabled by default.
+
 ## Management Plane (AppConfig)
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
