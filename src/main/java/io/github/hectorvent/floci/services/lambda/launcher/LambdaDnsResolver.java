@@ -8,25 +8,36 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.netty.util.NetUtil;
+import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Prepares DNS before runtime initialization on Docker bridges without external forwarding. */
 final class LambdaDnsResolver {
 
+    private static final Logger LOG = Logger.getLogger(LambdaDnsResolver.class);
     private static final String RESOLV_CONF = "/etc/resolv.conf";
+    private static final String DOCKER_DNS = "127.0.0.11";
     private static final Set<String> SPECIAL_NETWORKS = Set.of("bridge", "default", "host", "none");
+    private final ContainerBuilder containers;
+    private final ContainerLifecycleManager lifecycle;
+    private final EmulatorConfig config;
+    private final Map<String, Cleanup> pendingCleanup = new ConcurrentHashMap<>();
 
-    private LambdaDnsResolver() {
+    LambdaDnsResolver(ContainerBuilder containers, ContainerLifecycleManager lifecycle, EmulatorConfig config) {
+        this.containers = containers;
+        this.lifecycle = lifecycle;
+        this.config = config;
     }
 
-    static String prepare(ContainerBuilder.Builder workload, ContainerBuilder containers,
-                          ContainerLifecycleManager lifecycle, EmulatorConfig config, String platform) {
+    String prepare(ContainerBuilder.Builder workload, String platform) {
         ContainerSpec spec = workload.build();
         if (!requiresResolver(spec, lifecycle)) {
             return null;
@@ -42,6 +53,8 @@ final class LambdaDnsResolver {
             lifecycle.ensureVolume(volume, labels);
             ContainerSpec helper = containers.newContainer(spec.image())
                     .withName(volume + "-init")
+                    .withEntrypoint(List.of("/floci-resolver-not-executed"))
+                    .withCmd(List.of())
                     .withEnv(List.of())
                     .withNetworkMode("none")
                     .withLabels(labels)
@@ -61,17 +74,8 @@ final class LambdaDnsResolver {
                     .withReadOnlyBind(mountpoint + "/resolv.conf", RESOLV_CONF);
             return volume;
         } catch (RuntimeException failure) {
-            if (helperId != null) {
-                try {
-                    lifecycle.removeIfExistsStrict(helperId, true);
-                } catch (RuntimeException cleanupFailure) {
-                    if (cleanupFailure != failure) {
-                        failure.addSuppressed(cleanupFailure);
-                    }
-                }
-            }
             try {
-                lifecycle.removeVolumeStrict(volume);
+                remove(volume, helperId);
             } catch (RuntimeException cleanupFailure) {
                 if (cleanupFailure != failure) {
                     failure.addSuppressed(cleanupFailure);
@@ -80,6 +84,36 @@ final class LambdaDnsResolver {
             throw failure;
         }
     }
+
+    void remove(String volume, String containerId) {
+        Cleanup cleanup = pendingCleanup.computeIfAbsent(volume, ignored -> new Cleanup(volume, containerId));
+        cleanup(cleanup);
+    }
+
+    void retryCleanup() {
+        for (Cleanup cleanup : pendingCleanup.values()) {
+            try {
+                cleanup(cleanup);
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Resolver cleanup remains pending for volume {0}", cleanup.volume());
+            }
+        }
+    }
+
+    private void cleanup(Cleanup cleanup) {
+        synchronized (cleanup) {
+            if (pendingCleanup.get(cleanup.volume()) != cleanup) {
+                return;
+            }
+            if (cleanup.containerId() != null) {
+                lifecycle.removeIfExistsStrict(cleanup.containerId(), true);
+            }
+            lifecycle.removeVolumeStrict(cleanup.volume());
+            pendingCleanup.remove(cleanup.volume(), cleanup);
+        }
+    }
+
+    private record Cleanup(String volume, String containerId) { }
 
     static boolean requiresResolver(ContainerSpec spec, ContainerLifecycleManager lifecycle) {
         String networkMode = spec.networkMode();
@@ -95,16 +129,22 @@ final class LambdaDnsResolver {
     }
 
     private static boolean coversResolver(String target) {
-        return target != null && (target.equals(RESOLV_CONF) || target.equals("/etc") || target.equals("/"));
+        if (target == null) {
+            return false;
+        }
+        String normalized = Path.of(target).normalize().toString();
+        return normalized.equals(RESOLV_CONF) || normalized.equals("/etc") || normalized.equals("/");
     }
 
     static byte[] resolverContent(ContainerSpec spec) {
-        StringBuilder content = new StringBuilder();
+        StringBuilder content = new StringBuilder("nameserver " + DOCKER_DNS + "\n");
         for (String server : spec.dnsServers()) {
             if (!NetUtil.isValidIpV4Address(server) && !NetUtil.isValidIpV6Address(server)) {
                 throw new IllegalArgumentException("Lambda DNS requires an IP address");
             }
-            content.append("nameserver ").append(server).append('\n');
+            if (!DOCKER_DNS.equals(server)) {
+                content.append("nameserver ").append(server).append('\n');
+            }
         }
         return content.append("options ndots:0\n").toString().getBytes(StandardCharsets.UTF_8);
     }

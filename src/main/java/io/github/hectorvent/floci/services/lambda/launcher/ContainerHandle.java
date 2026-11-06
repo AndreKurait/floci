@@ -23,6 +23,7 @@ public class ContainerHandle {
     private Closeable logStream;
     private LambdaExitWatcher exitWatcher;
     private String dnsResolverVolume;
+    private boolean runtimeApiReleased;
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -74,6 +75,8 @@ public class ContainerHandle {
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
     String getDnsResolverVolume() { return dnsResolverVolume; }
     void setDnsResolverVolume(String volume) { this.dnsResolverVolume = volume; }
+    boolean isRuntimeApiReleased() { return runtimeApiReleased; }
+    void markRuntimeApiReleased() { runtimeApiReleased = true; }
 
     void setExitWatcher(LambdaExitWatcher exitWatcher) { this.exitWatcher = exitWatcher; }
 

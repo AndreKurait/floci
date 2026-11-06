@@ -125,6 +125,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
+    private final LambdaDnsResolver dnsResolver;
     private final ContainerLogStreamer logStreamer;
     private final ImageResolver imageResolver;
     private final RuntimeApiServerFactory runtimeApiServerFactory;
@@ -188,6 +189,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LambdaVpcNetworkManager vpcNetworkManager) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
+        this.dnsResolver = new LambdaDnsResolver(containerBuilder, lifecycleManager, config);
         this.logStreamer = logStreamer;
         this.imageResolver = imageResolver;
         this.runtimeApiServerFactory = runtimeApiServerFactory;
@@ -454,7 +456,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             specBuilder.withReadOnlyBind(hostPath, "/opt/aws-config");
         });
 
-        dnsResolverVolume = LambdaDnsResolver.prepare(specBuilder, containerBuilder, lifecycleManager, config,
+        dnsResolverVolume = dnsResolver.prepare(specBuilder,
                 requestedDockerPlatform(fn, dockerFlags).orElse(null));
         ContainerSpec spec = specBuilder.build();
 
@@ -619,9 +621,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             }
             if (dnsResolverVolume != null && !workloadRetained) {
                 try {
-                    lifecycleManager.removeVolumeStrict(dnsResolverVolume);
+                    dnsResolver.remove(dnsResolverVolume, containerId);
                 } catch (RuntimeException cleanupError) {
-                    e.addSuppressed(cleanupError);
+                    if (cleanupError != e) {
+                        e.addSuppressed(cleanupError);
+                    }
                 }
             }
             if (roleCredentials.isPresent()) {
@@ -761,9 +765,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     }
 
     public void stop(ContainerHandle handle) {
+        synchronized (handle) {
+            stopOwnedContainer(handle);
+        }
+    }
+
+    private void stopOwnedContainer(ContainerHandle handle) {
         LOG.infov("Stopping container {0}", handle.getContainerId());
         handle.setState(ContainerState.STOPPED);
 
+        if (handle.isRuntimeApiReleased()) {
+            removeResolver(handle);
+            return;
+        }
         RuntimeApiServer server = handle.getRuntimeApiServer();
 
         // Quiesce first: stop accepting new work, notify extensions, complete pending
@@ -826,11 +840,17 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         } finally {
             try {
                 runtimeApiServerFactory.release(server);
+                handle.markRuntimeApiReleased();
             } finally {
-                if (handle.getDnsResolverVolume() != null) {
-                    lifecycleManager.removeVolumeStrict(handle.getDnsResolverVolume());
-                }
+                removeResolver(handle);
             }
+        }
+    }
+
+    private void removeResolver(ContainerHandle handle) {
+        if (handle.getDnsResolverVolume() != null) {
+            dnsResolver.remove(handle.getDnsResolverVolume(), null);
+            handle.setDnsResolverVolume(null);
         }
     }
 
@@ -1119,6 +1139,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * `docker volume prune --filter label=floci` same as before this existed).
      */
     void cleanupSupersededVolumes() {
+        dnsResolver.retryCleanup();
         // Legacy callers without the authoritative store cannot rule out an uninvoked live function.
         if (functionStore == null) {
             return;

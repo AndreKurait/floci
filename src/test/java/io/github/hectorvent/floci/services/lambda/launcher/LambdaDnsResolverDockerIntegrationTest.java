@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -47,6 +48,8 @@ class LambdaDnsResolverDockerIntegrationTest {
             assert os.getuid() == 12345
             answers = socket.getaddrinfo("peer.example.test", 443, socket.AF_INET)
             assert answers and all(answer[4][0] == "192.0.2.44" for answer in answers), answers
+            aliases = socket.getaddrinfo(os.environ["PEER_ALIAS"], 443, socket.AF_INET)
+            assert aliases and all(answer[4][0] == os.environ["PEER_IP"] for answer in aliases), aliases
             try:
                 pathlib.Path("/etc/resolv.conf").write_text("nameserver 8.8.8.8")
             except OSError:
@@ -79,8 +82,9 @@ class LambdaDnsResolverDockerIntegrationTest {
         String peer = null;
         String runtime = null;
         String volume = null;
+        String alias = "dns-peer-" + UUID.randomUUID();
         try {
-            ContainerSpec peerSpec = containers.newContainer(IMAGE).withNetworkMode(network)
+            ContainerSpec peerSpec = containers.newContainer(IMAGE).withNetworkMode(network).withName(alias)
                     .withEntrypoint(List.of(PYTHON)).withCmd(List.of("-c", DNS_SERVER)).build();
             peer = lifecycle.createAndStart(peerSpec).containerId();
             ContainerExec.Result ready = ContainerExec.run(docker, peer, new String[]{
@@ -97,12 +101,22 @@ class LambdaDnsResolverDockerIntegrationTest {
                     .values().iterator().next().getIpAddress();
             ContainerBuilder.Builder workload = containers.newContainer(IMAGE).withNetworkMode(network)
                     .withDnsServer(address).withUser("12345:12345").withReadonlyRootfs()
+                    .withEnv(List.of("PEER_ALIAS=" + alias, "PEER_IP=" + address))
                     .withEntrypoint(List.of(PYTHON)).withCmd(List.of("-c", RUNTIME));
 
-            volume = LambdaDnsResolver.prepare(workload, containers, lifecycle, config, null);
+            volume = new LambdaDnsResolver(containers, lifecycle, config).prepare(workload, null);
             assertNotNull(volume);
             ContainerSpec spec = workload.build();
             runtime = lifecycle.create(spec);
+            List<InspectContainerResponse.Mount> mounts = docker.inspectContainerCmd(runtime).exec().getMounts();
+            String resolverVolume = volume;
+            InspectContainerResponse.Mount resolver = mounts.stream()
+                    .filter(mount -> "/etc/resolv.conf".equals(mount.getDestination().getPath()))
+                    .findFirst().orElseThrow();
+            InspectContainerResponse.Mount retained = mounts.stream()
+                    .filter(mount -> resolverVolume.equals(mount.getName())).findFirst().orElseThrow();
+            assertEquals(Boolean.FALSE, resolver.getRW(), "The effective resolver bind must be read-only");
+            assertEquals(Boolean.FALSE, retained.getRW(), "The effective named volume must be read-only");
             for (int attempt = 0; attempt < 2; attempt++) {
                 lifecycle.startCreated(runtime, spec);
                 Integer exit = docker.waitContainerCmd(runtime).exec(new WaitContainerResultCallback())
