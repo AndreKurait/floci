@@ -1335,6 +1335,11 @@ def validate(document: dict) -> list[str]:
         if not isinstance(document.get(key), dict) or not all(
                 isinstance(reason, str) and reason for reason in document[key].values()):
             problems.append(f"{key} does not give each a reason")
+    if isinstance(document.get("notCovered"), dict):
+        for key in ("namespaces", "handBuilt", "otherNamespaces"):
+            if isinstance(document.get(key), (dict, list)) and all(isinstance(n, str) for n in document[key]):
+                problems.extend(f"{namespace} is in both {key} and notCovered"
+                                for namespace in sorted(set(document[key]) & set(document["notCovered"])))
     for operation, entry in operations.items():
         namespace = namespace_of(operation)
         if not OPERATION_RE.match(operation) or namespace not in namespaces:
