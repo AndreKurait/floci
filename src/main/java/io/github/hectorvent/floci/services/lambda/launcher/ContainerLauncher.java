@@ -218,6 +218,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // must be visible in the catch block below to release its in-flight reference on any
         // failure path, not just the one where useCodeVolume's block itself throws.
         String reservedCodeVolume = null;
+        String dnsResolverVolume = null;
         Optional<SessionCreds> roleCredentials = Optional.empty();
         try {
 
@@ -380,6 +381,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             specBuilder.withReadOnlyBind(hostPath, "/opt/aws-config");
         });
 
+        dnsResolverVolume = LambdaDnsResolver.prepare(specBuilder, containerBuilder, lifecycleManager, config,
+                requestedDockerPlatform(fn, dockerFlags).orElse(null));
         ContainerSpec spec = specBuilder.build();
 
         // Create container without starting — provided.* runtimes exec
@@ -477,6 +480,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 containerId, fn.getFunctionName(), runtimeApiServer, ContainerState.WARM, fn.isHotReload(),
                 roleCredentials.map(SessionCreds::accessKeyId).orElse(null),
                 LambdaExecutionRoleCredentials.sessionAccountId(fn));
+        handle.setDnsResolverVolume(dnsResolverVolume);
 
         // Attach log streaming
         Closeable logHandle = logStreamer.attachForAccount(
@@ -496,9 +500,21 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     fn.getFunctionName(), e.getMessage());
             if (containerId != null) {
                 try {
-                    lifecycleManager.stopAndRemove(containerId, null);
+                    if (dnsResolverVolume == null) {
+                        lifecycleManager.stopAndRemove(containerId, null);
+                    } else {
+                        lifecycleManager.stopAndRemoveStrict(containerId, null);
+                    }
                 } catch (Exception cleanupError) {
                     LOG.warnv(cleanupError, "Could not remove failed Lambda container {0}", containerId);
+                    e.addSuppressed(cleanupError);
+                }
+            }
+            if (dnsResolverVolume != null) {
+                try {
+                    lifecycleManager.removeVolumeStrict(dnsResolverVolume);
+                } catch (RuntimeException cleanupError) {
+                    e.addSuppressed(cleanupError);
                 }
             }
             if (roleCredentials.isPresent()) {
@@ -670,7 +686,13 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             LOG.warnv(e, "RuntimeApiServer did not close cleanly for container {0}",
                     handle.getContainerId());
         } finally {
-            runtimeApiServerFactory.release(server);
+            try {
+                runtimeApiServerFactory.release(server);
+            } finally {
+                if (handle.getDnsResolverVolume() != null) {
+                    lifecycleManager.removeVolumeStrict(handle.getDnsResolverVolume());
+                }
+            }
         }
     }
 
