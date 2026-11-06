@@ -19,10 +19,20 @@ import java.util.function.Consumer;
  * intrinsic functions in properties) plus the region/account/stack it is being created in. The
  * helpers were lifted verbatim from the former CloudFormation monolith's private methods
  * so extracted provisioners produce byte-identical physical ids and resolved values.
+ *
+ * <p>{@code updatePolicy} is resolved with this operation's engine. {@code priorUpdatePolicy}
+ * was already resolved against the previous template, parameters and resource identities.
  */
 public record ProvisionContext(CloudFormationTemplateEngine engine, String region,
                                String accountId, String stackName, String priorPhysicalId,
-                               Consumer<StackEvent> progress, JsonNode priorProperties) {
+                               Consumer<StackEvent> progress, JsonNode priorProperties, JsonNode updatePolicy,
+                               JsonNode priorUpdatePolicy) {
+
+    public ProvisionContext(CloudFormationTemplateEngine engine, String region,
+                            String accountId, String stackName, String priorPhysicalId,
+                            Consumer<StackEvent> progress, JsonNode priorProperties) {
+        this(engine, region, accountId, stackName, priorPhysicalId, progress, priorProperties, null, null);
+    }
 
     public ProvisionContext(CloudFormationTemplateEngine engine, String region,
                             String accountId, String stackName, String priorPhysicalId) {

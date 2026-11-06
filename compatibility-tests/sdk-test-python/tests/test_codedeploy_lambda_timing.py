@@ -109,6 +109,7 @@ def rollout(aws_config, client_config):
 
         yield {
             "start": start, "deployments": deployments, "original": original, "target": target,
+            "name": name, "functions": functions, "role": role,
             "alias": lambda: functions.get_alias(FunctionName=name, Name="live"),
         }
 

@@ -52,7 +52,7 @@ class CloudFormationStackPolicyServiceTest {
         provisioner = mock(CfnResourceDispatcher.class);
         when(provisioner.referenceValue(anyString(), anyString())).thenAnswer(invocation -> invocation.getArgument(1));
         when(provisioner.provision(anyString(), anyString(), any(), any(), anyString(), anyString(), anyString(),
-                any(), any(), any(), any())).thenAnswer(invocation -> {
+                any(), any(), any(), any(), any(), any())).thenAnswer(invocation -> {
                     StackResource resource = new StackResource();
                     resource.setLogicalId(invocation.getArgument(0));
                     resource.setResourceType(invocation.getArgument(1));
@@ -79,6 +79,7 @@ class CloudFormationStackPolicyServiceTest {
 
         service.executeChangeSet("policy-create", "create", REGION, ACCOUNT).get(30, TimeUnit.SECONDS);
 
+        assertEquals("CREATE_COMPLETE", service.describeStacks("policy-create", REGION, ACCOUNT).getFirst().getStatus());
         List<PersistedStack> inProgress = stackStore.puts.stream()
                 .filter(put -> "CREATE_IN_PROGRESS".equals(put.status()))
                 .toList();

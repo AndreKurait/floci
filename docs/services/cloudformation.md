@@ -654,6 +654,21 @@ Changes made to `$LATEST` outside the stack, including Lambda's reactive S3 sync
 alias until an update publishes a new version. Event sources and API integrations still invoke the
 function rather than the alias, so they run `$LATEST`.
 
+An `AWS::Lambda::Alias` with `UpdatePolicy.CodeDeployLambdaAliasUpdate` runs a
+CodeDeploy deployment when its version changes. CloudFormation waits for that
+deployment, including configured traffic intervals and lifecycle callbacks,
+before completing the alias update. Initial alias creation and updates that keep
+the version do not start a deployment. References in the policy establish resource
+dependencies.
+
+A failed update stops any active deployment before restoring the prior alias.
+Rollback uses the previous template's resolved deployment policy and restores the
+alias description, routing weights and provisioned concurrency. Failed restoration
+remains retryable through `ContinueUpdateRollback`. Deployment stabilization has a
+24-hour emulator limit; configured traffic intervals are not shortened.
+SAM `DeploymentPreference` expansion and CodeDeploy's automatic Lambda
+alarm/rollback policies remain separate gaps.
+
 ## RDS Credential Dynamic References
 
 `AWS::RDS::DBInstance` and `AWS::RDS::DBCluster` resolve CloudFormation dynamic

@@ -94,6 +94,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.IotDomain
 import io.github.hectorvent.floci.services.cloudformation.provisioners.KinesisCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.KmsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.LambdaAddressingCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.LambdaAliasDeployment;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.LambdaCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.LambdaCodeSigningConfigCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.LambdaEventInvokeConfigCfnProvisioner;
@@ -498,7 +499,8 @@ final class CfnProvisionerFixture {
             if (lambdaService != null) {
                 discovered.add(new LambdaAddressingCfnProvisioner(lambdaService));
                 discovered.add(new LambdaEventInvokeConfigCfnProvisioner(lambdaService));
-                discovered.add(new LambdaVersionAliasCfnProvisioner(lambdaService, mock(ProvisionedConcurrencyPool.class)));
+                discovered.add(new LambdaVersionAliasCfnProvisioner(lambdaService,
+                        mock(ProvisionedConcurrencyPool.class), mock(LambdaAliasDeployment.class)));
                 discovered.add(new LambdaEventSourceMappingCfnProvisioner(lambdaService));
                 if (lambdaCodeSigningConfigService != null) {
                     discovered.add(new LambdaCodeSigningConfigCfnProvisioner(lambdaCodeSigningConfigService,

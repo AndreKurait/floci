@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.lambda.ProvisionedConcurrencyPool;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.mockito.Mockito;
 
 import java.time.Duration;
@@ -18,12 +19,18 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -39,7 +46,9 @@ class LambdaVersionAliasCfnProvisionerTest {
 
     private final LambdaService lambda = mock(LambdaService.class);
     private final ProvisionedConcurrencyPool concurrency = mock(ProvisionedConcurrencyPool.class);
-    private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(lambda, concurrency);
+    private final LambdaAliasDeployment deployments = mock(LambdaAliasDeployment.class);
+    private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(
+            lambda, concurrency, deployments);
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
@@ -121,6 +130,123 @@ class LambdaVersionAliasCfnProvisionerTest {
         assertEquals(ALIAS_ARN, r.getAttributes().get("AliasArn"));
     }
 
+    private ObjectNode updatePolicy(String group) {
+        ObjectNode policy = mapper.createObjectNode();
+        policy.putObject("CodeDeployLambdaAliasUpdate")
+                .put("ApplicationName", "application").put("DeploymentGroupName", group);
+        return policy;
+    }
+
+    private ProvisionContext updateContext(JsonNode policy, JsonNode priorPolicy) {
+        ProvisionContext create = ctx();
+        return new ProvisionContext(create.engine(), create.region(), create.accountId(), create.stackName(),
+                ALIAS_ARN, event -> {}, mapper.createObjectNode(), policy, priorPolicy);
+    }
+
+    private ObjectNode aliasProperties() {
+        return mapper.createObjectNode().put("FunctionName", "my-fn").put("Name", "production")
+                .put("FunctionVersion", "3").put("Description", "changed");
+    }
+
+    @Test
+    void rollbackRestoresTheActualAliasAndCapacityUsingThePriorDeploymentPolicy() {
+        LambdaAlias prior = alias("2");
+        prior.setDescription("previous");
+        prior.setRoutingConfig(Map.of("1", 0.25));
+        LambdaAlias updated = alias("3");
+        when(lambda.getAlias("us-east-1", "my-fn", "production")).thenReturn(prior, updated);
+        when(lambda.updateAlias(any(), any(), any(), any(), any(), any())).thenReturn(updated);
+        when(concurrency.get("us-east-1", "my-fn", "production", "000000000000"))
+                .thenReturn(capacity("READY", 2, null));
+        when(concurrency.put("us-east-1", "my-fn", "production", 2, "000000000000"))
+                .thenReturn(capacity("READY", 2, null));
+        JsonNode policy = updatePolicy("new-group");
+        JsonNode priorPolicy = updatePolicy("previous-group");
+        StackResource resource = resource("AWS::Lambda::Alias", "Alias");
+        resource.setPhysicalId(ALIAS_ARN);
+
+        provisioner.provision(resource, aliasProperties(), updateContext(policy, priorPolicy));
+        assertTrue(provisioner.rollbackUpdate(resource, event -> {}));
+
+        InOrder order = inOrder(deployments, lambda, concurrency);
+        order.verify(deployments).shift(eq(resource), eq("us-east-1"), eq(prior), eq("3"),
+                eq(policy.get("CodeDeployLambdaAliasUpdate")), any());
+        order.verify(lambda).updateAlias("us-east-1", "my-fn", "production", "3", "changed", Map.of());
+        order.verify(deployments).stopBeforeRestore(eq(resource), eq("us-east-1"), any());
+        order.verify(deployments).shift(eq(resource), eq("us-east-1"), eq(updated), eq("2"),
+                eq(priorPolicy.get("CodeDeployLambdaAliasUpdate")), any());
+        order.verify(lambda).updateAlias("us-east-1", "my-fn", "production", "2", "previous", Map.of("1", 0.25));
+        order.verify(concurrency).put("us-east-1", "my-fn", "production", 2, "000000000000");
+        verify(lambda, never()).createAlias(any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void failedRestorationRetainsTheDeploymentAndSnapshotForRollbackRetry() {
+        LambdaAlias prior = alias("2");
+        when(lambda.getAlias("us-east-1", "my-fn", "production")).thenReturn(prior, alias("3"));
+        noProvisionedConcurrency();
+        JsonNode policy = updatePolicy("new-group");
+        JsonNode priorPolicy = updatePolicy("previous-group");
+        IllegalStateException failure = new IllegalStateException("post-traffic hook failed");
+        doAnswer(invocation -> {
+            StackResource resource = invocation.getArgument(0);
+            resource.getAttributes().put(LambdaAliasDeployment.DEPLOYMENT_ATTR, "forward-deployment");
+            throw failure;
+        }).when(deployments).shift(any(), any(), any(), eq("3"), any(), any());
+        doThrow(new IllegalStateException("deployment has not stopped")).doNothing()
+                .when(deployments).stopBeforeRestore(any(), any(), any());
+        StackResource attempted = resource("AWS::Lambda::Alias", "Alias");
+        attempted.setPhysicalId(ALIAS_ARN);
+
+        assertSame(failure, assertThrows(IllegalStateException.class, () ->
+                provisioner.provision(attempted, aliasProperties(), updateContext(policy, priorPolicy))));
+        assertEquals(1, failure.getSuppressed().length);
+        assertTrue(attempted.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+        verify(lambda, never()).updateAlias(any(), any(), any(), any(), any(), any());
+
+        StackResource restored = resource("AWS::Lambda::Alias", "Alias");
+        restored.setPhysicalId(ALIAS_ARN);
+        provisioner.mergeFailedUpdateResourceTracking(restored, attempted);
+        assertEquals("forward-deployment", restored.getAttributes().get(LambdaAliasDeployment.DEPLOYMENT_ATTR));
+        LambdaVersionAliasCfnProvisioner retry = new LambdaVersionAliasCfnProvisioner(lambda, concurrency, deployments);
+        assertTrue(retry.rollbackUpdate(restored, event -> {}));
+        verify(deployments).shift(eq(restored), eq("us-east-1"), any(), eq("2"),
+                eq(priorPolicy.get("CodeDeployLambdaAliasUpdate")), any());
+        verify(lambda).updateAlias("us-east-1", "my-fn", "production", "2", "", Map.of());
+        verify(concurrency).delete("us-east-1", "my-fn", "production", "000000000000");
+        assertFalse(restored.getAttributes().containsKey(LambdaAliasDeployment.DEPLOYMENT_ATTR));
+    }
+
+    private void noProvisionedConcurrency() {
+        when(concurrency.get("us-east-1", "my-fn", "production", "000000000000"))
+                .thenThrow(new AwsException("ProvisionedConcurrencyConfigNotFoundException",
+                        "No Provisioned Concurrency Config found for this function", 404));
+    }
+
+    @Test
+    void aliasWithoutProvisionedConcurrencyCanUpdateAndRollBack() {
+        noProvisionedConcurrency();
+        when(lambda.getAlias("us-east-1", "my-fn", "production")).thenReturn(alias("2"), alias("3"));
+        when(lambda.updateAlias(any(), any(), any(), any(), any(), any())).thenReturn(alias("3"));
+        StackResource resource = resource("AWS::Lambda::Alias", "Alias");
+        resource.setPhysicalId(ALIAS_ARN);
+        provisioner.provision(resource, aliasProperties(), updateContext(null, null));
+        assertTrue(provisioner.rollbackUpdate(resource, event -> {}));
+        verify(lambda).updateAlias("us-east-1", "my-fn", "production", "3", "changed", Map.of());
+        verify(lambda).updateAlias("us-east-1", "my-fn", "production", "2", "", Map.of());
+        verify(concurrency).delete("us-east-1", "my-fn", "production", "000000000000");
+    }
+
+    @Test
+    void initialCreationWithAnUpdatePolicyDoesNotRunCodeDeploy() {
+        when(lambda.createAlias(any(), any(), any(), any(), any(), any())).thenReturn(alias("3"));
+        ProvisionContext create = ctx();
+        ProvisionContext context = new ProvisionContext(create.engine(), create.region(), create.accountId(),
+                create.stackName(), null, event -> {}, null, updatePolicy("group"), null);
+        provisioner.provision(resource("AWS::Lambda::Alias", "Alias"), aliasProperties(), context);
+        verifyNoInteractions(deployments);
+    }
+
     @Test
     void invalidProvisionedConcurrencyFailsBeforeCreatingTheAlias() throws Exception {
         when(lambda.createAlias(any(), any(), any(), any(), any(), any())).thenReturn(alias("3"));
@@ -176,7 +302,7 @@ class LambdaVersionAliasCfnProvisionerTest {
         when(concurrency.put("us-east-1", "my-fn", "production", 2, "000000000000"))
                 .thenReturn(capacity("IN_PROGRESS", 0, null));
         LambdaVersionAliasCfnProvisioner bounded = new LambdaVersionAliasCfnProvisioner(
-                lambda, concurrency, Duration.ZERO);
+                lambda, concurrency, mock(LambdaAliasDeployment.class), Duration.ZERO);
         assertThrows(AwsException.class,
                 () -> bounded.provision(resource("AWS::Lambda::Alias", "Alias"), props, ctx()));
         Mockito.verify(concurrency, Mockito.never()).get(any(), any(), any(), any());
@@ -207,6 +333,11 @@ class LambdaVersionAliasCfnProvisionerTest {
         ProvisionContext create = ctx();
         ProvisionContext update = new ProvisionContext(create.engine(), create.region(), create.accountId(),
                 create.stackName(), ALIAS_ARN, event -> {}, prior);
+        when(lambda.getAlias("us-east-1", "my-fn", "production")).thenReturn(alias("3"));
+        when(concurrency.get("us-east-1", "my-fn", "production", "000000000000"))
+                .thenReturn(capacity("READY", 2, null));
+        when(lambda.updateAlias(eq("us-east-1"), eq("my-fn"), eq("production"), eq("3"), eq(""), eq(Map.of())))
+                .thenReturn(alias("3"));
         provisioner.provision(resource("AWS::Lambda::Alias", "Alias"), next, update);
         verify(concurrency).delete("us-east-1", "my-fn", "production", "000000000000");
     }
