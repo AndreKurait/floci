@@ -3,11 +3,14 @@ package io.github.hectorvent.floci.services.cloudwatch.metrics;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -250,5 +253,47 @@ class AlarmEvaluatorTest {
         verify(metricsService, never()).setAlarmState(
                 anyString(), anyString(), anyString(), any(), anyString());
         verify(handler).handle(eq(POLICY_ARN), eq(alarm), eq(80.0), eq(REGION));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void lowSamplesOutsideTheSelectedPeriodsDoNotSuppressEvaluation(boolean lowLatest) {
+        MetricAlarm alarm = alarm();
+        alarm.setStatistic(null);
+        alarm.setExtendedStatistic("p99");
+        alarm.setEvaluateLowSampleCountPercentile("ignore");
+        alarm.setEvaluationPeriods(2);
+        alarm.setStateValue("OK");
+        alarm.setActionsEnabled(false);
+        long latest = Instant.now().getEpochSecond() / 60 * 60 - 60;
+        List<CloudWatchMetricsService.Datapoint> points = new ArrayList<>();
+        for (int index = 0; index < 3; index++) {
+            double count = index == (lowLatest ? 2 : 0) ? 999 : 1000;
+            points.add(new CloudWatchMetricsService.Datapoint(Instant.ofEpochSecond(latest - (2 - index) * 60L),
+                    count, count * 80, 80, 80, 80, "Percent", Map.of("p99", 80.0)));
+        }
+        stubMetrics(points);
+        evaluator.evaluate(alarm);
+        if (lowLatest) {
+            verify(metricsService, never()).setAlarmState(anyString(), anyString(), anyString(), any(), anyString());
+        } else {
+            verify(metricsService).setAlarmState(eq(alarm.getAlarmName()), eq("ALARM"), anyString(), any(), eq(REGION));
+        }
+    }
+
+    @Test
+    void lowSampleHoldDoesNotDispatchAnUnqualifiedBreachValue() {
+        MetricAlarm alarm = alarm();
+        alarm.setStatistic(null);
+        alarm.setExtendedStatistic("p99");
+        alarm.setEvaluateLowSampleCountPercentile("ignore");
+        alarm.setStateValue("ALARM");
+        stubMetrics(List.of(new CloudWatchMetricsService.Datapoint(Instant.now().minusSeconds(60),
+                1, 80, 80, 80, 80, "Percent", Map.of("p99", 80.0))));
+        when(handlers.iterator()).thenAnswer(inv -> List.of(handler).iterator());
+        when(handler.supports(POLICY_ARN)).thenReturn(true);
+        evaluator.evaluate(alarm);
+        verify(metricsService, never()).setAlarmState(anyString(), anyString(), anyString(), any(), anyString());
+        verify(handler).handle(eq(POLICY_ARN), eq(alarm), eq(Double.NaN), eq(REGION));
     }
 }

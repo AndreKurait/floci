@@ -18,6 +18,7 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.w3c.dom.Document;
 
@@ -126,14 +127,15 @@ class CloudWatchPercentileAlarmTest {
         assertThrows(AwsException.class, () -> statistics(percentile));
     }
 
-    @Test
-    void jsonAndQueryRoundTripPercentileSelectionWithoutInventingAnOrdinaryStatistic() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"evaluate", "ignore"})
+    void jsonAndQueryRoundTripPercentileSelectionWithoutInventingAnOrdinaryStatistic(String policy) throws Exception {
         ObjectNode request = alarmRequest();
-        request.put("EvaluateLowSampleCountPercentile", "evaluate");
+        request.put("EvaluateLowSampleCountPercentile", policy);
         json.handle("PutMetricAlarm", request, REGION);
         JsonNode result = jsonAlarm();
         assertEquals("p90", result.path("ExtendedStatistic").asText());
-        assertEquals("evaluate", result.path("EvaluateLowSampleCountPercentile").asText());
+        assertEquals(policy, result.path("EvaluateLowSampleCountPercentile").asText());
         assertFalse(result.has("Statistic"));
 
         MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
@@ -143,12 +145,14 @@ class CloudWatchPercentileAlarmTest {
         Document xml = XmlParser.parseDocument(
                 (String) query.handle("DescribeAlarms", new MultivaluedHashMap<>(), REGION).getEntity());
         assertEquals("p50", xml.getElementsByTagName("ExtendedStatistic").item(0).getTextContent());
+        assertEquals(policy, xml.getElementsByTagName("EvaluateLowSampleCountPercentile").item(0).getTextContent());
         assertEquals(0, xml.getElementsByTagName("Statistic").getLength());
         assertEquals("p50", jsonAlarm().path("ExtendedStatistic").asText());
 
         MetricAlarm original = service.describeAlarms(List.of("latency"), null, REGION).getFirst();
         MetricAlarm loaded = MAPPER.readValue(MAPPER.writeValueAsBytes(original), MetricAlarm.class);
         assertEquals("p50", loaded.getExtendedStatistic());
+        assertEquals(policy, loaded.getEvaluateLowSampleCountPercentile());
         assertNull(loaded.getStatistic());
     }
 
@@ -187,9 +191,67 @@ class CloudWatchPercentileAlarmTest {
         json.handle("PutMetricAlarm", alarmRequest(), REGION);
         ObjectNode mixed = alarmRequest().put("Statistic", "Average");
         assertThrows(AwsException.class, () -> json.handle("PutMetricAlarm", mixed, REGION));
-        ObjectNode unsupported = alarmRequest().put("EvaluateLowSampleCountPercentile", "ignore");
+        ObjectNode unsupported = alarmRequest().put("EvaluateLowSampleCountPercentile", "invalid");
         assertThrows(AwsException.class, () -> json.handle("PutMetricAlarm", unsupported, REGION));
         assertEquals("p90", jsonAlarm().path("ExtendedStatistic").asText());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"p99,1000,OK,1000,ALARM", "p99,1000,ALARM,10,OK",
+            "p99.9,10000,OK,1000,ALARM", "p50,20,OK,1000,ALARM", "p10,100,OK,1000,ALARM"})
+    @SuppressWarnings("unchecked")
+    void ignoreKeepsStateUntilThePeriodHasEnoughSamples(
+            String percentile, int requiredSamples, String before, double value, String after) {
+        json.handle("PutMetricAlarm", alarmRequest().put("ExtendedStatistic", percentile), REGION);
+        MetricAlarm alarm = service.describeAlarms(List.of("latency"), null, REGION).getFirst();
+        // Exercise evaluation separately from admission, including on previously stored alarms.
+        alarm.setEvaluateLowSampleCountPercentile("ignore");
+        alarm.setActionsEnabled(false);
+        service.setAlarmState("latency", before, "prior state", null, REGION);
+        long timestamp = Instant.now().getEpochSecond() / 60 * 60 - 30;
+        MetricDatum sample = repeated(value, requiredSamples - 1);
+        sample.setTimestamp(timestamp);
+        service.putMetricData(NAMESPACE, List.of(sample), REGION);
+        AlarmEvaluator evaluator = new AlarmEvaluator(service, mock(Instance.class));
+        try {
+            evaluator.evaluate(alarm);
+            assertEquals(before, alarm.getStateValue());
+            assertEquals("prior state", alarm.getStateReason());
+            service.putMetricData(NAMESPACE, List.of(scalar(value, timestamp)), REGION);
+            evaluator.evaluate(alarm);
+            assertEquals(after, alarm.getStateValue());
+        } finally {
+            evaluator.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"evaluate", "default", "ordinary"})
+    @SuppressWarnings("unchecked")
+    void lowSamplePolicyDoesNotSuppressDefaultEvaluationOrOrdinaryStatistics(String selection) {
+        ObjectNode request = alarmRequest();
+        if ("ordinary".equals(selection)) {
+            request.remove("ExtendedStatistic");
+            request.put("Statistic", "Average");
+        }
+        json.handle("PutMetricAlarm", request, REGION);
+        MetricAlarm alarm = service.describeAlarms(List.of("latency"), null, REGION).getFirst();
+        alarm.setEvaluateLowSampleCountPercentile(switch (selection) {
+            case "evaluate" -> "evaluate";
+            case "ordinary" -> "ignore";
+            default -> null;
+        });
+        alarm.setActionsEnabled(false);
+        service.setAlarmState("latency", "OK", "prior state", null, REGION);
+        long timestamp = Instant.now().getEpochSecond() / 60 * 60 - 30;
+        service.putMetricData(NAMESPACE, List.of(scalar(1000, timestamp)), REGION);
+        AlarmEvaluator evaluator = new AlarmEvaluator(service, mock(Instance.class));
+        try {
+            evaluator.evaluate(alarm);
+            assertEquals("ALARM", alarm.getStateValue());
+        } finally {
+            evaluator.stop();
+        }
     }
 
     @Test

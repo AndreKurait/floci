@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 
+import java.math.BigDecimal;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,6 +27,15 @@ final class MetricPercentiles {
             throw CloudWatchMetricsException.invalidParameterValue("Percentile must be between p0 and p100.");
         }
         return value;
+    }
+
+    static boolean lowSampleCount(String statistic, double count) {
+        percentile(statistic);
+        BigDecimal value = new BigDecimal(statistic.substring(1));
+        BigDecimal tail = value.min(BigDecimal.valueOf(100).subtract(value));
+        // Decimal arithmetic keeps the documented boundary exact, including p99.9 at 10,000 samples.
+        return tail.signum() > 0
+                && BigDecimal.valueOf(count).multiply(tail).compareTo(BigDecimal.valueOf(1000)) < 0;
     }
 
     static List<String> selection(List<String> statistics, List<String> extended) {

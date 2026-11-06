@@ -167,15 +167,29 @@ def test_percentile_does_not_invent_missing_distribution_data(percentile_scope, 
     assert len(_read_statistics(scope, "Unavailable", timestamp, Statistics=["Maximum"])) == 1
 
 
+def test_percentile_low_sample_policy_round_trips_and_updates(percentile_scope):
+    scope = percentile_scope
+    client = scope["client"]
+    scope["cleanup"].callback(client.delete_alarms, AlarmNames=[scope["name"]])
+    for policy in ("ignore", "evaluate"):
+        client.put_metric_alarm(**_alarm(scope, EvaluateLowSampleCountPercentile=policy))
+        described = _read_alarm(scope)
+        assert described["EvaluateLowSampleCountPercentile"] == policy
+        assert described["ExtendedStatistic"] == "p90"
+
+
 def test_percentile_invalid_selection_preserves_existing_alarm(percentile_scope):
     scope = percentile_scope
     client = scope["client"]
     client.put_metric_alarm(**_alarm(scope))
     scope["cleanup"].callback(client.delete_alarms, AlarmNames=[scope["name"]])
+    before = _read_alarm(scope)
     for changes in ({"Statistic": "Average"}, {"ExtendedStatistic": "p101"},
-                    {"EvaluateLowSampleCountPercentile": "ignore"}):
+                    {"EvaluateLowSampleCountPercentile": "invalid"}):
         with pytest.raises(ClientError):
             client.put_metric_alarm(**_alarm(scope, **changes))
-        assert _read_alarm(scope)["ExtendedStatistic"] == "p90"
+        after = _read_alarm(scope)
+        assert after["ExtendedStatistic"] == "p90"
+        assert after.get("EvaluateLowSampleCountPercentile") == before.get("EvaluateLowSampleCountPercentile")
     with pytest.raises(ClientError):
         _read_statistics(scope, "Latency", _timestamp(), Statistics=["Maximum"], ExtendedStatistics=["p90"])

@@ -546,8 +546,15 @@ It does not expand repeated samples in memory. Periods containing negative value
 sets with an unrecoverable distribution have no percentile datapoint. Exact AWS interpolation
 and precision have not been qualified.
 
-Omitted `EvaluateLowSampleCountPercentile` and explicit `evaluate` are supported. The `ignore`
-policy is rejected because suppression for statistically insignificant samples is not implemented.
+Omitted `EvaluateLowSampleCountPercentile` and explicit `evaluate` evaluate all available samples.
+For direct percentile alarms, `ignore` preserves the existing state when a selected real evaluation
+period has too few samples. It uses the documented minimum of `10/(1-p)` for `0.5 <= p < 1`
+and `10/p` for `0 < p < 0.5`: p99 requires 1,000 samples and p99.9 requires 10,000.
+Endpoints p0 and p100 retain their ordinary evaluation behavior. Older datapoints outside the
+selected evaluation periods do not suppress evaluation, and periods without a percentile datapoint
+retain their configured `TreatMissingData` behavior. Suppression for percentile inputs inside metric
+math expressions is not modeled. See
+[percentile alarms and low samples](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/percentiles-with-low-samples.html).
 Other extended statistics, such as trimmed means, and the console API's `ExtendedStatistics`
 request shape remain unsupported.
 

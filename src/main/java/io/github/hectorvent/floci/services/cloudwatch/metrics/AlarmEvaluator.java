@@ -14,6 +14,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -124,12 +125,20 @@ public class AlarmEvaluator {
         Instant start = Instant.ofEpochSecond(oldestBucket);
         Instant end = Instant.ofEpochSecond(lastCompleteBucket + period - 1);
         Map<Instant, Double> samples = new HashMap<>();
+        boolean ignoreLowSamples = false;
         if (math == null) {
             String statistic = alarm.getExtendedStatistic() != null
                     ? alarm.getExtendedStatistic() : alarm.getStatistic();
-            for (CloudWatchMetricsService.Datapoint point : metricsService.getMetricStatistics(
+            List<CloudWatchMetricsService.Datapoint> points = metricsService.getMetricStatistics(
                     alarm.getNamespace(), alarm.getMetricName(), alarm.getDimensions(),
-                    start, end, period, List.of(statistic), alarm.getUnit(), region)) {
+                    start, end, period, List.of(statistic), alarm.getUnit(), region);
+            if (alarm.getExtendedStatistic() != null && "ignore".equals(alarm.getEvaluateLowSampleCountPercentile())) {
+                ignoreLowSamples = points.stream()
+                        .sorted(Comparator.comparing(CloudWatchMetricsService.Datapoint::timestamp).reversed())
+                        .limit(evaluationPeriods)
+                        .anyMatch(point -> MetricPercentiles.lowSampleCount(statistic, point.sampleCount()));
+            }
+            for (CloudWatchMetricsService.Datapoint point : points) {
                 samples.put(point.timestamp(), CloudWatchMetricsService.resolveStatValue(point, statistic));
             }
         } else {
@@ -158,7 +167,11 @@ public class AlarmEvaluator {
         String newState;
         String reason;
         double latestValue;
-        if (real.size() >= evaluationPeriods) {
+        if (ignoreLowSamples) {
+            newState = alarm.getStateValue();
+            reason = alarm.getStateReason();
+            latestValue = Double.NaN;
+        } else if (real.size() >= evaluationPeriods) {
             List<Double> evaluated = real.subList(real.size() - evaluationPeriods, real.size());
             int breaching = countBreaches(evaluated, alarm);
             latestValue = latestBreachingValue(evaluated, alarm);
