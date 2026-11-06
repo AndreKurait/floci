@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
@@ -56,7 +57,8 @@ class Ec2SystemdV1RuntimeTest {
 
     @Test
     void validatesOwnedScopeWithoutChangingDockerState() {
-        assertEquals("floci-" + "a".repeat(32), runtime.requireHelper(helper(labels()), "i-owned", "eu-west-1"));
+        assertEquals("floci-" + "a".repeat(32),
+                runtime.requireHelper(helper(labels()), "i-owned", "eu-west-1", "123456789012"));
         verifyNoInteractions(docker, lifecycle);
     }
 
@@ -88,12 +90,63 @@ class Ec2SystemdV1RuntimeTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"io.floci.owner", "io.floci.service", "io.floci.resource-id", "io.floci.region"})
+    @ValueSource(strings = {"io.floci.owner", "io.floci.service", "io.floci.account",
+            "io.floci.resource-id", "io.floci.region"})
     void refusesChangedHelperIdentity(String key) {
         Map<String, String> labels = labels();
         labels.put(key, "foreign");
         assertThrows(IllegalStateException.class,
-                () -> runtime.requireHelper(helper(labels), "i-owned", "eu-west-1"));
+                () -> runtime.requireHelper(helper(labels), "i-owned", "eu-west-1", "123456789012"));
+        verifyNoInteractions(docker, lifecycle);
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {"210987654321"})
+    void aRestoredGuestMustBelongToItsInstancesAccount(String account) {
+        Map<String, String> labels = labels();
+        labels.put(ContainerStorageHelper.SERVICE_LABEL, "ec2");
+        labels.put(Ec2SystemdV1Runtime.RUNTIME_LABEL, ResolvedAmiImage.SYSTEMD_V1_RUNTIME);
+        if (account == null) {
+            labels.remove(ContainerStorageHelper.ACCOUNT_LABEL);
+        } else {
+            labels.put(ContainerStorageHelper.ACCOUNT_LABEL, account);
+        }
+        assertThrows(IllegalStateException.class, () -> runtime.rememberGuest(instance(), helper(labels)));
+        verifyNoInteractions(docker, lifecycle);
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    void aGuestCannotBeRestoredWithoutItsDeclaredAccount(String account) {
+        Instance instance = instance();
+        instance.setOwnerId(account);
+        Map<String, String> labels = labels();
+        labels.put(ContainerStorageHelper.SERVICE_LABEL, "ec2");
+        labels.put(Ec2SystemdV1Runtime.RUNTIME_LABEL, ResolvedAmiImage.SYSTEMD_V1_RUNTIME);
+        assertThrows(IllegalStateException.class, () -> runtime.rememberGuest(instance, helper(labels)));
+        verifyNoInteractions(docker, lifecycle);
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    void anInitHelperCannotBeAdoptedWithoutItsDeclaredAccount(String account) {
+        assertThrows(IllegalStateException.class,
+                () -> runtime.requireHelper(helper(labels()), "i-owned", "eu-west-1", account));
+        verifyNoInteractions(docker, lifecycle);
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    void anInitHelperMustCarryItsAccountIdentity(String account) {
+        Map<String, String> labels = labels();
+        if (account == null) {
+            labels.remove(ContainerStorageHelper.ACCOUNT_LABEL);
+        } else {
+            labels.put(ContainerStorageHelper.ACCOUNT_LABEL, account);
+        }
+        assertThrows(IllegalStateException.class,
+                () -> runtime.requireHelper(helper(labels), "i-owned", "eu-west-1", "123456789012"));
         verifyNoInteractions(docker, lifecycle);
     }
 
@@ -104,7 +157,7 @@ class Ec2SystemdV1RuntimeTest {
         Map<String, String> labels = labels();
         labels.put(Ec2SystemdV1Runtime.SCOPE_LABEL, scope);
         assertThrows(IllegalStateException.class,
-                () -> runtime.requireHelper(helper(labels), "i-owned", "eu-west-1"));
+                () -> runtime.requireHelper(helper(labels), "i-owned", "eu-west-1", "123456789012"));
         verifyNoInteractions(docker, lifecycle);
     }
 
@@ -124,6 +177,7 @@ class Ec2SystemdV1RuntimeTest {
         return new HashMap<>(Map.of(
                 ContainerStorageHelper.OWNER_LABEL, "owner/4566",
                 ContainerStorageHelper.SERVICE_LABEL, Ec2SystemdV1Runtime.SERVICE,
+                ContainerStorageHelper.ACCOUNT_LABEL, "123456789012",
                 ContainerStorageHelper.RESOURCE_ID_LABEL, "i-owned",
                 ContainerStorageHelper.REGION_LABEL, "eu-west-1",
                 Ec2SystemdV1Runtime.SCOPE_LABEL, "floci-" + "a".repeat(32)));
@@ -132,6 +186,7 @@ class Ec2SystemdV1RuntimeTest {
     private Instance instance() {
         Instance instance = new Instance();
         instance.setInstanceId("i-owned");
+        instance.setOwnerId("123456789012");
         instance.setRegion("eu-west-1");
         return instance;
     }

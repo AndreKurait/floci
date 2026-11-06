@@ -68,7 +68,7 @@ final class Ec2SystemdV1Runtime {
         String name = name(instance.getInstanceId());
         try {
             InspectContainerResponse existing = docker.inspectContainerCmd(name).exec();
-            String scope = requireHelper(existing, instance.getInstanceId(), region);
+            String scope = requireHelper(existing, instance.getInstanceId(), region, accountId);
             helpers.put(instance.getInstanceId(), existing.getId());
             ensureMounted(existing, scope);
             return;
@@ -107,6 +107,8 @@ final class Ec2SystemdV1Runtime {
         if (!ContainerStorageHelper.CONTAINER_LABEL_ALIASES.consistent(guest.getId(), labels)
                 || !"ec2".equals(labels.get(ContainerStorageHelper.SERVICE_LABEL))
                 || !owner().equals(labels.get(ContainerStorageHelper.OWNER_LABEL))
+                || instance.getOwnerId() == null || instance.getOwnerId().isBlank()
+                || !instance.getOwnerId().equals(labels.get(ContainerStorageHelper.ACCOUNT_LABEL))
                 || !instance.getInstanceId().equals(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))
                 || !instance.getRegion().equals(labels.get(ContainerStorageHelper.REGION_LABEL))) {
             throw new IllegalStateException("EC2 init guest ownership changed");
@@ -134,7 +136,7 @@ final class Ec2SystemdV1Runtime {
             throw new IllegalStateException("EC2 init guest has no running PID");
         }
         InspectContainerResponse helper = docker.inspectContainerCmd(name(instance.getInstanceId())).exec();
-        String scope = requireHelper(helper, instance.getInstanceId(), instance.getRegion());
+        String scope = requireHelper(helper, instance.getInstanceId(), instance.getRegion(), instance.getOwnerId());
         ensureMounted(helper, scope);
         String staging = "/.floci-ec2-init-" + UUID.randomUUID();
         try (InputStream archive = docker.copyArchiveFromContainerCmd(helper.getId(), BINARY).exec()) {
@@ -190,7 +192,7 @@ final class Ec2SystemdV1Runtime {
             throw new IllegalStateException("EC2 init helper disappeared before its service hierarchy was retired",
                     expected);
         }
-        remove(helper, instance.getInstanceId(), instance.getRegion());
+        remove(helper, instance.getInstanceId(), instance.getRegion(), instance.getOwnerId());
         helpers.remove(instance.getInstanceId());
     }
 
@@ -207,17 +209,18 @@ final class Ec2SystemdV1Runtime {
             Map<String, String> labels = helper.getConfig().getLabels();
             String instance = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
             String region = labels.get(ContainerStorageHelper.REGION_LABEL);
-            requireHelper(helper, instance, region);
+            String account = labels.get(ContainerStorageHelper.ACCOUNT_LABEL);
+            requireHelper(helper, instance, region, account);
             if (!stillDeclared.test(region, instance)) {
-                remove(helper, instance, region);
+                remove(helper, instance, region, account);
             } else {
                 helpers.put(instance, helper.getId());
             }
         }
     }
 
-    private void remove(InspectContainerResponse helper, String instance, String region) {
-        String scope = requireHelper(helper, instance, region);
+    private void remove(InspectContainerResponse helper, String instance, String region, String account) {
+        String scope = requireHelper(helper, instance, region, account);
         if (!Boolean.TRUE.equals(helper.getState().getRunning())) {
             docker.startContainerCmd(helper.getId()).exec();
         }
@@ -253,12 +256,14 @@ final class Ec2SystemdV1Runtime {
         lifecycle.removeIfExistsStrict(helper.getId());
     }
 
-    String requireHelper(InspectContainerResponse helper, String instance, String region) {
+    String requireHelper(InspectContainerResponse helper, String instance, String region, String account) {
         Map<String, String> labels = helper.getConfig().getLabels();
         if (labels == null || instance == null || region == null
+                || account == null || account.isBlank()
                 || !ContainerStorageHelper.CONTAINER_LABEL_ALIASES.consistent(helper.getId(), labels)
                 || !SERVICE.equals(labels.get(ContainerStorageHelper.SERVICE_LABEL))
                 || !owner().equals(labels.get(ContainerStorageHelper.OWNER_LABEL))
+                || !account.equals(labels.get(ContainerStorageHelper.ACCOUNT_LABEL))
                 || !instance.equals(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))
                 || !region.equals(labels.get(ContainerStorageHelper.REGION_LABEL))) {
             throw new IllegalStateException("EC2 init helper ownership changed");
