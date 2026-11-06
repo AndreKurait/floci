@@ -1,6 +1,5 @@
 AWS::ApiGateway::ApiKey	StageKeys	accepted and ignored, as the ApiGatewayApiKeyCfnProvisioner javadoc records
 AWS::ApiGateway::Authorizer	AuthType	accepted and ignored
-AWS::ApiGateway::Authorizer	AuthorizerCredentials	accepted and ignored
 AWS::ApiGateway::Authorizer	IdentityValidationExpression	accepted and ignored
 AWS::ApiGateway::Deployment	DeploymentCanarySettings	accepted and ignored
 AWS::ApiGateway::DomainName	EndpointAccessMode	accepted and ignored, as the ApiGatewayDomainCfnProvisioner javadoc records
