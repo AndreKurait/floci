@@ -79,6 +79,17 @@
     "LocationUri",
     "Type"
   ],
+  "AWS::AppConfig::Deployment": [
+    "ApplicationId",
+    "ConfigurationProfileId",
+    "ConfigurationVersion",
+    "DeploymentStrategyId",
+    "Description",
+    "DynamicExtensionParameters",
+    "EnvironmentId",
+    "KmsKeyIdentifier",
+    "Tags"
+  ],
   "AWS::AppConfig::DeploymentStrategy": [
     "Name",
     "ReplicateTo"

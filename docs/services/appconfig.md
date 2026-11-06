@@ -128,6 +128,7 @@ Floci provisions these resource types:
 - `AWS::AppConfig::ConfigurationProfile`
 - `AWS::AppConfig::DeploymentStrategy`
 - `AWS::AppConfig::HostedConfigurationVersion`
+- `AWS::AppConfig::Deployment`
 
 For the first four types, `Ref` returns the AppConfig ID, which `Fn::GetAtt` also returns as `ApplicationId`, `EnvironmentId`,
 `ConfigurationProfileId` and `Id`. A configuration profile's `KmsKeyArn` is not set.
@@ -145,6 +146,20 @@ keeps it; rollback deletes the new version and restores the original resource.
 `LatestVersionNumber` and `VersionLabel` are rejected before creation because the
 management service does not implement them.
 
+Deployment creation waits for AppConfig's `COMPLETE` state, preserving the strategy's
+rollout and final bake durations. `Fn::GetAtt DeploymentNumber` is a string and `State`
+reports completion. The physical identity and `Ref` include application, environment
+and deployment number. Rollback or revert during creation fails the stack resource;
+the wait is interruptible and bounded to 24 hours.
+
+Changing deployment properties creates a new deployment. Stack deletion and failed
+updates use `StopDeployment` with `AllowRevert=true`. Deleting a displaced deployment
+does not revert a newer one. Already reverted deployments and deployments outside
+their 72-hour revert window need no further change. Other failures, including missing
+prior configuration content, propagate instead of reporting successful cleanup.
+`KmsKeyIdentifier`, `DynamicExtensionParameters` and deployment `Tags` are rejected.
+This lifecycle does not add alarm evaluation or gradual per-client content delivery.
+
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
 description of an application, environment or configuration profile, an environment's `Monitors`, an application's
 `Tags`, and a deployment strategy's description, duration, final bake time, growth factor and growth type. A property
@@ -158,7 +173,7 @@ Deleting an environment deletes its deployments, and deleting a configuration pr
 versions. Floci keeps tags on applications only, so `Tags` on the other three types are accepted and not stored, as
 `TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier`, `RetrievalRoleArn` and `Validators`,
 and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
-`AWS::AppConfig::Deployment`, `Extension` and `ExtensionAssociation` are not provisioned.
+`AWS::AppConfig::Extension` and `ExtensionAssociation` are not provisioned.
 
 A stack created before Floci provisioned these types holds stubs for them, and an update creates the real resource in
 place of a stub only when it changes that resource. An update that changes an environment or configuration profile of

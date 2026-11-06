@@ -665,12 +665,20 @@ public class AppConfigService {
         String state = deployment.getState();
         boolean completed = "COMPLETE".equals(state);
         if (!"DEPLOYING".equals(state) && !(allowRevert && ("BAKING".equals(state) || completed))) {
+            if ("ROLLED_BACK".equals(state) || "REVERTED".equals(state)) {
+                throw new DeploymentStopException(DeploymentStopException.Reason.ALREADY_REVERTED,
+                        "The deployment cannot be stopped in its current state.");
+            }
             throw new AwsException("BadRequestException", "The deployment cannot be stopped in its current state.", 400);
         }
-        if (completed && (deployment.getCompletedAt() == null
-                || clock.instant().isAfter(Instant.parse(deployment.getCompletedAt()).plus(Duration.ofHours(72))))) {
+        if (completed && deployment.getCompletedAt() == null) {
             throw new AwsException("BadRequestException",
                     "A completed deployment can only be reverted within 72 hours of its recorded completion.", 400);
+        }
+        if (completed && clock.instant().isAfter(
+                Instant.parse(deployment.getCompletedAt()).plus(Duration.ofHours(72)))) {
+            throw new DeploymentStopException(DeploymentStopException.Reason.TOO_OLD,
+                    "A completed deployment can only be reverted within 72 hours of its recorded completion.");
         }
         List<Deployment> available = deploymentStore.scan(k -> true).stream()
                 .filter(row -> deployment.getApplicationId().equals(row.getApplicationId()))
@@ -681,7 +689,8 @@ public class AppConfigService {
                 .sorted(Comparator.comparingInt(Deployment::getDeploymentNumber).reversed())
                 .toList();
         if (available.isEmpty() || available.getFirst().getDeploymentNumber() != deploymentNumber) {
-            throw new AwsException("BadRequestException", "A newer deployment is active for this configuration.", 400);
+            throw new DeploymentStopException(DeploymentStopException.Reason.NOT_LATEST,
+                    "A newer deployment is active for this configuration.");
         }
         Deployment previous = available.stream()
                 .filter(row -> row.getDeploymentNumber() < deploymentNumber)
