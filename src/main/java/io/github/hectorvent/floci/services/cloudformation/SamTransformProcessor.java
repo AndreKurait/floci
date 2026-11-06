@@ -132,6 +132,7 @@ class SamTransformProcessor {
         // so expansion order between the Function and the HttpApi resource doesn't matter.
         List<HttpApiRoute> httpApiRoutes = collectHttpApiRoutes(samLogicalIds, resources);
         Map<String, String> generatedReferences = new LinkedHashMap<>();
+        SamDeploymentPreferences deployments = new SamDeploymentPreferences(objectMapper, expanded);
 
         for (String logicalId : samLogicalIds) {
             JsonNode resDef = resources.get(logicalId);
@@ -145,8 +146,11 @@ class SamTransformProcessor {
             // copyResourceLevelAttributes runs once per arm, right after that arm builds its node.
             switch (type) {
                 case "AWS::Serverless::Function" -> {
-                    String aliasId = expandServerlessFunction(logicalId, mergeGlobals(globals, "Function", properties),
+                    JsonNode functionProperties = mergeGlobals(globals, "Function", properties);
+                    String aliasId = expandServerlessFunction(logicalId, functionProperties,
                             resDef, expanded, expandedResources, parameterValues);
+                    deployments.add(logicalId, aliasId, resDef, functionProperties,
+                            value -> resolveParameterRefs(value, expanded, parameterValues));
                     if (aliasId != null) {
                         generatedReferences.put(logicalId + ".Alias", aliasId);
                     }
@@ -180,6 +184,7 @@ class SamTransformProcessor {
             }
         }
 
+        deployments.finish();
         // Synthesize the implicit REST API (RestApi + resources + methods + AWS_PROXY integrations +
         // deployment + stage + lambda permissions) for functions that declare Api events without an
         // explicit RestApiId — matching SAM's implicit-API behavior so the deployed service is reachable.
