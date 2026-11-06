@@ -666,8 +666,17 @@ Rollback uses the previous template's resolved deployment policy and restores th
 alias description, routing weights and provisioned concurrency. Failed restoration
 remains retryable through `ContinueUpdateRollback`. Deployment stabilization has a
 24-hour emulator limit; configured traffic intervals are not shortened.
-SAM `DeploymentPreference` expansion and CodeDeploy's automatic Lambda
-alarm/rollback policies remain separate gaps.
+CodeDeploy's automatic Lambda alarm/rollback policies remain a separate gap.
+
+SAM `DeploymentPreference` generates a shared CodeDeploy application, a deployment
+group per enabled function and the alias update policy above. The generated groups
+preserve deployment types, hooks, alarms and trigger configurations. A custom
+`Role` is used as declared; otherwise SAM creates the CodeDeploy service role.
+`Enabled: false` permits bootstrap without an alias or CodeDeploy resources.
+`PassthroughCondition: true` carries the function's condition to its group and
+combines conditions for the shared resources. `PropagateTags` carries function tags
+to the generated CodeDeploy resources. Declaring alarm and automatic rollback
+configuration does not yet make the Lambda deployment worker execute those policies.
 
 ## RDS Credential Dynamic References
 
