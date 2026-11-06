@@ -34,7 +34,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.Base64;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -617,6 +617,7 @@ public class AutoScalingService implements PassedRoleLookup {
                         });
             }
             cancelStandbyMoves(asg.getInstances());
+            completeTerminationActivities(asg.getInstances(), "Cancelled", "The Auto Scaling group was deleted.");
             groups.remove(key);
             instanceRefreshes.entrySet().removeIf(e -> region.equals(e.getValue().getRegion())
                     && name.equals(e.getValue().getAutoScalingGroupName()));
@@ -874,14 +875,17 @@ public class AutoScalingService implements PassedRoleLookup {
             throw new AwsException("ValidationError",
                     "HealthStatus must be Healthy or Unhealthy.", 400);
         }
-        updateGroupOfInstance(region, instanceId, asg -> asg.getInstances().stream()
-                .filter(instance -> instanceId.equals(instance.getInstanceId()))
-                .findFirst()
-                .ifPresent(instance -> instance.setHealthStatus(healthStatus)));
+        updateGroupOfInstance(region, instanceId, asg -> {
+            asg.getInstances().stream()
+                    .filter(instance -> instanceId.equals(instance.getInstanceId()))
+                    .findFirst()
+                    .ifPresent(instance -> instance.setHealthStatus(healthStatus));
+            return null;
+        });
     }
 
     /** Applies {@code update} to the group holding {@code instanceId}, under that group's lock. */
-    private void updateGroupOfInstance(String region, String instanceId, Consumer<AutoScalingGroup> update) {
+    private <T> T updateGroupOfInstance(String region, String instanceId, Function<AutoScalingGroup, T> update) {
         String name = groups.values().stream()
                 .filter(Objects::nonNull)
                 .filter(g -> region.equals(g.getRegion()) && containsInstance(g, instanceId))
@@ -895,8 +899,9 @@ public class AutoScalingService implements PassedRoleLookup {
             if (asg == null || !containsInstance(asg, instanceId)) {
                 throw instanceNotFound(instanceId);
             }
-            update.accept(asg);
+            T result = update.apply(asg);
             groups.put(key, asg);
+            return result;
         }
     }
 
@@ -1026,10 +1031,10 @@ public class AutoScalingService implements PassedRoleLookup {
             AutoScalingGroup asg = requireGroup(region, name);
             for (AsgInstance member : asg.getInstances()) {
                 // AWS detaches only InService and Standby instances. Floci does not refuse the other states yet,
-                // except for an instance whose standby move is still in progress, whatever its state: it keeps the
-                // move's activity until the reconciler completes or cancels the move.
+                // except for a member with an outstanding standby or termination activity: it keeps that
+                // activity until reconciliation completes it or group deletion cancels it.
                 boolean moving = "EnteringStandby".equals(member.getLifecycleState())
-                        || member.getStandbyActivityId() != null;
+                        || member.getStandbyActivityId() != null || member.getTerminationActivityId() != null;
                 if (moving && instanceIds.contains(member.getInstanceId())) {
                     throw new AwsException("ValidationError",
                             "The instance " + member.getInstanceId() + " is not in InService or Standby.", 400);
@@ -1055,21 +1060,45 @@ public class AutoScalingService implements PassedRoleLookup {
         }
     }
 
-    public void terminateInstanceInAutoScalingGroup(String region, String instanceId,
-                                                     boolean decrementDesiredCapacity) {
-        updateGroupOfInstance(region, instanceId, asg -> {
+    public ScalingActivity terminateInstanceInAutoScalingGroup(String region, String instanceId,
+                                                               boolean decrementDesiredCapacity) {
+        return updateGroupOfInstance(region, instanceId, asg -> {
+            AsgInstance instance = asg.getInstances().stream()
+                    .filter(member -> instanceId.equals(member.getInstanceId()))
+                    .findFirst().orElseThrow(() -> instanceNotFound(instanceId));
+            if (instance.getTerminationActivityId() != null) {
+                ScalingActivity pending = activities.get(instance.getTerminationActivityId());
+                if (pending != null) {
+                    return copyOf(pending);
+                }
+            }
+            int desired = asg.getDesiredCapacity();
+            int newDesired = decrementDesiredCapacity ? Math.max(asg.getMinSize(), desired - 1) : desired;
+            Instant now = Instant.now();
+            ScalingActivity activity = newActivity(region, asg.getAutoScalingGroupName(),
+                    "Terminating EC2 instance: " + instanceId,
+                    "At " + now.truncatedTo(ChronoUnit.SECONDS) + " instance " + instanceId
+                            + " was taken out of service in response to a user request"
+                            + (newDesired != desired ? ", shrinking the capacity from " + desired + " to " + newDesired : "")
+                            + ".", "InProgress", 0, now);
             InstanceRefresh refresh = activeInstanceRefresh(asg);
             completeInstanceRefreshIfSettled(region, asg.getAutoScalingGroupName(), asg);
             releaseRefreshOwnership(refresh, List.of(instanceId));
-            asg.getInstances().stream()
-                    .filter(i -> instanceId.equals(i.getInstanceId()))
-                    .findFirst()
-                    .ifPresent(i -> i.setLifecycleState("Terminating"));
-            if (decrementDesiredCapacity) {
-                int newDesired = Math.max(asg.getMinSize(), asg.getDesiredCapacity() - 1);
-                asg.setDesiredCapacity(newDesired);
-            }
+            instance.setLifecycleState("Terminating");
+            instance.setTerminationActivityId(activity.getActivityId());
+            asg.setDesiredCapacity(newDesired);
+            activities.put(activity.getActivityId(), activity);
+            return copyOf(activity);
         });
+    }
+
+    void completeTerminationActivities(List<AsgInstance> instances, String status, String message) {
+        for (AsgInstance instance : instances) {
+            if (instance.getTerminationActivityId() != null) {
+                completeActivity(instance.getTerminationActivityId(), status, message);
+                instance.setTerminationActivityId(null);
+            }
+        }
     }
 
     /**

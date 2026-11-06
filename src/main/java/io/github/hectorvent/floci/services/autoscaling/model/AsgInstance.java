@@ -21,6 +21,8 @@ public class AsgInstance {
     // The EnterStandby or ExitStandby activity the reconciler completes when this instance finishes moving
     // into or out of standby; null otherwise, and for members stored before standby was supported.
     private String standbyActivityId;
+    // The activity returned by an explicit termination request, completed when the member leaves the group.
+    private String terminationActivityId;
 
     public AsgInstance() {}
 
@@ -56,4 +58,7 @@ public class AsgInstance {
 
     public String getStandbyActivityId() { return standbyActivityId; }
     public void setStandbyActivityId(String v) { this.standbyActivityId = v; }
+
+    public String getTerminationActivityId() { return terminationActivityId; }
+    public void setTerminationActivityId(String v) { this.terminationActivityId = v; }
 }

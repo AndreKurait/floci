@@ -28,6 +28,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -63,6 +64,8 @@ class AutoScalingStandbyTest {
     private static final String EXITED = "ExitStandbyResponse.ExitStandbyResult.Activities.member";
     private static final String ACTIVITIES =
             "DescribeScalingActivitiesResponse.DescribeScalingActivitiesResult.Activities.member";
+    private static final String TERMINATION =
+            "TerminateInstanceInAutoScalingGroupResponse.TerminateInstanceInAutoScalingGroupResult.Activity";
     private static final String CAUSE_TIME = "At \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z ";
 
     private AutoScalingService service;
@@ -503,6 +506,120 @@ class AutoScalingStandbyTest {
         assertFalse(memberIds().contains("i-a"));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void terminationReturnsTheActivityThatReconciliationCompletes(boolean decrement) {
+        Instant before = Instant.now();
+        XmlPath response = terminate("i-a", decrement);
+        String activityId = response.getString(TERMINATION + ".ActivityId");
+
+        assertEquals(GROUP, response.getString(TERMINATION + ".AutoScalingGroupName"));
+        assertEquals("Terminating EC2 instance: i-a", response.getString(TERMINATION + ".Description"));
+        assertTrue(response.getString(TERMINATION + ".Cause").contains("in response to a user request"));
+        assertFalse(Instant.parse(response.getString(TERMINATION + ".StartTime"))
+                .isBefore(before.truncatedTo(ChronoUnit.MILLIS)));
+        assertEquals("InProgress", response.getString(TERMINATION + ".StatusCode"));
+        assertEquals(0, response.getInt(TERMINATION + ".Progress"));
+        assertTrue(response.getList(TERMINATION + ".EndTime").isEmpty());
+        assertEquals(decrement ? 1 : 2, group().getDesiredCapacity());
+        assertEquals("InProgress", activity(describeScalingActivities(), activityId, "StatusCode"));
+
+        reconciler.reconcile(group());
+
+        assertFalse(memberIds().contains("i-a"));
+        assertEquals("Successful", activity(describeScalingActivities(), activityId, "StatusCode"));
+        assertEquals("100", activity(describeScalingActivities(), activityId, "Progress"));
+        assertFalse(activity(describeScalingActivities(), activityId, "EndTime").isBlank());
+        assertEquals(List.of(activityId), describeScalingActivities().getList(ACTIVITIES
+                + ".findAll { it.Description.text().contains('i-a') }.ActivityId"));
+        assertEquals("InProgress", response.getString(TERMINATION + ".StatusCode"));
+        assertEquals(decrement ? 0 : 1, launches.get());
+    }
+
+    @Test
+    void standbyTerminationReturnsAnActivityWithoutLaunchingAReplacement() {
+        ok(enterStandby(true, "i-a"));
+        reconciler.reconcile(group());
+        assertEquals("Standby", lifecycle("i-a"));
+
+        String activityId = terminate("i-a", false).getString(TERMINATION + ".ActivityId");
+        reconciler.reconcile(group());
+
+        assertEquals(List.of("i-b"), memberIds());
+        assertEquals(1, group().getDesiredCapacity());
+        assertEquals("Successful", activity(describeScalingActivities(), activityId, "StatusCode"));
+        assertNoLaunch();
+    }
+
+    @Test
+    void aFailedTerminationKeepsItsActivityForTheSuccessfulRetry() {
+        String activityId = terminate("i-a", true).getString(TERMINATION + ".ActivityId");
+        doThrow(new AwsException("UnauthorizedOperation", "termination refused", 403))
+                .when(ec2).terminateInstances(REGION, List.of("i-a"));
+
+        reconciler.reconcile(group());
+
+        assertTrue(memberIds().contains("i-a"));
+        assertEquals("InProgress", activity(describeScalingActivities(), activityId, "StatusCode"));
+        doAnswer(invocation -> {
+            ec2States.put("i-a", InstanceState.terminated());
+            return List.of();
+        }).when(ec2).terminateInstances(REGION, List.of("i-a"));
+
+        reconciler.reconcile(group());
+
+        assertFalse(memberIds().contains("i-a"));
+        assertEquals("Successful", activity(describeScalingActivities(), activityId, "StatusCode"));
+    }
+
+    @Test
+    void aTerminationWhoseEc2RecordDisappearedStillCompletesItsActivity() {
+        String activityId = terminate("i-a", true).getString(TERMINATION + ".ActivityId");
+        ec2States.remove("i-a");
+
+        reconciler.reconcile(group());
+
+        assertFalse(memberIds().contains("i-a"));
+        assertEquals("Successful", activity(describeScalingActivities(), activityId, "StatusCode"));
+        assertEquals(List.of(activityId), describeScalingActivities().getList(ACTIVITIES
+                + ".findAll { it.Description.text().contains('i-a') }.ActivityId"));
+        verify(ec2, never()).terminateInstances(eq(REGION), anyList());
+    }
+
+    @Test
+    void repeatingAPendingTerminationDoesNotLoseItsActivityOrDecrementTwice() {
+        String first = terminate("i-a", true).getString(TERMINATION + ".ActivityId");
+        String repeated = terminate("i-a", true).getString(TERMINATION + ".ActivityId");
+
+        assertEquals(first, repeated);
+        assertEquals(1, group().getDesiredCapacity());
+        reconciler.reconcile(group());
+        assertEquals("Successful", activity(describeScalingActivities(), first, "StatusCode"));
+    }
+
+    @Test
+    void detachingAnInstanceWithAPendingTerminationIsRefused() {
+        String activityId = terminate("i-a", true).getString(TERMINATION + ".ActivityId");
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, GROUP, List.of("i-a"), false));
+
+        assertEquals("ValidationError", failure.getErrorCode());
+        assertEquals("The instance i-a is not in InService or Standby.", failure.getMessage());
+        assertTrue(memberIds().contains("i-a"));
+        assertEquals("InProgress", activity(describeScalingActivities(), activityId, "StatusCode"));
+    }
+
+    @Test
+    void deletingTheGroupCancelsItsPendingTerminationActivity() {
+        String activityId = terminate("i-a", true).getString(TERMINATION + ".ActivityId");
+
+        service.deleteAutoScalingGroup(REGION, GROUP, true);
+
+        assertTrue(service.describeAutoScalingGroups(REGION, List.of(GROUP)).isEmpty());
+        assertEquals("Cancelled", activity(describeScalingActivities(), activityId, "StatusCode"));
+    }
+
     @Test
     void anInstanceEc2NoLongerHasIsReplacedWhenItLeavesStandby() {
         ok(enterStandby(true, "i-a"));
@@ -873,6 +990,16 @@ class AutoScalingStandbyTest {
             params.add("InstanceIds.member." + (index + 1), instanceIds[index]);
         }
         return handler.handle("ExitStandby", params, REGION);
+    }
+
+    private XmlPath terminate(String instanceId, boolean decrement) {
+        MultivaluedHashMap<String, String> params = new MultivaluedHashMap<>();
+        params.add("InstanceId", instanceId);
+        params.add("ShouldDecrementDesiredCapacity", String.valueOf(decrement));
+        XmlPath response = ok(handler.handle("TerminateInstanceInAutoScalingGroup", params, REGION));
+        String activityId = response.getString(TERMINATION + ".ActivityId");
+        assertFalse(activityId == null || activityId.isBlank(), "termination response must contain ActivityId");
+        return response;
     }
 
     private Response describeScalingActivitiesResponse() {

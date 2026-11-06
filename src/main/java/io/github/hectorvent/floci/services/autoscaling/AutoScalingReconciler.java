@@ -347,10 +347,16 @@ public class AutoScalingReconciler {
         AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
-        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
-                "Removing stale EC2 instance reference(s): " + instanceIds,
-                "Persisted Auto Scaling state referenced instance containers that are no longer running.",
-                "Successful");
+        List<String> untracked = staleInstances.stream()
+                .filter(instance -> instance.getTerminationActivityId() == null)
+                .map(AsgInstance::getInstanceId).toList();
+        asgService.completeTerminationActivities(staleInstances, "Successful", null);
+        if (!untracked.isEmpty()) {
+            asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                    "Removing stale EC2 instance reference(s): " + untracked,
+                    "Persisted Auto Scaling state referenced instance containers that are no longer running.",
+                    "Successful");
+        }
         LOG.infov("ASG {0}: removed stale instance reference(s) {1}",
                 asg.getAutoScalingGroupName(), instanceIds);
     }
@@ -473,13 +479,16 @@ public class AutoScalingReconciler {
         if (instanceIds.isEmpty()) {
             return;
         }
+        List<String> refreshInstanceIds = terminatingInstances.stream()
+                .filter(instance -> instance.getTerminationActivityId() == null)
+                .map(AsgInstance::getInstanceId).filter(instanceIds::contains).toList();
         try {
             ec2Service.terminateInstances(asg.getRegion(), instanceIds);
         } catch (Exception e) {
-            LOG.warnv("ASG {0}: failed to terminate refreshing instances {1}: {2}",
+            LOG.warnv("ASG {0}: failed to terminate instances {1}: {2}",
                     asg.getAutoScalingGroupName(), instanceIds, e.getMessage());
             // Only real failures are recorded, not an instance that is going away or has gone in the meantime.
-            List<String> stillPresent = instanceIds.stream()
+            List<String> stillPresent = refreshInstanceIds.stream()
                     .filter(id -> !isMissingOrTerminalEc2Instance(asg, id, TERMINATED_STATES))
                     .toList();
             if (!stillPresent.isEmpty()) {
@@ -493,11 +502,15 @@ public class AutoScalingReconciler {
         AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
-        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
-                "Terminating EC2 instance(s) for refresh: " + instanceIds,
-                "An instance refresh requested replacement of active instances.",
-                "Successful");
-        LOG.infov("ASG {0}: terminated instance(s) for refresh {1}",
+        asgService.completeTerminationActivities(terminatingInstances.stream()
+                .filter(instance -> instanceIds.contains(instance.getInstanceId())).toList(), "Successful", null);
+        if (!refreshInstanceIds.isEmpty()) {
+            asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                    "Terminating EC2 instance(s) for refresh: " + refreshInstanceIds,
+                    "An instance refresh requested replacement of active instances.",
+                    "Successful");
+        }
+        LOG.infov("ASG {0}: terminated instance(s) {1}",
                 asg.getAutoScalingGroupName(), instanceIds);
     }
 
