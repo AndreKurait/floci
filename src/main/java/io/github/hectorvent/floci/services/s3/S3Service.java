@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
@@ -170,25 +171,19 @@ public class S3Service implements Resettable, ResourceProvider {
     // copyLegacyFileIfPresent()). Fixed-size stripes keep memory bounded, unlike a per-path
     // map that would need reference counting to ever shrink safely.
     private static final int DISK_FILE_LOCK_STRIPES = 256;
-    private final ReentrantLock[] diskFileLocks = newLockStripes(DISK_FILE_LOCK_STRIPES);
+    private final StripedLocks.Typed<ReentrantLock> diskFileLocks =
+            new StripedLocks.Typed<>(DISK_FILE_LOCK_STRIPES, ReentrantLock::new);
     // Bucket deletion must not sweep an upload while a multipart operation is creating or using it.
     // Read locks preserve parallel multipart writes; fair, fixed stripes avoid writer starvation
     // and retaining a lock for every bucket name ever seen.
-    private final ReentrantReadWriteLock[] multipartBucketLocks = newMultipartBucketLocks(256);
+    private final StripedLocks.Typed<ReentrantReadWriteLock> multipartBucketLocks =
+            new StripedLocks.Typed<>(256, () -> new ReentrantReadWriteLock(true));
     // A second, finer-grained lock prevents part writes, completion and abort from racing on
     // the same upload without serializing independent uploads in the bucket.
-    private final ReentrantLock[] multipartUploadLocks = newLockStripes(256);
-
-    private static ReentrantReadWriteLock[] newMultipartBucketLocks(int count) {
-        ReentrantReadWriteLock[] locks = new ReentrantReadWriteLock[count];
-        for (int i = 0; i < count; i++) {
-            locks[i] = new ReentrantReadWriteLock(true);
-        }
-        return locks;
-    }
+    private final StripedLocks.Typed<ReentrantLock> multipartUploadLocks = new StripedLocks.Typed<>(256, ReentrantLock::new);
 
     private ReentrantReadWriteLock multipartBucketLock(String bucketName) {
-        return multipartBucketLocks[Math.floorMod(bucketName.hashCode(), multipartBucketLocks.length)];
+        return multipartBucketLocks.lockFor(bucketName);
     }
 
     private static <T> T withLock(Lock lock, Supplier<T> operation) {
@@ -220,7 +215,7 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     private ReentrantLock multipartUploadLock(String uploadId) {
-        return multipartUploadLocks[Math.floorMod(uploadId.hashCode(), multipartUploadLocks.length)];
+        return multipartUploadLocks.lockFor(uploadId);
     }
 
     private <T> T withMultipartOperationLock(String bucketName, String uploadId, Supplier<T> operation) {
@@ -231,13 +226,6 @@ public class S3Service implements Resettable, ResourceProvider {
         withMultipartBucketReadLock(bucketName, () -> withLock(multipartUploadLock(uploadId), operation));
     }
 
-    private static ReentrantLock[] newLockStripes(int count) {
-        ReentrantLock[] locks = new ReentrantLock[count];
-        for (int i = 0; i < count; i++) {
-            locks[i] = new ReentrantLock();
-        }
-        return locks;
-    }
     // Memory mode keeps an object in one byte array; this is the largest the JDK reliably allocates.
     static final long MAX_IN_MEMORY_OBJECT_SIZE = Integer.MAX_VALUE - 8;
     // Directory under .multipart where a streamed part or object body is written before it is
@@ -7919,7 +7907,7 @@ public class S3Service implements Resettable, ResourceProvider {
 
     private ReentrantLock diskFileLock(Path path) {
         // A stripe collision just serializes unrelated paths — safe, unlike a map entry.
-        return diskFileLocks[Math.floorMod(path.hashCode(), diskFileLocks.length)];
+        return diskFileLocks.lockFor(path);
     }
 
     /**
