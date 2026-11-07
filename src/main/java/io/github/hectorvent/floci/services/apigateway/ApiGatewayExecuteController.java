@@ -2992,10 +2992,11 @@ public class ApiGatewayExecuteController {
             String routeResource = "$default".equals(route.getRouteKey()) ? "$default" : httpMethod + path;
             String invokeArn = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
                     apiId + "/" + stageName + "/" + routeResource).toString();
-            if (callerCallAuthorizer.authorize(iamIdentity == null ? null : iamIdentity.accessKey(),
+            if (callerCallAuthorizer.authorizeRequest(iamIdentity == null ? null : iamIdentity.accessKey(),
                     iamIdentity == null ? null : iamIdentity.accountId(),
                     iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,
-                    regionResolver.getPartition()) != Decision.ALLOW) {
+                    regionResolver.getPartition(), routeContext.sourceIp(), isSecureTransport(uriInfo))
+                    != Decision.ALLOW) {
                 return Response.status(403).entity(jsonMessage("Forbidden"))
                         .type(MediaType.APPLICATION_JSON).build();
             }
@@ -3752,7 +3753,7 @@ public class ApiGatewayExecuteController {
         ctx.put("domainName", AwsEndpoints.executeApiHost(apiId, arnRegion));
         ctx.put("domainPrefix", apiId);
         ObjectNode identity = ctx.putObject("identity");
-        identity.put("sourceIp", "127.0.0.1");
+        identity.put("sourceIp", routeContext.sourceIp());
         identity.put("userAgent", headers.getHeaderString("User-Agent") != null
                 ? headers.getHeaderString("User-Agent") : "");
         return event;
@@ -3802,7 +3803,7 @@ public class ApiGatewayExecuteController {
         http.put("method", httpMethod);
         http.put("path", preservedPath);
         http.put("protocol", "HTTP/1.1");
-        http.put("sourceIp", "127.0.0.1");
+        http.put("sourceIp", routeContext.sourceIp());
         http.put("userAgent", headers.getHeaderString("User-Agent") != null
                 ? headers.getHeaderString("User-Agent") : "");
 
@@ -4135,7 +4136,7 @@ public class ApiGatewayExecuteController {
         http.put("method", httpMethod);
         http.put("path", preservedPath);
         http.put("protocol", "HTTP/1.1");
-        http.put("sourceIp", "127.0.0.1");
+        http.put("sourceIp", routeContext.sourceIp());
         http.put("userAgent", headers.getHeaderString("User-Agent") != null
                 ? headers.getHeaderString("User-Agent") : "");
 
