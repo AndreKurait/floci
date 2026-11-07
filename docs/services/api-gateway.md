@@ -363,10 +363,17 @@ IAM-disabled REST routes retain signature validation without requiring policy gr
 
 Stored policy resources using `execute-api:/stage/METHOD/path` are expanded during evaluation
 without changing stored readback. AWS expands this shorthand when saving the policy. Floci uses
-live API policy storage here; deployment-snapshot policy activation is not modeled. Resource
-policies for unsigned, CUSTOM and Cognito routes and full inbound condition context remain
-separate work. REST Lambda backend permissions are enforced independently; see
+live API policy storage here; deployment-snapshot policy activation is not modeled. CUSTOM
+authorizer/resource-policy combination and full inbound condition context remain separate work.
+REST Lambda backend permissions are enforced independently; see
 [REST Lambda integration permissions](#rest-lambda-integration-permissions).
+
+With IAM enforcement enabled, REST `NONE` methods require an explicit anonymous grant from an
+attached resource policy. Signed headers do not establish an IAM principal for a `NONE` method.
+Cognito user-pool methods authenticate the token first, then require the resource-policy grant.
+An absent policy retains public access; an explicit deny or an attached policy without a matching
+allow stops backend dispatch. Source-IP conditions use the connection address rather than
+`X-Forwarded-For`.
 
 ### Request Model Validation
 
