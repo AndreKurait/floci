@@ -25,6 +25,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -66,6 +67,12 @@ class WebSocketAuthorizerRoleTest {
         role.setAssumeRolePolicyDocument(TRUST);
         when(iam.findRole(OWNER, "integration")).thenReturn(Optional.of(role));
         when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(ALLOW)));
+        when(iam.resolveCallerArns(anyString())).thenAnswer(invocation -> Optional.of(new IamService.CallerArns(
+                "arn:aws:sts::" + OWNER + ":assumed-role/integration/test-session", ROLE,
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROAEXAMPLE:test-session", null,
+                role.getPermissionsBoundaryArn() != null)));
+        when(iam.resolveCallerContext(anyString(), any(Instant.class)))
+                .thenAnswer(invocation -> iam.resolvePrincipalContext(ROLE));
         provider = mock(ResourcePolicyProvider.class);
         Instance<ResourcePolicyProvider> providers = mock(Instance.class);
         when(providers.iterator()).thenAnswer(invocation -> List.of(provider).iterator());
