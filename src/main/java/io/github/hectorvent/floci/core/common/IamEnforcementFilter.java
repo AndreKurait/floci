@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.iam.StsSessionTags;
+import io.github.hectorvent.floci.services.iam.StsSourceIdentity;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
@@ -572,7 +573,18 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if ("sts:AssumeRole".equals(action) && callerArns.isPresent()) {
             Map<String, String> parameters = IamConditionContextResolver.formParameters(ctx);
             try {
+                String sourceIdentity = StsSourceIdentity.resolve(parameters.get("SourceIdentity"),
+                        iamService.findSourceIdentity(akid, requestContext.getSessionToken()));
+                if (sourceIdentity != null) {
+                    conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
+                    conditionContext.put("sts:SourceIdentity", List.of(sourceIdentity));
+                }
                 StsSessionTags.readForm(parameters);
+                List<String> transitiveKeys = StsSessionTags.transitiveKeys(parameters);
+                if (!transitiveKeys.isEmpty()) {
+                    conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
+                    conditionContext.put("sts:TransitiveTagKeys", transitiveKeys);
+                }
             } catch (AwsException invalidTags) {
                 ctx.abortWith(queryXmlError(invalidTags.getErrorCode(), invalidTags.getMessage(), invalidTags.getHttpStatus()));
                 return;

@@ -1661,6 +1661,33 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return policy;
     }
 
+    String sessionPolicyDocument(String accountId, String policyArn) {
+        return sessionPolicy(accountId, policyArn).map(IamPolicy::getDefaultDocument).orElseThrow(() ->
+                new AwsException("MalformedPolicyDocument", "The session policy does not exist: " + policyArn, 400));
+    }
+
+    private Optional<IamPolicy> sessionPolicy(String accountId, String policyArn) {
+        if (AwsManagedPolicies.isManagedPolicyArn(policyArn)) {
+            return resolvePolicy(policyArn);
+        }
+        if (policies instanceof AccountAwareStorageBackend<IamPolicy> aware) {
+            return aware.getForAccount(accountId, policyArn);
+        }
+        return policies.get(policyArn);
+    }
+
+    private List<String> managedSessionPolicyDocuments(SessionCredential session) {
+        List<String> documents = new ArrayList<>();
+        if (!session.getManagedSessionPolicyArns().isEmpty()) {
+            String accountId = AwsArnUtils.parse(session.getRoleArn()).accountId();
+            for (String arn : session.getManagedSessionPolicyArns()) {
+                documents.add(sessionPolicy(accountId, arn).map(IamPolicy::getDefaultDocument)
+                        .orElse("{\"Statement\":[]}"));
+            }
+        }
+        return List.copyOf(documents);
+    }
+
     private IamPolicy requirePolicy(String policyArn) {
         return resolvePolicy(policyArn)
                 .orElseThrow(() -> new AwsException("NoSuchEntity",
@@ -4526,6 +4553,20 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .filter(token -> !token.isBlank());
     }
 
+    /** Source identity survives chaining only from a live, token-matched role session. */
+    public String findSourceIdentity(String accessKeyId, String sessionToken) {
+        return currentSession(accessKeyId)
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(SessionCredential::getSourceIdentity).orElse(null);
+    }
+
+    /** Inherited tags come only from a live session whose issued token matches this request. */
+    public Map<String, String> findTransitiveSessionTags(String accessKeyId, String sessionToken) {
+        return currentSession(accessKeyId)
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(SessionCredential::getTransitiveSessionTags).orElse(Map.of());
+    }
+
     /**
      * When the session a temporary access key belongs to expires, for callers that must not hand
      * out something outliving it. Empty for a long-term key, which names no session, and for a
@@ -4750,6 +4791,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                                   Instant expiration, String policy, String originAccountId,
                                   String sessionName, String principalId, boolean managedPolicyPresent,
                                   SessionCredential verifiedParentSession, Map<String, String> sessionTags) {
+        registerAssumeRoleSession(accessKeyId, secret, token, roleArn, expiration, policy, originAccountId,
+                sessionName, principalId, managedPolicyPresent, verifiedParentSession, sessionTags,
+                Map.of(), null, List.of());
+    }
+
+    void registerAssumeRoleSession(String accessKeyId, String secret, String token, String roleArn,
+                                  Instant expiration, String policy, String originAccountId,
+                                  String sessionName, String principalId, boolean managedPolicyPresent,
+                                  SessionCredential verifiedParentSession, Map<String, String> sessionTags,
+                                  Map<String, String> transitiveTags, String sourceIdentity,
+                                  List<String> managedPolicyArns) {
         SessionCredential session = new SessionCredential(accessKeyId, secret, token,
                 roleArn, expiration, policy, originAccountId);
         if (verifiedParentSession != null) {
@@ -4764,8 +4816,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         session.setRoleSessionName(sessionName);
         session.setAssumedRoleId(principalId);
         session.setAssumeRoleIssued(true);
-        session.setManagedSessionPolicyPresent(managedPolicyPresent);
+        session.setManagedSessionPolicyArns(managedPolicyArns);
+        session.setManagedSessionPolicyPresent(managedPolicyPresent || !session.getManagedSessionPolicyArns().isEmpty());
         session.setSessionTags(sessionTags);
+        session.setTransitiveSessionTags(transitiveTags);
+        session.setSourceIdentity(sourceIdentity);
         putNewSession(accessKeyId, session);
     }
 
@@ -4816,11 +4871,43 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                                 String roleArn, Instant expiration, String sessionPolicyDocument,
                                 String originAccountId, String roleSessionName, String assumedRoleId,
                                 Map<String, String> sessionTags) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration,
+                sessionPolicyDocument, originAccountId, roleSessionName, assumedRoleId, sessionTags, Map.of());
+    }
+
+    /** Registers effective tags and their independently retained transitive subset in one storage write. */
+    public void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                String roleArn, Instant expiration, String sessionPolicyDocument,
+                                String originAccountId, String roleSessionName, String assumedRoleId,
+                                Map<String, String> sessionTags, Map<String, String> transitiveTags) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration,
+                sessionPolicyDocument, originAccountId, roleSessionName, assumedRoleId, sessionTags, transitiveTags, null);
+    }
+
+    /** Registers source identity and managed policies atomically with its temporary credentials. */
+    void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                         String roleArn, Instant expiration, String sessionPolicyDocument,
+                         String originAccountId, String roleSessionName, String assumedRoleId,
+                         Map<String, String> sessionTags, Map<String, String> transitiveTags,
+                         String sourceIdentity) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration,
+                sessionPolicyDocument, originAccountId, roleSessionName, assumedRoleId, sessionTags,
+                transitiveTags, sourceIdentity, List.of());
+    }
+
+    void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                         String roleArn, Instant expiration, String sessionPolicyDocument,
+                         String originAccountId, String roleSessionName, String assumedRoleId,
+                         Map<String, String> sessionTags, Map<String, String> transitiveTags,
+                         String sourceIdentity, List<String> managedPolicyArns) {
         SessionCredential session = new SessionCredential(sessionAccessKeyId, secretAccessKey, sessionToken,
                 roleArn, expiration, sessionPolicyDocument, originAccountId);
         session.setRoleSessionName(roleSessionName);
         session.setAssumedRoleId(assumedRoleId);
         session.setSessionTags(sessionTags);
+        session.setTransitiveSessionTags(transitiveTags);
+        session.setSourceIdentity(sourceIdentity);
+        session.setManagedSessionPolicyArns(managedPolicyArns);
         putNewSession(sessionAccessKeyId, session);
     }
 
@@ -4839,8 +4926,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void registerIssuedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
                                       String federatedUserArn, Instant expiration, String sessionPolicyDocument,
                                       String originAccountId, String issuingAccessKeyId) {
-        putNewSession(sessionAccessKeyId, issuedSession(sessionAccessKeyId, secretAccessKey, sessionToken,
-                federatedUserArn, expiration, sessionPolicyDocument, originAccountId, issuingAccessKeyId));
+        registerIssuedSession(sessionAccessKeyId, secretAccessKey, sessionToken, federatedUserArn, expiration,
+                sessionPolicyDocument, originAccountId, issuingAccessKeyId, List.of());
+    }
+
+    public void registerIssuedSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                      String federatedUserArn, Instant expiration, String sessionPolicyDocument,
+                                      String originAccountId, String issuingAccessKeyId, List<String> managedPolicyArns) {
+        SessionCredential session = issuedSession(sessionAccessKeyId, secretAccessKey, sessionToken,
+                federatedUserArn, expiration, sessionPolicyDocument, originAccountId, issuingAccessKeyId);
+        session.setManagedSessionPolicyArns(managedPolicyArns);
+        putNewSession(sessionAccessKeyId, session);
     }
 
     /** Records explicit authentication provenance only for the GetSessionToken issuance path. */
@@ -5344,7 +5440,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private CallerContext federatedUserContext(SessionCredential session) {
         String sessionPolicy = session.getSessionPolicyDocument();
-        if (sessionPolicy == null || sessionPolicy.isBlank()) {
+        if ((sessionPolicy == null || sessionPolicy.isBlank())
+                && session.getManagedSessionPolicyArns().isEmpty()) {
             return issuingUser(session)
                     .map(user -> CallerContext.of(List.of(denyStatementsOf(user.getUserName()))))
                     .orElse(CallerContext.of(List.of()));
@@ -5519,7 +5616,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 return delegatedApproverContext(session);
             }
             if (isFederatedUserSession(session)) {
-                return withFederatedUserLimits(federatedUserContext(session));
+                return withFederatedUserLimits(federatedUserContext(session))
+                        .withManagedSessionPolicies(managedSessionPolicyDocuments(session));
             }
             if (session.getRoleArn() == null) {
                 if (session.getPresignedAction() != null) {
@@ -5544,7 +5642,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             }
             List<String> identityPolicies = collectRolePolicies(session.getRoleArn());
             String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
-            return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc);
+            return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc)
+                    .withManagedSessionPolicies(managedSessionPolicyDocuments(session));
         }
 
         // Unknown key — bypass
@@ -5665,7 +5764,21 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     public record CallerArns(String callerArn, String principalArn, String principalType,
                              String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
-                             Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge) {
+                             Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge,
+                             String sourceIdentity) {
+
+        public CallerArns(String callerArn, String principalArn, String principalType,
+                          String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
+                          Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge) {
+            this(callerArn, principalArn, principalType, userId, userName, permissionsBoundary,
+                    tokenIssueTime, principalTags, multiFactorAuthPresent, multiFactorAuthAge, null);
+        }
+
+        public CallerArns withSourceIdentity(String value) {
+            return new CallerArns(callerArn, principalArn, principalType, userId, userName,
+                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent,
+                    multiFactorAuthAge, value);
+        }
 
         public CallerArns(String callerArn, String principalArn, String principalType,
                           String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
@@ -5688,7 +5801,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         public CallerArns withMultiFactorAuthPresent(Boolean present) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
                     permissionsBoundary, tokenIssueTime, principalTags, present,
-                    Boolean.TRUE.equals(present) ? multiFactorAuthAge : null);
+                    Boolean.TRUE.equals(present) ? multiFactorAuthAge : null, sourceIdentity);
         }
 
         public CallerArns(String callerArn, String principalArn, String principalType, String userId,
@@ -5699,7 +5812,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withPrincipalTags(Map<String, String> tags) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent, multiFactorAuthAge);
+                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity);
         }
 
         /**
@@ -5737,12 +5850,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withTokenIssueTime(Instant issuedAt) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent, multiFactorAuthAge);
+                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity);
         }
 
         public CallerArns withMultiFactorAuthAge(Long age) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent, age);
+                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent, age, sourceIdentity);
         }
 
         /** A caller with no permissions boundary attached. */
@@ -5768,6 +5881,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
          */
         public void putPrincipalKeys(Map<String, List<String>> context) {
             context.put("aws:PrincipalArn", List.of(principalArn));
+            if (sourceIdentity != null) {
+                context.put("aws:SourceIdentity", List.of(sourceIdentity));
+            }
             principalTags.forEach((key, value) -> context.put("aws:PrincipalTag/" + key, List.of(value)));
             if (multiFactorAuthPresent != null) {
                 context.put("aws:MultiFactorAuthPresent", List.of(multiFactorAuthPresent.toString()));
@@ -5853,7 +5969,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 deleteSession(accessKeyId, session);
                 return Optional.empty();
             }
-            return sessionCallerArns(session).map(arns -> arns.withTokenIssueTime(session.getIssuedAt())
+            return sessionCallerArns(session).map(arns -> arns.withSourceIdentity(session.getSourceIdentity())
+                    .withTokenIssueTime(session.getIssuedAt())
                     .withMultiFactorAuthPresent(session.getMultiFactorAuthPresent())
                     .withMultiFactorAuthAge(Boolean.TRUE.equals(session.getMultiFactorAuthPresent())
                             && session.getMultiFactorAuthenticatedAt() != null
