@@ -3723,6 +3723,19 @@ public interface EmulatorConfig {
         /** Optional local probe interval ceiling; zero preserves each target group's interval. */
         @WithDefault("0")
         long maxHealthCheckIntervalMillis();
+
+        /** AWS defaults unless explicitly overridden for local deployments. */
+        @WithDefault("aws")
+        AlbZoneRule albZoneRule();
+
+        /** A region entry takes precedence over the global rule, including an explicit AWS reset. */
+        Map<String, AlbZoneRule> albZoneRuleByRegion();
+    }
+
+    enum AlbZoneRule {
+        AWS,
+        ALLOW_SINGLE_ZONE,
+        REQUIRE_TWO_ZONES
     }
 
     interface EksServiceConfig {
