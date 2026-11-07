@@ -3017,3 +3017,7 @@ API Gateway account logging-role assignments also require `iam:PassRole`, with
 `UpdateAccount` replacements of `/cloudwatchRoleArn` before account state changes.
 Floci retains its existing add/remove patch compatibility, although AWS documents
 only replace for this field; locally accepted additions also require PassRole.
+
+API Gateway HTTP API quick-create Lambda integrations check an assigned execution
+role through `iam:PassRole` before creating the API. Absent targets, HTTP URL
+targets and caller credentials pass no role.
