@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.LocallyBuiltHelperImage;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -29,6 +30,8 @@ import java.util.function.BiPredicate;
 
 /** Delegates only a named service hierarchy to old init binaries, leaving resource limits with Docker. */
 final class Ec2SystemdV1Runtime {
+    private static final Logger LOG = Logger.getLogger(Ec2SystemdV1Runtime.class);
+
     static final String SERVICE = "ec2-init";
     static final String SCOPE_LABEL = "io.floci.ec2.init-scope";
     static final String RUNTIME_LABEL = "io.floci.ec2.init-runtime";
@@ -241,35 +244,43 @@ final class Ec2SystemdV1Runtime {
         for (Container container : docker.listContainersCmd().withShowAll(true)
                 .withLabelFilter(Map.of(ContainerStorageHelper.SERVICE_LABEL, SERVICE,
                         ContainerStorageHelper.OWNER_LABEL, owner())).exec()) {
-            Map<String, String> listedLabels = container.getLabels();
-            if (listedLabels == null || !SERVICE.equals(listedLabels.get(ContainerStorageHelper.SERVICE_LABEL))
-                    || !owner().equals(listedLabels.get(ContainerStorageHelper.OWNER_LABEL))) {
-                continue;
+            try {
+                reconcileHelper(container, stillDeclared);
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Could not reconcile EC2 init helper {0}; retaining it for retry", container.getId());
             }
-            String instance = listedLabels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
-            if (instance == null || instance.isBlank()) {
-                throw new IllegalStateException("EC2 init helper has no instance identity");
+        }
+    }
+
+    private void reconcileHelper(Container container, BiPredicate<String, String> stillDeclared) {
+        Map<String, String> listedLabels = container.getLabels();
+        if (listedLabels == null || !SERVICE.equals(listedLabels.get(ContainerStorageHelper.SERVICE_LABEL))
+                || !owner().equals(listedLabels.get(ContainerStorageHelper.OWNER_LABEL))) {
+            return;
+        }
+        String instance = listedLabels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
+        if (instance == null || instance.isBlank()) {
+            throw new IllegalStateException("EC2 init helper has no instance identity");
+        }
+        synchronized (guestLocks.lockFor(instance)) {
+            InspectContainerResponse helper;
+            try {
+                helper = docker.inspectContainerCmd(container.getId()).exec();
+            } catch (NotFoundException expected) {
+                if (helpers.containsKey(instance)) {
+                    throw expected;
+                }
+                // Its guest may have retired this helper after the list call.
+                return;
             }
-            synchronized (guestLocks.lockFor(instance)) {
-                InspectContainerResponse helper;
-                try {
-                    helper = docker.inspectContainerCmd(container.getId()).exec();
-                } catch (NotFoundException expected) {
-                    if (helpers.containsKey(instance)) {
-                        throw expected;
-                    }
-                    // Its guest may have retired this helper after the list call.
-                    continue;
-                }
-                Map<String, String> labels = helper.getConfig().getLabels();
-                String region = labels.get(ContainerStorageHelper.REGION_LABEL);
-                String account = labels.get(ContainerStorageHelper.ACCOUNT_LABEL);
-                requireHelper(helper, instance, region, account);
-                if (!stillDeclared.test(region, instance)) {
-                    remove(helper, instance, region, account);
-                } else {
-                    helpers.put(instance, helper.getId());
-                }
+            Map<String, String> labels = helper.getConfig().getLabels();
+            String region = labels.get(ContainerStorageHelper.REGION_LABEL);
+            String account = labels.get(ContainerStorageHelper.ACCOUNT_LABEL);
+            requireHelper(helper, instance, region, account);
+            if (!stillDeclared.test(region, instance)) {
+                remove(helper, instance, region, account);
+            } else {
+                helpers.put(instance, helper.getId());
             }
         }
     }

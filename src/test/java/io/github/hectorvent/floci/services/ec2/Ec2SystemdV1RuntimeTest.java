@@ -18,6 +18,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -205,6 +206,60 @@ class Ec2SystemdV1RuntimeTest {
         runtime.reconcileOrphans((region, instance) -> fail("Not an init helper"));
         verify(docker, never()).inspectContainerCmd(anyString());
         verifyNoInteractions(lifecycle);
+    }
+
+    @Test
+    void invalidHelperDoesNotPreventLaterHelpersFromBeingRecovered() {
+        Map<String, String> invalidLabels = labels();
+        invalidLabels.remove(ContainerStorageHelper.RESOURCE_ID_LABEL);
+        Container invalid = mock(Container.class);
+        when(invalid.getId()).thenReturn("invalid-helper");
+        when(invalid.getLabels()).thenReturn(invalidLabels);
+        Container valid = mock(Container.class);
+        when(valid.getId()).thenReturn("owned-helper");
+        when(valid.getLabels()).thenReturn(labels());
+        when(docker.listContainersCmd().withShowAll(true).withLabelFilter(anyMap()).exec())
+                .thenReturn(List.of(invalid, valid));
+        InspectContainerResponse response = helper(labels());
+        when(docker.inspectContainerCmd("owned-helper").exec()).thenReturn(response);
+        List<String> recovered = new ArrayList<>();
+
+        assertDoesNotThrow(() -> runtime.reconcileOrphans((region, instance) -> recovered.add(instance)));
+
+        assertEquals(List.of("i-owned"), recovered);
+        verify(docker, never()).inspectContainerCmd("invalid-helper");
+        verifyNoInteractions(lifecycle);
+    }
+
+    @Test
+    void failedRemovalDoesNotBlockLaterHelpersAndRetainsRetryOwnership() {
+        Map<String, String> otherLabels = labels();
+        otherLabels.put(ContainerStorageHelper.RESOURCE_ID_LABEL, "i-other");
+        Container first = mock(Container.class);
+        when(first.getId()).thenReturn("owned-helper");
+        when(first.getLabels()).thenReturn(labels());
+        Container second = mock(Container.class);
+        when(second.getId()).thenReturn("other-helper");
+        when(second.getLabels()).thenReturn(otherLabels);
+        when(docker.listContainersCmd().withShowAll(true).withLabelFilter(anyMap()).exec())
+                .thenReturn(List.of(first, second));
+        InspectContainerResponse firstHelper = helper(labels());
+        InspectContainerResponse secondHelper = helper(otherLabels);
+        when(secondHelper.getId()).thenReturn("other-helper");
+        when(firstHelper.getState()).thenReturn(mock(InspectContainerResponse.ContainerState.class));
+        when(secondHelper.getState()).thenReturn(mock(InspectContainerResponse.ContainerState.class));
+        when(docker.inspectContainerCmd("owned-helper").exec()).thenReturn(firstHelper);
+        when(docker.inspectContainerCmd("other-helper").exec()).thenReturn(secondHelper);
+        ContainerExecStubs.completeEveryExec(docker, "owned-helper", 0, "", "");
+        ContainerExecStubs.completeEveryExec(docker, "other-helper", 0, "", "");
+        doThrow(new IllegalStateException("owned removal failed")).doNothing()
+                .when(lifecycle).removeIfExistsStrict("owned-helper");
+
+        assertDoesNotThrow(() -> runtime.reconcileOrphans((region, instance) -> false));
+
+        verify(lifecycle).removeIfExistsStrict("other-helper");
+        assertDoesNotThrow(() -> runtime.remove(instance()));
+        verify(lifecycle, times(2)).removeIfExistsStrict("owned-helper");
     }
 
     private Map<String, String> labels() {
