@@ -314,7 +314,8 @@ public class WebSocketHandler {
         final Integration finalIntegration = integration;
         final Map<String, String> finalStageVariables = stageVariables;
         vertx.<WebSocketIntegrationInvoker.IntegrationResult>executeBlocking(() -> {
-            return integrationInvoker.invoke(region, finalIntegration, eventJson,
+            return integrationInvoker.invoke(region, apiId, stageName, "$connect",
+                    finalIntegration, eventJson,
                     finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
         }).onSuccess(result -> {
             // Check for function error (Lambda invocation error)
@@ -589,7 +590,8 @@ public class WebSocketHandler {
         final Route finalRoute = route;
         final String finalConnectionId = connectionId;
         vertx.executeBlocking(() -> {
-            return integrationInvoker.invoke(region, finalIntegration, eventJson,
+            return integrationInvoker.invoke(region, apiId, stageName, finalRoute.getRouteKey(),
+                    finalIntegration, eventJson,
                     finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
         }).onSuccess(result -> {
             // Route response handling (Requirements 5.1–5.3)
@@ -687,7 +689,8 @@ public class WebSocketHandler {
             final Integration finalIntegration = integration;
             final Map<String, String> finalStageVariables = stageVariables;
             vertx.executeBlocking(() -> {
-                integrationInvoker.invoke(region, finalIntegration, eventJson,
+                integrationInvoker.invoke(region, apiId, stageName, "$disconnect",
+                        finalIntegration, eventJson,
                         finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
                 return null;
             }).onComplete(ar -> {
