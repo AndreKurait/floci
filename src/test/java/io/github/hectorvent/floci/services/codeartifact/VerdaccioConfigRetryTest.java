@@ -109,7 +109,7 @@ class VerdaccioConfigRetryTest {
 
         assertThrows(RuntimeException.class, () -> manager.ensureReady("npm-repo", "http://localhost:4566"));
 
-        verify(lifecycle).stopAndRemove("container", null);
+        verify(lifecycle).stopAndRemoveStrict("container", null);
         verify(lifecycle, never()).startCreated(any(), any());
         assertEquals(1, uploads.commands.size());
     }
