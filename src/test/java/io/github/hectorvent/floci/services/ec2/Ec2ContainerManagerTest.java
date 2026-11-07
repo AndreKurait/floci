@@ -2179,6 +2179,54 @@ class Ec2ContainerManagerTest {
         }
     }
 
+    @Test
+    void pendingNativeRebootDoesNotWaitForAnOccupiedLaunchWorker() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        Instance instance = instance("i-native-reboot-busy-launcher");
+        stubNativeInit(harness, instance);
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setState(InstanceState.pending());
+        CountDownLatch workerOccupied = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        CountDownLatch restarted = new CountDownLatch(1);
+        AtomicBoolean running = new AtomicBoolean(true);
+        InspectContainerResponse guest = harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID).exec();
+        InspectContainerResponse.ContainerState dockerState = mock(InspectContainerResponse.ContainerState.class);
+        when(guest.getState()).thenReturn(dockerState);
+        when(dockerState.getRunning()).thenAnswer(ignored -> running.get());
+        when(dockerState.getStatus()).thenReturn("exited");
+        when(dockerState.getExitCodeLong()).thenReturn(129L);
+        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenAnswer(ignored -> running.get());
+        StartContainerCmd start = mock(StartContainerCmd.class);
+        when(harness.dockerClient.startContainerCmd(TEST_CONTAINER_ID)).thenReturn(start);
+        doAnswer(ignored -> {
+            running.set(true);
+            restarted.countDown();
+            return null;
+        }).when(start).exec();
+        try {
+            assertTrue(harness.manager.restoreMetadataRegistration(instance));
+            executor.submit(() -> {
+                workerOccupied.countDown();
+                try {
+                    releaseWorker.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            assertTrue(workerOccupied.await(5, TimeUnit.SECONDS));
+            running.set(false);
+            assertTrue(harness.manager.isContainerRunning(instance));
+            assertTrue(restarted.await(2, TimeUnit.SECONDS),
+                    "Pending guest recovery must run while the launch worker is still occupied");
+            assertEquals("pending", instance.getState().getName());
+        } finally {
+            releaseWorker.countDown();
+            harness.manager.stop();
+        }
+    }
+
     private static void stubPendingNativeCleanup(LaunchHarness harness, Instance instance) {
         stubNativeInit(harness, instance);
         instance.setDockerContainerId(TEST_CONTAINER_ID);

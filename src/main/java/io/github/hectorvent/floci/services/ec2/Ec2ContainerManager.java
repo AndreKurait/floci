@@ -416,7 +416,8 @@ public class Ec2ContainerManager {
         this.serviceNetworkRetryExecutor = serviceNetworkRetryExecutor;
         this.userDataExecutionTimeout = userDataExecutionTimeout;
         this.guestReboots = new Ec2GuestReboots(dockerClient, config,
-                this::submitLifecycleOperation, this::restartNativeGuest);
+                (container, operation) -> submitLifecycleOperation(
+                        container, operation, serviceNetworkRetryExecutor), this::restartNativeGuest);
     }
 
     Ec2ContainerManager(ContainerBuilder containerBuilder,
@@ -1252,13 +1253,18 @@ public class Ec2ContainerManager {
     }
 
     private CompletableFuture<Void> submitLifecycleOperation(String containerId, Runnable operation) {
+        return submitLifecycleOperation(containerId, operation, executor);
+    }
+
+    private CompletableFuture<Void> submitLifecycleOperation(String containerId, Runnable operation,
+                                                             ExecutorService workers) {
         synchronized (lifecycleOperations) {
             CompletableFuture<Void> previous = lifecycleOperations.get(containerId);
             CompletableFuture<Void> completed = new CompletableFuture<>();
             lifecycleOperations.put(containerId, completed);
             Runnable submit = () -> {
                 try {
-                    executor.submit(() -> {
+                    workers.submit(() -> {
                         try {
                             operation.run();
                         } finally {
