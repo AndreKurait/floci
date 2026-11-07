@@ -52,6 +52,7 @@ class SsmGetParameterArnIamEnforcementIntegrationTest {
                     SsmException error = assertThrows(SsmException.class,
                             () -> user.getParameter(request -> request.name(deniedArn)));
                     assertEquals("AccessDeniedException", error.awsErrorDetails().errorCode());
+                    assertEquals(403, error.statusCode());
                 }
             } finally {
                 root.deleteParameter(request -> request.name(allowed));
