@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.testing.EnforcementFixtures;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.github.hectorvent.floci.testutil.ExecuteApiRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -27,6 +28,7 @@ import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.Map;
 import java.util.UUID;
@@ -111,6 +113,114 @@ class HttpIntegrationPermissionIntegrationTest {
                 "PolicyDocument", policy.replace("Allow", "Deny")));
         invoke(fixture, 500);
         verifyInvocations(fixture, 1);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1.0,000000000000,000000000000,us-east-1", "2.0,565656565656,343434343434,eu-west-1"})
+    void verifiedCallerPoliciesControlQualifiedLambda(String type, String callerAccount, String targetOwner,
+                                                      String targetRegion) throws Exception {
+        Fixture fixture = fixture(targetOwner, targetRegion, "arn:aws:iam::*:user/*", type);
+        String user = "http-caller-permission-" + UUID.randomUUID().toString().substring(0, 8);
+        String principal = createCallerUser(callerAccount, user, cleanup);
+        Response created = callerIam(callerAccount, "CreateAccessKey", Map.of("UserName", user));
+        CallerKey key = new CallerKey(created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId"),
+                created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.SecretAccessKey"), null);
+        cleanup.register(() -> callerIam(callerAccount, "DeleteAccessKey", Map.of("UserName", user, "AccessKeyId", key.accessKeyId())));
+        signedInvoke(fixture, key, key.secretAccessKey(), 500);
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
+                .formatted(fixture.arn());
+        putCallerUserPolicy(callerAccount, user, policy, cleanup);
+        if (!callerAccount.equals(targetOwner)) {
+            signedInvoke(fixture, key, key.secretAccessKey(), 500);
+            lambdaRequest(targetOwner, targetRegion).queryParam("Qualifier", "live")
+                    .body(Map.of("StatementId", "caller", "Action", "lambda:InvokeFunction", "Principal", principal))
+                    .post("/2015-03-31/functions/" + fixture.name() + "/policy").then().statusCode(201);
+        }
+        signedInvoke(fixture, key, "invalid-secret", 500);
+        verifyInvocations(fixture, 0);
+        signedInvoke(fixture, key, key.secretAccessKey(), 200);
+        verifyInvocations(fixture, 1);
+        callerIam(callerAccount, "PutUserPolicy", Map.of("UserName", user, "PolicyName", "invoke",
+                "PolicyDocument", policy.replace("Allow", "Deny")));
+        signedInvoke(fixture, key, key.secretAccessKey(), 500);
+        verifyInvocations(fixture, 1);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1.0", "2.0"})
+    void issuedSessionTokenAndSessionPolicyRemainEffective(String type) throws Exception {
+        Fixture fixture = fixture(OWNER, REGION, "arn:aws:iam::*:user/*", type);
+        String name = "http-caller-role-" + UUID.randomUUID().toString().substring(0, 8);
+        String trust = """
+                {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
+                "Action":"sts:AssumeRole"}}""".formatted(OWNER);
+        String role = createCallerRole(name, trust, cleanup);
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
+                .formatted(fixture.arn());
+        putRolePolicy(name, policy, cleanup);
+        CallerKey denied = assume(role, policy.replace("Allow", "Deny"));
+        signedInvoke(fixture, denied, denied.secretAccessKey(), 500);
+        CallerKey allowed = assume(role, null);
+        signedInvoke(fixture, new CallerKey(allowed.accessKeyId(), allowed.secretAccessKey(), null),
+                allowed.secretAccessKey(), 500);
+        signedInvoke(fixture, new CallerKey(allowed.accessKeyId(), allowed.secretAccessKey(), "invalid-token"),
+                allowed.secretAccessKey(), 500);
+        verifyInvocations(fixture, 0);
+        signedInvoke(fixture, allowed, allowed.secretAccessKey(), 200);
+        verifyInvocations(fixture, 1);
+        iam("PutRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke",
+                "PolicyDocument", policy.replace("Allow", "Deny")));
+        signedInvoke(fixture, allowed, allowed.secretAccessKey(), 500);
+        verifyInvocations(fixture, 1);
+    }
+
+    private static CallerKey assume(String role, String policy) {
+        RequestSpecification request = given().header("Authorization", EnforcementFixtures.auth(OWNER, "sts"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "AssumeRole")
+                .formParam("RoleArn", role).formParam("RoleSessionName", "caller-session");
+        if (policy != null) {
+            request.formParam("Policy", policy);
+        }
+        Response response = request.post("/").then().statusCode(200).extract().response();
+        String prefix = "AssumeRoleResponse.AssumeRoleResult.Credentials.";
+        return new CallerKey(response.xmlPath().getString(prefix + "AccessKeyId"),
+                response.xmlPath().getString(prefix + "SecretAccessKey"),
+                response.xmlPath().getString(prefix + "SessionToken"));
+    }
+
+    private static Response callerIam(String account, String action, Map<String, String> parameters) {
+        return given().header("Authorization", EnforcementFixtures.auth(account, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParams(parameters).post("/").then().statusCode(200).extract().response();
+    }
+
+    private record CallerKey(String accessKeyId, String secretAccessKey, String sessionToken) { }
+
+    private void signedInvoke(Fixture fixture, CallerKey key, String secret, int status) throws Exception {
+        byte[] body = "{\"request\":\"signed\"}".getBytes(StandardCharsets.UTF_8);
+        String host = baseUri.getHost() + ":" + baseUri.getPort();
+        String path = "/execute-api/" + fixture.apiId() + "/prod/items";
+        Map<String, String> signed = ExecuteApiRequestSigner.signedHeaders("POST", path, Map.of("tag", "a b"), host,
+                body, key.accessKeyId(), secret, REGION, Instant.now());
+        if (status == 200) {
+            for (String altered : new String[]{"body", "query"}) {
+                RequestSpecification invalid = given().header("Host", host).headers(signed)
+                        .queryParam("tag", "query".equals(altered) ? "other" : "a b")
+                        .contentType("application/json").body("body".equals(altered) ? new byte[0] : body);
+                if (key.sessionToken() != null) {
+                    invalid.header("X-Amz-Security-Token", key.sessionToken());
+                }
+                invalid.post(path).then().statusCode(500);
+            }
+        }
+        RequestSpecification request = given().header("Host", host).headers(signed)
+                .queryParam("tag", "a b").contentType("application/json").body(body);
+        if (key.sessionToken() != null) {
+            request.header("X-Amz-Security-Token", key.sessionToken());
+        }
+        request.post(path).then().statusCode(status);
     }
 
     private static void createRole(String name, String trust, PartitionCleanup ownedCleanup) {
@@ -198,6 +308,118 @@ class HttpIntegrationPermissionIntegrationTest {
                 .formParam("RoleName", name).formParam("PolicyName", "invoke").post("/");
     }
 
+    private static String createCallerRole(String name, String trust, PartitionCleanup ownedCleanup) {
+        Response created = callerIam(OWNER, "CreateRole", Map.of("RoleName", name, "Path", "/caller-path/",
+                "AssumeRolePolicyDocument", trust));
+        ownedCleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
+        return created.xmlPath().getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+    }
+
+    private static String createCallerUser(String account, String name, PartitionCleanup ownedCleanup) {
+        Response created = callerIam(account, "CreateUser", Map.of("UserName", name));
+        ownedCleanup.register(() -> callerIam(account, "DeleteUser", Map.of("UserName", name)));
+        return created.xmlPath().getString("CreateUserResponse.CreateUserResult.User.Arn");
+    }
+
+    private static void putCallerUserPolicy(String account, String name, String policy, PartitionCleanup ownedCleanup) {
+        callerIam(account, "PutUserPolicy", Map.of("UserName", name, "PolicyName", "invoke", "PolicyDocument", policy));
+        ownedCleanup.register(() -> callerIam(account, "DeleteUserPolicy", Map.of("UserName", name, "PolicyName", "invoke")));
+    }
+
+    @Test
+    void duplicateCallerRoleCreationDoesNotDeleteExistingRole() throws Exception {
+        String name = "http-existing-caller-role-" + UUID.randomUUID();
+        createCallerRole(name, "{}", cleanup);
+        PartitionCleanup attempted = new PartitionCleanup();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class, () -> createCallerRole(name, "{}", attempted));
+            assertTrue(failure.getMessage().contains("409"), failure.getMessage());
+        } finally {
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        iam("GetRole", Map.of("RoleName", name));
+    }
+
+    @Test
+    void successfulCallerRoleCreationRegistersCleanup() throws Exception {
+        String name = "http-owned-caller-role-" + UUID.randomUUID();
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            createCallerRole(name, "{}", owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        roleRequest("GetRole", name).then().statusCode(404);
+    }
+
+    @Test
+    void duplicateCallerUserCreationDoesNotDeleteExistingUser() throws Exception {
+        String name = "http-existing-caller-user-" + UUID.randomUUID();
+        createCallerUser(OWNER, name, cleanup);
+        PartitionCleanup attempted = new PartitionCleanup();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class, () -> createCallerUser(OWNER, name, attempted));
+            assertTrue(failure.getMessage().contains("409"), failure.getMessage());
+        } finally {
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        callerIam(OWNER, "GetUser", Map.of("UserName", name));
+    }
+
+    @Test
+    void successfulCallerUserCreationRegistersCleanup() throws Exception {
+        String name = "http-owned-caller-user-" + UUID.randomUUID();
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            createCallerUser(OWNER, name, owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        userRequest("GetUser", name).then().statusCode(404);
+    }
+
+    @Test
+    void rejectedCallerUserPolicyDoesNotDeleteExistingPolicy() throws Exception {
+        String name = "http-existing-caller-policy-" + UUID.randomUUID();
+        createCallerUser(OWNER, name, cleanup);
+        putCallerUserPolicy(OWNER, name, "{}", cleanup);
+        String path = "GetUserPolicyResponse.GetUserPolicyResult.PolicyDocument";
+        String before = userRequest("GetUserPolicy", name).then().statusCode(200).extract().xmlPath().getString(path);
+        PartitionCleanup attempted = new PartitionCleanup();
+        doThrow(new AwsException("ServiceFailure", "simulated policy write failure", 500))
+                .when(iamService).putUserPolicy(name, "invoke", "failed-write");
+        try {
+            AssertionError failure = assertThrows(AssertionError.class,
+                    () -> putCallerUserPolicy(OWNER, name, "failed-write", attempted));
+            assertTrue(failure.getMessage().contains("500"), failure.getMessage());
+        } finally {
+            doCallRealMethod().when(iamService).putUserPolicy(name, "invoke", "failed-write");
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        String after = userRequest("GetUserPolicy", name).then().statusCode(200).extract().xmlPath().getString(path);
+        assertEquals(before, after);
+    }
+
+    @Test
+    void successfulCallerUserPolicyRegistersCleanup() throws Exception {
+        String name = "http-owned-caller-policy-" + UUID.randomUUID();
+        createCallerUser(OWNER, name, cleanup);
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            putCallerUserPolicy(OWNER, name, "{}", owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        userRequest("GetUserPolicy", name).then().statusCode(404);
+        callerIam(OWNER, "GetUser", Map.of("UserName", name));
+    }
+
+    private static Response userRequest(String action, String name) {
+        return given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParam("UserName", name).formParam("PolicyName", "invoke").post("/");
+    }
+
     private static void iam(String action, Map<String, String> parameters) {
         given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
                 .contentType("application/x-www-form-urlencoded").formParam("Action", action)
@@ -271,6 +493,8 @@ class HttpIntegrationPermissionIntegrationTest {
         String integration = gateway.createIntegration(request -> request.apiId(api).integrationType("AWS_PROXY")
                 .integrationUri(arn).credentialsArn(credentials).payloadFormatVersion(payloadVersion)).integrationId();
         gateway.createRoute(request -> request.apiId(api).routeKey("GET /items").authorizationType("NONE").target("integrations/" + integration));
+        gateway.createRoute(request -> request.apiId(api).routeKey("POST /items").authorizationType("NONE")
+                .target("integrations/" + integration));
         gateway.createStage(request -> request.apiId(api).stageName("prod").autoDeploy(true));
         doAnswer(invocation -> {
             String payload = "{\"statusCode\":200,\"body\":\"ok\"}";

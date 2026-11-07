@@ -179,7 +179,7 @@ class HttpIntegrationRoleTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"arn:aws:iam::*:user/*", "*"})
+    @ValueSource(strings = {"*"})
     void callerCredentialsRetainSeparateUnqualifiedPath(String credentials) {
         integration.setCredentialsArn(credentials);
         assertEquals(200, invoke());
