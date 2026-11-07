@@ -31,12 +31,14 @@ final class Ec2GuestReboots implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final SweepWorker worker;
 
+    /** Observe owned native guests and serialize recovery with their other lifecycle operations. */
     Ec2GuestReboots(DockerClient docker, EmulatorConfig config,
                     BiFunction<String, Runnable, CompletableFuture<Void>> schedule,
                     Consumer<Instance> restart) {
         this(docker, config, schedule, restart, true);
     }
 
+    /** Allow deterministic polling in tests without starting a background sweep. */
     Ec2GuestReboots(DockerClient docker, EmulatorConfig config,
                     BiFunction<String, Runnable, CompletableFuture<Void>> schedule,
                     Consumer<Instance> restart, boolean automatic) {
@@ -47,6 +49,7 @@ final class Ec2GuestReboots implements AutoCloseable {
         worker = new SweepWorker("ec2-guest-reboots", automatic, 1, false, ignored -> poll());
     }
 
+    /** Begin observation while launch is pending or running; repeated registration keeps its recovery phase. */
     void watch(Instance instance) {
         String container = instance.getDockerContainerId();
         String state = instance.getState() == null ? "" : instance.getState().getName();
@@ -59,12 +62,14 @@ final class Ec2GuestReboots implements AutoCloseable {
         }
     }
 
+    /** Revoke queued recovery when stop or termination takes ownership of the guest. */
     void forget(Instance instance) {
         if (instance.getDockerContainerId() != null) {
             guests.remove(instance.getDockerContainerId());
         }
     }
 
+    /** Inspect every registered guest, retaining observations across transient Docker failures. */
     void poll() {
         guests.keySet().forEach(this::isRebooting);
     }
@@ -128,6 +133,7 @@ final class Ec2GuestReboots implements AutoCloseable {
         }
     }
 
+    /** Recheck the lease and Docker ownership after queueing, then restart in the instance's account scope. */
     private void resume(String container, Guest guest) {
         try {
             // Stop, terminate and a replacement lease win even after a reboot was queued.
@@ -150,6 +156,7 @@ final class Ec2GuestReboots implements AutoCloseable {
         }
     }
 
+    /** Require the same observation and container binding so a queued reboot cannot revive a replaced guest. */
     private boolean wanted(String container, Guest guest) {
         return !closed.get() && guests.get(container) == guest
                 && container.equals(guest.instance.getDockerContainerId())
@@ -158,12 +165,14 @@ final class Ec2GuestReboots implements AutoCloseable {
                     || "pending".equals(guest.instance.getState().getName()));
     }
 
+    /** Recognize Linux PID-namespace reboot, excluding an explicit stop and unrelated init failures. */
     static boolean requestedReboot(InspectContainerResponse current) {
         return current.getState() != null && !Boolean.TRUE.equals(current.getState().getRunning())
                 && "exited".equals(current.getState().getStatus())
                 && Long.valueOf(REBOOT_EXIT_CODE).equals(current.getState().getExitCodeLong());
     }
 
+    /** Bind recovery to the immutable container ID and this emulator's account, region and runtime labels. */
     private boolean owned(String container, Instance instance, InspectContainerResponse current) {
         Map<String, String> labels = current.getConfig() == null ? null : current.getConfig().getLabels();
         return labels != null && container.equals(current.getId())
@@ -178,6 +187,7 @@ final class Ec2GuestReboots implements AutoCloseable {
                 && ResolvedAmiImage.SYSTEMD_V1_RUNTIME.equals(labels.get(Ec2SystemdV1Runtime.RUNTIME_LABEL));
     }
 
+    /** Stop observation and invalidate queued recovery before shutting down the sweep worker. */
     @Override
     public void close() {
         closed.set(true);

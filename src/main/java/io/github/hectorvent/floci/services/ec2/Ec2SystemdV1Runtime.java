@@ -53,6 +53,7 @@ final class Ec2SystemdV1Runtime {
     private final Map<String, String> helpers = new HashMap<>();
     private final Set<String> retiredHelpers = new HashSet<>();
 
+    /** Keep helper ownership and retirement state separate from the workload container lifecycle. */
     Ec2SystemdV1Runtime(DockerClient docker, ContainerBuilder builder,
                        ContainerLifecycleManager lifecycle, EmulatorConfig config) {
         this.docker = docker;
@@ -61,12 +62,14 @@ final class Ec2SystemdV1Runtime {
         this.config = config;
     }
 
+    /** Supply the EC2-shaped hardware marker cloud-init reads, stable across restarts and scoped to the instance. */
     static String hardwareUuid(String accountId, String region, String instanceId) {
         String hex = "ec2" + Digests.sha256Hex(accountId + "\n" + region + "\n" + instanceId).substring(3, 32);
         return hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-" + hex.substring(12, 16)
                 + "-" + hex.substring(16, 20) + "-" + hex.substring(20);
     }
 
+    /** Adopt a verified helper or create one, then mount only this guest's delegated service hierarchy. */
     synchronized void prepare(Instance instance, String accountId, String region) {
         String name = name(instance.getInstanceId());
         try {
@@ -99,6 +102,7 @@ final class Ec2SystemdV1Runtime {
         ensureMounted(docker.inspectContainerCmd(helper).exec(), scope);
     }
 
+    /** Restore an owned native guest's helper reference; refuse a changed identity instead of silently adopting it. */
     synchronized boolean rememberGuest(Instance instance, InspectContainerResponse guest) {
         Map<String, String> labels = guest.getConfig() == null ? null : guest.getConfig().getLabels();
         if (labels == null || !ResolvedAmiImage.SYSTEMD_V1_RUNTIME.equals(labels.get(RUNTIME_LABEL))) {
@@ -120,6 +124,10 @@ final class Ec2SystemdV1Runtime {
         return true;
     }
 
+    /**
+     * Install the native bootstrap, isolate its clock and delegate its service hierarchy before releasing init.
+     * A guest whose final gate already exists is left running; any failed prerequisite keeps that gate closed.
+     */
     synchronized boolean release(Instance instance, String containerId) {
         InspectContainerResponse guest = docker.inspectContainerCmd(containerId).exec();
         if (!rememberGuest(instance, guest)) {
@@ -183,6 +191,7 @@ final class Ec2SystemdV1Runtime {
         return true;
     }
 
+    /** Retire the empty service hierarchy before deleting its helper, retaining proof for a lost delete response. */
     synchronized void remove(Instance instance) {
         String reference = helpers.get(instance.getInstanceId());
         if (reference == null) {
@@ -203,6 +212,7 @@ final class Ec2SystemdV1Runtime {
         helpers.remove(instance.getInstanceId());
     }
 
+    /** Recover declared helpers after restart and retire only verified helpers whose instance no longer exists. */
     synchronized void reconcileOrphans(BiPredicate<String, String> stillDeclared) {
         for (Container container : docker.listContainersCmd().withShowAll(true)
                 .withLabelFilter(Map.of(ContainerStorageHelper.SERVICE_LABEL, SERVICE,
@@ -226,6 +236,7 @@ final class Ec2SystemdV1Runtime {
         }
     }
 
+    /** Remove only the verified, empty guest scope; another guest's hierarchy remains mounted by its own helper. */
     private void remove(InspectContainerResponse helper, String instance, String region, String account) {
         String scope = requireHelper(helper, instance, region, account);
         helpers.put(instance, helper.getId());
@@ -268,6 +279,7 @@ final class Ec2SystemdV1Runtime {
         helpers.remove(instance, helper.getId());
     }
 
+    /** Return the private scope only after checking the helper's complete resource ownership and scope syntax. */
     String requireHelper(InspectContainerResponse helper, String instance, String region, String account) {
         Map<String, String> labels = helper.getConfig().getLabels();
         if (labels == null || instance == null || region == null
@@ -287,6 +299,7 @@ final class Ec2SystemdV1Runtime {
         return scope;
     }
 
+    /** Reestablish the verified service mount, invalidating any earlier proof that this helper was retired. */
     private void ensureMounted(InspectContainerResponse helper, String scope) {
         retiredHelpers.remove(helper.getId());
         if (!Boolean.TRUE.equals(helper.getState().getRunning())) {
@@ -306,6 +319,7 @@ final class Ec2SystemdV1Runtime {
         return ContainerStorageHelper.ownerIdentity(config);
     }
 
+    /** Bound helper operations and propagate failures so launch cannot release init after incomplete preparation. */
     private void run(String container, String... command) {
         ContainerExec.Result result = ContainerExec.run(docker, container, command, 15);
         if (result.timedOut() || result.exitCode() != 0) {
