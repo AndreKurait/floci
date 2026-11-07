@@ -213,11 +213,12 @@ public class StsQueryHandler {
         // these temporary credentials to the assumed role's account. The session records the
         // role's own ARN, path included: it is the session's aws:PrincipalArn, and it keeps naming
         // the role that issued the session even if a role of the same name replaces it later.
-        String sessionPolicy = getParam(params, "Policy");
+        StsSessionPolicies.Resolved sessionPolicy = StsSessionPolicies.resolve(params, accountId,
+                AwsArnUtils.parse(sessionRoleArn).partition(), iamService);
         iamService.registerSession(
-                accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
+                accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy.inline(), callerAccountId,
                 sessionName, assumedRoleId, effectiveTags,
-                StsSessionTags.transitive(sessionTags, transitiveKeys, inheritedTags), sourceIdentity);
+                StsSessionTags.transitive(sessionTags, transitiveKeys, inheritedTags), sourceIdentity, sessionPolicy.managedArns());
 
         XmlBuilder response = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
@@ -455,10 +456,11 @@ public class StsQueryHandler {
         String subject = verified != null ? verified.subject() : "web-identity-subject";
         String sourceIdentity = verified != null ? verified.sourceIdentity() : null;
 
-        String sessionPolicy = getParam(params, "Policy");
+        StsSessionPolicies.Resolved sessionPolicy = StsSessionPolicies.resolve(params, accountId,
+                AwsArnUtils.parse(sessionRoleArn).partition(), iamService);
         iamService.registerSession(
-                accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
-                sessionName, assumedRoleId, Map.of(), Map.of(), sourceIdentity);
+                accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy.inline(), callerAccountId,
+                sessionName, assumedRoleId, Map.of(), Map.of(), sourceIdentity, sessionPolicy.managedArns());
 
         XmlBuilder result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
@@ -681,9 +683,11 @@ public class StsQueryHandler {
         String assumedRoleArn = assumedRoleArn(sessionRoleArn, accountId, roleName, sessionName);
         String assumedRoleId = assumedRoleId(role, sessionName);
 
+        StsSessionPolicies.Resolved sessionPolicy = StsSessionPolicies.resolve(params, accountId,
+                AwsArnUtils.parse(sessionRoleArn).partition(), iamService);
         iamService.registerSession(accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration,
-                getParam(params, "Policy"), callerAccountId, sessionName, assumedRoleId,
-                Map.of(), Map.of(), verified.sourceIdentity());
+                sessionPolicy.inline(), callerAccountId, sessionName, assumedRoleId,
+                Map.of(), Map.of(), verified.sourceIdentity(), sessionPolicy.managedArns());
         XmlBuilder result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
                 .start("AssumedRoleUser").elem("Arn", assumedRoleArn).elem("AssumedRoleId", assumedRoleId).end("AssumedRoleUser")
@@ -734,11 +738,12 @@ public class StsQueryHandler {
         String federatedUserId = accountId + ":" + name;
         String federatedUserArn = regionResolver.buildGlobalArn("sts", accountId, "federated-user/" + name);
 
-        String sessionPolicy = getParam(params, "Policy");
+        StsSessionPolicies.Resolved sessionPolicy = StsSessionPolicies.resolve(params, accountId,
+                AwsRegions.partitionFor(regionResolver.getRegion()), iamService);
         // The session is scoped by its session policy within the permissions of the caller that
         // minted it, so the caller is recorded with it.
         iamService.registerIssuedSession(accessKeyId, secretKey, sessionToken, federatedUserArn, expiration,
-                sessionPolicy, accountId, callerAccessKeyId());
+                sessionPolicy.inline(), accountId, callerAccessKeyId(), sessionPolicy.managedArns());
 
         String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
