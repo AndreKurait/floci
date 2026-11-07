@@ -670,6 +670,11 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
                     targetContainerId, instance.getInstanceId(), volume.getVolumeId());
             return Optional.empty();
         }
+        if (!isRawDeviceGuest(instance)) {
+            LOG.debugv("Instance {0} is not privileged; raw volume {1} attached as metadata only",
+                    instance.getInstanceId(), volume.getVolumeId());
+            return Optional.empty();
+        }
 
         String helperId = ensureHelperContainer();
         if (helperId == null) {
