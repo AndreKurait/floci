@@ -15238,6 +15238,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         // Phase 5: pagination
         if (maxResults > 0) {
+            result.sort(Comparator.comparing(NetworkInterface::getNetworkInterfaceId));
             int total = result.size();
             int toIndex = Math.min(offset + maxResults, total);
             List<NetworkInterface> page = (offset < total)

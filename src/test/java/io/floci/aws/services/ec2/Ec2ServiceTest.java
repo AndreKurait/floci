@@ -163,6 +163,58 @@ import static org.mockito.Mockito.withSettings;
 class Ec2ServiceTest {
 
     @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void networkInterfacePagesRemainDistinctWhenStorageScanOrderChanges(boolean standalone) {
+        InMemoryStorage<String, Instance> rawInstances = spy(new InMemoryStorage<String, Instance>());
+        InMemoryStorage<String, NetworkInterface> rawInterfaces = spy(new InMemoryStorage<String, NetworkInterface>());
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of(
+                        "ec2-instances.json", new AccountAwareStorageBackend<>(rawInstances, null, "000000000000"),
+                        "ec2-network-interfaces.json", new AccountAwareStorageBackend<>(rawInterfaces, null, "000000000000"))));
+        String region = "us-east-1";
+        if (standalone) {
+            String subnetId = service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId();
+            for (int i = 0; i < 6; i++) {
+                service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(), List.of());
+            }
+        } else {
+            service.runInstances(region, "ami-test", "t3.micro", 6, 6, null, List.of(), null, null,
+                    List.of(), null, null);
+        }
+        List<String> expected = service.describeNetworkInterfaces(region, List.of(), Map.of())
+                .networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).sorted().toList();
+        assertEquals(6, expected.size());
+        NetworkInterfaceListResult first = service.describeNetworkInterfaces(region, List.of(), Map.of(), 5, null);
+        assertEquals(5, first.networkInterfaces().size());
+        assertNotNull(first.nextToken());
+
+        doAnswer(invocation -> {
+            List<Instance> values = new ArrayList<>((List<Instance>) invocation.callRealMethod());
+            Collections.reverse(values);
+            return values;
+        }).when(rawInstances).scan(any());
+        doAnswer(invocation -> {
+            List<NetworkInterface> values = new ArrayList<>((List<NetworkInterface>) invocation.callRealMethod());
+            Collections.reverse(values);
+            return values;
+        }).when(rawInterfaces).scan(any());
+
+        NetworkInterfaceListResult second = service.describeNetworkInterfaces(
+                region, List.of(), Map.of(), 5, first.nextToken());
+        assertEquals(1, second.networkInterfaces().size());
+        assertNull(second.nextToken());
+        List<String> actual = new ArrayList<>(first.networkInterfaces().stream()
+                .map(NetworkInterface::getNetworkInterfaceId).toList());
+        actual.addAll(second.networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+        assertEquals(expected, actual.stream().sorted().toList());
+        assertEquals(second.networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList(),
+                service.describeNetworkInterfaces(region, List.of(), Map.of(), 5, first.nextToken())
+                        .networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+    }
+
+
+    @ParameterizedTest
     @CsvSource({
             "false, aws:autoscaling:groupName", "true, aws:autoscaling:groupName",
             "false, AWS:custom", "true, AWS:custom",
