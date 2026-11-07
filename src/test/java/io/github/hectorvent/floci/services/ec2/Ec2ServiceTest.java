@@ -152,6 +152,7 @@ import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -2108,6 +2109,45 @@ class Ec2ServiceTest {
                 Map.of("group-id", List.of(groupId)), 0, null);
 
         assertEquals(1, result.networkInterfaces().size());
+    }
+
+    @Test
+    void describeNetworkInterfacesPaginationSurvivesStorageReordering() {
+        AccountAwareStorageBackend<Instance> instances =
+                spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instances)));
+        List<Instance> launched = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                6, 6, null, List.of(), null, null, List.of(), null, null).getInstances();
+        Map<String, List<String>> filters = Map.of("vpc-id", List.of(launched.getFirst().getVpcId()));
+
+        doReturn(launched).when(instances).scanForAccount(eq("000000000000"), any());
+        NetworkInterfaceListResult first =
+                service.describeNetworkInterfaces("us-east-1", List.of(), filters, 5, null);
+        assertEquals(5, first.networkInterfaces().size());
+        assertNotNull(first.nextToken());
+
+        // Another write can reorder a storage scan without changing the matching interfaces.
+        doReturn(launched.reversed()).when(instances).scanForAccount(eq("000000000000"), any());
+        NetworkInterfaceListResult last =
+                service.describeNetworkInterfaces("us-east-1", List.of(), filters, 5, first.nextToken());
+        assertEquals(1, last.networkInterfaces().size());
+        assertNull(last.nextToken());
+
+        List<String> ids = new ArrayList<>(first.networkInterfaces().stream()
+                .map(NetworkInterface::getNetworkInterfaceId).toList());
+        ids.addAll(last.networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+        Set<String> expected = new HashSet<>(launched.stream()
+                .map(instance -> instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId()).toList());
+        assertEquals(6, new HashSet<>(ids).size(), "Continuation must not repeat an interface");
+        assertEquals(expected, new HashSet<>(ids));
+
+        doReturn(launched).when(instances).scanForAccount(eq("000000000000"), any());
+        assertEquals(last.networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList(),
+                service.describeNetworkInterfaces("us-east-1", List.of(), filters, 5, first.nextToken())
+                        .networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
     }
 
     @ParameterizedTest
