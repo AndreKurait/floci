@@ -125,7 +125,9 @@ class Ec2SystemdV1RuntimeLifecycleTest {
         assertTrue(helperCommands.getFirst().contains("prepare-init"));
         assertEquals(List.of("/usr/local/bin/floci-ec2-init", "--configure-time", "81", GUEST),
                 helperCommands.get(1));
-        assertTrue(helperCommands.get(2).contains("delegate-init"));
+        assertEquals(List.of("/usr/local/bin/floci-ec2-init", "--delegate-init", "81", GUEST,
+                Ec2SystemdV1Runtime.ROOT + "/systemd/floci-" + "a".repeat(32) + "/cgroup.procs"),
+                helperCommands.get(2));
         InOrder order = inOrder(docker);
         order.verify(docker).copyArchiveFromContainerCmd(HELPER, "/usr/local/bin/floci-ec2-init");
         order.verify(docker).copyArchiveToContainerCmd(GUEST);
@@ -147,7 +149,21 @@ class Ec2SystemdV1RuntimeLifecycleTest {
         assertThrows(IllegalStateException.class, () -> runtime.release(instance, GUEST));
 
         assertFalse(guestCommands.contains(List.of("touch", Ec2SystemdV1Runtime.READY)));
-        assertFalse(helperCommands.stream().anyMatch(command -> command.contains("delegate-init")));
+        assertFalse(helperCommands.stream().anyMatch(command -> command.contains("--delegate-init")));
+    }
+
+    @Test
+    void failedIdentityPinnedDelegationNeverOpensTheFinalBootGate() {
+        List<List<String>> guestCommands = ContainerExecStubs.completeEveryExec(
+                docker, GUEST, List.of(1L, 0L), "", "");
+        ContainerExecStubs.completeEveryExec(
+                docker, HELPER, List.of(0L, 0L, 1L), "", "original PID namespace no longer has an init");
+        when(docker.copyArchiveFromContainerCmd(HELPER, "/usr/local/bin/floci-ec2-init").exec())
+                .thenReturn(new ByteArrayInputStream(new byte[0]));
+
+        assertThrows(IllegalStateException.class, () -> runtime.release(instance, GUEST));
+
+        assertFalse(guestCommands.contains(List.of("touch", Ec2SystemdV1Runtime.READY)));
     }
 
     private Map<String, String> labels(String service) {

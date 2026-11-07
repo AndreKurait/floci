@@ -22,6 +22,7 @@ import java.util.Map;
  * @param memorySwappiness swappiness from 0 to 100 (null = daemon default)
  * @param networkSysctls settings for the container's own network namespace
  * @param pidMode Docker PID namespace mode (null = private namespace)
+ * @param apparmorProfile Docker AppArmor profile (null = daemon default)
  */
 public record LinuxOptions(
         List<String> capAdd,
@@ -32,15 +33,26 @@ public record LinuxOptions(
         Long memorySwapBytes,
         Long memorySwappiness,
         Map<String, String> networkSysctls,
-        String pidMode
+        String pidMode,
+        String apparmorProfile
 ) {
     public LinuxOptions {
+        if (apparmorProfile != null && apparmorProfile.isBlank()) {
+            throw new IllegalArgumentException("Expected an AppArmor profile name");
+        }
         networkSysctls = Map.copyOf(networkSysctls);
         networkSysctls.forEach((key, value) -> {
             if (!key.matches("net\\.[a-zA-Z0-9_.]+") || value.isBlank()) {
                 throw new IllegalArgumentException("Expected a network-namespace sysctl and value");
             }
         });
+    }
+
+    public LinuxOptions(List<String> capAdd, List<String> capDrop, List<Device> devices,
+                        Long shmSizeBytes, Map<String, String> tmpfs, Long memorySwapBytes,
+                        Long memorySwappiness, Map<String, String> networkSysctls, String pidMode) {
+        this(capAdd, capDrop, devices, shmSizeBytes, tmpfs, memorySwapBytes, memorySwappiness,
+                networkSysctls, pidMode, null);
     }
 
     public LinuxOptions(List<String> capAdd, List<String> capDrop, List<Device> devices,

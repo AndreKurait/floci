@@ -23,7 +23,11 @@ credential: metadata tokens and instance-role sessions retain their own checks.
 
 Each instance has a labelled helper with no network, `SYS_ADMIN`, `SYS_TIME`, and the
 Docker host's PID and cgroup namespaces. This helper verifies the guest's
-Docker identity before moving its init PID into its private service subtree.
+Docker identity and pins its process directory and PID namespace before moving
+init into its private service subtree. A child enters that pinned PID namespace
+and writes namespace-local PID 1 to the service cgroup. If init exits, the
+namespace cannot supply a replacement PID 1; a reused host PID cannot redirect
+this write to another process.
 The guest then creates a cgroup namespace rooted at that subtree and executes
 native init. The guest has a private PID namespace and no bind mount of the
 host's cgroup filesystem. Its existing security-group network namespace and
@@ -34,6 +38,16 @@ Docker's resource limits; legacy per-service resource-controller limits are
 not emulated. A rootful Linux Docker daemon that permits this named hierarchy
 is required, together with kernel time namespaces. Dropping `SYS_ADMIN` or
 `SYS_BOOT` explicitly refuses this runtime.
+
+Docker's default AppArmor profile denies these mounts even with `SYS_ADMIN`.
+Only `systemd-v1` guests and their init helpers therefore select
+`apparmor=unconfined`. Docker's seccomp policy, device restrictions and capability
+drops still apply. Other containers keep their existing AppArmor selection.
+To retain AppArmor confinement, set
+`FLOCI_SERVICES_EC2_NATIVE_INIT_APPARMOR_PROFILE` to a profile already loaded on
+the workload Docker host. It must permit the helper's named cgroup mount, PID
+namespace entry, and the guest's private mounts and hypervisor remount. Floci
+does not install or alter host profiles.
 
 The helper image includes a small statically linked `floci-ec2-init` binary.
 It runs on the workload daemon's architecture and is copied into the guest's

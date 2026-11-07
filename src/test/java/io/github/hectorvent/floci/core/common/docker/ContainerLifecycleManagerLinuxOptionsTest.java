@@ -15,6 +15,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -82,6 +83,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
                 .withMemorySwapBytes(1536 * MIB)
                 .withMemorySwappiness(10)
                 .withPidMode("host")
+                .withApparmorProfile("floci-native")
                 .withNetworkSysctl("net.ipv4.ip_forward", "1")
                 .build();
 
@@ -99,6 +101,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertEquals(10L, hostConfig.getMemorySwappiness());
         assertEquals(Map.of("net.ipv4.ip_forward", "1"), hostConfig.getSysctls());
         assertEquals("host", hostConfig.getPidMode());
+        assertEquals(List.of("apparmor=floci-native"), hostConfig.getSecurityOpts());
     }
 
     @Test
@@ -118,6 +121,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertNull(hostConfig.getMemorySwappiness());
         assertNull(hostConfig.getSysctls());
         assertNull(hostConfig.getPidMode());
+        assertNull(hostConfig.getSecurityOpts());
     }
 
     @Test
@@ -158,6 +162,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
                 .withCapAdd("SYS_PTRACE")
                 .withCapAdd("NET_RAW")
                 .withCapDrop("MKNOD")
+                .withApparmorProfile("unconfined")
                 .build();
 
         manager().create(spec);
@@ -166,6 +171,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertArrayEquals(new Capability[] {Capability.SYS_PTRACE}, hostConfig.getCapAdd());
         assertArrayEquals(new Capability[] {Capability.NET_ADMIN, Capability.NET_RAW, Capability.MKNOD},
                 hostConfig.getCapDrop());
+        assertEquals(List.of("apparmor=unconfined"), hostConfig.getSecurityOpts());
     }
 
     /**

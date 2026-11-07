@@ -2,12 +2,16 @@ package io.github.hectorvent.floci.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -60,6 +64,35 @@ class Ec2SystemdV1RuntimeTest {
         assertEquals("floci-" + "a".repeat(32),
                 runtime.requireHelper(helper(labels()), "i-owned", "eu-west-1", "123456789012"));
         verifyNoInteractions(docker, lifecycle);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"unconfined", "floci-native"})
+    void helperUsesTheNativeMountProfileWithoutPrivilegedMode(String profile) {
+        when(config.services().ec2().nativeInitApparmorProfile())
+                .thenReturn("unconfined".equals(profile) ? Optional.empty() : Optional.of(profile));
+        when(config.services().ec2().metadataHelperImage()).thenReturn("test/native-helper:1");
+        when(config.docker().logMaxSize()).thenReturn("10m");
+        when(config.docker().logMaxFile()).thenReturn("3");
+        String name = ContainerStorageHelper.resourceName(config, Ec2SystemdV1Runtime.SERVICE, null, "i-owned");
+        when(docker.inspectContainerCmd(name).exec()).thenThrow(new NotFoundException("not created"));
+        when(lifecycle.create(any(ContainerSpec.class))).thenAnswer(invocation -> {
+            ContainerSpec spec = invocation.getArgument(0);
+            assertEquals(profile, spec.linuxOptions().apparmorProfile());
+            assertFalse(spec.privileged());
+            InspectContainerResponse response = helper(spec.labels());
+            when(response.getState()).thenReturn(mock(InspectContainerResponse.ContainerState.class));
+            when(response.getState().getRunning()).thenReturn(true);
+            when(docker.inspectContainerCmd("owned-helper").exec()).thenReturn(response);
+            return "owned-helper";
+        });
+        ContainerExecStubs.completeEveryExec(docker, "owned-helper", 0, "", "");
+        ContainerBuilder builder = new ContainerBuilder(config, mock(DockerHostResolver.class), null);
+
+        new Ec2SystemdV1Runtime(docker, builder, lifecycle, config)
+                .prepare(instance(), "123456789012", "eu-west-1");
+
+        verify(lifecycle).startCreated(eq("owned-helper"), any(ContainerSpec.class));
     }
 
     @Test

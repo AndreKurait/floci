@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -116,12 +117,50 @@ static int verify_guest(long pid, const char *container) {
     return directory;
 }
 
-static void configure_time(const char *pid_text, const char *container) {
+static int pin_guest(const char *pid_text, const char *container) {
     char *end;
     errno = 0;
     long pid = strtol(pid_text, &end, 10);
     require(errno == 0 && end != pid_text && *end == '\0', "Invalid EC2 guest PID");
-    int guest = verify_guest(pid, container);
+    return verify_guest(pid, container);
+}
+
+static void delegate_init(const char *pid_text, const char *container, const char *path) {
+    int guest = pin_guest(pid_text, container);
+    int namespace = openat(guest, "ns/pid", O_RDONLY | O_CLOEXEC);
+    if (namespace < 0) {
+        fail("Cannot pin EC2 guest PID namespace");
+    }
+    int processes = open(path, O_WRONLY | O_CLOEXEC);
+    if (processes < 0 || setns(namespace, CLONE_NEWPID) != 0) {
+        fail("Cannot enter EC2 guest PID namespace");
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        fail("Cannot delegate the original EC2 init");
+    }
+    if (child == 0) {
+        /* cgroup.procs resolves PIDs in the writer's active PID namespace.
+           Its PID 1 cannot be replaced when the original init exits. */
+        if (write(processes, "1\n", 2) != 2) {
+            fail("Cannot delegate EC2 init to its service hierarchy");
+        }
+        _exit(EXIT_SUCCESS);
+    }
+    int status;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    require(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
+            "EC2 init delegation did not complete");
+    if (close(processes) != 0 || close(namespace) != 0 || close(guest) != 0) {
+        fail("Cannot close EC2 delegation handles");
+    }
+}
+
+static void configure_time(const char *pid_text, const char *container) {
+    int guest = pin_guest(pid_text, container);
     struct timespec monotonic, boottime;
     if (clock_gettime(CLOCK_MONOTONIC, &monotonic) != 0
             || clock_gettime(CLOCK_BOOTTIME, &boottime) != 0) {
@@ -151,8 +190,13 @@ int main(int argc, char **argv) {
         configure_time(argv[2], argv[3]);
         return EXIT_SUCCESS;
     }
+    if (argc == 5 && strcmp(argv[1], "--delegate-init") == 0) {
+        delegate_init(argv[2], argv[3], argv[4]);
+        return EXIT_SUCCESS;
+    }
     require(argc >= 3 && strcmp(argv[1], "--boot") == 0,
-            "Usage: floci-ec2-init --boot /sbin/init | --configure-time PID CONTAINER_ID");
+            "Usage: floci-ec2-init --boot /sbin/init | --configure-time PID CONTAINER_ID"
+            " | --delegate-init PID CONTAINER_ID CGROUP_PROCS");
     boot(argv + 2);
     return EXIT_FAILURE;
 }

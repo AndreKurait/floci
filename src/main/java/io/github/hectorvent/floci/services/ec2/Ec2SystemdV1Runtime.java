@@ -88,6 +88,7 @@ final class Ec2SystemdV1Runtime {
         ContainerSpec spec = builder.newContainer(image).withName(name)
                 .withDockerNetwork(Optional.empty()).withNetworkMode("none")
                 .withUser("0").withCgroupnsMode("host").withPidMode("host")
+                .withApparmorProfile(config.services().ec2().nativeInitApparmorProfile().orElse("unconfined"))
                 .withCapAdd("SYS_ADMIN").withCapAdd("SYS_TIME")
                 .withEntrypoint(List.of("sh", "-c")).withCmd(List.of("exec sleep 2147483647"))
                 .withMount(new Mount().withType(MountType.TMPFS).withTarget(ROOT))
@@ -178,14 +179,8 @@ final class Ec2SystemdV1Runtime {
                 """);
         String pid = Long.toString(guest.getState().getPidLong());
         run(helper.getId(), BINARY, "--configure-time", pid, containerId);
-        run(helper.getId(), "sh", "-ec", """
-                case "$(cat "/proc/$1/cgroup")" in
-                    *"$2"*) ;;
-                    *) echo 'Guest PID does not belong to its Docker container' >&2; exit 1;;
-                esac
-                test "$(awk '/^NSpid:/ {print $NF}' "/proc/$1/status")" = 1
-                printf '%s\\n' "$1" > "$3/cgroup.procs"
-                """, "delegate-init", pid, containerId, MOUNT + "/" + scope);
+        run(helper.getId(), BINARY, "--delegate-init", pid, containerId,
+                MOUNT + "/" + scope + "/cgroup.procs");
         InspectContainerResponse current = docker.inspectContainerCmd(containerId).exec();
         if (!guest.getState().getPidLong().equals(current.getState().getPidLong())
                 || !Boolean.TRUE.equals(current.getState().getRunning())) {

@@ -896,6 +896,7 @@ public class Ec2ContainerManager {
         }
         if (image.systemdV1()) {
             specBuilder.withCgroupnsMode("private").withCapAdd("SYS_ADMIN").withCapAdd("SYS_BOOT")
+                    .withApparmorProfile(config.services().ec2().nativeInitApparmorProfile().orElse("unconfined"))
                     .withEnv("container", "docker")
                     .withEntrypoint(List.of("/bin/sh", "-c", Ec2SystemdV1Runtime.GATE))
                     .withCmd(List.of("ec2-init", Ec2SystemdV1Runtime.hardwareUuid(

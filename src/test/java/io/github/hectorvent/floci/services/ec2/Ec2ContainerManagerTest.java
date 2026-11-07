@@ -1991,6 +1991,7 @@ class Ec2ContainerManagerTest {
             assertEquals("running", instance.getState().getName());
             assertEquals(userData, instance.getUserData(), "metadata retains the original user data");
             boolean guestOwnsBootstrap = cloudInit && !"minimal".equals(runtime);
+            verify(harness.builder, never()).withApparmorProfile(anyString());
             if (guestOwnsBootstrap) {
                 verify(harness.dockerClient, never()).execCreateCmd(TEST_CONTAINER_ID);
                 verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
@@ -2009,10 +2010,13 @@ class Ec2ContainerManagerTest {
         }
     }
 
-    @Test
-    void nativeInitOwnsBootstrapWithoutCompatibilityUserDataOrSshInjection() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"unconfined", "floci-native"})
+    void nativeInitOwnsBootstrapWithoutCompatibilityUserDataOrSshInjection(String profile) throws Exception {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        when(harness.config.services().ec2().nativeInitApparmorProfile())
+                .thenReturn("unconfined".equals(profile) ? Optional.empty() : Optional.of(profile));
         Instance instance = instance("i-native-init-bootstrap");
         List<List<String>> helperCommands = stubNativeInit(harness, instance);
         instance.setUserData("#!/bin/sh\necho native-only\n");
@@ -2023,6 +2027,7 @@ class Ec2ContainerManagerTest {
             executor.shutdown();
             assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
             assertEquals("running", instance.getState().getName());
+            verify(harness.builder).withApparmorProfile(profile);
             assertTrue(helperCommands.stream().anyMatch(command -> command.contains("prepare-init")));
             assertTrue(harness.executedCommands.stream().anyMatch(command ->
                     Arrays.equals(command, new String[]{"test", "-f", Ec2SystemdV1Runtime.READY})));
