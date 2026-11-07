@@ -7,6 +7,8 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.spy;
@@ -64,10 +66,52 @@ class DeclaredPublicAliasRoutingTest {
     }
 
     @Test
-    void unknownOrIncompleteVpcOriginRetainsTheExistingTransport() {
+    void declaredOwnedAliasOutsideVpcSelectsUpstreamAfterOwnershipValidation() {
+        DnsAnswer answer = DnsAnswer.records(List.of(CONTROL), 45);
+        EmbeddedDnsServer owner = server(true, answer);
+        DnsAnswer validated = owner.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, null)
+                .orElseThrow();
+        assertTrue(validated.upstream());
+        assertEquals(answer.records(), validated.records());
+        assertEquals(45, validated.ttlSeconds());
+        DnsRecordSource zone = new DnsRecordSource() {
+            @Override
+            public Optional<DnsAnswer> resolveIpv4(String name) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
+                return Optional.of(validated.withAuthority("peer.example",
+                        new DnsRecord.Soa("ns.peer.example hostmaster.peer.example 1 2 3 4 5"), 60));
+            }
+        };
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(
+                List.of(), List.of(zone), List.of(), List.of(), true, List.of(HOST));
+        assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM, dns.planQuery(HOST, "172.18.0.3", CONTROL, 1));
+        for (DnsAnswer invalid : List.of(DnsAnswer.refused(), DnsAnswer.noData(), DnsAnswer.nxDomain())) {
+            assertEquals(invalid, server(true, invalid)
+                    .resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, null).orElseThrow());
+            assertThrows(IllegalArgumentException.class, invalid::viaUpstream);
+        }
+    }
+
+    @Test
+    void nonVpcLiteralAndUnsupportedAnswersDoNotSelectUpstream() {
+        for (DnsAnswer answer : List.of(DnsAnswer.records(List.of(CONTROL), 60),
+                DnsAnswer.refused(), DnsAnswer.noData(), DnsAnswer.nxDomain())) {
+            DnsRecordSource records = name -> Optional.of(answer);
+            EmbeddedDnsServer dns = new EmbeddedDnsServer(
+                    List.of(), List.of(records), List.of(), List.of(), true, List.of(HOST));
+            assertEquals(answer, dns.planQuery(HOST, "172.18.0.3", CONTROL, 1).answer().orElseThrow());
+            assertFalse(answer.upstream());
+        }
+    }
+
+    @Test
+    void incompleteVpcOriginRetainsTheExistingTransport() {
         DnsAnswer answer = DnsAnswer.records(List.of(CONTROL), 60);
         EmbeddedDnsServer dns = server(true, answer);
-        assertEquals(answer, dns.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, null).orElseThrow());
         for (DnsClientVpcSource.ClientVpc origin : List.of(
                 new DnsClientVpcSource.ClientVpc("", "us-east-1", "vpc-caller"),
                 new DnsClientVpcSource.ClientVpc("111111111111", "", "vpc-caller"),

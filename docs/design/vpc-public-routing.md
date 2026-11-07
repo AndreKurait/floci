@@ -75,6 +75,14 @@ checks. Undeclared aliases, literal address records, private-zone answers and
 failed alias lookups retain their existing behavior. This configured front-door
 handoff does not implement general native Application Load Balancer frontends.
 
+Outside a VPC, the same validated public alias uses the configured upstream DNS
+resolver to reach its declared front door. Alias ownership and canonical-zone
+validation still run first. A refused, missing, ambiguous or unsupported alias
+does not fall through to upstream DNS. The internal routing hint survives public
+zone validation without changing DNS record contents. Literal records pointing
+at the emulator retain their addresses. TLS remains verified against the original
+hostname and the front door's certificate.
+
 Qualification must prove a real peer response over verified TLS and a signed
 AWS request through the selected front door, then repeat route withdrawal and
 security-group denial with successful recovery. Source compilation or DNS

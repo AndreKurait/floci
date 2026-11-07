@@ -148,6 +148,23 @@ class Route53DnsResolutionTest {
     }
 
     @Test
+    void validatedPublicAliasPreservesItsUpstreamTransportThroughZoneValidation() {
+        String zone = uniqueZone();
+        String id = createPublicZone(zone);
+        addAlias(id, zone, "A", "owned.elb.example.");
+        Mockito.when(dnsServer.resolvePublicAliasTarget(zone + ".", "owned.elb.example.", id, 1, null))
+                .thenReturn(Optional.of(DnsAnswer.records(List.of("172.18.0.2"), 45).viaUpstream()));
+
+        DnsAnswer answer = dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow();
+        assertTrue(answer.upstream());
+        assertEquals(List.of("172.18.0.2"), answer.addresses());
+        assertEquals(45, answer.ttlSeconds());
+        assertEquals(zone + ".", answer.authority().name());
+        assertFalse(dnsRecordSource.resolveAuthoritative(zone, 28).orElseThrow().upstream());
+        Mockito.verifyNoInteractions(dnsLookupHelper);
+    }
+
+    @Test
     void publicAliasWithoutActiveAddressesPreservesTheNameAndNegativeAuthority() {
         String zone = uniqueZone();
         String id = createPublicZone(zone);

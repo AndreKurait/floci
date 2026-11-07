@@ -116,6 +116,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         }
         List<DnsRecord> answers = new ArrayList<>();
         int ttl = Integer.MAX_VALUE;
+        boolean upstream = false;
         try {
             for (ResourceRecordSet record : zone.matchingRecords()) {
                 if (!record.getType().equals(switch (type) {
@@ -145,6 +146,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                         return Optional.of(DnsAnswer.refused());
                     }
                     answers.addAll(target.records());
+                    upstream |= target.upstream();
                     ttl = Math.min(ttl, target.ttlSeconds());
                     continue;
                 }
@@ -177,7 +179,8 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             }
             DnsRecord.Soa soa = new DnsRecord.Soa(soaValue.getValue());
             soa.data();
-            return Optional.of(answer.withAuthority(apex, soa, publicTtlOf(soaSet)));
+            DnsAnswer authoritative = answer.withAuthority(apex, soa, publicTtlOf(soaSet));
+            return Optional.of(upstream ? authoritative.viaUpstream() : authoritative);
         } catch (IllegalArgumentException e) {
             LOG.debugv("Cannot encode public DNS records for {0}: {1}", name, e.getMessage());
             return Optional.of(DnsAnswer.refused());
