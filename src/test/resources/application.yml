@@ -404,6 +404,7 @@ floci:
       enabled: true
       mock: true
       max-health-check-interval-millis: 0
+      alb-zone-rule: aws
     codebuild:
       enabled: true
       # docker-network: floci-network
