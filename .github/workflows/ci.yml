@@ -195,10 +195,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: test
-    # always() so a failed shard still reaches the partition check and report, but not on a
-    # draft: there the shards are skipped and this would fail on them. Same condition as the shards.
+    # Report failed shards, but let canceled revisions release their concurrency slot.
+    # Drafts skip the shards and this summary.
     if: >-
-      always() && (
+      !cancelled() && (
         github.event_name != 'pull_request' || (
           github.event.pull_request.draft == false &&
           github.event.pull_request.state != 'closed' &&
