@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import org.jboss.logging.Logger;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -38,6 +39,9 @@ public class PerKeyContainerPool {
     private final ConcurrentHashMap<String, StartedContainer> containers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> startLocks = new ConcurrentHashMap<>();
     private final Object registryLock = new Object();
+    private record PendingRemoval(String key, StartedContainer container) {}
+
+    private final Map<String, PendingRemoval> pendingCleanup = new ConcurrentHashMap<>();
     private long generation;
 
     /**
@@ -68,7 +72,7 @@ public class PerKeyContainerPool {
             }
             if (existing != null) {
                 LOG.warnv("Sidecar container for key {0} is no longer healthy; restarting it", key);
-                lifecycleManager.stopAndRemove(existing.containerId(), null);
+                removeOwned(new PendingRemoval(key, existing));
             }
             long startedGeneration;
             synchronized (registryLock) {
@@ -84,7 +88,7 @@ public class PerKeyContainerPool {
             }
             if (reset) {
                 LOG.warnv("Sidecar pool was reset while starting a container for key {0}; stopping it", key);
-                lifecycleManager.stopAndRemove(started.containerId(), null);
+                removeOwned(new PendingRemoval(key, started));
                 throw new IllegalStateException("Sidecar pool was reset while starting a container for key " + key);
             }
             SidecarHealthHelper.waitForHealth(started.baseUrl(), healthPath);
@@ -104,7 +108,8 @@ public class PerKeyContainerPool {
     }
 
     /**
-     * Stops and removes the container for one key, if one was ever started. No-op otherwise.
+     * Stops and removes the container for one key and retries its previously failed removals.
+     * Failed removal remains owned for the next per-key cleanup or pool reset.
      * Shares {@link #ensureReady}'s per-key lock so a stop racing a concurrent first-use of the
      * same key serializes against it, instead of running between the moment that start commits to
      * a container and the moment it becomes visible here: without the shared lock, a stop that
@@ -126,40 +131,50 @@ public class PerKeyContainerPool {
         }
         Object lock = startLocks.computeIfAbsent(key, k -> new Object());
         synchronized (lock) {
-            StartedContainer container;
+            List<PendingRemoval> removals;
             synchronized (registryLock) {
-                container = strict ? containers.get(key) : containers.remove(key);
-            }
-            if (container != null) {
-                if (strict) {
-                    lifecycleManager.stopAndRemoveStrict(container.containerId(), null);
-                } else {
-                    lifecycleManager.stopAndRemove(container.containerId(), null);
+                StartedContainer container = strict ? containers.get(key) : containers.remove(key);
+                if (container != null) {
+                    pendingCleanup.put(container.containerId(), new PendingRemoval(key, container));
                 }
-                synchronized (registryLock) {
-                    containers.remove(key, container);
-                }
+                removals = pendingCleanup.values().stream()
+                        .filter(removal -> key.equals(removal.key())).toList();
             }
+            removals.forEach(this::removeOwned);
         }
     }
 
-    /** Detaches this generation's containers, then stops them without blocking later starts. */
+    private void removeOwned(PendingRemoval removal) {
+        StartedContainer container = removal.container();
+        synchronized (registryLock) {
+            pendingCleanup.put(container.containerId(), removal);
+        }
+        lifecycleManager.stopAndRemoveStrict(container.containerId(), null);
+        synchronized (registryLock) {
+            pendingCleanup.remove(container.containerId(), removal);
+            containers.remove(removal.key(), container);
+        }
+    }
+
+    /** Detaches this generation, then retries owned removals without blocking later starts. */
     public void stopAll() {
-        Map<String, StartedContainer> detached;
+        Map<String, PendingRemoval> detached;
         synchronized (registryLock) {
             generation++;
-            detached = Map.copyOf(containers);
+            containers.forEach((key, container) -> pendingCleanup.put(container.containerId(),
+                    new PendingRemoval(key, container)));
             containers.clear();
+            detached = Map.copyOf(pendingCleanup);
         }
         if (detached.isEmpty()) {
             return;
         }
         LOG.infov("Stopping {0} pooled sidecar container(s)", detached.size());
-        detached.forEach((key, container) -> {
+        detached.forEach((containerId, removal) -> {
             try {
-                lifecycleManager.stopAndRemove(container.containerId(), null);
+                removeOwned(removal);
             } catch (Exception e) {
-                LOG.debugv(e, "Failed to stop pooled sidecar container for key {0}", key);
+                LOG.debugv(e, "Failed to stop pooled sidecar container {0}; retained for retry", containerId);
             }
         });
     }
@@ -169,7 +184,9 @@ public class PerKeyContainerPool {
         List<String> keys;
         synchronized (registryLock) {
             generation++;
-            keys = List.copyOf(containers.keySet());
+            Set<String> ownedKeys = new HashSet<>(containers.keySet());
+            pendingCleanup.values().forEach(removal -> ownedKeys.add(removal.key()));
+            keys = List.copyOf(ownedKeys);
         }
         RuntimeException failure = null;
         for (String key : keys) {
