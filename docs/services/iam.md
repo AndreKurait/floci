@@ -1024,26 +1024,16 @@ hold reports that user instead.
 Hardware TOTP tokens and FIDO security keys are not modeled, so `ListMFADevices` returns only
 virtual devices where AWS would return every type.
 
-#### What a device does not yet affect
+#### Using a device for session authentication
 
-Enabling a device records state and nothing more. It does not change what a request is allowed to
-do:
+[GetSessionToken](sts.md#getsessiontoken-mfa-context) verifies the caller's assigned virtual
+MFA device and TOTP code before recording `aws:MultiFactorAuthPresent=true`. A request without
+MFA records `false`; assigning a device alone does not authenticate a session. Shared policy
+evaluation supplies the recorded value for both Allow and Deny conditions.
 
-- **Policy evaluation ignores MFA.** `aws:MultiFactorAuthPresent` and `aws:MultiFactorAuthAge` are
-  never placed in the request context, so under [enforcement](#iam-enforcement-mode) a statement
-  conditioned on either key does not behave as it would on AWS. Both directions fail closed rather
-  than open: an `Allow` gated on `Bool: {"aws:MultiFactorAuthPresent": "true"}` never grants,
-  because a missing key fails the condition block; and the common
-  `Deny` + `BoolIfExists: {"aws:MultiFactorAuthPresent": "false"}` lockout idiom always denies,
-  because `IfExists` passes on a missing key. So an MFA-gated policy is stricter than AWS here, not
-  laxer, but a device being enabled will not unlock it.
-- **No MFA-authenticated credentials.** `GetSessionToken` and `AssumeRole` accept `SerialNumber`
-  and `TokenCode` on AWS and return credentials that carry the MFA context keys. Floci's
-  [STS](sts.md) implementations ignore both parameters, so there is no way to obtain a session that
-  would satisfy an MFA condition even once the keys are populated.
-
-Both are out of scope here: this covers the device lifecycle only, and wiring MFA into
-authorization means touching the request context and STS session shape, which is separate work.
+Long-term credentials, legacy sessions without recorded provenance and GetFederationToken
+credentials leave this key absent. MFA for AssumeRole, `aws:MultiFactorAuthAge`, hardware/root
+devices and GetSessionToken's additional IAM/STS API restrictions remain separate work.
 
 ### Account
 
@@ -3059,8 +3049,8 @@ New local temporary credentials record their issuance time. Shared IAM principal
 exposes this timestamp as `aws:TokenIssueTime` for policy conditions, preserving it across
 storage serialization and later requests. Long-term access keys do not include this key.
 Older persisted session records without an issuance timestamp leave it absent; Floci does
-not derive a replacement timestamp from expiration or restart time. This does not add
-MFA or session-tag context.
+not derive a replacement timestamp from expiration or restart time. Session-tag context
+remains separate work.
 
 Attached IAM user and role tags are available as `aws:PrincipalTag/<key>` in resolved caller
 policy contexts, including existing local STS user and role sessions. Federated sessions
