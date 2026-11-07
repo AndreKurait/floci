@@ -40,6 +40,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.core.common.docker.UserDataPipeline;
@@ -58,6 +59,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -114,6 +116,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -282,7 +285,8 @@ class Ec2ContainerManagerTest {
                 verify(ports, never()).release(anyInt());
                 verify(network, never()).releasePrivateIp(any(), any(), any());
                 verify(network, never()).detach(any(), any(), any());
-                verify(lifecycle, never()).removeIfExistsStrict(any());
+                verify(lifecycle).removeIfExistsStrict(TEST_CONTAINER_ID);
+                verify(lifecycle, never()).removeIfExistsStrict(TEST_HELPER_ID);
                 instance.getNetworkInterfaces().clear();
                 instance.setPrivateIpAddress(null);
                 instance.setSubnetId(null);
@@ -2005,6 +2009,122 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void nativeInitOwnsBootstrapWithoutCompatibilityUserDataOrSshInjection() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        Instance instance = instance("i-native-init-bootstrap");
+        List<List<String>> helperCommands = stubNativeInit(harness, instance);
+        instance.setUserData("#!/bin/sh\necho native-only\n");
+        try {
+            harness.manager.launch(instance,
+                    new ResolvedAmiImage("test/native-guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME,
+                            true, null), "ssh-ed25519 AAAAtest", "us-west-2");
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            assertEquals("running", instance.getState().getName());
+            assertTrue(helperCommands.stream().anyMatch(command -> command.contains("prepare-init")));
+            assertTrue(harness.executedCommands.stream().anyMatch(command ->
+                    Arrays.equals(command, new String[]{"test", "-f", Ec2SystemdV1Runtime.READY})));
+            assertEquals(-1, commandIndex(harness.executedCommands, "/var/lib/user-data.sh"));
+            assertEquals(-1, commandIndex(harness.executedCommands, "/usr/sbin/sshd"));
+            verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
+            assertEquals("#!/bin/sh\necho native-only\n", instance.getUserData());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void failedLaunchRetainsNativeHelperUntilWorkloadRemovalCanBeConfirmed() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = leasedInstance("i-native-cleanup-workload");
+        stubPendingNativeCleanup(harness, instance);
+        doThrow(new IllegalStateException("Docker removal unavailable")).doNothing()
+                .when(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
+        try {
+            assertThrows(IllegalStateException.class, () -> harness.manager.cancelLaunch(instance));
+            assertEquals("terminated", instance.getState().getName());
+            verify(harness.lifecycleManager, never()).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+            verify(harness.vpcNetworkManager, never()).releasePrivateIp(any(), any(), any());
+            verify(harness.portAllocator, never()).release(2201);
+
+            assertTrue(harness.manager.cancelLaunch(instance));
+            InOrder order = inOrder(harness.lifecycleManager, harness.vpcNetworkManager);
+            order.verify(harness.lifecycleManager, times(2)).removeIfExistsStrict(TEST_CONTAINER_ID);
+            order.verify(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+            order.verify(harness.vpcNetworkManager)
+                    .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+            verify(harness.portAllocator).release(2201);
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void failedLaunchRetriesNativeHelperRetirementBeforeReleasingItsLease() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = leasedInstance("i-native-cleanup-helper");
+        stubPendingNativeCleanup(harness, instance);
+        doThrow(new IllegalStateException("Helper removal unavailable")).doNothing()
+                .when(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+        try {
+            assertThrows(IllegalStateException.class, () -> harness.manager.cancelLaunch(instance));
+            verify(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
+            verify(harness.vpcNetworkManager, never()).releasePrivateIp(any(), any(), any());
+            verify(harness.portAllocator, never()).release(2201);
+
+            assertTrue(harness.manager.cancelLaunch(instance));
+            verify(harness.lifecycleManager, times(2)).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+            verify(harness.vpcNetworkManager)
+                    .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+            verify(harness.portAllocator).release(2201);
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    private static final String TEST_INIT_HELPER_ID = "native-init-helper";
+
+    private static void stubPendingNativeCleanup(LaunchHarness harness, Instance instance) {
+        stubNativeInit(harness, instance);
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setSshHostPort(2201);
+        assertTrue(harness.manager.restoreMetadataRegistration(instance));
+        instance.setPrivateIpAddress("10.0.1.10");
+    }
+
+    private static List<List<String>> stubNativeInit(LaunchHarness harness, Instance instance) {
+        instance.setOwnerId("000000000000");
+        instance.setRegion("us-west-2");
+        InspectContainerResponse guest = inspectResponse("172.18.0.12");
+        when(guest.getId()).thenReturn(TEST_CONTAINER_ID);
+        ContainerConfig guestConfig = mock(ContainerConfig.class);
+        Map<String, String> labels = new HashMap<>(ContainerStorageHelper.resourceIdentityLabels(
+                "ec2", instance.getInstanceId(), instance.getOwnerId(), instance.getRegion()));
+        labels.put(ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(harness.config));
+        labels.put(Ec2SystemdV1Runtime.RUNTIME_LABEL, ResolvedAmiImage.SYSTEMD_V1_RUNTIME);
+        when(guestConfig.getLabels()).thenReturn(labels);
+        when(guest.getConfig()).thenReturn(guestConfig);
+        InspectContainerCmd guestInspect = mock(InspectContainerCmd.class);
+        when(guestInspect.exec()).thenReturn(guest);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(guestInspect);
+        InspectContainerResponse helper = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(helper.getId()).thenReturn(TEST_INIT_HELPER_ID);
+        when(helper.getState().getRunning()).thenReturn(true);
+        Map<String, String> helperLabels = new HashMap<>(labels);
+        helperLabels.put(ContainerStorageHelper.SERVICE_LABEL, Ec2SystemdV1Runtime.SERVICE);
+        helperLabels.put(Ec2SystemdV1Runtime.SCOPE_LABEL, "floci-" + "a".repeat(32));
+        when(helper.getConfig().getLabels()).thenReturn(helperLabels);
+        InspectContainerCmd helperInspect = mock(InspectContainerCmd.class);
+        when(helperInspect.exec()).thenReturn(helper);
+        when(harness.dockerClient.inspectContainerCmd(TEST_INIT_HELPER_ID)).thenReturn(helperInspect);
+        when(harness.dockerClient.inspectContainerCmd(ContainerStorageHelper.resourceName(
+                harness.config, Ec2SystemdV1Runtime.SERVICE, null, instance.getInstanceId())))
+                .thenReturn(helperInspect);
+        return ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_INIT_HELPER_ID, 0, "", "");
+    }
+
+    @Test
     void preferredMetadataSourceIpUsesConfiguredNetworkBeforeBridge() {
         ContainerNetwork bridge = new ContainerNetwork();
         bridge.withIpv4Address("172.17.0.8");
@@ -2418,7 +2538,7 @@ class Ec2ContainerManagerTest {
 
         assertTrue(startEntered.await(2, TimeUnit.SECONDS), "container startup should begin");
         assertTrue(harness.manager.cancelLaunch(instance));
-        verify(harness.lifecycleManager).removeIfExists(TEST_CONTAINER_ID);
+        verify(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
         verify(harness.portAllocator).release(2201);
 
         allowStart.countDown();
@@ -2557,7 +2677,7 @@ class Ec2ContainerManagerTest {
                 });
 
         awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
-        verify(harness.lifecycleManager, timeout(2_000)).removeIfExists(TEST_CONTAINER_ID);
+        verify(harness.lifecycleManager, timeout(2_000)).removeIfExistsStrict(TEST_CONTAINER_ID);
         verify(harness.portAllocator, timeout(2_000)).release(2201);
         assertEquals(1, userDataStarted.getCount());
     }

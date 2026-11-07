@@ -1066,12 +1066,10 @@ public class Ec2ContainerManager {
                     instance.getInstanceId(), e.getMessage());
         }
         if (containerId != null) {
-            try {
-                lifecycleManager.removeIfExists(containerId);
-            } catch (Exception e) {
-                LOG.warnv("Error removing failed EC2 container {0}: {1}", containerId, e.getMessage());
-            }
+            lifecycleManager.removeIfExistsStrict(containerId);
         }
+        // Retain the cleanup record and its leases until both the guest and init helper are gone.
+        systemdV1.remove(instance);
         if (firewallManager != null && firewallManager.enabled()
                 && cleanup.eniId() != null) {
             firewallManager.unregister(cleanup.eniId());
