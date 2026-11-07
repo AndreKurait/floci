@@ -19,6 +19,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -61,6 +62,30 @@ class CallerTimeConditionTest {
         when(clock.instant()).thenAnswer(ignored -> now.get());
         authorizer = new CallerCallAuthorizer(config, iam, new IamPolicyEvaluator(new ObjectMapper()),
                 providers, scpInstance, clock);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "session", "boundary", "scp", "resource"})
+    void attachedPrincipalTagConditionsReachEveryPolicyLayer(String layer) {
+        apply(layer, policy("Allow", "StringEquals", "aws:PrincipalTag/department", "engineering"));
+        when(iam.resolveCallerArns("key")).thenReturn(Optional.of(new IamService.CallerArns(USER, USER)
+                .withPrincipalTags(Map.of("department", "engineering"))));
+        assertEquals(Decision.ALLOW, invoke());
+        when(iam.resolveCallerArns("key")).thenReturn(Optional.of(new IamService.CallerArns(USER, USER)));
+        assertEquals(Decision.DENY, invoke());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "session", "boundary", "scp", "resource"})
+    void attachedPrincipalTagCannotBypassExplicitDeny(String layer) {
+        String deny = policy("Deny", "StringEquals", "aws:PrincipalTag/blocked", "yes");
+        String combined = "{\"Statement\":[" + ALLOW.substring(ALLOW.indexOf(':') + 1, ALLOW.length() - 1)
+                + "," + deny.substring(deny.indexOf(':') + 1, deny.length() - 1) + "]}";
+        apply(layer, combined);
+        assertEquals(Decision.ALLOW, invoke());
+        when(iam.resolveCallerArns("key")).thenReturn(Optional.of(new IamService.CallerArns(USER, USER)
+                .withPrincipalTags(Map.of("blocked", "yes"))));
+        assertEquals(Decision.DENY, invoke());
     }
 
     @ParameterizedTest
