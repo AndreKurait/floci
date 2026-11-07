@@ -1235,3 +1235,15 @@ WebSocket `$connect` routes configured with `AWS_IAM` require a verified SigV4 h
 When IAM enforcement is enabled, REST methods using `NONE` require an explicit anonymous grant from an attached resource policy. Cognito user-pool methods authenticate the token first, then require that resource-policy grant. Missing policies retain existing access; an explicit deny or an attached policy without a matching allow rejects the request before backend dispatch. Source-IP conditions use the connection address. Anonymous policy context omits `aws:PrincipalIsAWSService`, while signed AWS credentials retain their existing context. These checks use the current stored policy. Complete inbound condition context and deployment-snapshot activation remain separate work.
 
 REST `CUSTOM` authorizers combine their validated policy with the API resource policy when IAM enforcement is enabled. An explicit resource-policy deny stops the request before the authorizer is called. After authorizer evaluation, either policy can grant access, while an explicit deny from either policy wins. The API policy is evaluated for every request, including authorizer cache hits; flushing the authorizer cache still invalidates its cached policy. Custom `principalId` strings do not establish a verified IAM identity. The current transport source-IP and secure-transport conditions are supported; complete inbound condition context and deployment-snapshot policy activation remain separate limitations.
+
+REST `AWS_IAM` route policy evaluation supplies `aws:SourceIp` from the connection and
+`aws:SecureTransport` from the request URI scheme to the shared identity, resource, session,
+boundary and SCP evaluators. Forwarded IP/protocol headers do not supply these values under
+the default server configuration. The downstream Lambda caller-permission check remains a
+separate service call and does not inherit these inbound transport keys. Other inbound
+condition keys and transport-context propagation for HTTP/WebSocket routes remain separate work.
+
+REST resource-policy evaluation for callers without verified AWS credentials leaves
+`aws:PrincipalIsAWSService` absent. `Bool` matching `false` does not match an
+absent key; `Null` and `BoolIfExists` retain their IAM condition semantics.
+A Cognito token or custom authorizer principal does not become an AWS credential.
