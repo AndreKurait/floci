@@ -16,6 +16,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
@@ -28,15 +29,23 @@ public class CallerCallAuthorizer {
     private static final String ROOT_ALLOW_ALL =
             "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}";
 
+    private final Clock clock;
     private final EmulatorConfig config;
     private final IamService iam;
     private final IamPolicyEvaluator evaluator;
     private final Instance<ResourcePolicyProvider> providers;
     private final Instance<ScpProvider> scpProvider;
 
-    @Inject
     public CallerCallAuthorizer(EmulatorConfig config, IamService iam, IamPolicyEvaluator evaluator,
                                 Instance<ResourcePolicyProvider> providers, Instance<ScpProvider> scpProvider) {
+        this(config, iam, evaluator, providers, scpProvider, Clock.systemUTC());
+    }
+
+    @Inject
+    public CallerCallAuthorizer(EmulatorConfig config, IamService iam, IamPolicyEvaluator evaluator,
+                                Instance<ResourcePolicyProvider> providers, Instance<ScpProvider> scpProvider,
+                                Clock clock) {
+        this.clock = clock;
         this.config = config;
         this.iam = iam;
         this.evaluator = evaluator;
@@ -112,6 +121,7 @@ public class CallerCallAuthorizer {
             context.put("aws:SourceIp", List.of(sourceIp));
         }
         context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        putRequestTime(context, clock.instant());
         context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(),
                 "anonymous", resource.accountId());
         ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents, RequestPrincipal.anonymous(),
@@ -137,15 +147,21 @@ public class CallerCallAuthorizer {
             context.put("aws:SourceIp", List.of(sourceIp));
         }
         context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        putRequestTime(context, clock.instant());
         context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(),
                 "anonymous", resource.accountId());
         return evaluator.evaluateResourcePolicyFor(documents, RequestPrincipal.anonymous(),
                 action, resourceArn, context);
     }
 
+    private static void putRequestTime(Map<String, List<String>> context, Instant now) {
+        context.put("aws:CurrentTime", List.of(now.toString()));
+        context.put("aws:EpochTime", List.of(Long.toString(now.getEpochSecond())));
+    }
+
     private Decision authorizeCaller(String accessKey, String callerArn, String action, String resourceArn,
                                      AwsArnUtils.Arn resource, boolean localRoot, Map<String, List<String>> requestContext) {
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         if (iam.isInactiveAccessKey(accessKey) || iam.isExpiredSession(accessKey, now)) {
             return Decision.DENY;
         }
@@ -165,6 +181,7 @@ public class CallerCallAuthorizer {
         List<List<String>> scps = scpProvider.isResolvable()
                 ? scpProvider.get().effectiveScpLevels(account) : null;
         Map<String, List<String>> context = new HashMap<>(requestContext);
+        putRequestTime(context, now);
         arns.putPrincipalKeys(context);
         context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(), account, owner);
         ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,
