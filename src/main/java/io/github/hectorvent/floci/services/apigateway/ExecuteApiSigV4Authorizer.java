@@ -184,9 +184,10 @@ public class ExecuteApiSigV4Authorizer {
             return sessionToken;
         }
 
+        // API Gateway query signatures hash the request body, including an empty handshake body.
         String payloadHash = SigV4Canonicalization.payloadHash(
                 headers.apply("x-amz-content-sha256"),
-                signed.signedHeaders(), body, presigned);
+                signed.signedHeaders(), body, false);
         String canonicalHeaders = SigV4Canonicalization.canonicalHeaders(signed.signedHeaders(),
                 name -> "host".equals(name) ? hostHeader(headers, requestUri) : headerValue(headers, name));
         String canonicalQueryString = SigV4Canonicalization.canonicalQueryString(
