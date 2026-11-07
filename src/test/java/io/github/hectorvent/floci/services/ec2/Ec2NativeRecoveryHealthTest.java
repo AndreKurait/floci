@@ -163,4 +163,16 @@ class Ec2NativeRecoveryHealthTest {
         assertFalse(manager.isContainerRunning(instance));
         assertEquals(1, tasks.size(), "failed recovery is not rescheduled endlessly");
     }
+
+    @Test
+    void ordinaryRunningGuestDoesNotDependOnNativeBootAdmission() {
+        labels.remove(Ec2SystemdV1Runtime.RUNTIME_LABEL);
+        running.set(true);
+        ContainerExecStubs.completeEveryExec(docker, CONTAINER, 2, "", "no native bootstrap");
+        clearInvocations(docker);
+
+        assertTrue(manager.restoreMetadataRegistration(instance));
+        assertTrue(manager.isContainerRunning(instance));
+        verify(docker, never()).execCreateCmd(CONTAINER);
+    }
 }

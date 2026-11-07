@@ -89,7 +89,7 @@ final class Ec2SystemdV1Runtime {
                 .withDockerNetwork(Optional.empty()).withNetworkMode("none")
                 .withUser("0").withCgroupnsMode("host").withPidMode("host")
                 .withApparmorProfile(config.services().ec2().nativeInitApparmorProfile().orElse("unconfined"))
-                .withCapAdd("SYS_ADMIN").withCapAdd("SYS_TIME")
+                .withCapAdd("SYS_ADMIN").withCapAdd("SYS_TIME").withCapAdd("SYS_PTRACE")
                 .withEntrypoint(List.of("sh", "-c")).withCmd(List.of("exec sleep 2147483647"))
                 .withMount(new Mount().withType(MountType.TMPFS).withTarget(ROOT))
                 .withLogRotation()

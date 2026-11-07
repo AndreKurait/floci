@@ -21,8 +21,10 @@ DMI data. This is the Xen-style identification surface, not emulation of
 Nitro hardware or a separate kernel. The UUID is not an authentication
 credential: metadata tokens and instance-role sessions retain their own checks.
 
-Each instance has a labelled helper with no network, `SYS_ADMIN`, `SYS_TIME`, and the
-Docker host's PID and cgroup namespaces. This helper verifies the guest's
+Each instance has a labelled helper with no network, `SYS_ADMIN`, `SYS_TIME`,
+`SYS_PTRACE`, and the Docker host's PID and cgroup namespaces. `SYS_PTRACE`
+permits opening the guest's namespace handle across the different capability
+sets. The guest does not receive this capability. This helper verifies the guest's
 Docker identity and pins its process directory and PID namespace before moving
 init into its private service subtree. A child enters that pinned PID namespace
 and writes namespace-local PID 1 to the service cgroup. If init exits, the
@@ -48,6 +50,9 @@ To retain AppArmor confinement, set
 the workload Docker host. It must permit the helper's named cgroup mount, PID
 namespace entry, and the guest's private mounts and hypervisor remount. Floci
 does not install or alter host profiles.
+The native compatibility job checks both selections on an AppArmor-enforcing
+Ubuntu host. Its deliberately permissive test profile denies one sentinel write
+to prove enforcement; it is a qualification fixture, not a recommended workload policy.
 
 The helper image includes a small statically linked `floci-ec2-init` binary.
 It runs on the workload daemon's architecture and is copied into the guest's
@@ -96,6 +101,9 @@ instance ID, attached role and filesystem. Stop and terminate take precedence
 over queued reboot recovery. Poweroff and unrelated process failures are not
 automatically restarted by this mechanism. Failed recovery is not reported as
 a healthy instance to Auto Scaling.
+Native recovery restores IMDS addresses before releasing init. Lifecycle submission
+keeps the shared operation map unlocked while waiting for executor capacity, so
+a blocked launch cannot prevent the recovery worker from admitting another guest.
 
 Qualification must include native
 cloud-init through IMDSv2, actual cron and SSM processes, concurrent guest

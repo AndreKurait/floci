@@ -63,6 +63,12 @@ class Ec2ImageSharingServiceTest {
         Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
                 null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
         Volume root = launcher.describeVolumes(REGION, List.of(instance.getRootVolumeId()), Map.of()).getFirst();
+        root.setSize(24);
+        root.setVolumeType("gp3");
+        root.setIops(4500);
+        root.setThroughput(250);
+        root.setEncrypted(true);
+        root.getAttachments().getFirst().setDeleteOnTermination(false);
         when(manager.commitInstance(eq(instance), anyString())).thenReturn("example/captured:1");
         if (revoke) {
             owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
@@ -79,6 +85,10 @@ class Ec2ImageSharingServiceTest {
         assertEquals(instance.getRootDeviceName(), capturedRoot.getDeviceName());
         assertEquals(root.getSize(), capturedRoot.getEbs().getVolumeSize());
         assertEquals(root.getVolumeType(), capturedRoot.getEbs().getVolumeType());
+        assertEquals(4500, capturedRoot.getEbs().getIops());
+        assertEquals(250, capturedRoot.getEbs().getThroughput());
+        assertTrue(capturedRoot.getEbs().getEncrypted());
+        assertFalse(capturedRoot.getEbs().getDeleteOnTermination());
         Instance restored = launcher.runInstances(REGION, captured.getImageId(), "m6g.large", 1, 1,
                 null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
         Volume restoredRoot = launcher.describeVolumes(REGION, List.of(restored.getRootVolumeId()),

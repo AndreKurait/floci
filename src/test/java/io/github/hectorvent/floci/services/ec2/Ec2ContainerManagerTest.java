@@ -2168,6 +2168,10 @@ class Ec2ContainerManagerTest {
             assertTrue(harness.manager.restoreMetadataRegistration(instance));
             assertTrue(harness.executedCommands.stream().anyMatch(command ->
                     Arrays.equals(command, new String[]{"test", "-f", Ec2SystemdV1Runtime.READY})));
+            InOrder boot = inOrder(harness.metadataServer, harness.dockerClient);
+            boot.verify(harness.metadataServer, atLeastOnce())
+                    .registerContainer(anyString(), eq(instance.getInstanceId()), eq(instance));
+            boot.verify(harness.dockerClient).execCreateCmd(TEST_CONTAINER_ID);
         } finally {
             harness.manager.stop();
         }

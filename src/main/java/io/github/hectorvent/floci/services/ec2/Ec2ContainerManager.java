@@ -1272,38 +1272,40 @@ public class Ec2ContainerManager {
 
     private CompletableFuture<Void> submitLifecycleOperation(String containerId, Runnable operation,
                                                              ExecutorService workers) {
+        CompletableFuture<Void> previous;
+        CompletableFuture<Void> completed = new CompletableFuture<>();
         synchronized (lifecycleOperations) {
-            CompletableFuture<Void> previous = lifecycleOperations.get(containerId);
-            CompletableFuture<Void> completed = new CompletableFuture<>();
+            previous = lifecycleOperations.get(containerId);
             lifecycleOperations.put(containerId, completed);
-            Runnable submit = () -> {
+        }
+        Runnable submit = () -> {
+            try {
+                workers.submit(() -> {
+                    try {
+                        operation.run();
+                    } finally {
+                        lifecycleOperations.remove(containerId, completed);
+                        completed.complete(null);
+                    }
+                });
+            } catch (RuntimeException failure) {
+                failLifecycleSubmission(containerId, completed, failure);
+            }
+        };
+        if (previous == null) {
+            // Queue backpressure must not hold the shared lifecycle map lock: native recovery
+            // uses its own executor so a guest reboot can unblock a saturated launch pool.
+            submit.run();
+        } else {
+            previous.whenComplete((ignored, priorFailure) -> {
                 try {
-                    workers.submit(() -> {
-                        try {
-                            operation.run();
-                        } finally {
-                            lifecycleOperations.remove(containerId, completed);
-                            completed.complete(null);
-                        }
-                    });
+                    serviceNetworkRetryExecutor.execute(submit);
                 } catch (RuntimeException failure) {
                     failLifecycleSubmission(containerId, completed, failure);
                 }
-            };
-            if (previous == null) {
-                submit.run();
-            } else {
-                previous.whenComplete((ignored, priorFailure) -> {
-                    try {
-                        // Completion runs on a launch worker; a full launch queue must not trap it.
-                        serviceNetworkRetryExecutor.execute(submit);
-                    } catch (RuntimeException failure) {
-                        failLifecycleSubmission(containerId, completed, failure);
-                    }
-                });
-            }
-            return completed;
+            });
         }
+        return completed;
     }
 
     private void failLifecycleSubmission(String containerId, CompletableFuture<Void> completed,
@@ -1614,7 +1616,7 @@ public class Ec2ContainerManager {
                 known.add(instance.getImdsSourceIp());
             }
             known.forEach(address -> metadataServer.registerContainer(address, instance.getInstanceId(), instance));
-            return !known.isEmpty();
+            return !known.isEmpty() && (!running || restoreNativeBoot(instance, containerId));
         }
         String networkContainer = namespace == null ? containerId : namespace.helperId();
         String containerIp = namespace == null ? getContainerBridgeIp(networkContainer) : namespace.privateAddress();
@@ -1645,15 +1647,24 @@ public class Ec2ContainerManager {
         if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
             exposeReachablePublicAddress(instance);
         }
-        if (running) {
-            try {
-                releaseNativeGuest(instance, containerId);
-            } catch (RuntimeException failure) {
-                LOG.warnv(failure, "Could not restore native boot for EC2 instance {0}", instance.getInstanceId());
-                return false;
+        return !running || restoreNativeBoot(instance, containerId);
+    }
+
+    /** Restore IMDS before releasing native init, retaining ordinary guests' cached-address fallback. */
+    private boolean restoreNativeBoot(Instance instance, String containerId) {
+        try {
+            releaseNativeGuest(instance, containerId);
+            return true;
+        } catch (DockerException failure) {
+            if (!systemdV1.hasGuest(instance)) {
+                return true;
             }
+            LOG.warnv(failure, "Could not restore native boot for EC2 instance {0}", instance.getInstanceId());
+            return false;
+        } catch (RuntimeException failure) {
+            LOG.warnv(failure, "Could not restore native boot for EC2 instance {0}", instance.getInstanceId());
+            return false;
         }
-        return true;
     }
 
     /**

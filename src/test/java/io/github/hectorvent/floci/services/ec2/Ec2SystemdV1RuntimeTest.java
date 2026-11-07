@@ -80,6 +80,7 @@ class Ec2SystemdV1RuntimeTest {
             ContainerSpec spec = invocation.getArgument(0);
             assertEquals(profile, spec.linuxOptions().apparmorProfile());
             assertFalse(spec.privileged());
+            assertEquals(List.of("SYS_ADMIN", "SYS_TIME", "SYS_PTRACE"), spec.linuxOptions().capAdd());
             InspectContainerResponse response = helper(spec.labels());
             when(response.getState()).thenReturn(mock(InspectContainerResponse.ContainerState.class));
             when(response.getState().getRunning()).thenReturn(true);
