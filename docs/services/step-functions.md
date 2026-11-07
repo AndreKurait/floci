@@ -984,9 +984,12 @@ Literal reserved names, including `Expect`, `Upgrade`, `Authorization` and `Host
 `X-Amz-`, `X-Amzn-` and `X-Forwarded-` prefixes are rejected case-insensitively when a
 definition is created, updated or validated, including JSONata arguments and nested workflows.
 An explicit `Content-Length` must equal the serialized body size; the HTTP client writes that header.
-An API with a resource policy is invoked like any other: the execute-api listener evaluates the
-policy for the signed execution role, as it does for a direct caller.
-Private endpoints, query parameters and `AllowNullValues` remain unsupported.
+With `IAM_ROLE`, an API with a resource policy is invoked through the execute-api listener,
+which applies the method's authorization mode. `AWS_IAM` methods evaluate the signed role;
+`NONE` methods require an anonymous grant from an attached resource policy. A role-only grant
+does not grant anonymous access, and an applicable explicit deny still rejects the task.
+The separate `RESOURCE_POLICY` authentication mode, private endpoints, query parameters and
+`AllowNullValues` remain unsupported.
 
 With IAM enforcement enabled, the execution role must trust Step Functions. The task uses its
 `Credentials.RoleArn` when supplied, including assume-role authorization, identity policies,
