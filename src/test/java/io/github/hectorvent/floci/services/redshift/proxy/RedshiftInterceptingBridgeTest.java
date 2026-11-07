@@ -326,6 +326,69 @@ class RedshiftInterceptingBridgeTest {
     }
 
     @Test
+    @Timeout(10)
+    void extendedCopyReleasesBufferedCloseBeforeTakingBackendOwnership() throws Exception {
+        startBridge();
+        testClientEnd.setSoTimeout(3000);
+        testBackendEnd.setSoTimeout(3000);
+        when(s3Stub.objectExists("b", "in/data")).thenReturn(true);
+        when(s3Stub.getObject("b", "in/data")).thenReturn(
+                new S3Object("b", "in/data", "1|a\n".getBytes(StandardCharsets.US_ASCII), "text/plain"));
+        PostgresWireDecoder backendDecoder = new PostgresWireDecoder(testBackendEnd.getInputStream());
+        PostgresWireDecoder clientDecoder = new PostgresWireDecoder(testClientEnd.getInputStream());
+        PostgresWireDecoder.ParseMessage previous = new PostgresWireDecoder.ParseMessage("previous", "SELECT 1", List.of());
+        testClientEnd.getOutputStream().write(PostgresWireDecoder.encodeParse(previous, previous.sql()));
+        testClientEnd.getOutputStream().flush();
+        assertEquals('P', backendDecoder.nextMessage().type());
+        writeBackendFrame('1', new byte[0]);
+        assertEquals('1', clientDecoder.nextMessage().type());
+
+        AtomicReference<Throwable> backendFailure = new AtomicReference<>();
+        Thread backend = Thread.ofVirtual().start(() -> {
+            try {
+                assertEquals('C', backendDecoder.nextMessage().type());
+                assertEquals('P', backendDecoder.nextMessage().type());
+                assertEquals('B', backendDecoder.nextMessage().type());
+                assertEquals('D', backendDecoder.nextMessage().type());
+                // PostgreSQL can buffer these responses until a Flush or Sync arrives.
+                assertEquals('H', backendDecoder.nextMessage().type());
+                writeBackendFrame('3', new byte[0]);
+                writeBackendFrame('1', new byte[0]);
+                writeBackendFrame('2', new byte[0]);
+                writeBackendFrame('n', new byte[0]);
+                assertEquals('E', backendDecoder.nextMessage().type());
+                writeBackendFrame('G', new byte[]{0, 0, 0});
+                while (backendDecoder.nextMessage().type() != 'c') {
+                    // Consume CopyData until the bridge completes CopyIn.
+                }
+                assertEquals('S', backendDecoder.nextMessage().type());
+                writeBackendFrame('C', "COPY 1\0".getBytes(StandardCharsets.US_ASCII));
+                writeBackendFrame('Z', new byte[]{'I'});
+            } catch (Throwable failure) {
+                backendFailure.compareAndSet(null, failure);
+            }
+        });
+        PostgresWireDecoder.ParseMessage copy = new PostgresWireDecoder.ParseMessage(
+                "copy-s", "COPY t FROM 's3://b/in/data'", List.of());
+        ByteArrayOutputStream pipeline = new ByteArrayOutputStream();
+        pipeline.write(frame('C', concat(new byte[]{'S'}, cString("previous"))));
+        pipeline.write(PostgresWireDecoder.encodeParse(copy, copy.sql()));
+        pipeline.write(frame('B', concat(cString("copy-p"), cString("copy-s"), new byte[6])));
+        pipeline.write(frame('D', concat(new byte[]{'P'}, cString("copy-p"))));
+        pipeline.write(frame('E', concat(cString("copy-p"), new byte[4])));
+        pipeline.write(frame('S', new byte[0]));
+        testClientEnd.getOutputStream().write(pipeline.toByteArray());
+        testClientEnd.getOutputStream().flush();
+        for (char expected : new char[]{'3', '1', '2', 'n', 'C', 'Z'}) {
+            assertEquals(expected, clientDecoder.nextMessage().type());
+        }
+        backend.join();
+        if (backendFailure.get() != null) {
+            throw new AssertionError("fake backend failed", backendFailure.get());
+        }
+    }
+
+    @Test
     void pipelinedExtendedCopyPreservesResponseOrderAndSyncReadyForQuery() throws Exception {
         startBridge();
         Mockito.when(s3Stub.objectExists("b", "in/data")).thenReturn(true);

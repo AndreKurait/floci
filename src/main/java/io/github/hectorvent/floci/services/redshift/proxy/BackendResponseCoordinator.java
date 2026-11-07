@@ -279,16 +279,21 @@ final class BackendResponseCoordinator {
         }
     }
 
-    private boolean canOwnExtendedExecute(Ticket ticket) {
-        for (PendingOperation operation : pending) {
-            if (operation.ticket().equals(ticket)) {
-                return true;
+    boolean canOwnExtendedExecute(Ticket ticket) {
+        lock.lock();
+        try {
+            for (PendingOperation operation : pending) {
+                if (operation.ticket().equals(ticket)) {
+                    return true;
+                }
+                if (!isExtendedExecutePreamble(operation.ticket().operation())) {
+                    return false;
+                }
             }
-            if (!isExtendedExecutePreamble(operation.ticket().operation())) {
-                return false;
-            }
+            return false;
+        } finally {
+            lock.unlock();
         }
-        return false;
     }
 
     private static boolean isExtendedExecutePreamble(Operation operation) {
