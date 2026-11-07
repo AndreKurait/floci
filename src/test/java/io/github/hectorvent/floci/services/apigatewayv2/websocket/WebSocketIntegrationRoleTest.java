@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
@@ -87,7 +88,7 @@ class WebSocketIntegrationRoleTest {
         when(lambda.invokeTarget(anyString(), anyString(), any(byte[].class), any())).thenReturn(
                 new InvokeResult(200, null, "{\"statusCode\":200,\"body\":\"ok\"}".getBytes(StandardCharsets.UTF_8), null, "request"));
         service = new WebSocketIntegrationInvoker(lambda, mock(AwsServiceRouter.class), mapper,
-                mock(VtlTemplateEngine.class), direct, new RegionResolver("us-east-1", OWNER), roles);
+                mock(VtlTemplateEngine.class), direct, new RegionResolver("us-east-1", OWNER), roles, mock(CallerCallAuthorizer.class));
 
     }
 
