@@ -11,12 +11,14 @@ import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.ec2.model.Address;
 import software.amazon.awssdk.services.ec2.model.IpPermission;
 import software.amazon.awssdk.services.ec2.model.NatGateway;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -74,11 +76,19 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
             overrides.put("quarkus.tls.key-store.pem.0.cert", TLS.resolve("server.crt").toString());
             overrides.put("quarkus.tls.key-store.pem.0.key", TLS.resolve("server.key").toString());
             overrides.put("quarkus.http.insecure-requests", "enabled");
+            overrides.put("floci.services.ec2.imds-port", "19169");
             // The production protocol proxy forwards to these two internal listeners.
             overrides.put("quarkus.http.test-port", "4510");
             overrides.put("quarkus.http.test-ssl-port", "4511");
             return overrides;
         }
+    }
+
+    @Override
+    @BeforeEach
+    void prepare() throws Exception {
+        endpoint = URI.create("http://127.0.0.1:" + config.port());
+        super.prepare();
     }
 
     @Test
@@ -255,7 +265,7 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
     }
 
     private ContainerExec.Result request(String helper, String vpc, boolean tls) {
-        return exec(helper, "curl", "--silent", "--show-error", "--fail", "--max-time", "2",
+        return exec(helper, "curl", "--silent", "--show-error", "--fail-with-body", "--max-time", "2",
                 "--cacert", "/tmp/api-root-ca.pem", "--aws-sigv4", "aws:amz:us-east-1:ec2",
                 "--user", "test:test", "--data", "Action=DescribeVpcs&Version=2016-11-15&VpcId.1=" + vpc,
                 (tls ? "https" : "http") + "://ec2.us-east-1.amazonaws.com/");
@@ -263,7 +273,7 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
 
     private void assertVpcResponse(String helper, String vpc, boolean tls) {
         ContainerExec.Result result = request(helper, vpc, tls);
-        assertEquals(0, result.exitCode(), () -> result.summary() + networkDiagnostics());
+        assertEquals(0, result.exitCode(), () -> result.summary() + "\n" + result.stdout() + networkDiagnostics());
         assertTrue(result.stdout().contains("<vpcId>" + vpc + "</vpcId>"), result.stdout());
     }
 
