@@ -86,6 +86,9 @@ class SignedPythonIamRunnerTest(unittest.TestCase):
             suite[suite.index("--entrypoint") + 1:],
         )
 
+    def test_server_enforces_member_account_scps(self):
+        self.assertIn("FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true", self.start_arguments())
+
     def test_unhealthy_server_prevents_suite_execution(self):
         result, calls = self.execute(health="unhealthy")
         self.assertNotEqual(0, result.returncode)
