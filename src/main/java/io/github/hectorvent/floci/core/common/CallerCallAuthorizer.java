@@ -53,6 +53,10 @@ public class CallerCallAuthorizer {
         this.scpProvider = scpProvider;
     }
 
+    public boolean enforcementEnabled() {
+        return config.services().iam().enforcementEnabled();
+    }
+
     /**
      * The entry point must verify the signature before supplying this identity. Re-resolving it
      * here preserves current policy, session and boundary state without trusting request headers.
