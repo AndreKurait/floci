@@ -8,6 +8,7 @@ import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -18,13 +19,12 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiPredicate;
 
 /** Delegates only a named service hierarchy to old init binaries, leaving resource limits with Docker. */
@@ -50,8 +50,9 @@ final class Ec2SystemdV1Runtime {
     private final ContainerBuilder builder;
     private final ContainerLifecycleManager lifecycle;
     private final EmulatorConfig config;
-    private final Map<String, String> helpers = new HashMap<>();
-    private final Set<String> retiredHelpers = new HashSet<>();
+    private final Map<String, String> helpers = new ConcurrentHashMap<>();
+    private final Set<String> retiredHelpers = ConcurrentHashMap.newKeySet();
+    private final StripedLocks guestLocks = new StripedLocks(256);
 
     /** Keep helper ownership and retirement state separate from the workload container lifecycle. */
     Ec2SystemdV1Runtime(DockerClient docker, ContainerBuilder builder,
@@ -70,7 +71,13 @@ final class Ec2SystemdV1Runtime {
     }
 
     /** Adopt a verified helper or create one, then mount only this guest's delegated service hierarchy. */
-    synchronized void prepare(Instance instance, String accountId, String region) {
+    void prepare(Instance instance, String accountId, String region) {
+        synchronized (guestLocks.lockFor(instance.getInstanceId())) {
+            prepareGuest(instance, accountId, region);
+        }
+    }
+
+    private void prepareGuest(Instance instance, String accountId, String region) {
         String name = name(instance.getInstanceId());
         try {
             InspectContainerResponse existing = docker.inspectContainerCmd(name).exec();
@@ -104,11 +111,17 @@ final class Ec2SystemdV1Runtime {
     }
 
     /** Restore an owned native guest's helper reference; refuse a changed identity instead of silently adopting it. */
-    synchronized boolean rememberGuest(Instance instance, InspectContainerResponse guest) {
+    boolean rememberGuest(Instance instance, InspectContainerResponse guest) {
+        synchronized (guestLocks.lockFor(instance.getInstanceId())) {
+            return rememberOwnedGuest(instance, guest);
+        }
+    }
+
+    private boolean rememberOwnedGuest(Instance instance, InspectContainerResponse guest) {
         Map<String, String> labels = guest.getConfig() == null ? null : guest.getConfig().getLabels();
         if (labels == null || !ResolvedAmiImage.SYSTEMD_V1_RUNTIME.equals(labels.get(RUNTIME_LABEL))) {
             if (helpers.containsKey(instance.getInstanceId())) {
-                throw new IllegalStateException("EC2 init guest lost its runtime identity");
+                throw new GuestIdentityChangedException("EC2 init guest lost its runtime identity");
             }
             return false;
         }
@@ -119,13 +132,13 @@ final class Ec2SystemdV1Runtime {
                 || !instance.getOwnerId().equals(labels.get(ContainerStorageHelper.ACCOUNT_LABEL))
                 || !instance.getInstanceId().equals(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))
                 || !instance.getRegion().equals(labels.get(ContainerStorageHelper.REGION_LABEL))) {
-            throw new IllegalStateException("EC2 init guest ownership changed");
+            throw new GuestIdentityChangedException("EC2 init guest ownership changed");
         }
         helpers.putIfAbsent(instance.getInstanceId(), name(instance.getInstanceId()));
         return true;
     }
 
-    synchronized boolean hasGuest(Instance instance) {
+    boolean hasGuest(Instance instance) {
         return helpers.containsKey(instance.getInstanceId());
     }
 
@@ -133,7 +146,13 @@ final class Ec2SystemdV1Runtime {
      * Install the native bootstrap, isolate its clock and delegate its service hierarchy before releasing init.
      * A guest whose final gate already exists is left running; any failed prerequisite keeps that gate closed.
      */
-    synchronized boolean release(Instance instance, String containerId) {
+    boolean release(Instance instance, String containerId) {
+        synchronized (guestLocks.lockFor(instance.getInstanceId())) {
+            return releaseGuest(instance, containerId);
+        }
+    }
+
+    private boolean releaseGuest(Instance instance, String containerId) {
         InspectContainerResponse guest = docker.inspectContainerCmd(containerId).exec();
         if (!rememberGuest(instance, guest)) {
             return false;
@@ -191,7 +210,13 @@ final class Ec2SystemdV1Runtime {
     }
 
     /** Retire the empty service hierarchy before deleting its helper, retaining proof for a lost delete response. */
-    synchronized void remove(Instance instance) {
+    void remove(Instance instance) {
+        synchronized (guestLocks.lockFor(instance.getInstanceId())) {
+            removeGuest(instance);
+        }
+    }
+
+    private void removeGuest(Instance instance) {
         String reference = helpers.get(instance.getInstanceId());
         if (reference == null) {
             return;
@@ -212,7 +237,7 @@ final class Ec2SystemdV1Runtime {
     }
 
     /** Recover declared helpers after restart and retire only verified helpers whose instance no longer exists. */
-    synchronized void reconcileOrphans(BiPredicate<String, String> stillDeclared) {
+    void reconcileOrphans(BiPredicate<String, String> stillDeclared) {
         for (Container container : docker.listContainersCmd().withShowAll(true)
                 .withLabelFilter(Map.of(ContainerStorageHelper.SERVICE_LABEL, SERVICE,
                         ContainerStorageHelper.OWNER_LABEL, owner())).exec()) {
@@ -221,16 +246,30 @@ final class Ec2SystemdV1Runtime {
                     || !owner().equals(listedLabels.get(ContainerStorageHelper.OWNER_LABEL))) {
                 continue;
             }
-            InspectContainerResponse helper = docker.inspectContainerCmd(container.getId()).exec();
-            Map<String, String> labels = helper.getConfig().getLabels();
-            String instance = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
-            String region = labels.get(ContainerStorageHelper.REGION_LABEL);
-            String account = labels.get(ContainerStorageHelper.ACCOUNT_LABEL);
-            requireHelper(helper, instance, region, account);
-            if (!stillDeclared.test(region, instance)) {
-                remove(helper, instance, region, account);
-            } else {
-                helpers.put(instance, helper.getId());
+            String instance = listedLabels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
+            if (instance == null || instance.isBlank()) {
+                throw new IllegalStateException("EC2 init helper has no instance identity");
+            }
+            synchronized (guestLocks.lockFor(instance)) {
+                InspectContainerResponse helper;
+                try {
+                    helper = docker.inspectContainerCmd(container.getId()).exec();
+                } catch (NotFoundException expected) {
+                    if (helpers.containsKey(instance)) {
+                        throw expected;
+                    }
+                    // Its guest may have retired this helper after the list call.
+                    continue;
+                }
+                Map<String, String> labels = helper.getConfig().getLabels();
+                String region = labels.get(ContainerStorageHelper.REGION_LABEL);
+                String account = labels.get(ContainerStorageHelper.ACCOUNT_LABEL);
+                requireHelper(helper, instance, region, account);
+                if (!stillDeclared.test(region, instance)) {
+                    remove(helper, instance, region, account);
+                } else {
+                    helpers.put(instance, helper.getId());
+                }
             }
         }
     }
@@ -316,6 +355,12 @@ final class Ec2SystemdV1Runtime {
 
     private String owner() {
         return ContainerStorageHelper.ownerIdentity(config);
+    }
+
+    static final class GuestIdentityChangedException extends IllegalStateException {
+        GuestIdentityChangedException(String message) {
+            super(message);
+        }
     }
 
     /** Bound helper operations and propagate failures so launch cannot release init after incomplete preparation. */

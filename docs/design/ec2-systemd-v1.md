@@ -93,6 +93,10 @@ namespace references can retain the shared hierarchy; its presence alone does
 not mean this instance's groups remain. Another instance's groups are never removed.
 Helpers carry the same namespace,
 owner, region and instance identity used for ordinary EC2 lifecycle ownership.
+Runtime operations use bounded locks keyed by instance, so a slow Docker operation
+does not hold a runtime-wide monitor. Recovery and retirement use the same lock
+as boot for each instance. Each helper owns its mount namespace and private scope;
+concurrent helpers never remove another instance's scope.
 
 The guest also receives `SYS_BOOT` in its private PID namespace. A native OS
 reboot ends that namespace with Linux's reboot exit status; Floci restarts the

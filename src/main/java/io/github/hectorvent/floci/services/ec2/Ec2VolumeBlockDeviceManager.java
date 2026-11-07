@@ -670,7 +670,7 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
                     targetContainerId, instance.getInstanceId(), volume.getVolumeId());
             return Optional.empty();
         }
-        if (!isRawDeviceGuest(instance)) {
+        if (!isPresentRawDeviceGuest(instance)) {
             LOG.debugv("Instance {0} is not privileged; raw volume {1} attached as metadata only",
                     instance.getInstanceId(), volume.getVolumeId());
             return Optional.empty();
@@ -776,7 +776,7 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
                 && VALID_DEVICE_PATTERN.matcher(requestedDevice).matches() && !requestedDevice.contains("..")) {
             String targetContainerId = instance.getDockerContainerId();
             if (targetContainerId != null && !targetContainerId.isBlank()
-                    && lifecycleManager.isContainerRunning(targetContainerId) && isRawDeviceGuest(instance)) {
+                    && lifecycleManager.isContainerRunning(targetContainerId) && isPresentRawDeviceGuest(instance)) {
                 String normalizedDevice = requestedDevice.startsWith("/") ? requestedDevice : "/dev/" + requestedDevice;
                 execInContainer(targetContainerId, new String[]{"rm", "-f", normalizedDevice}, DEFAULT_TIMEOUT_SECONDS);
             }
@@ -794,6 +794,15 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
                     + "done";
             execInContainer(helperId,
                     new String[]{"sh", "-c", script, "detach", rawFile}, DEFAULT_TIMEOUT_SECONDS);
+        }
+    }
+
+    private boolean isPresentRawDeviceGuest(Instance instance) {
+        try {
+            return isRawDeviceGuest(instance);
+        } catch (NotFoundException expected) {
+            // A disappeared raw guest has no device node to create or remove; helper cleanup still runs.
+            return false;
         }
     }
 

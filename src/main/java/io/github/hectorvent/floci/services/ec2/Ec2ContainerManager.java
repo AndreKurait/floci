@@ -1595,7 +1595,7 @@ public class Ec2ContainerManager {
                     return false;
                 }
                 guestReboots.watch(instance);
-            } catch (DockerException failure) {
+            } catch (DockerException | IllegalStateException failure) {
                 LOG.warnv(failure, "Could not restore native reboot observation for EC2 instance {0}",
                         instance.getInstanceId());
                 return false;
@@ -1605,6 +1605,10 @@ public class Ec2ContainerManager {
         ProtectedNamespace namespace;
         try {
             namespace = protectedNamespace(instance);
+        } catch (IllegalStateException failure) {
+            guestReboots.failed(instance);
+            LOG.warnv(failure, "Could not verify restored EC2 instance {0} ownership", instance.getInstanceId());
+            return false;
         } catch (DockerException e) {
             LOG.warnv("Could not inspect the network namespace of EC2 instance {0}, keeping known IMDS addresses: {1}",
                     instance.getInstanceId(), e.getMessage());

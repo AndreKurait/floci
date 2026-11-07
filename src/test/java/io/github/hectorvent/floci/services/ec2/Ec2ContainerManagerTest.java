@@ -2158,6 +2158,51 @@ class Ec2ContainerManagerTest {
     private static final String TEST_INIT_HELPER_ID = "native-init-helper";
 
     @Test
+    void restoredNativeOwnershipMismatchIsContainedAndNeverDeletesTheForeignGuest() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-native-foreign-restore");
+        stubNativeInit(harness, instance);
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setState(InstanceState.running());
+        InspectContainerResponse guest = harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID).exec();
+        guest.getConfig().getLabels().put(ContainerStorageHelper.ACCOUNT_LABEL, "999999999999");
+        try {
+            assertFalse(harness.manager.restoreMetadataRegistration(instance));
+            verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
+            assertThrows(IllegalStateException.class, () -> harness.manager.terminateForShutdown(instance));
+            assertEquals("shutting-down", instance.getState().getName());
+            verify(harness.dockerClient, never()).removeContainerCmd(TEST_CONTAINER_ID);
+            verify(harness.lifecycleManager, never()).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void restoredExitedNativeOwnershipMismatchDoesNotAbortRecovery() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-native-foreign-reboot");
+        stubNativeInit(harness, instance);
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setState(InstanceState.running());
+        InspectContainerResponse guest = harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID).exec();
+        guest.getConfig().getLabels().put(ContainerStorageHelper.ACCOUNT_LABEL, "999999999999");
+        InspectContainerResponse.ContainerState state = mock(InspectContainerResponse.ContainerState.class);
+        when(guest.getState()).thenReturn(state);
+        when(state.getRunning()).thenReturn(false);
+        when(state.getStatus()).thenReturn("exited");
+        when(state.getExitCodeLong()).thenReturn(129L);
+        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(false);
+        try {
+            assertFalse(harness.manager.restoreMetadataRegistration(instance));
+            verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
+            verify(harness.dockerClient, never()).startContainerCmd(TEST_CONTAINER_ID);
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
     void restoredRunningNativeGuestValidatesItsBootGate() {
         LaunchHarness harness = launchHarness();
         Instance instance = instance("i-native-restore-gate");
@@ -2184,7 +2229,7 @@ class Ec2ContainerManagerTest {
         stubNativeInit(harness, instance);
         instance.setDockerContainerId(TEST_CONTAINER_ID);
         instance.setState(InstanceState.running());
-        ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 1, "", "");
+        ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 2, "", "gate inspection failed");
         try {
             assertFalse(harness.manager.restoreMetadataRegistration(instance));
             assertFalse(harness.manager.isContainerRunning(instance),
@@ -2210,7 +2255,7 @@ class Ec2ContainerManagerTest {
         when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
         try {
             assertTrue(harness.manager.restoreMetadataRegistration(instance));
-            ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 1, "", "");
+            ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 2, "", "gate inspection failed");
             harness.manager.reboot(instance);
             executor.shutdown();
             assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));

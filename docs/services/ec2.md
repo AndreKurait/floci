@@ -48,6 +48,9 @@ capped at 30 seconds between attempts. A transient Docker removal error does not
 another `TerminateInstances` call. The instance remains `shutting-down` and retains its
 ports, private-address reservation and cleanup identity until teardown completes.
 Repeated termination requests share the pending operation.
+An ownership mismatch keeps teardown pending and leaves the unverified container
+untouched. Recovery declines that instance without aborting other instances'
+recovery or registering its cached metadata addresses.
 
 On emulator shutdown, EC2's effective storage mode controls container retention.
 Memory-only instances are stopped and removed synchronously, including containers

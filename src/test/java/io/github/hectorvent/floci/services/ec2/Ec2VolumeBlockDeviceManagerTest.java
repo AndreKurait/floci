@@ -103,6 +103,46 @@ class Ec2VolumeBlockDeviceManagerTest {
     }
 
     @Test
+    void rawGuestDisappearingAfterRunningCheckStillReleasesItsLoopDevice() {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-disappeared");
+        instance.setDockerContainerId("disappeared-guest");
+        Volume volume = new Volume();
+        volume.setVolumeId("vol-disappeared");
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(inspect.exec()).thenThrow(new NotFoundException("guest disappeared after running check"));
+        when(dockerClient.inspectContainerCmd("disappeared-guest")).thenReturn(inspect);
+        when(lifecycleManager.isContainerRunning("disappeared-guest")).thenReturn(true);
+        List<List<String>> helperCommands = ContainerExecStubs.completeEveryExec(
+                dockerClient, HELPER_ID, 0, "", "");
+
+        assertEquals(Optional.empty(), manager.attachVolume(volume, instance, "/dev/xvdf"));
+        assertTrue(helperCommands.isEmpty(), "Metadata-only attach must not allocate a loop device");
+
+        assertDoesNotThrow(() -> manager.detachVolume(volume, instance, "/dev/xvdf"));
+
+        assertEquals(1, helperCommands.size());
+        assertTrue(helperCommands.getFirst().contains("detach"));
+        assertTrue(helperCommands.getFirst().contains("/volumes/vol-disappeared.raw"));
+        verify(dockerClient, never()).execCreateCmd("disappeared-guest");
+    }
+
+    @Test
+    void disappearedManagedGuestDoesNotFallBackToMetadataOnly() {
+        Instance instance = managedInstance();
+        instance.setDockerContainerId("disappeared-managed-guest");
+        Volume volume = managedVolume(instance);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(inspect.exec()).thenThrow(new NotFoundException("managed guest disappeared"));
+        when(dockerClient.inspectContainerCmd(instance.getDockerContainerId())).thenReturn(inspect);
+        when(lifecycleManager.isContainerRunning(instance.getDockerContainerId())).thenReturn(true);
+
+        assertThrows(NotFoundException.class, () -> manager.attachVolume(volume, instance, "/dev/xvdf"));
+        assertThrows(NotFoundException.class, () -> manager.detachVolume(volume, instance, "/dev/xvdf"));
+        verify(dockerClient, never()).execCreateCmd(anyString());
+    }
+
+    @Test
     void managedPreparationRejectsConflictingDockerOwnershipBeforeTouchingTheBackingFile() {
         Instance instance = managedInstance();
         Volume volume = managedVolume(instance);

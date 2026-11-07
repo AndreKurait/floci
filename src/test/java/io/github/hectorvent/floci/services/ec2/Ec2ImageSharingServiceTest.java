@@ -55,6 +55,74 @@ class Ec2ImageSharingServiceTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void legacySharedGuestCaptureRecoversItsCatalogRuntimeAndRootDevice(boolean withDataVolume) {
+        Image source = source();
+        if (withDataVolume) {
+            EbsBlockDevice ebs = new EbsBlockDevice();
+            ebs.setSnapshotId(snapshotId(source));
+            BlockDeviceMapping data = new BlockDeviceMapping();
+            data.setDeviceName("/dev/sdf");
+            data.setEbs(ebs);
+            source.setBlockDeviceMappings(List.of(source.getBlockDeviceMappings().getFirst(), data));
+        }
+        grant(source);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service launcher = service(RECIPIENT, false, manager);
+        Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setLaunchableImageId(null);
+        instance.setArchitecture(null);
+        instance.setRootDeviceName(null);
+        if (withDataVolume) {
+            Volume data = launcher.describeVolumes(REGION, List.of(), Map.of()).stream()
+                    .filter(volume -> !volume.getVolumeId().equals(instance.getRootVolumeId())).findFirst().orElseThrow();
+            data.setSize(32);
+        }
+        when(manager.commitInstance(eq(instance), anyString())).thenReturn("example/legacy-capture:1");
+
+        Image captured = launcher.createImage(REGION, instance.getInstanceId(), "legacy-capture", null, true);
+
+        assertEquals("ami-catalog-worker", captured.getSourceImageId());
+        assertEquals(source.getArchitecture(), captured.getArchitecture());
+        assertEquals(source.getRootDeviceName(), captured.getRootDeviceName());
+        assertEquals(captured.getRootDeviceName(), captured.getBlockDeviceMappings().getFirst().getDeviceName());
+        if (withDataVolume) {
+            EbsBlockDevice capturedData = captured.getBlockDeviceMappings().stream()
+                    .filter(mapping -> "/dev/sdf".equals(mapping.getDeviceName())).findFirst().orElseThrow().getEbs();
+            assertEquals(32, capturedData.getVolumeSize());
+            assertNotEquals(snapshotId(source), capturedData.getSnapshotId());
+        }
+        Instance restored = launcher.runInstances(REGION, captured.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
+        verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
+        ResolvedAmiImage original = new AmiImageResolver(catalog).resolveImage("ami-catalog-worker");
+        assertEquals(new ResolvedAmiImage("example/legacy-capture:1", original.guestRuntime(),
+                original.cloudInit(), original.dockerPlatform(), original.volumeMounts()), runtime.getValue());
+    }
+
+    @Test
+    void unavailableLegacySharedAncestryDoesNotLeaveAPartiallyRegisteredCapture() {
+        Image source = source();
+        grant(source);
+        Ec2Service launcher = service(RECIPIENT, false, mock(Ec2ContainerManager.class));
+        Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setLaunchableImageId(null);
+        source.setSourceImageId("ami-missing-ancestor");
+        Set<String> images = Set.copyOf(store("ec2-registered-images.json").keys());
+        Set<String> snapshots = Set.copyOf(store("ec2-snapshots.json").keys());
+
+        assertEquals("InvalidAMIID.NotFound", assertThrows(AwsException.class,
+                () -> launcher.createImage(REGION, instance.getInstanceId(), "refused-capture", null, true))
+                .getErrorCode());
+
+        assertEquals(images, store("ec2-registered-images.json").keys());
+        assertEquals(snapshots, store("ec2-snapshots.json").keys());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void captureOfSharedCatalogGuestRetainsItsAdmittedRuntimeAfterShareRevocation(boolean revoke) {
         Image source = source();
         grant(source);

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ec2;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
@@ -10,6 +11,9 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 
 import java.io.ByteArrayInputStream;
@@ -17,6 +21,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -164,6 +174,117 @@ class Ec2SystemdV1RuntimeLifecycleTest {
         assertThrows(IllegalStateException.class, () -> runtime.release(instance, GUEST));
 
         assertFalse(guestCommands.contains(List.of("touch", Ec2SystemdV1Runtime.READY)));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"82,true", "81,false"})
+    void changedGuestAfterSuccessfulDelegationNeverOpensTheFinalBootGate(long pid, boolean running) {
+        List<List<String>> guestCommands = ContainerExecStubs.completeEveryExec(
+                docker, GUEST, List.of(1L, 0L), "", "");
+        List<List<String>> helperCommands = ContainerExecStubs.completeEveryExec(docker, HELPER, 0, "", "");
+        when(docker.copyArchiveFromContainerCmd(HELPER, "/usr/local/bin/floci-ec2-init").exec())
+                .thenReturn(new ByteArrayInputStream(new byte[0]));
+        InspectContainerResponse changed = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(changed.getState().getPidLong()).thenReturn(pid);
+        when(changed.getState().getRunning()).thenReturn(running);
+        when(docker.inspectContainerCmd(GUEST).exec()).thenReturn(guest, changed);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> runtime.release(instance, GUEST));
+
+        assertEquals("EC2 init guest changed while delegating its cgroup", failure.getMessage());
+        assertTrue(helperCommands.stream().anyMatch(command -> command.contains("--delegate-init")));
+        assertFalse(guestCommands.contains(List.of("touch", Ec2SystemdV1Runtime.READY)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"prepare", "release", "remove", "reconcile"})
+    void slowGuestDockerOperationDoesNotBlockAnotherGuestsRecovery(String operation) throws Exception {
+        assertTrue(runtime.rememberGuest(instance, guest));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        String blockedContainer = switch (operation) {
+            case "release" -> GUEST;
+            case "reconcile" -> HELPER;
+            default -> helperName;
+        };
+        when(docker.inspectContainerCmd(blockedContainer).exec()).thenAnswer(ignored -> {
+            entered.countDown();
+            if (!resume.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Test did not release Docker inspection");
+            }
+            return "release".equals(operation) ? guest : helper;
+        });
+        ContainerExecStubs.completeEveryExec(docker, GUEST, 0, "", "");
+        ContainerExecStubs.completeEveryExec(docker, HELPER, 0, "", "");
+        Container listed = mock(Container.class);
+        when(listed.getId()).thenReturn(HELPER);
+        when(listed.getLabels()).thenReturn(labels(Ec2SystemdV1Runtime.SERVICE));
+        when(docker.listContainersCmd().withShowAll(true).withLabelFilter(Map.of(
+                ContainerStorageHelper.SERVICE_LABEL, Ec2SystemdV1Runtime.SERVICE,
+                ContainerStorageHelper.OWNER_LABEL, "owner/4566")).exec()).thenReturn(List.of(listed));
+        Instance other = new Instance();
+        other.setInstanceId("i-independent");
+        other.setOwnerId(instance.getOwnerId());
+        other.setRegion(instance.getRegion());
+        InspectContainerResponse otherGuest = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        Map<String, String> otherLabels = labels("ec2");
+        otherLabels.put(ContainerStorageHelper.RESOURCE_ID_LABEL, other.getInstanceId());
+        when(otherGuest.getId()).thenReturn("other-guest");
+        when(otherGuest.getConfig().getLabels()).thenReturn(otherLabels);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> slow = executor.submit(() -> {
+                switch (operation) {
+                    case "prepare" -> runtime.prepare(instance, instance.getOwnerId(), instance.getRegion());
+                    case "release" -> runtime.release(instance, GUEST);
+                    case "remove" -> runtime.remove(instance);
+                    case "reconcile" -> runtime.reconcileOrphans((region, id) -> false);
+                    default -> throw new AssertionError(operation);
+                }
+            });
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            assertTrue(executor.submit(() -> runtime.rememberGuest(other, otherGuest)).get(2, TimeUnit.SECONDS));
+            assertTrue(runtime.hasGuest(other));
+            resume.countDown();
+            slow.get(2, TimeUnit.SECONDS);
+        } finally {
+            resume.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void removalOfTheSameGuestWaitsForItsBootOperation() throws Exception {
+        assertTrue(runtime.rememberGuest(instance, guest));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        when(docker.inspectContainerCmd(GUEST).exec()).thenAnswer(ignored -> {
+            entered.countDown();
+            if (!resume.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Test did not release Docker inspection");
+            }
+            return guest;
+        });
+        ContainerExecStubs.completeEveryExec(docker, GUEST, 0, "", "");
+        ContainerExecStubs.completeEveryExec(docker, HELPER, 0, "", "");
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Boolean> releasing = executor.submit(() -> runtime.release(instance, GUEST));
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            Future<?> removing = executor.submit(() -> runtime.remove(instance));
+            assertThrows(TimeoutException.class, () -> removing.get(100, TimeUnit.MILLISECONDS));
+            verifyNoInteractions(lifecycle);
+            resume.countDown();
+            assertTrue(releasing.get(2, TimeUnit.SECONDS));
+            removing.get(2, TimeUnit.SECONDS);
+            verify(lifecycle).removeIfExistsStrict(HELPER);
+            assertFalse(runtime.hasGuest(instance));
+        } finally {
+            resume.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
     }
 
     private Map<String, String> labels(String service) {
