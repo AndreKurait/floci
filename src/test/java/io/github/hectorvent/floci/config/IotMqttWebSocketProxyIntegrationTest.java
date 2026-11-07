@@ -30,7 +30,9 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -50,8 +52,20 @@ import static org.mockito.Mockito.when;
  * dial the Quarkus test ports directly.
  */
 @QuarkusTest
-@TestProfile(IotMqttTlsProfile.class)
+@TestProfile(IotMqttWebSocketProxyIntegrationTest.ProxyTlsProfile.class)
 class IotMqttWebSocketProxyIntegrationTest {
+
+    public static final class ProxyTlsProfile extends IotMqttTlsProfile {
+        @Override
+        public Map<String, String> getConfigOverrides() {
+            Map<String, String> overrides = new HashMap<>(super.getConfigOverrides());
+            // Profile overrides do not reach TlsConfigSource. The private listeners
+            // must accept the transport preface emitted by the public proxy.
+            overrides.put("quarkus.http.proxy.use-proxy-protocol", "true");
+            overrides.put("quarkus.http.host", "127.0.0.1");
+            return overrides;
+        }
+    }
 
     static final String LEARNED_HOST = "iot.example.localhost.floci.io";
     private static final byte[] CONNACK_ACCEPTED = {0x20, 0x02, 0x00, 0x00};
@@ -94,13 +108,14 @@ class IotMqttWebSocketProxyIntegrationTest {
 
     @Test
     void learnedHostnameServesMqttOverWssOnceEnsureHostRan() throws Exception {
-        assertThrows(SSLHandshakeException.class, () -> upgradeAs(LEARNED_HOST),
+        int publicPort = startProxy();
+        assertThrows(SSLHandshakeException.class, () -> upgradeAs(LEARNED_HOST, publicPort),
                 "precondition: the boot leaf covers one label under localhost.floci.io, not two");
 
         try {
             certificateManager.ensureHost(LEARNED_HOST);
 
-            assertArrayEquals(CONNACK_ACCEPTED, upgradeAs(LEARNED_HOST),
+            assertArrayEquals(CONNACK_ACCEPTED, upgradeAs(LEARNED_HOST, publicPort),
                     "after ensureHost a client verifying the learned name gets an MQTT session on /mqtt");
         } finally {
             certificateManager.clear();
@@ -132,11 +147,11 @@ class IotMqttWebSocketProxyIntegrationTest {
      * name, so SNI and HTTPS endpoint identification apply to it, trusting only the Floci CA. Then a hand-written upgrade with
      * that Host, one masked binary frame carrying an MQTT CONNECT, and the CONNACK frame back.
      */
-    private byte[] upgradeAs(String host) throws Exception {
+    private byte[] upgradeAs(String host, int port) throws Exception {
         Socket plain = new Socket();
-        plain.connect(new InetSocketAddress("127.0.0.1", testSslPort), 5000);
+        plain.connect(new InetSocketAddress("127.0.0.1", port), 5000);
         try (SSLSocket socket = (SSLSocket) IotMqttWebSocketIntegrationTest.trustOnlyFlociCa().getSocketFactory()
-                .createSocket(plain, host, testSslPort, true)) {
+                .createSocket(plain, host, port, true)) {
             socket.setSoTimeout(10_000);
             SSLParameters parameters = socket.getSSLParameters();
             parameters.setServerNames(List.of(new SNIHostName(host)));
@@ -145,7 +160,7 @@ class IotMqttWebSocketProxyIntegrationTest {
             socket.startHandshake();
 
             OutputStream out = socket.getOutputStream();
-            out.write(("GET /mqtt HTTP/1.1\r\nHost: " + host + ":" + testSslPort + "\r\nUpgrade: websocket\r\n"
+            out.write(("GET /mqtt HTTP/1.1\r\nHost: " + host + ":" + port + "\r\nUpgrade: websocket\r\n"
                     + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
                     + "Sec-WebSocket-Protocol: mqtt\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
             out.flush();

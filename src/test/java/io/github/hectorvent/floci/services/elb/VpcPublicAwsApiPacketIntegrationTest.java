@@ -80,6 +80,7 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
             // The production protocol proxy forwards to these two internal listeners.
             overrides.put("quarkus.http.test-port", "4510");
             overrides.put("quarkus.http.test-ssl-port", "4511");
+            overrides.put("quarkus.http.proxy.use-proxy-protocol", "true");
             return overrides;
         }
     }
