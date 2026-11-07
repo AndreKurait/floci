@@ -52,8 +52,10 @@ class RoleRequestTimeIntegrationTest {
     final PartitionCleanup cleanup = new PartitionCleanup();
 
     @ParameterizedTest
-    @ValueSource(strings = {"AWS", "AWS_PROXY"})
-    void signedManagementRolePoliciesEnforceTimeBeforeLambdaInvocation(String type) throws Exception {
+    @ValueSource(strings = {"AWS", "AWS_PROXY", "AWS:tags", "AWS_PROXY:tags"})
+    void signedManagementRolePoliciesEnforceContextBeforeLambdaInvocation(String scenario) throws Exception {
+        boolean tagged = scenario.endsWith(":tags");
+        String type = scenario.split(":")[0];
         StaticCredentialsProvider credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
         IamClient iam = IamClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
                 .credentialsProvider(credentials).build();
@@ -83,9 +85,15 @@ class RoleRequestTimeIntegrationTest {
         functions.publishVersion(request -> request.functionName(name));
         String target = functions.createAlias(request -> request.functionName(name).name("live").functionVersion("1"))
                 .aliasArn();
-        String allow = """
+        if (tagged) {
+            iam.tagRole(request -> request.roleName(name).tags(tag -> tag.key("team").value("orders")));
+        }
+        String timeAllow = """
                 {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s",
                 "Condition":{"NumericLessThan":{"aws:EpochTime":"4102444800"}}}}""".formatted(target);
+        String allow = tagged ? """
+                {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s",
+                "Condition":{"StringEquals":{"aws:PrincipalTag/team":"orders"}}}}""".formatted(target) : timeAllow;
         iam.putRolePolicy(request -> request.roleName(name).policyName("invoke").policyDocument(allow));
         cleanup.register(() -> iam.deleteRolePolicy(request -> request.roleName(name).policyName("invoke")));
         String api = gateway.createRestApi(request -> request.name(name)).id();
@@ -104,9 +112,23 @@ class RoleRequestTimeIntegrationTest {
                 .when(lambda).invokeTarget(eq("us-east-1"), eq(target), any(byte[].class), eq(InvocationType.RequestResponse));
         invoke(api, 200);
         verify(lambda, times(2)).invokeTarget(eq("us-east-1"), eq(target), any(byte[].class), eq(InvocationType.RequestResponse));
-        iam.putRolePolicy(request -> request.roleName(name).policyName("invoke")
-                .policyDocument(allow.replace("4102444800", "0")));
-        invoke(api, 500);
+        if (tagged) {
+            iam.tagRole(request -> request.roleName(name).tags(tag -> tag.key("team").value("payments")));
+            invoke(api, 500);
+            iam.untagRole(request -> request.roleName(name).tagKeys("team"));
+            invoke(api, 500);
+            iam.tagRole(request -> request.roleName(name).tags(tag -> tag.key("team").value("orders")));
+            String deny = """
+                    {"Statement":[{"Effect":"Allow","Action":"*","Resource":"*"},
+                    {"Effect":"Deny","Action":"lambda:InvokeFunction","Resource":"%s",
+                    "Condition":{"StringEquals":{"aws:PrincipalTag/team":"orders"}}}]}""".formatted(target);
+            iam.putRolePolicy(request -> request.roleName(name).policyName("invoke").policyDocument(deny));
+            invoke(api, 500);
+        } else {
+            iam.putRolePolicy(request -> request.roleName(name).policyName("invoke")
+                    .policyDocument(allow.replace("4102444800", "0")));
+            invoke(api, 500);
+        }
         iam.putRolePolicy(request -> request.roleName(name).policyName("invoke").policyDocument(allow));
         iam.updateAssumeRolePolicy(request -> request.roleName(name)
                 .policyDocument(trust.replace("2100-01-01T00:00:00Z", "2000-01-01T00:00:00Z")));

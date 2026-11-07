@@ -21,6 +21,11 @@ account SCPs and Lambda resource policies apply; cross-account invocations requi
 both identity and resource-policy grants. Every uncached invocation rechecks the role,
 so revocation takes effect on the next request. The same resolved target is authorized
 and invoked.
+Attached execution-role tags supply `aws:PrincipalTag/<key>` to target identity,
+resource, permissions-boundary and SCP policies. Later calls read the current tags,
+so tag changes and removal affect authorization. These role tags are not added to
+the service principal's trust context; session-tag overrides are not implemented.
+
 Trust and target-policy evaluation use the same server-clock instant for
 `aws:CurrentTime` and `aws:EpochTime`. Time-conditioned grants and denies are
 reevaluated on each invocation. This request time is not `aws:TokenIssueTime`.
