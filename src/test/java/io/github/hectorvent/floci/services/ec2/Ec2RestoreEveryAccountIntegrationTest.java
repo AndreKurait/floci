@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -51,6 +52,9 @@ class Ec2RestoreEveryAccountIntegrationTest {
 
     @Inject
     Ec2Service service;
+
+    @Inject
+    RequestContext requestContext;
 
     @InjectMock
     Ec2ContainerManager containerManager;
@@ -128,6 +132,26 @@ class Ec2RestoreEveryAccountIntegrationTest {
                 () -> describe(instance.getInstanceId()).getFirst().getState().getName()));
         assertFalse(RequestScopes.callAs("000000000000", () -> describe(null).stream()
                 .anyMatch(listed -> listed.getInstanceId().equals(instance.getInstanceId()))));
+    }
+
+    @Test
+    void resetRetiresAnotherAccountsGuestInItsOwnRequestScope() throws Throwable {
+        Instance instance = runningInstanceOf(OTHER_ACCOUNT);
+        doAnswer(invocation -> {
+            Instance retiring = invocation.getArgument(0);
+            if (isSame(retiring, instance)) {
+                assertEquals(OTHER_ACCOUNT, requestContext.getAccountId());
+                assertEquals(REGION, requestContext.getRegion());
+            }
+            return null;
+        }).when(containerManager).terminateForShutdown(any());
+
+        try {
+            runOutsideAnyRequest(service::beforeReset);
+            verify(containerManager).terminateForShutdown(argThat(retiring -> isSame(retiring, instance)));
+        } finally {
+            service.afterReset();
+        }
     }
 
     @Test

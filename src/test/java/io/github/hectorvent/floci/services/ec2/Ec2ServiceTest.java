@@ -135,6 +135,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -7324,6 +7325,95 @@ class Ec2ServiceTest {
         }
         assertEquals("running", instanceStore.getForAccount("111122223333", "us-east-1::i-other")
                 .orElseThrow().getState().getName());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void resetRetiresEveryAccountsInstancesRegardlessOfStorageMode(String mode) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.storage().mode()).thenReturn(mode);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        List<Instance> instances = new ArrayList<>();
+        for (String account : List.of("111122223333", "444455556666")) {
+            for (InstanceState state : List.of(InstanceState.running(), InstanceState.stopped(), InstanceState.pending())) {
+                Instance instance = persistedInstance("i-" + account + "-" + state.getName(), "10.20.1.10", state);
+                if (!"pending".equals(state.getName())) {
+                    instance.setDockerContainerId("container-" + instance.getInstanceId());
+                }
+                instanceStore.putForAccount(account, "us-east-1::" + instance.getInstanceId(), instance);
+                instances.add(instance);
+            }
+        }
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
+
+        try {
+            service.beforeReset();
+            for (Instance instance : instances) {
+                verify(containers).terminateForShutdown(instance);
+            }
+        } finally {
+            service.afterReset();
+        }
+    }
+
+    @Test
+    void resetRefusesToDiscardInstanceRecordsWhenGuestRetirementFails() {
+        EmulatorConfig config = mockConfig(false);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-retirement-failure", "10.20.1.10", InstanceState.stopped());
+        instance.setDockerContainerId("retained-container");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-retirement-failure", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        IllegalStateException failure = new IllegalStateException("Guest retirement failed");
+        doThrow(failure).when(containers).terminateForShutdown(instance);
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), networks);
+
+        try {
+            assertSame(failure, assertThrows(IllegalStateException.class, service::beforeReset));
+            assertSame(instance, instanceStore.getForAccount("111122223333", "us-east-1::i-retirement-failure")
+                    .orElseThrow());
+            verify(networks, never()).resetNetworks();
+        } finally {
+            service.afterReset();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void resetRetiresGuestsOnlyWhenContainerBackedEc2IsEnabled(boolean enabled, boolean mockEc2) {
+        EmulatorConfig config = mockConfig(mockEc2);
+        when(config.services().ec2().enabled()).thenReturn(enabled);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-reset-enabled", "10.20.1.10", InstanceState.running());
+        instance.setDockerContainerId("container-reset-enabled");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-reset-enabled", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), networks);
+
+        try {
+            service.beforeReset();
+            if (enabled && !mockEc2) {
+                verify(containers).terminateForShutdown(instance);
+            } else {
+                verifyNoInteractions(containers);
+            }
+            if (enabled) {
+                verify(networks).resetNetworks();
+            } else {
+                verifyNoInteractions(networks);
+            }
+        } finally {
+            service.afterReset();
+        }
     }
 
     @ParameterizedTest

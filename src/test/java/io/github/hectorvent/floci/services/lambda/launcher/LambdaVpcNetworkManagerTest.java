@@ -1,10 +1,14 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
+import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -13,6 +17,7 @@ import io.github.hectorvent.floci.core.common.docker.DockerFlags;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.BeforeEach;
@@ -250,6 +255,49 @@ class LambdaVpcNetworkManagerTest {
 
     private static LambdaVpcNetworkManager.Attachment attachment() {
         return new LambdaVpcNetworkManager.Attachment("111111111111", "us-east-1", "eni-caller", "helper");
+    }
+
+    @Test
+    void theDnsExceptionInstallsOnlyItsOwnPolicyAndTheFinalRegistrationWaitsForPeers() {
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class, RETURNS_DEEP_STUBS);
+        DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        when(config.services()).thenReturn(services);
+        when(lifecycle.getDockerClient()).thenReturn(docker);
+        when(firewall.enabled()).thenReturn(true);
+        NetworkInterface eni = new NetworkInterface();
+        eni.setNetworkInterfaceId("eni-caller");
+        eni.setVpcId("vpc-caller");
+        eni.setPrivateIpAddress("10.74.1.10");
+        when(ec2.createNetworkInterface(anyString(), anyString(), anyString(), isNull(),
+                anyList(), anyList(), anyList())).thenReturn(eni);
+        SecurityGroup group = new SecurityGroup();
+        group.setGroupId("sg-caller");
+        when(ec2.describeSecurityGroups(anyString(), anyList(), anyList(), anyMap())).thenReturn(List.of(group));
+        when(firewall.createNamespace(anyString(), anyString(), anyString(), anyString(),
+                any(), anyMap(), anyMap()))
+                .thenReturn(new SecurityGroupFirewallManager.Namespace("helper", "172.17.0.2"));
+        when(vpcNetworks.attach(anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(Optional.of("attached"));
+        // The Runtime API host is a name, resolved inside the namespace after the DNS exception.
+        when(docker.execCreateCmd("helper").withAttachStdout(true).withAttachStderr(true)
+                .withCmd(any(String[].class)).exec().getId()).thenReturn("lookup");
+        ExecStartCmd start = mock(ExecStartCmd.class);
+        when(docker.execStartCmd("lookup")).thenReturn(start);
+        when(start.exec(any())).thenAnswer(invocation -> {
+            ResultCallback.Adapter<Frame> callback = invocation.getArgument(0);
+            callback.onNext(new Frame(StreamType.STDOUT, "172.17.0.1 floci-host\n".getBytes()));
+            callback.onComplete();
+            return callback;
+        });
+        when(docker.inspectExecCmd("lookup").exec().getExitCodeLong()).thenReturn(0L);
+
+        assertTrue(manager.prepare(function(), "environment", "floci-host", 9001, DockerFlags.parse(""))
+                .isPresent());
+
+        InOrder order = inOrder(firewall);
+        order.verify(firewall).register(any(), eq("helper"), anyMap(), eq(false));
+        order.verify(firewall).register(any(), eq("helper"), anyMap());
+        verify(firewall, never()).register(any(), anyString(), anyMap(), eq(true));
     }
 
     private static LambdaFunction function() {

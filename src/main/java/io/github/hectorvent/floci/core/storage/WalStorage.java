@@ -103,6 +103,21 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public boolean persistIfCurrent(K key, V value) {
+        compactionLock.writeLock().lock();
+        try {
+            if (value == null || store.get(key) != value) {
+                return false;
+            }
+            commitBufferedRecord(encodePuts(Map.of(key, value)));
+            dirty = true;
+            return true;
+        } finally {
+            compactionLock.writeLock().unlock();
+        }
+    }
+
+    @Override
     public void put(K key, V value) {
         byte[] record = encodePuts(Map.of(key, value));
         compactionLock.writeLock().lock();

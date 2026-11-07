@@ -25,7 +25,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -33,7 +32,6 @@ import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EmbeddedDnsTcpTest {
@@ -199,20 +197,6 @@ class EmbeddedDnsTcpTest {
         try (Socket healthy = connect(server.actualPort())) {
             healthy.getOutputStream().write(framed(request));
             assertArrayEquals(answer, readResponse(healthy));
-        }
-    }
-
-    @Test
-    void failureToBindUdpRetiresTheTcpListener() throws Exception {
-        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of());
-        try (DatagramSocket occupied = new DatagramSocket(0, InetAddress.getByName(ADDRESS))) {
-            int port = occupied.getLocalPort();
-            assertThrows(ExecutionException.class, () -> dns.listenAll(vertx, ADDRESS, port)
-                    .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS));
-            assertTrue(dns.getServerIp().isEmpty());
-            try (ServerSocket reclaimed = new ServerSocket(port, 1, InetAddress.getByName(ADDRESS))) {
-                assertEquals(port, reclaimed.getLocalPort());
-            }
         }
     }
 

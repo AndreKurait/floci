@@ -292,6 +292,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final EmulatorConfig config;
     private final IamService iamService;
     private final Ec2ContainerManager containerManager;
+    private final Object containerCompletionLock = new Object();
+    private boolean resettingInstances;
     private final Ec2PortForwardManager portForwardManager;
     private final AmiImageResolver amiImageResolver;
     private final Ec2ImageCatalog imageCatalog;
@@ -488,7 +490,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     void deleteInstanceForTest(String region, String instanceId) {
-        instances.delete(key(region, instanceId));
+        synchronized (containerCompletionLock) {
+            instances.delete(key(region, instanceId));
+        }
     }
 
     void putVolumeForTest(Volume volume) {
@@ -1655,6 +1659,36 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     // ─── Default resource seeding ──────────────────────────────────────────────
+
+    @Override
+    public void beforeReset() {
+        synchronized (containerCompletionLock) {
+            resettingInstances = true;
+        }
+        if (!config.services().ec2().enabled()) {
+            return;
+        }
+        // Reset discards ownership records, so even persistent guests must finish teardown first.
+        if (!config.services().ec2().mock()) {
+            for (AccountAwareStorageBackend.AccountEntry<Instance> entry : entriesOfEveryAccount(instances)) {
+                Instance instance = entry.value();
+                if (instance != null) {
+                    RequestScopes.runAs(entry.accountId(), instance.getRegion(),
+                            () -> containerManager.terminateForShutdown(instance));
+                }
+            }
+        }
+        if (vpcNetworkManager != null) {
+            vpcNetworkManager.resetNetworks();
+        }
+    }
+
+    @Override
+    public void afterReset() {
+        synchronized (containerCompletionLock) {
+            resettingInstances = false;
+        }
+    }
 
     // Storage is wiped before clear() runs, so the seeded-scope memory must go too or the default
     // VPC and subnets would never come back.
@@ -4725,7 +4759,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         policyGroups, policyPrefixLists(region, policyGroups),
                         () -> RequestScopes.callAs(accountId, region,
                                 () -> prepareInstanceMounts(region, inst, resolvedImage.volumeMounts())), () ->
-                                RequestScopes.runAs(accountId, region, () -> restoreAttachedVolumesForInstance(region, inst)));
+                                RequestScopes.runAs(accountId, region, () -> completeContainerStart(region, inst)));
             }
         }
 
@@ -4734,6 +4768,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
 
         return reservation;
+    }
+
+    private void completeContainerStart(String region, Instance instance) {
+        synchronized (containerCompletionLock) {
+            String storeKey = key(region, instance.getInstanceId());
+            if (resettingInstances || instances.get(storeKey).orElse(null) != instance) {
+                return;
+            }
+            try {
+                if ("running".equals(instance.getState().getName())) {
+                    restoreAttachedVolumesForInstance(region, instance);
+                }
+            } finally {
+                // The worker updates the live model after the API saved its pending record.
+                // Preserve that update even when volume restoration fails.
+                instances.put(storeKey, instance);
+            }
+        }
     }
 
     private List<Ec2VolumeBlockDeviceManager.PreparedMount> prepareInstanceMounts(
@@ -6176,7 +6228,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 String accountId = callerAccountId();
                 containerManager.start(inst, () ->
                         RequestScopes.runAs(accountId, region, () -> verifyInstanceMounts(region, inst)), () ->
-                        RequestScopes.runAs(accountId, region, () -> restoreAttachedVolumesForInstance(region, inst)));
+                        RequestScopes.runAs(accountId, region, () -> completeContainerStart(region, inst)));
             }
             instances.put(key(region, id), inst);
             Map<String, String> entry = new LinkedHashMap<>();
@@ -6272,17 +6324,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /** Removes terminated instances older than 1 hour. Called periodically by lifecycle. */
     public void pruneTerminatedInstances() {
-        long cutoff = System.currentTimeMillis() - 3_600_000L;
-        for (String storeKey : new ArrayList<>(instances.keys())) {
-            Instance inst = instances.get(storeKey).orElse(null);
-            if (inst != null && !inst.isReplayProtected()
-                    && "terminated".equals(inst.getState().getName())
-                    && inst.getTerminatedAt() > 0
-                    && inst.getTerminatedAt() < cutoff) {
-                tags.delete(inst.getInstanceId());
-                instances.delete(storeKey);
-                if (inst.getRegion() != null) {
-                    removeTags(inst.getRegion(), inst.getInstanceId());
+        synchronized (containerCompletionLock) {
+            long cutoff = System.currentTimeMillis() - 3_600_000L;
+            for (String storeKey : new ArrayList<>(instances.keys())) {
+                Instance inst = instances.get(storeKey).orElse(null);
+                if (inst != null && !inst.isReplayProtected()
+                        && "terminated".equals(inst.getState().getName())
+                        && inst.getTerminatedAt() > 0
+                        && inst.getTerminatedAt() < cutoff) {
+                    tags.delete(inst.getInstanceId());
+                    instances.delete(storeKey);
+                    if (inst.getRegion() != null) {
+                        removeTags(inst.getRegion(), inst.getInstanceId());
+                    }
                 }
             }
         }
@@ -14232,10 +14286,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             Optional<AccountAwareStorageBackend.OwnedEntry<Instance>> owner = accountAware.findAnyAccountEntry(storageKey);
             // No owner means the instance was terminated and deleted meanwhile; writing it would
             // leave a copy in the default account.
-            owner.ifPresent(found -> accountAware.putForAccount(found.account(), storageKey, instance));
+            owner.ifPresent(found -> accountAware.persistIfCurrentForAccount(found.account(), storageKey, instance));
             return;
         }
-        instances.put(storageKey, instance);
+        instances.persistIfCurrent(storageKey, instance);
     }
 
     private Optional<AccountAwareStorageBackend.OwnedEntry<Vpc>> findAnyVpcEntry(String region, String vpcId) {

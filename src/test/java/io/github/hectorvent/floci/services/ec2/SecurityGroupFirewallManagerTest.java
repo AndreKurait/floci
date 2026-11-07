@@ -36,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
@@ -64,6 +65,7 @@ class SecurityGroupFirewallManagerTest {
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config,
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
+        doNothing().when(manager).admit(anyString(), anyBoolean());
         String[] accounts = {"111111111111", "222222222222"};
         Container[] observed = new Container[2];
         for (int index = 0; index < accounts.length; index++) {
@@ -248,7 +250,7 @@ class SecurityGroupFirewallManagerTest {
 
         assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a")),
                 manager.vpcForClient("172.18.0.2"));
-        verify(manager).reconcileAll();
+        verify(manager).admit("eni-a", true);
     }
 
     @Test
@@ -261,6 +263,7 @@ class SecurityGroupFirewallManagerTest {
         registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
         clearInvocations(manager);
         doThrow(new IllegalStateException("nft installation failed")).doNothing().when(manager).reconcileAll();
+        doNothing().when(manager).admit(anyString(), anyBoolean());
 
         assertThrows(IllegalStateException.class, manager::retireDnsOrigins);
         assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
@@ -278,6 +281,7 @@ class SecurityGroupFirewallManagerTest {
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(mock(DockerClient.class),
                 mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
+        doNothing().when(manager).admit(anyString(), anyBoolean());
         registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
         doAnswer(ignored -> {
             assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
@@ -299,6 +303,7 @@ class SecurityGroupFirewallManagerTest {
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(dockerClient,
                 mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
+        doNothing().when(manager).admit(anyString(), anyBoolean());
         registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
         manager.retireDnsOrigins();
         assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
@@ -322,6 +327,7 @@ class SecurityGroupFirewallManagerTest {
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(dockerClient,
                 mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
+        doNothing().when(manager).admit(anyString(), anyBoolean());
         registerOrigin(manager, "eni-old", "helper-a", "172.18.0.2", "vpc-old");
         manager.retireDnsOrigins();
         registerOrigin(manager, "eni-new", "helper-a", "172.18.0.2", "vpc-new");
@@ -349,6 +355,7 @@ class SecurityGroupFirewallManagerTest {
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
+        doNothing().when(manager).admit(anyString(), anyBoolean());
         return manager;
     }
 
@@ -376,6 +383,7 @@ class SecurityGroupFirewallManagerTest {
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
+        doNothing().when(manager).admit(anyString(), anyBoolean());
         DnsClientVpcSource origins = assertInstanceOf(DnsClientVpcSource.class, manager);
         List<DnsClientVpcSource.ClientVpc> scopes = List.of(
                 new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a"),

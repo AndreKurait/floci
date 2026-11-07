@@ -17,6 +17,11 @@ public class InMemoryStorage<K, V> implements StorageBackend<K, V> {
     private volatile ConcurrentHashMap<K, V> store = new ConcurrentHashMap<>();
 
     @Override
+    public boolean persistIfCurrent(K key, V value) {
+        return value != null && store.get(key) == value;
+    }
+
+    @Override
     public synchronized void put(K key, V value) {
         store.put(key, value);
     }

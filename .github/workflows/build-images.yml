@@ -248,7 +248,7 @@ jobs:
     needs: [prepare, build-native-amd64, build-native-arm64]
     if: >-
       ${{
-        always() &&
+        !cancelled() &&
         needs.prepare.result == 'success' &&
         (!inputs.publish-native ||
           (needs.build-native-amd64.result == 'success' &&
