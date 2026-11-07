@@ -63,14 +63,19 @@ static void boot(char **command) {
     fail("Cannot execute native EC2 init");
 }
 
-static void verify_guest(long pid, const char *container) {
+static int verify_guest(long pid, const char *container) {
     require(pid > 1 && pid <= INT_MAX && strlen(container) == 64, "Invalid EC2 guest identity");
     for (const char *p = container; *p; p++) {
         require(isxdigit((unsigned char)*p), "Invalid EC2 container ID");
     }
     char path[80];
-    snprintf(path, sizeof(path), "/proc/%ld/cgroup", pid);
-    FILE *input = fopen(path, "r");
+    snprintf(path, sizeof(path), "/proc/%ld", pid);
+    int directory = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) {
+        fail("Cannot pin EC2 guest identity");
+    }
+    /* Proc directory FDs retain the original process identity even if its PID is reused. */
+    FILE *input = fdopen(openat(directory, "cgroup", O_RDONLY | O_CLOEXEC), "r");
     if (input == NULL) {
         fail("Cannot inspect EC2 guest cgroup");
     }
@@ -82,8 +87,7 @@ static void verify_guest(long pid, const char *container) {
     }
     require(!ferror(input) && owned, "PID does not belong to the EC2 container");
     fclose(input);
-    snprintf(path, sizeof(path), "/proc/%ld/status", pid);
-    input = fopen(path, "r");
+    input = fdopen(openat(directory, "status", O_RDONLY | O_CLOEXEC), "r");
     if (input == NULL) {
         fail("Cannot inspect EC2 guest PID namespace");
     }
@@ -109,6 +113,7 @@ static void verify_guest(long pid, const char *container) {
     require(!ferror(input) && last_pid == 1, "EC2 guest is not its namespace's init");
     free(line);
     fclose(input);
+    return directory;
 }
 
 static void configure_time(const char *pid_text, const char *container) {
@@ -116,15 +121,13 @@ static void configure_time(const char *pid_text, const char *container) {
     errno = 0;
     long pid = strtol(pid_text, &end, 10);
     require(errno == 0 && end != pid_text && *end == '\0', "Invalid EC2 guest PID");
-    verify_guest(pid, container);
+    int guest = verify_guest(pid, container);
     struct timespec monotonic, boottime;
     if (clock_gettime(CLOCK_MONOTONIC, &monotonic) != 0
             || clock_gettime(CLOCK_BOOTTIME, &boottime) != 0) {
         fail("Cannot read EC2 clock origins");
     }
-    char path[80];
-    snprintf(path, sizeof(path), "/proc/%ld/timens_offsets", pid);
-    int offsets = open(path, O_WRONLY | O_CLOEXEC);
+    int offsets = openat(guest, "timens_offsets", O_WRONLY | O_CLOEXEC);
     if (offsets < 0) {
         fail("Cannot open EC2 child clock offsets");
     }
@@ -134,7 +137,7 @@ static void configure_time(const char *pid_text, const char *container) {
     int length = snprintf(values, sizeof(values), "monotonic %ld 0\nboottime %ld 0\n",
                           -monotonic.tv_sec, -boottime.tv_sec);
     require(length > 0 && (size_t)length < sizeof(values), "EC2 clock offsets overflowed");
-    if (write(offsets, values, (size_t)length) != length || close(offsets) != 0) {
+    if (write(offsets, values, (size_t)length) != length || close(offsets) != 0 || close(guest) != 0) {
         fail("Cannot initialize private EC2 clocks");
     }
 }
