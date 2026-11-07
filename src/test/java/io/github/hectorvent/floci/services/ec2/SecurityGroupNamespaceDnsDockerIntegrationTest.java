@@ -18,9 +18,13 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -75,9 +79,10 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
                 relay = lifecycle.createAndStart(builder.newContainer(helperImage)
                         .withName("floci-resolver-target-" + suffix)
                         .withDockerNetwork(Optional.of(network))
-                        .withEntrypoint(List.of("socat"))
-                        .withCmd(List.of("-T", "2", "UDP4-RECVFROM:53,reuseaddr,fork",
-                                "UDP4:" + gateway + ":" + target.port())).build()).containerId();
+                        .withEntrypoint(List.of("sh", "-c"))
+                        .withCmd(List.of("socat -T 2 UDP4-RECVFROM:53,reuseaddr,fork UDP4:"
+                                + gateway + ":" + target.port() + " & exec socat TCP4-LISTEN:53,reuseaddr,fork TCP4:"
+                                + gateway + ":" + target.tcp.getLocalPort())).build()).containerId();
                 String resolver = docker.inspectContainerCmd(relay).exec().getNetworkSettings()
                         .getNetworks().values().iterator().next().getIpAddress();
                 when(embeddedDns.getServerIp()).thenReturn(Optional.of(resolver));
@@ -110,6 +115,18 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
                         .contains("192.0.2.71"), "The namespace owner must use the same resolver");
                 assertTrue(execute(workload, "nslookup", "-type=A", "control.example", resolver)
                         .contains("192.0.2.71"), "The DNS target and protected DNS exception must work");
+                assertTrue(execute(workload, "nslookup", "-type=A", "link-local.example", "169.254.169.253")
+                        .contains("192.0.2.71"), "AWS's link-local resolver must work through a deny-all security group");
+                assertTrue(execute(namespace.helperId(), "sh", "-c", tcpQuestionCommand())
+                        .replaceAll("\\s+", "").endsWith("c0000247"),
+                        "The same link-local address must answer DNS over TCP");
+                String routes = execute(namespace.helperId(), "ip", "-4", "route", "show",
+                        "table", "main", "exact", "169.254.169.253/32");
+                assertTrue(routes.contains("src " + serviceAddress),
+                        "Link-local DNS must retain the registered VPC caller's control-network identity");
+                assertTrue(execute(workload, "sh", "-c",
+                        "if nc -w 1 169.254.169.253 80 </dev/null >/dev/null 2>&1; then exit 1; fi").isBlank(),
+                        "The resolver alias must not grant HTTP access");
                 assertNull(target.failure.get(), "The real DNS target must remain healthy");
             }
         } finally {
@@ -127,6 +144,18 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
                 docker.removeNetworkCmd(network).exec();
             }
         }
+    }
+
+    private static String tcpQuestionCommand() {
+        byte[] question = new byte[]{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+                3, 't', 'c', 'p', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0, 1, 0, 1};
+        byte[] request = ByteBuffer.allocate(question.length + 2).putShort((short) question.length)
+                .put(question).array();
+        StringBuilder octal = new StringBuilder();
+        for (byte value : request) {
+            octal.append("\\").append("%03o".formatted(Byte.toUnsignedInt(value)));
+        }
+        return "printf '" + octal + "' | socat -T 3 - TCP4:169.254.169.253:53,connect-timeout=2 | od -An -tx1";
     }
 
     private String execute(String container, String... command) throws Exception {
@@ -148,12 +177,16 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
 
     private static final class DnsTarget implements AutoCloseable {
         private final DatagramSocket socket;
+        private final ServerSocket tcp;
         private final Thread worker;
+        private final Thread tcpWorker;
         private final AtomicReference<Throwable> failure = new AtomicReference<>();
 
         private DnsTarget(String address) throws Exception {
             socket = new DatagramSocket(0, InetAddress.getByName(address));
+            tcp = new ServerSocket(0, 10, InetAddress.getByName(address));
             worker = Thread.ofVirtual().start(this::serve);
+            tcpWorker = Thread.ofVirtual().start(this::serveTcp);
         }
 
         private int port() {
@@ -168,14 +201,7 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
                     if (request.getLength() == 0) {
                         continue; // The socat UDP relay emits an empty datagram when its peer closes.
                     }
-                    byte[] response = Arrays.copyOf(request.getData(), request.getLength() + 16);
-                    ByteBuffer buffer = ByteBuffer.wrap(response);
-                    assertEquals(1, buffer.getShort(4), "One DNS question is expected");
-                    assertEquals(0, buffer.getShort(10), "The fixture expects no additional records");
-                    buffer.putShort(2, (short) 0x8180).putShort(6, (short) 1).putShort(8, (short) 0);
-                    buffer.position(request.getLength());
-                    buffer.putShort((short) 0xc00c).putShort((short) 1).putShort((short) 1)
-                            .putInt(0).putShort((short) 4).put(new byte[]{(byte) 192, 0, 2, 71});
+                    byte[] response = answer(Arrays.copyOf(request.getData(), request.getLength()));
                     socket.send(new DatagramPacket(response, response.length, request.getSocketAddress()));
                 } catch (SocketException expected) {
                     if (!socket.isClosed()) {
@@ -189,11 +215,52 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
             }
         }
 
+        private void serveTcp() {
+            while (!tcp.isClosed()) {
+                try (Socket peer = tcp.accept()) {
+                    peer.setSoTimeout(3000);
+                    DataInputStream input = new DataInputStream(peer.getInputStream());
+                    int length = input.readUnsignedShort();
+                    assertTrue(length >= 12 && length <= 512);
+                    byte[] question = input.readNBytes(length);
+                    assertEquals(length, question.length);
+                    byte[] response = answer(question);
+                    DataOutputStream output = new DataOutputStream(peer.getOutputStream());
+                    output.writeShort(response.length);
+                    output.write(response);
+                    output.flush();
+                } catch (SocketException expected) {
+                    if (!tcp.isClosed()) {
+                        failure.set(expected);
+                    }
+                    return;
+                } catch (Throwable error) {
+                    failure.set(error);
+                    return;
+                }
+            }
+        }
+
+        private static byte[] answer(byte[] question) {
+            byte[] response = Arrays.copyOf(question, question.length + 16);
+            ByteBuffer buffer = ByteBuffer.wrap(response);
+            assertEquals(1, buffer.getShort(4), "One DNS question is expected");
+            assertEquals(0, buffer.getShort(10), "The fixture expects no additional records");
+            buffer.putShort(2, (short) 0x8180).putShort(6, (short) 1).putShort(8, (short) 0);
+            buffer.position(question.length);
+            buffer.putShort((short) 0xc00c).putShort((short) 1).putShort((short) 1)
+                    .putInt(0).putShort((short) 4).put(new byte[]{(byte) 192, 0, 2, 71});
+            return response;
+        }
+
         @Override
-        public void close() throws InterruptedException {
+        public void close() throws Exception {
             socket.close();
+            tcp.close();
             worker.join(3000);
+            tcpWorker.join(3000);
             assertTrue(!worker.isAlive(), "The owned DNS target must stop");
+            assertTrue(!tcpWorker.isAlive(), "The owned TCP DNS target must stop");
         }
     }
 }

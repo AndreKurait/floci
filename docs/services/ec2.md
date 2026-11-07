@@ -217,6 +217,13 @@ file, so ordinary DNS works on an internal Docker network without an external
 gateway. Floci handles recursive lookups and the workload VPC's Resolver rules.
 The existing DNS packet exception still permits only port 53 at that resolver.
 
+Protected namespaces also route IPv4 DNS requests to `169.254.169.253` through
+that same configured resolver. UDP and TCP port 53 retain the namespace's
+registered VPC identity, including on internal Docker networks without a default
+route. This DNS route is installed before workload startup and removed with the
+owned namespace. It does not attach workloads to the host metadata network or
+grant access to other ports, EC2 instance metadata, or arbitrary upstream DNS.
+
 An observer detects externally stopped, removed, or disconnected namespace helpers.
 It retires their DNS identity and removes their addresses from peer security-group rules,
 so an unrelated container reusing an address does not inherit the former ENI's membership.
