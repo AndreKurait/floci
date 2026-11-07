@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
+import io.github.hectorvent.floci.services.iam.StsRequestShapes;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
@@ -36,6 +37,7 @@ import jakarta.ws.rs.container.ContainerRequestFilter;
 import jakarta.ws.rs.container.ResourceInfo;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
@@ -562,6 +564,23 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         Optional<CallerArns> callerArns = accountRootPrincipal
                 ? Optional.of(accountRootArns(accountId))
                 : iamService.resolveCallerArns(akid);
+        if ("sts:AssumeRole".equals(action) && callerArns.isPresent()) {
+            MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+            IamConditionContextResolver.formParameters(ctx).forEach(parameters::putSingle);
+            if (parameters.containsKey("SerialNumber") || parameters.containsKey("TokenCode")) {
+                try {
+                    List<String> violations = StsRequestShapes.violations("AssumeRole", parameters);
+                    if (!violations.isEmpty()) {
+                        throw SmithyValidationErrors.validationError(violations);
+                    }
+                    callerArns = Optional.of(iamService.authenticateRequestMfa(callerArns.get(),
+                            parameters.getFirst("SerialNumber"), parameters.getFirst("TokenCode"), now));
+                } catch (AwsException denied) {
+                    ctx.abortWith(queryXmlError(denied.getErrorCode(), denied.getMessage(), denied.getHttpStatus()));
+                    return;
+                }
+            }
+        }
         if (callerArns.isPresent()) {
             caller = caller.withPrincipalArn(callerArns.get().callerArn());
             conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
