@@ -1248,9 +1248,14 @@ REST `AWS_IAM` route policy evaluation supplies `aws:SourceIp` from the connecti
 boundary and SCP evaluators. Forwarded IP/protocol headers do not supply these values under
 the default server configuration. The downstream Lambda caller-permission check remains a
 separate service call and does not inherit these inbound transport keys. Other inbound
-condition keys and transport-context propagation for WebSocket routes remain separate work.
+condition keys remain separate work.
 
 REST resource-policy evaluation for callers without verified AWS credentials leaves
 `aws:PrincipalIsAWSService` absent. `Bool` matching `false` does not match an
 absent key; `Null` and `BoolIfExists` retain their IAM condition semantics.
 A Cognito token or custom authorizer principal does not become an AWS credential.
+
+WebSocket `AWS_IAM` connection authorization evaluates `aws:SourceIp` and
+`aws:SecureTransport` from the upgrade connection through the shared caller policy
+evaluator. Forwarded headers do not replace these connection facts. This applies
+to connection authorization, separately from downstream integration permissions.
