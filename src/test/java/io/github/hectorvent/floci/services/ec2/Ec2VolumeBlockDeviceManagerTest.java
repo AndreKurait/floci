@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
@@ -15,10 +16,13 @@ import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -64,6 +68,33 @@ class Ec2VolumeBlockDeviceManagerTest {
         lifecycleManager = mock(ContainerLifecycleManager.class);
         manager = new Ec2VolumeBlockDeviceManager(dockerClient, mock(ContainerBuilder.class),
                 lifecycleManager, config);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rawHotAttachDoesNotCreateDevicesInAnUnprivilegedGuest(boolean privileged) {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-hot-attach");
+        instance.setDockerContainerId("guest-container");
+        Volume volume = new Volume();
+        volume.setVolumeId("vol-hot-attach");
+        volume.setSize(8);
+        InspectContainerResponse guest = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(guest.getHostConfig().getPrivileged()).thenReturn(privileged);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(inspect.exec()).thenReturn(guest);
+        when(dockerClient.inspectContainerCmd("guest-container")).thenReturn(inspect);
+        when(lifecycleManager.isContainerRunning("guest-container")).thenReturn(true);
+        List<List<String>> helperCommands = ContainerExecStubs.completeEveryExec(
+                dockerClient, HELPER_ID, 0, "/dev/loop7", "");
+        List<List<String>> guestCommands = ContainerExecStubs.completeEveryExec(
+                dockerClient, "guest-container", 0, "", "");
+
+        assertEquals(privileged ? Optional.of("/dev/xvdf") : Optional.empty(),
+                manager.attachVolume(volume, instance, "/dev/xvdf"));
+
+        assertEquals(privileged ? 1 : 0, helperCommands.size());
+        assertEquals(privileged ? 1 : 0, guestCommands.size());
     }
 
     @Test

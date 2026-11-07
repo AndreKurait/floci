@@ -81,6 +81,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
                 .withTmpfs("/scratch", "noexec,size=64m")
                 .withMemorySwapBytes(1536 * MIB)
                 .withMemorySwappiness(10)
+                .withPidMode("host")
                 .withNetworkSysctl("net.ipv4.ip_forward", "1")
                 .build();
 
@@ -97,6 +98,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertEquals(1536 * MIB, hostConfig.getMemorySwap());
         assertEquals(10L, hostConfig.getMemorySwappiness());
         assertEquals(Map.of("net.ipv4.ip_forward", "1"), hostConfig.getSysctls());
+        assertEquals("host", hostConfig.getPidMode());
     }
 
     @Test
@@ -115,6 +117,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertNull(hostConfig.getMemorySwap());
         assertNull(hostConfig.getMemorySwappiness());
         assertNull(hostConfig.getSysctls());
+        assertNull(hostConfig.getPidMode());
     }
 
     @Test

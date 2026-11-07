@@ -4462,6 +4462,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // is in-memory record construction, and the slow part, the container launch, still runs
         // outside.
         ResolvedAmiImage dockerImage = null;
+        String launchableImageId = null;
         synchronized (imageRegistryLock) {
             requireNotDeregistered(region, imageId);
             // Planned under the lock DeregisterImage deletes snapshots under, so a snapshot a
@@ -4477,7 +4478,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 // ancestor supplies the guest runtime (systemd vs minimal, cloud-init), which a
                 // committed layer does not change; the captured file system, when there is one,
                 // then replaces the image to actually run.
-                String launchableImageId = image != null && !callerAccountId().equals(image.getOwnerId())
+                launchableImageId = image != null && !callerAccountId().equals(image.getOwnerId())
                         && !foreignImageEntries(region, imageId).isEmpty()
                         ? sharedImageAncestor(region, image) : resolveLaunchableImageId(region, imageId);
                 dockerImage = amiImageResolver.resolveImage(launchableImageId);
@@ -4555,6 +4556,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             inst.setInstanceId(instanceId);
                             inst.setOwnerId(callerAccountId());
                             inst.setImageId(imageId);
+                            inst.setLaunchableImageId(launchableImageId);
                             inst.setState(InstanceState.pending());
                             inst.setInstanceType(effectiveInstanceType);
                             inst.setSpot(spot);
@@ -6733,6 +6735,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         Instance copy = new Instance();
         copy.setInstanceId(source.getInstanceId());
         copy.setImageId(source.getImageId());
+        copy.setLaunchableImageId(source.getLaunchableImageId());
         copy.setState(source.getState());
         copy.setStateTransitionReason(source.getStateTransitionReason());
         copy.setInstanceType(source.getInstanceType());
@@ -9771,14 +9774,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // so DescribeImages does not report a generic x86_64 / /dev/sda1 image with no devices.
         Image sourceImage = findImageForCapture(region, source.getImageId());
         Image image = registerImage(region, name, description,
-                sourceImage != null ? sourceImage.getArchitecture() : null,
-                sourceImage != null ? sourceImage.getRootDeviceName() : null,
+                source.getArchitecture(), source.getRootDeviceName(),
                 captureBlockDeviceMappings(region, source, sourceImage), false);
 
         // Carry the launchable ancestor so RunInstances on this AMI starts the same guest instead
         // of falling through to the catalog default. This is also the fallback when the file
         // system cannot be captured below.
-        image.setSourceImageId(resolveLaunchableImageId(region, source.getImageId()));
+        image.setSourceImageId(source.getLaunchableImageId() != null ? source.getLaunchableImageId()
+                : resolveLaunchableImageId(region, source.getImageId()));
         // The resolved image rather than the instance's id: an instance launched by a catalog alias
         // records the alias.
         image.setCreationSourceImageId(sourceImage != null ? sourceImage.getImageId() : source.getImageId());

@@ -168,6 +168,7 @@ public class ContainerBuilder {
         private LogConfig logConfig;
         private boolean privileged;
         private String cgroupnsMode;
+        private String pidMode;
         private String user;
         private final List<String> groupAdd = new ArrayList<>();
         private final List<String> dnsServers = new ArrayList<>();
@@ -536,6 +537,11 @@ public class ContainerBuilder {
             return this;
         }
 
+        public Builder withPidMode(String pidMode) {
+            this.pidMode = pidMode;
+            return this;
+        }
+
         /**
          * Sets the user the container process runs as, formatted {@code "uid[:gid]"}
          * (Docker's top-level container user). Null or blank leaves the image {@code USER}
@@ -808,7 +814,7 @@ public class ContainerBuilder {
                     Map.copyOf(ulimits),
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
-                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, networkSysctls),
+                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, networkSysctls, pidMode),
                     javaTrustStore
             );
         }

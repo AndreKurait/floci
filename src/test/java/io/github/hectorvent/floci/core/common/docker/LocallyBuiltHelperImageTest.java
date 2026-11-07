@@ -100,8 +100,10 @@ class LocallyBuiltHelperImageTest {
     @Test
     void replacesDockerfileOnlyCacheAndSendsDeclaredFilesToDocker() throws Exception {
         stubResolvedImage();
-        CachedImageStubs.image(dockerClient, DEFAULT_IMAGE, "linux", "amd64",
-                CachedImageStubs.recipe(CONTEXT_DOCKERFILE));
+        try (InputStream dockerfile = getClass().getResourceAsStream(CONTEXT_DOCKERFILE)) {
+            CachedImageStubs.image(dockerClient, DEFAULT_IMAGE, "linux", "amd64",
+                    Digests.sha256Hex(dockerfile.readAllBytes()));
+        }
         BuildImageCmd build = stubBuildReturning("sha256:context");
 
         LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder,

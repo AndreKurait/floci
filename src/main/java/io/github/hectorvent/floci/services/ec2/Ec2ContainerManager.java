@@ -180,6 +180,8 @@ public class Ec2ContainerManager {
     private final ContainerReachableEndpoint reachableEndpoint;
     private final Ec2InstanceTypeCatalog instanceTypeCatalog;
     private final Ec2MetadataNamespace metadataNamespaces;
+    private final Ec2SystemdV1Runtime systemdV1;
+    private final Ec2GuestReboots guestReboots;
     private SecurityGroupFirewallManager firewallManager;
     private final ExecutorService executor;
     private final Semaphore metadataSetupSlots = new Semaphore(METADATA_SETUP_CONCURRENCY);
@@ -193,7 +195,7 @@ public class Ec2ContainerManager {
     /** Instances whose service-network lookup failed and is retried on the next address read. */
     private final Set<String> serviceNetworkRetries = ConcurrentHashMap.newKeySet();
     private final Set<String> serviceNetworkRetriesRunning = ConcurrentHashMap.newKeySet();
-    /** Runs service-network lookup retries; see {@link #createServiceNetworkRetryExecutor}. */
+    /** Runs IO retries and lifecycle submissions that must not block a launch worker. */
     private final ExecutorService serviceNetworkRetryExecutor;
     private final Duration userDataExecutionTimeout;
     private final Set<ResultCallback<Frame>> activeUserDataCallbacks = ConcurrentHashMap.newKeySet();
@@ -233,6 +235,9 @@ public class Ec2ContainerManager {
             return null;
         }
         InspectContainerResponse worker = dockerClient.inspectContainerCmd(containerId).exec();
+        if (systemdV1.rememberGuest(instance, worker)) {
+            guestReboots.watch(instance);
+        }
         String helperId = namespaceOwnerId(worker);
         if (helperId == null) {
             return null;
@@ -406,9 +411,12 @@ public class Ec2ContainerManager {
         this.reachableEndpoint = reachableEndpoint;
         this.instanceTypeCatalog = instanceTypeCatalog != null ? instanceTypeCatalog : new Ec2InstanceTypeCatalog();
         this.metadataNamespaces = new Ec2MetadataNamespace(dockerClient, containerBuilder, lifecycleManager, config);
+        this.systemdV1 = new Ec2SystemdV1Runtime(dockerClient, containerBuilder, lifecycleManager, config);
         this.executor = executor;
         this.serviceNetworkRetryExecutor = serviceNetworkRetryExecutor;
         this.userDataExecutionTimeout = userDataExecutionTimeout;
+        this.guestReboots = new Ec2GuestReboots(dockerClient, config,
+                this::submitLifecycleOperation, this::restartNativeGuest);
     }
 
     Ec2ContainerManager(ContainerBuilder containerBuilder,
@@ -458,6 +466,7 @@ public class Ec2ContainerManager {
 
     @PreDestroy
     void stop() {
+        guestReboots.close();
         closeActiveUserDataCallbacks();
         executor.shutdownNow();
         terminationRetries.stop();
@@ -615,6 +624,12 @@ public class Ec2ContainerManager {
                     portForwardManager.reconcile(instance, appPorts);
                 }
 
+                // The guest's init consumes metadata, provisions SSH and runs user data.
+                // Running the compatibility bootstrap as well would execute scripts twice.
+                if (image.cloudInit() && (image.systemd() || image.imageRuntime())) {
+                    return;
+                }
+
                 // Inject SSH public key, if one was provided
                 if (publicKey != null && !publicKey.isBlank()) {
                     injectSshKey(containerId, publicKey);
@@ -742,6 +757,9 @@ public class Ec2ContainerManager {
                 if (isLaunchCancelled(instance)) {
                     throw new IllegalStateException("EC2 launch was canceled before guest startup");
                 }
+                if (image.systemdV1()) {
+                    systemdV1.prepare(instance, regionResolver.getAccountId(), region);
+                }
                 ContainerSpec spec = buildContainerSpec(containerName, image, region, serviceEndpoint,
                         instanceId, helperId, namespace != null, instance.getIamInstanceProfileArn() != null,
                         instance.getInstanceType(), options, mounts);
@@ -750,6 +768,9 @@ public class Ec2ContainerManager {
                         : lifecycleManager.create(spec, image.dockerPlatform());
                 if (!recordCreatedContainer(instance, containerId, sshHostPort)) {
                     lifecycleManager.removeIfExists(containerId);
+                    if (image.systemdV1()) {
+                        systemdV1.remove(instance);
+                    }
                     if (eniId != null) {
                         firewallManager.unregister(eniId);
                     }
@@ -761,6 +782,9 @@ public class Ec2ContainerManager {
                 }
                 recorded = true;
                 lifecycleManager.startCreated(containerId, spec);
+                if (image.systemdV1()) {
+                    releaseNativeGuest(instance, containerId);
+                }
                 return new StartedContainer(containerId, sshHostPort);
             } catch (Exception e) {
                 boolean ownsCleanup = !recorded || clearRecordedContainer(instance, containerId, sshHostPort);
@@ -769,6 +793,9 @@ public class Ec2ContainerManager {
                 }
                 if (containerId != null) {
                     lifecycleManager.removeIfExists(containerId);
+                }
+                if (image.systemdV1()) {
+                    systemdV1.remove(instance);
                 }
                 if (helperId != null) {
                     if (eniId != null) {
@@ -813,7 +840,8 @@ public class Ec2ContainerManager {
                 // sibling emulator's live instances off a shared daemon. See LABEL_OWNER.
                 .withLabels(Map.of(LABEL_OWNER, ownerIdentity()))
                 .withNetworkMode("container:" + helperId)
-                .withPrivileged(config.services().ec2().privileged() && !enforceSecurityGroups && mounts.isEmpty());
+                .withPrivileged(config.services().ec2().privileged() && !enforceSecurityGroups
+                        && mounts.isEmpty() && !image.systemdV1());
         config.services().ec2().capDrop().orElse(List.of()).forEach(specBuilder::withCapDrop);
         options.ulimits().forEach((name, limit) -> specBuilder.withUlimit(name, limit.soft(), limit.hard()));
         options.mounts().forEach(specBuilder::withMount);
@@ -844,7 +872,18 @@ public class Ec2ContainerManager {
         if (enforceSecurityGroups) {
             specBuilder.withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true"));
         }
-        if (image.systemd()) {
+        if (image.systemdV1()) {
+            specBuilder.withCgroupnsMode("private").withCapAdd("SYS_ADMIN").withCapAdd("SYS_BOOT")
+                    .withEnv("container", "docker")
+                    .withEntrypoint(List.of("/bin/sh", "-c", Ec2SystemdV1Runtime.GATE))
+                    .withCmd(List.of("ec2-init", Ec2SystemdV1Runtime.hardwareUuid(
+                            regionResolver.getAccountId(), region, instanceId)))
+                    .withTmpfs("/run", "rw,nosuid,nodev,exec")
+                    .withMount(new Mount().withType(MountType.TMPFS).withTarget("/run/lock"))
+                    .withMount(new Mount().withType(MountType.TMPFS).withTarget("/sys/fs/cgroup"))
+                    .withMount(new Mount().withType(MountType.TMPFS).withTarget("/sys/hypervisor"))
+                    .withLabels(Map.of(Ec2SystemdV1Runtime.RUNTIME_LABEL, ResolvedAmiImage.SYSTEMD_V1_RUNTIME));
+        } else if (image.systemd()) {
             specBuilder
                     .withCgroupnsMode("host")
                     .withMount(new Mount().withType(MountType.TMPFS).withTarget("/run"))
@@ -855,6 +894,23 @@ public class Ec2ContainerManager {
     }
 
     private void validateMountOptions(ResolvedAmiImage image, GuestOptions options) {
+        if (image.systemd()) {
+            for (Mount mount : options.mounts()) {
+                if (Set.of("/run", "/run/lock", "/sys/fs/cgroup").contains(mount.getTarget())
+                        || (image.systemdV1() && Set.of("/sys/hypervisor", "/run/floci-init-ready",
+                        "/run/floci-init-binary-ready").contains(mount.getTarget()))) {
+                    throw new IllegalArgumentException("Read-only bind target is reserved for systemd: "
+                            + mount.getTarget());
+                }
+            }
+        }
+        if (image.systemdV1() && config.services().ec2().capDrop().orElse(List.of()).stream().anyMatch(capability ->
+                "SYS_ADMIN".equalsIgnoreCase(capability) || "CAP_SYS_ADMIN".equalsIgnoreCase(capability)
+                        || "SYS_BOOT".equalsIgnoreCase(capability) || "CAP_SYS_BOOT".equalsIgnoreCase(capability)
+                        || "ALL".equalsIgnoreCase(capability))) {
+            throw new IllegalStateException(
+                    "The systemd-v1 runtime requires SYS_ADMIN and SYS_BOOT in its private guest namespace");
+        }
         if (image.volumeMounts().isEmpty()) {
             return;
         }
@@ -1011,12 +1067,10 @@ public class Ec2ContainerManager {
                     instance.getInstanceId(), e.getMessage());
         }
         if (containerId != null) {
-            try {
-                lifecycleManager.removeIfExists(containerId);
-            } catch (Exception e) {
-                LOG.warnv("Error removing failed EC2 container {0}: {1}", containerId, e.getMessage());
-            }
+            lifecycleManager.removeIfExistsStrict(containerId);
         }
+        // Retain the cleanup record and its leases until both the guest and init helper are gone.
+        systemdV1.remove(instance);
         if (firewallManager != null && firewallManager.enabled()
                 && cleanup.eniId() != null) {
             firewallManager.unregister(cleanup.eniId());
@@ -1161,6 +1215,7 @@ public class Ec2ContainerManager {
      * would be abandoned mid-flight during shutdown) and leaves state handling to the caller.
      */
     public void stopForShutdown(Instance instance) {
+        guestReboots.forget(instance);
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
             return;
@@ -1175,13 +1230,12 @@ public class Ec2ContainerManager {
         }
     }
 
-    private void submitLifecycleOperation(String containerId, Runnable operation) {
+    private CompletableFuture<Void> submitLifecycleOperation(String containerId, Runnable operation) {
         synchronized (lifecycleOperations) {
-            CompletableFuture<Void> previous = lifecycleOperations.getOrDefault(containerId,
-                    CompletableFuture.completedFuture(null));
+            CompletableFuture<Void> previous = lifecycleOperations.get(containerId);
             CompletableFuture<Void> completed = new CompletableFuture<>();
             lifecycleOperations.put(containerId, completed);
-            previous.whenComplete((ignored, priorFailure) -> {
+            Runnable submit = () -> {
                 try {
                     executor.submit(() -> {
                         try {
@@ -1192,12 +1246,30 @@ public class Ec2ContainerManager {
                         }
                     });
                 } catch (RuntimeException failure) {
-                    lifecycleOperations.remove(containerId, completed);
-                    completed.completeExceptionally(failure);
-                    LOG.warnv(failure, "Could not schedule lifecycle operation for EC2 container {0}", containerId);
+                    failLifecycleSubmission(containerId, completed, failure);
                 }
-            });
+            };
+            if (previous == null) {
+                submit.run();
+            } else {
+                previous.whenComplete((ignored, priorFailure) -> {
+                    try {
+                        // Completion runs on a launch worker; a full launch queue must not trap it.
+                        serviceNetworkRetryExecutor.execute(submit);
+                    } catch (RuntimeException failure) {
+                        failLifecycleSubmission(containerId, completed, failure);
+                    }
+                });
+            }
+            return completed;
         }
+    }
+
+    private void failLifecycleSubmission(String containerId, CompletableFuture<Void> completed,
+                                         RuntimeException failure) {
+        lifecycleOperations.remove(containerId, completed);
+        completed.completeExceptionally(failure);
+        LOG.warnv(failure, "Could not schedule lifecycle operation for EC2 container {0}", containerId);
     }
 
     /**
@@ -1205,6 +1277,7 @@ public class Ec2ContainerManager {
      * Updates instance state through stopping → stopped.
      */
     public void stop(Instance instance) {
+        guestReboots.forget(instance);
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
             instance.setState(InstanceState.stopped());
@@ -1278,6 +1351,7 @@ public class Ec2ContainerManager {
                     }
                 }
                 dockerClient.startContainerCmd(containerId).exec();
+                releaseNativeGuest(instance, containerId);
                 boolean running = false;
                 for (int i = 0; i < 20 && !running; i++) {
                     running = lifecycleManager.isContainerRunning(containerId);
@@ -1377,7 +1451,9 @@ public class Ec2ContainerManager {
     }
 
     boolean isContainerRunning(String containerId) {
-        return containerId != null && !containerId.isBlank() && lifecycleManager.isContainerRunning(containerId);
+        return containerId != null && !containerId.isBlank()
+                && !guestReboots.recoveryFailed(containerId)
+                && (lifecycleManager.isContainerRunning(containerId) || guestReboots.isRebooting(containerId));
     }
 
     /**
@@ -1427,6 +1503,7 @@ public class Ec2ContainerManager {
                 LOG.infov("Reconciled orphaned EC2 container {0} (instance {1}) left by a previous run",
                         container.getId(), String.valueOf(instanceId));
             }
+            systemdV1.reconcileOrphans(stillDeclared);
         } catch (Exception e) {
             LOG.warnv("Could not reconcile orphaned EC2 containers: {0}", e.getMessage());
         }
@@ -1464,7 +1541,21 @@ public class Ec2ContainerManager {
         }
         String containerId = instance.getDockerContainerId();
         if (!lifecycleManager.isContainerRunning(containerId)) {
-            return false;
+            String state = instance.getState() == null ? "" : instance.getState().getName();
+            if (!("pending".equals(state) || "running".equals(state))) {
+                return false;
+            }
+            try {
+                InspectContainerResponse guest = dockerClient.inspectContainerCmd(containerId).exec();
+                if (!Ec2GuestReboots.requestedReboot(guest) || !systemdV1.rememberGuest(instance, guest)) {
+                    return false;
+                }
+                guestReboots.watch(instance);
+            } catch (DockerException failure) {
+                LOG.warnv(failure, "Could not restore native reboot observation for EC2 instance {0}",
+                        instance.getInstanceId());
+                return false;
+            }
         }
 
         ProtectedNamespace namespace;
@@ -1805,6 +1896,7 @@ public class Ec2ContainerManager {
      * is logged and swallowed rather than killing the executor task.
      */
     public void terminate(Instance instance, Runnable afterTeardown) {
+        guestReboots.forget(instance);
         PendingTermination pending = pendingTerminations.computeIfAbsent(instance.getInstanceId(), ignored -> {
             if (instance.getState() != null && "terminated".equals(instance.getState().getName())) {
                 return null;
@@ -1934,6 +2026,7 @@ public class Ec2ContainerManager {
                     }
                 }
                 containerGone = false;
+                systemdV1.remove(instance);
                 // Retire the endpoint before removing its namespace: another termination may reconcile peers.
                 if (firewallManager != null && firewallManager.enabled() && firewallEniId != null) {
                     firewallManager.unregister(firewallEniId);
@@ -1978,9 +2071,16 @@ public class Ec2ContainerManager {
         if (containerId == null) {
             return;
         }
-        executor.submit(() -> {
+        InstanceState expected = instance.getState();
+        submitLifecycleOperation(containerId, () -> {
+            if (instance.getState() != expected || expected == null || !"running".equals(expected.getName())
+                    || !containerId.equals(instance.getDockerContainerId())) {
+                return;
+            }
             try {
                 dockerClient.restartContainerCmd(containerId).exec();
+                guestReboots.forget(instance);
+                releaseNativeGuest(instance, containerId);
                 LOG.infov("Rebooted EC2 container {0}", containerId);
             } catch (Exception e) {
                 LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());
@@ -1990,7 +2090,20 @@ public class Ec2ContainerManager {
 
     public boolean isContainerRunning(Instance instance) {
         String containerId = instance.getDockerContainerId();
-        return containerId != null && lifecycleManager.isContainerRunning(containerId);
+        return isContainerRunning(containerId);
+    }
+
+    private void releaseNativeGuest(Instance instance, String containerId) {
+        if (systemdV1.release(instance, containerId)) {
+            guestReboots.watch(instance);
+        }
+    }
+
+    private void restartNativeGuest(Instance instance) {
+        String containerId = instance.getDockerContainerId();
+        dockerClient.startContainerCmd(containerId).exec();
+        releaseNativeGuest(instance, containerId);
+        LOG.infov("Resumed native EC2 reboot in container {0}", containerId);
     }
 
     /** Signals that an instance's file system could not be captured as a Docker image. */

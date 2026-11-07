@@ -27,6 +27,11 @@ or instance-type restrictions.
 
 `RunInstances` launches a **real Docker container** for each instance. By default, the `minimal` guest runtime overrides the image's CMD with `tail -f /dev/null`. Catalog entries can instead select `systemd`, which starts `/sbin/init` with the mounts needed for a systemd-based cloud-image guest, or `image`, which preserves the image's own ENTRYPOINT and CMD.
 
+Cloud images whose native systemd requires the named cgroup v1 hierarchy can
+select `systemd-v1`. It starts the image's native init in a delegated service
+hierarchy and supports native guest reboots. See the
+[runtime requirements and qualification limits](../design/ec2-systemd-v1.md).
+
 | EC2 state | Docker operation |
 |---|---|
 | `pending → running` | Container created and started |
@@ -241,7 +246,10 @@ Both paths must be normalized absolute Linux paths, including when the Floci
 process runs on Windows. Sources must already exist on the Docker daemon host.
 Docker refuses a missing source without creating it.
 Duplicate targets and replacing the guest root are rejected before guest
-resources are allocated.
+resources are allocated. For systemd images, `/run`, `/run/lock`, and
+`/sys/fs/cgroup` are reserved for the runtime and cannot be bind targets.
+The `systemd-v1` runtime also reserves `/sys/hypervisor`, `/run/floci-init-ready`,
+and `/run/floci-init-binary-ready`. These readiness files belong to native guest startup.
 
 These mounts apply to EC2 guest containers in every runtime mode. Helpers retain
 their own configuration. Image ENTRYPOINT/CMD, process limits, metadata and
@@ -312,6 +320,11 @@ CreateImage and CopyImage use their explicit source, even when the output name
 matches another registration binding. Names without a declared binding retain
 the existing metadata registration and default-image fallback behavior.
 The mapping does not import snapshot bytes or prove that a guest boots.
+New container-backed instances retain the runtime ancestor admitted at launch.
+Creating an image from a guest launched from a shared catalog-bound AMI keeps
+the instance's architecture, root device and runtime even after sharing is
+revoked or Floci restarts. Instances saved without this binding retain the legacy
+source-image lookup. This does not enable sharing captured Docker layers.
 
 `CopyImage` accepts a name already used by another AMI, including another copy
 of the same source or a different architecture. Each copy receives its own AMI
@@ -2419,6 +2432,15 @@ cannot split a move between its source and destination.
 
 A launch template with network interfaces cannot be combined with an instance-level
 `SubnetId`; place the subnet on the primary network interface instead.
+
+## Native cloud-init ownership
+
+When a catalog image declares `cloudInit: true` and uses `systemd`, `systemd-v1`,
+or `image`, its native startup process owns cloud-init, SSH configuration, and
+user-data execution. Floci exposes the original user data through metadata and
+does not also extract and execute shell scripts or inject an SSH key. The image
+must install and start cloud-init itself. Images without cloud-init and the
+`minimal` runtime retain the compatibility bootstrap.
 
 ## Instance metadata discovery
 
