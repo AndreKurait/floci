@@ -498,6 +498,8 @@ public class EcrRegistryManager {
     }
 
     private void runReconcileOnce() {
+        LOG.infov("ECR callback diagnostic reconciliation entry reconciled={0} hookPresent={1}",
+                reconciled, reconcileHook != null);
         if (reconciled || reconcileHook == null) {
             return;
         }
@@ -505,6 +507,7 @@ public class EcrRegistryManager {
             // Give the registry a moment to be ready on first start
             for (int i = 0; i < 10; i++) {
                 if (httpClient().ping()) {
+                    LOG.infov("ECR callback diagnostic reconciliation ping success attempt={0}", i);
                     break;
                 }
                 try {

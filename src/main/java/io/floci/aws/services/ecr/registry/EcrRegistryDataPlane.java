@@ -18,6 +18,7 @@ import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
 
 import java.net.URI;
 import java.net.URLDecoder;
@@ -34,6 +35,8 @@ import java.util.regex.Pattern;
  */
 @ApplicationScoped
 public class EcrRegistryDataPlane {
+
+    private static final Logger LOG = Logger.getLogger(EcrRegistryDataPlane.class);
 
     private static final Pattern ECR_HOST = Pattern.compile(
             "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.localhost(?:\\.floci\\.io)?(?::[0-9]+)?$");
@@ -212,6 +215,7 @@ public class EcrRegistryDataPlane {
                 return;
             }
             if (result.failed()) {
+                LOG.warnv(result.cause(), "ECR callback diagnostic manager failure");
                 context.request().resume();
                 exchange.end();
                 registryUnavailable(context);
@@ -241,6 +245,7 @@ public class EcrRegistryDataPlane {
         HttpClient client = exchange.open(vertx.createHttpClient(new HttpClientOptions().setConnectTimeout(5_000)));
         client.request(options).onComplete(upstreamRequest -> {
             if (upstreamRequest.failed()) {
+                LOG.warnv(upstreamRequest.cause(), "ECR callback diagnostic connection failure");
                 context.request().resume();
                 exchange.end();
                 registryUnavailable(context);
@@ -250,22 +255,26 @@ public class EcrRegistryDataPlane {
             copyRequestHeaders(context, clientReq);
             clientReq.response().onComplete(upstreamResponse -> {
                 if (upstreamResponse.failed()) {
+                    LOG.warnv(upstreamResponse.cause(), "ECR callback diagnostic response failure");
                     exchange.end();
                     failUnlessGone(context, 502);
                     return;
                 }
+                LOG.infov("ECR callback diagnostic upstream response status={0}", upstreamResponse.result().statusCode());
                 copyResponseHeaders(context, upstreamResponse.result(), request);
                 upstreamResponse.result().pipeTo(context.response()).onComplete(ignored -> exchange.end());
             });
             Buffer waitingBody = exchange.replayBody();
             if (waitingBody == null) {
-                clientReq.send(context.request()).onFailure(ignored -> {
+                clientReq.send(context.request()).onFailure(failure -> {
+                    LOG.warnv(failure, "ECR callback diagnostic streaming send failure");
                     exchange.end();
                     failUnlessGone(context, 502);
                 });
                 context.request().resume();
             } else {
-                clientReq.send(waitingBody).onFailure(ignored -> {
+                clientReq.send(waitingBody).onFailure(failure -> {
+                    LOG.warnv(failure, "ECR callback diagnostic replay send failure");
                     exchange.end();
                     failUnlessGone(context, 502);
                 });
