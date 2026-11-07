@@ -48,7 +48,7 @@ class BuildV2ProxyEventJwtClaimsTest {
                 null, null, null, null,
                 regionResolver, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null
-        , null, null, null, mock(ServiceCallAuthorizer.class));
+        , null, null, null, mock(ServiceCallAuthorizer.class), null);
     }
 
     @Test
