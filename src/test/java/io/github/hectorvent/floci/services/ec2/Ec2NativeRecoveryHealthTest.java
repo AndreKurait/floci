@@ -44,6 +44,7 @@ class Ec2NativeRecoveryHealthTest {
     private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
     private final InspectContainerResponse inspection = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
     private final ExecutorService executor = mock(ExecutorService.class);
+    private final ExecutorService retries = mock(ExecutorService.class);
     private final List<Runnable> tasks = new CopyOnWriteArrayList<>();
     private final AtomicBoolean running = new AtomicBoolean();
     private final Instance instance = new Instance();
@@ -77,15 +78,27 @@ class Ec2NativeRecoveryHealthTest {
         when(inspection.getState().getPidLong()).thenReturn(81L);
         when(docker.inspectContainerCmd(CONTAINER).exec()).thenReturn(inspection);
         when(lifecycle.isContainerRunning(CONTAINER)).thenAnswer(ignored -> running.get());
+        InspectContainerResponse helper = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(helper.getId()).thenReturn("owned-init-helper");
+        when(helper.getState().getRunning()).thenReturn(true);
+        Map<String, String> helperLabels = new HashMap<>(labels);
+        helperLabels.put(ContainerStorageHelper.SERVICE_LABEL, Ec2SystemdV1Runtime.SERVICE);
+        helperLabels.put(Ec2SystemdV1Runtime.SCOPE_LABEL, "floci-" + "a".repeat(32));
+        when(helper.getConfig().getLabels()).thenReturn(helperLabels);
+        when(docker.inspectContainerCmd("owned-init-helper").exec()).thenReturn(helper);
+        when(docker.inspectContainerCmd(ContainerStorageHelper.resourceName(
+                config, Ec2SystemdV1Runtime.SERVICE, null, instance.getInstanceId())).exec()).thenReturn(helper);
+        ContainerExecStubs.completeEveryExec(docker, CONTAINER, 0, "", "");
         doAnswer(invocation -> {
             tasks.add(invocation.getArgument(0));
             return null;
-        }).when(executor).submit(any(Runnable.class));
+        }).when(retries).submit(any(Runnable.class));
         manager = new Ec2ContainerManager(mock(ContainerBuilder.class), lifecycle,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), mock(DockerHostResolver.class),
                 docker, mock(PortAllocator.class), config, metadata, mock(Ec2PortForwardManager.class),
                 mock(RegionResolver.class), mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
-                mock(ContainerReachableEndpoint.class), executor, Duration.ofSeconds(1));
+                mock(ContainerReachableEndpoint.class), new Ec2InstanceTypeCatalog(),
+                executor, retries, Duration.ofSeconds(1));
     }
 
     @AfterEach

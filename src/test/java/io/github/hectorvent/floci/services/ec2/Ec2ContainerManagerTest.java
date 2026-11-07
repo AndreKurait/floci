@@ -2116,6 +2116,40 @@ class Ec2ContainerManagerTest {
         }
     }
 
+    @Test
+    void failedNativeLaunchAutomaticallyReclaimsItsResourcesWhenDockerRecovers() throws Exception {
+        LaunchHarness harness = launchHarness();
+        Instance instance = leasedInstance("i-native-cleanup-automatic");
+        stubPendingNativeCleanup(harness, instance);
+        AtomicBoolean dockerRecovered = new AtomicBoolean();
+        CountDownLatch reclaimed = new CountDownLatch(1);
+        doAnswer(ignored -> {
+            if (!dockerRecovered.get()) {
+                throw new IllegalStateException("Docker removal temporarily unavailable");
+            }
+            return null;
+        }).when(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
+        doAnswer(ignored -> {
+            reclaimed.countDown();
+            return null;
+        }).when(harness.metadataServer).unregisterContainer("172.18.0.12", instance);
+        try {
+            assertThrows(IllegalStateException.class, () -> harness.manager.cancelLaunch(instance));
+            verify(harness.lifecycleManager, never()).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+            verify(harness.portAllocator, never()).release(2201);
+            verify(harness.vpcNetworkManager, never()).releasePrivateIp(any(), any(), any());
+
+            dockerRecovered.set(true);
+            assertTrue(reclaimed.await(5, TimeUnit.SECONDS),
+                    "Cleanup must resume after Docker recovers without another cancel request");
+            verify(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+            verify(harness.portAllocator).release(2201);
+            verify(harness.vpcNetworkManager).releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
     private static final String TEST_INIT_HELPER_ID = "native-init-helper";
 
     @Test

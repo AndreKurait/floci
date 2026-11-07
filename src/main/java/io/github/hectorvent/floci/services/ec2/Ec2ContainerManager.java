@@ -1053,7 +1053,9 @@ public class Ec2ContainerManager {
                 }
                 String eniId = instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()
                         ? null : instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
-                cleanup = new FailedLaunchCleanup(instance.getDockerContainerId(), instance.getSshHostPort(),
+                String accountId = instance.getOwnerId() != null ? instance.getOwnerId() : regionResolver.getAccountId();
+                cleanup = new FailedLaunchCleanup(instance, accountId, new AtomicBoolean(),
+                        instance.getDockerContainerId(), instance.getSshHostPort(),
                         instance.getContainerBridgeIp(), eniId, instance.getRegion(), instance.getVpcId(),
                         instance.getSubnetId(), leasedPrivateIp);
                 failedLaunchCleanups.put(instance.getInstanceId(), cleanup);
@@ -1064,16 +1066,27 @@ public class Ec2ContainerManager {
                 serviceNetworkRetries.remove(instance.getInstanceId());
             }
         }
-        synchronized (cleanup) {
-            if (failedLaunchCleanups.get(instance.getInstanceId()) != cleanup) {
-                return;
-            }
-            finishFailedLaunch(instance, cleanup);
-            failedLaunchCleanups.remove(instance.getInstanceId(), cleanup);
+        try {
+            completeFailedLaunchCleanup(cleanup);
+        } catch (RuntimeException failure) {
+            startTerminationRetries();
+            throw failure;
         }
     }
 
-    private record FailedLaunchCleanup(String containerId, int sshHostPort, String containerIp,
+    private void completeFailedLaunchCleanup(FailedLaunchCleanup cleanup) {
+        synchronized (cleanup) {
+            String instanceId = cleanup.instance().getInstanceId();
+            if (failedLaunchCleanups.get(instanceId) != cleanup) {
+                return;
+            }
+            finishFailedLaunch(cleanup.instance(), cleanup);
+            failedLaunchCleanups.remove(instanceId, cleanup);
+        }
+    }
+
+    private record FailedLaunchCleanup(Instance instance, String accountId, AtomicBoolean retrying,
+                                       String containerId, int sshHostPort, String containerIp,
                                        String eniId, String region, String vpcId, String subnetId,
                                        String leasedPrivateIp) {
     }
@@ -1948,6 +1961,35 @@ public class Ec2ContainerManager {
         pendingTerminations.values().stream()
                 .filter(pending -> !now.isBefore(pending.retryAt))
                 .forEach(this::submitTermination);
+        failedLaunchCleanups.values().forEach(this::submitFailedLaunchCleanup);
+    }
+
+    private void startTerminationRetries() {
+        if (!executor.isShutdown() && terminationRetriesStarted.compareAndSet(false, true)) {
+            terminationRetries.start();
+        }
+    }
+
+    private void submitFailedLaunchCleanup(FailedLaunchCleanup cleanup) {
+        if (serviceNetworkRetryExecutor.isShutdown() || !cleanup.retrying().compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            serviceNetworkRetryExecutor.execute(() -> {
+                try {
+                    RequestScopes.runAs(cleanup.accountId(), cleanup.region(),
+                            () -> completeFailedLaunchCleanup(cleanup));
+                } catch (RuntimeException failure) {
+                    LOG.debugv(failure, "Failed EC2 launch {0} still needs cleanup", cleanup.instance().getInstanceId());
+                } finally {
+                    cleanup.retrying().set(false);
+                }
+            });
+        } catch (RuntimeException failure) {
+            cleanup.retrying().set(false);
+            LOG.debugv(failure, "Could not schedule failed EC2 launch cleanup for {0}",
+                    cleanup.instance().getInstanceId());
+        }
     }
 
     private void submitTermination(PendingTermination pending) {
@@ -1969,9 +2011,7 @@ public class Ec2ContainerManager {
                         } else {
                             pending.retryAt = Instant.now().plusSeconds(pending.retryDelaySeconds);
                             pending.retryDelaySeconds = Math.min(30, pending.retryDelaySeconds * 2);
-                            if (!executor.isShutdown() && terminationRetriesStarted.compareAndSet(false, true)) {
-                                terminationRetries.start();
-                            }
+                            startTerminationRetries();
                         }
                     } finally {
                         pending.executing.set(false);
