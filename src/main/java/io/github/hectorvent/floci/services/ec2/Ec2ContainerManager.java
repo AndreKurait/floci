@@ -195,7 +195,7 @@ public class Ec2ContainerManager {
     /** Instances whose service-network lookup failed and is retried on the next address read. */
     private final Set<String> serviceNetworkRetries = ConcurrentHashMap.newKeySet();
     private final Set<String> serviceNetworkRetriesRunning = ConcurrentHashMap.newKeySet();
-    /** Runs service-network lookup retries; see {@link #createServiceNetworkRetryExecutor}. */
+    /** Runs IO retries and lifecycle submissions that must not block a launch worker. */
     private final ExecutorService serviceNetworkRetryExecutor;
     private final Duration userDataExecutionTimeout;
     private final Set<ResultCallback<Frame>> activeUserDataCallbacks = ConcurrentHashMap.newKeySet();
@@ -1233,11 +1233,10 @@ public class Ec2ContainerManager {
 
     private CompletableFuture<Void> submitLifecycleOperation(String containerId, Runnable operation) {
         synchronized (lifecycleOperations) {
-            CompletableFuture<Void> previous = lifecycleOperations.getOrDefault(containerId,
-                    CompletableFuture.completedFuture(null));
+            CompletableFuture<Void> previous = lifecycleOperations.get(containerId);
             CompletableFuture<Void> completed = new CompletableFuture<>();
             lifecycleOperations.put(containerId, completed);
-            previous.whenComplete((ignored, priorFailure) -> {
+            Runnable submit = () -> {
                 try {
                     executor.submit(() -> {
                         try {
@@ -1248,13 +1247,30 @@ public class Ec2ContainerManager {
                         }
                     });
                 } catch (RuntimeException failure) {
-                    lifecycleOperations.remove(containerId, completed);
-                    completed.completeExceptionally(failure);
-                    LOG.warnv(failure, "Could not schedule lifecycle operation for EC2 container {0}", containerId);
+                    failLifecycleSubmission(containerId, completed, failure);
                 }
-            });
+            };
+            if (previous == null) {
+                submit.run();
+            } else {
+                previous.whenComplete((ignored, priorFailure) -> {
+                    try {
+                        // Completion runs on a launch worker; a full launch queue must not trap it.
+                        serviceNetworkRetryExecutor.execute(submit);
+                    } catch (RuntimeException failure) {
+                        failLifecycleSubmission(containerId, completed, failure);
+                    }
+                });
+            }
             return completed;
         }
+    }
+
+    private void failLifecycleSubmission(String containerId, CompletableFuture<Void> completed,
+                                         RuntimeException failure) {
+        lifecycleOperations.remove(containerId, completed);
+        completed.completeExceptionally(failure);
+        LOG.warnv(failure, "Could not schedule lifecycle operation for EC2 container {0}", containerId);
     }
 
     /**

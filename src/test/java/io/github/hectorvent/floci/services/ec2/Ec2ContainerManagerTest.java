@@ -528,7 +528,7 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void restartWaitsForPhysicalStopBeforeStartingTheContainer() {
+    void restartWaitsForPhysicalStopBeforeStartingTheContainer() throws InterruptedException {
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
         when(lifecycle.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
         DockerClient docker = mock(DockerClient.class);
@@ -540,7 +540,7 @@ class Ec2ContainerManagerTest {
         StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
         when(docker.stopContainerCmd(TEST_CONTAINER_ID)).thenReturn(stop);
         ExecutorService executor = mock(ExecutorService.class);
-        List<Runnable> tasks = new ArrayList<>();
+        List<Runnable> tasks = new CopyOnWriteArrayList<>();
         doAnswer(invocation -> {
             tasks.add(invocation.getArgument(0));
             return null;
@@ -569,17 +569,21 @@ class Ec2ContainerManagerTest {
             return null;
         }).when(start).exec();
 
-        manager.stop(instance);
-        manager.start(instance);
-        assertEquals(1, tasks.size(), "start must wait until the physical stop completes");
-        tasks.getFirst().run();
-        assertEquals(List.of("stop"), operations);
-        assertEquals(2, tasks.size());
-        tasks.get(1).run();
+        try {
+            manager.stop(instance);
+            manager.start(instance);
+            assertEquals(1, tasks.size(), "start must wait until the physical stop completes");
+            tasks.getFirst().run();
+            assertEquals(List.of("stop"), operations);
+            awaitUntil(() -> tasks.size() == 2, Duration.ofSeconds(2));
+            tasks.get(1).run();
 
-        assertEquals(List.of("stop", "start"), operations);
-        assertTrue(physicalRunning.get());
-        assertEquals("running", instance.getState().getName());
+            assertEquals(List.of("stop", "start"), operations);
+            assertTrue(physicalRunning.get());
+            assertEquals("running", instance.getState().getName());
+        } finally {
+            manager.stop();
+        }
     }
 
     @Test
