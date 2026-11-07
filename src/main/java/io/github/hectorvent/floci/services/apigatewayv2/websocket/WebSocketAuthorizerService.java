@@ -3,9 +3,13 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.services.apigateway.AuthorizerPolicyEvaluator;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -36,17 +40,23 @@ public class WebSocketAuthorizerService {
     private final ObjectMapper objectMapper;
     private final AuthorizerPolicyEvaluator authorizerPolicyEvaluator;
 
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
+    private final RegionResolver regionResolver;
+
     @Inject
     public WebSocketAuthorizerService(ApiGatewayV2Service apiGatewayV2Service,
                                       LambdaService lambdaService,
                                       WebSocketProxyEventBuilder proxyEventBuilder,
                                       ObjectMapper objectMapper,
-                                      AuthorizerPolicyEvaluator authorizerPolicyEvaluator) {
+                                      AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
+                                      ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver) {
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
         this.proxyEventBuilder = proxyEventBuilder;
         this.objectMapper = objectMapper;
         this.authorizerPolicyEvaluator = authorizerPolicyEvaluator;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
+        this.regionResolver = regionResolver;
     }
 
     /**
@@ -134,10 +144,22 @@ public class WebSocketAuthorizerService {
         // Invoke the authorizer Lambda
         InvokeResult invokeResult;
         try {
+            if (authorizer.getAuthorizerCredentialsArn() == null
+                    || authorizer.getAuthorizerCredentialsArn().isBlank()) {
+                String accountId = regionResolver.getAccountId();
+                String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                        region, accountId);
+                String sourceArn = AwsArnUtils.Arn.of("execute-api", region, accountId,
+                        apiId + "/authorizers/" + authorizerId).toString();
+                if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                        sourceArn, accountId) == Decision.DENY) {
+                    return AuthorizerResult.error();
+                }
+            }
             invokeResult = lambdaService.invokeTarget(region, functionName,
                     authorizerEventJson.getBytes(), InvocationType.RequestResponse);
         } catch (Exception e) {
-            LOG.warnv("Lambda authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
+            LOG.warnv(e, "Lambda authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
             return AuthorizerResult.error();
         }
 
@@ -185,7 +207,7 @@ public class WebSocketAuthorizerService {
 
             return AuthorizerResult.allow(context);
         } catch (Exception e) {
-            LOG.warnv("Failed to parse authorizer policy for API {0}: {1}", apiId, e.getMessage());
+            LOG.warnv(e, "Failed to parse authorizer policy for API {0}: {1}", apiId, e.getMessage());
             return AuthorizerResult.error();
         }
     }
