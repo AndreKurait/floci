@@ -759,7 +759,7 @@ class StsQueryHandlerTest {
         if (status == 400) {
             assertTrue(((String) response.getEntity()).contains("ValidationError"));
             verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                    any(), any(), anyString(), anyString(), anyString());
+                    any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class));
         }
     }
 
