@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
@@ -30,6 +31,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 /**
  * Manages a pool of warm Lambda containers per function.
@@ -60,7 +62,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
     private final long drainTimeoutNanos;
     private final ConcurrentHashMap<String, PoolState> poolStates = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<ContainerHandle, Lease> activeLeases = new ConcurrentHashMap<>();
-    private final Set<ContainerHandle> owned = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<ContainerHandle, String> owned = new ConcurrentHashMap<>();
     private final Set<ContainerHandle> pendingTeardown = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<ContainerHandle, CountDownLatch> stoppingHandles = new ConcurrentHashMap<>();
     private LifecycleState lifecycleState = new LifecycleState();
@@ -85,7 +87,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         private final Map<String, Long> epochByEnvironment = new HashMap<>();
     }
 
-    private record Lease(PoolState poolState, long epoch, String environmentKey) {
+    private record Lease(PoolState poolState, long epoch, String environmentKey, String functionScope) {
     }
 
     private record IdleEntry(PoolState poolState, String environmentKey,
@@ -191,9 +193,9 @@ public class WarmPool implements ContainerTeardown, Resettable {
             for (String functionName : new ArrayList<>(poolStates.keySet())) {
                 detachFunction(functionName);
             }
-            knownHandles = new ArrayList<>(owned);
+            knownHandles = new ArrayList<>(owned.keySet());
             pendingTeardown.addAll(knownHandles);
-            pendingTeardown.removeIf(handle -> !owned.contains(handle));
+            pendingTeardown.removeIf(handle -> !owned.containsKey(handle));
         }
         List<Runnable> drains = new ArrayList<>();
         if (provisioned != null) {
@@ -243,6 +245,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         PoolState poolState = null;
         long leaseEpoch = 0;
         String environmentKey = executionEnvironmentKey(fn);
+        String functionScope = ephemeral ? null : functionScope(fn);
 
         if (!ephemeral) {
             synchronized (capLock) {
@@ -293,7 +296,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
                 LOG.debugv(ephemeral ? "Ephemeral start for function: {0}" : "Cold start for function: {0}",
                         fn.getFunctionName());
                 handle = lambdaRuntimeLauncher.launch(fn);
-                owned.add(handle);
+                owned.put(handle, environmentKey);
             } else {
                 LOG.debugv("Reusing warm container for function: {0}", fn.getFunctionName());
             }
@@ -301,7 +304,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             synchronized (capLock) {
                 rejected = admission.stopped || admission != lifecycleState;
                 if (!rejected && !ephemeral) {
-                    activeLeases.put(handle, new Lease(poolState, leaseEpoch, environmentKey));
+                    activeLeases.put(handle, new Lease(poolState, leaseEpoch, environmentKey, functionScope));
                 }
                 if (!rejected) {
                     handle.setState(ContainerState.BUSY);
@@ -312,7 +315,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
                 long cleanupDeadline = admission.deadlineNanos > now
                         ? admission.deadlineNanos : now + drainTimeoutNanos;
                 stopInParallel(List.of(handle), cleanupDeadline);
-                if (owned.contains(handle)) {
+                if (owned.containsKey(handle)) {
                     LOG.warnv("Lambda acquisition crossed shutdown; container {0} remains owned for cleanup",
                             handle.getContainerId());
                 }
@@ -345,7 +348,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             return;
         }
         Lease lease = activeLeases.remove(handle);
-        if (!owned.contains(handle)) {
+        if (!owned.containsKey(handle)) {
             return;
         }
         boolean ephemeral = config != null && config.services().lambda().ephemeral();
@@ -380,7 +383,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             synchronized (lease.poolState()) {
                 stale = lifecycleState.stopped || lease.epoch() != lease.poolState().epochByEnvironment
                         .getOrDefault(lease.environmentKey(), 0L);
-                returned = !stale && idleSize(lease.poolState()) < maxPoolSizePerFunction;
+                returned = !stale && idleSize(lease.poolState(), lease.functionScope()) < maxPoolSizePerFunction;
                 if (returned) {
                     if (maxIdleTotal > 0) {
                         evicted = evictIdleBeyond(maxIdleTotal - 1);
@@ -525,14 +528,37 @@ public class WarmPool implements ContainerTeardown, Resettable {
         stopInParallel(toStop);
     }
 
-    /**
-     * Stops and removes all warm containers for every environment of the given function.
-     * Called on function deletion and emulator shutdown.
-     */
+    /** Drains every account/region with this name; deletion uses the owner-scoped overload. */
     public void drainFunction(String functionName) {
-        List<ContainerHandle> handles = detachFunction(functionName);
+        drainFunction(functionName, ignored -> true);
+    }
+
+    /** Drains only the named account/region's environments, across all its versions. */
+    public void drainFunction(LambdaFunction fn) {
+        String scope = functionScope(fn);
+        drainFunction(fn.getFunctionName(), key -> matchesFunctionScope(key, scope));
+    }
+
+    private static String functionScope(LambdaFunction fn) {
+        String arn = fn.getFunctionArn();
+        if (arn != null && !arn.isBlank()) {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            return new AwsArnUtils.Arn(parsed.partition(), "lambda", parsed.region(), parsed.accountId(),
+                    "function:" + fn.getFunctionName()).toString();
+        }
+        return fn.getFunctionName();
+    }
+
+    private static boolean matchesFunctionScope(String environmentKey, String scope) {
+        return environmentKey.equals(scope) || environmentKey.startsWith(scope + ":");
+    }
+
+    private void drainFunction(String functionName, Predicate<String> matches) {
+        List<ContainerHandle> handles = detachFunction(functionName, matches);
         for (ContainerHandle handle : pendingTeardown) {
-            if (owned.contains(handle) && handle.getFunctionName().equals(functionName) && !handles.contains(handle)) {
+            String environmentKey = owned.get(handle);
+            if (environmentKey != null && handle.getFunctionName().equals(functionName)
+                    && matches.test(environmentKey) && !handles.contains(handle)) {
                 handles.add(handle);
             }
         }
@@ -546,13 +572,20 @@ public class WarmPool implements ContainerTeardown, Resettable {
     }
 
     private List<ContainerHandle> detachFunction(String functionName) {
+        return detachFunction(functionName, ignored -> true);
+    }
+
+    private List<ContainerHandle> detachFunction(String functionName, Predicate<String> matches) {
         PoolState poolState = poolStates.computeIfAbsent(functionName, ignored -> new PoolState());
         List<ContainerHandle> toStop;
         synchronized (poolState) {
-            poolState.epochByEnvironment.replaceAll((ignored, epoch) -> epoch + 1);
+            poolState.epochByEnvironment.replaceAll((key, epoch) -> matches.test(key) ? epoch + 1 : epoch);
             toStop = new ArrayList<>();
-            poolState.idleByEnvironment.values().forEach(toStop::addAll);
-            poolState.idleByEnvironment.clear();
+            for (String key : new ArrayList<>(poolState.idleByEnvironment.keySet())) {
+                if (matches.test(key)) {
+                    toStop.addAll(poolState.idleByEnvironment.remove(key));
+                }
+            }
         }
         LOG.infov("Draining {0} container(s) for function: {1}", toStop.size(), functionName);
         return toStop;
@@ -569,9 +602,9 @@ public class WarmPool implements ContainerTeardown, Resettable {
 
     private void stopInParallel(List<ContainerHandle> handles, long deadline) {
         for (ContainerHandle handle : handles) {
-            if (owned.contains(handle)) {
+            if (owned.containsKey(handle)) {
                 pendingTeardown.add(handle);
-                if (!owned.contains(handle)) {
+                if (!owned.containsKey(handle)) {
                     pendingTeardown.remove(handle);
                 }
             }
@@ -660,10 +693,12 @@ public class WarmPool implements ContainerTeardown, Resettable {
         return fn.getFunctionName() + ":" + fn.getVersion();
     }
 
-    private static int idleSize(PoolState poolState) {
+    private static int idleSize(PoolState poolState, String scope) {
         int size = 0;
-        for (ArrayDeque<ContainerHandle> idle : poolState.idleByEnvironment.values()) {
-            size += idle.size();
+        for (Map.Entry<String, ArrayDeque<ContainerHandle>> idle : poolState.idleByEnvironment.entrySet()) {
+            if (matchesFunctionScope(idle.getKey(), scope)) {
+                size += idle.getValue().size();
+            }
         }
         return size;
     }
@@ -695,7 +730,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             return;
         }
         try {
-            if (!owned.contains(handle)) {
+            if (!owned.containsKey(handle)) {
                 return;
             }
             pendingTeardown.add(handle);
