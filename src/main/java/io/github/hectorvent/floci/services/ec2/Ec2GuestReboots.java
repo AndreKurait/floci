@@ -69,6 +69,12 @@ final class Ec2GuestReboots implements AutoCloseable {
         guests.keySet().forEach(this::isRebooting);
     }
 
+    /** A live bootstrap shell is not a healthy instance after native recovery has failed. */
+    boolean recoveryFailed(String container) {
+        Guest guest = guests.get(container);
+        return guest != null && wanted(container, guest) && guest.phase.get() == Phase.FAILED;
+    }
+
     /** Normal reboot must not make Auto Scaling replace the instance while its init restarts. */
     boolean isRebooting(String container) {
         Guest guest = guests.get(container);
@@ -152,7 +158,7 @@ final class Ec2GuestReboots implements AutoCloseable {
                     || "pending".equals(guest.instance.getState().getName()));
     }
 
-    private static boolean requestedReboot(InspectContainerResponse current) {
+    static boolean requestedReboot(InspectContainerResponse current) {
         return current.getState() != null && !Boolean.TRUE.equals(current.getState().getRunning())
                 && "exited".equals(current.getState().getStatus())
                 && Long.valueOf(REBOOT_EXIT_CODE).equals(current.getState().getExitCodeLong());

@@ -19,9 +19,11 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiPredicate;
 
@@ -49,6 +51,7 @@ final class Ec2SystemdV1Runtime {
     private final ContainerLifecycleManager lifecycle;
     private final EmulatorConfig config;
     private final Map<String, String> helpers = new HashMap<>();
+    private final Set<String> retiredHelpers = new HashSet<>();
 
     Ec2SystemdV1Runtime(DockerClient docker, ContainerBuilder builder,
                        ContainerLifecycleManager lifecycle, EmulatorConfig config) {
@@ -189,6 +192,10 @@ final class Ec2SystemdV1Runtime {
         try {
             helper = docker.inspectContainerCmd(reference).exec();
         } catch (NotFoundException expected) {
+            if (retiredHelpers.remove(reference)) {
+                helpers.remove(instance.getInstanceId());
+                return;
+            }
             throw new IllegalStateException("EC2 init helper disappeared before its service hierarchy was retired",
                     expected);
         }
@@ -221,6 +228,7 @@ final class Ec2SystemdV1Runtime {
 
     private void remove(InspectContainerResponse helper, String instance, String region, String account) {
         String scope = requireHelper(helper, instance, region, account);
+        helpers.put(instance, helper.getId());
         if (!Boolean.TRUE.equals(helper.getState().getRunning())) {
             docker.startContainerCmd(helper.getId()).exec();
         }
@@ -253,7 +261,11 @@ final class Ec2SystemdV1Runtime {
                     done
                 fi
                 """, "retire-init", MOUNT, scope);
+        // Keep retirement proof if Docker deletes the helper but its response is lost.
+        retiredHelpers.add(helper.getId());
         lifecycle.removeIfExistsStrict(helper.getId());
+        retiredHelpers.remove(helper.getId());
+        helpers.remove(instance, helper.getId());
     }
 
     String requireHelper(InspectContainerResponse helper, String instance, String region, String account) {
@@ -276,6 +288,7 @@ final class Ec2SystemdV1Runtime {
     }
 
     private void ensureMounted(InspectContainerResponse helper, String scope) {
+        retiredHelpers.remove(helper.getId());
         if (!Boolean.TRUE.equals(helper.getState().getRunning())) {
             docker.startContainerCmd(helper.getId()).exec();
         }

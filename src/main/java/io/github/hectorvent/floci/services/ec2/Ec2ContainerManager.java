@@ -1437,6 +1437,7 @@ public class Ec2ContainerManager {
 
     boolean isContainerRunning(String containerId) {
         return containerId != null && !containerId.isBlank()
+                && !guestReboots.recoveryFailed(containerId)
                 && (lifecycleManager.isContainerRunning(containerId) || guestReboots.isRebooting(containerId));
     }
 
@@ -1525,7 +1526,21 @@ public class Ec2ContainerManager {
         }
         String containerId = instance.getDockerContainerId();
         if (!lifecycleManager.isContainerRunning(containerId)) {
-            return false;
+            String state = instance.getState() == null ? "" : instance.getState().getName();
+            if (!("pending".equals(state) || "running".equals(state))) {
+                return false;
+            }
+            try {
+                InspectContainerResponse guest = dockerClient.inspectContainerCmd(containerId).exec();
+                if (!Ec2GuestReboots.requestedReboot(guest) || !systemdV1.rememberGuest(instance, guest)) {
+                    return false;
+                }
+                guestReboots.watch(instance);
+            } catch (DockerException failure) {
+                LOG.warnv(failure, "Could not restore native reboot observation for EC2 instance {0}",
+                        instance.getInstanceId());
+                return false;
+            }
         }
 
         ProtectedNamespace namespace;
