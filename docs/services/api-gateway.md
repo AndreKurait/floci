@@ -1320,3 +1320,12 @@ previous stack tags. Policy-retained resources and resources explicitly retained
 without scanning other APIs or guessing from live exports, dynamic references or
 current SSM values. Stored-record reload support does not establish process-crash
 atomicity.
+
+CloudFormation replaces an `AWS::ApiGatewayV2::Api` when `ProtocolType` changes.
+Referenced children move to the new API through their recorded parent identities.
+The old API remains available until the update commits, and
+`UpdateReplacePolicy: Retain` preserves it. Rollback restores the old API identity
+and Body ownership metadata, deleting the replacement through the shared retryable
+cleanup lifecycle. Ordinary API name updates remain in place. These lifecycle
+checks use local SDK and service tests; they do not establish deployment activation
+or live AWS parity.
