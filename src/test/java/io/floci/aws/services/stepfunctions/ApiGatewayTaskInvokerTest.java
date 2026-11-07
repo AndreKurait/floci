@@ -76,7 +76,7 @@ class ApiGatewayTaskInvokerTest {
     private ObjectNode request;
     private IamRole role;
     private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-    private final Instance<ScpProvider> scps = mock(Instance.class);
+
     private final AtomicReference<List<String>> receivedHeaders = new AtomicReference<>();
     private final AtomicReference<String> observedHeader = new AtomicReference<>("x_test");
 
@@ -86,7 +86,7 @@ class ApiGatewayTaskInvokerTest {
         AssumeRolePolicyEvaluator trust = new AssumeRolePolicyEvaluator(mapper, policies);
         Instance<ResourcePolicyProvider> resourcePolicies = mock(Instance.class);
         when(resourcePolicies.isUnsatisfied()).thenReturn(true);
-        LambdaTaskAuthorizer authorizer = new LambdaTaskAuthorizer(iam, policies, trust, resourcePolicies, scps);
+        LambdaTaskAuthorizer authorizer = new LambdaTaskAuthorizer(iam, policies, trust, resourcePolicies);
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
         invoker = new ApiGatewayTaskInvoker(api, iam, trust, authorizer, config, mapper, listener);
         machine = new StateMachine();
@@ -333,8 +333,7 @@ class ApiGatewayTaskInvokerTest {
     @Test
     void scpDenialPreventsIssuingCredentials() {
         ScpProvider provider = mock(ScpProvider.class);
-        when(scps.isResolvable()).thenReturn(true);
-        when(scps.get()).thenReturn(provider);
+        when(iam.effectiveScpLevels(anyString())).thenAnswer(inv -> provider.effectiveScpLevels(inv.getArgument(0)));
         when(provider.effectiveScpLevels(ACCOUNT)).thenReturn(List.of(List.of(
                 "{\"Statement\":[{\"Effect\":\"Deny\",\"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}]}")));
         denied("ApiGateway.403");

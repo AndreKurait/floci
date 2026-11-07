@@ -7,7 +7,7 @@ import java.util.List;
  * documents per organization level (root, each OU on the path, then the account).
  *
  * <p>Implemented by the Organizations service; consumed lazily by
- * {@code IamEnforcementFilter} via {@code Instance<ScpProvider>} so IAM never depends on
+ * {@code IamService} via {@code Instance<ScpProvider>} so IAM never depends on
  * Organizations directly (Organizations already depends on IAM for role provisioning).</p>
  */
 public interface ScpProvider {

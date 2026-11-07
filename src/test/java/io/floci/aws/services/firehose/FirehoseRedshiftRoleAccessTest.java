@@ -7,14 +7,12 @@ import io.floci.aws.services.firehose.model.RedshiftDestination;
 import io.floci.aws.services.iam.AssumeRolePolicyEvaluator;
 import io.floci.aws.services.iam.IamPolicyEvaluator;
 import io.floci.aws.services.iam.IamService;
-import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.ServiceRoleAuthorizer;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.redshift.RedshiftService;
 import io.floci.aws.services.redshiftserverless.RedshiftServerlessService;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
-import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -64,10 +62,9 @@ class FirehoseRedshiftRoleAccessTest {
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
         iamService = mock(IamService.class);
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(new ObjectMapper());
-        Instance<ScpProvider> scpProvider = mock(Instance.class);
-        when(scpProvider.isResolvable()).thenReturn(false);
+
         ServiceRoleAuthorizer authorizer = new ServiceRoleAuthorizer(config, iamService, evaluator,
-                new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator), scpProvider);
+                new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator));
         delivery = new FirehoseRedshiftDelivery(mock(RedshiftService.class), mock(RedshiftServerlessService.class),
                 mock(SecretsManagerService.class), authorizer, iamService, new ObjectMapper(),
                 (url, user, password, sql) -> { });

@@ -6,7 +6,6 @@ import io.floci.aws.services.iam.IamPolicyEvaluator;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.IamService.CallerArns;
 import io.floci.aws.services.iam.IamService.OwnedSecretKey;
-import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.lambdaweb.LambdaWebIamAuth.Inbound;
 import io.floci.aws.services.lambdaweb.LambdaWebService.WebFunctionTarget;
@@ -14,7 +13,6 @@ import io.floci.aws.services.lambdaweb.model.WebFunction;
 import io.floci.aws.services.lambdaweb.model.WebFunctionEndpoint;
 import io.netty.handler.codec.http.QueryStringDecoder;
 import io.vertx.core.MultiMap;
-import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -54,9 +52,9 @@ class LambdaWebIamAuthTest {
     private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
     private final IamService iamService = mock(IamService.class);
     @SuppressWarnings("unchecked")
-    private final Instance<ScpProvider> scpProvider = mock(Instance.class);
+
     private final LambdaWebIamAuth iamAuth = new LambdaWebIamAuth(config, iamService,
-            new IamPolicyEvaluator(new ObjectMapper()), scpProvider);
+            new IamPolicyEvaluator(new ObjectMapper()));
     private final WebFunction function = new WebFunction();
     private final WebFunctionEndpoint endpoint = new WebFunctionEndpoint();
 
@@ -308,8 +306,7 @@ class LambdaWebIamAuthTest {
         Map<String, String> forged = new HashMap<>(iamAuth.cloudFrontSignature(DISTRIBUTION_ARN));
         forged.put("lambda-web-cloudfront-key", "0".repeat(64));
         assertFalse(allowsCloudFront(forged));
-        LambdaWebIamAuth another = new LambdaWebIamAuth(config, iamService, new IamPolicyEvaluator(new ObjectMapper()),
-                scpProvider);
+        LambdaWebIamAuth another = new LambdaWebIamAuth(config, iamService, new IamPolicyEvaluator(new ObjectMapper()));
         assertFalse(allowsCloudFront(another.cloudFrontSignature(DISTRIBUTION_ARN)));
         assertFalse(allowsCloudFront(iamAuth.cloudFrontSignature("E2EXAMPLE")));
     }

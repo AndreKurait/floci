@@ -21,13 +21,11 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.IamService.CallerArns;
 import io.floci.aws.services.iam.IamService.OwnedSecretKey;
 import io.floci.aws.services.iam.RequestPrincipal;
-import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.lambdaweb.LambdaWebService.WebFunctionTarget;
 import io.vertx.core.MultiMap;
 import io.vertx.core.http.HttpServerRequest;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -70,16 +68,13 @@ public class LambdaWebIamAuth {
     private final EmulatorConfig config;
     private final IamService iamService;
     private final IamPolicyEvaluator evaluator;
-    private final Instance<ScpProvider> scpProvider;
     private final String cloudFrontKey;
 
     @Inject
-    public LambdaWebIamAuth(EmulatorConfig config, IamService iamService, IamPolicyEvaluator evaluator,
-                            Instance<ScpProvider> scpProvider) {
+    public LambdaWebIamAuth(EmulatorConfig config, IamService iamService, IamPolicyEvaluator evaluator) {
         this.config = config;
         this.iamService = iamService;
         this.evaluator = evaluator;
-        this.scpProvider = scpProvider;
         byte[] key = new byte[32];
         new SecureRandom().nextBytes(key);
         this.cloudFrontKey = HexFormat.of().formatHex(key);
@@ -312,8 +307,7 @@ public class LambdaWebIamAuth {
             // A known credential with no policies to evaluate, as the enforcement filter treats it.
             return true;
         }
-        List<List<String>> scpLevels = scpProvider.isResolvable()
-                ? scpProvider.get().effectiveScpLevels(callerAccount) : null;
+        List<List<String>> scpLevels = iamService.effectiveScpLevels(callerAccount);
         if (scpLevels != null) {
             caller = caller.withScpLevels(scpLevels);
         }

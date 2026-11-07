@@ -5,7 +5,6 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.iam.ServiceRoleAuthorizer.Permission;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
-import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -48,12 +47,11 @@ class ServiceRoleAuthorizerTest {
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
         iamService = mock(IamService.class);
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(new ObjectMapper());
-        Instance<ScpProvider> scpProvider = mock(Instance.class);
+
         scps = mock(ScpProvider.class);
-        when(scpProvider.isResolvable()).thenReturn(true);
-        when(scpProvider.get()).thenReturn(scps);
+        when(iamService.effectiveScpLevels(anyString())).thenAnswer(inv -> scps.effectiveScpLevels(inv.getArgument(0)));
         authorizer = new ServiceRoleAuthorizer(config, iamService, evaluator,
-                new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator), scpProvider);
+                new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator));
     }
 
     private void role(String trust, String... policies) {
