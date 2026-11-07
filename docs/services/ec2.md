@@ -1375,7 +1375,15 @@ Validation matches AWS behavior:
 
 | Action | Description |
 |--------|-------------|
-| DescribeSnapshots | Lists or returns stored snapshots, filterable by id and owner. |
+| CreateSnapshot | Creates a regional snapshot of an available or in-use volume's metadata, with independently stored snapshot tags. |
+| DescribeSnapshots | Lists or returns stored snapshots, filterable by id, owner, tag key and tag value. |
+| DeleteSnapshot | Deletes an owned regional snapshot and its tags. A snapshot used as the root device of a registered AMI must first be released by deregistering every referencing AMI. |
+
+Creation records the source volume's size, encryption flag and ID, and returns a completed
+snapshot. It does not copy disk blocks or inherit volume tags. Deleting the source volume
+does not delete its snapshots, and deleting a snapshot does not delete the source volume.
+Both mutating operations validate `DryRun` without changing resources. Snapshot creation
+supports regional placement; Outposts and local placement are rejected.
 
 ### Flow Logs
 
