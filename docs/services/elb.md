@@ -293,6 +293,39 @@ Load-balancer security-group IDs are stored and returned by `CreateLoadBalancer`
 not evaluate security-group ingress or egress rules, target security-group references,
 network ACLs, or VPC/subnet routing. An `internal` scheme does not create a private
 network boundary on the host. These declarations do not isolate reachable targets.
+The ALB backend path above is the exception for application load balancers.
+
+Network load balancers keep their existing transport: Floci dials NLB targets and sends
+their health checks from its own container address. With
+`FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, a target ingress rule that
+references a security group of a network load balancer in the target's VPC also accepts
+Floci's address on the Docker network it shares with the target (the target's VPC network
+where Floci joined it, otherwise Floci's main network), on that rule's protocol and ports.
+On AWS the NLB's nodes are in that group. A target that admits neither the group nor a CIDR
+containing that address still refuses the traffic, and its health check reports
+`Target.Timeout`. With isolated VPC address spaces, Floci dials a protected NLB target of the
+target group's VPC at its address on Floci's main network, because its private address lives
+only inside its namespace. NLB traffic never reaches a protected endpoint of another VPC or
+account, any protected endpoint from a target group without a VPC, or a host name registered
+as an ip target, and never a protected target whose ingress does not admit the traffic's port
+from that load balancer's own groups (or from Floci's address by CIDR), so a second NLB in the
+VPC does not reach a target that admits only the first: the health check fails and the
+connection is closed. This is decided by the
+listener or load balancer the traffic is for, so a target group shared with an ALB keeps
+these checks for the NLB's traffic. Application load balancer traffic gets none of this. Creating or deleting a network load balancer,
+`SetSecurityGroups` and `SetSubnets` update the targets' rules.
+
+Limits of the NLB rule:
+
+- Every network load balancer shares Floci's address on a network. Such a rule therefore
+  also admits other traffic Floci sends to that port from that address, from any account,
+  including Floci's own HTTP integrations (SNS, EventBridge API destinations, API Gateway)
+  and an ALB that has no managed VPC interfaces (native VPC networking off).
+- With isolated address spaces, a rule that admits only the VPC CIDR still refuses the
+  traffic, and so does an NLB without security groups.
+- The NLB's own ingress and egress rules are not applied.
+- Floci running outside a container admits nothing this way: it reaches containers from a
+  Docker gateway that every host process shares.
 
 `EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic` is not handled by
 `SetSecurityGroups`, is not returned as an enforcement setting, and does not filter
