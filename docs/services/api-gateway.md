@@ -344,9 +344,15 @@ handling; a hand-rolled signer must include it.
 > the full check.
 
 > [!NOTE]
-> HTTP and WebSocket IAM routes authenticate signatures without evaluating caller or resource
-> policies. `principalOrgId` and `cognitoIdentity` are always null; identity-pool federation is
-> not modeled.
+> With IAM enforcement enabled, HTTP API `AWS_IAM` routes require `execute-api:Invoke`
+> for the API owner's ARN and the requested stage, HTTP method and path. The `$default`
+> route uses the stage's `/$default` resource instead of a method and path. Identity policies,
+> session policies, permissions boundaries and SCPs are evaluated before dispatch, including
+> for HTTP proxy integrations. HTTP APIs do not support resource policies. IAM-off behavior
+> remains signature-only. The verified local `test` credential retains account-root access,
+> subject to SCPs. WebSocket route policy evaluation remains unimplemented.
+> `principalOrgId` and `cognitoIdentity` are always null; Organizations membership and
+> identity-pool federation are not modelled in those event fields.
 
 With IAM enforcement enabled, REST `AWS_IAM` methods also require `execute-api:Invoke` on the
 API owner, region, stage, concrete HTTP method and requested path. The shared IAM evaluator
