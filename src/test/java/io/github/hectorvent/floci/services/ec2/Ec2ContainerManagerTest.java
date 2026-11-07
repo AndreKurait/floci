@@ -3977,7 +3977,8 @@ class Ec2ContainerManagerTest {
             "systemd,/run/custom", "systemd,/run/lockfile", "systemd,/sys/fs/cgroup-extra",
             "minimal,/run/floci-init-ready", "minimal,/run/floci-init-binary-ready",
             "image,/run/floci-init-ready", "image,/run/floci-init-binary-ready",
-            "systemd,/run/floci-init-ready", "systemd,/run/floci-init-binary-ready"
+            "systemd,/run/floci-init-ready", "systemd,/run/floci-init-binary-ready",
+            "minimal,/run/floci-time-ready", "image,/run/floci-time-ready", "systemd,/run/floci-time-ready"
     })
     void otherRuntimeMountTargetsRemainAvailable(String runtime, String target) throws Exception {
         ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
@@ -3994,7 +3995,7 @@ class Ec2ContainerManagerTest {
     @ParameterizedTest
     @ValueSource(strings = {
             "/run", "/run/lock", "/sys/fs/cgroup", "/sys/hypervisor",
-            "/run/floci-init-ready", "/run/floci-init-binary-ready"
+            "/run/floci-init-ready", "/run/floci-init-binary-ready", "/run/floci-time-ready"
     })
     void nativeRuntimeMountsRefuseBeforeAllocatingGuestResources(String target) throws Exception {
         assertNull(launchConfiguredGuest(new ResolvedAmiImage(
