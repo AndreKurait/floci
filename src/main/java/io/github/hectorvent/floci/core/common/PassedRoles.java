@@ -226,8 +226,8 @@ final class PassedRoles {
     /** What a request names that holds the roles it passes, looked up in the request's account and Region. */
     interface Lookups {
 
-        /** Integration roles assigned by a REST API import in the request account and region. */
-        default List<String> importedRestApiIntegrationRoles(String document) {
+        /** Integration and authorizer roles assigned by a REST API import in the request account and region. */
+        default List<String> importedRestApiRoles(String document) {
             return List.of();
         }
 
@@ -558,7 +558,7 @@ final class PassedRoles {
         boolean replaceRequest = "apigateway:PUT".equals(action) && REST_API.matcher(path).matches();
         if (importRequest || replaceRequest) {
             byte[] body = IamConditionContextResolver.bufferEntity(ctx);
-            return body == null ? List.of() : passed(lookups.importedRestApiIntegrationRoles(
+            return body == null ? List.of() : passed(lookups.importedRestApiRoles(
                     new String(body, StandardCharsets.UTF_8)), API_GATEWAY);
         }
         return switch (action) {
