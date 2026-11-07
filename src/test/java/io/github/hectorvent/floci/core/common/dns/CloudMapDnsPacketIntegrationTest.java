@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common.dns;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudmap.CloudMapDnsRecordSource;
 import io.github.hectorvent.floci.services.cloudmap.CloudMapService;
 import io.github.hectorvent.floci.services.cloudmap.model.Service;
@@ -14,6 +15,8 @@ import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.datagram.DatagramSocketOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -21,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -49,6 +53,9 @@ class CloudMapDnsPacketIntegrationTest {
     @Inject
     Vertx vertx;
 
+    @Inject
+    EmulatorConfig config;
+
     @Test
     void configuredTtlReachesTheDnsPacket() throws Exception {
         String namespace = uniqueNamespace();
@@ -59,7 +66,7 @@ class CloudMapDnsPacketIntegrationTest {
                 Map.of("AWS_INSTANCE_IPV4", "172.31.0.6"), REGION);
 
         byte[] request = buildQuery("api." + namespace, (short) 1);
-        byte[] response = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)), request);
+        byte[] response = query(serverForVpc(List.of(cloudMapDnsRecordSource)), request);
         ByteBuffer packet = ByteBuffer.wrap(response);
 
         assertEquals(0, packet.getShort(2) & 0x000F);
@@ -74,10 +81,14 @@ class CloudMapDnsPacketIntegrationTest {
      * has no record for, or NOERROR/NODATA for a name holding only another type (the TXT below).
      * With that source consulted first, Cloud Map's A record must still win.
      */
-    @Test
-    void cloudMapInstanceResolvesWhenTheRoute53ZoneSourceIsConsultedFirst() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void cloudMapInstanceResolvesWhenTheRoute53ZoneSourceIsConsultedFirst(boolean publicNamespace) throws Exception {
         String namespace = uniqueNamespace();
-        String namespaceId = privateDnsNamespace(namespace);
+        String namespaceId = publicNamespace
+                ? cloudMapService.createPublicDnsNamespace(namespace, null, null, Map.of(), REGION)
+                        .getTargets().get("NAMESPACE")
+                : privateDnsNamespace(namespace);
         Service service = cloudMapService.createService("both", namespaceId, null, null,
                 "{\"DnsRecords\":[{\"Type\":\"A\",\"TTL\":15}]}", null, null, null, Map.of(), REGION);
         cloudMapService.registerInstance(service.getId(), "task-1", null,
@@ -106,7 +117,7 @@ class CloudMapDnsPacketIntegrationTest {
                 List.of(route53DnsRecordSource, cloudMapDnsRecordSource),
                 List.of(cloudMapDnsRecordSource, route53DnsRecordSource))) {
             byte[] request = buildQuery("both." + namespace, (short) 1);
-            byte[] response = query(new EmbeddedDnsServer(List.of(), sources), request);
+            byte[] response = query(serverForVpc(sources), request);
             ByteBuffer packet = ByteBuffer.wrap(response);
 
             assertEquals(0, packet.getShort(2) & 0x000F);
@@ -115,14 +126,13 @@ class CloudMapDnsPacketIntegrationTest {
                     Arrays.copyOfRange(response, request.length + 12, request.length + 16));
 
             // A name only Route 53 holds (as TXT) is NODATA for A, not Cloud Map's NXDOMAIN.
-            ByteBuffer txtOnly = ByteBuffer.wrap(query(new EmbeddedDnsServer(List.of(), sources),
+            ByteBuffer txtOnly = ByteBuffer.wrap(query(serverForVpc(sources),
                     buildQuery("txtonly." + namespace, (short) 1)));
             assertEquals(0, txtOnly.getShort(2) & 0x000F);
             assertEquals(0, txtOnly.getShort(6));
         }
         // A name neither source has is still NXDOMAIN.
-        byte[] missing = query(new EmbeddedDnsServer(List.of(),
-                List.of(route53DnsRecordSource, cloudMapDnsRecordSource)),
+        byte[] missing = query(serverForVpc(List.of(route53DnsRecordSource, cloudMapDnsRecordSource)),
                 buildQuery("nothere." + namespace, (short) 1));
         assertEquals(3, ByteBuffer.wrap(missing).getShort(2) & 0x000F);
     }
@@ -136,7 +146,7 @@ class CloudMapDnsPacketIntegrationTest {
         cloudMapService.registerInstance(service.getId(), "task-1", null,
                 Map.of("AWS_INSTANCE_IPV4", "172.31.0.6", "AWS_INSTANCE_PORT", "8080"), REGION);
 
-        byte[] response = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)),
+        byte[] response = query(serverForVpc(List.of(cloudMapDnsRecordSource)),
                 buildQuery("srvonly." + namespace, (short) 1));
         ByteBuffer packet = ByteBuffer.wrap(response);
 
@@ -155,7 +165,7 @@ class CloudMapDnsPacketIntegrationTest {
                 Map.of("AWS_INSTANCE_IPV4", "172.31.0.6", "AWS_INSTANCE_PORT", "8080"), REGION);
 
         byte[] request = buildQuery("task-1.backend." + namespace, (short) 1);
-        byte[] response = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)), request);
+        byte[] response = query(serverForVpc(List.of(cloudMapDnsRecordSource)), request);
         ByteBuffer packet = ByteBuffer.wrap(response);
 
         assertEquals(0, packet.getShort(2) & 0x000F);
@@ -170,7 +180,7 @@ class CloudMapDnsPacketIntegrationTest {
         String namespace = uniqueNamespace();
         privateDnsNamespace(namespace);
 
-        byte[] response = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)),
+        byte[] response = query(serverForVpc(List.of(cloudMapDnsRecordSource)),
                 buildQuery("missing." + namespace, (short) 1));
 
         assertEquals(3, ByteBuffer.wrap(response).getShort(2) & 0x000F);
@@ -188,7 +198,7 @@ class CloudMapDnsPacketIntegrationTest {
         cloudMapService.registerInstance(service.getId(), "task-1", null,
                 Map.of("AWS_INSTANCE_IPV6", "2001:db8::1"), REGION);
         byte[] request = buildQuery("typed." + namespace, (short) 28);
-        byte[] response = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)), request);
+        byte[] response = query(serverForVpc(List.of(cloudMapDnsRecordSource)), request);
         ByteBuffer packet = ByteBuffer.wrap(response);
         assertEquals(1, packet.getShort(6));
         assertEquals(28, packet.getShort(request.length + 2));
@@ -207,7 +217,7 @@ class CloudMapDnsPacketIntegrationTest {
                 Map.of("AWS_INSTANCE_CNAME", "backend.example.com"), REGION);
         for (short type : new short[]{1, 5, 28}) {
             byte[] request = buildQuery("typed." + namespace, type);
-            byte[] response = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)), request);
+            byte[] response = query(serverForVpc(List.of(cloudMapDnsRecordSource)), request);
             ByteBuffer packet = ByteBuffer.wrap(response);
             assertEquals(1, packet.getShort(6));
             assertEquals(5, packet.getShort(request.length + 2));
@@ -224,7 +234,7 @@ class CloudMapDnsPacketIntegrationTest {
         cloudMapService.registerInstance(service.getId(), "task-1", null,
                 Map.of("AWS_INSTANCE_IPV6", "2001:db8::2", "AWS_INSTANCE_PORT", "8080"), REGION);
         byte[] request = buildQuery("typed." + namespace, (short) 33);
-        byte[] response = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)), request);
+        byte[] response = query(serverForVpc(List.of(cloudMapDnsRecordSource)), request);
         ByteBuffer packet = ByteBuffer.wrap(response);
         assertEquals(1, packet.getShort(6));
         assertEquals(33, packet.getShort(request.length + 2));
@@ -233,7 +243,7 @@ class CloudMapDnsPacketIntegrationTest {
         assertEquals(1, packet.getShort());
         assertEquals(8080, packet.getShort());
         assertEquals("task-1.typed." + namespace, EmbeddedDnsServer.readName(packet, response));
-        byte[] address = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)),
+        byte[] address = query(serverForVpc(List.of(cloudMapDnsRecordSource)),
                 buildQuery("task-1.typed." + namespace, (short) 28));
         assertEquals(1, ByteBuffer.wrap(address).getShort(6));
     }
@@ -246,7 +256,7 @@ class CloudMapDnsPacketIntegrationTest {
             cloudMapService.registerInstance(service.getId(), "task-" + i, null,
                     Map.of("AWS_INSTANCE_IPV4", "172.31.0." + i), REGION);
         }
-        byte[] response = query(new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource)),
+        byte[] response = query(serverForVpc(List.of(cloudMapDnsRecordSource)),
                 buildQuery("typed." + namespace, (short) 1));
         assertEquals(1, ByteBuffer.wrap(response).getShort(6));
     }
@@ -265,7 +275,7 @@ class CloudMapDnsPacketIntegrationTest {
             cloudMapService.registerInstance(service.getId(), "instance-with-long-name-" + i, null,
                     Map.of("AWS_INSTANCE_IPV4", "192.0.2.1", "AWS_INSTANCE_PORT", "8080"), REGION);
         }
-        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of(), List.of(cloudMapDnsRecordSource));
+        EmbeddedDnsServer dns = serverForVpc(List.of(cloudMapDnsRecordSource));
         byte[] legacyQuery = buildQuery("typed." + namespace, (short) 33);
         byte[] legacy = query(dns, legacyQuery);
         ByteBuffer legacyPacket = ByteBuffer.wrap(legacy);
@@ -312,6 +322,13 @@ class CloudMapDnsPacketIntegrationTest {
 
     private static String uniqueNamespace() {
         return "dnspacket" + UUID.randomUUID().toString().substring(0, 8) + ".internal";
+    }
+
+    private EmbeddedDnsServer serverForVpc(List<DnsRecordSource> sources) {
+        DnsClientVpcSource clients = address -> "127.0.0.1".equals(address)
+                ? Optional.of(new DnsClientVpcSource.ClientVpc(config.defaultAccountId(), REGION, "vpc-dns"))
+                : Optional.empty();
+        return new EmbeddedDnsServer(List.of(), sources, List.of(), List.of(clients));
     }
 
     private byte[] query(EmbeddedDnsServer dns, byte[] request) throws Exception {
