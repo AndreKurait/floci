@@ -5676,7 +5676,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return Optional.of(new CallerArns(sessionArn, roleArn, CallerArns.TYPE_ASSUMED_ROLE,
                 sessionUserId(session).orElse(null), null,
                 role != null && role.getPermissionsBoundaryArn() != null)
-                .withPrincipalTags(role == null || !roleArnMatches(roleArn, role) ? Map.of() : role.getTags()));
+                .withPrincipalTags(sessionRoleMatches(session, role) ? role.getTags() : Map.of()));
+    }
+
+    private static boolean sessionRoleMatches(SessionCredential session, IamRole role) {
+        if (role == null || !roleArnMatches(session.getRoleArn(), role)) {
+            return false;
+        }
+        String assumedRoleId = session.getAssumedRoleId();
+        if (assumedRoleId != null) {
+            return assumedRoleId.startsWith(role.getRoleId() + ":");
+        }
+        return role.getRoleId().equals(session.getEc2RoleId());
     }
 
     /**

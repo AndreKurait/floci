@@ -54,12 +54,38 @@ class IamPrincipalTagsServiceTest {
         IamRole role = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
         iam.tagRole("Worker", Map.of("department", "engineering"));
         iam.registerSession("ASIASESSION", "secret", "token", role.getArn(), NOW.plusSeconds(3600), null,
-                ACCOUNT, "worker", "AROAID:worker");
+                ACCOUNT, "worker", role.getRoleId() + ":worker");
         assertEquals(List.of("engineering"), context("ASIASESSION").get("aws:PrincipalTag/department"));
         assertEquals(List.of(role.getArn()), context("ASIASESSION").get("aws:PrincipalArn"));
         assertEquals(List.of(NOW.toString()), context("ASIASESSION").get("aws:TokenIssueTime"));
         iam.untagRole("Worker", List.of("department"));
         assertFalse(context("ASIASESSION").containsKey("aws:PrincipalTag/department"));
+    }
+
+    @Test
+    void recreatedRoleDoesNotSupplyTagsToTheOriginalSession() {
+        IamRole original = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        iam.tagRole("Worker", Map.of("department", "engineering"));
+        iam.registerSession("ASIAOLD", "secret", "token", original.getArn(), NOW.plusSeconds(3600), null,
+                ACCOUNT, "worker", original.getRoleId() + ":worker");
+        assertEquals(List.of("engineering"), context("ASIAOLD").get("aws:PrincipalTag/department"));
+        iam.deleteRole("Worker");
+        IamRole replacement = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        assertEquals(original.getArn(), replacement.getArn());
+        assertNotEquals(original.getRoleId(), replacement.getRoleId());
+        iam.tagRole("Worker", Map.of("department", "security"));
+        assertFalse(context("ASIAOLD").containsKey("aws:PrincipalTag/department"));
+        iam.registerSession("ASIANEW", "secret", "token", replacement.getArn(), NOW.plusSeconds(3600), null,
+                ACCOUNT, "replacement", replacement.getRoleId() + ":replacement");
+        assertEquals(List.of("security"), context("ASIANEW").get("aws:PrincipalTag/department"));
+    }
+
+    @Test
+    void aSessionWithoutRecordedRoleIdentityDoesNotSupplyTags() {
+        IamRole role = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        iam.tagRole("Worker", Map.of("department", "engineering"));
+        iam.registerSession("ASIALEGACY", role.getArn(), NOW.plusSeconds(3600));
+        assertFalse(context("ASIALEGACY").containsKey("aws:PrincipalTag/department"));
     }
 
     @Test
