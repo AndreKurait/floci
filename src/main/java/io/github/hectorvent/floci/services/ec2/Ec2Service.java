@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
@@ -2218,7 +2219,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // bounded — a lock per storage key would never evict — at the cost of unrelated resources
     // sharing a monitor on hash collision.
     private static final int LOCK_STRIPES = 512;
-    private final Object[] resourceLocks = newLockStripes();
+    private final StripedLocks resourceLocks = new StripedLocks(LOCK_STRIPES);
 
     /** The AMI state a deregistered image is tombstoned with; one of EC2's documented ImageState values. */
     private static final String DEREGISTERED_STATE = "deregistered";
@@ -2253,31 +2254,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return imageRegistryLock;
     }
 
-    private static Object[] newLockStripes() {
-        Object[] stripes = new Object[LOCK_STRIPES];
-        for (int i = 0; i < stripes.length; i++) {
-            stripes[i] = new Object();
-        }
-        return stripes;
-    }
-
     private int stripeOf(String storeKey) {
-        return Math.floorMod(storeKey.hashCode(), LOCK_STRIPES);
+        return resourceLocks.stripeOf(storeKey);
     }
 
     private Object lockFor(String storeKey) {
-        return resourceLocks[stripeOf(storeKey)];
+        return resourceLocks.lockFor(storeKey);
     }
 
     // Stripe index, not key order, is the total order two-lock callers must agree on: distinct
     // keys can share a stripe, so ordering by key could have two callers take the same pair of
     // monitors in opposite orders.
     private Object lowerLockOf(String keyA, String keyB) {
-        return resourceLocks[Math.min(stripeOf(keyA), stripeOf(keyB))];
+        return resourceLocks.lockAt(Math.min(stripeOf(keyA), stripeOf(keyB)));
     }
 
     private Object higherLockOf(String keyA, String keyB) {
-        return resourceLocks[Math.max(stripeOf(keyA), stripeOf(keyB))];
+        return resourceLocks.lockAt(Math.max(stripeOf(keyA), stripeOf(keyB)));
     }
 
     /** Synthesizes a locally-administered unicast MAC (AWS never discloses how it derives its own). */
@@ -10549,7 +10542,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             change.run();
             return;
         }
-        synchronized (resourceLocks[stripes[next]]) {
+        synchronized (resourceLocks.lockAt(stripes[next])) {
             runHoldingStripes(stripes, next + 1, change);
         }
     }

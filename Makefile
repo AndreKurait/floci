@@ -516,14 +516,24 @@ IAM_REQUEST_RESOURCES_PATHS := src/main/resources/aws/iam-request-resources.json
 	tools/aws/regen_iam_request_resources.py $(IAM_PASSED_ROLES_GENERATOR) \
 	tools/aws/test_regen_iam_request_resources.py
 
-iam-data-verify: ## CI gate (online): every vendored IAM file must still match AWS; CHANGED="<paths>" checks only the ones they cover
+iam-data-verify: ## CI gate (online): every vendored IAM file must still match AWS; CHANGED_FILE=<manifest> or CHANGED="<paths>" checks only the ones they cover
 	@# Every check runs even when an earlier one fails, so one file's drift cannot hide another's
 	@# state. Sequential steps in CI stop at the first failure, which once left the action
 	@# resource gate unexercised while the namespace list was stale.
 	@namespaces=0; actions=0; authorized=0; passed=0; connectors=0; tagged=0; requested=0; dynamodb=0; conditionkeys=0; s3control=0; requestkeys=0; \
+	if [ -n "$(CHANGED_FILE)" ] && [ ! -r "$(CHANGED_FILE)" ]; then \
+		echo "error: cannot read changed-file manifest: $(CHANGED_FILE)"; exit 1; \
+	fi; \
 	covers() { \
-		[ -z "$(strip $(CHANGED))" ] && return 0; \
-		for path in $(CHANGED); do case " $$1 " in *" $$path "*) return 0;; esac; done; \
+		if [ -n "$(CHANGED_FILE)" ]; then \
+			! grep -q '[^[:space:]]' "$(CHANGED_FILE)" && return 0; \
+			while IFS= read -r path || [ -n "$$path" ]; do \
+				case " $$1 " in *" $$path "*) return 0;; esac; \
+			done < "$(CHANGED_FILE)"; \
+		else \
+			[ -z "$(strip $(CHANGED))" ] && return 0; \
+			for path in $(CHANGED); do case " $$1 " in *" $$path "*) return 0;; esac; done; \
+		fi; \
 		echo "not checked, as the change touches none of its files: $$2"; \
 		return 1; \
 	}; \
