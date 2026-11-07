@@ -262,6 +262,10 @@ public class Ec2QueryHandler {
                 case "RegisterImage" -> handleRegisterImage(params, region);
                 case "DeregisterImage" -> handleDeregisterImage(params, region);
                 case "CopyImage" -> handleCopyImage(params, region);
+                case "DescribeImageAttribute" -> handleDescribeImageAttribute(params, region);
+                case "ModifyImageAttribute" -> handleModifyImageAttribute(params, region);
+                case "DescribeSnapshotAttribute" -> handleDescribeSnapshotAttribute(params, region);
+                case "ModifySnapshotAttribute" -> handleModifySnapshotAttribute(params, region);
                 case "CreateSnapshot" -> handleCreateSnapshot(params, region);
                 case "DeleteSnapshot" -> handleDeleteSnapshot(params, region);
                 case "DescribeSnapshots" -> handleDescribeSnapshots(params, region);
@@ -462,6 +466,8 @@ public class Ec2QueryHandler {
             mapping.setDeviceName(deviceName);
             EbsBlockDevice ebs = new EbsBlockDevice();
             ebs.setSnapshotId(snapshotId);
+            ebs.setIops(parseOptionalInt(p.getFirst(prefix + ".Ebs.Iops"), prefix + ".Ebs.Iops"));
+            ebs.setThroughput(parseOptionalInt(p.getFirst(prefix + ".Ebs.Throughput"), prefix + ".Ebs.Throughput"));
             ebs.setVolumeSize(parseOptionalInt(volumeSize, prefix + ".Ebs.VolumeSize"));
             ebs.setVolumeType(volumeType);
             ebs.setDeleteOnTermination(parseOptionalBoolean(deleteOnTermination,
@@ -4277,6 +4283,12 @@ public class Ec2QueryHandler {
      * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CopyImage.html">CopyImage</a>
      */
     private Response handleCopyImage(MultivaluedMap<String, String> p, String region) {
+        if (p.containsKey("KmsKeyId") || Boolean.parseBoolean(p.getFirst("Encrypted"))
+                || p.keySet().stream().anyMatch(name -> name.startsWith("Destination")
+                        || name.equals("SnapshotCopyCompletionDurationMinutes"))) {
+            throw new AwsException("UnsupportedOperation",
+                    "CopyImage supports regional copies without encryption or placement options.", 400);
+        }
         List<Tag> imageTags = parseTagsForResource(p, "image", IMAGE_TAG_RESOURCE_TYPES);
         List<Tag> snapshotTags = parseTagsForResource(p, "snapshot", IMAGE_TAG_RESOURCE_TYPES);
         Image image = service.copyImage(
@@ -4285,8 +4297,8 @@ public class Ec2QueryHandler {
                 p.getFirst("SourceImageId"),
                 p.getFirst("Name"),
                 p.getFirst("Description"),
-                Boolean.parseBoolean(p.getFirst("CopyImageTags")),
-                imageTags);
+                Boolean.parseBoolean(p.getFirst("DryRun")),
+                Boolean.parseBoolean(p.getFirst("CopyImageTags")), imageTags);
         applyResourceTags(imageTags, region, image.getImageId());
         applyImageSnapshotTags(snapshotTags, region, image);
         XmlBuilder xml = new XmlBuilder()
@@ -4295,6 +4307,102 @@ public class Ec2QueryHandler {
                 .elem("imageId", image.getImageId())
                 .end("CopyImageResponse");
         return xmlResponse(xml.build());
+    }
+
+    private Response handleDescribeImageAttribute(MultivaluedMap<String, String> p, String region) {
+        requirePermissionAttribute(p, "launchPermission");
+        List<String> users = service.describeImageLaunchPermissions(region, p.getFirst("ImageId"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return permissionResponse("DescribeImageAttribute", "imageId", p.getFirst("ImageId"),
+                "launchPermission", users);
+    }
+
+    private Response handleDescribeSnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        requirePermissionAttribute(p, "createVolumePermission");
+        List<String> users = service.describeSnapshotCreateVolumePermissions(region, p.getFirst("SnapshotId"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return permissionResponse("DescribeSnapshotAttribute", "snapshotId", p.getFirst("SnapshotId"),
+                "createVolumePermission", users);
+    }
+
+    private void requirePermissionAttribute(MultivaluedMap<String, String> p, String expected) {
+        if (p.getFirst("Attribute") == null) {
+            throw new AwsException("MissingParameter", "The parameter Attribute is missing", 400);
+        }
+        if (!expected.equals(p.getFirst("Attribute"))) {
+            throw new AwsException("UnsupportedOperation", "Only the " + expected + " attribute is supported.", 400);
+        }
+    }
+
+    private Response permissionResponse(String action, String idName, String id, String permission,
+                                        List<String> users) {
+        XmlBuilder xml = new XmlBuilder().start(action + "Response", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString()).elem(idName, id).start(permission);
+        for (String user : users) {
+            xml.start("item").elem("userId", user).end("item");
+        }
+        return xmlResponse(xml.end(permission).end(action + "Response").build());
+    }
+
+    private Response handleModifyImageAttribute(MultivaluedMap<String, String> p, String region) {
+        PermissionChanges changes = permissionChanges(p, "ImageId", "LaunchPermission", "launchPermission");
+        service.modifyImageLaunchPermissions(region, p.getFirst("ImageId"), changes.add(), changes.remove(),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("ModifyImageAttribute");
+    }
+
+    private Response handleModifySnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        PermissionChanges changes = permissionChanges(p, "SnapshotId",
+                "CreateVolumePermission", "createVolumePermission");
+        service.modifySnapshotCreateVolumePermissions(region, p.getFirst("SnapshotId"),
+                changes.add(), changes.remove(), Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("ModifySnapshotAttribute");
+    }
+
+    private record PermissionChanges(List<String> add, List<String> remove) {}
+
+    private PermissionChanges permissionChanges(MultivaluedMap<String, String> p, String idName,
+                                                 String field, String attribute) {
+        if (p.containsKey("Attribute") && !attribute.equals(p.getFirst("Attribute"))) {
+            throw new AwsException("UnsupportedOperation", "Only the " + attribute + " attribute is supported.", 400);
+        }
+        Map<Integer, String> add = new TreeMap<>();
+        Map<Integer, String> remove = new TreeMap<>();
+        Set<String> common = Set.of("Action", "Version", idName, "Attribute", "DryRun");
+        for (String key : p.keySet()) {
+            if (common.contains(key)) {
+                continue;
+            }
+            if (!key.startsWith(field + ".")) {
+                throw new AwsException("UnsupportedOperation",
+                        "Only nested " + field + " Add/Remove UserId changes are supported.", 400);
+            }
+            String[] parts = key.substring(field.length() + 1).split("\\.", -1);
+            if (parts.length != 3 || !Set.of("Add", "Remove").contains(parts[0])
+                    || !parts[1].matches("[1-9][0-9]*") || !"UserId".equals(parts[2])) {
+                throw new AwsException("UnsupportedOperation",
+                        "Only nested " + field + " Add/Remove UserId changes are supported.", 400);
+            }
+            int index;
+            try {
+                index = Integer.parseInt(parts[1]);
+            } catch (NumberFormatException invalid) {
+                throw new AwsException("InvalidParameterValue", "Invalid permission index.", 400);
+            }
+            if (p.get(key).size() != 1) {
+                throw new AwsException("InvalidParameterValue", "Permission UserId must have one value.", 400);
+            }
+            ("Add".equals(parts[0]) ? add : remove).put(index, p.getFirst(key));
+        }
+        for (Map<Integer, String> changes : List.of(add, remove)) {
+            int expected = 1;
+            for (int index : changes.keySet()) {
+                if (index != expected++) {
+                    throw new AwsException("InvalidParameterValue", "Permission indexes must start at 1 without gaps.", 400);
+                }
+            }
+        }
+        return new PermissionChanges(new ArrayList<>(add.values()), new ArrayList<>(remove.values()));
     }
 
     private Response handleCreateSnapshot(MultivaluedMap<String, String> p, String region) {
@@ -6873,6 +6981,12 @@ public class Ec2QueryHandler {
                 }
                 if (ebs.getEncrypted() != null) {
                     xml.elem("encrypted", String.valueOf(ebs.getEncrypted()));
+                }
+                if (ebs.getIops() != null) {
+                    xml.elem("iops", String.valueOf(ebs.getIops()));
+                }
+                if (ebs.getThroughput() != null) {
+                    xml.elem("throughput", String.valueOf(ebs.getThroughput()));
                 }
                 xml.end("ebs");
             }

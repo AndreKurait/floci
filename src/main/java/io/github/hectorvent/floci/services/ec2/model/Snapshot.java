@@ -5,7 +5,9 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -22,6 +24,7 @@ public class Snapshot {
     private boolean encrypted;
     private String region;
     private List<Tag> tags = new ArrayList<>();
+    private Set<String> createVolumePermissionUserIds = new LinkedHashSet<>();
 
     public Snapshot() {}
 
@@ -57,4 +60,9 @@ public class Snapshot {
 
     public List<Tag> getTags() { return tags; }
     public void setTags(List<Tag> tags) { this.tags = tags; }
+
+    public Set<String> getCreateVolumePermissionUserIds() { return createVolumePermissionUserIds; }
+    public void setCreateVolumePermissionUserIds(Set<String> userIds) {
+        this.createVolumePermissionUserIds = userIds == null ? new LinkedHashSet<>() : new LinkedHashSet<>(userIds);
+    }
 }
