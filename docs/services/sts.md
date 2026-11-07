@@ -303,8 +303,8 @@ when its condition matches.
 ### Known limitations
 
 - Federation support is operation-specific. Direct `AssumeRole` session tags and source identity
-  are documented below. Verified OIDC source identity is supported; SAML source identity and
-  federation session-tag ingestion remain separate limitations.
+  are documented below. Verified OIDC and SAML source identity are supported;
+  federation session-tag ingestion remains a separate limitation.
 
 ## Web Identity Validation (IRSA)
 
@@ -436,10 +436,16 @@ signature-enforcing SDK tests do not establish managed AWS error-message or runt
 
 `AssumeRole` retains a supplied `SourceIdentity` in the issued session and returns it in the response. Role chaining inherits the value and rejects attempts to change it. With IAM enforcement enabled, setting or inheriting it requires the target trust policy's `sts:SetSourceIdentity` permission and applicable caller permission ceilings. Role chaining requires the caller role's identity permission as well.
 
-Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. SAML claim ingestion and CloudTrail source-identity reporting remain separate work.
+Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. CloudTrail source-identity reporting remains separate work.
 
 ### Verified OIDC source identity
 
 `AssumeRoleWithWebIdentity` reads the `https://aws.amazon.com/source_identity` string claim only after token signature, issuer, audience and lifetime verification. A supplied value must satisfy the source identity constraints. The federated trust policy must allow both `sts:AssumeRoleWithWebIdentity` and `sts:SetSourceIdentity`; both evaluations can use `sts:SourceIdentity`. An explicit deny prevents credential issuance.
 
 The response and issued session retain the value, and signed downstream requests receive `aws:SourceIdentity`. Missing claims leave that context absent. This does not extend the set of supported OIDC issuers or claim full federation condition, session-tag, native-image or managed AWS parity.
+
+### Verified SAML source identity
+
+`AssumeRoleWithSAML` reads the `https://aws.amazon.com/SAML/Attributes/SourceIdentity` attribute only from the verified assertion. A present attribute must contain one valid source identity value. The role trust policy must allow both `sts:AssumeRoleWithSAML` and `sts:SetSourceIdentity`; each evaluation receives the verified `sts:SourceIdentity` value. Explicit denial prevents session creation.
+
+The response and issued session retain the source identity through the existing shared session metadata. Missing attributes preserve the existing trust contract. This does not establish full SAML condition support, session-tag issuance, CloudTrail reporting, native-image behavior or managed AWS parity.
