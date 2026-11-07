@@ -66,7 +66,6 @@ class LambdaTaskAuthorizerTest {
     private IamService iamService;
     private LambdaResourcePolicyProvider functionPolicies;
     private ResourcePolicyProvider bucketPolicies;
-    private Instance<ScpProvider> scpProvider;
     private LambdaTaskAuthorizer authorizer;
 
     @BeforeEach
@@ -74,7 +73,6 @@ class LambdaTaskAuthorizerTest {
     void setUp() {
         iamService = mock(IamService.class);
         functionPolicies = mock(LambdaResourcePolicyProvider.class);
-        scpProvider = mock(Instance.class);
         when(functionPolicies.getResourcePolicies(eq("lambda"), anyString()))
                 .thenReturn(List.of(new ResourcePolicy(null, FUNCTION_ACCOUNT)));
         when(functionPolicies.getResourcePolicies("lambda", OWN_FUNCTION))
@@ -87,7 +85,7 @@ class LambdaTaskAuthorizerTest {
         ObjectMapper mapper = new ObjectMapper();
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(mapper);
         authorizer = new LambdaTaskAuthorizer(iamService, evaluator, new AssumeRolePolicyEvaluator(mapper, evaluator),
-                providers, scpProvider);
+                providers);
     }
 
     @Test
@@ -614,8 +612,7 @@ class LambdaTaskAuthorizerTest {
     private void scps(String document) {
         ScpProvider provider = mock(ScpProvider.class);
         when(provider.effectiveScpLevels(SFN_ACCOUNT)).thenReturn(List.of(List.of(document)));
-        when(scpProvider.isResolvable()).thenReturn(true);
-        when(scpProvider.get()).thenReturn(provider);
+        when(iamService.effectiveScpLevels(anyString())).thenAnswer(inv -> provider.effectiveScpLevels(inv.getArgument(0)));
     }
 
     private void functionPolicy(String functionArn, String owner, String document) {

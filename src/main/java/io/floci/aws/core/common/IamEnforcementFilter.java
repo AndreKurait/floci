@@ -19,7 +19,6 @@ import io.floci.aws.services.iam.RequestPrincipal;
 import io.floci.aws.services.iam.ResourceArnBuilder;
 import io.floci.aws.services.iam.ResourcePolicyProvider;
 import io.floci.aws.services.iam.ResourcePolicyProviders;
-import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.s3.S3ObjectActions;
@@ -208,7 +207,6 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private final CloudTrailService cloudTrailService;
     private final CurrentVertxRequest currentVertxRequest;
     private final ResolvedServiceCatalog catalog;
-    private final Instance<ScpProvider> scpProvider;
     private final SessionAccountLookup sessionAccountLookup;
     private final Instance<ResourcePolicyProvider> resourcePolicyProviders;
     private final Instance<PassedRoleLookup> passedRoleLookups;
@@ -230,7 +228,6 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                 CloudTrailService cloudTrailService,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog catalog,
-                                Instance<ScpProvider> scpProvider,
                                 SessionAccountLookup sessionAccountLookup,
                                 Instance<ResourcePolicyProvider> resourcePolicyProviders,
                                 Instance<PassedRoleLookup> passedRoleLookups,
@@ -249,7 +246,6 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         this.cloudTrailService = cloudTrailService;
         this.currentVertxRequest = currentVertxRequest;
         this.catalog = catalog;
-        this.scpProvider = scpProvider;
         this.sessionAccountLookup = sessionAccountLookup;
         this.resourcePolicyProviders = resourcePolicyProviders;
         this.passedRoleLookups = passedRoleLookups;
@@ -271,7 +267,6 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                          CloudTrailService cloudTrailService,
                          CurrentVertxRequest currentVertxRequest,
                          ResolvedServiceCatalog catalog,
-                         Instance<ScpProvider> scpProvider,
                          SessionAccountLookup sessionAccountLookup,
                          Instance<ResourcePolicyProvider> resourcePolicyProviders,
                          Instance<PassedRoleLookup> passedRoleLookups,
@@ -280,7 +275,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         this(config, accountResolver, iamService, evaluator, actionRegistry,
                 queryServiceResolver, arnBuilder, requestContext,
                 conditionContextResolver, cloudTrailService, currentVertxRequest, catalog,
-                scpProvider, sessionAccountLookup, resourcePolicyProviders, passedRoleLookups, clock, resourceInfo, null);
+                sessionAccountLookup, resourcePolicyProviders, passedRoleLookups, clock, resourceInfo, null);
     }
 
     /** Package-private constructor for callers predating Query dispatch-aware enforcement. */
@@ -295,13 +290,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                          CloudTrailService cloudTrailService,
                          CurrentVertxRequest currentVertxRequest,
                          ResolvedServiceCatalog catalog,
-                         Instance<ScpProvider> scpProvider,
                          SessionAccountLookup sessionAccountLookup,
                          Instance<ResourcePolicyProvider> resourcePolicyProviders) {
         this(config, accountResolver, iamService, evaluator, actionRegistry,
                 new AwsQueryServiceResolver(catalog), arnBuilder, requestContext,
                 conditionContextResolver, cloudTrailService, currentVertxRequest, catalog,
-                scpProvider, sessionAccountLookup, resourcePolicyProviders, null, Clock.systemUTC(), null, null);
+                sessionAccountLookup, resourcePolicyProviders, null, Clock.systemUTC(), null, null);
     }
 
     /** Package-private constructor for callers predating resourcePolicyProviders. */
@@ -316,12 +310,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                          CloudTrailService cloudTrailService,
                          CurrentVertxRequest currentVertxRequest,
                          ResolvedServiceCatalog catalog,
-                         Instance<ScpProvider> scpProvider,
                          SessionAccountLookup sessionAccountLookup) {
         this(config, accountResolver, iamService, evaluator, actionRegistry,
                 new AwsQueryServiceResolver(catalog), arnBuilder, requestContext,
                 conditionContextResolver, cloudTrailService, currentVertxRequest, catalog,
-                scpProvider, sessionAccountLookup, null, null, Clock.systemUTC(), null, null);
+                sessionAccountLookup, null, null, Clock.systemUTC(), null, null);
     }
 
     /** Package-private constructor for testing with S3Service. */
@@ -336,14 +329,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                          CloudTrailService cloudTrailService,
                          CurrentVertxRequest currentVertxRequest,
                          ResolvedServiceCatalog catalog,
-                         Instance<ScpProvider> scpProvider,
                          SessionAccountLookup sessionAccountLookup,
                          Instance<ResourcePolicyProvider> resourcePolicyProviders,
                          Instance<S3Service> s3ServiceProvider) {
         this(config, accountResolver, iamService, evaluator, actionRegistry,
                 new AwsQueryServiceResolver(catalog), arnBuilder, requestContext,
                 conditionContextResolver, cloudTrailService, currentVertxRequest, catalog,
-                scpProvider, sessionAccountLookup, resourcePolicyProviders, null, Clock.systemUTC(), null, s3ServiceProvider);
+                sessionAccountLookup, resourcePolicyProviders, null, Clock.systemUTC(), null, s3ServiceProvider);
     }
 
     @Override
@@ -451,16 +443,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         }
 
         // Service control policies from the caller's organization, when the Organizations
-        // service is present and SCP enforcement is enabled. Resolved lazily via Instance
-        // to avoid a hard IAM → Organizations dependency.
+        // service is present and SCP enforcement is enabled. IAM owns the optional provider lookup.
         //
         // Resolved before the account-root branch below, which needs to know whether a ceiling
         // exists in order to decide between enforcing and bypassing. That costs an organization
         // lookup on requests that then bypass; both flags are opt-in, and effectiveScpLevels
         // returns null immediately when SCP enforcement is off.
-        List<List<String>> scpLevels = scpProvider.isResolvable()
-                ? scpProvider.get().effectiveScpLevels(accountId)
-                : null;
+        List<List<String>> scpLevels = iamService.effectiveScpLevels(accountId);
 
         boolean accountRootPrincipal = false;
         if (caller == null) {
@@ -1521,8 +1510,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 throw expiredTokenException(credentialScope);
             }
 
-            List<List<String>> scpLevels = scpProvider.isResolvable()
-                    ? scpProvider.get().effectiveScpLevels(accountId) : null;
+            List<List<String>> scpLevels = iamService.effectiveScpLevels(accountId);
 
             boolean accountRootPrincipal = false;
             CallerContext caller = iamService.resolveCallerContext(akid, now);

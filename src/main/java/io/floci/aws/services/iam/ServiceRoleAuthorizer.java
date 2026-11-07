@@ -7,7 +7,6 @@ import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 
 import java.util.List;
@@ -34,18 +33,15 @@ public class ServiceRoleAuthorizer {
     private final IamService iamService;
     private final IamPolicyEvaluator evaluator;
     private final AssumeRolePolicyEvaluator trustEvaluator;
-    private final Instance<ScpProvider> scpProvider;
 
     @Inject
     public ServiceRoleAuthorizer(EmulatorConfig config, IamService iamService,
                                  IamPolicyEvaluator evaluator,
-                                 AssumeRolePolicyEvaluator trustEvaluator,
-                                 Instance<ScpProvider> scpProvider) {
+                                 AssumeRolePolicyEvaluator trustEvaluator) {
         this.config = config;
         this.iamService = iamService;
         this.evaluator = evaluator;
         this.trustEvaluator = trustEvaluator;
-        this.scpProvider = scpProvider;
     }
 
     /**
@@ -85,8 +81,7 @@ public class ServiceRoleAuthorizer {
             return Optional.of("The role " + roleArn + " does not trust " + servicePrincipal + ".");
         }
         CallerContext caller = iamService.resolvePrincipalContext(role.get().getArn());
-        List<List<String>> scpLevels = scpProvider.isResolvable()
-                ? scpProvider.get().effectiveScpLevels(accountId) : null;
+        List<List<String>> scpLevels = iamService.effectiveScpLevels(accountId);
         if (scpLevels != null) {
             caller = caller.withScpLevels(scpLevels);
         }

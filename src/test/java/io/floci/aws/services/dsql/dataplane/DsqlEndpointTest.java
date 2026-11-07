@@ -5,7 +5,6 @@ import io.floci.aws.services.dsql.DsqlPrincipals;
 import io.floci.aws.services.iam.IamPolicyEvaluator;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.ResourcePolicyProvider;
-import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.testing.MutableClock;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.AfterEach;
@@ -26,12 +25,11 @@ class DsqlEndpointTest {
 
     @BeforeEach
     void createEndpoint() {
-        @SuppressWarnings("unchecked")
-        Instance<ScpProvider> scpProvider = mock(Instance.class);
+
         @SuppressWarnings("unchecked")
         Instance<ResourcePolicyProvider> resourcePolicyProviders = mock(Instance.class);
         endpoint = new DsqlEndpoint(mock(DsqlTlsCertificates.class), mock(IamService.class),
-                mock(IamPolicyEvaluator.class), scpProvider, resourcePolicyProviders, mock(DsqlPrincipals.class),
+                mock(IamPolicyEvaluator.class), resourcePolicyProviders, mock(DsqlPrincipals.class),
                 mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), clock);
     }
 

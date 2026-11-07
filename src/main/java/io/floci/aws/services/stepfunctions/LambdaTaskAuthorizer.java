@@ -18,7 +18,6 @@ import io.floci.aws.services.iam.RequestPrincipal;
 import io.floci.aws.services.iam.ResourcePolicyProvider;
 import io.floci.aws.services.iam.ResourcePolicyProvider.ResourcePolicy;
 import io.floci.aws.services.iam.ResourcePolicyProviders;
-import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.stepfunctions.model.StateMachine;
@@ -57,18 +56,15 @@ public class LambdaTaskAuthorizer {
     private final IamPolicyEvaluator evaluator;
     private final AssumeRolePolicyEvaluator trustEvaluator;
     private final Instance<ResourcePolicyProvider> resourcePolicies;
-    private final Instance<ScpProvider> scpProvider;
 
     @Inject
     public LambdaTaskAuthorizer(IamService iamService, IamPolicyEvaluator evaluator,
                                 AssumeRolePolicyEvaluator trustEvaluator,
-                                Instance<ResourcePolicyProvider> resourcePolicies,
-                                Instance<ScpProvider> scpProvider) {
+                                Instance<ResourcePolicyProvider> resourcePolicies) {
         this.iamService = iamService;
         this.evaluator = evaluator;
         this.trustEvaluator = trustEvaluator;
         this.resourcePolicies = resourcePolicies;
-        this.scpProvider = scpProvider;
     }
 
     /**
@@ -256,7 +252,7 @@ public class LambdaTaskAuthorizer {
     }
 
     private List<List<String>> scpLevels(String accountId) {
-        return scpProvider.isResolvable() ? scpProvider.get().effectiveScpLevels(accountId) : null;
+        return iamService.effectiveScpLevels(accountId);
     }
 
     /**

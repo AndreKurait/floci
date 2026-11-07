@@ -94,6 +94,7 @@ class IamEnforcementFilterTest {
         iamConfig = mock(EmulatorConfig.IamServiceConfig.class);
         accountResolver = mock(AccountResolver.class);
         iamService = mock(IamService.class);
+        when(iamService.effectiveScpLevels(anyString())).thenReturn(null);
         evaluator = mock(IamPolicyEvaluator.class);
         actionRegistry = mock(IamActionRegistry.class);
         arnBuilder = mock(ResourceArnBuilder.class);
@@ -123,16 +124,12 @@ class IamEnforcementFilterTest {
     }
 
     private IamEnforcementFilter newFilter(CurrentVertxRequest currentVertxRequest, CloudTrailService cloudTrail) {
-        @SuppressWarnings("unchecked")
-        Instance<ScpProvider> scpProvider =
-                mock(Instance.class);
-        when(scpProvider.isResolvable()).thenReturn(false);
         return new IamEnforcementFilter(
                 config, accountResolver, iamService, evaluator, actionRegistry, arnBuilder,
                 requestContext, conditionContextResolver,
                 cloudTrail,
                 currentVertxRequest,
-                catalog, scpProvider, sessionAccountLookup);
+                catalog, sessionAccountLookup);
     }
 
     private IamEnforcementFilter newFilter(ResourceInfo resourceInfo) {
@@ -140,15 +137,12 @@ class IamEnforcementFilterTest {
     }
 
     private IamEnforcementFilter newFilter(ResourceInfo resourceInfo, Clock clock) {
-        @SuppressWarnings("unchecked")
-        Instance<ScpProvider> scpProvider = mock(Instance.class);
-        when(scpProvider.isResolvable()).thenReturn(false);
         return new IamEnforcementFilter(
                 config, accountResolver, iamService, evaluator, actionRegistry,
                 new AwsQueryServiceResolver(catalog), arnBuilder, requestContext,
                 conditionContextResolver, mock(CloudTrailService.class),
                 mock(CurrentVertxRequest.class),
-                catalog, scpProvider, sessionAccountLookup, null, null, clock, resourceInfo);
+                catalog, sessionAccountLookup, null, null, clock, resourceInfo);
     }
 
     @ParameterizedTest
@@ -1622,15 +1616,12 @@ class IamEnforcementFilterTest {
     }
 
     private IamEnforcementFilter newFilterWithRealEvaluator(Instance<S3Service> s3ServiceProvider) {
-        @SuppressWarnings("unchecked")
-        Instance<ScpProvider> scpProvider = mock(Instance.class);
-        when(scpProvider.isResolvable()).thenReturn(false);
         return new IamEnforcementFilter(
                 config, accountResolver, iamService, new IamPolicyEvaluator(new ObjectMapper()),
                 actionRegistry, arnBuilder, requestContext, conditionContextResolver,
                 mock(CloudTrailService.class),
                 mock(CurrentVertxRequest.class),
-                catalog, scpProvider, sessionAccountLookup, null, s3ServiceProvider);
+                catalog, sessionAccountLookup, null, s3ServiceProvider);
     }
 
     private void stubSignedS3Request(ContainerRequestContext containerRequest, String action, String resource,
@@ -1808,20 +1799,17 @@ class IamEnforcementFilterTest {
             + "\"Action\":\"organizations:LeaveOrganization\",\"Resource\":\"*\"}]}";
 
     /**
-     * Filter whose SCP provider is resolvable (returns {@code scp}) and whose policy evaluator is
+     * Filter whose IAM service resolves organization policies through {@code scp} and whose policy evaluator is
      * real, so the SCP deny-ceiling is exercised in-process rather than mocked away.
      */
     private IamEnforcementFilter newFilterWithScp(ScpProvider scp) {
-        @SuppressWarnings("unchecked")
-        Instance<ScpProvider> scpProvider = mock(Instance.class);
-        when(scpProvider.isResolvable()).thenReturn(true);
-        when(scpProvider.get()).thenReturn(scp);
+        when(iamService.effectiveScpLevels(anyString())).thenAnswer(inv -> scp.effectiveScpLevels(inv.getArgument(0)));
         return new IamEnforcementFilter(
                 config, accountResolver, iamService, new IamPolicyEvaluator(new ObjectMapper()),
                 actionRegistry, arnBuilder, requestContext, conditionContextResolver,
                 mock(CloudTrailService.class),
                 mock(CurrentVertxRequest.class),
-                catalog, scpProvider, sessionAccountLookup);
+                catalog, sessionAccountLookup);
     }
 
     @Test
@@ -2636,15 +2624,12 @@ class IamEnforcementFilterTest {
                 mock(Instance.class);
         when(providers.isUnsatisfied()).thenReturn(false);
         when(providers.iterator()).thenAnswer(invocation -> List.of(provider).iterator());
-        @SuppressWarnings("unchecked")
-        Instance<ScpProvider> scpProvider =
-                mock(Instance.class);
-        when(scpProvider.isResolvable()).thenReturn(false);
+
         return new IamEnforcementFilter(
                 config, accountResolver, iamService, evaluator, actionRegistry, arnBuilder,
                 requestContext, conditionContextResolver,
                 mock(CloudTrailService.class),
                 mock(CurrentVertxRequest.class),
-                catalog, scpProvider, sessionAccountLookup, providers);
+                catalog, sessionAccountLookup, providers);
     }
 }

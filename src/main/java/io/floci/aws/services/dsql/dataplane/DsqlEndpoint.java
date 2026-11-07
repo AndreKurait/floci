@@ -19,7 +19,6 @@ import io.floci.aws.services.iam.IamService.CallerArns;
 import io.floci.aws.services.iam.RequestPrincipal;
 import io.floci.aws.services.iam.ResourcePolicyProvider;
 import io.floci.aws.services.iam.ResourcePolicyProviders;
-import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -82,7 +81,6 @@ public class DsqlEndpoint {
     private final DsqlTlsCertificates certificates;
     private final IamService iamService;
     private final IamPolicyEvaluator policyEvaluator;
-    private final Instance<ScpProvider> scpProvider;
     private final Instance<ResourcePolicyProvider> resourcePolicyProviders;
     private final DsqlPrincipals principals;
     private final SigV4RequestValidator validator;
@@ -126,13 +124,12 @@ public class DsqlEndpoint {
 
     @Inject
     public DsqlEndpoint(DsqlTlsCertificates certificates, IamService iamService, IamPolicyEvaluator policyEvaluator,
-                        Instance<ScpProvider> scpProvider, Instance<ResourcePolicyProvider> resourcePolicyProviders,
+                        Instance<ResourcePolicyProvider> resourcePolicyProviders,
                         DsqlPrincipals principals, EmulatorConfig config, Clock clock) {
         this.clock = clock;
         this.certificates = certificates;
         this.iamService = iamService;
         this.policyEvaluator = policyEvaluator;
-        this.scpProvider = scpProvider;
         this.resourcePolicyProviders = resourcePolicyProviders;
         this.principals = principals;
         this.validator = new SigV4RequestValidator(iamService);
@@ -403,8 +400,7 @@ public class DsqlEndpoint {
         if (caller == null) {
             return null;
         }
-        List<List<String>> scpLevels = scpProvider.isResolvable()
-                ? scpProvider.get().effectiveScpLevels(route.accountId()) : null;
+        List<List<String>> scpLevels = iamService.effectiveScpLevels(route.accountId());
         if (scpLevels != null) {
             caller = caller.withScpLevels(scpLevels);
         }

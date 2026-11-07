@@ -9,7 +9,6 @@ import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.ServiceRoleAuthorizer;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
-import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -37,7 +36,6 @@ class RedshiftServerlessScheduledActionAuthorizerTest {
 
     private EmulatorConfig config;
     private IamService iamService;
-    private Instance<ScpProvider> scpProvider;
     private ScpProvider scps;
     private RedshiftServerlessScheduledActionAuthorizer authorizer;
 
@@ -48,12 +46,10 @@ class RedshiftServerlessScheduledActionAuthorizerTest {
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
         iamService = mock(IamService.class);
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(new ObjectMapper());
-        scpProvider = mock(Instance.class);
         scps = mock(ScpProvider.class);
-        when(scpProvider.isResolvable()).thenReturn(true);
-        when(scpProvider.get()).thenReturn(scps);
+        when(iamService.effectiveScpLevels(anyString())).thenAnswer(inv -> scps.effectiveScpLevels(inv.getArgument(0)));
         ServiceRoleAuthorizer serviceRoleAuthorizer = new ServiceRoleAuthorizer(config, iamService, evaluator,
-                new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator), scpProvider);
+                new AssumeRolePolicyEvaluator(new ObjectMapper(), evaluator));
         authorizer = new RedshiftServerlessScheduledActionAuthorizer(serviceRoleAuthorizer);
     }
 
