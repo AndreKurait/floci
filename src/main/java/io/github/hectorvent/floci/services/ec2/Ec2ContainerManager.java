@@ -855,6 +855,14 @@ public class Ec2ContainerManager {
     }
 
     private void validateMountOptions(ResolvedAmiImage image, GuestOptions options) {
+        if (image.systemd()) {
+            for (Mount mount : options.mounts()) {
+                if (Set.of("/run", "/run/lock", "/sys/fs/cgroup").contains(mount.getTarget())) {
+                    throw new IllegalArgumentException("Read-only bind target is reserved for systemd: "
+                            + mount.getTarget());
+                }
+            }
+        }
         if (image.volumeMounts().isEmpty()) {
             return;
         }

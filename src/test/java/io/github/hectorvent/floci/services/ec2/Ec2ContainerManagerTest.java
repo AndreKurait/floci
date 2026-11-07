@@ -3772,6 +3772,33 @@ class Ec2ContainerManagerTest {
                         "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"/run", "/run/lock", "/sys/fs/cgroup"})
+    void systemdMountTargetsRefuseBeforePortsHelpersOrWorkload(String target) throws Exception {
+        assertNull(launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "minimal,/run", "minimal,/run/lock", "minimal,/sys/fs/cgroup",
+            "image,/run", "image,/run/lock", "image,/sys/fs/cgroup",
+            "systemd,/run/custom", "systemd,/run/lockfile", "systemd,/sys/fs/cgroup-extra"
+    })
+    void otherRuntimeMountTargetsRemainAvailable(String runtime, String target) throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", runtime, "systemd".equals(runtime), "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), false, false, false);
+
+        Mount bind = spec.mounts().stream().filter(mount -> mount.getType() == MountType.BIND)
+                .findFirst().orElseThrow();
+        assertEquals(target, bind.getTarget());
+        assertTrue(bind.getReadOnly());
+    }
+
     @Test
     void duplicateMountTargetsRefuseBeforePortsHelpersOrWorkload() throws Exception {
         assertNull(launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"), Map.of(
