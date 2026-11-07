@@ -12,6 +12,7 @@ import io.vertx.core.datagram.DatagramSocket;
 import jakarta.inject.Inject;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.apache5.Apache5HttpClient;
@@ -24,6 +25,7 @@ import software.amazon.awssdk.services.route53.Route53Client;
 import software.amazon.awssdk.services.route53.model.AliasTarget;
 import software.amazon.awssdk.services.route53.model.Change;
 import software.amazon.awssdk.services.route53.model.ChangeAction;
+import software.amazon.awssdk.services.route53.model.DeleteHostedZoneRequest;
 import software.amazon.awssdk.services.route53.model.ResourceRecordSet;
 
 import java.net.DatagramPacket;
@@ -144,6 +146,69 @@ class ApiGatewayAliasDnsIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(value = EndpointType.class, names = {"REGIONAL", "EDGE"})
+    void declaredNonVpcAliasUsesUpstreamOnlyWhileItsNativeTargetIsValid(EndpointType type) throws Exception {
+        StaticCredentialsProvider credentials =
+                StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+        try (ApiGatewayClient api = ApiGatewayClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                     .credentialsProvider(credentials).httpClientBuilder(Apache5HttpClient.builder()).build();
+             Route53Client route53 = Route53Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                     .credentialsProvider(credentials).httpClientBuilder(Apache5HttpClient.builder()).build()) {
+            String domain = "api." + UUID.randomUUID() + ".example.test";
+            String zone = null;
+            boolean domainCreated = false;
+            ResourceRecordSet installed = null;
+            List<DnsRecordSource> sources = new ArrayList<>();
+            EmbeddedDnsServer dns = new EmbeddedDnsServer(
+                    List.of(), sources, List.of(), List.of(), true, List.of(domain));
+            sources.add(new Route53DnsRecordSource(zones, config, new DnsLookupHelper(), dns));
+            sources.add(new ApiGatewayDnsRecordSource(gateways, dns));
+            DatagramSocket listener = dns.listen(vertx, "127.0.0.1", 0)
+                    .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            try {
+                zone = route53.createHostedZone(r -> r.name(domain).callerReference(UUID.randomUUID().toString()))
+                        .hostedZone().id();
+                CreateDomainNameResponse target = createDomain(api, domain, type);
+                domainCreated = true;
+                String targetName = type == EndpointType.REGIONAL
+                        ? target.regionalDomainName() : target.distributionDomainName();
+                String targetZone = type == EndpointType.REGIONAL
+                        ? target.regionalHostedZoneId() : target.distributionHostedZoneId();
+                installed = alias(domain, targetName, targetZone);
+                change(route53, zone, ChangeAction.CREATE, installed);
+                assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                        dns.planQuery(domain, "127.0.0.2", "127.0.0.1", 1));
+                assertEquals(0, ByteBuffer.wrap(query(listener, domain, 28)).getShort(6));
+
+                installed = ResourceRecordSet.builder().name(domain).type("A").ttl(45L)
+                        .resourceRecords(record -> record.value("127.0.0.1")).build();
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(),
+                        address(query(listener, domain, 1), 45));
+                installed = alias(domain, targetName, "WRONG");
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                assertEquals(5, rcode(query(listener, domain, 1)));
+                installed = alias(domain, targetName, targetZone);
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                api.deleteDomainName(r -> r.domainName(domain));
+                domainCreated = false;
+                assertEquals(5, rcode(query(listener, domain, 1)));
+            } finally {
+                listener.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+                if (installed != null) {
+                    change(route53, zone, ChangeAction.DELETE, installed);
+                }
+                if (domainCreated) {
+                    api.deleteDomainName(r -> r.domainName(domain));
+                }
+                if (zone != null) {
+                    route53.deleteHostedZone(DeleteHostedZoneRequest.builder().id(zone).build());
+                }
+            }
+        }
+    }
+
     private static CreateDomainNameResponse createDomain(ApiGatewayClient api, String domain, EndpointType type) {
         return api.createDomainName(r -> {
             r.domainName(domain).endpointConfiguration(c -> c.types(type));
@@ -203,6 +268,10 @@ class ApiGatewayAliasDnsIntegrationTest {
     }
 
     private static byte[] address(byte[] answer) {
+        return address(answer, 60);
+    }
+
+    private static byte[] address(byte[] answer, int ttlSeconds) {
         ByteBuffer packet = ByteBuffer.wrap(answer);
         packet.position(12);
         EmbeddedDnsServer.readName(packet, answer);
@@ -210,7 +279,7 @@ class ApiGatewayAliasDnsIntegrationTest {
         EmbeddedDnsServer.readName(packet, answer);
         assertEquals(1, packet.getShort());
         packet.getShort();
-        assertEquals(60, packet.getInt());
+        assertEquals(ttlSeconds, packet.getInt());
         assertEquals(4, packet.getShort());
         byte[] value = new byte[4];
         packet.get(value);
