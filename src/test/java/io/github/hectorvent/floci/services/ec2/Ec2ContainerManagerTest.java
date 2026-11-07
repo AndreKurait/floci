@@ -2035,6 +2035,38 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void failedNativeReleaseRetainsWorkloadCleanupUntilStrictRemovalSucceeds() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        Instance instance = instance("i-native-release-cleanup");
+        stubNativeInit(harness, instance);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID))
+                .thenThrow(new IllegalStateException("Native release inspection unavailable"));
+        doThrow(new IllegalStateException("Docker removal unavailable")).doNothing()
+                .when(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
+        try {
+            harness.manager.launch(instance,
+                    new ResolvedAmiImage("test/native-guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME,
+                            true, null), null, "us-west-2");
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            assertEquals("terminated", instance.getState().getName());
+            verify(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
+            verify(harness.lifecycleManager, never()).removeIfExists(TEST_CONTAINER_ID);
+            verify(harness.lifecycleManager, never()).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+            verify(harness.portAllocator, never()).release(2201);
+
+            assertTrue(harness.manager.cancelLaunch(instance));
+            InOrder order = inOrder(harness.lifecycleManager);
+            order.verify(harness.lifecycleManager, times(2)).removeIfExistsStrict(TEST_CONTAINER_ID);
+            order.verify(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
+            verify(harness.portAllocator).release(2201);
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
     void failedLaunchRetainsNativeHelperUntilWorkloadRemovalCanBeConfirmed() {
         LaunchHarness harness = launchHarness();
         Instance instance = leasedInstance("i-native-cleanup-workload");

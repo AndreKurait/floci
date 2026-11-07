@@ -704,6 +704,7 @@ public class Ec2ContainerManager {
             String eniId = null;
             String containerId = null;
             boolean recorded = false;
+            boolean nativeReleaseStarted = false;
             try {
                 if (firewallManager != null && firewallManager.enabled()) {
                     if (instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()) {
@@ -783,10 +784,30 @@ public class Ec2ContainerManager {
                 recorded = true;
                 lifecycleManager.startCreated(containerId, spec);
                 if (image.systemdV1()) {
+                    nativeReleaseStarted = true;
                     releaseNativeGuest(instance, containerId);
                 }
                 return new StartedContainer(containerId, sshHostPort);
             } catch (Exception e) {
+                if (nativeReleaseStarted) {
+                    synchronized (instance) {
+                        if (!Objects.equals(containerId, instance.getDockerContainerId())
+                                || sshHostPort != instance.getSshHostPort()) {
+                            return null;
+                        }
+                    }
+                    LOG.warnv(e, "Native EC2 launch failed for {0}; retaining strict workload cleanup",
+                            instanceId);
+                    try {
+                        failLaunch(instance, leasedPrivateIp);
+                    } catch (RuntimeException cleanupFailure) {
+                        LOG.warnv(cleanupFailure, "Native EC2 launch cleanup retained for {0}", instanceId);
+                    }
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return null;
+                }
                 boolean ownsCleanup = !recorded || clearRecordedContainer(instance, containerId, sshHostPort);
                 if (!ownsCleanup) {
                     return null;
