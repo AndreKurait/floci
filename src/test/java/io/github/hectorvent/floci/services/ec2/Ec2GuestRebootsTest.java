@@ -177,6 +177,68 @@ class Ec2GuestRebootsTest {
     }
 
     @Test
+    void transientIdleInspectionFailureRetainsObservationForTheNextPoll() {
+        reboots.watch(instance);
+        when(docker.inspectContainerCmd(CONTAINER).exec())
+                .thenThrow(new IllegalStateException("Daemon temporarily unavailable"))
+                .thenReturn(inspection);
+
+        assertFalse(reboots.isRebooting(CONTAINER));
+        assertTrue(queued.isEmpty());
+        reboots.poll();
+        assertEquals(1, queued.size());
+        queued.removeFirst().run();
+        assertEquals(List.of(instance), restarted);
+        assertFalse(reboots.isRebooting(CONTAINER));
+    }
+
+    @Test
+    void recoveredIdleInspectionStillRejectsChangedGuestOwnership() {
+        reboots.watch(instance);
+        when(docker.inspectContainerCmd(CONTAINER).exec())
+                .thenThrow(new IllegalStateException("Daemon temporarily unavailable"))
+                .thenReturn(inspection);
+
+        assertFalse(reboots.isRebooting(CONTAINER));
+        labels.put(ContainerStorageHelper.ACCOUNT_LABEL, "210987654321");
+        assertFalse(reboots.isRebooting(CONTAINER));
+        labels.put(ContainerStorageHelper.ACCOUNT_LABEL, instance.getOwnerId());
+        reboots.poll();
+        assertTrue(queued.isEmpty());
+        assertTrue(restarted.isEmpty());
+    }
+
+    @Test
+    void synchronousSchedulingFailureRemainsTerminal() {
+        reboots.close();
+        reboots = new Ec2GuestReboots(docker, config, (container, task) -> {
+            throw new RejectedExecutionException("Executor stopped");
+        }, guest -> fail("Rejected task must not run"), false);
+        reboots.watch(instance);
+
+        assertFalse(reboots.isRebooting(CONTAINER));
+        clearInvocations(docker);
+        reboots.poll();
+        verifyNoInteractions(docker);
+        assertTrue(restarted.isEmpty());
+    }
+
+    @Test
+    void inspectionFailureAfterSchedulingRemainsTerminal() {
+        reboots.watch(instance);
+        assertTrue(reboots.isRebooting(CONTAINER));
+        when(docker.inspectContainerCmd(CONTAINER).exec())
+                .thenThrow(new IllegalStateException("Cannot inspect the queued guest"));
+        queued.removeFirst().run();
+
+        assertFalse(reboots.isRebooting(CONTAINER));
+        clearInvocations(docker);
+        reboots.poll();
+        verifyNoInteractions(docker);
+        assertTrue(restarted.isEmpty());
+    }
+
+    @Test
     void aRemovedContainerRetiresItsObservation() {
         reboots.watch(instance);
         when(docker.inspectContainerCmd(CONTAINER).exec()).thenThrow(new NotFoundException("gone"));
@@ -207,33 +269,6 @@ class Ec2GuestRebootsTest {
         queued.removeFirst().run();
         assertEquals(List.of(instance), restarted);
         assertEquals("pending", instance.getState().getName());
-    }
-
-    @Test
-    void aTransientInspectionFailureDoesNotDisableLaterRebootRecovery() {
-        when(docker.inspectContainerCmd(CONTAINER).exec())
-                .thenThrow(new IllegalStateException("Temporary inspection failure"))
-                .thenReturn(inspection);
-        reboots.watch(instance);
-        assertFalse(reboots.isRebooting(CONTAINER));
-        assertTrue(queued.isEmpty());
-        assertTrue(reboots.isRebooting(CONTAINER));
-        assertEquals(1, queued.size());
-        queued.removeFirst().run();
-        assertEquals(List.of(instance), restarted);
-    }
-
-    @Test
-    void aSynchronousSchedulingFailureStillDisablesRecovery() {
-        reboots.close();
-        reboots = new Ec2GuestReboots(docker, config, (container, task) -> {
-            throw new RejectedExecutionException("Executor stopped");
-        }, guest -> fail("Rejected task must not run"), false);
-        reboots.watch(instance);
-        assertFalse(reboots.isRebooting(CONTAINER));
-        clearInvocations(docker);
-        reboots.poll();
-        verifyNoInteractions(docker);
     }
 
     @Test

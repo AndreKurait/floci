@@ -100,7 +100,7 @@ final class Ec2GuestReboots implements AutoCloseable {
             guests.remove(container, guest);
             return false;
         } catch (RuntimeException failure) {
-            LOG.warnv(failure, "Could not inspect native EC2 guest {0}; observation will retry", container);
+            LOG.debugv(failure, "Could not inspect native EC2 guest for reboot; will retry: {0}", container);
             return false;
         }
         try {
