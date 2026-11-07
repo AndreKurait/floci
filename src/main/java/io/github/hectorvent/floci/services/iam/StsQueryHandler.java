@@ -78,6 +78,7 @@ public class StsQueryHandler {
     private final CentralRootAccess centralRootAccess;
     private final WebIdentityTokenIssuer tokenIssuer;
     private final Clock clock;
+    private final StsSessionTagAuthorizer sessionTagAuthorizer;
 
     /** CSPRNG for session secret keys and session tokens; ordinary IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
@@ -98,10 +99,10 @@ public class StsQueryHandler {
                            SAMLTrustPolicyEvaluator samlTrustEvaluator,
                            DelegationRequestService delegationRequestService,
                            CentralRootAccess centralRootAccess,
-                           WebIdentityTokenIssuer tokenIssuer) {
+                           WebIdentityTokenIssuer tokenIssuer, StsSessionTagAuthorizer sessionTagAuthorizer) {
         this(iamService, accountResolver, regionResolver, config, trustPolicyEvaluator, webIdentityTrustEvaluator,
                 tokenVerifier, oidcIssuerKeys, samlProviderService, samlTrustEvaluator, delegationRequestService,
-                centralRootAccess, tokenIssuer, Clock.systemUTC());
+                centralRootAccess, tokenIssuer, sessionTagAuthorizer, Clock.systemUTC());
     }
 
     StsQueryHandler(IamService iamService, AccountResolver accountResolver, RegionResolver regionResolver,
@@ -113,7 +114,7 @@ public class StsQueryHandler {
                     SAMLTrustPolicyEvaluator samlTrustEvaluator,
                     DelegationRequestService delegationRequestService,
                     CentralRootAccess centralRootAccess,
-                    WebIdentityTokenIssuer tokenIssuer,
+                    WebIdentityTokenIssuer tokenIssuer, StsSessionTagAuthorizer sessionTagAuthorizer,
                     Clock clock) {
         this.iamService = iamService;
         this.accountResolver = accountResolver;
@@ -129,6 +130,7 @@ public class StsQueryHandler {
         this.centralRootAccess = centralRootAccess;
         this.tokenIssuer = tokenIssuer;
         this.clock = clock;
+        this.sessionTagAuthorizer = sessionTagAuthorizer;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params) {
@@ -160,6 +162,7 @@ public class StsQueryHandler {
         if (validation != null) {
             return validation;
         }
+        Map<String, String> sessionTags = StsSessionTags.read(params);
         String roleArn = getParam(params, "RoleArn");
         String sessionName = getParam(params, "RoleSessionName");
         int durationSeconds = getIntParam(params, "DurationSeconds", 3600);
@@ -176,7 +179,7 @@ public class StsQueryHandler {
         String accountId = AwsArnUtils.accountOrDefault(roleArn, callerAccountId);
 
         IamRole role = iamService.findRole(accountId, roleName).orElse(null);
-        Response trustDenied = enforceTrustPolicy(roleArn, role, accountId, params);
+        Response trustDenied = enforceTrustPolicy(roleArn, role, accountId, params, sessionTags);
         if (trustDenied != null) {
             return trustDenied;
         }
@@ -204,7 +207,7 @@ public class StsQueryHandler {
         String sessionPolicy = getParam(params, "Policy");
         iamService.registerSession(
                 accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
-                sessionName, assumedRoleId);
+                sessionName, assumedRoleId, sessionTags);
 
         String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
@@ -234,7 +237,7 @@ public class StsQueryHandler {
      * principal does wherever else Floci builds it.
      */
     private Response enforceTrustPolicy(String roleArn, IamRole role, String roleAccountId,
-                                        MultivaluedMap<String, String> params) {
+                                        MultivaluedMap<String, String> params, Map<String, String> sessionTags) {
         String callerAccount = regionResolver.getAccountId();
         IamService.CallerArns caller = iamService.resolveCallerArns(callerAccessKeyId())
                 .orElseGet(() -> IamService.CallerArns.accountRoot(
@@ -256,6 +259,7 @@ public class StsQueryHandler {
 
         Map<String, List<String>> requestContext = IamConditionContextResolver.withGlobalContext(
                 null, roleArn, regionResolver.getRegion(), callerAccount, roleAccountId);
+        requestContext.putAll(StsSessionTags.context(sessionTags));
         requestContext.put("sts:RoleSessionName", List.of(getParam(params, "RoleSessionName")));
         String externalId = getParam(params, "ExternalId");
         if (externalId != null) {
@@ -263,6 +267,12 @@ public class StsQueryHandler {
         }
         if (trustPolicyEvaluator.allows(role.getAssumeRolePolicyDocument(), caller, callerAccount,
                 requestContext)) {
+            if (!sessionTags.isEmpty() && !sessionTagAuthorizer.allows(callerAccessKeyId(), caller,
+                    callerAccount, role, requestContext)) {
+                return AwsQueryResponse.error("AccessDenied",
+                        "User: " + callerArn + " is not authorized to perform: sts:TagSession on resource: " + roleArn,
+                        AwsNamespaces.STS, 403);
+            }
             return null;
         }
         return AwsQueryResponse.error("AccessDenied",
