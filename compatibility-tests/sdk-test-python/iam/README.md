@@ -27,3 +27,8 @@ token, and `iam:PassRole` with the AppConfig service condition.
 unqualified subscription and an alias. It observes actual handler logs, revokes
 and restores the topic's permission, and verifies that an SQS sibling continues
 receiving messages during denial. It requires Docker for the Lambda runtime.
+
+`test_stepfunctions_apigateway_resource_policy.py` checks seven IAM_ROLE task
+resource-policy combinations through a real Step Functions execution and API
+Gateway MOCK integration. It runs here because the default Python suite disables
+IAM enforcement. The signed IAM job checks both allowed and denied executions.
