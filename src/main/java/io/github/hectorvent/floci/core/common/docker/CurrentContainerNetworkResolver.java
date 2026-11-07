@@ -151,7 +151,10 @@ public class CurrentContainerNetworkResolver {
                 return Optional.empty();
             }
 
-            Optional<CurrentContainerNetwork> selected = selectNetwork(networks);
+            String creationNetwork = inspect.getHostConfig() == null
+                    ? null : inspect.getHostConfig().getNetworkMode();
+            Optional<CurrentContainerNetwork> selected = selectNetwork(
+                    networks, "default".equals(creationNetwork) ? "bridge" : creationNetwork);
             selected.ifPresent(network -> LOG.infov(
                     "Detected current Docker network for spawned containers: {0} ({1})",
                     network.name(), network.ipAddress()));
@@ -162,14 +165,14 @@ public class CurrentContainerNetworkResolver {
         }
     }
 
-    private Optional<CurrentContainerNetwork> selectNetwork(Map<String, ContainerNetwork> networks) {
+    private Optional<CurrentContainerNetwork> selectNetwork(Map<String, ContainerNetwork> networks,
+                                                            String creationNetwork) {
         if (configuredNetwork != null) {
-            return networks.entrySet().stream()
-                    .filter(entry -> isUsable(entry.getValue()))
-                    .filter(entry -> configuredNetwork.equals(entry.getKey())
-                            || configuredNetwork.equals(entry.getValue().getNetworkID()))
-                    .map(entry -> new CurrentContainerNetwork(entry.getKey(), entry.getValue().getIpAddress()))
-                    .findFirst();
+            return namedNetwork(networks, configuredNetwork);
+        }
+        Optional<CurrentContainerNetwork> original = namedNetwork(networks, creationNetwork);
+        if (original.isPresent()) {
+            return original;
         }
         return networks.entrySet().stream()
                 .filter(entry -> isUsable(entry.getValue()))
@@ -179,6 +182,17 @@ public class CurrentContainerNetworkResolver {
                         .filter(entry -> isUsable(entry.getValue()))
                         .findFirst())
                 .map(entry -> new CurrentContainerNetwork(entry.getKey(), entry.getValue().getIpAddress()));
+    }
+
+    private Optional<CurrentContainerNetwork> namedNetwork(Map<String, ContainerNetwork> networks, String selection) {
+        if (selection == null) {
+            return Optional.empty();
+        }
+        return networks.entrySet().stream()
+                .filter(entry -> isUsable(entry.getValue()))
+                .filter(entry -> selection.equals(entry.getKey()) || selection.equals(entry.getValue().getNetworkID()))
+                .map(entry -> new CurrentContainerNetwork(entry.getKey(), entry.getValue().getIpAddress()))
+                .findFirst();
     }
 
     private boolean isUsable(ContainerNetwork network) {

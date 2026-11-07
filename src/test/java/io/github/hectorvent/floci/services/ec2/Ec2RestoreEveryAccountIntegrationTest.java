@@ -30,7 +30,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Startup restore runs from {@code @PostConstruct}, on a thread with no request, where account-aware
+ * The startup observer restores instances on a thread with no request, where account-aware
  * storage resolves to the default account. These tests run it the same way, on a bare thread, for
  * an instance owned by another account.
  */

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -78,6 +79,7 @@ final class VpcAwsApiBridge {
             throw new IllegalStateException("Invalid container-reachable AWS API endpoint");
         }
         backendPort = target.getPort();
+        retireOrphans();
         ContainerSpec spec = containers.newContainer(config.network().securityGroupEnforcement().helperImage())
                 .withName(ContainerStorageHelper.resourceName(config, SERVICE, null, UUID.randomUUID().toString()))
                 .withDockerNetwork(Optional.empty()).withHostDockerInternalOnLinux().withCapAdd("NET_ADMIN")
@@ -115,6 +117,23 @@ final class VpcAwsApiBridge {
                 failure.addSuppressed(cleanupFailure);
             }
             throw failure;
+        }
+    }
+
+    private void retireOrphans() {
+        String owner = ContainerStorageHelper.ownerIdentity(config);
+        Map<String, String> selection = Map.of(
+                ContainerStorageHelper.OWNER_LABEL, owner, ContainerStorageHelper.SERVICE_LABEL, SERVICE);
+        for (Container container : docker.listContainersCmd().withShowAll(true).withLabelFilter(selection).exec()) {
+            Map<String, String> labels = container.getLabels();
+            if (labels == null || !owner.equals(labels.get(ContainerStorageHelper.OWNER_LABEL))
+                    || !SERVICE.equals(labels.get(ContainerStorageHelper.SERVICE_LABEL))) {
+                continue;
+            }
+            String[] names = container.getNames();
+            new NetworkNamespaceLease(container.getId(), names == null || names.length == 0 ? null : names[0])
+                    .requireUnused(docker);
+            lifecycle.removeIfExistsStrict(container.getId());
         }
     }
 
