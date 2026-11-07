@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ec2.net;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler.ControlConnection;
 
 import java.util.List;
@@ -32,8 +33,8 @@ final class VpcRoutingCommands {
                 """;
     }
 
-    static String endpoint(String privateAddress, List<LocalRoute> localRoutes, List<Hop> hops,
-                           List<String> resolvers, List<ControlConnection> controls,
+    static String endpoint(String privateAddress, String privateDevice, List<LocalRoute> localRoutes, List<Hop> hops,
+                           List<String> deniedDestinations, List<String> resolvers, List<ControlConnection> controls,
                            boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources) {
         String source = VpcRouteSelection.ipv4(privateAddress);
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush proto 186\n");
@@ -41,6 +42,12 @@ final class VpcRoutingCommands {
             script.append("ip -4 route replace ").append(hop.destination()).append("/32 via ")
                     .append(hop.gateway()).append(" dev ").append(hop.device())
                     .append(" src ").append(source).append(" proto 186\n");
+        }
+        // A route lookup must reach OUTPUT for its drop policy to model a packet timeout.
+        for (String destination : deniedDestinations) {
+            script.append("ip -4 route replace ").append(VpcRouteSelection.ipv4(destination))
+                    .append("/32 dev ").append(device(privateDevice)).append(" src ").append(source)
+                    .append(" proto 186\n");
         }
         StringBuilder rules = new StringBuilder("flush chain inet floci_vpc_routes ingress\n")
                 .append("flush chain inet floci_vpc_routes egress\n")
@@ -85,6 +92,10 @@ final class VpcRoutingCommands {
             }
             rules.append("counter accept\n");
         }
+        for (String destination : deniedDestinations) {
+            rules.append("add rule inet floci_vpc_routes egress ip daddr ")
+                    .append(VpcRouteSelection.ipv4(destination)).append(" counter drop\n");
+        }
         for (LocalRoute route : localRoutes) {
             rules.append("add rule inet floci_vpc_routes egress ip daddr ").append(route.destination())
                     .append(route.allowed() ? " counter accept\n" : " counter drop\n");
@@ -108,6 +119,21 @@ final class VpcRoutingCommands {
                 + external + " dnat to " + internal + "\n"
                 + "add rule ip floci_public_address outgoing oifname \"" + device + "\" ip saddr "
                 + internal + " snat to " + external + "\n");
+    }
+
+    static String publicInstanceSource(String privateAddress, String publicAddress, String publicDevice) {
+        String rules = """
+                add table ip floci_instance_api
+                add chain ip floci_instance_api outgoing { type nat hook postrouting priority srcnat; }
+                flush chain ip floci_instance_api outgoing
+                """;
+        if (publicAddress != null) {
+            rules += "add rule ip floci_instance_api outgoing oifname \"" + device(publicDevice)
+                    + "\" ip saddr " + VpcRouteSelection.ipv4(privateAddress) + " ip daddr "
+                    + EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS
+                    + " snat to " + VpcRouteSelection.ipv4(publicAddress) + "\n";
+        }
+        return nft(rules);
     }
 
     static String natGuard() {
@@ -183,16 +209,16 @@ final class VpcRoutingCommands {
                 .append("add rule inet floci_public_api egress ip daddr ").append(backend)
                 .append(" tcp dport ").append(backendPort).append(" counter accept\n");
         for (Hop caller : callers) {
-            if (!outside.equals(caller.device()) || !caller.replyOnly()) {
-                throw new IllegalArgumentException("Public API return routes require the public interface");
+            if (!caller.replyOnly()) {
+                throw new IllegalArgumentException("Public API routes must only permit replies");
             }
             script.append("ip -4 route replace ").append(caller.destination()).append("/32 via ")
-                    .append(caller.gateway()).append(" dev ").append(outside)
+                    .append(caller.gateway()).append(" dev ").append(caller.device())
                     .append(" src ").append(external).append(" proto 186\n");
-            rules.append("add rule inet floci_public_api ingress iifname \"").append(outside)
+            rules.append("add rule inet floci_public_api ingress iifname \"").append(caller.device())
                     .append("\" ip saddr ").append(caller.destination()).append(" ip daddr ").append(external)
                     .append(" tcp dport { 80, 443 } counter accept\n")
-                    .append("add rule inet floci_public_api egress oifname \"").append(outside)
+                    .append("add rule inet floci_public_api egress oifname \"").append(caller.device())
                     .append("\" ip saddr ").append(external).append(" ip daddr ").append(caller.destination())
                     .append(" tcp sport { 80, 443 } ct state established,related counter accept\n");
         }

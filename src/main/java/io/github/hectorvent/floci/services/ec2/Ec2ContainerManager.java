@@ -1341,6 +1341,7 @@ public class Ec2ContainerManager {
             } catch (Exception e) {
                 LOG.warnv("Error stopping EC2 container {0}: {1}", containerId, e.getMessage());
             }
+            refreshPublicRouting(instance, null);
             instance.compareAndSetState(stopping, InstanceState.stopped());
         });
     }
@@ -1898,6 +1899,19 @@ public class Ec2ContainerManager {
         }
         instance.setPublicIpAddress(publicAddress);
         instance.setPublicDnsName("127.0.0.1".equals(publicAddress) ? "localhost" : publicAddress);
+        refreshPublicRouting(instance);
+    }
+
+    void refreshPublicRouting(Instance instance) {
+        refreshPublicRouting(instance, instance.getPublicIpAddress());
+    }
+
+    void refreshPublicRouting(Instance instance, String address) {
+        if (firewallManager != null && firewallManager.enabled()
+                && instance.getNetworkInterfaces() != null && !instance.getNetworkInterfaces().isEmpty()) {
+            firewallManager.publishPublicAddress(instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId(),
+                    address);
+        }
     }
 
     static void exposeReachablePrivateAddress(Instance instance, String privateIp) {

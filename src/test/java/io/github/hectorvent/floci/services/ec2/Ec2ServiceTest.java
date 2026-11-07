@@ -10311,6 +10311,30 @@ class Ec2ServiceTest {
                         .getFirst().getInstances().getFirst().getPublicIpAddress());
     }
 
+    @Test
+    void failedPublicRouteDoesNotPublishAnUnreachableElasticAddressAndCanBeRetried() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        when(manager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.9");
+        Ec2Service service = eipService(manager);
+        String instanceId = launchOne(service);
+        Instance instance = service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                .getFirst().getInstances().getFirst();
+        String previousAddress = instance.getPublicIpAddress();
+        Address allocated = service.allocateAddress("us-east-1");
+        doThrow(new IllegalStateException("Routing namespace unavailable")).doNothing()
+                .when(manager).refreshPublicRouting(instance, "192.168.215.9");
+
+        assertThrows(IllegalStateException.class,
+                () -> service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId));
+        assertEquals(previousAddress, instance.getPublicIpAddress(),
+                "Failed route admission must leave the instance address eligible for retry");
+
+        Address associated = service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId);
+        assertEquals("192.168.215.9", associated.getPublicIp());
+        assertEquals("192.168.215.9", instance.getPublicIpAddress());
+        verify(manager, times(2)).refreshPublicRouting(instance, "192.168.215.9");
+    }
+
     /**
      * DescribeAddresses is where Terraform refreshes public_ip, and Docker hands out a new
      * bridge IP after a stop/start, so the association has to be re-resolved on read.

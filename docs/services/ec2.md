@@ -1312,20 +1312,32 @@ both the NAT and frontend subnets' internet-gateway routes must exist; missing o
 unsupported routes drop traffic. Frontend security-group ingress remains a
 separate requirement.
 
-`FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API=true` also routes private workloads to
-Floci's public AWS APIs through their NAT. Enable DNS spoofing
+`FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API=true` also routes workloads to
+Floci's public AWS APIs. Private workloads use their NAT; EC2 instances with a
+native public IPv4 address use their subnet's attached internet-gateway route.
+Enable DNS spoofing
 (`FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true`) and TLS (`FLOCI_TLS_ENABLED=true`) for clients
 using normal AWS HTTPS endpoints, and install Floci's CA in the client's trust store.
 Known VPC clients resolve spoofed AWS API names to `192.0.2.1`; stored resource
 DNS answers still take precedence. Security-group egress, a private-subnet NAT
-route and the NAT subnet's attached internet-gateway route remain required.
+route and the NAT subnet's attached internet-gateway route remain required for
+private callers. Public EC2 callers require security-group egress and their
+own internet-gateway route, without a NAT gateway. Elastic IP association and
+removal, stop and start update this admission.
+An internal Docker control network stays isolated. Floci attaches these public
+instances to its managed public transport for AWS API traffic and preserves the
+instance's advertised public source address there. It removes that attachment
+when the public address or instance retires. Routing and NAT are programmed inside
+owned namespaces. Managed public destinations without an admitted path still
+reach the namespace's drop policy, including when Docker supplies no default route.
 HTTP and HTTPS use their standard ports. This does not enable arbitrary internet
-access, public-instance routes or VPC endpoints. The shared TLS proxy does not
-preserve the NAT source for IAM `aws:SourceIp` evaluation.
+access, other public-instance destinations or VPC endpoints. The host-port
+loopback fallback is not a native public IPv4 address. The shared TLS proxy does
+not preserve the original source for IAM `aws:SourceIp` evaluation.
 
 With both routing flags enabled, Floci omits its automatic `AWS_ENDPOINT_URL`
 from protected EC2 and Docker Lambda workloads. SDKs select their normal AWS
-endpoints, so API calls exercise the NAT and security-group path. Region,
+endpoints, so API calls exercise their declared routes and security groups. Region,
 credentials, IMDS and the Lambda Runtime API keep their existing configuration.
 Explicit function or image endpoint settings remain application inputs.
 
