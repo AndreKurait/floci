@@ -141,7 +141,7 @@ class StsQueryHandlerTest {
         assertEquals(200, response.getStatus());
         assertTrue(response.getEntity().toString().contains("<SourceIdentity>original</SourceIdentity>"));
         verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
-                isNull(), eq("000000000000"), eq("source"), anyString(), eq(Map.of()), eq(Map.of()), eq("original"));
+                isNull(), eq("000000000000"), eq("source"), anyString(), eq(Map.of()), eq(Map.of()), eq("original"), eq(List.of()));
     }
 
     @Test
@@ -159,13 +159,13 @@ class StsQueryHandlerTest {
         parameters.putSingle("Tags.member.3.Value", "session");
         assertEquals(200, handler.handle("AssumeRole", parameters).getStatus());
         verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
-                isNull(), eq("000000000000"), eq("tagged"), anyString(), eq(Map.of("Project", "session")), eq(Map.of()), isNull());
+                isNull(), eq("000000000000"), eq("tagged"), anyString(), eq(Map.of("Project", "session")), eq(Map.of()), isNull(), eq(List.of()));
         parameters.putSingle("Tags.member.3.Key", "");
         Response invalid = handler.handle("AssumeRole", parameters);
         assertEquals(400, invalid.getStatus());
         assertTrue(invalid.getEntity().toString().contains("<Code>ValidationError</Code>"));
         verify(service).registerSession(anyString(), anyString(), anyString(), anyString(), any(),
-                any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class));
+                any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class), anyList());
     }
 
     @ParameterizedTest
@@ -196,7 +196,7 @@ class StsQueryHandlerTest {
                         eq("000000000000"), eq("AKIAlongterm"), isNull(), isNull(), eq(now));
             } else {
                 verify(service).registerIssuedSession(anyString(), anyString(), anyString(), anyString(),
-                        expiration.capture(), isNull(), eq("000000000000"), eq("AKIAlongterm"));
+                        expiration.capture(), isNull(), eq("000000000000"), eq("AKIAlongterm"), eq(List.of()));
             }
             assertEquals(expected, expiration.getValue());
         }
@@ -539,7 +539,7 @@ class StsQueryHandlerTest {
 
         assertEquals(200, response.getStatus(), (String) response.getEntity());
         verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
-                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(Map.of()), eq(Map.of()), isNull());
+                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
     }
 
     @Test
@@ -627,13 +627,13 @@ class StsQueryHandlerTest {
             assertTrue(body.contains("<Code>ValidationError</Code>"), body);
             assertTrue(body.contains("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."), body);
             verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                    any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class));
+                    any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class), anyList());
         } else {
             Instant expiry = now.plusSeconds(requested == 0 ? 3600 : requested);
             assertEquals(expiry.toString(), extract(EXPIRATION, body));
             verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()),
                     eq(expiry), isNull(), eq("000000000000"), eq("duration"),
-                    anyString(), eq(Map.of()), eq(Map.of()), isNull());
+                    anyString(), eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
         }
     }
 
@@ -649,7 +649,7 @@ class StsQueryHandlerTest {
         assertEquals(403, response.getStatus());
         assertTrue(response.getEntity().toString().contains("<Code>AccessDenied</Code>"));
         verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class));
+                any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class), anyList());
     }
 
     @Test
@@ -759,7 +759,7 @@ class StsQueryHandlerTest {
         if (status == 400) {
             assertTrue(((String) response.getEntity()).contains("ValidationError"));
             verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                    any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class));
+                    any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class), anyList());
         }
     }
 
@@ -1103,7 +1103,7 @@ class StsQueryHandlerTest {
         ArgumentCaptor<Instant> sessionExpiration = ArgumentCaptor.forClass(Instant.class);
         verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()),
                 sessionExpiration.capture(), isNull(), eq("000000000000"), eq("sx"),
-                anyString(), eq(Map.of()), eq(Map.of()), isNull());
+                anyString(), eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
         assertEquals(expiration, sessionExpiration.getValue());
     }
 
@@ -1148,10 +1148,10 @@ class StsQueryHandlerTest {
         if (status == 400) {
             assertTrue(response.getEntity().toString().contains("role chaining"));
             verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(), any(),
-                    any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class));
+                    any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class), anyList());
         } else {
             verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
-                    isNull(), eq("000000000000"), eq("chained"), anyString(), eq(Map.of()), eq(Map.of()), isNull());
+                    isNull(), eq("000000000000"), eq("chained"), anyString(), eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
         }
     }
 
@@ -1199,6 +1199,6 @@ class StsQueryHandlerTest {
                 eq("arn:aws:iam::000000000002:user/admin"), eq(expiry), isNull(),
                 eq("000000000002"));
         verify(iamService, never()).registerIssuedSession(anyString(), anyString(), anyString(),
-                anyString(), any(), any(), anyString(), any());
+                anyString(), any(), any(), anyString(), any(), anyList());
     }
 }
