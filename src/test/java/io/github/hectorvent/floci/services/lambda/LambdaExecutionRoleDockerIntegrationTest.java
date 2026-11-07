@@ -2,10 +2,12 @@ package io.github.hectorvent.floci.services.lambda;
 
 import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -61,7 +63,7 @@ class LambdaExecutionRoleDockerIntegrationTest {
                 """);
 
         try {
-            given()
+            lambda()
                     .contentType("application/json")
                     .body("""
                         {
@@ -83,7 +85,7 @@ class LambdaExecutionRoleDockerIntegrationTest {
             .then()
                     .statusCode(201);
 
-            Response response = given()
+            Response response = lambda()
                     .contentType("application/json")
                     .body("{}")
             .when()
@@ -102,10 +104,14 @@ class LambdaExecutionRoleDockerIntegrationTest {
             assertNull(iamService.resolveCallerContext(accessKeyId),
                     "ephemeral container stop should unregister its execution-role session");
         } finally {
-            given().when().delete(BASE_PATH + "/functions/" + functionName);
+            lambda().when().delete(BASE_PATH + "/functions/" + functionName);
             iamService.deleteRolePolicy(roleName, "RuntimePolicy");
             iamService.deleteRole(roleName);
         }
+    }
+
+    private static RequestSpecification lambda() {
+        return given().filter(AwsRequestSigner.signedAs(ACCOUNT_ID, "test", "lambda"));
     }
 
     private static String handlerZipBase64() throws Exception {
