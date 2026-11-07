@@ -117,6 +117,14 @@ EC2 launch behavior and counts each member under the requested zone. This permit
 real zones outside the local subnet catalog, such as `us-east-1d`; the underlying
 EC2 instance can use a default subnet in a different zone.
 
+### Tags
+
+| Operation | Notes |
+|---|---|
+| `DescribeTags` | Returns stored group tags in the caller's account and region. Filters support `auto-scaling-group`, `key`, `value`, and `propagate-at-launch`, with AND across filters and OR across values. Names are case-insensitive; string values are case-sensitive. Boolean values accept case and surrounding whitespace. Empty `Values` ignores a valid filter; missing `Name` or `Values` raises `ValidationError`. `MaxRecords` defaults to 50 and accepts 1 to 100; `NextToken` continues the result |
+| `CreateOrUpdateTags` | Creates or updates tags and their `PropagateAtLaunch` values |
+| `DeleteTags` | Removes tags from the named group |
+
 ### Instance Management
 
 | Operation | Notes |
@@ -125,7 +133,7 @@ EC2 instance can use a default subnet in a different zone.
 | `SetInstanceHealth` | Updates an instance's health status immediately; accepts but does not enforce the grace-period flag |
 | `SetInstanceProtection` | Enables or disables scale-in protection for named instances in a group |
 | `SetDesiredCapacity` | Updates desired count; reconciler handles scale-out / scale-in within 10 s |
-| `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
+| `AttachInstances` | Attaches existing EC2 instances to a group; waits for configured load-balancer registration before `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
 | `TerminateInstanceInAutoScalingGroup` | Requests termination of a specific instance; optionally decrements desired capacity and returns its `InProgress` activity |
 | `EnterStandby` | Moves `InService` instances to `EnteringStandby` and returns one `InProgress` activity (progress 50) per instance; the reconciler deregisters them from the group's target groups and Classic Load Balancers and sets `Standby` within 10 s. `ShouldDecrementDesiredCapacity=true` lowers desired capacity by the number of instances, refused with `ValidationError` below `MinSize`; `false` keeps it, so the group launches replacements |
@@ -154,15 +162,36 @@ the group's name. `AttachInstances` adds the same group tags and `aws:autoscalin
 overwriting existing tags with the same keys. `DetachInstances` removes only
 `aws:autoscaling:groupName`, and only while it names the group being detached from.
 
-`AttachInstances` does not yet refuse what AWS refuses for the instance's state or zone or for
-the group's `MaxSize`, and does not grow desired capacity by the number of instances attached.
-An ID EC2 has no instance for joins the group without tags.
+Attachment checks EC2 existence, running state and the group's effective Availability
+Zones before changing tags or membership. A different subnet or VPC in a matching
+zone is accepted. Repeated IDs count once toward desired capacity. Suspended Launch
+or capacity above the maximum rejects the attachment. Each newly attached instance
+increases the existing desired capacity by one.
+When the group names target groups or Classic load balancers, attached instances
+remain `Pending` until registration succeeds. Failed registrations retry through
+reconciliation, including after a storage reload. Groups without load balancers
+complete attachment immediately.
+
+Detach validates the whole batch before deleting membership tags or refresh ownership.
+Missing members, Pending or Detaching members, and a decremented desired capacity below
+the minimum are rejected. Retained lifecycle states require
+`ShouldDecrementDesiredCapacity=false`, as the
+[DetachInstances API](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_DetachInstances.html)
+specifies. Selected refresh originals remain detachable while their EC2
+instances are still running, including refreshes stored before replacement ownership
+was recorded. A missing EC2 original produces the same lifecycle `ValidationError`
+as a terminated original. Detachment completes synchronously; Floci does not
+reproduce AWS's asynchronous Detaching transition.
+
+Group deletion retains a `Delete in progress` entry until child cleanup finishes.
+If a storage operation fails, retrying deletion continues cleanup; reconciliation
+does not launch replacement instances for the retained deleting group.
 
 Standby follows the
 [user guide](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-enter-exit-standby.html).
-A member in `EnteringStandby` or `Standby` does not count toward desired capacity, including when
-`AttachInstances` raises desired capacity to the group's size, and is never chosen for scale-in or
-instance refresh. `StartInstanceRefresh` leaves such members alone whatever its `StandbyInstances`
+A member in `EnteringStandby` or `Standby` does not count toward desired capacity and is never chosen
+for scale-in or instance refresh. Attaching new instances increases the existing desired capacity
+without counting standby members again. `StartInstanceRefresh` leaves such members alone whatever its `StandbyInstances`
 preference says, as AWS does for `Ignore`; AWS's default, `Wait`, and `Terminate` are not
 implemented. A member keeps its health status in standby and when it returns to service, and stays
 in the group even when its EC2 instance stops or terminates. If it did, the member fails the health
@@ -174,9 +203,9 @@ Each move's activity carries the description and cause AWS writes and completes 
 `Cancelled` when the instance is terminated first, fails that health check, is replaced by an
 instance refresh on its way back to service, or when the group is deleted. `DetachInstances` refuses
 an instance whose move is still in progress, such as one in `EnteringStandby` or `Pending` on its way
-back, with `The instance <id> is not in InService or Standby.`, AWS's answer for a state it does not
-detach; Floci does not refuse the other such states yet. Floci does not wait for connection draining and
-does not write the activity's `Details` member.
+back, with `The instance <id> is not in InService or Standby.` Other lifecycle-state validation
+follows the detach rules above. Floci does not wait for connection draining and does not write
+the activity's `Details` member.
 
 ### Instance Refresh
 
@@ -334,6 +363,10 @@ Direct and mixed launch templates retain the selected version's original user-da
 encoding for instance attributes and metadata, including compressed and binary
 payloads. Execution still uses decoded text. Older templates that store only
 execution text retain that text through a UTF-8 fallback.
+
+For direct and mixed launch templates, omitting the version selects `$Default`.
+Explicit `$Default`, `$Latest`, and numeric versions keep their requested selection.
+Image validation and instance-profile authorization use that same version selection.
 
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
 

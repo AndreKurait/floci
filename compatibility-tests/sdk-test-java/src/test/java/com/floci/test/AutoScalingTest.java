@@ -5,7 +5,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
-import software.amazon.awssdk.services.autoscaling.model.AttachInstancesRequest;
 import software.amazon.awssdk.services.autoscaling.model.AutoScalingException;
 import software.amazon.awssdk.services.autoscaling.model.AutoScalingGroup;
 import software.amazon.awssdk.services.autoscaling.model.AvailabilityZoneDistribution;
@@ -14,7 +13,6 @@ import software.amazon.awssdk.services.autoscaling.model.CapacityReservationTarg
 import software.amazon.awssdk.services.autoscaling.model.CreateAutoScalingGroupRequest;
 import software.amazon.awssdk.services.autoscaling.model.CreateLaunchConfigurationRequest;
 import software.amazon.awssdk.services.autoscaling.model.DeleteAutoScalingGroupRequest;
-import software.amazon.awssdk.services.autoscaling.model.DesiredConfiguration;
 import software.amazon.awssdk.services.autoscaling.model.DisableMetricsCollectionRequest;
 import software.amazon.awssdk.services.autoscaling.model.EnableMetricsCollectionRequest;
 import software.amazon.awssdk.services.autoscaling.model.EnabledMetric;
@@ -26,12 +24,14 @@ import software.amazon.awssdk.services.autoscaling.model.LaunchTemplate;
 import software.amazon.awssdk.services.autoscaling.model.LaunchTemplateOverrides;
 import software.amazon.awssdk.services.autoscaling.model.LaunchTemplateSpecification;
 import software.amazon.awssdk.services.autoscaling.model.MixedInstancesPolicy;
-import software.amazon.awssdk.services.autoscaling.model.StartInstanceRefreshRequest;
 import software.amazon.awssdk.services.autoscaling.model.UpdateAutoScalingGroupRequest;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.CreateLaunchTemplateRequest;
-import software.amazon.awssdk.services.ec2.model.CreateLaunchTemplateVersionRequest;
+import software.amazon.awssdk.services.ec2.model.DescribeInstancesRequest;
 import software.amazon.awssdk.services.ec2.model.RequestLaunchTemplateData;
+import software.amazon.awssdk.services.ec2.waiters.Ec2Waiter;
+
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -192,79 +192,69 @@ class AutoScalingTest {
 
     @Test
     @DisplayName("UpdateAutoScalingGroup rejects desired configuration changes during active instance refresh")
-    void activeInstanceRefreshDesiredConfigurationConflictMapsToSdkAutoScalingException() {
+    void activeInstanceRefreshDesiredConfigurationConflictMapsToSdkAutoScalingException() throws Exception {
         String launchTemplateName = TestFixtures.uniqueName("sdk-active-refresh");
         String autoScalingGroupName = TestFixtures.uniqueName("sdk-active-refresh-asg");
+        String imageId = ec2.registerImage(request -> request.name(launchTemplateName)
+                .architecture("x86_64").rootDeviceName("/dev/sda1")).imageId();
+        try (AutoCloseable image = () -> ec2.deregisterImage(request -> request.imageId(imageId))) {
+            ec2.createLaunchTemplate(request -> request.launchTemplateName(launchTemplateName)
+                    .launchTemplateData(data -> data.imageId(imageId).instanceType("t3.micro")));
+            try (AutoCloseable template = () -> ec2.deleteLaunchTemplate(
+                    request -> request.launchTemplateName(launchTemplateName))) {
+                ec2.createLaunchTemplateVersion(request -> request.launchTemplateName(launchTemplateName)
+                        .sourceVersion("1").launchTemplateData(data -> data.imageId(imageId).instanceType("t3.small")));
+                ec2.createLaunchTemplateVersion(request -> request.launchTemplateName(launchTemplateName)
+                        .sourceVersion("1").launchTemplateData(data -> data.imageId(imageId).instanceType("t3.medium")));
+                String instanceId = ec2.runInstances(request -> request.imageId(imageId)
+                        .instanceType("t3.micro").minCount(1).maxCount(1)
+                        .placement(placement -> placement.availabilityZone(TestFixtures.availabilityZone())))
+                        .instances().get(0).instanceId();
+                try (AutoCloseable instance = () -> ec2.terminateInstances(request -> request.instanceIds(instanceId));
+                        Ec2Waiter waiter = ec2.waiter()) {
+                    waiter.waitUntilInstanceRunning(DescribeInstancesRequest.builder().instanceIds(instanceId).build(),
+                                    TestFixtures.waiterOverride(Duration.ofMinutes(2)))
+                            .matched().response().orElseThrow();
+                    String availabilityZone = ec2.describeInstances(request -> request.instanceIds(instanceId))
+                            .reservations().get(0).instances().get(0).placement().availabilityZone();
+                    autoScaling.createAutoScalingGroup(request -> request.autoScalingGroupName(autoScalingGroupName)
+                            .launchTemplate(templateSpec -> templateSpec.launchTemplateName(launchTemplateName).version("1"))
+                            .minSize(0).maxSize(1).desiredCapacity(0).availabilityZones(availabilityZone));
+                    try (AutoCloseable group = () -> autoScaling.deleteAutoScalingGroup(
+                            request -> request.autoScalingGroupName(autoScalingGroupName).forceDelete(true))) {
+                        autoScaling.attachInstances(request -> request.autoScalingGroupName(autoScalingGroupName)
+                                .instanceIds(instanceId));
+                        autoScaling.suspendProcesses(request -> request.autoScalingGroupName(autoScalingGroupName)
+                                .scalingProcesses("InstanceRefresh"));
+                        autoScaling.startInstanceRefresh(request -> request.autoScalingGroupName(autoScalingGroupName)
+                                .desiredConfiguration(configuration -> configuration.launchTemplate(
+                                        templateSpec -> templateSpec.launchTemplateName(launchTemplateName).version("2"))));
 
-        ec2.createLaunchTemplate(CreateLaunchTemplateRequest.builder()
-                .launchTemplateName(launchTemplateName)
-                .launchTemplateData(RequestLaunchTemplateData.builder()
-                        .imageId("ami-12345678")
-                        .instanceType("t3.micro")
-                        .build())
-                .build());
-        ec2.createLaunchTemplateVersion(CreateLaunchTemplateVersionRequest.builder()
-                .launchTemplateName(launchTemplateName)
-                .sourceVersion("1")
-                .launchTemplateData(RequestLaunchTemplateData.builder()
-                        .imageId("ami-12345678")
-                        .instanceType("t3.small")
-                        .build())
-                .build());
-        ec2.createLaunchTemplateVersion(CreateLaunchTemplateVersionRequest.builder()
-                .launchTemplateName(launchTemplateName)
-                .sourceVersion("1")
-                .launchTemplateData(RequestLaunchTemplateData.builder()
-                        .imageId("ami-12345678")
-                        .instanceType("t3.medium")
-                        .build())
-                .build());
-        autoScaling.createAutoScalingGroup(CreateAutoScalingGroupRequest.builder()
-                .autoScalingGroupName(autoScalingGroupName)
-                .launchTemplate(LaunchTemplateSpecification.builder()
-                        .launchTemplateName(launchTemplateName)
-                        .version("1")
-                        .build())
-                .minSize(0)
-                .maxSize(1)
-                .desiredCapacity(1)
-                .availabilityZones(TestFixtures.availabilityZone())
-                .build());
-        autoScaling.attachInstances(AttachInstancesRequest.builder()
-                .autoScalingGroupName(autoScalingGroupName)
-                .instanceIds("i-sdk-active-refresh")
-                .build());
-        autoScaling.startInstanceRefresh(StartInstanceRefreshRequest.builder()
-                .autoScalingGroupName(autoScalingGroupName)
-                .desiredConfiguration(DesiredConfiguration.builder()
-                        .launchTemplate(LaunchTemplateSpecification.builder()
-                                .launchTemplateName(launchTemplateName)
-                                .version("2")
-                                .build())
-                        .build())
-                .build());
-
-        assertThatThrownBy(() -> autoScaling.updateAutoScalingGroup(UpdateAutoScalingGroupRequest.builder()
-                .autoScalingGroupName(autoScalingGroupName)
-                .launchTemplate(LaunchTemplateSpecification.builder()
-                        .launchTemplateName(launchTemplateName)
-                        .version("3")
-                        .build())
-                .build()))
-                .isInstanceOfSatisfying(AutoScalingException.class, error -> {
-                    assertThat(error.statusCode()).isEqualTo(400);
-                    assertThat(error.awsErrorDetails().serviceName()).isEqualTo("AutoScaling");
-                    assertThat(error.awsErrorDetails().errorCode()).isEqualTo("ValidationError");
-                    assertThat(error.awsErrorDetails().errorMessage())
-                            .isEqualTo(ACTIVE_INSTANCE_REFRESH_DESIRED_CONFIGURATION_MESSAGE);
-                    assertThat(error.requestId()).isNotBlank();
-                    assertThat(error.getMessage()).contains(
-                            ACTIVE_INSTANCE_REFRESH_DESIRED_CONFIGURATION_MESSAGE,
-                            "Service: AutoScaling",
-                            "Status Code: 400",
-                            "Request ID: ",
-                            "SDK Attempt Count: 1");
-                });
+                        assertThatThrownBy(() -> autoScaling.updateAutoScalingGroup(UpdateAutoScalingGroupRequest.builder()
+                                .autoScalingGroupName(autoScalingGroupName)
+                                .launchTemplate(LaunchTemplateSpecification.builder()
+                                        .launchTemplateName(launchTemplateName)
+                                        .version("3")
+                                        .build())
+                                .build()))
+                                .isInstanceOfSatisfying(AutoScalingException.class, error -> {
+                                    assertThat(error.statusCode()).isEqualTo(400);
+                                    assertThat(error.awsErrorDetails().serviceName()).isEqualTo("AutoScaling");
+                                    assertThat(error.awsErrorDetails().errorCode()).isEqualTo("ValidationError");
+                                    assertThat(error.awsErrorDetails().errorMessage())
+                                            .isEqualTo(ACTIVE_INSTANCE_REFRESH_DESIRED_CONFIGURATION_MESSAGE);
+                                    assertThat(error.requestId()).isNotBlank();
+                                    assertThat(error.getMessage()).contains(
+                                            ACTIVE_INSTANCE_REFRESH_DESIRED_CONFIGURATION_MESSAGE,
+                                            "Service: AutoScaling",
+                                            "Status Code: 400",
+                                            "Request ID: ",
+                                            "SDK Attempt Count: 1");
+                                });
+                    }
+                }
+            }
+        }
     }
 
     @Test

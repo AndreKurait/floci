@@ -6,12 +6,14 @@ import io.restassured.response.ValidatableResponse;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -73,9 +75,18 @@ class AutoScalingInstanceMembershipTagIntegrationTest {
             assertEquals(name, instanceTags(launched).get(GROUP_NAME_TAG));
             assertEquals(List.of(launched), instancesTaggedWith(name));
 
+            String subnet = given().header("Authorization", EC2_AUTH).formParam("Action", "DescribeSubnets")
+                    .formParam("Filter.1.Name", "availability-zone")
+                    .formParam("Filter.1.Value.1", "us-east-1a")
+                    .formParam("Filter.2.Name", "default-for-az")
+                    .formParam("Filter.2.Value.1", "true")
+                    .post("/").then().statusCode(200).extract()
+                    .path("DescribeSubnetsResponse.subnetSet.item[0].subnetId");
             standalone = given().header("Authorization", EC2_AUTH).formParam("Action", "RunInstances")
+                    .formParam("SubnetId", subnet)
                     .formParam("ImageId", "ami-12345678").formParam("InstanceType", "t3.micro")
                     .formParam("MinCount", "1").formParam("MaxCount", "1")
+                    .formParam("Placement.AvailabilityZone", "us-east-1a")
                     .formParam("TagSpecification.1.ResourceType", "instance")
                     .formParam("TagSpecification.1.Tag.1.Key", "Team")
                     .formParam("TagSpecification.1.Tag.1.Value", "red")
@@ -83,7 +94,13 @@ class AutoScalingInstanceMembershipTagIntegrationTest {
                     .formParam("TagSpecification.1.Tag.2.Value", "me")
                     .post("/").then().statusCode(200)
                     .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
-            attach(name, standalone).statusCode(200);
+            String attachmentId = standalone;
+            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> given().header("Authorization", EC2_AUTH)
+                    .formParam("Action", "DescribeInstances").formParam("InstanceId.1", attachmentId)
+                    .post("/").then().statusCode(200)
+                    .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name",
+                            equalTo("running")));
+            attach(name, standalone).log().ifValidationFails().statusCode(200);
             assertEquals(Map.of("Owner", "me", "Team", "blue"), userTags(standalone));
             assertEquals(name, instanceTags(standalone).get(GROUP_NAME_TAG));
 
