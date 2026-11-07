@@ -416,11 +416,16 @@ public class EmbeddedDnsServer {
 
     /** Resolves only resource-backed alias targets, without recursive or upstream DNS lookups. */
     public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        return resolveAliasTarget(name, hostedZoneId, type, null);
+    }
+
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                 DnsClientVpcSource.ClientVpc origin) {
         DnsAnswer resolved = null;
         if (recordSources != null) {
             for (DnsRecordSource source : recordSources) {
                 try {
-                    Optional<DnsAnswer> candidate = source.resolveAliasTarget(name, hostedZoneId, type);
+                    Optional<DnsAnswer> candidate = source.resolveAliasTarget(name, hostedZoneId, type, origin);
                     if (candidate.isPresent()) {
                         if (resolved != null) {
                             return Optional.of(DnsAnswer.refused());
@@ -435,6 +440,12 @@ public class EmbeddedDnsServer {
             }
         }
         return Optional.ofNullable(resolved);
+    }
+
+    /** The owned API listener remains subject to the caller's ordinary public routing. */
+    public Optional<String> publicApiAddress(DnsClientVpcSource.ClientVpc origin) {
+        return publicAwsApi && origin != null && isUsableOrigin(origin)
+                ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS) : getServerIp();
     }
 
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {

@@ -31,6 +31,12 @@ public interface DnsRecordSource {
         return Optional.empty();
     }
 
+    /** Preserve the caller's VPC when an owned public API target selects its transport. */
+    default Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                   DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type);
+    }
+
     /**
      * Resolves a query name to IPv4 addresses and their TTL. An empty optional means this
      * source does not own the name. The name arrives without a trailing dot and in the case the client sent.
