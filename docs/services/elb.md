@@ -4,6 +4,19 @@
 
 Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB) through the ELBv2 management API. The control plane is AWS SDK / CLI / Terraform compatible. HTTP, HTTPS, and TCP listeners can forward to registered instance and IP targets using the target's reachable local address.
 
+### Route 53 aliases
+
+A public Route 53 `A` alias to an existing Application Load Balancer resolves to
+Floci's listener address. The target DNS name and canonical hosted-zone ID must
+both match the stored load balancer. DNS lookup finds the owner across accounts
+without changing account-scoped management reads. Target names accept DNS casing,
+a trailing dot, and the `dualstack.` prefix.
+
+The IPv4 listener currently supplies no IPv6 address. Network and Gateway Load
+Balancer aliases, health-evaluated aliases, and advanced routing policies remain
+unsupported. Unknown, deleted, ambiguous, or mismatched targets cannot resolve
+through a suffix match or upstream DNS fallback.
+
 > Classic (v1) Elastic Load Balancing is a **different API** served from the same endpoint host —
 > see [ELB Classic (v1)](elb-classic.md). Requests are routed by their `Version` parameter:
 > `2015-12-01` here, `2012-06-01` there.

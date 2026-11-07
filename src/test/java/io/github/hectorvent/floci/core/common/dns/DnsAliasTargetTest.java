@@ -69,4 +69,19 @@ class DnsAliasTargetTest {
                 new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-client");
         assertEquals(expected, server.resolveAliasTarget("lb.example", "ZTARGET", 1, origin).orElseThrow());
     }
+
+    @Test
+    void resourceLookupReceivesTheQueryingVpc() {
+        DnsRecordSource source = mock(DnsRecordSource.class);
+        DnsClientVpcSource.ClientVpc origin =
+                new DnsClientVpcSource.ClientVpc("730000000001", "eu-west-1", "vpc-origin");
+        DnsAnswer answer = DnsAnswer.records(List.of("198.51.100.4"), 60);
+        when(source.resolveAliasTarget("lb.example", "ZTARGET", 1, origin))
+                .thenReturn(Optional.of(answer));
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(source));
+
+        assertEquals(answer, server.resolveAliasTarget("lb.example", "ZTARGET", 1, origin).orElseThrow());
+        verify(source).resolveAliasTarget("lb.example", "ZTARGET", 1, origin);
+        verifyNoMoreInteractions(source);
+    }
 }
