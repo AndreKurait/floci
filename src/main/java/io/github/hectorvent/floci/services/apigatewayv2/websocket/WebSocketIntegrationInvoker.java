@@ -2,11 +2,15 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.services.apigateway.AwsServiceRouter;
 import io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
 import io.github.hectorvent.floci.services.apigatewayv2.proxy.PinnedHttpClient;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -57,15 +61,20 @@ public class WebSocketIntegrationInvoker {
     private final VtlTemplateEngine vtlEngine;
     private final HttpClient httpClient;
     private final AddressResolver addressResolver;
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
+    private final RegionResolver regionResolver;
 
     @Inject
     public WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
-                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine) {
-        this(lambdaService, serviceRouter, objectMapper, vtlEngine, InetAddress::getAllByName);
+                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
+                                       ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver) {
+        this(lambdaService, serviceRouter, objectMapper, vtlEngine, serviceCallAuthorizer, regionResolver,
+                InetAddress::getAllByName);
     }
 
     WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
                                 ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
+                                ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver,
                                 AddressResolver addressResolver) {
         this.lambdaService = lambdaService;
         this.serviceRouter = serviceRouter;
@@ -73,6 +82,8 @@ public class WebSocketIntegrationInvoker {
         this.vtlEngine = vtlEngine;
         this.httpClient = HttpClient.newHttpClient();
         this.addressResolver = addressResolver;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
+        this.regionResolver = regionResolver;
     }
 
     @FunctionalInterface
@@ -115,6 +126,9 @@ public class WebSocketIntegrationInvoker {
      * Invoke the integration for a route.
      *
      * @param region            the AWS region
+     * @param apiId             the source API identifier
+     * @param stageName         the source stage
+     * @param routeKey          the selected route key
      * @param integration       the Integration model
      * @param eventJson         the serialized proxy event JSON
      * @param stageVariables    stage variables for URI substitution
@@ -122,7 +136,8 @@ public class WebSocketIntegrationInvoker {
      * @param responseTemplates response templates (for MOCK integration)
      * @return the integration result
      */
-    public IntegrationResult invoke(String region, Integration integration, String eventJson,
+    public IntegrationResult invoke(String region, String apiId, String stageName, String routeKey,
+                                    Integration integration, String eventJson,
                                     Map<String, String> stageVariables,
                                     Map<String, String> requestTemplates,
                                     Map<String, String> responseTemplates) {
@@ -131,9 +146,31 @@ public class WebSocketIntegrationInvoker {
             integrationType = "AWS_PROXY";
         }
 
+        String functionName = null;
+        if ("AWS_PROXY".equals(integrationType) || "AWS".equals(integrationType)) {
+            functionName = extractFunctionName(substituteStageVariables(integration.getIntegrationUri(),
+                    stageVariables));
+            if (functionName == null || functionName.isEmpty()) {
+                LOG.warnv("Could not extract function name from integration URI: {0}", integration.getIntegrationUri());
+                return new IntegrationResult(500, null, "Invalid integration URI");
+            }
+            if (integration.getCredentialsArn() == null || integration.getCredentialsArn().isBlank()) {
+                String accountId = regionResolver.getAccountId();
+                String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                        region, accountId);
+                String sourceArn = AwsArnUtils.Arn.of("execute-api", region, accountId,
+                        apiId + "/" + stageName + "/" + routeKey).toString();
+                if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                        sourceArn, accountId) == Decision.DENY) {
+                    return new IntegrationResult(500, null, "Invalid permissions on Lambda function");
+                }
+            }
+        }
+
         return switch (integrationType) {
-            case "AWS_PROXY" -> invokeAwsProxy(region, integration, eventJson, stageVariables);
-            case "AWS" -> invokeAws(region, integration, eventJson, stageVariables, requestTemplates, responseTemplates);
+            case "AWS_PROXY" -> invokeAwsProxy(region, functionName, eventJson);
+            case "AWS" -> invokeAws(region, functionName, integration, eventJson,
+                    stageVariables, requestTemplates, responseTemplates);
             case "HTTP_PROXY" -> invokeHttpProxy(integration, eventJson, stageVariables);
             case "HTTP" -> invokeHttp(integration, eventJson, stageVariables, requestTemplates, responseTemplates);
             case "MOCK" -> invokeMock(integration, stageVariables, requestTemplates, responseTemplates);
@@ -147,17 +184,7 @@ public class WebSocketIntegrationInvoker {
     /**
      * Invoke a Lambda function via AWS_PROXY integration.
      */
-    private IntegrationResult invokeAwsProxy(String region, Integration integration,
-                                             String eventJson, Map<String, String> stageVariables) {
-        String uri = integration.getIntegrationUri();
-        uri = substituteStageVariables(uri, stageVariables);
-
-        String functionName = extractFunctionName(uri);
-        if (functionName == null || functionName.isEmpty()) {
-            LOG.warnv("Could not extract function name from integration URI: {0}", uri);
-            return new IntegrationResult(500, null, "Invalid integration URI");
-        }
-
+    private IntegrationResult invokeAwsProxy(String region, String functionName, String eventJson) {
         LOG.debugv("Invoking Lambda function {0} for AWS_PROXY integration", functionName);
 
         InvokeResult result = lambdaService.invokeTarget(region, functionName,
@@ -203,19 +230,10 @@ public class WebSocketIntegrationInvoker {
      * Applies requestTemplates before invocation and responseTemplates after.
      * Uses templates from the method parameters first, falling back to the integration model's templates.
      */
-    private IntegrationResult invokeAws(String region, Integration integration, String eventJson,
+    private IntegrationResult invokeAws(String region, String functionName, Integration integration, String eventJson,
                                         Map<String, String> stageVariables,
                                         Map<String, String> requestTemplates,
                                         Map<String, String> responseTemplates) {
-        String uri = integration.getIntegrationUri();
-        uri = substituteStageVariables(uri, stageVariables);
-
-        String functionName = extractFunctionName(uri);
-        if (functionName == null || functionName.isEmpty()) {
-            LOG.warnv("Could not extract function name from integration URI: {0}", uri);
-            return new IntegrationResult(500, null, "Invalid integration URI");
-        }
-
         // Use passed templates, falling back to integration model's templates
         Map<String, String> effectiveRequestTemplates = (requestTemplates != null && !requestTemplates.isEmpty())
                 ? requestTemplates
