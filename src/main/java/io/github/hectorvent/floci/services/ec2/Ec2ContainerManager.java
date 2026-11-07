@@ -897,7 +897,8 @@ public class Ec2ContainerManager {
         if (image.systemd()) {
             for (Mount mount : options.mounts()) {
                 if (Set.of("/run", "/run/lock", "/sys/fs/cgroup").contains(mount.getTarget())
-                        || (image.systemdV1() && "/sys/hypervisor".equals(mount.getTarget()))) {
+                        || (image.systemdV1() && Set.of("/sys/hypervisor", "/run/floci-init-ready",
+                        "/run/floci-init-binary-ready").contains(mount.getTarget()))) {
                     throw new IllegalArgumentException("Read-only bind target is reserved for systemd: "
                             + mount.getTarget());
                 }

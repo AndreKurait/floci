@@ -248,7 +248,8 @@ Docker refuses a missing source without creating it.
 Duplicate targets and replacing the guest root are rejected before guest
 resources are allocated. For systemd images, `/run`, `/run/lock`, and
 `/sys/fs/cgroup` are reserved for the runtime and cannot be bind targets.
-The `systemd-v1` runtime also reserves `/sys/hypervisor`.
+The `systemd-v1` runtime also reserves `/sys/hypervisor`, `/run/floci-init-ready`,
+and `/run/floci-init-binary-ready`. These readiness files belong to native guest startup.
 
 These mounts apply to EC2 guest containers in every runtime mode. Helpers retain
 their own configuration. Image ENTRYPOINT/CMD, process limits, metadata and

@@ -3974,7 +3974,10 @@ class Ec2ContainerManagerTest {
     @CsvSource({
             "minimal,/run", "minimal,/run/lock", "minimal,/sys/fs/cgroup",
             "image,/run", "image,/run/lock", "image,/sys/fs/cgroup",
-            "systemd,/run/custom", "systemd,/run/lockfile", "systemd,/sys/fs/cgroup-extra"
+            "systemd,/run/custom", "systemd,/run/lockfile", "systemd,/sys/fs/cgroup-extra",
+            "minimal,/run/floci-init-ready", "minimal,/run/floci-init-binary-ready",
+            "image,/run/floci-init-ready", "image,/run/floci-init-binary-ready",
+            "systemd,/run/floci-init-ready", "systemd,/run/floci-init-binary-ready"
     })
     void otherRuntimeMountTargetsRemainAvailable(String runtime, String target) throws Exception {
         ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
@@ -3989,7 +3992,10 @@ class Ec2ContainerManagerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"/run", "/run/lock", "/sys/fs/cgroup", "/sys/hypervisor"})
+    @ValueSource(strings = {
+            "/run", "/run/lock", "/sys/fs/cgroup", "/sys/hypervisor",
+            "/run/floci-init-ready", "/run/floci-init-binary-ready"
+    })
     void nativeRuntimeMountsRefuseBeforeAllocatingGuestResources(String target) throws Exception {
         assertNull(launchConfiguredGuest(new ResolvedAmiImage(
                 "example/guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME, true, "linux/arm64"), Map.of(
