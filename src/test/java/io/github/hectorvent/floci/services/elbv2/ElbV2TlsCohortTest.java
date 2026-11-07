@@ -96,7 +96,7 @@ class ElbV2TlsCohortTest {
         for (Listener listener : List.of(left, right, unrelated)) {
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(listener == left ? "left.example.test" : "right.example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn())).thenReturn(loadBalancer);
+            when(dataPlane.elbV2Service.getLoadBalancerForListener(region, listener.getListenerArn(), listener.getLoadBalancerArn())).thenReturn(loadBalancer);
         }
         CountDownLatch insideSecondPeer = new CountDownLatch(1);
         CountDownLatch releaseFirst = new CountDownLatch(1);

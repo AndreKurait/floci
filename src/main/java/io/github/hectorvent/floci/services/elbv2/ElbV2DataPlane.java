@@ -750,7 +750,7 @@ public class ElbV2DataPlane {
                 .filter(candidate -> candidate != null && "forward".equals(candidate.getType()))
                 .findFirst().orElse(null);
         String tgArn = action == null ? null : resolveTgArn(action);
-        TargetGroup tg = tgArn == null ? null : elbV2Service.getTargetGroup(listener.region(), tgArn);
+        TargetGroup tg = tgArn == null ? null : elbV2Service.getTargetGroupForListener(listener.region(), listener.arn(), tgArn);
         if (tg == null || "lambda".equals(tg.getTargetType())) {
             socket.close();
             return;
@@ -859,7 +859,7 @@ public class ElbV2DataPlane {
     }
 
     private ListenerBinding binding(Listener listener, String region) {
-        LoadBalancer loadBalancer = elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn());
+        LoadBalancer loadBalancer = elbV2Service.getLoadBalancerForListener(region, listener.getListenerArn(), listener.getLoadBalancerArn());
         String host = loadBalancer != null ? normalizeHost(loadBalancer.getDnsName()) : listener.getLoadBalancerArn();
         boolean secure = "HTTPS".equalsIgnoreCase(listener.getProtocol());
         Set<String> hosts = new LinkedHashSet<>();
@@ -1248,7 +1248,7 @@ public class ElbV2DataPlane {
             req.response().setStatusCode(502).end("No target group");
             return;
         }
-        TargetGroup tg = elbV2Service.getTargetGroup(region, tgArn);
+        TargetGroup tg = elbV2Service.getTargetGroupForListener(region, listenerArn, tgArn);
         if (tg == null) {
             req.response().setStatusCode(502).end("Target group not found");
             return;
@@ -1310,7 +1310,7 @@ public class ElbV2DataPlane {
         if (binding == null) {
             return null;
         }
-        LoadBalancer loadBalancer = elbV2Service.getLoadBalancer(region, binding.loadBalancerArn());
+        LoadBalancer loadBalancer = elbV2Service.getLoadBalancerForListener(region, listenerArn, binding.loadBalancerArn());
         if (loadBalancer == null || loadBalancer.getAttributes() == null) {
             return null;
         }
@@ -1335,7 +1335,7 @@ public class ElbV2DataPlane {
     }
 
     private String listenerAttribute(String listenerArn, String region, String key) {
-        Listener listener = elbV2Service.getListener(region, listenerArn);
+        Listener listener = elbV2Service.getDataPlaneListener(region, listenerArn);
         if (listener == null || listener.getAttributes() == null) {
             return null;
         }
