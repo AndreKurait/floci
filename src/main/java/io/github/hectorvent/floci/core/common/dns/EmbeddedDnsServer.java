@@ -47,6 +47,7 @@ import java.util.SequencedSet;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -359,6 +360,26 @@ public class EmbeddedDnsServer {
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * The address this server answers for a name it spoofs, as a client in {@code origin} receives it
+     * (the routed public AWS API address for a VPC client when that routing is on), or empty when the
+     * server does not own the name or does not know its own address.
+     */
+    public Optional<String> emulatorAddress(String name, DnsClientVpcSource.ClientVpc origin) {
+        if (!matchesSuffix(name)) {
+            return Optional.empty();
+        }
+        if (publicAwsApi && origin != null && isUsableOrigin(origin) && isAwsEndpointName(name)) {
+            return Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS);
+        }
+        return getServerIp();
+    }
+
+    private static boolean isAwsEndpointName(String name) {
+        String lower = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        return TlsConfigSource.awsEndpointSuffixes().stream().anyMatch(suffix -> DomainNames.isWithin(lower, suffix));
+    }
+
     boolean matchesSuffix(String name) {
         if (name == null || name.isEmpty()) {
             return false;
@@ -439,6 +460,10 @@ public class EmbeddedDnsServer {
      * broad domain (or for "." itself) cannot send the platform's own names off to a resolver that
      * knows nothing about them.
      *
+     * <p>The one exception is an AWS endpoint name that a private zone associated with the querying
+     * VPC covers: on AWS that zone answers the VPC ahead of public resolution, which emulator spoofing
+     * stands in for. Floci's own names and EC2 internal names are not affected.
+     *
      * <p>A forwarding rule associated with the querying VPC is then applied before Floci resolves
      * the name from a record source, because a Resolver rule takes precedence over a private
      * hosted zone that matches the same name.
@@ -446,12 +471,18 @@ public class EmbeddedDnsServer {
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
         DnsClientVpcSource.ClientVpc origin = vpcForClient(clientAddress).orElse(null);
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, origin);
-        boolean routedApi = publicAwsApi && origin != null && TlsConfigSource.awsEndpointSuffixes().stream()
-                .anyMatch(suffix -> DomainNames.isWithin(name.toLowerCase(Locale.ROOT), suffix));
+        boolean awsEndpointName = isAwsEndpointName(name);
+        boolean routedApi = publicAwsApi && origin != null && awsEndpointName;
         Optional<DnsAnswer> emulatorName = resolveEmulatorName(name,
                 routedApi ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
-            return QueryPlan.answering(emulatorName.orElseThrow());
+            // Spoofing stands in for public resolution. A private zone associated with the querying
+            // VPC answers ahead of public resolution on AWS, including for an AWS endpoint name (how a
+            // VPC is pointed at a centralized endpoint), so it answers here too, and only for that VPC.
+            // Resolver forwarding rules still do not steer an emulator-owned name, as before.
+            Optional<DnsAnswer> vpcScoped = origin == null || !awsEndpointName ? Optional.empty()
+                    : firstAnswer(name, source -> source.resolvePrivate(name, type, origin));
+            return QueryPlan.answering(vpcScoped.orElseGet(emulatorName::orElseThrow));
         }
         // A rule steers the name whatever the query asks about it, so this is deliberately not
         // gated on the record type: the raw query is relayed to the rule's resolvers as it stands.
@@ -549,6 +580,11 @@ public class EmbeddedDnsServer {
 
     private Optional<DnsAnswer> resolveFromRecordSources(String name, int type, boolean authoritative,
                                                          DnsClientVpcSource.ClientVpc origin) {
+        return firstAnswer(name, source -> authoritative ? source.resolveAuthoritative(name, type, origin)
+                : source.resolve(name, type, origin));
+    }
+
+    private Optional<DnsAnswer> firstAnswer(String name, Function<DnsRecordSource, Optional<DnsAnswer>> query) {
         if (recordSources == null) {
             return Optional.empty();
         }
@@ -559,8 +595,7 @@ public class EmbeddedDnsServer {
         Optional<DnsAnswer> empty = Optional.empty();
         for (DnsRecordSource source : recordSources) {
             try {
-                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type, origin)
-                        : source.resolve(name, type, origin);
+                Optional<DnsAnswer> answer = query.apply(source);
                 if (answer != null && answer.isPresent()) {
                     if (answer.get().isEmpty()) {
                         if (empty.isEmpty() || (!empty.get().nameExists() && answer.get().nameExists())) {

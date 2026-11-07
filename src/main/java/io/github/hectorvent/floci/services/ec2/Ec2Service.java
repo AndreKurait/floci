@@ -10922,6 +10922,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private String launchableImageForCaller(String region, String imageId, Image image) {
+        if (image == null && !foreignImageEntries(region, imageId).isEmpty()) {
+            throw new AwsException("InvalidAMIID.NotFound", "The source image ancestry is unavailable.", 400);
+        }
         return image != null && !callerAccountId().equals(image.getOwnerId())
                 && !foreignImageEntries(region, imageId).isEmpty()
                 ? sharedImageAncestor(region, image) : resolveLaunchableImageId(region, imageId);

@@ -68,6 +68,66 @@ def terminate(ec2, instance, namespace):
     wait_for("Root volume cleanup", lambda: not ec2.describe_volumes()["Volumes"])
 
 
+def cleanup_case(namespace, server, network, guest_image, output, record):
+    passed = record["status"] == "passed"
+    errors = []
+
+    def attempt(operation, action):
+        try:
+            return action()
+        except BaseException:
+            errors.append({"operation": operation, "traceback": traceback.format_exc()})
+            return None
+
+    def server_logs():
+        logs = docker("logs", server, check=False)
+        (output / "server.log").write_text(logs.stdout + logs.stderr)
+
+    def server_action(*args):
+        assert inspect(server)["Config"]["Labels"]["io.floci.ci.run"] == namespace
+        docker(*args, server)
+
+    def remove_container(identifier):
+        assert inspect(identifier)["Config"]["Labels"]["floci_namespace"] == namespace
+        docker("rm", "--force", identifier)
+
+    def remove_volume(volume):
+        data = json.loads(docker("volume", "inspect", volume).stdout)[0]
+        assert data["Labels"]["floci_namespace"] == namespace
+        assert data["Driver"] == "local" and not data.get("Options"), data
+        docker("run", "--rm", "--label", "io.floci.ci.run=" + namespace,
+               "--mount", "type=volume,source=" + volume + ",target=/backing,readonly",
+               "--entrypoint", "/bin/sh", guest_image, "-ec",
+               'test -z "$(find /backing -mindepth 1 -print -quit)"')
+        docker("volume", "rm", volume)
+
+    def remove_network():
+        data = json.loads(docker("network", "inspect", network).stdout)[0]
+        assert data["Labels"]["io.floci.ci.run"] == namespace
+        docker("network", "rm", network)
+
+    attempt("server logs", server_logs)
+    attempt("guest diagnostics", lambda: diagnostics(namespace, output))
+    attempt("stop server", lambda: server_action("stop", "--time", "20"))
+    attempt("remove server", lambda: server_action("rm", "--volumes"))
+    remaining = attempt("list containers", lambda: containers(namespace))
+    record["remaining_containers"] = remaining
+    for identifier in remaining or []:
+        attempt("remove container " + identifier, lambda: remove_container(identifier))
+    volumes = attempt("list volumes", lambda: docker("volume", "ls", "-q", "--filter",
+                      "label=floci_namespace=" + namespace).stdout.split())
+    for volume in volumes or []:
+        attempt("remove volume " + volume, lambda: remove_volume(volume))
+    attempt("remove network", remove_network)
+    if passed and remaining:
+        errors.append({"operation": "automatic guest cleanup", "remaining_containers": remaining})
+    record["cleanup_passed"] = not errors
+    if errors:
+        record.update(status="failed", cleanup_errors=errors)
+        if passed:
+            raise AssertionError("Native qualification cleanup failed", errors)
+
+
 def boot_case(image, guest_image, profile, output):
     namespace = "floci-native-" + uuid.uuid4().hex[:16]
     server = namespace + "-server"
@@ -232,35 +292,7 @@ curl --fail --silent --show-error --noproxy '*' --max-time 10 \
         raise
     finally:
         try:
-            logs = docker("logs", server, check=False)
-            (output / "server.log").write_text(logs.stdout + logs.stderr)
-            diagnostics(namespace, output)
-            docker("stop", "--time", "20", server, check=False)
-            removed = docker("rm", "--volumes", server, check=False)
-            if record["status"] == "passed":
-                assert removed.returncode == 0, removed
-            remaining = containers(namespace)
-            record["remaining_containers"] = remaining
-            for identifier in remaining:
-                assert inspect(identifier)["Config"]["Labels"]["floci_namespace"] == namespace
-                docker("rm", "--force", identifier)
-            volumes = docker("volume", "ls", "-q", "--filter",
-                             "label=floci_namespace=" + namespace).stdout.split()
-            for volume in volumes:
-                data = json.loads(docker("volume", "inspect", volume).stdout)[0]
-                assert data["Labels"]["floci_namespace"] == namespace
-                assert data["Driver"] == "local" and not data.get("Options"), data
-                docker("run", "--rm", "--label", "io.floci.ci.run=" + namespace,
-                       "--mount", "type=volume,source=" + volume + ",target=/backing,readonly",
-                       "--entrypoint", "/bin/sh", guest_image, "-ec",
-                       'test -z "$(find /backing -mindepth 1 -print -quit)"')
-                docker("volume", "rm", volume)
-            docker("network", "rm", network)
-            assert not remaining, remaining
-            record["cleanup_passed"] = True
-        except BaseException:
-            record.update(status="failed", cleanup_passed=False, cleanup_traceback=traceback.format_exc())
-            raise
+            cleanup_case(namespace, server, network, guest_image, output, record)
         finally:
             (output / "result.json").write_text(json.dumps(record, indent=2) + "\n")
     return record

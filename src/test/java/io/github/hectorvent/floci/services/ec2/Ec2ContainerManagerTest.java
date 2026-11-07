@@ -16,7 +16,6 @@ import com.github.dockerjava.api.command.InspectImageCmd;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.PingCmd;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
-import com.github.dockerjava.api.command.RestartContainerCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.exception.DockerException;
@@ -41,7 +40,6 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
-import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.core.common.docker.UserDataPipeline;
@@ -60,7 +58,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
-import org.mockito.InOrder;
 
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -117,7 +114,6 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -174,11 +170,10 @@ class Ec2ContainerManagerTest {
             boolean transientFailure, boolean peerRefreshFailure) throws Exception {
         DockerClient docker = mock(DockerClient.class);
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
-        when(firewall.enabled()).thenReturn(true);
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.port()).thenReturn(4566);
-        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        when(firewall.enabled()).thenReturn(true);
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 mock(ContainerBuilder.class), lifecycle,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
@@ -286,8 +281,7 @@ class Ec2ContainerManagerTest {
                 verify(ports, never()).release(anyInt());
                 verify(network, never()).releasePrivateIp(any(), any(), any());
                 verify(network, never()).detach(any(), any(), any());
-                verify(lifecycle).removeIfExistsStrict(TEST_CONTAINER_ID);
-                verify(lifecycle, never()).removeIfExistsStrict(TEST_HELPER_ID);
+                verify(lifecycle, never()).removeIfExistsStrict(any());
                 instance.getNetworkInterfaces().clear();
                 instance.setPrivateIpAddress(null);
                 instance.setSubnetId(null);
@@ -533,7 +527,7 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void restartWaitsForPhysicalStopBeforeStartingTheContainer() throws InterruptedException {
+    void restartWaitsForPhysicalStopBeforeStartingTheContainer() {
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
         when(lifecycle.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
         DockerClient docker = mock(DockerClient.class);
@@ -545,7 +539,7 @@ class Ec2ContainerManagerTest {
         StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
         when(docker.stopContainerCmd(TEST_CONTAINER_ID)).thenReturn(stop);
         ExecutorService executor = mock(ExecutorService.class);
-        List<Runnable> tasks = new CopyOnWriteArrayList<>();
+        List<Runnable> tasks = new ArrayList<>();
         doAnswer(invocation -> {
             tasks.add(invocation.getArgument(0));
             return null;
@@ -574,21 +568,17 @@ class Ec2ContainerManagerTest {
             return null;
         }).when(start).exec();
 
-        try {
-            manager.stop(instance);
-            manager.start(instance);
-            assertEquals(1, tasks.size(), "start must wait until the physical stop completes");
-            tasks.getFirst().run();
-            assertEquals(List.of("stop"), operations);
-            awaitUntil(() -> tasks.size() == 2, Duration.ofSeconds(2));
-            tasks.get(1).run();
+        manager.stop(instance);
+        manager.start(instance);
+        assertEquals(1, tasks.size(), "start must wait until the physical stop completes");
+        tasks.getFirst().run();
+        assertEquals(List.of("stop"), operations);
+        assertEquals(2, tasks.size());
+        tasks.get(1).run();
 
-            assertEquals(List.of("stop", "start"), operations);
-            assertTrue(physicalRunning.get());
-            assertEquals("running", instance.getState().getName());
-        } finally {
-            manager.stop();
-        }
+        assertEquals(List.of("stop", "start"), operations);
+        assertTrue(physicalRunning.get());
+        assertEquals("running", instance.getState().getName());
     }
 
     @Test
@@ -1936,7 +1926,7 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void launchSystemdGuestWithoutCloudInitUsesInitAndCompatibilityUserData() throws Exception {
+    void launchSystemdGuestUsesInitInsteadOfTail() throws Exception {
         Ec2ContainerManager.containerBridgeIpAttempts = 1;
         Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
@@ -1951,7 +1941,7 @@ class Ec2ContainerManagerTest {
         instance.setUserData("#!/bin/sh\necho ready\n");
 
         harness.manager.launch(instance,
-                new ResolvedAmiImage("floci/ami-ubuntu:24.04-arm64", ResolvedAmiImage.SYSTEMD_RUNTIME, false,
+                new ResolvedAmiImage("floci/ami-ubuntu:24.04-arm64", ResolvedAmiImage.SYSTEMD_RUNTIME, true,
                         "linux/arm64"),
                 null,
                 "us-west-2");
@@ -1965,395 +1955,6 @@ class Ec2ContainerManagerTest {
         assertEquals(-1, commandIndex(harness.executedCommands, "/usr/sbin/sshd"),
                 "a systemd guest's init starts sshd; Floci must not start a second one");
         verify(harness.lifecycleManager).create(any(ContainerSpec.class), eq("linux/arm64"));
-    }
-
-    @ParameterizedTest
-    @CsvSource({"systemd,true", "image,true", "systemd,false", "image,false", "minimal,true", "minimal,false"})
-    void launchDelegatesBootstrapOnlyToAnActiveGuestCloudInit(String runtime, boolean cloudInit) throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
-        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
-        when(harness.dockerClient.inspectContainerCmd(TEST_HELPER_ID)).thenReturn(inspect);
-        InspectContainerResponse withIp = inspectResponse("172.18.0.11");
-        when(inspect.exec()).thenReturn(withIp);
-        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
-        Instance instance = instance("i-cloud-init");
-        String userData = "#!/bin/sh\necho run-once\n";
-        instance.setUserData(userData);
-
-        try {
-            harness.manager.launch(instance, new ResolvedAmiImage("test/native-guest:1", runtime, cloudInit, null),
-                    "ssh-ed25519 AAAAtest", "us-west-2");
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "launch worker should finish");
-            assertEquals("running", instance.getState().getName());
-            assertEquals(userData, instance.getUserData(), "metadata retains the original user data");
-            boolean guestOwnsBootstrap = cloudInit && !"minimal".equals(runtime);
-            verify(harness.builder, never()).withApparmorProfile(anyString());
-            verify(harness.builder, never()).withStopSignal(anyString());
-            if (guestOwnsBootstrap) {
-                verify(harness.dockerClient, never()).execCreateCmd(TEST_CONTAINER_ID);
-                verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
-            } else {
-                assertTrue(commandIndex(harness.executedCommands, "/var/lib/user-data.sh") >= 0,
-                        "guests without an active cloud-init keep compatibility bootstrap");
-            }
-            if ("image".equals(runtime)) {
-                verify(harness.builder, never()).withCmd(List.of("tail", "-f", "/dev/null"));
-                verify(harness.builder, never()).withCmd(List.of("/sbin/init"));
-            } else if ("systemd".equals(runtime)) {
-                verify(harness.builder).withCmd(List.of("/sbin/init"));
-            }
-        } finally {
-            executor.shutdownNow();
-        }
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"unconfined", "floci-native"})
-    void nativeInitOwnsBootstrapWithoutCompatibilityUserDataOrSshInjection(String profile) throws Exception {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
-        when(harness.config.services().ec2().nativeInitApparmorProfile())
-                .thenReturn("unconfined".equals(profile) ? Optional.empty() : Optional.of(profile));
-        Instance instance = instance("i-native-init-bootstrap");
-        List<List<String>> helperCommands = stubNativeInit(harness, instance);
-        instance.setUserData("#!/bin/sh\necho native-only\n");
-        try {
-            harness.manager.launch(instance,
-                    new ResolvedAmiImage("test/native-guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME,
-                            true, null), "ssh-ed25519 AAAAtest", "us-west-2");
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
-            assertEquals("running", instance.getState().getName());
-            verify(harness.builder).withApparmorProfile(profile);
-            verify(harness.builder).withStopSignal("SIGRTMIN+3");
-            assertTrue(helperCommands.stream().anyMatch(command -> command.contains("prepare-init")));
-            assertTrue(harness.executedCommands.stream().anyMatch(command ->
-                    Arrays.equals(command, new String[]{"test", "-f", Ec2SystemdV1Runtime.READY})));
-            assertEquals(-1, commandIndex(harness.executedCommands, "/var/lib/user-data.sh"));
-            assertEquals(-1, commandIndex(harness.executedCommands, "/usr/sbin/sshd"));
-            verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
-            assertEquals("#!/bin/sh\necho native-only\n", instance.getUserData());
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void failedNativeReleaseRetainsWorkloadCleanupUntilStrictRemovalSucceeds() throws Exception {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
-        Instance instance = instance("i-native-release-cleanup");
-        stubNativeInit(harness, instance);
-        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID))
-                .thenThrow(new IllegalStateException("Native release inspection unavailable"));
-        doThrow(new IllegalStateException("Docker removal unavailable")).doNothing()
-                .when(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
-        try {
-            harness.manager.launch(instance,
-                    new ResolvedAmiImage("test/native-guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME,
-                            true, null), null, "us-west-2");
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
-            assertEquals("terminated", instance.getState().getName());
-            verify(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
-            verify(harness.lifecycleManager, never()).removeIfExists(TEST_CONTAINER_ID);
-            verify(harness.lifecycleManager, never()).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-            verify(harness.portAllocator, never()).release(2201);
-
-            assertTrue(harness.manager.cancelLaunch(instance));
-            InOrder order = inOrder(harness.lifecycleManager);
-            order.verify(harness.lifecycleManager, times(2)).removeIfExistsStrict(TEST_CONTAINER_ID);
-            order.verify(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-            verify(harness.portAllocator).release(2201);
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void failedLaunchRetainsNativeHelperUntilWorkloadRemovalCanBeConfirmed() {
-        LaunchHarness harness = launchHarness();
-        Instance instance = leasedInstance("i-native-cleanup-workload");
-        stubPendingNativeCleanup(harness, instance);
-        doThrow(new IllegalStateException("Docker removal unavailable")).doNothing()
-                .when(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
-        try {
-            assertThrows(IllegalStateException.class, () -> harness.manager.cancelLaunch(instance));
-            assertEquals("terminated", instance.getState().getName());
-            verify(harness.lifecycleManager, never()).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-            verify(harness.vpcNetworkManager, never()).releasePrivateIp(any(), any(), any());
-            verify(harness.portAllocator, never()).release(2201);
-
-            assertTrue(harness.manager.cancelLaunch(instance));
-            InOrder order = inOrder(harness.lifecycleManager, harness.vpcNetworkManager);
-            order.verify(harness.lifecycleManager, times(2)).removeIfExistsStrict(TEST_CONTAINER_ID);
-            order.verify(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-            order.verify(harness.vpcNetworkManager)
-                    .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
-            verify(harness.portAllocator).release(2201);
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void failedLaunchRetriesNativeHelperRetirementBeforeReleasingItsLease() {
-        LaunchHarness harness = launchHarness();
-        Instance instance = leasedInstance("i-native-cleanup-helper");
-        stubPendingNativeCleanup(harness, instance);
-        doThrow(new IllegalStateException("Helper removal unavailable")).doNothing()
-                .when(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-        try {
-            assertThrows(IllegalStateException.class, () -> harness.manager.cancelLaunch(instance));
-            verify(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
-            verify(harness.vpcNetworkManager, never()).releasePrivateIp(any(), any(), any());
-            verify(harness.portAllocator, never()).release(2201);
-
-            assertTrue(harness.manager.cancelLaunch(instance));
-            verify(harness.lifecycleManager, times(2)).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-            verify(harness.vpcNetworkManager)
-                    .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
-            verify(harness.portAllocator).release(2201);
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void failedNativeLaunchAutomaticallyReclaimsItsResourcesWhenDockerRecovers() throws Exception {
-        LaunchHarness harness = launchHarness();
-        Instance instance = leasedInstance("i-native-cleanup-automatic");
-        stubPendingNativeCleanup(harness, instance);
-        AtomicBoolean dockerRecovered = new AtomicBoolean();
-        CountDownLatch reclaimed = new CountDownLatch(1);
-        doAnswer(ignored -> {
-            if (!dockerRecovered.get()) {
-                throw new IllegalStateException("Docker removal temporarily unavailable");
-            }
-            return null;
-        }).when(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
-        doAnswer(ignored -> {
-            reclaimed.countDown();
-            return null;
-        }).when(harness.metadataServer).unregisterContainer("172.18.0.12", instance);
-        try {
-            assertThrows(IllegalStateException.class, () -> harness.manager.cancelLaunch(instance));
-            verify(harness.lifecycleManager, never()).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-            verify(harness.portAllocator, never()).release(2201);
-            verify(harness.vpcNetworkManager, never()).releasePrivateIp(any(), any(), any());
-
-            dockerRecovered.set(true);
-            assertTrue(reclaimed.await(5, TimeUnit.SECONDS),
-                    "Cleanup must resume after Docker recovers without another cancel request");
-            verify(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-            verify(harness.portAllocator).release(2201);
-            verify(harness.vpcNetworkManager).releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    private static final String TEST_INIT_HELPER_ID = "native-init-helper";
-
-    @Test
-    void restoredNativeOwnershipMismatchIsContainedAndNeverDeletesTheForeignGuest() {
-        LaunchHarness harness = launchHarness();
-        Instance instance = instance("i-native-foreign-restore");
-        stubNativeInit(harness, instance);
-        instance.setDockerContainerId(TEST_CONTAINER_ID);
-        instance.setState(InstanceState.running());
-        InspectContainerResponse guest = harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID).exec();
-        guest.getConfig().getLabels().put(ContainerStorageHelper.ACCOUNT_LABEL, "999999999999");
-        try {
-            assertFalse(harness.manager.restoreMetadataRegistration(instance));
-            verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
-            assertThrows(IllegalStateException.class, () -> harness.manager.terminateForShutdown(instance));
-            assertEquals("shutting-down", instance.getState().getName());
-            verify(harness.dockerClient, never()).removeContainerCmd(TEST_CONTAINER_ID);
-            verify(harness.lifecycleManager, never()).removeIfExistsStrict(TEST_INIT_HELPER_ID);
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void restoredExitedNativeOwnershipMismatchDoesNotAbortRecovery() {
-        LaunchHarness harness = launchHarness();
-        Instance instance = instance("i-native-foreign-reboot");
-        stubNativeInit(harness, instance);
-        instance.setDockerContainerId(TEST_CONTAINER_ID);
-        instance.setState(InstanceState.running());
-        InspectContainerResponse guest = harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID).exec();
-        guest.getConfig().getLabels().put(ContainerStorageHelper.ACCOUNT_LABEL, "999999999999");
-        InspectContainerResponse.ContainerState state = mock(InspectContainerResponse.ContainerState.class);
-        when(guest.getState()).thenReturn(state);
-        when(state.getRunning()).thenReturn(false);
-        when(state.getStatus()).thenReturn("exited");
-        when(state.getExitCodeLong()).thenReturn(129L);
-        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(false);
-        try {
-            assertFalse(harness.manager.restoreMetadataRegistration(instance));
-            verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
-            verify(harness.dockerClient, never()).startContainerCmd(TEST_CONTAINER_ID);
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void restoredRunningNativeGuestValidatesItsBootGate() {
-        LaunchHarness harness = launchHarness();
-        Instance instance = instance("i-native-restore-gate");
-        stubNativeInit(harness, instance);
-        instance.setDockerContainerId(TEST_CONTAINER_ID);
-        instance.setState(InstanceState.running());
-        try {
-            assertTrue(harness.manager.restoreMetadataRegistration(instance));
-            assertTrue(harness.executedCommands.stream().anyMatch(command ->
-                    Arrays.equals(command, new String[]{"test", "-f", Ec2SystemdV1Runtime.READY})));
-            InOrder boot = inOrder(harness.metadataServer, harness.dockerClient);
-            boot.verify(harness.metadataServer, atLeastOnce())
-                    .registerContainer(anyString(), eq(instance.getInstanceId()), eq(instance));
-            boot.verify(harness.dockerClient).execCreateCmd(TEST_CONTAINER_ID);
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void restoredRunningNativeGuestWithFailedBootIsNotHealthy() {
-        LaunchHarness harness = launchHarness();
-        Instance instance = instance("i-native-restore-failed-gate");
-        stubNativeInit(harness, instance);
-        instance.setDockerContainerId(TEST_CONTAINER_ID);
-        instance.setState(InstanceState.running());
-        ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 2, "", "gate inspection failed");
-        try {
-            assertFalse(harness.manager.restoreMetadataRegistration(instance));
-            assertFalse(harness.manager.isContainerRunning(instance),
-                    "A running bootstrap shell cannot hide a failed native boot");
-            ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 0, "", "");
-            assertTrue(harness.manager.restoreMetadataRegistration(instance));
-            assertTrue(harness.manager.isContainerRunning(instance),
-                    "A verified ready gate must clear the earlier boot failure");
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void failedNativeApiRebootIsNotReportedHealthy() throws Exception {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
-        Instance instance = instance("i-native-api-reboot-failed-gate");
-        stubNativeInit(harness, instance);
-        instance.setDockerContainerId(TEST_CONTAINER_ID);
-        instance.setState(InstanceState.running());
-        RestartContainerCmd restart = mock(RestartContainerCmd.class);
-        when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
-        try {
-            assertTrue(harness.manager.restoreMetadataRegistration(instance));
-            ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 2, "", "gate inspection failed");
-            harness.manager.reboot(instance);
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
-            verify(restart).exec();
-            assertFalse(harness.manager.isContainerRunning(instance),
-                    "Failed native release after Docker restart must remain unhealthy");
-        } finally {
-            harness.manager.stop();
-        }
-    }
-
-    @Test
-    void pendingNativeRebootDoesNotWaitForAnOccupiedLaunchWorker() throws Exception {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
-        Instance instance = instance("i-native-reboot-busy-launcher");
-        stubNativeInit(harness, instance);
-        instance.setDockerContainerId(TEST_CONTAINER_ID);
-        instance.setState(InstanceState.pending());
-        CountDownLatch workerOccupied = new CountDownLatch(1);
-        CountDownLatch releaseWorker = new CountDownLatch(1);
-        CountDownLatch restarted = new CountDownLatch(1);
-        AtomicBoolean running = new AtomicBoolean(true);
-        InspectContainerResponse guest = harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID).exec();
-        InspectContainerResponse.ContainerState dockerState = mock(InspectContainerResponse.ContainerState.class);
-        when(guest.getState()).thenReturn(dockerState);
-        when(dockerState.getRunning()).thenAnswer(ignored -> running.get());
-        when(dockerState.getStatus()).thenReturn("exited");
-        when(dockerState.getExitCodeLong()).thenReturn(129L);
-        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenAnswer(ignored -> running.get());
-        StartContainerCmd start = mock(StartContainerCmd.class);
-        when(harness.dockerClient.startContainerCmd(TEST_CONTAINER_ID)).thenReturn(start);
-        doAnswer(ignored -> {
-            running.set(true);
-            restarted.countDown();
-            return null;
-        }).when(start).exec();
-        try {
-            assertTrue(harness.manager.restoreMetadataRegistration(instance));
-            executor.submit(() -> {
-                workerOccupied.countDown();
-                try {
-                    releaseWorker.await();
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                }
-            });
-            assertTrue(workerOccupied.await(5, TimeUnit.SECONDS));
-            running.set(false);
-            assertTrue(harness.manager.isContainerRunning(instance));
-            assertTrue(restarted.await(2, TimeUnit.SECONDS),
-                    "Pending guest recovery must run while the launch worker is still occupied");
-            assertEquals("pending", instance.getState().getName());
-        } finally {
-            releaseWorker.countDown();
-            harness.manager.stop();
-        }
-    }
-
-    private static void stubPendingNativeCleanup(LaunchHarness harness, Instance instance) {
-        stubNativeInit(harness, instance);
-        instance.setDockerContainerId(TEST_CONTAINER_ID);
-        instance.setSshHostPort(2201);
-        assertTrue(harness.manager.restoreMetadataRegistration(instance));
-        instance.setPrivateIpAddress("10.0.1.10");
-    }
-
-    private static List<List<String>> stubNativeInit(LaunchHarness harness, Instance instance) {
-        instance.setOwnerId("000000000000");
-        instance.setRegion("us-west-2");
-        InspectContainerResponse guest = inspectResponse("172.18.0.12");
-        when(guest.getId()).thenReturn(TEST_CONTAINER_ID);
-        ContainerConfig guestConfig = mock(ContainerConfig.class);
-        Map<String, String> labels = new HashMap<>(ContainerStorageHelper.resourceIdentityLabels(
-                "ec2", instance.getInstanceId(), instance.getOwnerId(), instance.getRegion()));
-        labels.put(ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(harness.config));
-        labels.put(Ec2SystemdV1Runtime.RUNTIME_LABEL, ResolvedAmiImage.SYSTEMD_V1_RUNTIME);
-        when(guestConfig.getLabels()).thenReturn(labels);
-        when(guest.getConfig()).thenReturn(guestConfig);
-        InspectContainerCmd guestInspect = mock(InspectContainerCmd.class);
-        when(guestInspect.exec()).thenReturn(guest);
-        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(guestInspect);
-        InspectContainerResponse helper = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
-        when(helper.getId()).thenReturn(TEST_INIT_HELPER_ID);
-        when(helper.getState().getRunning()).thenReturn(true);
-        Map<String, String> helperLabels = new HashMap<>(labels);
-        helperLabels.put(ContainerStorageHelper.SERVICE_LABEL, Ec2SystemdV1Runtime.SERVICE);
-        helperLabels.put(Ec2SystemdV1Runtime.SCOPE_LABEL, "floci-" + "a".repeat(32));
-        when(helper.getConfig().getLabels()).thenReturn(helperLabels);
-        InspectContainerCmd helperInspect = mock(InspectContainerCmd.class);
-        when(helperInspect.exec()).thenReturn(helper);
-        when(harness.dockerClient.inspectContainerCmd(TEST_INIT_HELPER_ID)).thenReturn(helperInspect);
-        when(harness.dockerClient.inspectContainerCmd(ContainerStorageHelper.resourceName(
-                harness.config, Ec2SystemdV1Runtime.SERVICE, null, instance.getInstanceId())))
-                .thenReturn(helperInspect);
-        return ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_INIT_HELPER_ID, 0, "", "");
     }
 
     @Test
@@ -2770,7 +2371,7 @@ class Ec2ContainerManagerTest {
 
         assertTrue(startEntered.await(2, TimeUnit.SECONDS), "container startup should begin");
         assertTrue(harness.manager.cancelLaunch(instance));
-        verify(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
+        verify(harness.lifecycleManager).removeIfExists(TEST_CONTAINER_ID);
         verify(harness.portAllocator).release(2201);
 
         allowStart.countDown();
@@ -2909,7 +2510,7 @@ class Ec2ContainerManagerTest {
                 });
 
         awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
-        verify(harness.lifecycleManager, timeout(2_000)).removeIfExistsStrict(TEST_CONTAINER_ID);
+        verify(harness.lifecycleManager, timeout(2_000)).removeIfExists(TEST_CONTAINER_ID);
         verify(harness.portAllocator, timeout(2_000)).release(2201);
         assertEquals(1, userDataStarted.getCount());
     }
@@ -3446,27 +3047,6 @@ class Ec2ContainerManagerTest {
         when(container.getId()).thenReturn(containerId);
         when(container.getLabels()).thenReturn(labels);
         return container;
-    }
-
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void unavailableDockerDuringReconciliationDoesNotPreventStartupOrRetry(boolean helperListingFails) {
-        LaunchHarness harness = reconcileHarness(true, 4680);
-        ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
-        when(harness.dockerClient.listContainersCmd()).thenReturn(listing);
-        if (helperListingFails) {
-            when(listing.exec()).thenReturn(List.of())
-                    .thenThrow(new IllegalStateException("Docker is unavailable"))
-                    .thenReturn(List.of());
-        } else {
-            when(listing.exec()).thenThrow(new IllegalStateException("Docker is unavailable"))
-                    .thenReturn(List.of());
-        }
-
-        assertEquals(0, harness.manager.reconcileOrphanedContainers((region, instance) -> false));
-        assertEquals(0, harness.manager.reconcileOrphanedContainers((region, instance) -> false));
-        verify(listing, times(helperListingFails ? 4 : 3)).exec();
-        verify(harness.lifecycleManager, never()).removeIfExists(anyString());
     }
 
     @Test
@@ -4090,7 +3670,6 @@ class Ec2ContainerManagerTest {
         HostConfig host = createGuestHostConfig(spec);
 
         assertFalse(Boolean.TRUE.equals(host.getPrivileged()));
-        assertFalse(Boolean.TRUE.equals(host.getInit()));
         assertEquals(Set.of(Capability.NET_ADMIN, Capability.NET_RAW), Set.of(host.getCapDrop()));
         assertEquals("container:" + TEST_HELPER_ID, host.getNetworkMode());
         assertFalse(spec.env().stream().anyMatch(value -> value.startsWith("AWS_ACCESS_KEY_ID=")));
@@ -4206,11 +3785,7 @@ class Ec2ContainerManagerTest {
     @CsvSource({
             "minimal,/run", "minimal,/run/lock", "minimal,/sys/fs/cgroup",
             "image,/run", "image,/run/lock", "image,/sys/fs/cgroup",
-            "systemd,/run/custom", "systemd,/run/lockfile", "systemd,/sys/fs/cgroup-extra",
-            "minimal,/run/floci-init-ready", "minimal,/run/floci-init-binary-ready",
-            "image,/run/floci-init-ready", "image,/run/floci-init-binary-ready",
-            "systemd,/run/floci-init-ready", "systemd,/run/floci-init-binary-ready",
-            "minimal,/run/floci-time-ready", "image,/run/floci-time-ready", "systemd,/run/floci-time-ready"
+            "systemd,/run/custom", "systemd,/run/lockfile", "systemd,/sys/fs/cgroup-extra"
     })
     void otherRuntimeMountTargetsRemainAvailable(String runtime, String target) throws Exception {
         ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
@@ -4222,26 +3797,6 @@ class Ec2ContainerManagerTest {
                 .findFirst().orElseThrow();
         assertEquals(target, bind.getTarget());
         assertTrue(bind.getReadOnly());
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {
-            "/run", "/run/lock", "/sys/fs/cgroup", "/sys/hypervisor",
-            "/run/floci-init-ready", "/run/floci-init-binary-ready", "/run/floci-time-ready"
-    })
-    void nativeRuntimeMountsRefuseBeforeAllocatingGuestResources(String target) throws Exception {
-        assertNull(launchConfiguredGuest(new ResolvedAmiImage(
-                "example/guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME, true, "linux/arm64"), Map.of(
-                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
-                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), true, false, true));
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"SYS_ADMIN", "CAP_SYS_ADMIN", "sys_boot", "cap_sys_boot", "ALL"})
-    void nativeRuntimeRefusesMissingRequiredCapabilitiesBeforeAllocation(String capability) throws Exception {
-        assertNull(launchConfiguredGuest(new ResolvedAmiImage(
-                "example/guest:1", ResolvedAmiImage.SYSTEMD_V1_RUNTIME, true, "linux/arm64"),
-                Map.of("FLOCI_SERVICES_EC2_CAP_DROP", capability), true, false, true));
     }
 
     @Test

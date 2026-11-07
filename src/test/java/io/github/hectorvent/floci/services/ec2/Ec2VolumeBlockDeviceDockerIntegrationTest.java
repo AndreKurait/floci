@@ -481,6 +481,40 @@ class Ec2VolumeBlockDeviceDockerIntegrationTest {
     }
 
     @Test
+    void runInstancesMountsDataBeforeTheFirstUserDataCommand() {
+        when(images.resolveImage(anyString())).thenReturn(new ResolvedAmiImage(
+                config.services().ec2().volumeHelperImage(), ResolvedAmiImage.DEFAULT_RUNTIME, false, null,
+                List.of(new Ec2ImageCatalog.VolumeMount("xvdf", "/data", "ext4"))));
+        LaunchTemplateData.BlockDeviceMapping data = new LaunchTemplateData.BlockDeviceMapping();
+        data.setDeviceName("/dev/xvdf");
+        LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+        ebs.setVolumeSize(1);
+        ebs.setVolumeType("gp3");
+        data.setEbs(ebs);
+        Instance instance = ec2Service.runInstances("us-east-1", "ami-first-boot-data", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(),
+                "#!/bin/sh\nif test -b /dev/xvdf && findmnt -n -o FSTYPE /data | grep -qx ext4; "
+                        + "then echo ready; else echo missing; fi > /root/first-boot-data\n",
+                null, null, null, 0, null, null, null, null, false, null, null, List.of(data))
+                .getInstances().getFirst();
+        instancesToClean.add(instance.getInstanceId());
+        try {
+            await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+                assertEquals("running", instance.getState().getName());
+                assertNotNull(instance.getDockerContainerId());
+                ContainerExec.Result result = execIn(instance.getDockerContainerId(), "cat /root/first-boot-data");
+                assertEquals(0, result.exitCode(), result.summary());
+                assertEquals("ready", result.stdout().trim());
+            });
+            assertFalse(Boolean.TRUE.equals(dockerClient.inspectContainerCmd(instance.getDockerContainerId())
+                    .exec().getHostConfig().getPrivileged()));
+        } finally {
+            ec2Service.terminateInstances("us-east-1", List.of(instance.getInstanceId()));
+            await().atMost(Duration.ofSeconds(30)).until(() -> "terminated".equals(instance.getState().getName()));
+        }
+    }
+
+    @Test
     void volumeAttachedProducesUsableBlockDeviceOfCorrectSize() {
         String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 10);
         Instance instance = createRunningTestInstance(suffix);

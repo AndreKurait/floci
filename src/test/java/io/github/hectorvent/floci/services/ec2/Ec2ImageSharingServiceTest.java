@@ -101,15 +101,20 @@ class Ec2ImageSharingServiceTest {
                 original.cloudInit(), original.dockerPlatform(), original.volumeMounts()), runtime.getValue());
     }
 
-    @Test
-    void unavailableLegacySharedAncestryDoesNotLeaveAPartiallyRegisteredCapture() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unavailableLegacySharedAncestryDoesNotLeaveAPartiallyRegisteredCapture(boolean revoke) {
         Image source = source();
         grant(source);
         Ec2Service launcher = service(RECIPIENT, false, mock(Ec2ContainerManager.class));
         Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
                 null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
         instance.setLaunchableImageId(null);
-        source.setSourceImageId("ami-missing-ancestor");
+        if (revoke) {
+            owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
+        } else {
+            source.setSourceImageId("ami-missing-ancestor");
+        }
         Set<String> images = Set.copyOf(store("ec2-registered-images.json").keys());
         Set<String> snapshots = Set.copyOf(store("ec2-snapshots.json").keys());
 

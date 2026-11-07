@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
@@ -112,6 +113,57 @@ class Ec2SystemdV1RuntimeLifecycleTest {
         when(helper.getConfig().getLabels()).thenReturn(foreign);
         assertThrows(IllegalStateException.class, () -> runtime.remove(instance));
         verify(lifecycle, times(1)).removeIfExistsStrict(HELPER);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "inspection", "scope", "removal"})
+    void reconciliationContinuesAfterOneHelperFailsAndRetainsItsRetry(String failure) {
+        assertTrue(runtime.rememberGuest(instance, guest));
+        Container first = mock(Container.class);
+        Map<String, String> firstLabels = labels(Ec2SystemdV1Runtime.SERVICE);
+        when(first.getId()).thenReturn(HELPER);
+        when(first.getLabels()).thenReturn(firstLabels);
+        Container next = mock(Container.class);
+        Map<String, String> nextLabels = labels(Ec2SystemdV1Runtime.SERVICE);
+        nextLabels.put(ContainerStorageHelper.RESOURCE_ID_LABEL, "i-next");
+        nextLabels.put(Ec2SystemdV1Runtime.SCOPE_LABEL, "floci-" + "b".repeat(32));
+        when(next.getId()).thenReturn("next-helper");
+        when(next.getLabels()).thenReturn(nextLabels);
+        InspectContainerResponse nextHelper = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(nextHelper.getId()).thenReturn("next-helper");
+        when(nextHelper.getConfig().getLabels()).thenReturn(nextLabels);
+        when(nextHelper.getState().getRunning()).thenReturn(true);
+        when(docker.inspectContainerCmd("next-helper").exec()).thenReturn(nextHelper);
+        when(docker.listContainersCmd().withShowAll(true).withLabelFilter(anyMap()).exec())
+                .thenReturn(List.of(first, next));
+        ContainerExecStubs.completeEveryExec(docker, HELPER, 0, "", "");
+        ContainerExecStubs.completeEveryExec(docker, "next-helper", 0, "", "");
+        switch (failure) {
+            case "identity" -> firstLabels.remove(ContainerStorageHelper.RESOURCE_ID_LABEL);
+            case "inspection" -> when(docker.inspectContainerCmd(HELPER).exec())
+                    .thenThrow(new IllegalStateException("Docker inspection unavailable"));
+            case "removal" -> doThrow(new IllegalStateException("Docker removal unavailable"))
+                    .when(lifecycle).removeIfExistsStrict(HELPER);
+            case "scope" -> ContainerExecStubs.completeEveryExec(docker, HELPER, 1, "", "scope still occupied");
+            default -> throw new AssertionError(failure);
+        }
+
+        assertDoesNotThrow(() -> runtime.reconcileOrphans((region, id) -> false));
+
+        verify(lifecycle).removeIfExistsStrict("next-helper");
+        assertTrue(runtime.hasGuest(instance));
+        firstLabels.put(ContainerStorageHelper.RESOURCE_ID_LABEL, instance.getInstanceId());
+        InspectContainerCmd inspectHelper = docker.inspectContainerCmd(HELPER);
+        doReturn(helper).when(inspectHelper).exec();
+        doNothing().when(lifecycle).removeIfExistsStrict(HELPER);
+        ContainerExecStubs.completeEveryExec(docker, HELPER, 0, "", "");
+        when(docker.listContainersCmd().withShowAll(true).withLabelFilter(anyMap()).exec())
+                .thenReturn(List.of(first));
+
+        runtime.reconcileOrphans((region, id) -> false);
+
+        assertFalse(runtime.hasGuest(instance));
+        verify(lifecycle, times("removal".equals(failure) ? 2 : 1)).removeIfExistsStrict(HELPER);
     }
 
     @Test

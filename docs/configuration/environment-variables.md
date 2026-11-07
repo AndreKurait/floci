@@ -39,7 +39,7 @@ Anyone who can reach Floci's port can call its APIs. The Docker images listen on
 docker run --rm -p 127.0.0.1:4566:4566 floci/floci:latest
 ```
 
-Running Floci directly on a Linux host (not in a container) with services that start containers, such as Lambda functions or ECS tasks, needs a non-loopback address. Those containers reach Floci through `host.docker.internal`, which resolves to the Docker bridge gateway (`172.17.0.1` by default) rather than to the host's loopback. Set `QUARKUS_HTTP_HOST=0.0.0.0` and `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`, and keep port 4566 closed to other networks with a firewall. See also [Lambda on native Linux Docker](../getting-started/quick-start.md#lambda-on-native-linux-docker-ufw).
+Running Floci directly on a Linux host (not in a container) with services that start containers, such as Lambda functions or ECS tasks, needs a non-loopback address. Those containers reach Floci through `host.docker.internal` (ECS task containers through the address it stands for), which resolves to the Docker bridge gateway (`172.17.0.1` by default) rather than to the host's loopback. Set `QUARKUS_HTTP_HOST=0.0.0.0` and `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`, and keep port 4566 closed to other networks with a firewall. See also [Lambda on native Linux Docker](../getting-started/quick-start.md#lambda-on-native-linux-docker-ufw).
 
 ## Browser CORS
 
@@ -543,6 +543,7 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS` | `21600` | Lifetime of the vended credentials. Matches the six hours AWS documents for task-role credentials |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` | `51679` | Port on the Floci host serving the credentials endpoint. Not the address task containers use, which is always `169.254.170.2:80` |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PROXY_IMAGE` | `floci/network-helper:local` | Image for the per-network proxy that holds `169.254.170.2` and forwards to the port above |
+| `FLOCI_SERVICES_ECS_EXTRA_HOSTS` | _(none)_ | Comma-separated `hostname:ip` entries (ip may be `host-gateway`) added to every task container after its definition's `extraHosts`. Unset by default: like the ECS agent, Floci adds no hosts entry of its own. `host.docker.internal:host-gateway` restores the entry Floci used to add on Linux |
 
 ### EC2
 

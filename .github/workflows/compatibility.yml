@@ -573,6 +573,9 @@ jobs:
           python3 -m venv /tmp/native-ec2-sdk
           /tmp/native-ec2-sdk/bin/pip install -r compatibility-tests/sdk-test-python/requirements.txt
 
+      - name: Verify independent native cleanup failures
+        run: /tmp/native-ec2-sdk/bin/python .github/ci/test_ec2_systemd_v1_apparmor.py
+
       - name: Load the qualification AppArmor profile
         id: profile
         run: |

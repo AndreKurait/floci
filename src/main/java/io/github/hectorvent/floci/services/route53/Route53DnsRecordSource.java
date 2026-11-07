@@ -189,6 +189,12 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     }
 
     @Override
+    public Optional<DnsAnswer> resolvePrivate(String name, int type, ClientVpc origin) {
+        // resolve(name, type, origin) answers only names a private zone associated with origin covers.
+        return origin == null ? Optional.empty() : resolve(name, type, origin);
+    }
+
+    @Override
     public Optional<DnsAnswer> resolve(String name, int type, ClientVpc origin) {
         return resolveIpv4(name, origin).map(answer -> type == 1 ? answer
                 : answer.nameExists() ? DnsAnswer.noData() : DnsAnswer.nxDomain());
@@ -247,7 +253,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                             ttl = Math.min(ttl, target.ttlSeconds());
                         }
                     } else {
-                        List<String> resolved = resolveOutsidePrivateZones(cleanAlias);
+                        List<String> resolved = resolveOutsidePrivateZones(cleanAlias, origin);
                         if (!resolved.isEmpty()) {
                             addresses.addAll(resolved);
                             ttl = Math.min(ttl, DnsAnswer.DEFAULT_TTL_SECONDS);
@@ -278,7 +284,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                             return DnsAnswer.records(targetAnswer.addresses(),
                                     Math.min(cnameTtl, targetAnswer.ttlSeconds()));
                         }
-                        return DnsAnswer.records(resolveOutsidePrivateZones(cleanTarget),
+                        return DnsAnswer.records(resolveOutsidePrivateZones(cleanTarget, origin),
                                 Math.min(cnameTtl, DnsAnswer.DEFAULT_TTL_SECONDS));
                     }
                 }
@@ -288,7 +294,13 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         return DnsAnswer.noData();
     }
 
-    private List<String> resolveOutsidePrivateZones(String name) {
+    private List<String> resolveOutsidePrivateZones(String name, ClientVpc origin) {
+        // A target the embedded server spoofs (an AWS endpoint name, for example the vpce name a
+        // centralized endpoint's zone aliases) gets the emulator's spoofed address for this client.
+        Optional<String> emulator = dnsServer == null ? Optional.empty() : dnsServer.emulatorAddress(name, origin);
+        if (emulator != null && emulator.isPresent()) {
+            return List.of(emulator.orElseThrow());
+        }
         if (matchesFlociSuffix(name)) {
             return getLocalFlociAddress().map(List::of).orElse(List.of());
         }
