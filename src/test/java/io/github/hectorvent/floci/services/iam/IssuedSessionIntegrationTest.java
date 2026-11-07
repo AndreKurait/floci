@@ -28,6 +28,7 @@ class IssuedSessionIntegrationTest {
     private static final String BASE = "/_floci/iam/issued-sessions/";
     private final List<String> roleNames = new ArrayList<>();
     private final List<String> issuedKeys = new ArrayList<>();
+    private final List<String> policyArns = new ArrayList<>();
     @Inject
     IamService iam;
 
@@ -46,6 +47,9 @@ class IssuedSessionIntegrationTest {
         }
         for (String name : roleNames) {
             query("iam", Map.of("Action", "DeleteRole", "RoleName", name)).statusCode(200);
+        }
+        for (String arn : policyArns) {
+            query("iam", Map.of("Action", "DeletePolicy", "PolicyArn", arn)).statusCode(200);
         }
     }
 
@@ -138,7 +142,13 @@ class IssuedSessionIntegrationTest {
             params.put("Policy", policy);
         }
         if (managed) {
-            params.put("PolicyArns.member.1.arn", arn.replace("role/", "policy/"));
+            String policyArn = query("iam", Map.of("Action", "CreatePolicy", "PolicyName", name,
+                    "PolicyDocument", """
+                            {"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}
+                            """))
+                    .statusCode(200).extract().path("CreatePolicyResponse.CreatePolicyResult.Policy.Arn");
+            policyArns.add(policyArn);
+            params.put("PolicyArns.member.1.arn", policyArn);
         }
         ValidatableResponse response = query("sts", params).statusCode(200);
         issuedKeys.add(field(response, "Credentials.AccessKeyId"));

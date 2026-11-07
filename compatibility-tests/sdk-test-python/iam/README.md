@@ -32,3 +32,7 @@ token, and `iam:PassRole` with the AppConfig service condition.
 failures and selected-version tag conditions. These cases require IAM enforcement;
 S3 source deployment, missing versions, rollback and CloudFormation cases remain
 in the default suite. Both suites share owned fixtures and cleanup.
+
+`test_stepfunctions_apigateway_resource_policy.py` checks seven role and public
+resource-policy decisions through real Step Functions API Gateway tasks. Its fixtures
+remove the owned state machines, APIs and roles after each case.

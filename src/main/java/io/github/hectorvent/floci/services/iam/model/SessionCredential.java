@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 
 @RegisterForReflection
@@ -32,7 +33,9 @@ public class SessionCredential {
     private String roleArn;
     private String roleSessionName;
     private String assumedRoleId;
+    private String sourceIdentity;
     private Map<String, String> sessionTags = Map.of();
+    private Map<String, String> transitiveSessionTags = Map.of();
     private Instant expiration;
     private Instant issuedAt;
     /** True only for credentials issued by GetSessionToken, never inferred from their key or token. */
@@ -41,6 +44,7 @@ public class SessionCredential {
     private Instant multiFactorAuthenticatedAt;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
     private String sessionPolicyDocument;
+    private List<String> managedSessionPolicyArns = List.of();
     /**
      * Account of the caller that minted this session, captured at mint time. Used to route
      * temporary credentials that carry no role ARN (e.g. GetSessionToken) back to the caller. A
@@ -146,8 +150,16 @@ public class SessionCredential {
     public String getRoleSessionName() { return roleSessionName; }
     public void setRoleSessionName(String roleSessionName) { this.roleSessionName = roleSessionName; }
 
+    public String getSourceIdentity() { return sourceIdentity; }
+    public void setSourceIdentity(String value) { sourceIdentity = value; }
+
     public String getAssumedRoleId() { return assumedRoleId; }
     public void setAssumedRoleId(String assumedRoleId) { this.assumedRoleId = assumedRoleId; }
+
+    public Map<String, String> getTransitiveSessionTags() { return transitiveSessionTags; }
+    public void setTransitiveSessionTags(Map<String, String> tags) {
+        transitiveSessionTags = tags == null ? Map.of() : Map.copyOf(tags);
+    }
 
     public Map<String, String> getSessionTags() { return sessionTags; }
     public void setSessionTags(Map<String, String> tags) { sessionTags = tags == null ? Map.of() : Map.copyOf(tags); }
@@ -170,6 +182,11 @@ public class SessionCredential {
 
     public Instant getExpiration() { return expiration; }
     public void setExpiration(Instant expiration) { this.expiration = expiration; }
+
+    public List<String> getManagedSessionPolicyArns() { return managedSessionPolicyArns; }
+    public void setManagedSessionPolicyArns(List<String> arns) {
+        managedSessionPolicyArns = arns == null ? List.of() : List.copyOf(arns);
+    }
 
     public String getSessionPolicyDocument() { return sessionPolicyDocument; }
     public void setSessionPolicyDocument(String sessionPolicyDocument) { this.sessionPolicyDocument = sessionPolicyDocument; }

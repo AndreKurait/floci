@@ -45,6 +45,7 @@ import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -126,6 +127,26 @@ class StsQueryHandlerTest {
     }
 
     @Test
+    void iamDisabledAssumeRoleRetainsSourceIdentityWithoutRequiringTrustPermission() {
+        IamService service = mock(IamService.class);
+        IamRole role = new IamRole();
+        role.setRoleName("TestRole");
+        role.setArn("arn:aws:iam::000000000000:role/TestRole");
+        when(service.findRole(anyString(), anyString())).thenReturn(Optional.of(role));
+        StsQueryHandler handler = newHandler(service, new RegionResolver(REGION, "000000000000"));
+        MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+        parameters.putSingle("RoleArn", role.getArn());
+        parameters.putSingle("RoleSessionName", "source");
+        parameters.putSingle("SourceIdentity", "original");
+        Response response = handler.handle("AssumeRole", parameters);
+        assertEquals(200, response.getStatus());
+        assertTrue(response.getEntity().toString().contains("<SourceIdentity>original</SourceIdentity>"));
+        verify(service).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
+                isNull(), eq("000000000000"), eq("source"), anyString(), eq(false), isNull(),
+                eq(Map.of()), eq(Map.of()), eq("original"), eq(List.of()));
+    }
+
+    @Test
     void iamDisabledAssumeRoleStillValidatesAndStoresSessionTags() {
         IamService service = mock(IamService.class);
         IamRole role = new IamRole();
@@ -141,11 +162,13 @@ class StsQueryHandlerTest {
         assertEquals(200, handler.handle("AssumeRole", parameters).getStatus());
         verify(service).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
                 isNull(), eq("000000000000"), eq("tagged"), anyString(), eq(false), isNull(),
-                eq(Map.of("Project", "session")));
+                eq(Map.of("Project", "session")), eq(Map.of()), isNull(), eq(List.of()));
         parameters.putSingle("Tags.member.3.Key", "");
         Response invalid = handler.handle("AssumeRole", parameters);
         assertEquals(400, invalid.getStatus());
-        assertTrue(invalid.getEntity().toString().contains("ValidationError"));
+        assertTrue(invalid.getEntity().toString().contains("<Code>ValidationError</Code>"));
+        verify(service).registerAssumeRoleSession(anyString(), anyString(), anyString(), anyString(), any(),
+                any(), anyString(), anyString(), anyString(), eq(false), isNull(), anyMap(), anyMap(), nullable(String.class), anyList());
     }
 
     @ParameterizedTest
@@ -175,8 +198,8 @@ class StsQueryHandlerTest {
                 verify(service).registerSessionToken(anyString(), anyString(), anyString(), expiration.capture(),
                         eq("000000000000"), eq("AKIAlongterm"), isNull(), isNull(), eq(now));
             } else {
-                verify(service).registerIssuedSession(anyString(), anyString(), anyString(), anyString(), expiration.capture(),
-                        isNull(), eq("000000000000"), eq("AKIAlongterm"));
+                verify(service).registerIssuedSession(anyString(), anyString(), anyString(), anyString(),
+                        expiration.capture(), isNull(), eq("000000000000"), eq("AKIAlongterm"), eq(List.of()));
             }
             assertEquals(expected, expiration.getValue());
         }
@@ -519,7 +542,8 @@ class StsQueryHandlerTest {
 
         assertEquals(200, response.getStatus(), (String) response.getEntity());
         verify(iamService).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
-                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(false), isNull(), eq(Map.of()));
+                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(false), isNull(),
+                eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
     }
 
     @Test
@@ -606,14 +630,14 @@ class StsQueryHandlerTest {
         if (status == 400) {
             assertTrue(body.contains("<Code>ValidationError</Code>"), body);
             assertTrue(body.contains("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."), body);
-            verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                    any(), any(), anyString(), anyString(), anyString());
+            verify(service, never()).registerAssumeRoleSession(anyString(), anyString(), anyString(), anyString(),
+                    any(), any(), anyString(), anyString(), anyString(), eq(false), isNull(), anyMap(), anyMap(), nullable(String.class), anyList());
         } else {
             Instant expiry = now.plusSeconds(requested == 0 ? 3600 : requested);
             assertEquals(expiry.toString(), extract(EXPIRATION, body));
             verify(service).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()),
                     eq(expiry), isNull(), eq("000000000000"), eq("duration"), anyString(),
-                    eq(false), isNull(), eq(Map.of()));
+                    eq(false), isNull(), eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
         }
     }
 
@@ -628,8 +652,8 @@ class StsQueryHandlerTest {
                 .handle("AssumeRole", params);
         assertEquals(403, response.getStatus());
         assertTrue(response.getEntity().toString().contains("<Code>AccessDenied</Code>"));
-        verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                any(), any(), anyString(), anyString(), anyString());
+        verify(service, never()).registerAssumeRoleSession(anyString(), anyString(), anyString(), anyString(),
+                any(), any(), anyString(), anyString(), anyString(), eq(false), isNull(), anyMap(), anyMap(), nullable(String.class), anyList());
     }
 
     @Test
@@ -739,7 +763,7 @@ class StsQueryHandlerTest {
         if (status == 400) {
             assertTrue(((String) response.getEntity()).contains("ValidationError"));
             verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                    any(), any(), anyString(), anyString(), anyString());
+                    any(), any(), anyString(), anyString(), anyString(), anyMap(), anyMap(), nullable(String.class), anyList());
         }
     }
 
@@ -1082,7 +1106,8 @@ class StsQueryHandlerTest {
         assertEquals(expected, extract(EXPIRATION, (String) response.getEntity()));
         ArgumentCaptor<Instant> sessionExpiration = ArgumentCaptor.forClass(Instant.class);
         verify(iamService).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()),
-                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("sx"), anyString(), eq(false), isNull(), eq(Map.of()));
+                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("sx"), anyString(), eq(false), isNull(),
+                eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
         assertEquals(expiration, sessionExpiration.getValue());
     }
 
@@ -1126,12 +1151,12 @@ class StsQueryHandlerTest {
         assertEquals(status, response.getStatus(), response.getEntity().toString());
         if (status == 400) {
             assertTrue(response.getEntity().toString().contains("role chaining"));
-            verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(), any(),
-                    any(), anyString(), anyString(), anyString());
+            verify(service, never()).registerAssumeRoleSession(anyString(), anyString(), anyString(), anyString(), any(),
+                    any(), anyString(), anyString(), anyString(), eq(false), isNull(), anyMap(), anyMap(), nullable(String.class), anyList());
         } else {
             verify(service).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
                     isNull(), eq("000000000000"), eq("chained"), anyString(),
-                    eq(false), isNull(), eq(Map.of()));
+                    eq(false), isNull(), eq(Map.of()), eq(Map.of()), isNull(), eq(List.of()));
         }
     }
 
@@ -1179,6 +1204,6 @@ class StsQueryHandlerTest {
                 eq("arn:aws:iam::000000000002:user/admin"), eq(expiry), isNull(),
                 eq("000000000002"));
         verify(iamService, never()).registerIssuedSession(anyString(), anyString(), anyString(),
-                anyString(), any(), any(), anyString(), any());
+                anyString(), any(), any(), anyString(), any(), anyList());
     }
 }
