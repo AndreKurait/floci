@@ -70,6 +70,25 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     }
 
     @Override
+    public boolean requiresOwnershipRecovery(StackResource resource) {
+        return resource.getPhysicalId() != null && !"DELETE_COMPLETE".equals(resource.getStatus())
+                && Set.of(AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT).contains(resource.getResourceType())
+                && (resource.getAttributes().get("ApiId") == null
+                    || resource.getAttributes().get("ApiId").isBlank());
+    }
+
+    @Override
+    public void recoverOwnership(StackResource resource, JsonNode properties, ProvisionContext context) {
+        JsonNode resolved = context.engine().resolveNodeStrict(properties.path("ApiId"));
+        if (resolved == null || !resolved.isTextual() || resolved.asText().isBlank()
+                || resolved.asText().contains("{{resolve:")) {
+            throw new AwsException("ValidationError", "Cannot recover ApiId for " + resource.getLogicalId()
+                    + " from its previous stack template", 400);
+        }
+        resource.getAttributes().put("ApiId", resolved.asText());
+    }
+
+    @Override
     public Set<String> resourceTypes() {
         return Set.of(API, AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT, VPC_LINK);
     }
