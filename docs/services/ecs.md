@@ -897,6 +897,27 @@ Every `awsvpc` task receives an ENI in its subnet. With `FLOCI_NETWORK_SECURITY_
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS` | `21600` | Lifetime of the vended credentials |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` | `51679` | Floci-side port serving the credentials endpoint |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PROXY_IMAGE` | `floci/network-helper:local` | Image for the per-network credentials proxy |
+| `FLOCI_SERVICES_ECS_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to every task container's `/etc/hosts` (the ip may be `host-gateway`); see [Hosts entries](#hosts-entries) |
+
+### Hosts entries
+
+As the ECS agent does, Floci adds `/etc/hosts` entries to a task container only from the
+`extraHosts` its container definition declares, in declared order. Each `HostEntry` needs a
+`hostname` and an `ipAddress`; the `ipAddress` may be Docker's `host-gateway`. As on ECS, an
+`awsvpc` task does not take `extraHosts`. `FLOCI_SERVICES_ECS_EXTRA_HOSTS` adds operator entries to
+every task container after the declared ones; with security-group enforcement an `awsvpc` task's
+containers share one network namespace, and these entries (and `--add-host` entries in
+`FLOCI_SERVICES_ECS_DOCKER_FLAGS`) go on that namespace. A definition that maps
+`host.docker.internal` itself keeps its own mapping.
+
+Floci does not add `host.docker.internal` to task containers. When Floci runs directly on a Linux
+host with Docker Engine, tasks are handed the default bridge network's gateway address in
+`AWS_ENDPOINT_URL`, `FLOCI_ENDPOINT`, `FLOCI_HOSTNAME`, the task metadata URI and the Firelens
+endpoint instead of the `host.docker.internal` name. Docker Desktop and Podman resolve that name
+themselves, so it is kept there. If Docker does not say what the gateway is, Floci keeps the
+`host.docker.internal:host-gateway` entry rather than guess. Task code that used
+`host.docker.internal` to reach other services on the host can restore the entry with
+`FLOCI_SERVICES_ECS_EXTRA_HOSTS=host.docker.internal:host-gateway`.
 
 ### Image pulls
 

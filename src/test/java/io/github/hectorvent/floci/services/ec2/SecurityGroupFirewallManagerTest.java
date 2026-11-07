@@ -444,6 +444,42 @@ class SecurityGroupFirewallManagerTest {
     }
 
     @Test
+    void helperCarriesExactlyTheHostsItsServiceChooses() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.network().securityGroupEnforcement().enabled()).thenReturn(true);
+        when(config.network().securityGroupEnforcement().helperImage()).thenReturn("example/network-helper:test");
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        when(config.docker().imageRegistryBase()).thenReturn(Optional.empty());
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        Info linux = mock(Info.class);
+        when(linux.getOsType()).thenReturn("linux");
+        when(linux.getArchitecture()).thenReturn("amd64");
+        when(dockerClient.infoCmd().exec()).thenReturn(linux);
+        InspectImageResponse image = mock(InspectImageResponse.class);
+        when(image.getOs()).thenReturn("linux");
+        when(image.getArch()).thenReturn("amd64");
+        when(dockerClient.inspectImageCmd(anyString()).exec()).thenReturn(image);
+        DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
+        when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+        EmbeddedDnsServer embeddedDnsServer = mock(EmbeddedDnsServer.class);
+        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.createAndStart(any())).thenThrow(new IllegalStateException("stop after the spec"));
+        SecurityGroupFirewallManager manager = new SecurityGroupFirewallManager(dockerClient,
+                new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer), lifecycleManager, config,
+                embeddedDnsServer);
+
+        assertThrows(IllegalStateException.class, () -> manager.createNamespace("ec2", "i-1", "000000000000",
+                "us-east-1", Optional.empty(), Map.of(8080, 0), Map.of(), "127.0.0.1",
+                List.of("db.internal:10.0.0.5")));
+
+        ArgumentCaptor<ContainerSpec> helper = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycleManager).createAndStart(helper.capture());
+        assertEquals(List.of("db.internal:10.0.0.5"), helper.getValue().extraHosts(),
+                "workloads get only the entries their service passes, not host.docker.internal");
+    }
+
+    @Test
     void onlyFlocisDnsIsExemptFromTheSecurityGroups() {
         EmbeddedDnsServer embeddedDnsServer = mock(EmbeddedDnsServer.class);
         when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
