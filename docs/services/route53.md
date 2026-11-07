@@ -88,6 +88,18 @@ For a Docker host client, publish DNS separately from HTTP, for example `-p 5353
 
 The longest matching public zone answers. Missing names return NXDOMAIN; existing names without the requested supported type return NOERROR with no answers. Both include the zone SOA with the smaller of its TTL and minimum field for negative caching. Changes and deletes affect DNS through the same stored record sets as the Route 53 API.
 
+Public `A` aliases can target an existing API Gateway custom domain's reported regional
+or edge endpoint. Resolution verifies its reported hosted-zone ID and refuses unknown,
+deleted or ambiguous targets. The source does not infer ownership from a hostname suffix.
+Deleting the alias while keeping its hosted zone returns NXDOMAIN; an external transport
+fallback does not conceal that missing native record.
+
+The answer uses Floci's API listener. With native public routing enabled, a known VPC
+caller receives the public API bridge address and remains subject to its NAT, route and
+security-group rules. Unknown callers retain the ordinary listener address. This uses
+the existing custom-domain API routing; it does not add CloudFront distribution behavior
+or private API Gateway custom-domain support.
+
 Public `A` aliases can target an existing Classic load balancer when VPC frontends are enabled. The target DNS name, including the optional `dualstack.` prefix, and canonical hosted-zone ID must identify that load balancer. Answers use its current frontend addresses and 60-second TTL, including when the public zone and load balancer belong to different accounts. Alias resolution reads owned resources without following DNS or replacing targets with the emulator API address. Removing the target makes its aliases return REFUSED.
 
 Other public alias targets, alias `AAAA` records, `EvaluateTargetHealth=true`, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones or alias targets, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary. Clients can retry over TCP, which supports messages up to 65,535 bytes, fragmented input, pipelining and connection reuse. TCP admission is bounded to 128 connections and 16 pending queries per connection; idle connections expire after 30 seconds.
