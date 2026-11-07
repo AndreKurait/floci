@@ -902,6 +902,10 @@ Conditions can test `aws:SourceIp` (IPv4 and IPv6 CIDR ranges), `aws:SecureTrans
 caller-supplied `X-Forwarded-For` header does not override it. An empty `Condition`
 object places no condition on its statement, as in IAM.
 
+HTTP API Lambda proxy events and both REQUEST authorizer payload formats report that
+same connection address in their `sourceIp` field. Forwarded headers remain headers;
+they do not replace the client address in the event context.
+
 ### HTTP API private integrations
 
 An `HTTP_PROXY` integration with `connectionType: VPC_LINK` reaches a private backend through a v2
