@@ -82,9 +82,7 @@ final class SidecarRepositoryLease {
         }
         boolean stopped = false;
         try {
-            if (pool.isTracked(repositoryId)) {
-                pool.stopContainerStrict(repositoryId);
-            }
+            pool.stopContainerStrict(repositoryId);
             stopped = true;
         } finally {
             synchronized (use) {
