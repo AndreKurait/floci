@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.time.Duration;
 import java.util.List;
@@ -14,6 +16,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.LongSupplier;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -144,88 +147,47 @@ class MapIterationSchedulerTest {
         assertEquals(0, started.get());
     }
 
-    @Test
-    void endsTheSerialWaitForASingleItemOncePastTheDeadline() throws Exception {
+    @ParameterizedTest
+    @CsvSource({"1, 3", "2, 1", "2, 2"})
+    void interruptsBlockedIterationsWhenTheWaitBudgetExpires(int itemCount, int maxConcurrency) throws Exception {
+        int inFlight = Math.min(itemCount, maxConcurrency);
+        CountDownLatch started = new CountDownLatch(inFlight);
         CountDownLatch neverRelease = new CountDownLatch(1);
-        CountDownLatch blockedInterrupted = new CountDownLatch(1);
+        CountDownLatch blockedInterrupted = new CountDownLatch(inFlight);
+        List<Integer> cut = new CopyOnWriteArrayList<>();
+        AtomicInteger clockReads = new AtomicInteger();
+        // Start the real 200 ms queue wait only after the worker window is ready.
+        LongSupplier nanoTime = () -> {
+            if (clockReads.getAndIncrement() > 0) {
+                try {
+                    assertTrue(started.await(10, TimeUnit.SECONDS), "the worker window did not start");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while waiting for workers", e);
+                }
+            }
+            return 0;
+        };
 
-        // Not try-with-resources: against the still-buggy serial path the iteration below never
-        // returns and is never interrupted, so ExecutorService#close() would block on
-        // awaitTermination forever. shutdownNow() in the finally block does not wait.
-        ExecutorService driver = Executors.newSingleThreadExecutor();
         try {
-            Future<List<Integer>> execution = driver.submit(() -> MapIterationScheduler.execute(
-                    1, 3, index -> () -> {
-                        try {
-                            neverRelease.await();
-                            return index;
-                        } catch (InterruptedException e) {
-                            blockedInterrupted.countDown();
-                            throw e;
-                        }
-                    }, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200)));
+            Assertions.assertTimeoutPreemptively(Duration.ofSeconds(15), () ->
+                    assertThrows(TimeoutException.class, () -> MapIterationScheduler.execute(
+                            itemCount, maxConcurrency, index -> () -> {
+                                started.countDown();
+                                try {
+                                    neverRelease.await();
+                                    return index;
+                                } catch (InterruptedException e) {
+                                    blockedInterrupted.countDown();
+                                    throw e;
+                                }
+                            }, TimeUnit.MILLISECONDS.toNanos(200), cut::add, nanoTime)));
 
-            ExecutionException failure = assertThrows(ExecutionException.class,
-                    () -> execution.get(2, TimeUnit.SECONDS));
-            assertEquals(TimeoutException.class, failure.getCause().getClass());
-            assertTrue(blockedInterrupted.await(2, TimeUnit.SECONDS),
-                    "the single iteration should be interrupted once the deadline passes");
+            assertTrue(blockedInterrupted.await(10, TimeUnit.SECONDS),
+                    "every blocked iteration should be interrupted after the timed wait expires");
+            assertEquals(List.of(), cut, "deadline expiry must not name an iteration as failed");
         } finally {
-            driver.shutdownNow();
-        }
-    }
-
-    @Test
-    void endsTheSerialWaitForMaxConcurrencyOneOncePastTheDeadline() throws Exception {
-        CountDownLatch neverRelease = new CountDownLatch(1);
-        CountDownLatch blockedInterrupted = new CountDownLatch(1);
-
-        // Not try-with-resources: see endsTheSerialWaitForASingleItemOncePastTheDeadline above.
-        ExecutorService driver = Executors.newSingleThreadExecutor();
-        try {
-            Future<List<Integer>> execution = driver.submit(() -> MapIterationScheduler.execute(
-                    2, 1, index -> () -> {
-                        try {
-                            neverRelease.await();
-                            return index;
-                        } catch (InterruptedException e) {
-                            blockedInterrupted.countDown();
-                            throw e;
-                        }
-                    }, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200)));
-
-            ExecutionException failure = assertThrows(ExecutionException.class,
-                    () -> execution.get(2, TimeUnit.SECONDS));
-            assertEquals(TimeoutException.class, failure.getCause().getClass());
-            assertTrue(blockedInterrupted.await(2, TimeUnit.SECONDS),
-                    "the blocked iteration should be interrupted once the deadline passes");
-        } finally {
-            driver.shutdownNow();
-        }
-    }
-
-    @Test
-    void endsTheConcurrentWaitOncePastTheDeadline() throws Exception {
-        CountDownLatch neverRelease = new CountDownLatch(1);
-        CountDownLatch blockedInterrupted = new CountDownLatch(2);
-
-        try (ExecutorService driver = Executors.newSingleThreadExecutor()) {
-            Future<List<Integer>> execution = driver.submit(() -> MapIterationScheduler.execute(
-                    2, 2, index -> () -> {
-                        try {
-                            neverRelease.await();
-                            return index;
-                        } catch (InterruptedException e) {
-                            blockedInterrupted.countDown();
-                            throw e;
-                        }
-                    }, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200)));
-
-            ExecutionException failure = assertThrows(ExecutionException.class,
-                    () -> execution.get(5, TimeUnit.SECONDS));
-            assertEquals(TimeoutException.class, failure.getCause().getClass());
-            assertTrue(blockedInterrupted.await(2, TimeUnit.SECONDS),
-                    "the iterations still running should be interrupted once the deadline passes");
+            neverRelease.countDown();
         }
     }
     @Test
@@ -267,23 +229,4 @@ class MapIterationSchedulerTest {
                 "each was named before it was cancelled");
     }
 
-    @Test
-    void namesNoIterationWhenTheDeadlineEndsTheRun() throws Exception {
-        CountDownLatch neverRelease = new CountDownLatch(1);
-        List<Integer> cut = new CopyOnWriteArrayList<>();
-
-        try (ExecutorService driver = Executors.newSingleThreadExecutor()) {
-            Future<List<Integer>> execution = driver.submit(() -> MapIterationScheduler.execute(
-                    2, 2, index -> () -> {
-                        neverRelease.await();
-                        return index;
-                    }, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(100), cut::add));
-
-            ExecutionException failure = assertThrows(ExecutionException.class,
-                    () -> execution.get(2, TimeUnit.SECONDS));
-            assertEquals(TimeoutException.class, failure.getCause().getClass());
-        }
-
-        assertEquals(List.of(), cut);
-    }
 }
