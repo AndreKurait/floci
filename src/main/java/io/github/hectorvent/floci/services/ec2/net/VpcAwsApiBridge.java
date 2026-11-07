@@ -37,7 +37,8 @@ final class VpcAwsApiBridge {
     private String transport;
     private String device;
     private String backend;
-    private int backendPort;
+    private int httpBackendPort;
+    private int httpsBackendPort;
     private String applied;
     private boolean listenersStarted;
 
@@ -88,12 +89,21 @@ final class VpcAwsApiBridge {
         if (endpoint == null) {
             throw new IllegalStateException("The public AWS API bridge has no container endpoint resolver");
         }
-        URI target = URI.create(endpoint.baseUrl(false));
+        String selectedHost = config.network().vpcRouting().publicAwsApiUpstreamHost()
+                .map(VpcRouteSelection::ipv4).orElse(null);
+        URI target = URI.create(selectedHost == null ? endpoint.baseUrl(false)
+                : "http://" + selectedHost + ":" + config.network().vpcRouting().publicAwsApiUpstreamHttpPort());
         if (!"http".equals(target.getScheme()) || target.getHost() == null
                 || target.getPort() < 1 || target.getPort() > 65535) {
             throw new IllegalStateException("Invalid container-reachable AWS API endpoint");
         }
-        backendPort = target.getPort();
+        httpBackendPort = target.getPort();
+        httpsBackendPort = selectedHost == null ? httpBackendPort
+                : config.network().vpcRouting().publicAwsApiUpstreamHttpsPort();
+        if (httpsBackendPort < 1 || httpsBackendPort > 65535
+                || EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS.equals(selectedHost)) {
+            throw new IllegalStateException("Invalid public endpoint upstream address or HTTPS port");
+        }
         retireOrphans();
         ContainerSpec spec = containers.newContainer(config.network().securityGroupEnforcement().helperImage())
                 .withName(ContainerStorageHelper.resourceName(config, SERVICE, null, UUID.randomUUID().toString()))
@@ -154,7 +164,8 @@ final class VpcAwsApiBridge {
 
     void configure(List<VpcRoutingCommands.Hop> callers) {
         String address = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
-        String script = VpcRoutingCommands.publicApi(address, backend, backendPort, device, callers);
+        String script = VpcRoutingCommands.publicApi(
+                address, backend, httpBackendPort, httpsBackendPort, device, callers);
         if (!script.equals(applied)) {
             execute("sh", "-c", script);
             applied = script;
@@ -169,7 +180,7 @@ final class VpcAwsApiBridge {
                     trap 'kill "$first" "$second" 2>/dev/null || true' EXIT TERM INT
                     wait -n
                     exit 1
-                    """.formatted(address, backend, backendPort, address, backend, backendPort);
+                    """.formatted(address, backend, httpBackendPort, address, backend, httpsBackendPort);
             RetryingTarCopier.copyBytes(docker, namespace.id(), "/tmp", "floci-api-start.sh",
                     start.getBytes(StandardCharsets.UTF_8), 0600);
             execute("touch", "/tmp/floci-api-ready");
