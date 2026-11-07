@@ -11,18 +11,23 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -55,6 +60,45 @@ class CodeBuildRunnerTest {
                 List.of("./test.sh"), 60, new AtomicBoolean(false));
 
         assertEquals("Exit code 1: tests failed", result.errorMessage());
+    }
+
+    @Test
+    void phaseOutputPreservesSplitUtf8AndFlushesBothStreamsOnce() {
+        byte[] euro = "€".getBytes(StandardCharsets.UTF_8);
+        DockerClient dockerClient = dockerClientStreaming(new byte[]{euro[0]}, 1, "failure-tail", 7L);
+        ExecStartCmd startCmd = dockerClient.execStartCmd("exec-1");
+        doAnswer(invocation -> {
+            ResultCallback.Adapter<Frame> callback = invocation.getArgument(0);
+            callback.onNext(new Frame(StreamType.STDOUT, new byte[]{euro[0]}));
+            callback.onNext(new Frame(StreamType.STDERR, "stderr\npartial-error".getBytes(StandardCharsets.UTF_8)));
+            callback.onNext(new Frame(StreamType.STDOUT, new byte[]{euro[1], euro[2], '\n'}));
+            callback.onNext(new Frame(StreamType.STDOUT, "partial-out".getBytes(StandardCharsets.UTF_8)));
+            callback.onComplete();
+            return callback;
+        }).when(startCmd).exec(any());
+        CloudWatchLogsService logs = mock(CloudWatchLogsService.class);
+        List<String> messages = new ArrayList<>();
+        when(logs.putLogEventsForAccount(any(), any(), any(), any(), any())).thenAnswer(invocation -> {
+            assertEquals("111111111111", invocation.getArgument(0));
+            assertEquals("/aws/codebuild/project", invocation.getArgument(1));
+            assertEquals("build-stream", invocation.getArgument(2));
+            assertEquals("ap-northeast-3", invocation.getArgument(4));
+            List<Map<String, Object>> events = invocation.getArgument(3);
+            events.forEach(event -> messages.add((String) event.get("message")));
+            return null;
+        });
+        ContainerLogStreamer streamer = new ContainerLogStreamer(null, logs);
+        CodeBuildRunner runner = new CodeBuildRunner(dockerClient, null, null, streamer,
+                null, null, null, null, null, null, null);
+
+        CodeBuildRunner.PhaseResult result = runner.runPhase("container-1", "/src", List.of(),
+                List.of("./build.sh"), 1, new AtomicBoolean(false),
+                streamer.execLineLogCallbackForAccount("111111111111", "/aws/codebuild/project",
+                        "build-stream", "ap-northeast-3"));
+
+        assertTrue(result.failed());
+        assertTrue(result.errorMessage().startsWith("Exit code 7:"));
+        assertEquals(List.of("stderr", "€", "partial-error", "partial-out"), messages);
     }
 
     @Test
