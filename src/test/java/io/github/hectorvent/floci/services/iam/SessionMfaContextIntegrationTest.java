@@ -40,21 +40,24 @@ class SessionMfaContextIntegrationTest {
 
     @ParameterizedTest
     @CsvSource({
-            "Allow,Bool,false,true,true",
-            "Allow,Bool,false,false,false",
-            "Deny,Bool,false,true,false",
-            "Deny,Bool,false,false,true",
-            "Allow,Null,true,true,false",
-            "Allow,Null,true,false,true",
-            "Deny,BoolIfExists,false,true,false",
-            "Deny,BoolIfExists,false,false,false",
-            "Allow,Bool,true,true,false"
+            "Allow,Bool,false,true,true,MultiFactorAuthPresent",
+            "Allow,Bool,false,false,false,MultiFactorAuthPresent",
+            "Deny,Bool,false,true,false,MultiFactorAuthPresent",
+            "Deny,Bool,false,false,true,MultiFactorAuthPresent",
+            "Allow,Null,true,true,false,MultiFactorAuthPresent",
+            "Allow,Null,true,false,true,MultiFactorAuthPresent",
+            "Deny,BoolIfExists,false,true,false,MultiFactorAuthPresent",
+            "Deny,BoolIfExists,false,false,false,MultiFactorAuthPresent",
+            "Allow,Bool,true,true,false,MultiFactorAuthPresent",
+            "Allow,Null,true,true,true,MultiFactorAuthAge",
+            "Allow,Null,true,false,true,MultiFactorAuthAge",
+            "Allow,NumericLessThan,3600,true,false,MultiFactorAuthAge"
     })
     void issuedNonMfaCredentialsHaveFalseRatherThanAbsentContext(String effect, String operator, String value,
-                                                                boolean temporary, boolean allowed) throws Exception {
+                                                                boolean temporary, boolean allowed, String key) throws Exception {
         String statement = "{\"Effect\":\"" + effect + "\",\"Action\":\"ssm:DescribeParameters\","
                 + "\"Resource\":\"*\",\"Condition\":{\"" + operator
-                + "\":{\"aws:MultiFactorAuthPresent\":\"" + value + "\"}}}";
+                + "\":{\"aws:" + key + "\":\"" + value + "\"}}}";
         String policy = "{\"Statement\":[" + ("Deny".equals(effect)
                 ? "{\"Effect\":\"Allow\",\"Action\":\"ssm:DescribeParameters\",\"Resource\":\"*\"}," : "")
                 + statement + "]}";
@@ -86,11 +89,23 @@ class SessionMfaContextIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"Allow,true,true", "Allow,false,false", "Deny,true,false", "Deny,false,true"})
-    void verifiedVirtualMfaControlsSignedResourceAccess(String effect, String value, boolean allowed)
+    @CsvSource({
+            "Allow,Bool,MultiFactorAuthPresent,true,true",
+            "Allow,Bool,MultiFactorAuthPresent,false,false",
+            "Deny,Bool,MultiFactorAuthPresent,true,false",
+            "Deny,Bool,MultiFactorAuthPresent,false,true",
+            "Allow,NumericLessThan,MultiFactorAuthAge,3600,true",
+            "Allow,NumericGreaterThan,MultiFactorAuthAge,3600,false",
+            "Deny,NumericLessThan,MultiFactorAuthAge,3600,false",
+            "Deny,NumericGreaterThan,MultiFactorAuthAge,3600,true",
+            "Allow,Null,MultiFactorAuthAge,false,true",
+            "Allow,Null,MultiFactorAuthAge,true,false"
+    })
+    void verifiedVirtualMfaControlsSignedResourceAccess(String effect, String operator, String key,
+                                                       String value, boolean allowed)
             throws Exception {
         String conditional = "{\"Effect\":\"" + effect + "\",\"Action\":\"ssm:DescribeParameters\","
-                + "\"Resource\":\"*\",\"Condition\":{\"Bool\":{\"aws:MultiFactorAuthPresent\":\""
+                + "\"Resource\":\"*\",\"Condition\":{\"" + operator + "\":{\"aws:" + key + "\":\""
                 + value + "\"}}}";
         String policy = "{\"Statement\":[" + ("Deny".equals(effect)
                 ? "{\"Effect\":\"Allow\",\"Action\":\"ssm:DescribeParameters\",\"Resource\":\"*\"}," : "")
