@@ -1300,5 +1300,15 @@ CloudFormation in-place updates to standalone V2 authorizers snapshot their comp
 configuration before mutation. Failure during the update or in a later stack
 resource restores the previous authorizer ID, credentials and settings. Failed
 restoration keeps the snapshot for rollback retry; successful stack updates clear
-it. Changing the owning API, deployment activation, concurrent transaction isolation
-and process-crash recovery remain outside this rollback support.
+it. Deployment activation, concurrent transaction isolation and process-crash
+recovery remain outside this rollback support.
+
+### CloudFormation V2 child replacement
+
+CloudFormation replaces standalone V2 authorizers, integrations, routes, stages and
+deployments when their `ApiId` changes. Replacement cleanup tracks the owning API
+alongside each child ID, including stages with the same name on different APIs.
+`Ref` continues to return the child ID or stage name. A later stack failure restores
+the previous child; `UpdateReplacePolicy: Retain` keeps a displaced child. Stage
+name changes also replace the stage. Cleanup requires the recorded `ApiId`;
+migration of older resources without that ownership record remains separate work.
