@@ -8,6 +8,7 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -242,6 +243,36 @@ class Ec2ImageSnapshotPermissionIntegrationTest {
             assertEquals(beforeSnapshots, ownedSnapshots(RECIPIENT, DESTINATION_REGION));
             assertEquals(0, ownedImages(RECIPIENT, SOURCE_REGION));
             assertSourceUnchanged(source);
+        } finally {
+            deregister(source.imageId(), OWNER, SOURCE_REGION);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {OWNER, RECIPIENT})
+    void registeredImageCannotFallBackToAnotherRegion(String account) {
+        Source source = source(1);
+        try {
+            modifyImage(source.imageId(), "Add", RECIPIENT).statusCode(200);
+            int instancesBefore = request("DescribeInstances", account, DESTINATION_REGION)
+                    .post("/").then().statusCode(200).extract().xmlPath()
+                    .getList("DescribeInstancesResponse.reservationSet.item").size();
+            int volumesBefore = request("DescribeVolumes", account, DESTINATION_REGION)
+                    .post("/").then().statusCode(200).extract().xmlPath()
+                    .getList("DescribeVolumesResponse.volumeSet.item").size();
+            request("DescribeImages", account, DESTINATION_REGION).formParam("ImageId.1", source.imageId())
+                    .post("/").then().statusCode(400)
+                    .body("Response.Errors.Error.Code", equalTo("InvalidAMIID.NotFound"));
+            request("RunInstances", account, DESTINATION_REGION).formParam("ImageId", source.imageId())
+                    .formParam("InstanceType", "t3.micro").formParam("MinCount", 1).formParam("MaxCount", 1)
+                    .post("/").then().statusCode(400)
+                    .body("Response.Errors.Error.Code", equalTo("InvalidAMIID.NotFound"));
+            assertEquals(instancesBefore, request("DescribeInstances", account, DESTINATION_REGION)
+                    .post("/").then().statusCode(200).extract().xmlPath()
+                    .getList("DescribeInstancesResponse.reservationSet.item").size());
+            assertEquals(volumesBefore, request("DescribeVolumes", account, DESTINATION_REGION)
+                    .post("/").then().statusCode(200).extract().xmlPath()
+                    .getList("DescribeVolumesResponse.volumeSet.item").size());
         } finally {
             deregister(source.imageId(), OWNER, SOURCE_REGION);
         }

@@ -9785,7 +9785,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     || imageForCaller(region, imageId).isPresent()) {
                 continue;
             }
-            if (!foreignImageEntries(region, imageId).isEmpty()) {
+            if (hasRegisteredImageId(imageId)) {
                 if (sharedImageForCaller(region, imageId).isPresent()) {
                     continue; // A visible image excluded by the requested owners or filters is not a fallback.
                 }
@@ -10794,6 +10794,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return List.of();
     }
 
+    private boolean hasRegisteredImageId(String imageId) {
+        String suffix = "::" + imageId;
+        if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
+            return !aware.scanAllAccountEntries(storedKey -> storedKey.endsWith(suffix)).isEmpty();
+        }
+        return !registeredImages.scan(storedKey -> storedKey.endsWith(suffix)).isEmpty();
+    }
+
     private Optional<Image> imageForCaller(String region, String imageId) {
         if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
             return aware.getForAccountMigratingLegacy(callerAccountId(), key(region, imageId),
@@ -10921,7 +10929,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private String launchableImageForCaller(String region, String imageId, Image image) {
-        if (image == null && !foreignImageEntries(region, imageId).isEmpty()) {
+        if (image == null && hasRegisteredImageId(imageId)) {
             throw new AwsException("InvalidAMIID.NotFound", "The source image ancestry is unavailable.", 400);
         }
         return image != null && !callerAccountId().equals(image.getOwnerId())
@@ -10943,10 +10951,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .toList();
     }
 
-    /** Rejects an AMI id that has been deregistered; unknown ids fall through to the resolver. */
+    /** Rejects unavailable registered AMIs; unknown ids fall through to the resolver. */
     private void requireNotDeregistered(String region, String imageId) {
         Image image = imageForCaller(region, imageId).orElse(null);
-        if (image == null && !foreignImageEntries(region, imageId).isEmpty()) {
+        if (image == null && hasRegisteredImageId(imageId)) {
             image = sharedImageForCaller(region, imageId).orElseThrow(() ->
                     new AwsException("InvalidAMIID.NotFound", "The image is not available: " + imageId, 400));
         }
