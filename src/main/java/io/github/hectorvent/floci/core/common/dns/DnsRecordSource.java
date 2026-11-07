@@ -47,4 +47,14 @@ public interface DnsRecordSource {
     default Optional<DnsAnswer> resolve(String name, int type, DnsClientVpcSource.ClientVpc origin) {
         return resolve(name, type);
     }
+
+    /**
+     * Answers only from zones scoped to {@code origin}'s VPC, such as Route 53 private hosted zones
+     * associated with it, or empty. The embedded DNS server lets such an answer take precedence over
+     * AWS endpoint spoofing for that VPC, so a source must not answer here for a name it would
+     * answer for every client.
+     */
+    default Optional<DnsAnswer> resolvePrivate(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        return Optional.empty();
+    }
 }
