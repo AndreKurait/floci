@@ -4273,6 +4273,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // is in-memory record construction, and the slow part, the container launch, still runs
         // outside.
         ResolvedAmiImage dockerImage = null;
+        String launchableImageId = null;
         synchronized (imageRegistryLock) {
             requireNotDeregistered(region, imageId);
             // Planned under the lock DeregisterImage deletes snapshots under, so a snapshot a
@@ -4286,7 +4287,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 // ancestor supplies the guest runtime (systemd vs minimal, cloud-init), which a
                 // committed layer does not change; the captured file system, when there is one,
                 // then replaces the image to actually run.
-                dockerImage = amiImageResolver.resolveImage(resolveLaunchableImageId(region, imageId));
+                launchableImageId = launchableImageForCaller(region, imageId, image);
+                dockerImage = amiImageResolver.resolveImage(launchableImageId);
                 String captured = capturedImageFor(region, imageId);
                 if (captured != null) {
                     dockerImage = new ResolvedAmiImage(captured, dockerImage.guestRuntime(),
@@ -4352,6 +4354,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             inst.setInstanceId(instanceId);
                             inst.setOwnerId(callerAccountId());
                             inst.setImageId(imageId);
+                            inst.setLaunchableImageId(launchableImageId);
                             inst.setState(InstanceState.pending());
                             inst.setInstanceType(effectiveInstanceType);
                             inst.setSpot(spot);
@@ -4883,7 +4886,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private void validateArchitectureCompatibility(String region, String imageId, String instanceType) {
-        Optional<String> imageArchitecture = registeredImages.get(key(region, imageId))
+        Optional<String> imageArchitecture = imageForCaller(region, imageId)
+                .or(() -> sharedImageForCaller(region, imageId))
                 .map(Image::getArchitecture)
                 .or(() -> imageCatalog.findByIdOrAlias(imageId).map(image -> image.architecture))
                 .filter(value -> !value.isBlank());
@@ -4903,7 +4907,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private String architectureFor(String region, String imageId, String instanceType) {
-        Optional<String> registeredArchitecture = registeredImages.get(key(region, imageId))
+        Optional<String> registeredArchitecture = imageForCaller(region, imageId)
+                .or(() -> sharedImageForCaller(region, imageId))
                 .map(Image::getArchitecture);
         return registeredArchitecture
                 .filter(value -> !value.isBlank())
@@ -9183,6 +9188,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .collect(Collectors.toList());
         List<Image> images = new ArrayList<>(catalogImages);
         images.addAll(createdImages);
+        if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
+            aware.scanAllAccountEntries(k -> k.startsWith(region + "::")).stream()
+                    .filter(entry -> !callerAccountId().equals(entry.accountId()))
+                    .map(entry -> entry.value().getImageId()).distinct()
+                    .map(id -> sharedImageForCaller(region, id)).flatMap(Optional::stream)
+                    .map(this::sharedImageView)
+                    .filter(img -> matchesImageIds(img, imageIds))
+                    .filter(img -> matchesImageOwners(img, owners))
+                    .filter(img -> matchesRegisteredImageFilters(img, filters))
+                    .forEach(images::add);
+        }
         addFallbackLaunchableImages(region, images, imageIds, owners, filters);
         return images;
     }
@@ -9201,8 +9217,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (String imageId : imageIds) {
             if (imageId == null || !imageId.startsWith("ami-") || present.contains(imageId)
                     || imageCatalog.findByIdOrAlias(imageId).isPresent()
-                    || registeredImages.get(key(region, imageId)).isPresent()) {
+                    || imageForCaller(region, imageId).isPresent()) {
                 continue;
+            }
+            if (hasRegisteredImageId(imageId)) {
+                if (sharedImageForCaller(region, imageId).isPresent()) {
+                    continue; // A visible image excluded by the requested owners or filters is not a fallback.
+                }
+                throw new AwsException("InvalidAMIID.NotFound", "The image is not available: " + imageId, 400);
             }
             Image fallback = fallbackLaunchableImage(imageId);
             if (matchesImageOwners(fallback, owners) && matchesRegisteredImageFilters(fallback, filters)) {
@@ -9241,15 +9263,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // The new AMI inherits what it was captured from rather than the registerImage defaults,
         // so DescribeImages does not report a generic x86_64 / /dev/sda1 image with no devices.
         Image sourceImage = findImageForCapture(region, source.getImageId());
+        String architecture = source.getArchitecture();
+        if (architecture == null && sourceImage != null) {
+            architecture = sourceImage.getArchitecture();
+        }
+        String rootDeviceName = source.getRootDeviceName();
+        if (rootDeviceName == null && sourceImage != null) {
+            rootDeviceName = sourceImage.getRootDeviceName();
+        }
+        String launchableImageId = source.getLaunchableImageId() != null ? source.getLaunchableImageId()
+                : launchableImageForCaller(region, source.getImageId(), sourceImage);
         Image image = registerImage(region, name, description,
-                sourceImage != null ? sourceImage.getArchitecture() : null,
-                sourceImage != null ? sourceImage.getRootDeviceName() : null,
-                captureBlockDeviceMappings(region, source, sourceImage));
+                architecture, rootDeviceName,
+                captureBlockDeviceMappings(region, source, sourceImage), false);
 
         // Carry the launchable ancestor so RunInstances on this AMI starts the same guest instead
         // of falling through to the catalog default. This is also the fallback when the file
         // system cannot be captured below.
-        image.setSourceImageId(resolveLaunchableImageId(region, source.getImageId()));
+        image.setSourceImageId(launchableImageId);
         // The resolved image rather than the instance's id: an instance launched by a catalog alias
         // records the alias.
         image.setCreationSourceImageId(sourceImage != null ? sourceImage.getImageId() : source.getImageId());
@@ -9319,16 +9350,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // may have given a different type from the source AMI's.
         Volume rootVolume = source.getRootVolumeId() == null ? null
                 : volumes.get(key(region, source.getRootVolumeId())).orElse(null);
-        if (rootVolume != null && sourceImage != null) {
-            mappings.stream()
-                    .filter(m -> m.getEbs() != null
-                            && Objects.equals(m.getDeviceName(), sourceImage.getRootDeviceName()))
-                    .forEach(m -> m.getEbs().setVolumeType(rootVolume.getVolumeType()));
+        if (rootVolume != null) {
+            for (VolumeAttachment attachment : rootVolume.getAttachments()) {
+                if (source.getInstanceId().equals(attachment.getInstanceId())) {
+                    mappings.removeIf(mapping -> Objects.equals(mapping.getDeviceName(), attachment.getDevice()));
+                    mappings.addFirst(attachedMapping(rootVolume, attachment));
+                    break;
+                }
+            }
         }
-        Set<String> devices = mappings.stream()
-                .map(BlockDeviceMapping::getDeviceName)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toSet());
+        Set<String> devices = new HashSet<>();
         for (Volume volume : volumes.scan(k -> true)) {
             if (!region.equals(volume.getRegion())
                     || volume.getVolumeId().equals(source.getRootVolumeId())) {
@@ -9339,6 +9370,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         || !devices.add(attachment.getDevice())) {
                     continue;
                 }
+                mappings.removeIf(mapping -> Objects.equals(mapping.getDeviceName(), attachment.getDevice()));
                 mappings.add(attachedMapping(volume, attachment));
             }
         }
@@ -9351,6 +9383,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ebs.setSnapshotId("snap-" + randomHex(17));
         ebs.setVolumeSize(volume.getSize());
         ebs.setVolumeType(volume.getVolumeType());
+        ebs.setIops(volume.getIops());
+        ebs.setThroughput(volume.getThroughput());
         ebs.setDeleteOnTermination(attachment.isDeleteOnTermination());
         ebs.setEncrypted(volume.isEncrypted());
         BlockDeviceMapping mapping = new BlockDeviceMapping();
@@ -9405,6 +9439,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // it), but the root of a copy or capture is always a snapshot.
         ebs.setSnapshotId(sourceEbs.getSnapshotId() != null || root ? "snap-" + randomHex(17) : null);
         ebs.setVolumeSize(sourceEbs.getVolumeSize());
+        ebs.setIops(sourceEbs.getIops());
+        ebs.setThroughput(sourceEbs.getThroughput());
         ebs.setVolumeType(sourceEbs.getVolumeType());
         ebs.setDeleteOnTermination(sourceEbs.getDeleteOnTermination());
         ebs.setEncrypted(sourceEbs.getEncrypted());
@@ -9440,6 +9476,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                  List<LaunchTemplateData.BlockDeviceMapping> launchMappings) {
         requireValidLaunchDevices(launchMappings);
         List<LaunchTemplateData.BlockDeviceMapping> amiMappings = new ArrayList<>();
+        Set<String> inheritedSnapshots = new HashSet<>();
         if (image != null && image.getBlockDeviceMappings() != null) {
             for (BlockDeviceMapping declared : image.getBlockDeviceMappings()) {
                 LaunchTemplateData.BlockDeviceMapping mapping = launchMapping(declared);
@@ -9448,6 +9485,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     mapping.setDeviceName(rootDeviceName);
                 }
                 amiMappings.add(mapping);
+                if (mapping.getEbs() != null && mapping.getEbs().getSnapshotId() != null) {
+                    inheritedSnapshots.add(mapping.getEbs().getSnapshotId());
+                }
             }
         }
         if (amiMappings.stream().noneMatch(m -> rootDeviceName.equals(m.getDeviceName()))) {
@@ -9485,9 +9525,36 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             String snapshotId = ebs.getSnapshotId() == null || ebs.getSnapshotId().isBlank()
                     ? null : ebs.getSnapshotId();
-            Snapshot snapshot = snapshotId == null ? null : snapshots.get(key(region, snapshotId))
-                    .orElseThrow(() -> new AwsException("InvalidSnapshot.NotFound",
-                            "The snapshot '" + snapshotId + "' does not exist.", 400));
+            Snapshot snapshot = null;
+            if (snapshotId != null) {
+                // Launch permission includes the AMI's backing snapshots, but only here. Direct
+                // CreateVolume and CopyImage retain their independent snapshot permission checks.
+                if (image != null && inheritedSnapshots.contains(snapshotId)
+                        && !callerAccountId().equals(image.getOwnerId())
+                        && snapshots instanceof AccountAwareStorageBackend<Snapshot> aware) {
+                    snapshot = aware.getForAccount(image.getOwnerId(), key(region, snapshotId)).orElse(null);
+                    if (snapshot == null || !image.getOwnerId().equals(snapshot.getOwnerId())
+                            || !snapshotId.equals(snapshot.getSnapshotId()) || !region.equals(snapshot.getRegion())) {
+                        throw new AwsException("InvalidSnapshot.NotFound", "AMI backing snapshot is unavailable.", 400);
+                    }
+                    if (snapshot.isEncrypted()) {
+                        throw new AwsException("UnsupportedOperation", "Encrypted shared launch requires KMS authorization.", 400);
+                    }
+                    if (!"completed".equals(snapshot.getState())) {
+                        throw new AwsException("IncorrectState", "AMI backing snapshot is not completed.", 400);
+                    }
+                } else {
+                    try {
+                        snapshot = volumeSnapshot(region, snapshotId);
+                    } catch (AwsException failure) {
+                        if ("InvalidSnapshot.NotFound".equals(failure.getErrorCode())) {
+                            throw new AwsException("InvalidSnapshot.NotFound",
+                                    "The snapshot '" + snapshotId + "' does not exist.", 400);
+                        }
+                        throw failure;
+                    }
+                }
+            }
             Integer snapshotSize = snapshot == null ? null : snapshot.getVolumeSize();
             // With neither a size nor a sized snapshot, the root gets the default root size and
             // any other device 0, which leaves the size to CreateVolume's default.
@@ -9581,6 +9648,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             ebs.setSnapshotId(declaredEbs.getSnapshotId());
             ebs.setVolumeSize(declaredEbs.getVolumeSize());
             ebs.setVolumeType(declaredEbs.getVolumeType());
+            ebs.setIops(declaredEbs.getIops());
+            ebs.setThroughput(declaredEbs.getThroughput());
             ebs.setDeleteOnTermination(declaredEbs.getDeleteOnTermination());
             ebs.setEncrypted(declaredEbs.getEncrypted());
             mapping.setEbs(ebs);
@@ -9594,7 +9663,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     private static boolean describesVolume(EbsBlockDevice ebs) {
         return ebs != null && (ebs.getSnapshotId() != null || ebs.getVolumeSize() != null
-                || ebs.getVolumeType() != null || ebs.getDeleteOnTermination() != null || ebs.getEncrypted() != null);
+                || ebs.getVolumeType() != null || ebs.getDeleteOnTermination() != null || ebs.getEncrypted() != null
+                || ebs.getIops() != null || ebs.getThroughput() != null);
     }
 
     /** The image a CreateImage source was launched from, whether catalog-backed or registered. */
@@ -9602,7 +9672,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (imageId == null || imageId.isBlank()) {
             return null;
         }
-        Image registered = registeredImages.get(key(region, imageId)).orElse(null);
+        Image registered = imageForCaller(region, imageId)
+                .or(() -> sharedImageForCaller(region, imageId)).orElse(null);
         if (registered != null) {
             return registered;
         }
@@ -9650,6 +9721,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Image registerImage(String region, String name, String description, String architecture,
                                String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings) {
+        return registerImage(region, name, description, architecture, rootDeviceName, blockDeviceMappings, true);
+    }
+
+    private Image registerImage(String region, String name, String description, String architecture,
+                                String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings,
+                                boolean bindRegistrationName) {
         if (name == null || name.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter Name", 400);
         }
@@ -9659,25 +9736,31 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // DeregisterImage scans before deleting a snapshot; both run under the registry lock so
         // a registration cannot slip between that scan and the delete.
         synchronized (imageRegistryLock) {
-            return registerImageLocked(region, name, description, architecture, rootDeviceName,
-                    blockDeviceMappings);
+            boolean duplicateName = registeredImages.scan(k -> true).stream()
+                    .filter(img -> region.equals(img.getRegion()))
+                    // Deregistered AMIs release their names immediately in Floci.
+                    .filter(img -> !DEREGISTERED_STATE.equals(img.getState()))
+                    .anyMatch(img -> name.equals(img.getName()));
+            if (duplicateName) {
+                throw new AwsException("InvalidAMIName.Duplicate",
+                        "AMI name '" + name + "' is already in use.", 400);
+            }
+            Ec2ImageCatalog.CatalogImage source = bindRegistrationName
+                    ? imageCatalog.findByRegistrationName(name).orElse(null) : null;
+            if (source != null && architecture != null && !source.architecture.equals(architecture)) {
+                throw new AwsException("InvalidParameterValue",
+                        "Architecture '" + architecture + "' does not match the catalog image bound to Name '"
+                                + name + "' (" + source.architecture + ").", 400);
+            }
+            return registerImageLocked(region, name, description,
+                    source != null ? source.architecture : architecture, rootDeviceName,
+                    blockDeviceMappings, source != null ? source.imageId : null);
         }
     }
 
     private Image registerImageLocked(String region, String name, String description, String architecture,
-                                      String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings) {
-        boolean duplicateName = registeredImages.scan(k -> true).stream()
-                .filter(img -> region.equals(img.getRegion()))
-                // A deregistered AMI no longer holds its name: "If you have recently deregistered
-                // an AMI with the same name, allow enough time for the change to propagate"
-                // (InvalidAMIName.Duplicate). Floci has no propagation delay, so the name is free
-                // immediately -- which is what Packer's force_deregister then rebuild relies on.
-                .filter(img -> !DEREGISTERED_STATE.equals(img.getState()))
-                .anyMatch(img -> name.equals(img.getName()));
-        if (duplicateName) {
-            throw new AwsException("InvalidAMIName.Duplicate",
-                    "AMI name '" + name + "' is already in use.", 400);
-        }
+                                      String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings,
+                                      String sourceImageId) {
         Image image = new Image();
         image.setImageId("ami-" + randomHex(17));
         image.setName(name);
@@ -9692,6 +9775,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         image.setHypervisor("xen");
         image.setCreationDate(ISO_FMT.format(Instant.now()));
         image.setRegion(region);
+        image.setSourceImageId(sourceImageId);
         image.setBlockDeviceMappings(blockDeviceMappings != null ? new ArrayList<>(blockDeviceMappings) : List.of());
         registeredImages.put(key(region, image.getImageId()), image);
         for (BlockDeviceMapping mapping : image.getBlockDeviceMappings()) {
@@ -9886,8 +9970,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      *
      * <p>Tags: "Default: Your user-defined AMI tags are not copied." With {@code copyImageTags}
      * the copy gets the caller's tags on the source, less the {@code aws:} system tags, which AWS
-     * does not copy either. Floci keeps each account's tags apart and does not model shared
-     * ({@code ec2:SharedTag/}) tags, so no other account's tag is visible to the caller or copied.
+     * does not copy either. A shared image exposes the owner's {@code ec2:SharedTag/} tags
+     * together with the receiving account's private tags; the owner's private tags are excluded.
      * {@code requestedImageTags} are the image tags the request's TagSpecification will add after
      * the copy; with the copied ones they must stay within the per-resource limit, which is
      * checked before anything is created so a refused copy leaves no AMI or snapshot behind.
@@ -9895,7 +9979,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CopyImage.html">CopyImage</a>
      */
     public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
-                           String name, String description, boolean copyImageTags,
+                           String name, String description) {
+        return copyImage(destinationRegion, sourceRegion, sourceImageId, name, description, false);
+    }
+
+    public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
+                           String name, String description, boolean dryRun) {
+        return copyImage(destinationRegion, sourceRegion, sourceImageId, name, description, dryRun, false);
+    }
+
+    public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
+                           String name, String description, boolean dryRun, boolean copyImageTags) {
+        return copyImage(destinationRegion, sourceRegion, sourceImageId, name, description,
+                dryRun, copyImageTags, List.of());
+    }
+
+    public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
+                           String name, String description, boolean copyImageTags, List<Tag> requestedImageTags) {
+        return copyImage(destinationRegion, sourceRegion, sourceImageId, name, description,
+                false, copyImageTags, requestedImageTags);
+    }
+
+    public Image copyImage(String destinationRegion, String sourceRegion, String sourceImageId,
+                           String name, String description, boolean dryRun, boolean copyImageTags,
                            List<Tag> requestedImageTags) {
         if (sourceImageId == null || sourceImageId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter SourceImageId", 400);
@@ -9914,7 +10020,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Registered AMIs are keyed by (region, id) and are visible only in their own region,
             // so the source is resolved against SourceRegion rather than the request's region.
             // Catalog AMIs are region-independent in Floci and so resolve from either side.
-            Image source = registeredImages.get(key(sourceRegion, sourceImageId)).orElse(null);
+            Image source = imageForCaller(sourceRegion, sourceImageId).orElse(null);
+            if (source != null && (!callerAccountId().equals(source.getOwnerId())
+                    || !sourceRegion.equals(source.getRegion()) || !sourceImageId.equals(source.getImageId()))) {
+                throw new AwsException("AuthFailure", "The source image ownership does not match its stored key.", 400);
+            }
             if (source != null && DEREGISTERED_STATE.equals(source.getState())) {
                 throw new AwsException("InvalidAMIID.Unavailable",
                         "The image id '[" + sourceImageId + "]' has been deregistered and is no longer available", 400);
@@ -9924,12 +10034,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .map(Ec2ImageCatalog.CatalogImage::toImage)
                         .orElse(null);
             }
+            boolean foreign = false;
+            if (source == null) {
+                source = sharedCopySource(sourceRegion, sourceImageId);
+                foreign = source != null;
+            }
             if (source == null) {
                 throw new AwsException("InvalidAMIID.NotFound",
                         "The image id '[" + sourceImageId + "]' does not exist in region " + sourceRegion, 400);
             }
 
-            List<Tag> copiedTags = copyImageTags ? copiedImageTags(sourceRegion, source) : List.of();
+            List<Tag> copiedTags = copyImageTags
+                    ? (foreign ? sharedImageView(source).getTags() : copiedImageTags(sourceRegion, source))
+                            .stream().filter(tag -> !isAwsTagKey(tag.getKey()))
+                            .map(tag -> new Tag(tag.getKey(), tag.getValue())).toList()
+                    : List.of();
+            validateNewResourceTags(copiedTags);
             if (!copiedTags.isEmpty() && requestedImageTags != null && !requestedImageTags.isEmpty()) {
                 Set<String> userKeys = userTagKeys(copiedTags);
                 userKeys.addAll(userTagKeys(requestedImageTags));
@@ -9938,20 +10058,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Fresh snapshot ids: two AMIs sharing one snapshot would make deleting either appear
             // to take the other's backing with it, and the copy's snapshots live in the
             // destination region anyway.
-            Image copy = registerImage(destinationRegion, name, description, source.getArchitecture(),
-                    source.getRootDeviceName(), sourceImageMappings(source));
-            if (!copiedTags.isEmpty()) {
-                copy.setTags(new ArrayList<>(copiedTags));
-                putTags(destinationRegion, copy.getImageId(), new ArrayList<>(copiedTags));
-            }
+            List<BlockDeviceMapping> mappings = foreign
+                    ? sharedCopyMappings(sourceRegion, source) : sourceImageMappings(source);
+            String ancestor = foreign ? sharedImageAncestor(sourceRegion, source)
+                    : resolveLaunchableImageId(sourceRegion, sourceImageId);
+            requireNotDryRun(dryRun);
+            // CopyImage accepts repeated names; only RegisterImage/CreateImage require uniqueness.
+            Image copy = registerImageLocked(destinationRegion, name, description, source.getArchitecture(),
+                    source.getRootDeviceName(), mappings, null);
             copy.setVirtualizationType(source.getVirtualizationType());
             copy.setRootDeviceType(source.getRootDeviceType());
             copy.setPlatform(source.getPlatform());
             // The launchable ancestor is resolved in the SOURCE region, since that is where the
             // chain of CreateImage parents lives; it bottoms out at a catalog id, which is
             // region-agnostic.
-            copy.setSourceImageId(resolveLaunchableImageId(sourceRegion, sourceImageId));
-            // The resolved id rather than the request's: a catalog image may be named by an alias.
+            copy.setSourceImageId(ancestor);
             copy.setCreationSourceImageId(source.getImageId());
             copy.setCreationSourceImageRegion(sourceRegion);
             // The captured file system is the point of a CreateImage AMI, and the ancestry the
@@ -9960,10 +10081,277 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // it. Without this the copy launches the base image, which is the same silent
             // emptiness CreateImage itself used to produce. The layer is shared rather than
             // duplicated; reclamation accounts for that.
-            copy.setDockerImage(capturedImageFor(sourceRegion, sourceImageId));
+            copy.setDockerImage(foreign ? null : capturedImageFor(sourceRegion, sourceImageId));
+            copy.setTags(new ArrayList<>(copiedTags));
             registeredImages.put(key(destinationRegion, copy.getImageId()), copy);
+            if (!copiedTags.isEmpty()) {
+                createTags(destinationRegion, List.of(copy.getImageId()), copiedTags);
+            }
             return copy;
         }
+    }
+
+    public List<String> describeImageLaunchPermissions(String region, String imageId, boolean dryRun) {
+        synchronized (imageRegistryLock) {
+            Image image = requiredOwnedImage(region, imageId);
+            requireNotDryRun(dryRun);
+            return image.getLaunchPermissionUserIds().stream().sorted().toList();
+        }
+    }
+
+    public List<String> describeSnapshotCreateVolumePermissions(String region, String snapshotId, boolean dryRun) {
+        synchronized (imageRegistryLock) {
+            Snapshot snapshot = requiredOwnedSnapshot(region, snapshotId);
+            requireNotDryRun(dryRun);
+            return snapshot.getCreateVolumePermissionUserIds().stream().sorted().toList();
+        }
+    }
+
+    public void modifyImageLaunchPermissions(String region, String imageId, List<String> add,
+                                              List<String> remove, boolean dryRun) {
+        synchronized (imageRegistryLock) {
+            Image image = requiredOwnedImage(region, imageId);
+            validatePermissionChanges(add, remove, false);
+            requireNotDryRun(dryRun);
+            Set<String> updated = new LinkedHashSet<>(image.getLaunchPermissionUserIds());
+            updated.addAll(add);
+            updated.removeAll(remove);
+            image.setLaunchPermissionUserIds(updated);
+            registeredImages.put(key(region, imageId), image);
+        }
+    }
+
+    public void modifySnapshotCreateVolumePermissions(String region, String snapshotId, List<String> add,
+                                                       List<String> remove, boolean dryRun) {
+        synchronized (imageRegistryLock) {
+            Snapshot snapshot = requiredOwnedSnapshot(region, snapshotId);
+            validatePermissionChanges(add, remove, true);
+            if (!add.isEmpty() && snapshot.isEncrypted()) {
+                throw new AwsException("UnsupportedOperation", "Encrypted snapshot sharing is not supported.", 400);
+            }
+            requireNotDryRun(dryRun);
+            Set<String> updated = new LinkedHashSet<>(snapshot.getCreateVolumePermissionUserIds());
+            updated.addAll(add);
+            updated.removeAll(remove);
+            snapshot.setCreateVolumePermissionUserIds(updated);
+            snapshots.put(key(region, snapshotId), snapshot);
+        }
+    }
+
+    private Image requiredOwnedImage(String region, String imageId) {
+        requirePermissionResourceId(imageId, "ImageId", "ami", "InvalidAMIID.Malformed");
+        Image image = imageForCaller(region, imageId).orElse(null);
+        if (image == null || !callerAccountId().equals(image.getOwnerId())
+                || !region.equals(image.getRegion()) || !imageId.equals(image.getImageId())) {
+            throw new AwsException("InvalidAMIID.NotFound", "The image '" + imageId + "' does not exist.", 400);
+        }
+        if (!"available".equals(image.getState())) {
+            throw new AwsException("InvalidAMIID.Unavailable", "The image '" + imageId + "' is not available.", 400);
+        }
+        return image;
+    }
+
+    private Snapshot requiredOwnedSnapshot(String region, String snapshotId) {
+        requirePermissionResourceId(snapshotId, "SnapshotId", "snap", "InvalidSnapshotID.Malformed");
+        Snapshot snapshot = snapshots instanceof AccountAwareStorageBackend<Snapshot> aware
+                ? aware.getForAccountMigratingLegacy(callerAccountId(), key(region, snapshotId),
+                        value -> callerAccountId().equals(value.getOwnerId())
+                                && region.equals(value.getRegion()) && snapshotId.equals(value.getSnapshotId()))
+                        .orElse(null)
+                : snapshots.get(key(region, snapshotId)).orElse(null);
+        if (snapshot == null || !callerAccountId().equals(snapshot.getOwnerId())
+                || !region.equals(snapshot.getRegion()) || !snapshotId.equals(snapshot.getSnapshotId())) {
+            throw new AwsException("InvalidSnapshot.NotFound",
+                    "The snapshot '" + snapshotId + "' does not exist.", 400);
+        }
+        return snapshot;
+    }
+
+    private static void requirePermissionResourceId(String id, String parameter, String prefix, String error) {
+        if (id == null || id.isBlank()) {
+            throw new AwsException("MissingParameter", "The parameter " + parameter + " is missing.", 400);
+        }
+        if (!id.matches(prefix + "-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException(error, "Invalid " + parameter + ": " + id, 400);
+        }
+    }
+
+    private static void validatePermissionChanges(List<String> add, List<String> remove, boolean snapshot) {
+        if (add.isEmpty() && remove.isEmpty()) {
+            throw new AwsException("MissingParameter", "A nested permission Add or Remove is required.", 400);
+        }
+        if ((snapshot && !add.isEmpty() && !remove.isEmpty())
+                || add.stream().anyMatch(remove::contains)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The requested permission additions and removals cannot be combined.", 400);
+        }
+        if (snapshot && (long) add.size() + remove.size() > 500) {
+            throw new AwsException("InvalidParameterValue", "At most 500 snapshot permissions may be modified.", 400);
+        }
+        for (List<String> values : List.of(add, remove)) {
+            for (String userId : values) {
+                if (userId == null || !userId.matches("[0-9]{12}")) {
+                    throw new AwsException("InvalidParameterValue", "UserId must be a 12-digit account ID.", 400);
+                }
+            }
+        }
+    }
+
+    private static void requireNotDryRun(boolean dryRun) {
+        if (dryRun) {
+            throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
+        }
+    }
+
+    private List<AccountAwareStorageBackend.AccountEntry<Image>> foreignImageEntries(String region, String imageId) {
+        if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
+            return aware.scanAllAccountEntries(key(region, imageId)::equals).stream()
+                    .filter(entry -> !callerAccountId().equals(entry.accountId())).toList();
+        }
+        return List.of();
+    }
+
+    private boolean hasRegisteredImageId(String imageId) {
+        String suffix = "::" + imageId;
+        if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
+            return !aware.scanAllAccountEntries(storedKey -> storedKey.endsWith(suffix)).isEmpty();
+        }
+        return !registeredImages.scan(storedKey -> storedKey.endsWith(suffix)).isEmpty();
+    }
+
+    private Optional<Image> imageForCaller(String region, String imageId) {
+        if (registeredImages instanceof AccountAwareStorageBackend<Image> aware) {
+            return aware.getForAccountMigratingLegacy(callerAccountId(), key(region, imageId),
+                    image -> callerAccountId().equals(image.getOwnerId())
+                            && region.equals(image.getRegion()) && imageId.equals(image.getImageId()));
+        }
+        return registeredImages.get(key(region, imageId));
+    }
+
+    private Optional<Image> sharedImageForCaller(String region, String imageId) {
+        List<AccountAwareStorageBackend.AccountEntry<Image>> entries = foreignImageEntries(region, imageId);
+        if (entries.size() != 1) {
+            return Optional.empty();
+        }
+        AccountAwareStorageBackend.AccountEntry<Image> entry = entries.getFirst();
+        Image image = entry.value();
+        return entry.accountId().equals(image.getOwnerId()) && region.equals(image.getRegion())
+                && imageId.equals(image.getImageId()) && !DEREGISTERED_STATE.equals(image.getState())
+                && (image.isPublic() || image.getLaunchPermissionUserIds().contains(callerAccountId()))
+                ? Optional.of(image) : Optional.empty();
+    }
+
+    private Image sharedImageView(Image source) {
+        Image view = new Image(source);
+        List<Tag> visibleTags = sharedImageTags(source.getRegion(), source);
+        getTagsForAccount(callerAccountId(), source.getRegion(), source.getImageId(), List.of()).stream()
+                .filter(tag -> tag.getKey() != null && !tag.getKey().startsWith("ec2:SharedTag/"))
+                .map(tag -> new Tag(tag.getKey(), tag.getValue())).forEach(visibleTags::add);
+        view.setTags(visibleTags);
+        view.setLaunchPermissionUserIds(Set.of());
+        return view;
+    }
+
+    private List<Tag> sharedImageTags(String region, Image source) {
+        return getTagsForAccount(source.getOwnerId(), region, source.getImageId(), source.getTags()).stream()
+                .filter(tag -> tag.getKey() != null && tag.getKey().startsWith("ec2:SharedTag/"))
+                .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new));
+    }
+
+    private Image sharedCopySource(String region, String imageId) {
+        List<AccountAwareStorageBackend.AccountEntry<Image>> entries = foreignImageEntries(region, imageId);
+        if (entries.isEmpty()) {
+            return null;
+        }
+        if (entries.size() != 1) {
+            throw new AwsException("AuthFailure", "The source image owner is ambiguous.", 400);
+        }
+        AccountAwareStorageBackend.AccountEntry<Image> entry = entries.getFirst();
+        Image source = entry.value();
+        if (sharedImageForCaller(region, imageId).isEmpty()) {
+            throw new AwsException("AuthFailure", "Not authorized to copy image: " + imageId, 400);
+        }
+        if (!"available".equals(source.getState())) {
+            throw new AwsException("InvalidAMIID.Unavailable", "The source image is not available.", 400);
+        }
+        return source;
+    }
+
+    private List<BlockDeviceMapping> sharedCopyMappings(String region, Image source) {
+        List<BlockDeviceMapping> declared = source.getBlockDeviceMappings();
+        if (!"ebs".equals(source.getRootDeviceType()) || declared == null
+                || declared.stream().noneMatch(mapping -> mapping.getEbs() != null)) {
+            throw new AwsException("UnsupportedOperation", "Shared copies require EBS snapshot mappings.", 400);
+        }
+        List<BlockDeviceMapping> result = new ArrayList<>();
+        for (BlockDeviceMapping mapping : declared) {
+            EbsBlockDevice ebs = mapping.getEbs();
+            BlockDeviceMapping copied = recapture(mapping, Objects.equals(mapping.getDeviceName(), source.getRootDeviceName()));
+            if (ebs != null) {
+                Snapshot snapshot = snapshots instanceof AccountAwareStorageBackend<Snapshot> aware
+                        ? aware.getForAccount(source.getOwnerId(), key(region, ebs.getSnapshotId())).orElse(null)
+                        : null;
+                if (snapshot == null || !source.getOwnerId().equals(snapshot.getOwnerId())
+                        || !region.equals(snapshot.getRegion())
+                        || !Objects.equals(ebs.getSnapshotId(), snapshot.getSnapshotId())
+                        || !snapshot.getCreateVolumePermissionUserIds().contains(callerAccountId())) {
+                    throw new AwsException("AuthFailure", "Not authorized to copy a backing snapshot.", 400);
+                }
+                if (!"completed".equals(snapshot.getState())) {
+                    throw new AwsException("IncorrectState", "A backing snapshot is not completed.", 400);
+                }
+                if (snapshot.isEncrypted() || Boolean.TRUE.equals(ebs.getEncrypted())) {
+                    throw new AwsException("UnsupportedOperation",
+                            "Encrypted shared snapshot copies are not supported.", 400);
+                }
+                if (snapshot.getVolumeSize() == null || snapshot.getVolumeSize() <= 0) {
+                    throw new AwsException("InvalidParameterValue",
+                            "A backing snapshot has no valid volume size.", 400);
+                }
+                copied.getEbs().setVolumeSize(snapshot.getVolumeSize());
+                copied.getEbs().setEncrypted(false);
+            }
+            result.add(copied);
+        }
+        return result;
+    }
+
+    private String sharedImageAncestor(String region, Image source) {
+        Set<String> visited = new HashSet<>();
+        Image current = source;
+        while (visited.size() < 16 && visited.add(current.getImageId())) {
+            if (current.getDockerImage() != null) {
+                throw new AwsException("UnsupportedOperation",
+                        "Shared captured Docker images are not supported.", 400);
+            }
+            String ancestor = current.getSourceImageId();
+            if (ancestor == null) {
+                if (config.services().ec2().mock()) {
+                    return null;
+                }
+                throw new AwsException("UnsupportedOperation",
+                        "Container-backed shared images require a catalog-bound source image.", 400);
+            }
+            if (imageCatalog.findByIdOrAlias(ancestor).isPresent()) {
+                return ancestor;
+            }
+            current = registeredImages instanceof AccountAwareStorageBackend<Image> aware
+                    ? aware.getForAccount(source.getOwnerId(), key(region, ancestor)).orElse(null) : null;
+            if (current == null || !source.getOwnerId().equals(current.getOwnerId())
+                    || !region.equals(current.getRegion()) || !ancestor.equals(current.getImageId())) {
+                throw new AwsException("InvalidAMIID.NotFound", "The source image ancestry is unavailable.", 400);
+            }
+        }
+        throw new AwsException("InvalidAMIID.Unavailable", "The source image ancestry cannot be resolved.", 400);
+    }
+
+    private String launchableImageForCaller(String region, String imageId, Image image) {
+        if (image == null && hasRegisteredImageId(imageId)) {
+            throw new AwsException("InvalidAMIID.NotFound", "The source image ancestry is unavailable.", 400);
+        }
+        return image != null && !callerAccountId().equals(image.getOwnerId())
+                && !foreignImageEntries(region, imageId).isEmpty()
+                ? sharedImageAncestor(region, image) : resolveLaunchableImageId(region, imageId);
     }
 
     /**
@@ -9980,9 +10368,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .toList();
     }
 
-    /** Rejects an AMI id that has been deregistered; unknown ids fall through to the resolver. */
+    /** Rejects unavailable registered AMIs; unknown ids fall through to the resolver. */
     private void requireNotDeregistered(String region, String imageId) {
-        Image image = registeredImages.get(key(region, imageId)).orElse(null);
+        Image image = imageForCaller(region, imageId).orElse(null);
+        if (image == null && hasRegisteredImageId(imageId)) {
+            image = sharedImageForCaller(region, imageId).orElseThrow(() ->
+                    new AwsException("InvalidAMIID.NotFound", "The image is not available: " + imageId, 400));
+        }
         if (image != null && DEREGISTERED_STATE.equals(image.getState())) {
             throw new AwsException("InvalidAMIID.Unavailable",
                     "The image id '[" + imageId + "]' has been deregistered and is no longer available", 400);
@@ -10935,6 +11327,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (String resourceId : resourceIds) {
             requireTaggableResource(region, resourceId);
         }
+        validateSharedImageTagChanges(region, resourceIds, tagList, "create");
         // The limit is checked under the same locks as the write, so two requests cannot both pass
         // it and then together exceed it, and a rejected request writes nothing.
         withTagWriteLocks(region, resourceIds, () -> {
@@ -11015,6 +11408,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    private void validateSharedImageTagChanges(String region, List<String> resourceIds,
+                                              List<Tag> tagList, String operation) {
+        if (tagList.stream().noneMatch(tag -> tag.getKey() != null
+                && tag.getKey().startsWith("ec2:SharedTag/"))) {
+            return;
+        }
+        for (String resourceId : resourceIds) {
+            if (resourceId.startsWith("ami-") && imageForCaller(region, resourceId).isEmpty()
+                    && sharedImageForCaller(region, resourceId).isPresent()) {
+                throw new AwsException("AccessDenied", "Only the resource owner can " + operation
+                        + " shared tags on resource '" + resourceId + "'.", 403);
+            }
+        }
+    }
+
     private static void validateTagLengths(List<Tag> tagList) {
         for (Tag tag : tagList) {
             if (tag.getKey().codePointCount(0, tag.getKey().length()) > MAX_TAG_KEY_LENGTH) {
@@ -11071,7 +11479,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Not describeImages: it answers an unknown ami- id with a launchable fallback image.
             case "ami" -> requireFound(imageCatalog.findByIdOrAlias(resourceId).isPresent()
                             || registeredImages.get(key(region, resourceId))
-                                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState())).isPresent(),
+                                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState())).isPresent()
+                            || sharedImageForCaller(region, resourceId).isPresent(),
                     "InvalidAMIID.NotFound", "The image id '[" + resourceId + "]' does not exist");
             case "snap" -> requireFound(!describeSnapshots(region, List.of(resourceId), List.of(), Map.of()).isEmpty(),
                     "InvalidSnapshot.NotFound", "The snapshot '" + resourceId + "' does not exist.");
@@ -11171,6 +11580,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public void deleteTags(String region, List<String> resourceIds, List<Tag> tagList) {
         validateTagTargets(region, resourceIds);
         validateUserTagKeys(tagList);
+        validateSharedImageTagChanges(region, resourceIds, tagList, "delete");
         deleteResourceTags(region, resourceIds, tagList);
     }
 
@@ -15459,6 +15869,32 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     // ─── Volumes ───────────────────────────────────────────────────────────────
 
+    private Snapshot volumeSnapshot(String region, String snapshotId) {
+        Snapshot snapshot = snapshots.get(key(region, snapshotId)).orElse(null);
+        if (snapshot == null && snapshots instanceof AccountAwareStorageBackend<Snapshot> aware) {
+            List<AccountAwareStorageBackend.AccountEntry<Snapshot>> entries =
+                    aware.scanAllAccountEntries(key(region, snapshotId)::equals);
+            if (entries.size() == 1) {
+                AccountAwareStorageBackend.AccountEntry<Snapshot> entry = entries.getFirst();
+                Snapshot candidate = entry.value();
+                if (entry.accountId().equals(candidate.getOwnerId())
+                        && candidate.getCreateVolumePermissionUserIds().contains(callerAccountId())) {
+                    snapshot = candidate;
+                }
+            }
+        }
+        if (snapshot == null || !region.equals(snapshot.getRegion()) || !snapshotId.equals(snapshot.getSnapshotId())) {
+            throw new AwsException("InvalidSnapshot.NotFound", "The snapshot is not available: " + snapshotId, 400);
+        }
+        if (!"completed".equals(snapshot.getState())) {
+            throw new AwsException("IncorrectState", "The snapshot is not completed: " + snapshotId, 400);
+        }
+        if (!callerAccountId().equals(snapshot.getOwnerId()) && snapshot.isEncrypted()) {
+            throw new AwsException("UnsupportedOperation", "Encrypted shared snapshots require KMS authorization.", 400);
+        }
+        return snapshot;
+    }
+
     private boolean ebsEncryptionByDefault(String region) {
         return ebsEncryptionService != null && ebsEncryptionService.getEbsEncryptionByDefault(region);
     }
@@ -15490,6 +15926,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public Volume createVolume(String region, String availabilityZone, String volumeType,
                                int size, boolean encrypted, String kmsKeyId, int iops, Integer throughput,
                                String snapshotId, List<Tag> volumeTags) {
+        if (snapshotId != null && !snapshotId.isBlank()) {
+            Snapshot snapshot = volumeSnapshot(region, snapshotId);
+            if (snapshot.getVolumeSize() == null || snapshot.getVolumeSize() <= 0) {
+                throw new AwsException("InvalidParameterValue", "Snapshot has no valid size.", 400);
+            }
+            if (size > 0 && size < snapshot.getVolumeSize()) {
+                throw new AwsException("InvalidParameterValue", "Volume size must be at least the snapshot size.", 400);
+            }
+            size = size > 0 ? size : snapshot.getVolumeSize();
+            encrypted |= snapshot.isEncrypted();
+        }
         ensureDefaultResources(region);
         Volume vol = newVolume(region, availabilityZone, volumeType, size, encrypted, kmsKeyId, iops, throughput,
                 snapshotId);

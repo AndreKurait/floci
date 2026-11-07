@@ -162,6 +162,13 @@ metadata.
 | `ami-rhel8` | | `registry.access.redhat.com/ubi8/ubi:8.10` |
 | `ami-rhel9` | | `registry.access.redhat.com/ubi9/ubi:9.5` |
 
+An external catalog entry can declare `registrationNames`, a list of exact, case-sensitive
+`RegisterImage` names. Registering one binds the new AMI to that catalog runtime and
+architecture; an explicitly conflicting architecture is rejected before registration.
+Names are never inferred from the display name or matched by prefix. Duplicate or blank
+registration names fail catalog loading. Captures and copies preserve their source
+runtime independently of their destination name.
+
 Any unrecognized AMI ID (including real AWS AMI IDs like `ami-0abc12345678`) falls back to the catalog `defaultDockerImage` (`public.ecr.aws/amazonlinux/amazonlinux:2023` by default).
 
 ### Cloud-image-derived AMI guests
@@ -492,10 +499,35 @@ with `DryRunOperation` before any of these checks, and creates nothing either.
 | Action | Description |
 |--------|-------------|
 | DescribeImages | Returns AMI metadata known to the local EC2 service. |
+| DescribeImageAttribute | Reads the caller-owned regional AMI's `launchPermission` account IDs. |
+| ModifyImageAttribute | Adds or removes regional AMI launch permissions using nested account-ID entries. |
 | CreateImage | Captures an instance as a new AMI. Reboots the source unless `NoReboot=true`. Applies `image` and `snapshot` tags from `TagSpecification` to the AMI and its new snapshots. |
 | RegisterImage | Registers an AMI from supplied metadata and block device mappings, with `image` tags from `TagSpecification`. |
 | CopyImage | Copies an AMI from `SourceRegion` into the request's region as a new AMI the caller owns, applying `image` and `snapshot` tags from `TagSpecification` to the copy and its new snapshots. By default the source's tags are not copied. With `CopyImageTags=true` the copy also gets the caller's tags on the source AMI's own id, without its `aws:` system tags; tags put on a catalog alias such as `ami-amazonlinux2` stay behind. When a `TagSpecification` tag has the same key as a copied one, Floci keeps the `TagSpecification` value, and the copied and specified tags together may not exceed 50 (`TagLimitExceeded`, and nothing is created). |
 | DeregisterImage | Deregisters an AMI. Its snapshots are kept unless `DeleteAssociatedSnapshots=true`, and a snapshot another AMI still uses is kept either way. |
+
+Registered AMIs remain scoped to their region. A known AMI that is unavailable to the
+caller in the requested region cannot use the default image fallback for describe or launch.
+Shared AMIs are visible in their region to accounts with launch permission. A launch can use the AMI's
+backing snapshots through that permission; `CopyImage` separately requires permission for
+every backing snapshot before creating any destination image or snapshot. Copies have
+independent IDs, ownership and permissions. Revoking the source grant does not remove an
+existing copy.
+
+A receiving account sees the owner's `ec2:SharedTag/` tags together with its own private
+tags. `CopyImageTags=true` copies those caller-visible tags, excluding `aws:` system tags.
+Explicit image tags override copied values. Only the owner may create or delete shared
+tags; recipients can maintain their own private tags.
+
+The permission APIs support nested `LaunchPermission.Add.N.UserId` and
+`LaunchPermission.Remove.N.UserId` entries with 12-digit account IDs. Attribute reads and
+mutations require ownership and the resource's region. `DryRun` validates without mutation.
+Public, organization and legacy flat permission forms remain unsupported.
+
+Shared container launches and copies require a catalog-bound runtime ancestor. The
+instance retains that admitted runtime for later image capture, including after sharing is
+revoked. Copying captured Docker images across accounts and encrypted shared snapshots
+remain unsupported. Mock mode supports the metadata lifecycle without copying disk blocks.
 
 Every resource EC2 creates is owned by the account the request resolves to, the same account
 [STS](sts.md) reports for those credentials, and that account is what `ownerId` and the resource ARN
@@ -1377,7 +1409,15 @@ Validation matches AWS behavior:
 |--------|-------------|
 | CreateSnapshot | Creates a regional snapshot of an available or in-use volume's metadata, with independently stored snapshot tags. |
 | DescribeSnapshots | Lists or returns stored snapshots, filterable by id, owner, tag key and tag value. |
+| DescribeSnapshotAttribute | Reads the caller-owned regional snapshot's `createVolumePermission` account IDs. |
+| ModifySnapshotAttribute | Adds or removes regional snapshot permissions using nested account-ID entries. |
 | DeleteSnapshot | Deletes an owned regional snapshot and its tags. A snapshot used as the root device of a registered AMI must first be released by deregistering every referencing AMI. |
+
+Snapshot permissions use `CreateVolumePermission.Add.N.UserId` or
+`CreateVolumePermission.Remove.N.UserId`, with at most 500 entries and one operation per
+request. `CreateVolume` accepts a shared, completed, unencrypted snapshot only when the
+caller has its permission. The volume inherits the snapshot size unless a larger size is
+requested. Creating the volume leaves the owner's snapshot unchanged.
 
 Creation records the source volume's size, encryption flag and ID, and returns a completed
 snapshot. It does not copy disk blocks or inherit volume tags. Deleting the source volume
