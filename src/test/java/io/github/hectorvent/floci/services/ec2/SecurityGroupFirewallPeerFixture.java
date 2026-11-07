@@ -10,6 +10,7 @@ import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.InspectExecResponse;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -59,6 +60,9 @@ class SecurityGroupFirewallPeerFixture {
     static final Pattern PEER_ACCEPT = Pattern.compile(
             "add rule inet floci_sg (?:ingress|egress) ip (?:saddr|daddr) (172\\.18\\.\\d+\\.\\d+) .*accept");
 
+    /** Docker networks reported for a container id, such as Floci's own container. */
+    final Map<String, Map<String, ContainerNetwork>> containerNetworks = new ConcurrentHashMap<>();
+
     /** Every nft script installed, in order, and each helper's currently installed script. */
     final List<String[]> installs = Collections.synchronizedList(new ArrayList<>());
     final Map<String, String> installed = new ConcurrentHashMap<>();
@@ -103,11 +107,16 @@ class SecurityGroupFirewallPeerFixture {
     }
 
     SecurityGroupFirewallManager manager() {
+        return manager(Optional.empty());
+    }
+
+    /** A manager in a Floci whose own container address, where its DNS listens, is {@code flociAddress}. */
+    SecurityGroupFirewallManager manager(Optional<String> flociAddress) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ec2().vpcNetworks().isolateAddressSpaces()).thenReturn(false);
         when(config.network().securityGroupEnforcement().enabled()).thenReturn(true);
         EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
-        when(dns.getServerIp()).thenReturn(Optional.empty());
+        when(dns.getServerIp()).thenReturn(flociAddress);
         return new SecurityGroupFirewallManager(docker(), mock(ContainerBuilder.class),
                 mock(ContainerLifecycleManager.class), config, dns);
     }
@@ -151,6 +160,10 @@ class SecurityGroupFirewallPeerFixture {
             InspectContainerCmd inspect = mock(InspectContainerCmd.class);
             InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
             when(response.getState().getRunning()).thenReturn(true);
+            Map<String, ContainerNetwork> networks = containerNetworks.get(invocation.<String>getArgument(0));
+            if (networks != null) {
+                when(response.getNetworkSettings().getNetworks()).thenReturn(networks);
+            }
             when(inspect.exec()).thenReturn(response);
             return inspect;
         });

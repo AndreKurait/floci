@@ -78,6 +78,16 @@ public final class SecurityGroupNftCompiler {
         }
     }
 
+    /**
+     * Security groups of a load balancer whose health checks and forwarded requests Floci sends from
+     * its own address. On AWS that traffic comes from load-balancer nodes in these groups.
+     */
+    public record EmulatorOrigin(String accountId, String region, String vpcId, Set<String> groupIds) {
+        public EmulatorOrigin {
+            groupIds = Set.copyOf(groupIds);
+        }
+    }
+
     public static String initialRuleset() {
         return "add table inet floci_sg\n"
                 + "add chain inet floci_sg ingress { type filter hook input priority -10; policy drop; }\n"
@@ -108,6 +118,19 @@ public final class SecurityGroupNftCompiler {
     public static String compile(Endpoint target, Collection<Endpoint> peers,
                                   Map<String, List<String>> prefixLists, List<String> vpcResolvers,
                                   boolean isolatedAddressSpaces, Predicate<Endpoint> admitted) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, admitted,
+                List.of(), List.of());
+    }
+
+    /**
+     * As above, and an ingress rule that references a security group of an {@code emulatorOrigins}
+     * load balancer in the target's VPC also accepts that traffic from {@code emulatorAddresses},
+     * the addresses Floci sends it from. Only group references match, never CIDR rules.
+     */
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
+                                  Collection<EmulatorOrigin> emulatorOrigins, List<String> emulatorAddresses) {
         if (target == null || target.groups() == null || target.groups().isEmpty()) {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
@@ -180,6 +203,13 @@ public final class SecurityGroupNftCompiler {
                             }
                         }
                     }
+                    if (!egress && admitsEmulatorOrigin(target, group, permission, emulatorOrigins)) {
+                        for (String address : emulatorAddresses) {
+                            if (literal(address)) {
+                                appendRule(rules, chain, addressField, address, protocol);
+                            }
+                        }
+                    }
                 }
             }
             // A managed peer must never fall through to a broad external CIDR rule
@@ -239,6 +269,24 @@ public final class SecurityGroupNftCompiler {
             }
         }
         return rules.toString();
+    }
+
+    private static boolean admitsEmulatorOrigin(Endpoint target, SecurityGroup group, IpPermission permission,
+                                                Collection<EmulatorOrigin> origins) {
+        if (origins == null || permission.getUserIdGroupPairs() == null
+                || permission.getUserIdGroupPairs().isEmpty()) {
+            return false;
+        }
+        for (EmulatorOrigin origin : origins) {
+            if (target.accountId().equals(origin.accountId()) && target.region().equals(origin.region())
+                    && target.vpcId().equals(origin.vpcId())
+                    && SecurityGroupPolicy.matchesPeer(group, permission,
+                            new SecurityGroupPolicy.Peer(null, origin.accountId(), origin.vpcId(),
+                                    origin.groupIds()), Map.of())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void appendRule(StringBuilder rules, String chain, String addressField,

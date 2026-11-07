@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.RequestHost;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elb.model.ClassicListener;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
@@ -53,6 +54,10 @@ public class ElbClassicDataPlane {
     private final Vertx vertx;
     private final HttpClient client;
     private final AtomicInteger nextTarget = new AtomicInteger();
+
+    /** Null in unit tests, which run without security-group enforcement. */
+    @Inject
+    jakarta.enterprise.inject.Instance<SecurityGroupFirewallManager> securityGroupFirewall;
 
     @Inject
     public ElbClassicDataPlane(ElbClassicService service, ElbClassicHealthChecker health,
@@ -199,7 +204,11 @@ public class ElbClassicDataPlane {
                     || !"InService".equals(health.getHealth(lb, id).state())) {
                 continue;
             }
-            targets.add(ElbClassicHealthChecker.instanceHost(instance, id));
+            String host = ElbClassicHealthChecker.backendHost(securityGroupFirewall, lb,
+                    ElbClassicHealthChecker.instanceHost(instance, id));
+            if (host != null) {
+                targets.add(host);
+            }
         }
         return targets;
     }
