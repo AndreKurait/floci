@@ -16,11 +16,11 @@ class DnsAliasTargetTest {
     @Test
     void unownedAliasesCannotUseSuffixSpoofingOrOrdinaryDnsResolution() {
         DnsRecordSource source = mock(DnsRecordSource.class);
-        when(source.resolveAliasTarget("api.example", "ZTARGET", 1)).thenReturn(Optional.empty());
+        when(source.resolveAliasTarget("api.example", "ZTARGET", 1, null)).thenReturn(Optional.empty());
         EmbeddedDnsServer server = new EmbeddedDnsServer(List.of("example"), List.of(source));
 
         assertTrue(server.resolveAliasTarget("api.example", "ZTARGET", 1).isEmpty());
-        verify(source).resolveAliasTarget("api.example", "ZTARGET", 1);
+        verify(source).resolveAliasTarget("api.example", "ZTARGET", 1, null);
         verifyNoMoreInteractions(source);
     }
 
@@ -28,9 +28,9 @@ class DnsAliasTargetTest {
     void competingAliasOwnersAreRefused() {
         DnsRecordSource first = mock(DnsRecordSource.class);
         DnsRecordSource second = mock(DnsRecordSource.class);
-        when(first.resolveAliasTarget("lb.example", "ZTARGET", 1))
+        when(first.resolveAliasTarget("lb.example", "ZTARGET", 1, null))
                 .thenReturn(Optional.of(DnsAnswer.records(List.of("198.51.100.4"), 60)));
-        when(second.resolveAliasTarget("lb.example", "ZTARGET", 1))
+        when(second.resolveAliasTarget("lb.example", "ZTARGET", 1, null))
                 .thenReturn(Optional.of(DnsAnswer.records(List.of("198.51.100.5"), 60)));
         EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(first, second));
 
@@ -40,9 +40,33 @@ class DnsAliasTargetTest {
     @Test
     void failedResourceLookupCannotBecomeAnUpstreamQuery() {
         DnsRecordSource source = mock(DnsRecordSource.class);
-        when(source.resolveAliasTarget("lb.example", "ZTARGET", 1)).thenThrow(new IllegalStateException("storage"));
+        when(source.resolveAliasTarget("lb.example", "ZTARGET", 1, null))
+                .thenThrow(new IllegalStateException("storage"));
         EmbeddedDnsServer server = new EmbeddedDnsServer(List.of("example"), List.of(source));
 
         assertEquals(5, server.resolveAliasTarget("lb.example", "ZTARGET", 1).orElseThrow().responseCode());
+    }
+
+    @Test
+    void existingAliasSourcesRetainTheirDefaultContextDelegation() {
+        DnsAnswer expected = DnsAnswer.records(List.of("198.51.100.4"), 60);
+        DnsRecordSource source = new DnsRecordSource() {
+            @Override
+            public Optional<DnsAnswer> resolveIpv4(String name) {
+                throw new AssertionError("Alias ownership must not use ordinary DNS resolution");
+            }
+
+            @Override
+            public Optional<DnsAnswer> resolveAliasTarget(String name, String zone, int type) {
+                assertEquals("lb.example", name);
+                assertEquals("ZTARGET", zone);
+                assertEquals(1, type);
+                return Optional.of(expected);
+            }
+        };
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(source));
+        DnsClientVpcSource.ClientVpc origin =
+                new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-client");
+        assertEquals(expected, server.resolveAliasTarget("lb.example", "ZTARGET", 1, origin).orElseThrow());
     }
 }
