@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.IntConsumer;
 import java.util.function.IntFunction;
+import java.util.function.LongSupplier;
 
 /** Runs Map iterations with a bounded in-flight window while preserving input order. */
 final class MapIterationScheduler {
@@ -46,6 +47,13 @@ final class MapIterationScheduler {
                                IntFunction<Callable<T>> taskFactory, long deadlineNanos,
                                IntConsumer cutting)
             throws Exception {
+        return execute(itemCount, maxConcurrency, taskFactory, deadlineNanos, cutting, System::nanoTime);
+    }
+
+    static <T> List<T> execute(int itemCount, int maxConcurrency,
+                               IntFunction<Callable<T>> taskFactory, long deadlineNanos,
+                               IntConsumer cutting, LongSupplier nanoTime)
+            throws Exception {
         if (itemCount < 0) {
             throw new IllegalArgumentException("itemCount must not be negative");
         }
@@ -55,7 +63,7 @@ final class MapIterationScheduler {
         if (itemCount == 0) {
             return List.of();
         }
-        if (System.nanoTime() >= deadlineNanos) {
+        if (nanoTime.getAsLong() >= deadlineNanos) {
             throw new TimeoutException();
         }
 
@@ -75,7 +83,7 @@ final class MapIterationScheduler {
             }
             while (completed < itemCount) {
                 Future<IndexedResult<T>> future =
-                        completions.poll(deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+                        completions.poll(deadlineNanos - nanoTime.getAsLong(), TimeUnit.NANOSECONDS);
                 if (future == null) {
                     cancel(inFlight.keySet());
                     throw new TimeoutException();
