@@ -30,6 +30,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -61,6 +62,7 @@ class Ec2ImageSharingServiceTest {
         Ec2Service launcher = service(RECIPIENT, false, manager);
         Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
                 null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        Volume root = launcher.describeVolumes(REGION, List.of(instance.getRootVolumeId()), Map.of()).getFirst();
         when(manager.commitInstance(eq(instance), anyString())).thenReturn("example/captured:1");
         if (revoke) {
             owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
@@ -71,8 +73,18 @@ class Ec2ImageSharingServiceTest {
         assertEquals(instance.getArchitecture(), captured.getArchitecture());
         assertEquals(instance.getRootDeviceName(), captured.getRootDeviceName());
         assertEquals("ami-catalog-worker", captured.getSourceImageId());
+        assertNotNull(captured.getBlockDeviceMappings(), "Captured root mapping must survive share revocation");
+        assertEquals(1, captured.getBlockDeviceMappings().size());
+        BlockDeviceMapping capturedRoot = captured.getBlockDeviceMappings().getFirst();
+        assertEquals(instance.getRootDeviceName(), capturedRoot.getDeviceName());
+        assertEquals(root.getSize(), capturedRoot.getEbs().getVolumeSize());
+        assertEquals(root.getVolumeType(), capturedRoot.getEbs().getVolumeType());
         Instance restored = launcher.runInstances(REGION, captured.getImageId(), "m6g.large", 1, 1,
                 null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        Volume restoredRoot = launcher.describeVolumes(REGION, List.of(restored.getRootVolumeId()),
+                Map.of()).getFirst();
+        assertEquals(root.getSize(), restoredRoot.getSize());
+        assertEquals(root.getVolumeType(), restoredRoot.getVolumeType());
         ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
         verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
         ResolvedAmiImage original = new AmiImageResolver(catalog).resolveImage("ami-catalog-worker");

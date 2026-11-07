@@ -80,6 +80,24 @@ final class Ec2GuestReboots implements AutoCloseable {
         return guest != null && wanted(container, guest) && guest.phase.get() == Phase.FAILED;
     }
 
+    void failed(Instance instance) {
+        watch(instance);
+        String container = instance.getDockerContainerId();
+        Guest guest = container == null ? null : guests.get(container);
+        if (guest != null && wanted(container, guest)) {
+            guest.phase.set(Phase.FAILED);
+        }
+    }
+
+    void released(Instance instance) {
+        watch(instance);
+        String container = instance.getDockerContainerId();
+        Guest guest = container == null ? null : guests.get(container);
+        if (guest != null && wanted(container, guest)) {
+            guest.phase.compareAndSet(Phase.FAILED, Phase.IDLE);
+        }
+    }
+
     /** Normal reboot must not make Auto Scaling replace the instance while its init restarts. */
     boolean isRebooting(String container) {
         Guest guest = guests.get(container);

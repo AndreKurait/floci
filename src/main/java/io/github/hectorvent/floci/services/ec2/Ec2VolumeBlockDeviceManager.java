@@ -776,7 +776,7 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
                 && VALID_DEVICE_PATTERN.matcher(requestedDevice).matches() && !requestedDevice.contains("..")) {
             String targetContainerId = instance.getDockerContainerId();
             if (targetContainerId != null && !targetContainerId.isBlank()
-                    && lifecycleManager.isContainerRunning(targetContainerId)) {
+                    && lifecycleManager.isContainerRunning(targetContainerId) && isRawDeviceGuest(instance)) {
                 String normalizedDevice = requestedDevice.startsWith("/") ? requestedDevice : "/dev/" + requestedDevice;
                 execInContainer(targetContainerId, new String[]{"rm", "-f", normalizedDevice}, DEFAULT_TIMEOUT_SECONDS);
             }

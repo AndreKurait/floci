@@ -9773,8 +9773,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // The new AMI inherits what it was captured from rather than the registerImage defaults,
         // so DescribeImages does not report a generic x86_64 / /dev/sda1 image with no devices.
         Image sourceImage = findImageForCapture(region, source.getImageId());
+        String architecture = source.getArchitecture();
+        if (architecture == null && sourceImage != null) {
+            architecture = sourceImage.getArchitecture();
+        }
         Image image = registerImage(region, name, description,
-                source.getArchitecture(), source.getRootDeviceName(),
+                architecture, source.getRootDeviceName(),
                 captureBlockDeviceMappings(region, source, sourceImage), false);
 
         // Carry the launchable ancestor so RunInstances on this AMI starts the same guest instead
@@ -9851,11 +9855,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // may have given a different type from the source AMI's.
         Volume rootVolume = source.getRootVolumeId() == null ? null
                 : volumes.get(key(region, source.getRootVolumeId())).orElse(null);
-        if (rootVolume != null && sourceImage != null) {
-            mappings.stream()
-                    .filter(m -> m.getEbs() != null
-                            && Objects.equals(m.getDeviceName(), sourceImage.getRootDeviceName()))
-                    .forEach(m -> setVolumePerformance(m.getEbs(), rootVolume));
+        if (rootVolume != null) {
+            for (VolumeAttachment attachment : rootVolume.getAttachments()) {
+                if (source.getInstanceId().equals(attachment.getInstanceId())) {
+                    mappings.removeIf(mapping -> Objects.equals(mapping.getDeviceName(), attachment.getDevice()));
+                    mappings.addFirst(attachedMapping(rootVolume, attachment));
+                    break;
+                }
+            }
         }
         Set<String> devices = mappings.stream()
                 .map(BlockDeviceMapping::getDeviceName)

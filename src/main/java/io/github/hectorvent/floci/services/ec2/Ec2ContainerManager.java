@@ -1561,7 +1561,8 @@ public class Ec2ContainerManager {
             return false;
         }
         String containerId = instance.getDockerContainerId();
-        if (!lifecycleManager.isContainerRunning(containerId)) {
+        boolean running = lifecycleManager.isContainerRunning(containerId);
+        if (!running) {
             String state = instance.getState() == null ? "" : instance.getState().getName();
             if (!("pending".equals(state) || "running".equals(state))) {
                 return false;
@@ -1623,6 +1624,14 @@ public class Ec2ContainerManager {
         }
         if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
             exposeReachablePublicAddress(instance);
+        }
+        if (running) {
+            try {
+                releaseNativeGuest(instance, containerId);
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Could not restore native boot for EC2 instance {0}", instance.getInstanceId());
+                return false;
+            }
         }
         return true;
     }
@@ -2115,8 +2124,15 @@ public class Ec2ContainerManager {
     }
 
     private void releaseNativeGuest(Instance instance, String containerId) {
-        if (systemdV1.release(instance, containerId)) {
-            guestReboots.watch(instance);
+        try {
+            if (systemdV1.release(instance, containerId)) {
+                guestReboots.released(instance);
+            }
+        } catch (RuntimeException failure) {
+            if (systemdV1.hasGuest(instance)) {
+                guestReboots.failed(instance);
+            }
+            throw failure;
         }
     }
 

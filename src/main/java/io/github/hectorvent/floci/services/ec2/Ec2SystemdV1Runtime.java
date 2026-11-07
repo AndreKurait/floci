@@ -124,6 +124,10 @@ final class Ec2SystemdV1Runtime {
         return true;
     }
 
+    synchronized boolean hasGuest(Instance instance) {
+        return helpers.containsKey(instance.getInstanceId());
+    }
+
     /**
      * Install the native bootstrap, isolate its clock and delegate its service hierarchy before releasing init.
      * A guest whose final gate already exists is left running; any failed prerequisite keeps that gate closed.

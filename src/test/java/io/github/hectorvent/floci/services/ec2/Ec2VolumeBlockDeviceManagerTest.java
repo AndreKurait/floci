@@ -95,6 +95,11 @@ class Ec2VolumeBlockDeviceManagerTest {
 
         assertEquals(privileged ? 1 : 0, helperCommands.size());
         assertEquals(privileged ? 1 : 0, guestCommands.size());
+
+        manager.detachVolume(volume, instance, "/dev/xvdf");
+
+        assertEquals(privileged ? 2 : 0, guestCommands.size(),
+                "Detaching a metadata-only attachment must preserve an existing guest device path");
     }
 
     @Test

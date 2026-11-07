@@ -16,6 +16,7 @@ import com.github.dockerjava.api.command.InspectImageCmd;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.PingCmd;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
+import com.github.dockerjava.api.command.RestartContainerCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.exception.DockerException;
@@ -2116,6 +2117,67 @@ class Ec2ContainerManagerTest {
     }
 
     private static final String TEST_INIT_HELPER_ID = "native-init-helper";
+
+    @Test
+    void restoredRunningNativeGuestValidatesItsBootGate() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-native-restore-gate");
+        stubNativeInit(harness, instance);
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setState(InstanceState.running());
+        try {
+            assertTrue(harness.manager.restoreMetadataRegistration(instance));
+            assertTrue(harness.executedCommands.stream().anyMatch(command ->
+                    Arrays.equals(command, new String[]{"test", "-f", Ec2SystemdV1Runtime.READY})));
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void restoredRunningNativeGuestWithFailedBootIsNotHealthy() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-native-restore-failed-gate");
+        stubNativeInit(harness, instance);
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setState(InstanceState.running());
+        ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 1, "", "");
+        try {
+            assertFalse(harness.manager.restoreMetadataRegistration(instance));
+            assertFalse(harness.manager.isContainerRunning(instance),
+                    "A running bootstrap shell cannot hide a failed native boot");
+            ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 0, "", "");
+            assertTrue(harness.manager.restoreMetadataRegistration(instance));
+            assertTrue(harness.manager.isContainerRunning(instance),
+                    "A verified ready gate must clear the earlier boot failure");
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void failedNativeApiRebootIsNotReportedHealthy() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        Instance instance = instance("i-native-api-reboot-failed-gate");
+        stubNativeInit(harness, instance);
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        instance.setState(InstanceState.running());
+        RestartContainerCmd restart = mock(RestartContainerCmd.class);
+        when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
+        try {
+            assertTrue(harness.manager.restoreMetadataRegistration(instance));
+            ContainerExecStubs.completeEveryExec(harness.dockerClient, TEST_CONTAINER_ID, 1, "", "");
+            harness.manager.reboot(instance);
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            verify(restart).exec();
+            assertFalse(harness.manager.isContainerRunning(instance),
+                    "Failed native release after Docker restart must remain unhealthy");
+        } finally {
+            harness.manager.stop();
+        }
+    }
 
     private static void stubPendingNativeCleanup(LaunchHarness harness, Instance instance) {
         stubNativeInit(harness, instance);

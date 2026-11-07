@@ -154,6 +154,19 @@ class Ec2RegisteredImageRuntimeTest {
                 launchedImage(EAST, captured.getImageId(), "t4g.micro"));
     }
 
+    @Test
+    void createImageUsesSourceArchitectureForAnOlderInstanceWithoutIt() {
+        Instance original = launch(EAST, "ami-native-arm", "t4g.micro");
+        original.setArchitecture(null);
+        when(containerManager.commitInstance(eq(original), anyString())).thenReturn("example/captured:1");
+
+        Image captured = service.createImage(EAST, original.getInstanceId(), "legacy-instance-capture", null, true);
+
+        assertEquals("arm64", captured.getArchitecture());
+        assertEquals(new ResolvedAmiImage("example/captured:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"),
+                launchedImage(EAST, captured.getImageId(), "t4g.micro"));
+    }
+
     private Response query(String action, String region, String... entries) {
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         for (int i = 0; i < entries.length; i += 2) {
