@@ -7,6 +7,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.IOException;
 import java.net.Inet4Address;
@@ -15,6 +17,7 @@ import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.Set;
@@ -23,6 +26,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -156,6 +160,31 @@ class TlsProxyServerTest {
         int publicPort = FreePorts.anyInterfacePort();
         proxy = new TlsProxyServer(vertx, configWith(false, publicPort, 443), "127.0.0.1", 4510, 4511);
         assertFalse(portAccepts(publicPort), "no proxy should listen when TLS is disabled");
+        assertNull(proxy.localBaseUri());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "127.0.0.1,127.0.0.1", "0.0.0.0,127.0.0.1",
+            "::1,::1", "::,::1", "0:0:0:0:0:0:0:0,::1"
+    })
+    @Timeout(20)
+    void localEndpointUsesTheBoundPublicPort(String bindHost, String expectedHost) throws Exception {
+        EmulatorConfig config = configWith(true, 0, 0);
+        when(config.security().allowUnsafeNetworkExposure()).thenReturn(true);
+        httpBackend = startMarkerBackend("PLAIN");
+        proxy = new TlsProxyServer(vertx, config, bindHost, httpBackend.actualPort(), 4511);
+
+        URI endpoint = proxy.localBaseUri();
+
+        assertEquals("http", endpoint.getScheme());
+        assertEquals(InetAddress.getByName(expectedHost), InetAddress.getByName(endpoint.getHost()));
+        assertTrue(endpoint.getPort() > 0);
+        try (Socket socket = new Socket(endpoint.getHost(), endpoint.getPort())) {
+            socket.setSoTimeout(5000);
+            socket.getOutputStream().write('G');
+            assertEquals("PLAIN", new String(socket.getInputStream().readNBytes(5), StandardCharsets.UTF_8));
+        }
     }
 
     // ---- helpers ----
