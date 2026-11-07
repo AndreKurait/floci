@@ -39,6 +39,7 @@ public class ElbV2HealthChecker implements Resettable {
     private final Vertx vertx;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
+    private final ElbV2VpcNetworkManager vpcNetworks;
     private final long maxHealthCheckIntervalMillis;
     private final SSLSocketFactory backendTls = backendTls();
 
@@ -49,11 +50,17 @@ public class ElbV2HealthChecker implements Resettable {
     private final KeyedWorkQueue<ProbeWork> probes = new KeyedWorkQueue<>(
             "elb-health-probe", MAX_CONCURRENT_PROBES, 4096, this::runProbe);
 
-    @Inject
     public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
+        this(vertx, config, ec2Service, null);
+    }
+
+    @Inject
+    public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
+                             ElbV2VpcNetworkManager vpcNetworks) {
         this.vertx = vertx;
         this.config = config;
         this.ec2Service = ec2Service;
+        this.vpcNetworks = vpcNetworks;
         maxHealthCheckIntervalMillis = config.services().elbv2().maxHealthCheckIntervalMillis();
         if (maxHealthCheckIntervalMillis < 0) {
             throw new IllegalArgumentException(
@@ -234,7 +241,8 @@ public class ElbV2HealthChecker implements Resettable {
                 statusCode = SocketDeadline.call(work.settings().timeout(), () -> {
                     String host = ElbV2TargetResolver.resolveHost(ec2Service, work.group(), work.targetId());
                     return probeOnce(host, healthCheckPort(work.group(), work.port()),
-                            work.settings().path(), work.settings().timeout(), work.settings().protocol());
+                            work.settings().path(), work.settings().timeout(), work.settings().protocol(),
+                            vpcNetworks == null ? Proxy.NO_PROXY : vpcNetworks.proxy(work.group()).javaProxy());
                 }, () -> {
                     synchronized (this) {
                         state.workerRunning = false;
@@ -305,10 +313,11 @@ public class ElbV2HealthChecker implements Resettable {
         }
     }
 
-    private int probeOnce(String host, int port, String path, int timeoutSeconds, String protocol) throws IOException {
+    private int probeOnce(String host, int port, String path, int timeoutSeconds, String protocol,
+                          Proxy proxy) throws IOException {
         String scheme = "HTTPS".equals(protocol) ? "https" : "http";
         URL url = new URL(scheme, ElbV2TargetResolver.resolveCheckedAddress(host), port, path);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection(proxy);
         if (conn instanceof HttpsURLConnection https) {
             https.setSSLSocketFactory(backendTls);
             https.setHostnameVerifier((hostname, session) -> true);

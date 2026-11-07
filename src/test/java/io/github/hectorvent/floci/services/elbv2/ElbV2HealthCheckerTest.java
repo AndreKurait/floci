@@ -45,6 +45,27 @@ class ElbV2HealthCheckerTest {
     private final Vertx vertx = Vertx.vertx();
     private final List<ElbV2HealthChecker> checkers = new ArrayList<>();
 
+    @Test
+    void unavailableAlbNamespaceCannotProduceAHealthyDirectProbe() throws Exception {
+        HttpServer server = startServer(200);
+        try {
+            EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+            ElbV2VpcNetworkManager networks = mock(ElbV2VpcNetworkManager.class);
+            TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
+            when(networks.proxy(group)).thenThrow(new IllegalStateException("ALB backend network is not ready"));
+            ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class), networks);
+            checkers.add(checker);
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertEquals("unhealthy",
+                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            assertEquals("Target.FailedHealthChecks",
+                    checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
+        } finally {
+            server.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
+    }
+
     @AfterEach
     void closeVertx() {
         checkers.forEach(ElbV2HealthChecker::shutdown);

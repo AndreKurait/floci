@@ -182,6 +182,33 @@ class SecurityGroupNftCompilerTest {
     }
 
     @Test
+    void serviceControlListenerDoesNotOpenOtherIngressOrNewEgress() {
+        SecurityGroupNftCompiler.Endpoint target = new SecurityGroupNftCompiler.Endpoint(
+                "111111111111", "us-east-1", "vpc-1", "eni-lb", "10.0.1.10", "172.18.0.3",
+                Set.of("sg-lb"), List.of(new SecurityGroup()), List.of(), false, Set.of(),
+                List.of(new SecurityGroupNftCompiler.ControlListener("172.18.0.2", 1080)));
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(), Map.of());
+
+        assertTrue(nft.contains("ingress ip saddr 172.18.0.2 tcp dport 1080 accept"));
+        assertFalse(nft.contains("saddr 172.18.0.2 accept"));
+        assertFalse(nft.contains("egress ip daddr 172.18.0.2"));
+        assertFalse(nft.contains("dport 4566 accept"));
+        assertTrue(nft.contains("egress ip daddr 169.254.169.254 drop"));
+    }
+
+    @Test
+    void serviceControlListenerRejectsNetworksNamesAndInvalidPorts() {
+        for (String address : List.of("172.18.0.2/16", "controller.example", "172.18.0.2\naccept")) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> new SecurityGroupNftCompiler.ControlListener(address, 1080));
+        }
+        for (int port : List.of(0, -1, 65536)) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> new SecurityGroupNftCompiler.ControlListener("172.18.0.2", port));
+        }
+    }
+
+    @Test
     void runtimeControlRequiresOneLiteralAddressAndPort() {
         assertThrows(IllegalArgumentException.class,
                 () -> new SecurityGroupNftCompiler.ControlConnection("172.18.0.2/16", 10042));
