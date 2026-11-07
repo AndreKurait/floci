@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.WebSocketUpgrades;
 import io.github.hectorvent.floci.core.common.tls.ReloadingKeyManager;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
@@ -51,6 +52,7 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -139,6 +141,10 @@ public class ElbV2DataPlane {
 
     @Inject
     Ec2Service ec2Service;
+
+    /** Null in unit tests, which run without security-group enforcement. */
+    @Inject
+    Instance<SecurityGroupFirewallManager> securityGroupFirewall;
 
     @Inject
     CertificateReferenceResolver certificateResolver;
@@ -727,7 +733,7 @@ public class ElbV2DataPlane {
         }
         TargetDescription target = pickRoundRobin(tgArn, candidates);
         int port = ElbV2HealthChecker.effectivePort(target, tg);
-        String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        String host = ElbV2TargetResolver.resolveHost(ec2Service, securityGroupFirewall, tg, target);
         AtomicBoolean disconnected = new AtomicBoolean();
         socket.closeHandler(ignored -> disconnected.set(true));
         vertx.executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
@@ -1245,7 +1251,7 @@ public class ElbV2DataPlane {
         }
         List<String> cookies = duration > 0 ? stickyCookie.headers(scope, tg, target) : List.of();
         int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
-        String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        String host = ElbV2TargetResolver.resolveHost(ec2Service, securityGroupFirewall, tg, target);
         boolean secure = "HTTPS".equals(tg.getProtocol());
         if (isWebSocketUpgrade(req)) {
             proxyUpgrade(req, host, targetPort, secure, hostHeader, forwarded,

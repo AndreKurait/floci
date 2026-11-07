@@ -202,6 +202,12 @@ and [node ownership across zones](../design/classic-multiaz.md).
 - These security-group associations are metadata at the shared Classic edge. It does not enforce
   frontend security-group rules or route clients through modeled NAT gateways. A successful request
   through this edge does not validate those network prerequisites.
+- With security-group enforcement and the shared edge, health checks and backend requests leave
+  from Floci's container address on the network it shares with the instance (with isolated VPC
+  address spaces, they go to the instance's address on Floci's main network). An instance rule that references a security group of a Classic load balancer in its
+  VPC also accepts that address, as it accepts the load balancer on AWS; see
+  [ELBv2 security groups](elb.md#security-groups-and-privatelink) for the limits. Protected
+  frontends need no such rule: their traffic leaves the load balancer's own namespace.
 - Load balancer state is persisted through Floci storage, and on startup health checking is
   restarted for the load balancers of every account.
 - A new load balancer gets AWS's default health check (`TCP:80`, interval 30, timeout 5,

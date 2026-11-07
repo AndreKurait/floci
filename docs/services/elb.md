@@ -239,9 +239,40 @@ not prove that a health check passed.
 
 Load-balancer security-group IDs are stored and returned by `CreateLoadBalancer`,
 `DescribeLoadBalancers`, and `SetSecurityGroups`. The ELBv2 proxy and health checker do
-not evaluate security-group ingress or egress rules, target security-group references,
-network ACLs, or VPC/subnet routing. An `internal` scheme does not create a private
-network boundary on the host. These declarations do not isolate reachable targets.
+not evaluate the load balancer's own ingress or egress rules, network ACLs, or VPC/subnet
+routing. An `internal` scheme does not create a private network boundary on the host.
+
+With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, targets do enforce their own
+ingress rules. On AWS, health checks and forwarded requests come from load-balancer nodes
+in the load balancer's security groups. In Floci they leave from Floci's own container
+address on the Docker network it shares with the target: the target's VPC network where
+Floci joined it, otherwise Floci's main network. A target ingress rule that references a
+security group of an application or network load balancer in the target's VPC therefore
+also accepts that address, on that rule's protocol and ports. A target that admits neither
+such a group nor a CIDR containing that address still refuses the traffic, and the health
+check reports `Target.Timeout`.
+
+With isolated VPC address spaces (`FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES`),
+a target's private address lives inside its own namespace, where Floci cannot route.
+Floci then dials a protected target of the target group's VPC at its address on Floci's
+main network. A protected endpoint of another VPC or account is never dialled: its health
+check fails and requests get 503. Creating or deleting a load balancer,
+`SetSecurityGroups` and `SetSubnets` update the targets' rules.
+
+Limits:
+
+- Every load balancer shares Floci's address on a network. Such a rule therefore also
+  admits other traffic Floci sends to that port from that address, from any account,
+  including another load balancer's and Floci's own HTTP integrations (SNS, EventBridge
+  API destinations, API Gateway).
+- With isolated address spaces, CIDR rules see Floci's main-network address rather than
+  a load-balancer node address in the VPC. A rule that admits only the VPC CIDR then still
+  refuses the traffic, and so does an NLB without security groups.
+- A load balancer created without security groups gets none, where AWS applies the VPC's
+  default group.
+- The load balancer's own ingress and egress rules are not applied.
+- Floci running outside a container admits nothing this way: it reaches containers from a
+  Docker gateway that every host process shares.
 
 `EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic` is not handled by
 `SetSecurityGroups`, is not returned as an enforcement setting, and does not filter

@@ -5,12 +5,14 @@ import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
 import io.github.hectorvent.floci.core.common.concurrent.SocketDeadline;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.vertx.core.Vertx;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -48,6 +50,10 @@ public class ElbV2HealthChecker implements Resettable {
     private final Semaphore probeSlots = new Semaphore(MAX_CONCURRENT_PROBES);
     private final KeyedWorkQueue<ProbeWork> probes = new KeyedWorkQueue<>(
             "elb-health-probe", MAX_CONCURRENT_PROBES, 4096, this::runProbe);
+
+    /** Null in unit tests, which run without security-group enforcement. */
+    @Inject
+    Instance<SecurityGroupFirewallManager> securityGroupFirewall;
 
     @Inject
     public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
@@ -232,7 +238,8 @@ public class ElbV2HealthChecker implements Resettable {
             Exception failure = null;
             try {
                 statusCode = SocketDeadline.call(work.settings().timeout(), () -> {
-                    String host = ElbV2TargetResolver.resolveHost(ec2Service, work.group(), work.targetId());
+                    String host = ElbV2TargetResolver.resolveHost(ec2Service, securityGroupFirewall,
+                            work.group(), work.targetId());
                     return probeOnce(host, healthCheckPort(work.group(), work.port()),
                             work.settings().path(), work.settings().timeout(), work.settings().protocol());
                 }, () -> {

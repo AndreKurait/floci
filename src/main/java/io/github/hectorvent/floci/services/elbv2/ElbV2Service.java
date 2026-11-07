@@ -13,16 +13,21 @@ import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.EmulatorOriginSource;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.VpcDependencyProvider;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elbv2.model.*;
 import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -42,7 +47,8 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
-public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider, VpcDependencyProvider {
+public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider, VpcDependencyProvider,
+        EmulatorOriginSource {
 
     private static final Logger LOG = Logger.getLogger(ElbV2Service.class);
     private static final String DEFAULT_SSL_POLICY = "ELBSecurityPolicy-2016-08";
@@ -75,8 +81,14 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     @Inject
     CertificateReferenceResolver certificateResolver;
 
+    /** Left null by the unit tests, which wire this service without EC2 security-group enforcement. */
+    @Inject
+    Instance<SecurityGroupFirewallManager> securityGroupFirewall;
+
     // region → ARN → resource
     private Map<String, Map<String, LoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
+    // The store behind loadBalancers, which shows only the calling account; null without storage
+    private AccountAwareStorageBackend<Map<String, LoadBalancer>> loadBalancerStore;
     private Map<String, Map<String, TargetGroup>> targetGroups = new ConcurrentHashMap<>();
     private Map<String, Map<String, Listener>> listeners = new ConcurrentHashMap<>();
     private Map<String, Map<String, Rule>> rules = new ConcurrentHashMap<>();
@@ -133,8 +145,9 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (storageFactory == null) {
             return;
         }
-        this.loadBalancers = storageBacked("elbv2-load-balancers.json",
+        this.loadBalancerStore = storageFactory.create("elbv2", "elbv2-load-balancers.json",
                 new TypeReference<Map<String, Map<String, LoadBalancer>>>() {});
+        this.loadBalancers = new StorageBackedMap<>(loadBalancerStore);
         this.targetGroups = storageBacked("elbv2-target-groups.json",
                 new TypeReference<Map<String, Map<String, TargetGroup>>>() {});
         this.listeners = storageBacked("elbv2-listeners.json",
@@ -325,6 +338,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (!initialTags.isEmpty()) {
             tags.put(arn, new LinkedHashMap<>(initialTags));
         }
+        emulatorOriginsChanged(lb);
         return lb;
     }
 
@@ -428,6 +442,46 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         tgToLbs.values().forEach(lbSet -> lbSet.remove(arn));
         tags.remove(arn);
         loadBalancers.put(region, regionLbs);
+        emulatorOriginsChanged(lb);
+    }
+
+    /**
+     * Every application or network load balancer with security groups in a VPC, in every account.
+     * Floci sends their health checks and forwarded requests from its own address, so a target's
+     * rule that admits one of these groups admits that address.
+     */
+    @Override
+    public List<SecurityGroupNftCompiler.EmulatorOrigin> emulatorOrigins() {
+        Collection<Map<String, LoadBalancer>> regions = loadBalancerStore != null
+                ? loadBalancerStore.scanAllAccounts() : loadBalancers.values();
+        List<SecurityGroupNftCompiler.EmulatorOrigin> origins = new ArrayList<>();
+        for (Map<String, LoadBalancer> regionLbs : regions) {
+            for (LoadBalancer lb : regionLbs.values()) {
+                AwsArnUtils.Arn arn;
+                try {
+                    arn = AwsArnUtils.looksLikeArn(lb.getLoadBalancerArn())
+                            ? AwsArnUtils.parse(lb.getLoadBalancerArn()) : null;
+                } catch (IllegalArgumentException e) {
+                    // One unreadable record must not hide every other load balancer's groups.
+                    continue;
+                }
+                String accountId = arn != null ? arn.accountId() : null;
+                String region = lb.getRegion() != null ? lb.getRegion() : arn != null ? arn.region() : null;
+                List<String> groups = lb.getSecurityGroups();
+                if (accountId != null && region != null && lb.getVpcId() != null
+                        && groups != null && !groups.isEmpty()) {
+                    origins.add(new SecurityGroupNftCompiler.EmulatorOrigin(accountId, region,
+                            lb.getVpcId(), groups.stream().filter(Objects::nonNull).collect(Collectors.toSet())));
+                }
+            }
+        }
+        return origins;
+    }
+
+    private void emulatorOriginsChanged(LoadBalancer lb) {
+        if (lb.getVpcId() != null && securityGroupFirewall != null && securityGroupFirewall.isResolvable()) {
+            securityGroupFirewall.get().emulatorOriginsChanged();
+        }
     }
 
     public Map<String, String> describeLoadBalancerAttributes(String region, String arn) {
@@ -521,6 +575,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         LoadBalancer lb = requireLoadBalancer(region, arn);
         lb.setSecurityGroups(new ArrayList<>(sgIds));
         persistRegion(loadBalancers, region);
+        emulatorOriginsChanged(lb);
     }
 
     /**
@@ -561,6 +616,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 lb.setVpcId(vpcId);
             }
             persistRegion(loadBalancers, region);
+            emulatorOriginsChanged(lb);
         });
     }
 

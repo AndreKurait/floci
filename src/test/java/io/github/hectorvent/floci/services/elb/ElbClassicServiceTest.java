@@ -2,11 +2,14 @@ package io.github.hectorvent.floci.services.elb;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
@@ -100,6 +103,45 @@ class ElbClassicServiceTest {
     private ClassicLoadBalancer create(String name) {
         return service.createLoadBalancer(REGION, name, List.of(httpListener()),
                 List.of(), List.of("subnet-a"), List.of("sg-1"), null, Map.of());
+    }
+
+    /**
+     * The shared Classic edge sends health checks and backend requests from Floci's own address, so
+     * its VPC load balancers' groups are emulator origins; a protected frontend sends from its own
+     * namespace, which already carries the groups, so it is none.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void sharedEdgeLoadBalancerSecurityGroupsAreEmulatorOrigins() {
+        ElbClassicService shared = new ElbClassicService(ec2Service, healthChecker, null, null,
+                new RegionResolver(REGION, DEFAULT_ACCOUNT));
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        Instance<SecurityGroupFirewallManager> firewalls = mock(Instance.class);
+        when(firewalls.isResolvable()).thenReturn(true);
+        when(firewalls.get()).thenReturn(firewall);
+        shared.securityGroupFirewall = firewalls;
+
+        shared.createLoadBalancer(REGION, "edge", List.of(httpListener()), List.of(), List.of("subnet-a"),
+                List.of("sg-1"), null, Map.of());
+        assertEquals(List.of(new SecurityGroupNftCompiler.EmulatorOrigin(DEFAULT_ACCOUNT, REGION, "vpc-1",
+                Set.of("sg-1"))), shared.emulatorOrigins());
+
+        shared.applySecurityGroups(REGION, "edge", List.of("sg-2"));
+        assertEquals(List.of(new SecurityGroupNftCompiler.EmulatorOrigin(DEFAULT_ACCOUNT, REGION, "vpc-1",
+                Set.of("sg-2"))), shared.emulatorOrigins());
+        shared.deleteLoadBalancer(REGION, "edge");
+        assertEquals(List.of(), shared.emulatorOrigins());
+        verify(firewall, times(3)).emulatorOriginsChanged();
+
+        ElbClassicFrontendManager frontends = mock(ElbClassicFrontendManager.class);
+        when(frontends.enabled()).thenReturn(true);
+        ElbClassicService protectedEdge = new ElbClassicService(ec2Service, healthChecker, null, null,
+                new RegionResolver(REGION, DEFAULT_ACCOUNT), null, null, frontends);
+        protectedEdge.securityGroupFirewall = firewalls;
+        protectedEdge.createLoadBalancer(REGION, "protected", List.of(httpListener()), List.of(),
+                List.of("subnet-a"), List.of("sg-1"), null, Map.of());
+        assertEquals(List.of(), protectedEdge.emulatorOrigins());
+        verify(firewall, times(3)).emulatorOriginsChanged();
     }
 
     @Test

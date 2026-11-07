@@ -11,6 +11,8 @@ import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.AvailabilityZone;
@@ -21,6 +23,7 @@ import io.github.hectorvent.floci.services.elbv2.model.RuleCondition;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
+import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
@@ -42,6 +45,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -1430,6 +1435,53 @@ class ElbV2ServiceTest {
 
     static StorageFactory sharedStorageFactory() {
         return new SharedStorageFactory();
+    }
+
+    /**
+     * Floci sends ALB and NLB health checks and forwarded requests from its own address, so the
+     * firewall admits that address wherever a target admits one of these load balancers' groups. It
+     * reads them off the request thread, so it must see every account, not only the default one.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void loadBalancerSecurityGroupsInEveryAccountAreEmulatorOrigins() {
+        SharedStorageFactory storageFactory = new SharedStorageFactory();
+        ElbV2Service service = serviceWithStorage(storageFactory, mock(ElbV2DataPlane.class),
+                mock(ElbV2HealthChecker.class));
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        Instance<SecurityGroupFirewallManager> firewalls = mock(Instance.class);
+        when(firewalls.isResolvable()).thenReturn(true);
+        when(firewalls.get()).thenReturn(firewall);
+        service.securityGroupFirewall = firewalls;
+
+        String alb = service.createLoadBalancer(REGION, "alb", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of("sg-alb"), Map.of()).getLoadBalancerArn();
+        service.createLoadBalancer(REGION, "no-groups", "internal", "network", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of());
+        LoadBalancer foreign = new LoadBalancer();
+        foreign.setLoadBalancerArn("arn:aws:elasticloadbalancing:" + REGION
+                + ":222222222222:loadbalancer/net/nlb/0123456789abcdef");
+        foreign.setRegion(REGION);
+        foreign.setVpcId("vpc-b");
+        foreign.setType("network");
+        foreign.setSecurityGroups(new ArrayList<>(List.of("sg-nlb")));
+        AccountAwareStorageBackend<Map<String, LoadBalancer>> store = storageFactory.create("elbv2",
+                "elbv2-load-balancers.json", new TypeReference<Map<String, Map<String, LoadBalancer>>>() {});
+        store.putForAccount("222222222222", REGION,
+                new ConcurrentHashMap<>(Map.of(foreign.getLoadBalancerArn(), foreign)));
+
+        assertEquals(Set.of(
+                        new SecurityGroupNftCompiler.EmulatorOrigin("000000000000", REGION, "vpc-a", Set.of("sg-alb")),
+                        new SecurityGroupNftCompiler.EmulatorOrigin("222222222222", REGION, "vpc-b", Set.of("sg-nlb"))),
+                Set.copyOf(service.emulatorOrigins()));
+
+        service.setSecurityGroups(REGION, alb, List.of("sg-alb", "sg-extra"));
+        assertTrue(service.emulatorOrigins().contains(new SecurityGroupNftCompiler.EmulatorOrigin(
+                "000000000000", REGION, "vpc-a", Set.of("sg-alb", "sg-extra"))));
+        service.deleteLoadBalancer(REGION, alb);
+        assertTrue(service.emulatorOrigins().stream().noneMatch(origin -> "vpc-a".equals(origin.vpcId())));
+        // create (twice), SetSecurityGroups and delete each re-evaluate the protected targets.
+        verify(firewall, times(4)).emulatorOriginsChanged();
     }
 
     static ElbV2Service serviceWithStorage(StorageFactory storageFactory,
