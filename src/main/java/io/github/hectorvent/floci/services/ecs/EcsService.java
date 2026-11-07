@@ -962,6 +962,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         validateTaskSize(request, fargate);
         validateEphemeralStorage(request.getEphemeralStorage());
         validateContainerDependencies(containerDefs);
+        validateExtraHosts(containerDefs);
         validateFirelensS3Config(containerDefs, fargate);
         EcsLinuxParameters.validate(containerDefs);
         if (fargate) {
@@ -1134,6 +1135,45 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     "Invalid setting for ephemeral storage. Size must be between "
                             + (EphemeralStorage.DEFAULT_SIZE_IN_GIB + 1) + " GiB and "
                             + EphemeralStorage.MAX_SIZE_IN_GIB + " GiB.", 400);
+        }
+    }
+
+    /**
+     * A HostEntry requires both {@code hostname} and {@code ipAddress}. The task container's
+     * runtime writes each as one hosts-file line, so a hostname cannot carry whitespace, a colon
+     * (the separator Docker splits the entry on) or control characters.
+     */
+    private static void validateExtraHosts(List<ContainerDefinition> containerDefs) {
+        if (containerDefs == null) {
+            return;
+        }
+        for (ContainerDefinition def : containerDefs) {
+            Object declared = def.getUnparsed() == null ? null : def.getUnparsed().get("extraHosts");
+            if (declared == null) {
+                continue;
+            }
+            if (!(declared instanceof List<?> entries)) {
+                throw new AwsException("ClientException", "Container.extraHosts should be a list.", 400);
+            }
+            for (Object entry : entries) {
+                if (!(entry instanceof Map<?, ?> host)) {
+                    throw new AwsException("ClientException", "Container.extraHosts should contain HostEntry objects.", 400);
+                }
+                String hostname = host.get("hostname") instanceof String value ? value.strip() : "";
+                String ipAddress = host.get("ipAddress") instanceof String value ? value.strip() : "";
+                if (hostname.isEmpty()) {
+                    throw new AwsException("ClientException",
+                            "Container.extraHosts.hostname should not be null or empty.", 400);
+                }
+                if (ipAddress.isEmpty()) {
+                    throw new AwsException("ClientException",
+                            "Container.extraHosts.ipAddress should not be null or empty.", 400);
+                }
+                if (!EcsContainerManager.isHostsFileSafe(hostname, ipAddress)) {
+                    throw new AwsException("ClientException",
+                            "Invalid extraHosts entry for container " + def.getName() + ": " + hostname, 400);
+                }
+            }
         }
     }
 
