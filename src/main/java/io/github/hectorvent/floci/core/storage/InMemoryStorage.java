@@ -29,6 +29,11 @@ public class InMemoryStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public void putAllDurably(Map<K, V> entries) {
+        putAllAtomically(entries);
+    }
+
+    @Override
     public Optional<V> get(K key) {
         return Optional.ofNullable(store.get(key));
     }
@@ -67,6 +72,11 @@ public class InMemoryStorage<K, V> implements StorageBackend<K, V> {
     @Override
     public boolean isEmpty() {
         return store.isEmpty();
+    }
+
+    @Override
+    public void flushOrThrow() {
+        // This backend is intentionally volatile.
     }
 
     @Override
