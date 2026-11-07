@@ -1159,8 +1159,7 @@ use Lambda resource-based permissions.
 
 This local role evaluation does not issue STS credentials or establish all
 service-specific trust condition keys. Integration caller-passthrough credentials
-are not an authorizer credential mode. WebSocket integration role enforcement and live
-AWS or native-image parity remain outside this support.
+are not an authorizer credential mode. Live AWS or native-image parity remains outside this support.
 
 
 HTTP API AWS/AWS_PROXY Lambda integrations without `credentialsArn` check Lambda
@@ -1226,3 +1225,5 @@ separate execution path; this check does not implement role assumption.
 WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
 
 WebSocket REQUEST Lambda authorizers with configured credentials check the API owner's IAM role trust and Lambda invocation permissions when IAM enforcement is enabled. The role must trust API Gateway; shared identity/resource policy, permissions boundary and SCP evaluation applies to the same qualified function invoked. Foreign-account targets also require a resource grant. Missing credentials retain Lambda resource-policy authorization. Full service trust condition context and actual issued execution-role STS sessions are not modeled by this check.
+
+WebSocket Lambda integrations with a configured execution role check API Gateway service trust and the role's identity, resource, permissions-boundary and SCP policies when IAM enforcement is enabled. The API owner account and partition constrain the role; qualified targets are resolved once before authorization and invocation. The caller-credentials sentinel and legacy bare-star compatibility path remain separate from role enforcement. Issued execution-role STS sessions and full condition-context forwarding are not modeled by this check.
