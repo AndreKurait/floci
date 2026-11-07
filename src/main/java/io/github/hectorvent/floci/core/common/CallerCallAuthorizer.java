@@ -103,6 +103,30 @@ public class CallerCallAuthorizer {
         return grant == ResourcePolicyDecision.ALLOW ? Decision.ALLOW : Decision.DENY;
     }
 
+    /** Resource-policy phase for a custom authorizer, whose principalId is not an IAM identity. */
+    public ResourcePolicyDecision evaluateAnonymousResourcePolicy(String action, String resourceArn,
+                                                                   String sourceIp, boolean secureTransport) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return ResourcePolicyDecision.NEUTRAL;
+        }
+        if (!AwsArnUtils.isArn(resourceArn)) {
+            return ResourcePolicyDecision.EXPLICIT_DENY;
+        }
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        List<String> documents = ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn)
+                .stream().map(ResourcePolicy::policyDocument)
+                .filter(document -> document != null && !document.isBlank()).toList();
+        Map<String, List<String>> context = new HashMap<>();
+        if (sourceIp != null && !sourceIp.isBlank()) {
+            context.put("aws:SourceIp", List.of(sourceIp));
+        }
+        context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(),
+                "anonymous", resource.accountId());
+        return evaluator.evaluateResourcePolicyFor(documents, RequestPrincipal.anonymous(),
+                action, resourceArn, context);
+    }
+
     private Decision authorizeCaller(String accessKey, String callerArn, String action, String resourceArn,
                                      AwsArnUtils.Arn resource, boolean localRoot) {
         Instant now = Instant.now();

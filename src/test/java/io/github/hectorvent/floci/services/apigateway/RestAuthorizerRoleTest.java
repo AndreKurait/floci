@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
@@ -89,6 +90,7 @@ class RestAuthorizerRoleTest {
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(mapper);
         ServiceRoleCallAuthorizer roles = new ServiceRoleCallAuthorizer(config, iam,
                 new AssumeRolePolicyEvaluator(mapper, evaluator), evaluator, providers, scpInstance);
+        CallerCallAuthorizer callers = new CallerCallAuthorizer(config, iam, evaluator, providers, scpInstance);
         direct = mock(ServiceCallAuthorizer.class);
         ApiGatewayService gateway = mock(ApiGatewayService.class);
         lambda = mock(LambdaService.class);
@@ -132,7 +134,7 @@ class RestAuthorizerRoleTest {
                 new InvokeResult(200, null, "{\"principalId\":\"caller\",\"policyDocument\":{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}]}}".getBytes(StandardCharsets.UTF_8), null, "request"));
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
-                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, cache, new AuthorizerPolicyEvaluator(evaluator), null, direct, null, roles);
+                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, cache, new AuthorizerPolicyEvaluator(evaluator), null, direct, callers, roles);
     }
 
     @ParameterizedTest
