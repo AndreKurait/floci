@@ -144,6 +144,44 @@ class CallerTimeConditionTest {
         verifyNoInteractions(clock);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "session", "boundary", "scp", "resource"})
+    void tokenIssueTimeUsesCredentialMetadataRatherThanEvaluationTime(String layer) {
+        Instant issued = NOW.minusSeconds(600);
+        when(iam.resolveCallerArns("key")).thenReturn(Optional.of(
+                new IamService.CallerArns(USER, USER).withTokenIssueTime(issued)));
+        apply(layer, policy("Allow", "DateEquals", "aws:TokenIssueTime", issued.toString()));
+        assertEquals(Decision.ALLOW, invoke());
+        now.set(NOW.plusSeconds(30));
+        assertEquals(Decision.ALLOW, invoke());
+        apply(layer, policy("Allow", "DateGreaterThan", "aws:TokenIssueTime", issued.toString()));
+        assertEquals(Decision.DENY, invoke());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "session", "boundary", "scp", "resource"})
+    void tokenTimeDenyCannotBeBypassedByAnOlderSession(String layer) {
+        Instant issued = NOW.minusSeconds(600);
+        when(iam.resolveCallerArns("key")).thenReturn(Optional.of(
+                new IamService.CallerArns(USER, USER).withTokenIssueTime(issued)));
+        String deny = policy("Deny", "DateLessThan", "aws:TokenIssueTime", NOW.toString());
+        String combined = "{\"Statement\":[" + ALLOW.substring(ALLOW.indexOf(':') + 1, ALLOW.length() - 1)
+                + "," + deny.substring(deny.indexOf(':') + 1, deny.length() - 1) + "]}";
+        apply(layer, combined);
+        assertEquals(Decision.DENY, invoke());
+        when(iam.resolveCallerArns("key")).thenReturn(Optional.of(
+                new IamService.CallerArns(USER, USER).withTokenIssueTime(NOW)));
+        assertEquals(Decision.ALLOW, invoke());
+    }
+
+    @Test
+    void longTermKeyDoesNotGainTokenIssueTime() {
+        apply("identity", policy("Allow", "Null", "aws:TokenIssueTime", "true"));
+        assertEquals(Decision.ALLOW, invoke());
+        apply("identity", policy("Allow", "Null", "aws:TokenIssueTime", "false"));
+        assertEquals(Decision.DENY, invoke());
+    }
+
     private Decision invoke() {
         return authorizer.authorizeRequest("key", ACCOUNT, USER, ACTION, TARGET, "aws", "127.0.0.1", false);
     }
