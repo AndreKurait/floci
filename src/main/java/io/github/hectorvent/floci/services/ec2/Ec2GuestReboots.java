@@ -87,8 +87,17 @@ final class Ec2GuestReboots implements AutoCloseable {
         if (guest.phase.get() == Phase.RESTARTING) {
             return true;
         }
+        InspectContainerResponse current;
         try {
-            InspectContainerResponse current = docker.inspectContainerCmd(container).exec();
+            current = docker.inspectContainerCmd(container).exec();
+        } catch (NotFoundException missing) {
+            guests.remove(container, guest);
+            return false;
+        } catch (RuntimeException failure) {
+            LOG.warnv(failure, "Could not inspect native EC2 guest {0}; observation will retry", container);
+            return false;
+        }
+        try {
             if (!requestedReboot(current)) {
                 return false;
             }
@@ -106,9 +115,6 @@ final class Ec2GuestReboots implements AutoCloseable {
                 });
             }
             return wanted(container, guest) && guest.phase.get() != Phase.FAILED;
-        } catch (NotFoundException missing) {
-            guests.remove(container, guest);
-            return false;
         } catch (RuntimeException failure) {
             guest.phase.set(Phase.FAILED);
             LOG.warnv(failure, "Could not recover native EC2 reboot for {0}", container);
@@ -142,7 +148,8 @@ final class Ec2GuestReboots implements AutoCloseable {
         return !closed.get() && guests.get(container) == guest
                 && container.equals(guest.instance.getDockerContainerId())
                 && guest.instance.getState() != null
-                && "running".equals(guest.instance.getState().getName());
+                && ("running".equals(guest.instance.getState().getName())
+                    || "pending".equals(guest.instance.getState().getName()));
     }
 
     private static boolean requestedReboot(InspectContainerResponse current) {
