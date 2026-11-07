@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
 /** Direct AssumeRole tags shared by request authorization and session issuance. */
 public final class StsSessionTags {
     private static final Pattern MEMBER = Pattern.compile("(Tags(?:\\.member)?\\.([^.]+))\\.(?:Key|Value)");
+    private static final Pattern TRANSITIVE_MEMBER = AwsQueryLists.memberKeys("TransitiveTagKeys", null);
     private static final Pattern VALUE = Pattern.compile("[\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*");
 
     private StsSessionTags() {
@@ -46,6 +47,44 @@ public final class StsSessionTags {
             tags.put(key, value);
         }
         return Map.copyOf(tags);
+    }
+
+    public static List<String> transitiveKeys(Map<String, String> form) {
+        List<String> members = form.keySet().stream()
+                .filter(key -> TRANSITIVE_MEMBER.matcher(key).matches())
+                .sorted(Comparator.comparingInt(AwsQueryLists::memberIndex)).toList();
+        if (members.size() > 50) {
+            throw invalid("Member 'transitiveTagKeys' must have length less than or equal to 50");
+        }
+        List<String> keys = new ArrayList<>();
+        for (String member : members) {
+            String key = form.get(member);
+            validate(member, key, 1, 128);
+            keys.add(key);
+        }
+        return List.copyOf(keys);
+    }
+
+    public static Map<String, String> inherit(Map<String, String> requested, Map<String, String> inherited) {
+        for (String key : requested.keySet()) {
+            if (inherited.keySet().stream().anyMatch(existing -> existing.equalsIgnoreCase(key))) {
+                throw invalid("A session tag cannot replace an inherited transitive tag");
+            }
+        }
+        Map<String, String> result = new LinkedHashMap<>(inherited);
+        result.putAll(requested);
+        return Map.copyOf(result);
+    }
+
+    public static Map<String, String> transitive(Map<String, String> requested, List<String> keys,
+                                                 Map<String, String> inherited) {
+        Map<String, String> result = new LinkedHashMap<>(inherited);
+        requested.forEach((key, value) -> {
+            if (keys.stream().anyMatch(selected -> selected.equalsIgnoreCase(key))) {
+                result.put(key, value);
+            }
+        });
+        return Map.copyOf(result);
     }
 
     private static void validate(String member, String value, int minimum, int maximum) {
