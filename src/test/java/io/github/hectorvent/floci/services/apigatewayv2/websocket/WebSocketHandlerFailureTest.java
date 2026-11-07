@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer;
+import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer.Failure;
+import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer.Result;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
@@ -13,6 +16,7 @@ import io.github.hectorvent.floci.testutil.LogCapture;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
+import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.http.ServerWebSocket;
@@ -22,6 +26,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.lang.reflect.Method;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -41,6 +46,7 @@ class WebSocketHandlerFailureTest {
     private final WebSocketIntegrationInvoker invoker = mock(WebSocketIntegrationInvoker.class);
     private final WebSocketAuthorizerService authorizer = mock(WebSocketAuthorizerService.class);
     private final Vertx vertx = mock(Vertx.class);
+    private final ExecuteApiSigV4Authorizer sigV4 = mock(ExecuteApiSigV4Authorizer.class);
     private final RoutingContext context = mock(RoutingContext.class);
     private final HttpServerRequest request = mock(HttpServerRequest.class);
     private final HttpServerResponse response = mock(HttpServerResponse.class);
@@ -56,7 +62,7 @@ class WebSocketHandlerFailureTest {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.hostname()).thenReturn(Optional.of("localhost"));
         handler = new WebSocketHandler(apiService, connections, selection, events, invoker,
-                authorizer, mock(RegionResolver.class), config, mapper, vertx);
+                authorizer, mock(RegionResolver.class), config, mapper, vertx, sigV4);
         when(vertx.executeBlocking(any(Callable.class))).thenAnswer(invocation -> {
             Callable<Object> task = invocation.getArgument(0);
             Promise<Object> completion = Promise.promise();
@@ -68,6 +74,11 @@ class WebSocketHandlerFailureTest {
         when(context.response()).thenReturn(response);
         when(response.setStatusCode(anyInt())).thenReturn(response);
         when(request.headers()).thenReturn(MultiMap.caseInsensitiveMultiMap());
+        when(request.method()).thenReturn(HttpMethod.GET);
+        when(request.absoluteURI()).thenReturn("http://api.execute-api.us-east-1.amazonaws.com/prod");
+        when(request.path()).thenReturn("/prod");
+        when(sigV4.authorize(anyString(), any(URI.class), any(), any(), any(), anyString()))
+                .thenReturn(new Result(Failure.MISSING, "unsigned fixture", null));
         when(request.params()).thenReturn(MultiMap.caseInsensitiveMultiMap());
         Api api = new Api();
         api.setProtocolType("WEBSOCKET");
@@ -76,7 +87,7 @@ class WebSocketHandlerFailureTest {
         when(apiService.getStage(REGION, "api", "prod")).thenReturn(new Stage());
         when(apiService.getIntegration(REGION, "api", "integration")).thenReturn(integration);
         when(invoker.invoke(eq(REGION), eq("api"), eq("prod"), anyString(),
-                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap()))
+                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap(), isNull()))
                 .thenReturn(new WebSocketIntegrationInvoker.IntegrationResult(200, null, null, Map.of()));
     }
 
@@ -207,13 +218,13 @@ class WebSocketHandlerFailureTest {
 
     private void failInvocation(RuntimeException failure) {
         when(invoker.invoke(eq(REGION), eq("api"), eq("prod"), anyString(),
-                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap()))
+                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap(), isNull()))
                 .thenThrow(failure);
     }
 
     private void verifyInvocation(String routeKey) {
         verify(invoker).invoke(eq(REGION), eq("api"), eq("prod"), eq(routeKey),
-                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap());
+                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap(), isNull());
     }
 
     private void completeTask() {

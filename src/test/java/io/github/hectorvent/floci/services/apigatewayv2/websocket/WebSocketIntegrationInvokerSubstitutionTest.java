@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
@@ -30,7 +31,7 @@ class WebSocketIntegrationInvokerSubstitutionTest {
                 mock(LambdaService.class),
                 mock(AwsServiceRouter.class),
                 new ObjectMapper(),
-                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class));
+                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class));
     }
 
     @Test

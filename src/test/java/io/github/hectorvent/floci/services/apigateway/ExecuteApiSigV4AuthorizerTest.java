@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.github.hectorvent.floci.testutil.ExecuteApiRequestSigner;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -78,6 +79,21 @@ class ExecuteApiSigV4AuthorizerTest {
 
         assertTrue(result.authorized(), String.valueOf(result.detail()));
         assertEquals("test", result.identity().accessKey());
+    }
+
+    @Test
+    void presignedBodyMustMatchTheSignedPayload() throws Exception {
+        byte[] body = "{\"operation\":\"original\"}".getBytes(StandardCharsets.UTF_8);
+        URI signed = AwsRequestSigner.signedAs("test", "test", "execute-api")
+                .presignedUri("POST", URI.create("http://" + HOST + PATH), Map.of(), body);
+        ExecuteApiSigV4Authorizer.Result original = authorizer.authorize(
+                "POST", headers(Map.of()), uriInfo(PATH, signed.getRawQuery()), body, null);
+        assertTrue(original.authorized(), String.valueOf(original.detail()));
+
+        byte[] changed = "{\"operation\":\"changed\"}".getBytes(StandardCharsets.UTF_8);
+        ExecuteApiSigV4Authorizer.Result tampered = authorizer.authorize(
+                "POST", headers(Map.of()), uriInfo(PATH, signed.getRawQuery()), changed, null);
+        assertEquals(ExecuteApiSigV4Authorizer.Failure.MISMATCH, tampered.failure());
     }
 
     @Test
