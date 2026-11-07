@@ -1289,3 +1289,12 @@ The original request path and payload are verified even when an execute-api virt
 rewrites the local route. Policy denial returns 403 before connection lookup; an authorized
 request for another API's, stage's or region's connection returns 410. POST retains its
 128 KiB payload limit after authorization, including when the connection is absent.
+
+### CloudFormation V2 authorizer update rollback
+
+CloudFormation in-place updates to standalone V2 authorizers snapshot their complete
+configuration before mutation. Failure during the update or in a later stack
+resource restores the previous authorizer ID, credentials and settings. Failed
+restoration keeps the snapshot for rollback retry; successful stack updates clear
+it. Changing the owning API, deployment activation, concurrent transaction isolation
+and process-crash recovery remain outside this rollback support.

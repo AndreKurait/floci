@@ -79,6 +79,38 @@ class ApiGatewayV2CfnCredentialsIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"HTTP", "WEBSOCKET"})
+    void failedLaterResourceRestoresAuthorizerCredentialsAndAllowsRetry(String protocol) {
+        try (ApiGatewayV2Client api = api()) {
+            String name = "v2-authorizer-rollback-" + UUID.randomUUID();
+            String apiId = null;
+            try (StackCleanup cleanup = new StackCleanup(name)) {
+                stackAction("CreateStack", name, template(protocol, ROLE, ROLE, false));
+                Map<String, String> ids = outputs(waitFor(name, "CREATE_COMPLETE"));
+                apiId = ids.get("Api");
+                for (String credentials : new String[]{null, OTHER}) {
+                    String failed = template(protocol, ROLE, credentials, true)
+                            .replace("\"DependsOn\":\"Integration\"", "\"DependsOn\":\"Authorizer\"");
+                    stackAction("UpdateStack", name, failed);
+                    CfnStackWaits.StackState status = CfnStackWaits.awaitTerminal(name);
+                    assertCredentials(api, ids, ROLE, ROLE);
+                    assertEquals("UPDATE_ROLLBACK_COMPLETE", status.status(), status.reason());
+                    assertEquals(ids, outputs(cloudFormation.describeStacks(name, "us-east-1").getFirst()));
+                }
+                stackAction("UpdateStack", name, template(protocol, ROLE, OTHER, false));
+                assertEquals(ids, outputs(waitFor(name, "UPDATE_COMPLETE")));
+                assertCredentials(api, ids, ROLE, OTHER);
+            }
+            {
+                String deletedApiId = apiId;
+                if (deletedApiId != null) {
+                    assertThrows(NotFoundException.class, () -> api.getApi(b -> b.apiId(deletedApiId)));
+                }
+            }
+        }
+    }
+
     @Test
     void cleanupPreservesFailureBeforeCreation() {
         String name = "v2-cleanup-absent-" + UUID.randomUUID();
