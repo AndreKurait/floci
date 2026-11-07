@@ -15486,6 +15486,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             boolean ended = "terminated".equals(state) || "shutting-down".equals(state);
             if (secondary == null && !ended && (!reachable.equals(inst.getPublicIpAddress())
                     || !dnsName.equals(inst.getPublicDnsName()))) {
+                if ("running".equals(state)) {
+                    containerManager.refreshPublicRouting(inst, reachable);
+                }
                 inst.setPublicIpAddress(reachable);
                 inst.setPublicDnsName(dnsName);
                 instances.put(key(region, instanceId), inst);
@@ -15660,6 +15663,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
         });
         instances.put(key(region, inst.getInstanceId()), inst);
+        if (!config.services().ec2().mock() && inst.getState() != null
+                && "running".equals(inst.getState().getName())) {
+            containerManager.refreshPublicRouting(inst);
+        }
     }
 
     /**

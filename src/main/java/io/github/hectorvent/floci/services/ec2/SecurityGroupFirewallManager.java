@@ -399,6 +399,19 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         pendingHelperCleanup.remove(eniId);
     }
 
+    public synchronized void publishPublicAddress(String eniId, String address) {
+        ProtectedEndpoint current = endpoints.get(eniId);
+        if (current == null) {
+            if (address == null) {
+                return;
+            }
+            throw new IllegalStateException("Public address has no admitted security-group endpoint");
+        }
+        if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
+            vpcRouting.get().attachPublicInstance(current.endpoint(), current.helperId(), address);
+        }
+    }
+
     public synchronized void updateGroups(String eniId, Set<String> groupIds,
                                           Map<String, SecurityGroup> groups,
                                           Map<String, List<String>> prefixLists) {

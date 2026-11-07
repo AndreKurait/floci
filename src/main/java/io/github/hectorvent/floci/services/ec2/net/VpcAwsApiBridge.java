@@ -63,6 +63,21 @@ final class VpcAwsApiBridge {
         return device;
     }
 
+    record NetworkEndpoint(String address, String device) {}
+
+    NetworkEndpoint onNetwork(String network) {
+        InspectContainerResponse inspection = docker.inspectContainerCmd(namespace.id()).exec();
+        if (inspection.getNetworkSettings().getNetworks().values().stream()
+                .noneMatch(value -> network.equals(value.getNetworkID()))) {
+            docker.connectToNetworkCmd().withNetworkId(network).withContainerId(namespace.id()).exec();
+            inspection = docker.inspectContainerCmd(namespace.id()).exec();
+        }
+        String address = inspection.getNetworkSettings().getNetworks().values().stream()
+                .filter(value -> network.equals(value.getNetworkID())).map(ContainerNetwork::getIpAddress)
+                .filter(value -> value != null && !value.isBlank()).findFirst().orElseThrow();
+        return new NetworkEndpoint(VpcRouteSelection.ipv4(address), deviceFor(address));
+    }
+
     void ensure(String network) {
         if (namespace != null) {
             if (!Boolean.TRUE.equals(docker.inspectContainerCmd(namespace.id()).exec().getState().getRunning())) {

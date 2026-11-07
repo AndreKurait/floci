@@ -345,7 +345,8 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
         for (Container container : docker.listContainersCmd().withLabelFilter(Map.of(
                 ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config))).exec()) {
             if (!"true".equals(container.getLabels().get(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL))
-                    && !"vpc-nat".equals(container.getLabels().get(ContainerStorageHelper.SERVICE_LABEL))) {
+                    && !"vpc-nat".equals(container.getLabels().get(ContainerStorageHelper.SERVICE_LABEL))
+                    && !"vpc-aws-api".equals(container.getLabels().get(ContainerStorageHelper.SERVICE_LABEL))) {
                 continue;
             }
             evidence.append("\nNamespace ").append(container.getId()).append(' ')

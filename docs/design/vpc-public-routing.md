@@ -93,14 +93,26 @@ the NAT subnet's attached internet-gateway route. Workload egress rules still
 apply. The bridge admits ports 80 and 443 from the active NAT EIPs and installs
 explicit return routes to those NATs. Its only new outbound connection is to the
 selected upstream listener. It neither routes general internet traffic nor adds a
-workload control-network exemption. Removing the last NAT retires the bridge.
-The TCP bridge opens a new upstream connection after accepting the NAT socket,
+workload control-network exemption.
+
+An EC2 instance with a native public IPv4 address can instead use its subnet's
+attached internet-gateway route. The bridge joins that instance's existing public
+Docker network and installs a return route for its public address. The instance's
+existing public-address translation supplies the source; it does not cross the
+separate NAT transport bridge, where Docker would masquerade that source again.
+Only the public API destination is admitted through this route, subject to the
+instance's security-group egress. A private neighbor cannot borrow it. Removing
+an Elastic IP or stopping the instance withdraws its admission; reassociation or
+start restores it when the declared public address and internet route exist.
+Removing the last NAT and public caller retires the bridge.
+The TCP bridge opens a new upstream connection after accepting the routed socket,
 so these checks do not qualify IAM `aws:SourceIp` behavior.
 
 `VpcPublicAwsApiPacketIntegrationTest` covers normal AWS DNS, signed EC2 requests
 over HTTP and verified HTTPS, observed NAT peers, workload egress denial, private
 and NAT-subnet route withdrawal, recovery, NAT replacement and retirement. It
-also repeats the existing private frontend and public NAT cases with the feature
+also covers direct public EC2 access, private-neighbor isolation, Elastic IP
+changes and stop/start, and repeats the private frontend and public NAT cases with the feature
 enabled. The bounded test client waits on dropped packets; no server delay is injected.
 
 Floci installs routing and translation rules inside owned container namespaces.
