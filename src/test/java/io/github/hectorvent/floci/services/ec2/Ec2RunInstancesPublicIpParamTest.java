@@ -211,9 +211,9 @@ class Ec2RunInstancesPublicIpParamTest {
         handler.handle("RunInstances", p, REGION);
         InOrder order = inOrder(service);
         if (templateExisting || requestExisting) {
-            verify(service, never()).createTags(REGION, List.of("eni-primary"), templateTags);
+            verify(service, never()).tagRunInstancesInterfaces(REGION, List.of("eni-primary"), templateTags, null);
         } else {
-            order.verify(service).createTags(REGION, List.of("eni-primary"), templateTags);
+            order.verify(service).tagRunInstancesInterfaces(REGION, List.of("eni-primary"), templateTags, null);
         }
         ArgumentCaptor<List<Tag>> requestTags = ArgumentCaptor.forClass(List.class);
         order.verify(service).createTags(eq(REGION), eq(List.of("eni-secondary", "eni-primary")), requestTags.capture());

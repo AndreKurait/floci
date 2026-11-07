@@ -6,6 +6,8 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static io.restassured.RestAssured.given;
@@ -17,14 +19,18 @@ class Ec2RunInstancesPlacementIntegrationTest {
     private static final String ZONE = "us-east-1b";
 
     @ParameterizedTest
-    @CsvSource({"false,false", "true,false", "true,true"})
-    void zoneIdSelectsTheSubnetAndOverridesATemplateZone(boolean template, boolean templateUsesId) {
+    @CsvSource({"false,false,false", "true,false,false", "true,true,false",
+            "false,false,true", "true,false,true", "true,true,true"})
+    void zoneIdSelectsTheSubnetAndOverridesATemplateZone(boolean template, boolean templateUsesId, boolean token) {
         String owner = Long.toString(ACCOUNTS.incrementAndGet());
         String zoneId = zoneId(owner, ZONE);
         String templateId = null;
-        String instanceId = null;
+        List<String> instances = new ArrayList<>();
         try {
             RequestSpecification launch = runInstance(owner);
+            if (token) {
+                launch.formParam("ClientToken", "placement-" + owner);
+            }
             if (template) {
                 templateId = request("CreateLaunchTemplate", owner)
                         .formParam("LaunchTemplateName", "placement")
@@ -40,9 +46,10 @@ class Ec2RunInstancesPlacementIntegrationTest {
             if (!templateUsesId) {
                 launch.formParam("Placement.AvailabilityZoneId", zoneId);
             }
-            instanceId = launch.post("/").then().statusCode(200)
+            String instanceId = launch.post("/").then().statusCode(200)
                     .body("RunInstancesResponse.instancesSet.item.placement.availabilityZone", equalTo(ZONE))
                     .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
+            instances.add(instanceId);
             String subnetId = request("DescribeInstances", owner).formParam("InstanceId.1", instanceId)
                     .post("/").then().statusCode(200)
                     .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.placement.availabilityZone",
@@ -51,8 +58,16 @@ class Ec2RunInstancesPlacementIntegrationTest {
             request("DescribeSubnets", owner).formParam("SubnetId.1", subnetId)
                     .post("/").then().statusCode(200)
                     .body("DescribeSubnetsResponse.subnetSet.item.availabilityZone", equalTo(ZONE));
+            if (token) {
+                instances.add(runInstance(owner).formParam("ClientToken", "placement-" + owner)
+                        .formParam("Placement.AvailabilityZoneId", zoneId(owner, "us-east-1c"))
+                        .post("/").then().statusCode(200)
+                        .body("RunInstancesResponse.instancesSet.item.placement.availabilityZone",
+                                equalTo("us-east-1c"))
+                        .extract().path("RunInstancesResponse.instancesSet.item.instanceId"));
+            }
         } finally {
-            if (instanceId != null) {
+            for (String instanceId : instances) {
                 request("TerminateInstances", owner).formParam("InstanceId.1", instanceId)
                         .post("/").then().statusCode(200);
             }

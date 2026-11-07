@@ -181,6 +181,11 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public void putAllDurably(Map<K, V> entries) {
+        putAllAtomically(entries);
+    }
+
+    @Override
     public Optional<V> get(K key) {
         return Optional.ofNullable(store.get(key));
     }
@@ -303,15 +308,25 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
         }
     }
 
+    @Override
+    public void flushOrThrow() {
+        compact(true);
+    }
+
     private void compact() {
+        compact(false);
+    }
+
+    private void compact(boolean reportFailure) {
         compactionLock.writeLock().lock();
         try {
+            if (reportFailure && walFailure != null) {
+                throw new IllegalStateException("WAL recovery is required after an uncertain write", walFailure);
+            }
             if (!dirty || walFailure != null) {
                 return;
             }
             StorageFiles.writeAtomically(snapshotPath, tempFile -> snapshotMapper.writeValue(tempFile.toFile(), store));
-            dirty = false;
-
             closeWalWriter();
             try {
                 Files.deleteIfExists(walPath);
@@ -320,8 +335,12 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
                 openWalWriter();
             }
 
+            dirty = false;
             LOG.debugv("Compacted {0} entries to snapshot, WAL truncated", store.size());
         } catch (IOException e) {
+            if (reportFailure) {
+                throw new UncheckedIOException("Failed to compact WAL storage", e);
+            }
             LOG.errorv(e, "Failed to compact WAL storage");
         } finally {
             compactionLock.writeLock().unlock();

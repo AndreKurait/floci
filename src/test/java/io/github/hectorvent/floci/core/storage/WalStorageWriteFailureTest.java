@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -144,6 +145,8 @@ class WalStorageWriteFailureTest {
             assertEquals(1, failure.getCause().getSuppressed().length);
             assertOldValue(store);
             assertThrows(IllegalStateException.class, () -> store.put("later", "unsafe"));
+            IllegalStateException flushFailure = assertThrows(IllegalStateException.class, store::flushOrThrow);
+            assertNotNull(flushFailure.getCause());
             store.flush();
             assertTrue(Files.notExists(directory.resolve("snapshot.json")));
             assertArrayEquals(committedLog, Files.readAllBytes(retained));
@@ -174,6 +177,8 @@ class WalStorageWriteFailureTest {
             assertSame(original, failure.getCause());
             assertOldValue(store);
             assertThrows(IllegalStateException.class, () -> store.put("later", "unsafe"));
+            IllegalStateException flushFailure = assertThrows(IllegalStateException.class, store::flushOrThrow);
+            assertNotNull(flushFailure.getCause());
         } finally {
             store.shutdown();
         }
@@ -359,6 +364,8 @@ class WalStorageWriteFailureTest {
             assertEquals(1, failure.getCause().getSuppressed().length);
             assertOldValue(store);
             assertThrows(IllegalStateException.class, () -> store.put("later", "unsafe"));
+            IllegalStateException flushFailure = assertThrows(IllegalStateException.class, store::flushOrThrow);
+            assertNotNull(flushFailure.getCause());
             store.flush();
             assertArrayEquals(committedLog, Files.readAllBytes(directory.resolve("data.wal")));
             assertTrue(Files.notExists(directory.resolve("snapshot.json")));
