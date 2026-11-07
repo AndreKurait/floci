@@ -1159,7 +1159,7 @@ use Lambda resource-based permissions.
 
 This local role evaluation does not issue STS credentials or establish all
 service-specific trust condition keys. Integration caller-passthrough credentials
-are not an authorizer credential mode. WebSocket role enforcement and live
+are not an authorizer credential mode. WebSocket integration role enforcement and live
 AWS or native-image parity remain outside this support.
 
 
@@ -1224,3 +1224,5 @@ configuration error before invocation. Configured authorizer roles retain their
 separate execution path; this check does not implement role assumption.
 
 WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
+
+WebSocket REQUEST Lambda authorizers with configured credentials check the API owner's IAM role trust and Lambda invocation permissions when IAM enforcement is enabled. The role must trust API Gateway; shared identity/resource policy, permissions boundary and SCP evaluation applies to the same qualified function invoked. Foreign-account targets also require a resource grant. Missing credentials retain Lambda resource-policy authorization. Full service trust condition context and actual issued execution-role STS sessions are not modeled by this check.

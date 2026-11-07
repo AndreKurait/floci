@@ -110,7 +110,8 @@ class WebSocketIntegrationPermissionIntegrationTest {
                         + arn + "/invocations")).integrationId();
         gateway.createRoute(request -> request.apiId(api).routeKey("$connect").authorizationType("NONE")
                 .target("integrations/" + integration));
-        gateway.createStage(request -> request.apiId(api).stageName("prod").autoDeploy(true));
+        String deployment = gateway.createDeployment(request -> request.apiId(api)).deploymentId();
+        gateway.createStage(request -> request.apiId(api).stageName("prod").deploymentId(deployment));
         doReturn(new InvokeResult(200, null,
                 "{\"statusCode\":200,\"body\":\"ok\"}".getBytes(StandardCharsets.UTF_8), null, "permission-test"))
                 .when(lambda).invokeTarget(eq(REGION), eq(arn), any(byte[].class), eq(InvocationType.RequestResponse));
