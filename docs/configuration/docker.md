@@ -275,7 +275,7 @@ Startup cleanup acts on an object only when every owner key it carries, new or l
 
 Containers spawned by Floci (Lambda, RDS, ElastiCache, OpenSearch, MSK, ECS) need to be on the same Docker network to communicate with each other and with Floci itself.
 
-When Floci itself runs inside Docker and no network is configured, it automatically detects the current container's Docker network and uses it for spawned containers. You only need to set this manually when you want to force a specific network.
+When Floci itself runs inside Docker and no shared network is configured, it prefers the network selected when its container was created. Attaching managed VPC networks later does not move service endpoints or embedded DNS after a restart. Set the shared network explicitly when service containers should use a different attachment.
 
 Set the shared network at the top level:
 

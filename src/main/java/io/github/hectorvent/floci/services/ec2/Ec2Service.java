@@ -115,7 +115,6 @@ import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.ram.RamService;
 import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsService;
-import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.context.ContextNotActiveException;
 import jakarta.inject.Inject;
@@ -1228,7 +1227,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         this.configuredManagedPrefixLists = loadManagedPrefixListCatalog();
     }
 
-    @PostConstruct
+    // Firewall restoration can call this service through CDI, so Ec2Startup runs it after construction.
     void restoreMetadataRegistrations() {
         runInstancesReplay.recoverPending(recovery -> RequestScopes.runAs(recovery.account(), recovery.region(),
                 () -> compensateRunInstances(recovery.region(), recovery.allocations())));
@@ -14277,7 +14276,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * An instance record from whichever account owns it. The startup sweep runs from
-     * {@code @PostConstruct}, outside any request, where an account-aware backend resolves to the
+     * the startup observer, outside any request, where an account-aware backend resolves to the
      * default account: a record owned by another account would read as absent and its live
      * container would be destroyed. Read-only, so a cross-account hit stays in its own partition.
      */
