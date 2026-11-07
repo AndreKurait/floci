@@ -1159,7 +1159,7 @@ use Lambda resource-based permissions.
 
 This local role evaluation does not issue STS credentials or establish all
 service-specific trust condition keys. Integration caller-passthrough credentials
-are not an authorizer credential mode. HTTP/WebSocket role enforcement and live
+are not an authorizer credential mode. WebSocket role enforcement and live
 AWS or native-image parity remain outside this support.
 
 
@@ -1215,3 +1215,10 @@ compatibility spelling is preserved separately. Full forwarded condition context
 issuance of execution-role STS sessions remain outside this behavior.
 
 HTTP API REQUEST Lambda authorizers with configured execution roles check API-owner role trust and Lambda invocation permissions when IAM enforcement is enabled. Role identity policies, resource policies, permissions boundaries and SCPs are evaluated against the same qualified target used for invocation. Absent credentials retain service-principal resource-policy authorization. Authorizer credentials support role ARNs, not the integration caller-credentials sentinel. Actual execution-role STS session issuance and full condition-context forwarding are not modeled by this check.
+
+WebSocket REQUEST authorizers without `authorizerCredentialsArn` check the Lambda
+resource policy when IAM enforcement is enabled. The check uses the API account,
+the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns the existing authorizer
+configuration error before invocation. Configured authorizer roles retain their
+separate execution path; this check does not implement role assumption.
