@@ -18,6 +18,7 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.w3c.dom.Document;
 
@@ -187,9 +188,157 @@ class CloudWatchPercentileAlarmTest {
         json.handle("PutMetricAlarm", alarmRequest(), REGION);
         ObjectNode mixed = alarmRequest().put("Statistic", "Average");
         assertThrows(AwsException.class, () -> json.handle("PutMetricAlarm", mixed, REGION));
-        ObjectNode unsupported = alarmRequest().put("EvaluateLowSampleCountPercentile", "ignore");
+        ObjectNode unsupported = alarmRequest().put("EvaluateLowSampleCountPercentile", "sometimes");
         assertThrows(AwsException.class, () -> json.handle("PutMetricAlarm", unsupported, REGION));
         assertEquals("p90", jsonAlarm().path("ExtendedStatistic").asText());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"evaluate", "ignore"})
+    void bothProtocolsAcceptEachDocumentedLowSampleCountPolicy(String policy) {
+        json.handle("PutMetricAlarm", alarmRequest().put("EvaluateLowSampleCountPercentile", policy), REGION);
+        assertEquals(policy, jsonAlarm().path("EvaluateLowSampleCountPercentile").asText());
+
+        MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+        alarmRequest().put("AlarmName", "latency-query").put("EvaluateLowSampleCountPercentile", policy)
+                .fields().forEachRemaining(field -> parameters.putSingle(field.getKey(), field.getValue().asText()));
+        query.handle("PutMetricAlarm", parameters, REGION);
+        assertEquals(policy, service.describeAlarms(List.of("latency-query"), null, REGION)
+                .getFirst().getEvaluateLowSampleCountPercentile());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"sometimes", "Ignore", "EVALUATE", ""})
+    void bothProtocolsRejectAnUndocumentedLowSampleCountPolicy(String policy) {
+        ObjectNode request = alarmRequest().put("EvaluateLowSampleCountPercentile", policy);
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> json.handle("PutMetricAlarm", request, REGION)).getErrorCode());
+        MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+        request.fields().forEachRemaining(field -> parameters.putSingle(field.getKey(), field.getValue().asText()));
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> query.handle("PutMetricAlarm", parameters, REGION)).getErrorCode());
+        assertTrue(service.describeAlarms(List.of("latency"), null, REGION).isEmpty());
+    }
+
+    /**
+     * AWS applies the low-sample policy below 10/(1-p) samples for p in [0.5, 1) and below 10/p
+     * for p in (0, 0.5); p0 and p100 have no floor. One sample short of the floor holds the state
+     * under {@code ignore}; reaching the floor lets the alarm transition.
+     */
+    @ParameterizedTest
+    @CsvSource({"p50,20", "p90,100", "p99,1000", "p99.9,10000", "p25,40", "p10,100", "p0,1", "p100,1"})
+    @SuppressWarnings("unchecked")
+    void ignoreFloorFollowsTheDocumentedFormula(String percentile, int floor) {
+        json.handle("PutMetricAlarm", alarmRequest().put("ExtendedStatistic", percentile)
+                .put("EvaluateLowSampleCountPercentile", "ignore"), REGION);
+        MetricAlarm alarm = service.describeAlarms(List.of("latency"), null, REGION).getFirst();
+        alarm.setActionsEnabled(false);
+        AlarmEvaluator evaluator = new AlarmEvaluator(service, mock(Instance.class));
+        try {
+            service.setAlarmState("latency", "OK", "initial", null, REGION);
+            long timestamp = Instant.now().getEpochSecond() / 60 * 60 - 30;
+            if (floor > 1) {
+                service.putMetricData(NAMESPACE, samples("Latency", 1000, floor - 1, timestamp), REGION);
+                evaluator.evaluate(alarm);
+                assertEquals("OK", alarm.getStateValue(), percentile + " below its floor");
+            }
+            service.putMetricData(NAMESPACE, samples("Latency", 1000, 1, timestamp), REGION);
+            evaluator.evaluate(alarm);
+            assertEquals("ALARM", alarm.getStateValue(), percentile + " at its floor");
+        } finally {
+            evaluator.stop();
+        }
+    }
+
+    /**
+     * With {@code ignore}, a breach seen in too few samples must not move the alarm; the same
+     * samples under {@code evaluate} do. Once the sample count reaches the floor the alarm is
+     * evaluated again, and a low-sample recovery likewise leaves an ALARM in place.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void ignoreHoldsTheStateWhileTooFewSamplesAndEvaluateDoesNot() {
+        json.handle("PutMetricAlarm", alarmRequest().put("EvaluateLowSampleCountPercentile", "ignore"), REGION);
+        json.handle("PutMetricAlarm", alarmRequest().put("AlarmName", "latency-evaluate")
+                .put("MetricName", "LatencyEvaluate").put("EvaluateLowSampleCountPercentile", "evaluate"), REGION);
+        MetricAlarm ignored = service.describeAlarms(List.of("latency"), null, REGION).getFirst();
+        MetricAlarm evaluated = service.describeAlarms(List.of("latency-evaluate"), null, REGION).getFirst();
+        ignored.setActionsEnabled(false);
+        evaluated.setActionsEnabled(false);
+        AlarmEvaluator evaluator = new AlarmEvaluator(service, mock(Instance.class));
+        try {
+            service.setAlarmState("latency", "OK", "initial", null, REGION);
+            service.setAlarmState("latency-evaluate", "OK", "initial", null, REGION);
+            long timestamp = Instant.now().getEpochSecond() / 60 * 60 - 30;
+            service.putMetricData(NAMESPACE, samples("Latency", 1000, 99, timestamp), REGION);
+            service.putMetricData(NAMESPACE, samples("LatencyEvaluate", 1000, 99, timestamp), REGION);
+
+            evaluator.evaluate(ignored);
+            evaluator.evaluate(evaluated);
+            assertEquals("OK", ignored.getStateValue());
+            assertEquals("initial", ignored.getStateReason());
+            assertEquals("ALARM", evaluated.getStateValue());
+
+            service.putMetricData(NAMESPACE, samples("Latency", 1000, 1, timestamp), REGION);
+            evaluator.evaluate(ignored);
+            assertEquals("ALARM", ignored.getStateValue());
+
+            json.handle("PutMetricAlarm", alarmRequest().put("AlarmName", "latency-recover")
+                    .put("MetricName", "LatencyRecover").put("EvaluateLowSampleCountPercentile", "ignore"), REGION);
+            MetricAlarm recovering = service.describeAlarms(List.of("latency-recover"), null, REGION).getFirst();
+            recovering.setActionsEnabled(false);
+            service.setAlarmState("latency-recover", "ALARM", "breached earlier", null, REGION);
+            service.putMetricData(NAMESPACE, samples("LatencyRecover", 1, 5, timestamp), REGION);
+            evaluator.evaluate(recovering);
+            assertEquals("ALARM", recovering.getStateValue());
+        } finally {
+            evaluator.stop();
+        }
+    }
+
+    /** Only the datapoints that decide the state are checked; an older thin period does not hold it. */
+    @Test
+    @SuppressWarnings("unchecked")
+    void ignoreLooksOnlyAtTheDatapointsThatDecideTheState() {
+        json.handle("PutMetricAlarm", alarmRequest().put("EvaluateLowSampleCountPercentile", "ignore"), REGION);
+        MetricAlarm alarm = service.describeAlarms(List.of("latency"), null, REGION).getFirst();
+        alarm.setActionsEnabled(false);
+        AlarmEvaluator evaluator = new AlarmEvaluator(service, mock(Instance.class));
+        try {
+            service.setAlarmState("latency", "OK", "initial", null, REGION);
+            long timestamp = Instant.now().getEpochSecond() / 60 * 60 - 30;
+            service.putMetricData(NAMESPACE, samples("Latency", 1000, 5, timestamp - 60), REGION);
+            service.putMetricData(NAMESPACE, samples("Latency", 1000, 100, timestamp), REGION);
+            evaluator.evaluate(alarm);
+            assertEquals("ALARM", alarm.getStateValue());
+        } finally {
+            evaluator.stop();
+        }
+    }
+
+    /** No samples at all is missing data, not a low sample count: TreatMissingData still decides. */
+    @Test
+    @SuppressWarnings("unchecked")
+    void ignoreLeavesMissingDataToTreatMissingData() {
+        json.handle("PutMetricAlarm", alarmRequest().put("EvaluateLowSampleCountPercentile", "ignore"), REGION);
+        MetricAlarm alarm = service.describeAlarms(List.of("latency"), null, REGION).getFirst();
+        alarm.setActionsEnabled(false);
+        AlarmEvaluator evaluator = new AlarmEvaluator(service, mock(Instance.class));
+        try {
+            service.setAlarmState("latency", "ALARM", "initial", null, REGION);
+            evaluator.evaluate(alarm);
+            assertEquals("OK", alarm.getStateValue());
+        } finally {
+            evaluator.stop();
+        }
+    }
+
+    private static List<MetricDatum> samples(String metricName, double value, int count, long timestamp) {
+        List<MetricDatum> samples = new ArrayList<>();
+        for (int index = 0; index < count; index++) {
+            samples.add(MetricDatum.of(metricName, "Milliseconds", value, List.of(), timestamp));
+        }
+        return samples;
     }
 
     @Test

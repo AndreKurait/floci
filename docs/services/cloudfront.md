@@ -129,6 +129,12 @@ PUT, PATCH and DELETE).
 
 ## Behavior
 
+- The matching cache behavior's `ViewerProtocolPolicy` applies to HTTP and WebSocket viewers.
+  `https-only` rejects HTTP with 403. `redirect-to-https` returns 301 for GET/HEAD and 307 for
+  other allowed HTTP/1.1-or-later methods; those other methods receive 403 over HTTP/1.0.
+  Redirects preserve the raw path and query. All three policies accept HTTPS, and denied or
+  redirected requests do not reach the origin. Local delivery URLs retain explicit ports other
+  than the default HTTP port 80.
 - All distributions are immediately set to `Deployed` state (no async `InProgress` delay).
 - Distribution IDs are 14 uppercase alphanumeric characters starting with `E` (e.g. `E1Z2X3C4V5B6N7`).
 - Distribution domain names follow the pattern `{id}.cloudfront.net`, with the id lower-cased as AWS
@@ -156,6 +162,10 @@ PUT, PATCH and DELETE).
   method; any other method returns 403 `Invalid method.`. A behavior without `AllowedMethods` allows
   GET and HEAD. Origin forwarding preserves the raw path, including `%25` for a literal percent
   sign, on generated domains and aliases. Custom-origin redirects are not followed.
+- Viewer host lookup spans accounts, while management APIs remain account-scoped. Policy and key
+  references resolve in the distribution's owning account without replacing the viewer identity
+  used for origin authorization. Equally specific conflicting stored host claims are not routed.
+  Cross-account S3 origins use the existing `FLOCI_SERVICES_S3_GLOBAL_BUCKET_NAMESPACE=true` setting.
 - POST, PUT, PATCH and DELETE are forwarded to custom origins with the viewer request body and its
   `Content-Type`. The body is streamed to the origin with the viewer's `Content-Length`, or chunked
   when the viewer sent it chunked or, as HTTP/2 allows, with no length, so it is never held in
@@ -323,6 +333,9 @@ PUT, PATCH and DELETE).
 - `ViewerCertificate.ACMCertificateArn` must name an existing ACM certificate: distribution create and
   update reject an unknown one with `InvalidViewerCertificate`. ACM lists the distribution's ARN under
   `InUseBy`, and `DeleteCertificate` returns `ResourceInUseException` while a distribution references it.
+- CloudFormation distribution create and update preserve `ViewerCertificate`, including resolved
+  references and conditions. The CloudFormation names `AcmCertificateArn`, `IamCertificateId` and
+  `SslSupportMethod` map to the corresponding CloudFront API fields.
 - Up to 20 custom response headers policies can be created, and one policy can be associated with
   up to 100 distributions.
 - The five AWS managed response headers policy IDs are available and can be selected with

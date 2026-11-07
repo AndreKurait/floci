@@ -4,10 +4,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.codedeploy.model.Deployment;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -48,12 +50,17 @@ class CodeDeployServiceTest {
 
     private LambdaService lambdaService;
     private SsmCommandService ssmCommandService;
+    private ServiceRoleCallAuthorizer roleAuthorizer;
     private CodeDeployService service;
 
     @BeforeEach
     void setUp() {
         lambdaService = mock(LambdaService.class);
         ssmCommandService = mock(SsmCommandService.class);
+        roleAuthorizer = mock(ServiceRoleCallAuthorizer.class);
+        when(roleAuthorizer.authorizeWithoutSourceContext(
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(Decision.ALLOW);
         service = newService(Duration.ofHours(1));
     }
 
@@ -65,7 +72,7 @@ class CodeDeployServiceTest {
         CodeDeployService svc = new CodeDeployService(lambdaService, mock(EcsService.class),
                 mock(ElbV2Service.class), ssmCommandService, mock(Ec2Service.class), new ObjectMapper(),
                 new RegionResolver(REGION, ACCOUNT_ID), null, hookCallbackTimeout, clock,
-                mock(CodeDeployAgentDeployment.class));
+                mock(CodeDeployAgentDeployment.class), roleAuthorizer);
         svc.initializeStorage();
         return svc;
     }
@@ -77,7 +84,7 @@ class CodeDeployServiceTest {
         when(resolver.getAccountId()).thenAnswer(ignored -> account.get());
         CodeDeployService scoped = new CodeDeployService(lambdaService, mock(EcsService.class),
                 mock(ElbV2Service.class), ssmCommandService, mock(Ec2Service.class), new ObjectMapper(),
-                resolver, null, mock(CodeDeployAgentDeployment.class));
+                resolver, null, mock(CodeDeployAgentDeployment.class), roleAuthorizer);
         scoped.createApplication(REGION, "account-app", "Server", null);
         scoped.createDeploymentGroup(REGION, "account-app", "group", null, ROLE_ARN, Map.of());
         String id = scoped.createDeployment(REGION, "account-app", "group", null,
@@ -378,6 +385,79 @@ class CodeDeployServiceTest {
         service.putLifecycleEventHookExecutionStatus("ignored", capturedExecutionId.get(), "Failed");
 
         assertEquals("Succeeded", service.getDeployment(REGION, deploymentId).getStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GetAlias", "UpdateAlias"})
+    void deniedAliasPermissionFailsBeforeTheUnauthorizedCall(String operation) {
+        createLambdaAppAndGroup("app-denied-alias", "group-denied-alias");
+        String aliasArn = "arn:aws:lambda:us-east-1:000000000000:function:myFunc:live";
+        when(roleAuthorizer.authorizeWithoutSourceContext("codedeploy", ROLE_ARN,
+                "lambda:" + operation, aliasArn, ACCOUNT_ID, "aws")).thenReturn(Decision.DENY);
+
+        String id = createLambdaDeployment("app-denied-alias", "group-denied-alias", null, null);
+        Deployment deployment = awaitTerminal(id, Duration.ofSeconds(5));
+
+        assertEquals("Failed", deployment.getStatus());
+        assertEquals("IAM_ROLE_PERMISSIONS", deployment.getErrorInformation().get("code"));
+        assertTrue(deployment.getErrorInformation().get("message").contains("lambda:" + operation));
+        verify(roleAuthorizer).authorizeWithoutSourceContext("codedeploy", ROLE_ARN,
+                "lambda:" + operation, aliasArn, ACCOUNT_ID, "aws");
+        verify(lambdaService, never()).updateAlias(anyString(), anyString(), anyString(), anyString(), any(), any());
+        if ("GetAlias".equals(operation)) {
+            verify(lambdaService, never()).getAlias(anyString(), anyString(), anyString());
+        } else {
+            verify(lambdaService).getAlias(REGION, "myFunc", "live");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void deniedHookPermissionPreventsInvocation(boolean beforeTraffic) {
+        createLambdaAppAndGroup("app-denied-hook", "group-denied-hook");
+        String hook = "arn:aws:lambda:us-east-1:000000000000:function:validation:published";
+        when(roleAuthorizer.authorizeWithoutSourceContext("codedeploy", ROLE_ARN,
+                "lambda:InvokeFunction", hook, ACCOUNT_ID, "aws")).thenReturn(Decision.DENY);
+
+        String id = createLambdaDeployment("app-denied-hook", "group-denied-hook",
+                beforeTraffic ? hook : null, beforeTraffic ? null : hook);
+        Deployment deployment = awaitTerminal(id, Duration.ofSeconds(5));
+
+        assertEquals("Failed", deployment.getStatus());
+        assertEquals("IAM_ROLE_PERMISSIONS", deployment.getErrorInformation().get("code"));
+        verify(roleAuthorizer).authorizeWithoutSourceContext("codedeploy", ROLE_ARN,
+                "lambda:InvokeFunction", hook, ACCOUNT_ID, "aws");
+        verify(lambdaService, never()).invoke(anyString(), anyString(), any(byte[].class), any());
+        if (beforeTraffic) {
+            verify(lambdaService, never()).updateAlias(
+                    anyString(), anyString(), anyString(), anyString(), any(), any());
+        } else {
+            verify(lambdaService).updateAlias(REGION, "myFunc", "live", "2", null, Map.of());
+        }
+    }
+
+    @Test
+    void runningDeploymentKeepsItsSelectedRoleWhenTheGroupChanges() {
+        createLambdaAppAndGroup("app-role-snapshot", "group-role-snapshot");
+        String replacementRole = "arn:aws:iam::000000000000:role/ReplacementRole";
+        when(roleAuthorizer.authorizeWithoutSourceContext(eq("codedeploy"), eq(replacementRole),
+                anyString(), anyString(), anyString(), anyString())).thenReturn(Decision.DENY);
+        when(lambdaService.invoke(eq(REGION), eq("beforeHook"), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenAnswer(invocation -> {
+                    service.updateDeploymentGroup(REGION, "app-role-snapshot", "group-role-snapshot",
+                            null, null, replacementRole, null);
+                    byte[] payload = invocation.getArgument(2);
+                    service.putLifecycleEventHookExecutionStatus("ignored", executionIdFrom(payload), "Succeeded");
+                    return new InvokeResult(200, null, new byte[0], null, "role-snapshot");
+                });
+
+        String id = createLambdaDeployment("app-role-snapshot", "group-role-snapshot", "beforeHook", null);
+
+        assertEquals("Succeeded", awaitTerminal(id, Duration.ofSeconds(5)).getStatus());
+        verify(roleAuthorizer).authorizeWithoutSourceContext("codedeploy", ROLE_ARN,
+                "lambda:UpdateAlias", "arn:aws:lambda:us-east-1:000000000000:function:myFunc:live", ACCOUNT_ID, "aws");
+        verify(roleAuthorizer, never()).authorizeWithoutSourceContext(eq("codedeploy"), eq(replacementRole),
+                anyString(), anyString(), anyString(), anyString());
     }
 
     // ---- Helpers --------------------------------------------------------------------------

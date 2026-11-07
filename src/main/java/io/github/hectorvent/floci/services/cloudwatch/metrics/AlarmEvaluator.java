@@ -124,6 +124,7 @@ public class AlarmEvaluator {
         Instant start = Instant.ofEpochSecond(oldestBucket);
         Instant end = Instant.ofEpochSecond(lastCompleteBucket + period - 1);
         Map<Instant, Double> samples = new HashMap<>();
+        Map<Instant, Double> sampleCounts = new HashMap<>();
         if (math == null) {
             String statistic = alarm.getExtendedStatistic() != null
                     ? alarm.getExtendedStatistic() : alarm.getStatistic();
@@ -131,6 +132,7 @@ public class AlarmEvaluator {
                     alarm.getNamespace(), alarm.getMetricName(), alarm.getDimensions(),
                     start, end, period, List.of(statistic), alarm.getUnit(), region)) {
                 samples.put(point.timestamp(), CloudWatchMetricsService.resolveStatValue(point, statistic));
+                sampleCounts.put(point.timestamp(), point.sampleCount());
             }
         } else {
             CloudWatchMetricsService.MetricDataResult result =
@@ -140,19 +142,33 @@ public class AlarmEvaluator {
             }
         }
         Double[] buckets = new Double[range];
+        Double[] bucketSampleCounts = new Double[range];
         for (Map.Entry<Instant, Double> sample : samples.entrySet()) {
             long bucket = (sample.getKey().getEpochSecond() / period) * period;
             int index = (int) ((bucket - oldestBucket) / period);
             if (index >= 0 && index < range) {
                 buckets[index] = sample.getValue();
+                bucketSampleCounts[index] = sampleCounts.get(sample.getKey());
             }
         }
 
         List<Double> real = new ArrayList<>();
-        for (Double value : buckets) {
-            if (value != null) {
-                real.add(value);
+        List<Double> realSampleCounts = new ArrayList<>();
+        for (int index = 0; index < range; index++) {
+            if (buckets[index] != null) {
+                real.add(buckets[index]);
+                realSampleCounts.add(bucketSampleCounts[index]);
             }
+        }
+
+        if (lowSampleCountHolds(alarm, realSampleCounts, evaluationPeriods)) {
+            // Held like TreatMissingData=ignore: an ALARM keeps dispatching, with the latest breach
+            // among the datapoints that would have decided the state (NaN when none of them breaches).
+            if ("ALARM".equals(alarm.getStateValue()) && alarm.isActionsEnabled()) {
+                List<Double> deciding = real.subList(Math.max(0, real.size() - evaluationPeriods), real.size());
+                dispatch(alarm, latestBreachingValue(deciding, alarm), region);
+            }
+            return;
         }
 
         String newState;
@@ -202,6 +218,32 @@ public class AlarmEvaluator {
         if ("ALARM".equals(newState) && alarm.isActionsEnabled()) {
             dispatch(alarm, latestValue, region);
         }
+    }
+
+    /**
+     * {@code EvaluateLowSampleCountPercentile=ignore} on a single-metric percentile alarm: AWS keeps
+     * the alarm state "during periods with too few data points to be statistically significant".
+     * AWS does not say how that combines with M of N, so this is Floci's reading: the datapoints that
+     * would decide the state are checked (the most recent {@code evaluationPeriods} real ones, or all
+     * of them when there are fewer), and if any of them holds fewer samples than {@link
+     * MetricPercentiles#minimumSamples} the state is left as it is. A period with no samples at all
+     * is missing data, which {@code TreatMissingData} still governs. Metric math alarms are not held.
+     */
+    private static boolean lowSampleCountHolds(MetricAlarm alarm, List<Double> realSampleCounts,
+                                               int evaluationPeriods) {
+        if (!MetricPercentiles.IGNORE.equals(alarm.getEvaluateLowSampleCountPercentile())
+                || alarm.getExtendedStatistic() == null || !alarm.getMetrics().isEmpty()) {
+            return false;
+        }
+        double floor = MetricPercentiles.minimumSamples(alarm.getExtendedStatistic());
+        int from = Math.max(0, realSampleCounts.size() - evaluationPeriods);
+        for (Double count : realSampleCounts.subList(from, realSampleCounts.size())) {
+            // Null cannot occur on the single-metric path; guarded so a future caller cannot unbox it.
+            if (count != null && count < floor) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

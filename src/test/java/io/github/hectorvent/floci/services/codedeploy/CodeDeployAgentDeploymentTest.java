@@ -106,7 +106,7 @@ class CodeDeployAgentDeploymentTest {
 
     @Test
     void incompleteTrafficControlAndUnknownPoliciesCannotStartAnAgentDeployment() {
-        assertThrows(AwsException.class, () -> prepare("CodeDeployDefault.HalfAtATime"));
+        assertThrows(AwsException.class, () -> prepare("CustomUnsupportedConfig"));
         group.setDeploymentStyle(Map.of("deploymentType", "IN_PLACE", "deploymentOption", "WITH_TRAFFIC_CONTROL"));
         assertThrows(AwsException.class, () -> prepare(null));
         group.setDeploymentStyle(Map.of("deploymentType", "BLUE_GREEN"));
@@ -405,6 +405,109 @@ class CodeDeployAgentDeploymentTest {
         done(run);
         assertEquals("Succeeded", run.deployment().getStatus());
         assertEquals("Failed", target(run, SECOND).get("status"));
+    }
+
+    @Test
+    void halfAtATimeRoundsConcurrencyDownAndReplacesOnlyCompletedHosts() throws Exception {
+        members(FIRST, SECOND, "i-third", "i-fourth", "i-fifth");
+        Running run = start(prepare("CodeDeployDefault.HalfAtATime"));
+        pending(FIRST, "ApplicationStop");
+        pending(SECOND, "ApplicationStop");
+        assertTrue(commands.poll(ACCOUNT, REGION, host("i-third")).isEmpty());
+        succeed(FIRST);
+        pending("i-third", "ApplicationStop");
+        assertTrue(commands.poll(ACCOUNT, REGION, host("i-fourth")).isEmpty());
+        succeed(SECOND);
+        pending("i-fourth", "ApplicationStop");
+        succeed("i-third");
+        pending("i-fifth", "ApplicationStop");
+        succeed("i-fourth");
+        succeed("i-fifth");
+        done(run);
+        assertEquals("Succeeded", run.deployment().getStatus());
+        assertTrue(run.targets().stream().allMatch(target -> "Succeeded".equals(target.get("status"))));
+    }
+
+    @Test
+    void halfAtATimeReducesConcurrencyAfterAFailure() throws Exception {
+        members(FIRST, SECOND, "i-third", "i-fourth", "i-fifth");
+        Running run = start(prepare("CodeDeployDefault.HalfAtATime"));
+        pending(SECOND, "ApplicationStop");
+        complete(FIRST, "ApplicationStop", "Failed", "{\"error_code\":4}");
+        succeed(SECOND);
+        pending("i-third", "ApplicationStop");
+        assertTrue(commands.poll(ACCOUNT, REGION, host("i-fourth")).isEmpty());
+        succeed("i-third");
+        pending("i-fourth", "ApplicationStop");
+        assertTrue(commands.poll(ACCOUNT, REGION, host("i-fifth")).isEmpty());
+        succeed("i-fourth");
+        complete("i-fifth", "ApplicationStop", "Failed", "{\"error_code\":4}");
+        done(run);
+        assertEquals("Succeeded", run.deployment().getStatus());
+        assertEquals(3, run.targets().stream().filter(target -> "Succeeded".equals(target.get("status"))).count());
+    }
+
+    @Test
+    void halfAtATimeStopsBeforeAnotherHostWouldBreachTheHealthyMinimum() throws Exception {
+        members(FIRST, SECOND, "i-third", "i-fourth", "i-fifth");
+        Running run = start(prepare("CodeDeployDefault.HalfAtATime"));
+        pending(SECOND, "ApplicationStop");
+        complete(FIRST, "ApplicationStop", "Failed", "{\"error_code\":4}");
+        complete(SECOND, "ApplicationStop", "Failed", "{\"error_code\":4}");
+        done(run);
+        assertEquals("Failed", run.deployment().getStatus());
+        assertEquals("HEALTH_CONSTRAINTS", run.deployment().getErrorInformation().get("code"));
+        for (String id : List.of("i-third", "i-fourth", "i-fifth")) {
+            assertEquals("Skipped", target(run, id).get("status"));
+            assertTrue(commands.poll(ACCOUNT, REGION, host(id)).isEmpty());
+        }
+    }
+
+    @Test
+    void halfAtATimeStopWaitsForActiveCommandsWithoutStartingAnotherHost() throws Exception {
+        members(FIRST, SECOND, "i-third", "i-fourth");
+        Running run = start(prepare("CodeDeployDefault.HalfAtATime"));
+        String first = pending(FIRST, "ApplicationStop");
+        String second = pending(SECOND, "ApplicationStop");
+        commands.acknowledge(ACCOUNT, REGION, first);
+        commands.acknowledge(ACCOUNT, REGION, second);
+        run.stop().set(true);
+        commands.complete(ACCOUNT, REGION, first, "Succeeded", "{}");
+        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        assertTrue(commands.poll(ACCOUNT, REGION, host("i-third")).isEmpty());
+        commands.complete(ACCOUNT, REGION, second, "Succeeded", "{}");
+        done(run);
+        assertEquals("Stopped", run.deployment().getStatus());
+        assertEquals("Skipped", target(run, "i-third").get("status"));
+        assertEquals("Skipped", target(run, "i-fourth").get("status"));
+    }
+
+    @Test
+    void halfAtATimeRequiresAtLeastHalfToSucceedForTwoHosts() throws Exception {
+        members(FIRST, SECOND);
+        Running run = start(prepare("CodeDeployDefault.HalfAtATime"));
+        pending(FIRST, "ApplicationStop");
+        assertTrue(commands.poll(ACCOUNT, REGION, host(SECOND)).isEmpty());
+        succeed(FIRST);
+        complete(SECOND, "ApplicationStop", "Failed", "{\"error_code\":4}");
+        done(run);
+        assertEquals("Succeeded", run.deployment().getStatus());
+    }
+
+    @Test
+    void halfAtATimeCannotTakeAHostOfflineWhenTheRoundedMinimumLeavesNoCapacity() throws Exception {
+        members(FIRST);
+        Running run = start(prepare("CodeDeployDefault.HalfAtATime"));
+        done(run);
+        assertEquals("Failed", run.deployment().getStatus());
+        assertEquals("HEALTH_CONSTRAINTS", run.deployment().getErrorInformation().get("code"));
+        assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
+    }
+
+    private void succeed(String instance) {
+        for (String phase : PHASES) {
+            complete(instance, phase, "Succeeded", "{}");
+        }
     }
 
     private CodeDeployAgentDeployment runner(Duration start, Duration complete) {

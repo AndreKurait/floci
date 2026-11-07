@@ -66,11 +66,19 @@ existing application storage and region visibility.
 | `ListDeploymentTargets` | Returns target IDs for a deployment |
 | `GetDeploymentTarget` | Returns one target and its lifecycle event diagnostics |
 | `BatchGetDeploymentTargets` | Returns target details including lifecycle event status |
-| `PutLifecycleEventHookExecutionStatus` | Called by lifecycle hook Lambda to report `Succeeded` or `Failed`; failure triggers auto-rollback |
+| `PutLifecycleEventHookExecutionStatus` | Called by lifecycle hook Lambda to report `Succeeded` or `Failed`; a failed hook fails the deployment |
 
 Lambda deployment workers retain the requesting account and region while
 resolving deployment configurations, invoking lifecycle hooks, and shifting
 alias traffic. Identically named functions in another account remain separate.
+
+With IAM enforcement enabled, Lambda deployments use the deployment group's
+service role. It must trust CodeDeploy and permit `lambda:GetAlias` and
+`lambda:UpdateAlias` on the qualified alias ARN, plus `lambda:InvokeFunction`
+on configured lifecycle hooks. Permission checks run before each operation,
+including later traffic shifts, and honor explicit denies and permissions
+boundaries. A denied operation fails the deployment with `IAM_ROLE_PERMISSIONS`.
+An in-progress deployment keeps the role selected when it started.
 
 Lambda canary and linear deployments honor their configured intervals in minutes. The deployment
 stays `InProgress` between traffic shifts. Stop requests are observed during the wait, leave
@@ -234,12 +242,15 @@ The ECS service must be created with `deploymentController.type: EXTERNAL`.
 
 For `computePlatform: Lambda`, `CreateDeployment` performs real traffic shifting:
 
-1. Reads the deployment group's `deploymentStyle` and `deploymentConfigName` to determine the traffic shift strategy
-2. For **canary** and **linear** strategies: updates the Lambda alias `RoutingConfig` to route a percentage to the new function version, waits the configured interval, then shifts to 100%
-3. For **all-at-once**: shifts directly to 100% of the new version
-4. Invokes `BeforeAllowTraffic` lifecycle hook Lambda (if configured) and waits for `PutLifecycleEventHookExecutionStatus` callback
-5. Invokes `AfterAllowTraffic` lifecycle hook Lambda (if configured) and waits for the callback
-6. If any lifecycle hook reports `Failed`, auto-rolls back the alias to the previous version and marks the deployment `Failed`
+1. Reads the alias and selects the deployment configuration using the deployment group's service role.
+2. Invokes `BeforeAllowTraffic` (if configured) and waits for its `PutLifecycleEventHookExecutionStatus` callback.
+3. For **canary** and **linear** strategies, updates the alias `RoutingConfig`, waits the configured intervals, and shifts to 100%. For **all-at-once**, shifts directly to the new version.
+4. Invokes `AfterAllowTraffic` (if configured) and waits for its callback.
+5. Marks the deployment `Succeeded` only after those operations succeed. A failed hook or denied operation fails the deployment.
+
+Lambda alarm monitoring and automatic rollback are not implemented. A failed
+deployment can leave its last traffic shift in place; CloudFormation's alias
+update policy performs its own rollback deployment.
 
 ## Configuration
 

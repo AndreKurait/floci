@@ -2,7 +2,8 @@ package io.github.hectorvent.floci.services.codedeploy;
 
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.services.codedeploy.CodeDeployClient;
 import software.amazon.awssdk.services.codedeploy.model.DeploymentInfo;
 import software.amazon.awssdk.services.codedeploy.model.DeploymentStatus;
@@ -24,12 +25,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 @TestProfile(CodeDeployAgentDockerFixture.AgentProfile.class)
 class CodeDeployAgentDockerIntegrationTest extends CodeDeployAgentDockerFixture {
-    @Test
-    void autoScalingGuestsInstallTheSelectedS3VersionReportHookFailureAndRecover() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"CodeDeployDefault.OneAtATime", "CodeDeployDefault.HalfAtATime"})
+    void autoScalingGuestsInstallTheSelectedS3VersionReportHookFailureAndRecover(String configName) throws Exception {
         Fleet fleet = fleet();
         String name = fleet.name();
         S3Client s3 = fleet.s3();
         CodeDeployClient deployments = fleet.deployments();
+        deployments.updateDeploymentGroup(request -> request.applicationName(name).currentDeploymentGroupName(name)
+                .deploymentConfigName(configName));
         List<String> targets = fleet.targets();
         RevisionLocation original = upload(s3, name, "revision.zip", bundle("original", false));
         upload(s3, name, "revision.zip", bundle("unselected-newer-version", false));

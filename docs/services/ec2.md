@@ -2441,3 +2441,16 @@ user-data execution. Floci exposes the original user data through metadata and
 does not also extract and execute shell scripts or inject an SSH key. The image
 must install and start cloud-init itself. Images without cloud-init and the
 `minimal` runtime retain the compatibility bootstrap.
+
+## Instance metadata discovery
+
+Metadata directory reads list implemented categories available for the requested
+metadata build and instance. Native cloud-init can traverse `meta-data/`,
+`placement/`, `public-keys/`, and `dynamic/instance-identity/` using the same
+IMDSv2 token as individual metadata values. Unavailable optional categories are
+omitted. Directory requests retain metadata disablement, token validation, and
+token expiry; they do not redirect to another metadata build.
+
+The SSH public key is captured when the instance launches and retained in its
+metadata after the EC2 key-pair record is deleted. The private key is never part
+of instance metadata.

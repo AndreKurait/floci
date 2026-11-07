@@ -92,6 +92,7 @@ quarkus:
         - aws/*.json
         - iam/service-linked-roles.tsv
         - cloudformation/*.json
+        - draft-04/schema
         - elb/*.json
         - redshift/*.sql
         - i18n/*.properties

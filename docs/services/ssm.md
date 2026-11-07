@@ -345,6 +345,9 @@ execution of `AWS-RunShellScript` in a Floci EC2 container. This mode bypasses t
 SSM agent and cannot establish that agent startup or network transport works.
 It writes a private executable script, preserves the requested working directory,
 and records output, exit status and timing. Unsupported targets use agent delivery.
+If Docker's completion notification is delayed, a finished command keeps its recorded
+exit status and output. Running or indeterminate commands still time out, and guest
+execution deadlines remain enforced.
 
 Managed-node registration is independent of EC2 and IMDS. `UpdateInstanceInformation`
 stores a managed-node record; it does not create an EC2 instance or install IMDS.

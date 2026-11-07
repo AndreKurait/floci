@@ -112,6 +112,7 @@ class Ec2MetadataTokenTest {
             "/latest/dynamic/instance-identity/document",
             "/latest/user-data",
             "/latest/meta-data/iam/info",
+            "/latest/meta-data/iam/security-credentials",
             "/latest/meta-data/iam/security-credentials/",
             "/latest/meta-data/identity-credentials/ec2/security-credentials/ec2-instance",
             "/latest/meta-data/tags/instance/"
@@ -154,12 +155,21 @@ class Ec2MetadataTokenTest {
 
     /** The token check sits ahead of the routes without claiming the methods IMDS does not serve. */
     @Test
-    void aMethodImdsDoesNotServeIsStillNotFound() throws Exception {
+    void postingToAnUnknownMetadataDirectoryIsStillNotFound() throws Exception {
         setTokenRequirement("required");
         String token = fixture.putToken("60").body();
 
-        assertEquals(404, fixture.send("POST", "/latest/meta-data/", token).statusCode());
-        assertEquals(404, fixture.send("POST", "/latest/meta-data/", null).statusCode());
+        assertEquals(404, fixture.send("POST", "/latest/meta-data/no-such-directory/", token).statusCode());
+        assertEquals(404, fixture.send("POST", "/latest/meta-data/no-such-directory/", null).statusCode());
+    }
+
+    @Test
+    void postingToAnExistingDirectoryIsMethodNotAllowed() throws Exception {
+        setTokenRequirement("required");
+        String token = fixture.putToken("60").body();
+
+        assertEquals(405, fixture.send("POST", "/latest/meta-data/", token).statusCode());
+        assertEquals(405, fixture.send("POST", "/latest/meta-data/", null).statusCode());
     }
 
     @Test
