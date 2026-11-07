@@ -148,8 +148,8 @@ class HttpIntegrationPermissionTest {
     }
 
     @Test
-    void callerPassthroughRetainsItsSeparatePath() {
-        integration.setCredentialsArn("arn:aws:iam::*:user/*");
+    void legacyStarRetainsItsSeparatePath() {
+        integration.setCredentialsArn("*");
         assertEquals(200, invoke("2.0"));
     }
 
