@@ -22,3 +22,8 @@ Query/Scan table and index defaults and explicit projection policies.
 regions. It checks implicit denial, scoped grants, explicit denial, name-to-ID
 resource resolution, configuration-token authorization without consuming a denied
 token, and `iam:PassRole` with the AppConfig service condition.
+
+`test_sns_lambda_permissions.py` runs a Python 3.12 Lambda handler with both an
+unqualified subscription and an alias. It observes actual handler logs, revokes
+and restores the topic's permission, and verifies that an SQS sibling continues
+receiving messages during denial. It requires Docker for the Lambda runtime.
