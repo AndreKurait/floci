@@ -2218,7 +2218,12 @@ public class IamQueryHandler {
         }
         return pagedList(action, pairs, pair -> pair[0], params, (xml, pair) -> {
             Map<String, List<String>> resourceContext = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-            resourceContext.putAll(context);
+            context.forEach((key, values) -> {
+                // The ARN alias accepts overrides only in the lowercase aws: namespace.
+                if (!key.equalsIgnoreCase("aws:ARN") || key.startsWith("aws:")) {
+                    resourceContext.put(key, values);
+                }
+            });
             resourceContext.putIfAbsent("aws:ResourceArn", List.of(pair[2]));
             resourceContext.putIfAbsent("aws:ARN", List.of(pair[2]));
             IamPolicyEvaluator.SimulationDecision decision =

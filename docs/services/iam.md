@@ -756,7 +756,9 @@ resource or trust policy that referred to the old name still refers to it after 
 Both simulation operations populate `aws:ResourceArn` and `aws:ARN` for each evaluated
 resource, including the default `*` when `ResourceArns` is omitted. Each action/resource pair
 gets its own condition context, including when results are paginated. Explicit `ContextEntries`
-take precedence regardless of the key's case. Other missing condition keys remain absent.
+override `aws:ResourceArn` case-insensitively. Overrides of `aws:ARN` require the lowercase
+`aws:` namespace, while the `ARN` suffix is case-insensitive. Other missing condition keys
+remain absent.
 
 `GetContextKeysForCustomPolicy` and `GetContextKeysForPrincipalPolicy` return every Condition
 operator's key, and every `${...}` policy variable found in a Resource pattern or a Condition

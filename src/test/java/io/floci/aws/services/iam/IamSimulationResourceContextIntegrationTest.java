@@ -7,6 +7,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
@@ -21,7 +22,6 @@ import software.amazon.awssdk.services.iam.model.SimulateCustomPolicyResponse;
 
 import java.net.URI;
 import java.util.List;
-import java.util.Locale;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -69,17 +69,31 @@ class IamSimulationResourceContextIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"aws:ResourceArn", "aws:ARN"})
-    void explicitContextWinsWithoutChangingTheEvaluatedResource(String key) {
+    @CsvSource({
+            "aws:ResourceArn, aws:ResourceArn, allowed",
+            "aws:ResourceArn, AWS:RESOURCEARN, allowed",
+            "aws:ResourceArn, aws:resourcearn, allowed",
+            "AWS:RESOURCEARN, AWS:RESOURCEARN, allowed",
+            "aws:ResourceArn, aws:ARN, explicitDeny",
+            "aws:ARN, aws:ARN, allowed",
+            "aws:ARN, aws:arn, allowed",
+            "aws:ARN, aws:Arn, allowed",
+            "aws:ARN, AWS:ARN, explicitDeny",
+            "AWS:ARN, aws:ARN, allowed",
+            "AWS:ARN, AWS:ARN, explicitDeny",
+            "aws:ARN, aws:ResourceArn, explicitDeny"
+    })
+    void explicitContextUsesAwsNamespaceWithoutChangingTheResource(
+            String conditionKey, String contextKey, String expected) {
         try (IamClient iam = client()) {
             List<EvaluationResult> results = iam.simulateCustomPolicy(request -> request
-                    .policyInputList(ALLOW, denyPrivate(key)).actionNames("s3:GetObject").resourceArns(PRIVATE)
-                    .contextEntries(ContextEntry.builder().contextKeyName(key.toUpperCase(Locale.ROOT))
+                    .policyInputList(ALLOW, denyPrivate(conditionKey)).actionNames("s3:GetObject").resourceArns(PRIVATE)
+                    .contextEntries(ContextEntry.builder().contextKeyName(contextKey)
                             .contextKeyValues(PUBLIC).contextKeyType(ContextKeyTypeEnum.STRING).build()))
                     .evaluationResults();
             assertEquals(1, results.size());
             assertEquals(PRIVATE, results.getFirst().evalResourceName());
-            assertEquals(PolicyEvaluationDecisionType.ALLOWED, results.getFirst().evalDecision());
+            assertEquals(expected, results.getFirst().evalDecisionAsString());
         }
     }
 
