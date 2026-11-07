@@ -956,6 +956,28 @@ public class Route53Service implements Resettable {
 
     record PublicDnsZone(String name, List<ResourceRecordSet> matchingRecords, List<ResourceRecordSet> records) {}
 
+    /** A service registration can fill a missing record only inside one undelegated public zone. */
+    public Optional<String> publicDnsRegistrationZoneId(String qname, String recordType) {
+        if (qname == null || qname.isBlank()) {
+            return Optional.empty();
+        }
+        String normalized = normalizeName(qname).toLowerCase(Locale.ROOT);
+        List<OwnedZone> zones = mostSpecificZones(normalized, false);
+        if (zones.size() != 1) {
+            return Optional.empty();
+        }
+        OwnedZone owned = zones.getFirst();
+        String apex = normalizeName(owned.zone().getName()).toLowerCase(Locale.ROOT);
+        List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(
+                owned.accountId(), owned.zone().getId());
+        boolean delegated = records.stream().anyMatch(record -> "NS".equals(record.getType())
+                && !normalizeName(record.getName()).equalsIgnoreCase(apex)
+                && DomainNames.isWithin(normalized, normalizeName(record.getName())));
+        boolean stored = findRecordsForName(normalized, List.of(records)).stream()
+                .anyMatch(record -> "CNAME".equals(record.getType()) || record.getType().equals(recordType));
+        return delegated || stored ? Optional.empty() : Optional.of(owned.zone().getId());
+    }
+
     List<PublicDnsZone> publicDnsZones(String qname) {
         String normalized = normalizeName(qname).toLowerCase();
         return mostSpecificZones(normalized, false).stream()

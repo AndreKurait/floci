@@ -42,6 +42,10 @@ removal take effect on subsequent queries. An unrelated VPC or an unknown caller
 cannot read private registrations. The most specific associated private zone wins,
 and its negative answers do not fall back to a public namespace.
 
+Public registrations participate in the backing zone's authoritative lookup.
+Explicit Route 53 records, delegations and more specific public zones retain
+authority over the same name; ambiguous public zones remain refused.
+
 A DNS namespace is answerable, not just storable. Floci's embedded DNS server
 resolves `<service>.<namespace>` to the `AWS_INSTANCE_IPV4` of the instances
 registered under that service, one A record each, so a container that uses Floci

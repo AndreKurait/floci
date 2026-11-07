@@ -242,9 +242,62 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
 
         for (List<DnsRecordSource> sources : sourceOrders()) {
             assertEquals(3, answer("api." + name, "192.0.2.10", sources).orElseThrow().responseCode());
+            assertEquals(List.of("203.0.113.7"),
+                    answer("api." + name, "192.0.2.20", sources).orElseThrow().addresses());
+            assertEquals(List.of("203.0.113.7"),
+                    answer("api." + name, null, sources).orElseThrow().addresses());
         }
-        assertEquals(List.of("203.0.113.7"),
-                answer("api." + name, "192.0.2.20", List.of(cloudMapRecords)).orElseThrow().addresses());
+    }
+
+    @Test
+    void publicChildZoneNegativeAnswerCannotFallThroughToParentCloudMapNamespace() {
+        String parent = uniqueName();
+        register(cloudMapNamespace(parent, null), "api.child", "203.0.113.7");
+        zone("child." + parent, null);
+
+        for (List<DnsRecordSource> sources : sourceOrders()) {
+            assertEquals(3, answer("api.child." + parent, null, sources).orElseThrow().responseCode());
+        }
+    }
+
+    @Test
+    void ambiguousPublicZoneCannotBeResolvedThroughCloudMapRegistration() {
+        String name = uniqueName();
+        register(cloudMapNamespace(name, null), "api", "203.0.113.7");
+        zone(name, null);
+
+        for (List<DnsRecordSource> sources : sourceOrders()) {
+            assertEquals(5, answer("api." + name, null, sources).orElseThrow().responseCode());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"A", "CNAME", "NS"})
+    void publicRegistrationPreservesExplicitRecordsAndDelegation(String type) {
+        String name = uniqueName();
+        String namespace = cloudMapNamespace(name, null);
+        register(namespace, "api.child", "203.0.113.7");
+        String backingZone = cloudMap.getNamespace(namespace).getHostedZoneId();
+        ResourceRecordSet stored = new ResourceRecordSet();
+        stored.setName(("NS".equals(type) ? "child." : "api.child.") + name);
+        stored.setType(type);
+        stored.setTtl(60L);
+        stored.setRecords(List.of(new ResourceRecord("A".equals(type) ? "192.0.2.72" : "target.example.")));
+        route53.changeResourceRecordSets(
+                backingZone, List.of(Map.of("action", "CREATE", "rrs", stored)), null);
+        try {
+            for (List<DnsRecordSource> sources : sourceOrders()) {
+                DnsAnswer resolved = answer("api.child." + name, null, sources).orElseThrow();
+                if ("A".equals(type)) {
+                    assertEquals(List.of("192.0.2.72"), resolved.addresses());
+                } else {
+                    assertEquals(5, resolved.responseCode());
+                }
+            }
+        } finally {
+            route53.changeResourceRecordSets(
+                    backingZone, List.of(Map.of("action", "DELETE", "rrs", stored)), null);
+        }
     }
 
     private List<List<DnsRecordSource>> sourceOrders() {

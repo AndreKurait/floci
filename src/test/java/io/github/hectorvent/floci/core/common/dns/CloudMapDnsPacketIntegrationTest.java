@@ -15,6 +15,8 @@ import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.datagram.DatagramSocketOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -79,10 +81,14 @@ class CloudMapDnsPacketIntegrationTest {
      * has no record for, or NOERROR/NODATA for a name holding only another type (the TXT below).
      * With that source consulted first, Cloud Map's A record must still win.
      */
-    @Test
-    void cloudMapInstanceResolvesWhenTheRoute53ZoneSourceIsConsultedFirst() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void cloudMapInstanceResolvesWhenTheRoute53ZoneSourceIsConsultedFirst(boolean publicNamespace) throws Exception {
         String namespace = uniqueNamespace();
-        String namespaceId = privateDnsNamespace(namespace);
+        String namespaceId = publicNamespace
+                ? cloudMapService.createPublicDnsNamespace(namespace, null, null, Map.of(), REGION)
+                        .getTargets().get("NAMESPACE")
+                : privateDnsNamespace(namespace);
         Service service = cloudMapService.createService("both", namespaceId, null, null,
                 "{\"DnsRecords\":[{\"Type\":\"A\",\"TTL\":15}]}", null, null, null, Map.of(), REGION);
         cloudMapService.registerInstance(service.getId(), "task-1", null,
