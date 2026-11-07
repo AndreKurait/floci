@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.iam.StsRequestShapes;
+import io.github.hectorvent.floci.services.iam.StsSessionTags;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
@@ -567,6 +568,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if ("sts:AssumeRole".equals(action) && callerArns.isPresent()) {
             MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
             IamConditionContextResolver.formParameters(ctx).forEach(parameters::putSingle);
+            try {
+                StsSessionTags.read(parameters);
+            } catch (AwsException invalidTags) {
+                ctx.abortWith(queryXmlError(invalidTags.getErrorCode(), invalidTags.getMessage(),
+                        invalidTags.getHttpStatus()));
+                return;
+            }
             if (parameters.containsKey("SerialNumber") || parameters.containsKey("TokenCode")) {
                 try {
                     List<String> violations = StsRequestShapes.violations("AssumeRole", parameters);
@@ -631,7 +639,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 region, accountId, akid)) {
             return;
         }
-        if (tagOnCreate.isPresent() && abortIfTagOnCreateDenied(ctx, caller, principal, callerArns.orElse(null),
+        // STS checks TagSession trust and caller permissions before issuing credentials.
+        if (tagOnCreate.isPresent() && !"sts:AssumeRole".equals(action)
+                && abortIfTagOnCreateDenied(ctx, caller, principal, callerArns.orElse(null),
                 action, resolvedAuthorization.operation(), tagOnCreate.get(), credentialScope, resources, region,
                 accountId, akid)) {
             return;
