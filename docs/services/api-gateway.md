@@ -1151,3 +1151,10 @@ stage, HTTP method and request path, the Lambda function region, and the exact
 qualified target passed to invocation. Missing permission returns HTTP 500 before
 invocation. Configured roles and caller passthrough retain their separate paths;
 this check does not implement role assumption.
+
+HTTP API Lambda REQUEST authorizers without `authorizerCredentialsArn` check the
+Lambda resource policy when IAM enforcement is enabled. The permission uses the API
+owner and region, the source ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns HTTP 500 before invocation;
+missing identity still returns HTTP 401 first. Configured authorizer roles retain
+their separate execution path. This check does not implement role assumption.
