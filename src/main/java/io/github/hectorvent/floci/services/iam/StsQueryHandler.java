@@ -201,8 +201,7 @@ public class StsQueryHandler {
 
         String sessionRoleArn = canonicalRoleArn(role, accountId, roleName);
         String assumedRoleArn = assumedRoleArn(sessionRoleArn, accountId, roleName, sessionName);
-        String roleId = (role != null && role.getRoleId() != null) ? role.getRoleId() : ("AROA" + randomId(16));
-        String assumedRoleId = roleId + ":" + sessionName;
+        String assumedRoleId = assumedRoleId(role, sessionName);
 
         // Register session so IAM enforcement can resolve the role's policies, RDS/ElastiCache
         // IAM token validation can find the temporary secret key, and account routing can map
@@ -429,7 +428,7 @@ public class StsQueryHandler {
 
         String sessionRoleArn = canonicalRoleArn(role, accountId, roleName);
         String assumedRoleArn = assumedRoleArn(sessionRoleArn, accountId, roleName, sessionName);
-        String assumedRoleId = "AROA" + randomId(16) + ":" + sessionName;
+        String assumedRoleId = assumedRoleId(role, sessionName);
 
         String provider = verified != null ? verified.issuer()
                 : (providerId != null && !providerId.isBlank() ? providerId : "accounts.google.com");
@@ -550,6 +549,11 @@ public class StsQueryHandler {
                 new VerifiedWebIdentity(claims.issuer(), claims.subject(), STS_AUDIENCE), role.get());
     }
 
+    private String assumedRoleId(IamRole role, String sessionName) {
+        String roleId = (role != null && role.getRoleId() != null) ? role.getRoleId() : ("AROA" + randomId(16));
+        return roleId + ":" + sessionName;
+    }
+
     /**
      * A session on a role lives in the role's partition, whatever region AssumeRole is signed
      * for. Callers pass the stored role's ARN when the role exists, not the RoleArn the request
@@ -633,7 +637,7 @@ public class StsQueryHandler {
         String sessionToken = sessionToken(params);
         String sessionRoleArn = canonicalRoleArn(role, accountId, roleName);
         String assumedRoleArn = assumedRoleArn(sessionRoleArn, accountId, roleName, sessionName);
-        String assumedRoleId = "AROA" + randomId(16) + ":" + sessionName;
+        String assumedRoleId = assumedRoleId(role, sessionName);
 
         iamService.registerSession(accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, null,
                 callerAccountId, sessionName, assumedRoleId);
