@@ -111,7 +111,7 @@ class RestRouteIamTest {
         CallerCallAuthorizer callers = new CallerCallAuthorizer(config, iam, evaluator, providers, scpInstance);
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
-                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), signature, null, null, null, mock(ServiceCallAuthorizer.class), callers);
+                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), signature, null, null, null, mock(ServiceCallAuthorizer.class), callers, null);
     }
 
     @ParameterizedTest

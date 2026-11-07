@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.Authorizer;
 import io.github.hectorvent.floci.services.apigateway.model.Integration;
@@ -91,7 +92,8 @@ class RestAuthorizerFailureTest {
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
                 new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, cache,
-                new AuthorizerPolicyEvaluator(evaluator), null, direct, mock(CallerCallAuthorizer.class));
+                new AuthorizerPolicyEvaluator(evaluator), null, direct, mock(CallerCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class));
     }
 
     @ParameterizedTest
