@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.apigateway.AuthorizerPolicyEvaluator;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
@@ -33,9 +34,11 @@ class WebSocketAuthorizerPermissionTest {
     private static final String REGION = "us-east-1";
     private static final String SOURCE = "arn:aws:execute-api:us-east-1:" + OWNER + ":api/authorizers/auth";
     private static final String TARGET = "arn:aws:lambda:us-west-2:444455556666:function:auth:live";
+    private static final String ROLE = "arn:aws:iam::" + OWNER + ":role/authorizer";
     private final ObjectMapper mapper = spy(new ObjectMapper());
     private final Authorizer authorizer = new Authorizer();
     private final LambdaService lambda = mock(LambdaService.class);
+    private final ServiceRoleCallAuthorizer roles = mock(ServiceRoleCallAuthorizer.class);
     private final EmulatorConfig.IamServiceConfig iam = mock(EmulatorConfig.IamServiceConfig.class);
     private String policy;
     private RuntimeException policyFailure;
@@ -71,7 +74,9 @@ class WebSocketAuthorizerPermissionTest {
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(mapper);
         service = new WebSocketAuthorizerService(gateway, lambda, builder, mapper,
                 new AuthorizerPolicyEvaluator(evaluator), new ServiceCallAuthorizer(config, evaluator, providers),
-                builder.regionResolver);
+                builder.regionResolver, roles);
+        when(roles.authorizeWithoutSourceContext("apigateway", ROLE, "lambda:InvokeFunction",
+                TARGET, OWNER, "aws")).thenReturn(IamPolicyEvaluator.Decision.ALLOW);
         when(lambda.invokeTarget(eq(REGION), eq(TARGET), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, null, """
                         {"principalId":"user","policyDocument":{"Version":"2012-10-17",
@@ -127,9 +132,15 @@ class WebSocketAuthorizerPermissionTest {
     }
 
     @Test
-    void configuredRoleRetainsItsSeparateExecutionPath() {
-        authorizer.setAuthorizerCredentialsArn("arn:aws:iam::" + OWNER + ":role/authorizer");
+    void configuredRoleDelegatesToRoleAuthorization() {
+        authorizer.setAuthorizerCredentialsArn(ROLE);
         assertEquals(200, invoke());
+        when(roles.authorizeWithoutSourceContext("apigateway", ROLE, "lambda:InvokeFunction",
+                TARGET, OWNER, "aws")).thenReturn(IamPolicyEvaluator.Decision.DENY);
+        assertEquals(500, invoke());
+        verify(roles, times(2)).authorizeWithoutSourceContext("apigateway", ROLE, "lambda:InvokeFunction",
+                TARGET, OWNER, "aws");
+        verify(lambda).invokeTarget(eq(REGION), eq(TARGET), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @Test
@@ -140,16 +151,19 @@ class WebSocketAuthorizerPermissionTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"service-policy", "service-invocation", "configured-invocation", "policy-parsing"})
+    @ValueSource(strings = {"service-policy", "role-policy", "service-invocation", "configured-invocation", "policy-parsing"})
     void unexpectedAuthorizerFailureRetainsOriginalCause(String failureStage) throws Exception {
         RuntimeException cause = new IllegalStateException("authorizer underlying failure");
         RuntimeException failure = new IllegalStateException("authorizer failure detail", cause);
         policy = grant();
-        if ("configured-invocation".equals(failureStage)) {
-            authorizer.setAuthorizerCredentialsArn("arn:aws:iam::" + OWNER + ":role/authorizer");
+        if ("configured-invocation".equals(failureStage) || "role-policy".equals(failureStage)) {
+            authorizer.setAuthorizerCredentialsArn(ROLE);
         }
         if ("service-policy".equals(failureStage)) {
             policyFailure = failure;
+        } else if ("role-policy".equals(failureStage)) {
+            when(roles.authorizeWithoutSourceContext("apigateway", ROLE, "lambda:InvokeFunction",
+                    TARGET, OWNER, "aws")).thenThrow(failure);
         } else if ("policy-parsing".equals(failureStage)) {
             doThrow(failure).when(mapper).readTree(any(byte[].class));
         } else {
@@ -157,7 +171,8 @@ class WebSocketAuthorizerPermissionTest {
         }
         List<LogRecord> records = LogCapture.capture(WebSocketAuthorizerService.class,
                 () -> assertEquals(500, invoke()));
-        verify(lambda, times("service-policy".equals(failureStage) ? 0 : 1)).invokeTarget(
+        boolean failedBeforeInvocation = "service-policy".equals(failureStage) || "role-policy".equals(failureStage);
+        verify(lambda, times(failedBeforeInvocation ? 0 : 1)).invokeTarget(
                 eq(REGION), eq(TARGET), any(byte[].class), eq(InvocationType.RequestResponse));
         String template = "policy-parsing".equals(failureStage)
                 ? "Failed to parse authorizer policy for API {0}: {1}"
