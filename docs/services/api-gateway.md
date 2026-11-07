@@ -30,6 +30,11 @@ Trust and target-policy evaluation use the same server-clock instant for
 `aws:CurrentTime` and `aws:EpochTime`. Time-conditioned grants and denies are
 reevaluated on each invocation. This request time is not `aws:TokenIssueTime`.
 
+After trust succeeds, each evaluation resolves a temporary local role credential
+through IAM. Its session identity supplies `aws:userid` and its recorded issuance
+time supplies `aws:TokenIssueTime`. The authorization credential is revoked after
+evaluation; the Lambda workload retains its own execution-role credentials.
+
 Role checks do not synthesize service-specific trust `SourceArn` or `SourceAccount`
 conditions. Caller-passthrough credentials, HTTP/WebSocket integrations and Lambda
 authorizers remain separate paths. IAM enforcement disabled retains the existing
@@ -1239,13 +1244,13 @@ separate execution path; this check does not implement role assumption.
 
 WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
 
-WebSocket REQUEST Lambda authorizers with configured credentials check the API owner's IAM role trust and Lambda invocation permissions when IAM enforcement is enabled. The role must trust API Gateway; shared identity/resource policy, permissions boundary and SCP evaluation applies to the same qualified function invoked. Foreign-account targets also require a resource grant. Missing credentials retain Lambda resource-policy authorization. Full service trust condition context and actual issued execution-role STS sessions are not modeled by this check.
+WebSocket REQUEST Lambda authorizers with configured credentials check the API owner's IAM role trust and Lambda invocation permissions when IAM enforcement is enabled. The role must trust API Gateway; shared identity/resource policy, permissions boundary and SCP evaluation applies to the same qualified function invoked. Foreign-account targets also require a resource grant. Missing credentials retain Lambda resource-policy authorization. Full service trust condition context remains separate work.
 
-WebSocket Lambda integrations with a configured execution role check API Gateway service trust and the role's identity, resource, permissions-boundary and SCP policies when IAM enforcement is enabled. The API owner account and partition constrain the role; qualified targets are resolved once before authorization and invocation. The caller-credentials sentinel and legacy bare-star compatibility path remain separate from role enforcement. Issued execution-role STS sessions and full condition-context forwarding are not modeled by this check.
+WebSocket Lambda integrations with a configured execution role check API Gateway service trust and the role's identity, resource, permissions-boundary and SCP policies when IAM enforcement is enabled. The API owner account and partition constrain the role; qualified targets are resolved once before authorization and invocation. The caller-credentials sentinel and legacy bare-star compatibility path remain separate from role enforcement. Full condition-context forwarding remains separate work.
 
 WebSocket Lambda integrations using the documented `arn:<partition>:iam::*:user/*` caller credential require a verified SigV4 handshake identity when IAM enforcement is enabled. The private connection identity is retained for message and disconnect invocations, but permissions are evaluated again for every invocation against current caller/session, identity, resource, boundary and SCP policies. Signature headers and caller metadata are not read from message payloads. The legacy bare `*` credential remains a local compatibility bypass. This forwarding check does not enforce `execute-api:Invoke` route permissions or issue execution-role STS sessions.
 
-WebSocket `$connect` routes configured with `AWS_IAM` require a verified SigV4 handshake and `execute-api:Invoke` on the API owner, region, stage and `$connect` route when IAM enforcement is enabled. Authorization runs before the upgrade, including when no integration is configured. It uses current caller/session policies, permissions boundaries and SCPs. New connections observe revocation; route authorization is performed at connection time. This is separate from the Lambda caller-permission check on each message or disconnect invocation. IAM-disabled local connections and non-IAM routes retain their existing behavior. Full forwarded condition context and issued execution-role STS sessions remain separate work.
+WebSocket `$connect` routes configured with `AWS_IAM` require a verified SigV4 handshake and `execute-api:Invoke` on the API owner, region, stage and `$connect` route when IAM enforcement is enabled. Authorization runs before the upgrade, including when no integration is configured. It uses current caller/session policies, permissions boundaries and SCPs. New connections observe revocation; route authorization is performed at connection time. This is separate from the Lambda caller-permission check on each message or disconnect invocation. IAM-disabled local connections and non-IAM routes retain their existing behavior. Full forwarded condition context remains separate work.
 
 When IAM enforcement is enabled, REST methods using `NONE` require an explicit anonymous grant from an attached resource policy. Cognito user-pool methods authenticate the token first, then require that resource-policy grant. Missing policies retain existing access; an explicit deny or an attached policy without a matching allow rejects the request before backend dispatch. Source-IP conditions use the connection address. Anonymous policy context omits `aws:PrincipalIsAWSService`, while signed AWS credentials retain their existing context. These checks use the current stored policy. Complete inbound condition context and deployment-snapshot activation remain separate work.
 
@@ -1272,8 +1277,7 @@ Caller policy evaluation supplies `aws:CurrentTime` and `aws:EpochTime` from the
 server clock. The same instant is used for caller session expiry and time-based
 identity, session, boundary, SCP and resource-policy conditions. REST anonymous
 and custom-authorizer resource-policy checks also receive these time keys.
-These values do not come from client-supplied date headers. This does not add
-other global condition keys or issue STS sessions for service execution roles.
+These values do not come from client-supplied date headers.
 
 ### WebSocket connection management permissions
 

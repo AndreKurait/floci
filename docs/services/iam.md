@@ -3060,7 +3060,7 @@ exposes this timestamp as `aws:TokenIssueTime` for policy conditions, preserving
 storage serialization and later requests. Long-term access keys do not include this key.
 Older persisted session records without an issuance timestamp leave it absent; Floci does
 not derive a replacement timestamp from expiration or restart time. This does not add
-MFA/session-tag context or issue new service execution-role sessions.
+MFA or session-tag context.
 
 Attached IAM user and role tags are available as `aws:PrincipalTag/<key>` in resolved caller
 policy contexts, including existing local STS user and role sessions. Federated sessions
@@ -3068,3 +3068,9 @@ also carry their issuing user's attached tags while retaining the federated prin
 identity. Each resolution reads current identity tags and retains an immutable snapshot
 for that evaluation. Policy simulation still requires explicitly supplied tag context.
 Session-tag issuance, transitive tags and session-tag overrides remain separate work.
+
+### Service execution-role authorization sessions
+
+The shared execution-role authorizer checks service trust before registering a temporary local role credential. It resolves that credential through IAM for policy evaluation, including the full role ARN, session ARN, role ID and `aws:userid`. Conditions on session identity therefore apply to both Allow and Deny statements.
+
+The credential is revoked when authorization evaluation ends, including denied and failed evaluations. It has a 15-minute expiration as a fallback and is not injected into the Lambda workload. Its locally selected session name is not a claim about AWS service-selected session names or credential caching. Session-tag overrides and the complete service trust condition context remain separate limitations.

@@ -94,6 +94,12 @@ class EventBridgeLambdaPermissionTest {
         role.setAssumeRolePolicyDocument(TRUST);
         when(roleService.findRole(SOURCE, "execution")).thenReturn(Optional.of(role));
         when(roleService.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(ALLOW)));
+        when(roleService.resolveCallerArns(anyString())).thenAnswer(invocation -> Optional.of(new IamService.CallerArns(
+                "arn:aws:sts::" + SOURCE + ":assumed-role/execution/test-session", ROLE,
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROAEXAMPLE:test-session", null,
+                role.getPermissionsBoundaryArn() != null)));
+        when(roleService.resolveCallerContext(anyString(), any(Instant.class)))
+                .thenAnswer(invocation -> roleService.resolvePrincipalContext(ROLE));
         scps = mock(ScpProvider.class);
         @SuppressWarnings("unchecked")
         Instance<ScpProvider> scpInstance = mock(Instance.class);
