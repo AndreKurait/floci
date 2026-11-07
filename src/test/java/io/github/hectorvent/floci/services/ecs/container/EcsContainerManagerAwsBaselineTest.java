@@ -196,6 +196,7 @@ class EcsContainerManagerAwsBaselineTest {
         // The id in the URI is the one the container is then found by.
         String id = metadataUri.substring(metadataUri.lastIndexOf('/') + 1);
         assertEquals(id, task.getContainers().getFirst().getMetadataId());
+        verify(builder).withHostDockerInternalOnLinux();
     }
 
     private static ContainerDefinition containerDef(String name, String image, List<KeyValuePair> env) {

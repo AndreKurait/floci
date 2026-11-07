@@ -419,12 +419,11 @@ public class EcsContainerManager {
                 ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(imagesByContainer.get(def))
                         .withName(containerName)
                         .withEnv(env)
-                        .withDockerNetwork(config.services().ecs().dockerNetwork())
-                        // Resolve Floci's endpoint from inside the task container the same way Lambda
-                        // containers do: host.docker.internal on Linux, plus Floci's embedded DNS so the
-                        // reachable AWS_ENDPOINT_URL hostname resolves to Floci instead of the container's
-                        // own loopback.
-                        .withHostDockerInternalOnLinux();
+                        .withDockerNetwork(config.services().ecs().dockerNetwork());
+                String endpoint = flociEndpointFor(dockerFlags);
+                if (endpoint != null && "host.docker.internal".equalsIgnoreCase(URI.create(endpoint).getHost())) {
+                    specBuilder.withHostDockerInternalOnLinux();
+                }
                 // The operator's flags first: a --dns there replaces Floci's embedded DNS, which
                 // withEmbeddedDns() only adds when no server is set yet.
                 dockerFlags.applyTo(specBuilder, "ECS");

@@ -382,6 +382,10 @@ link-local address `169.254.170.2`, which a local container cannot be given, so 
 same paths on its own port; applications and the AWS SDKs read the environment variable rather than
 the address, so they work unchanged.
 
+Tasks use Floci's reachable network endpoint without adding a Docker host alias. When that endpoint
+falls back to `host.docker.internal`, Floci adds the Linux `host-gateway` mapping it needs. Explicit
+`--add-host` entries in `floci.services.ecs.docker-flags` are preserved.
+
 | Path | Returns |
 |---|---|
 | `/v4/{id}` | The container's metadata |

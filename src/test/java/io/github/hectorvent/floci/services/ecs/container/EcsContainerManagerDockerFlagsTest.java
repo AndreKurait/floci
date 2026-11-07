@@ -22,6 +22,8 @@ import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -178,6 +180,34 @@ class EcsContainerManagerDockerFlagsTest {
         List<String> env = taskEnv();
         assertTrue(env.contains("AWS_ENDPOINT_URL=http://floci:4566"), env.toString());
         assertTrue(env.contains("FLOCI_ENDPOINT=http://floci:4566"), env.toString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"http://floci:4566", "http://10.9.0.2:4566", "http://[fd00::2]:4566"})
+    void reachableNetworkEndpointDoesNotAddADockerHostAlias(String endpoint) {
+        when(awsEnv.flociEndpoint()).thenReturn(endpoint);
+
+        EcsTask task = task();
+        manager.startTask(task, taskDefinition(container("app")), null, "eu-west-1");
+
+        verify(builder, never()).withHostDockerInternalOnLinux();
+        verify(builder).withEmbeddedDns();
+        assertTrue(taskEnv().contains("ECS_CONTAINER_METADATA_URI_V4=" + endpoint + "/v4/"
+                + task.getContainers().getFirst().getMetadataId()));
+    }
+
+    @Test
+    void customDnsRetainsTheDockerHostFallbackWhenNoContainerAddressExists() {
+        when(config.services().ecs().dockerFlags()).thenReturn(Optional.of("--dns 10.9.0.53"));
+        when(awsEnv.flociEndpoint(false)).thenReturn("http://host.docker.internal:4566");
+
+        EcsTask task = task();
+        manager.startTask(task, taskDefinition(container("app")), null, "eu-west-1");
+
+        verify(builder).withHostDockerInternalOnLinux();
+        verify(builder).withDnsServer("10.9.0.53");
+        assertTrue(taskEnv().contains("ECS_CONTAINER_METADATA_URI_V4=http://host.docker.internal:4566/v4/"
+                + task.getContainers().getFirst().getMetadataId()));
     }
 
     @Test
