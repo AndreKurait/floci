@@ -16,6 +16,11 @@ import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.Config;
 import org.jboss.logging.Logger;
 
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -196,6 +201,22 @@ public class TlsProxyServer {
      */
     public boolean reservesPort(int port) {
         return config.tls().enabled() && listenPorts().contains(port) && !failedPorts.contains(port);
+    }
+
+    /** The bound public listener for local HTTP clients; private backends require PROXY protocol. */
+    public URI localBaseUri() {
+        if (proxyServers.isEmpty()) {
+            return null;
+        }
+        try {
+            InetAddress address = InetAddress.getByName(host);
+            String localHost = address.isAnyLocalAddress()
+                    ? (address instanceof Inet6Address ? "::1" : "127.0.0.1")
+                    : address.getHostAddress();
+            return new URI("http", null, localHost, proxyServers.getFirst().actualPort(), "/", null, null);
+        } catch (UnknownHostException | URISyntaxException error) {
+            throw new IllegalStateException("Cannot address the bound TLS proxy listener", error);
+        }
     }
 
     /**

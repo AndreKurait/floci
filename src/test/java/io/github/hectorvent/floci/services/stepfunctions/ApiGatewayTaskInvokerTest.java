@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
@@ -71,6 +72,7 @@ class ApiGatewayTaskInvokerTest {
     private ApiGatewayTaskInvoker invoker;
     // Quarkus and the JDK test server share the HttpServer simple name.
     private final io.quarkus.vertx.http.HttpServer listener = mock(io.quarkus.vertx.http.HttpServer.class);
+    private final TlsProxyServer tlsProxy = mock(TlsProxyServer.class);
     private HttpServer server;
     private StateMachine machine;
     private ObjectNode request;
@@ -88,7 +90,7 @@ class ApiGatewayTaskInvokerTest {
         when(resourcePolicies.isUnsatisfied()).thenReturn(true);
         LambdaTaskAuthorizer authorizer = new LambdaTaskAuthorizer(iam, policies, trust, resourcePolicies, scps);
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
-        invoker = new ApiGatewayTaskInvoker(api, iam, trust, authorizer, config, mapper, listener);
+        invoker = new ApiGatewayTaskInvoker(api, iam, trust, authorizer, config, mapper, listener, tlsProxy);
         machine = new StateMachine();
         machine.setStateMachineArn("arn:aws:states:eu-west-1:" + ACCOUNT + ":stateMachine:Owned");
         machine.setRoleArn(ROLE);
@@ -159,6 +161,24 @@ class ApiGatewayTaskInvokerTest {
         assertEquals(200, result.path("StatusCode").asInt());
         assertEquals("OK", result.path("StatusText").asText());
         assertEquals("owned", result.path("ResponseBody").path("workflow_id").asText());
+        assertEquals(request.path("RequestBody"), received.get());
+        assertEquals(null, serverFailure.get());
+        verify(iam).unregisterSession(ACCOUNT, credentials.get()[0]);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"127.0.0.1", "::1"})
+    void tlsUsesThePublicListenerAndRevokesSession(String host) throws Exception {
+        server.stop(0);
+        startServer(host);
+        URI publicListener = listener.getLocalBaseUri();
+        when(config.tls().enabled()).thenReturn(true);
+        when(tlsProxy.localBaseUri()).thenReturn(publicListener);
+        when(listener.getLocalBaseUri()).thenReturn(null);
+
+        JsonNode result = invoker.invoke(request, machine, null);
+
+        assertEquals(200, result.path("StatusCode").asInt());
         assertEquals(request.path("RequestBody"), received.get());
         assertEquals(null, serverFailure.get());
         verify(iam).unregisterSession(ACCOUNT, credentials.get()[0]);
