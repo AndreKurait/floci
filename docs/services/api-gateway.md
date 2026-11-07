@@ -1145,3 +1145,9 @@ qualified Lambda target. Missing permission returns an authorizer configuration
 error before invoking Lambda. Cached authorizer results do not invoke Lambda; a
 cache miss or stage cache flush makes the next invocation check permission again.
 
+HTTP API AWS/AWS_PROXY Lambda integrations without `credentialsArn` check Lambda
+resource policies when IAM enforcement is enabled. The check uses the API owner,
+stage, HTTP method and request path, the Lambda function region, and the exact
+qualified target passed to invocation. Missing permission returns HTTP 500 before
+invocation. Configured roles and caller passthrough retain their separate paths;
+this check does not implement role assumption.
