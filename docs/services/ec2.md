@@ -435,6 +435,8 @@ permission sets or ordinary owner tags. The source remains independent.
 This is metadata and local catalog behavior, not EBS block-data copying.
 
 `DescribeImages` includes explicitly shared images in the selected region, preserving the source owner.
+Registered AMIs remain scoped to their region. A known AMI that is unavailable to the
+caller in the requested region cannot use the default image fallback for describe or launch.
 Owner and tag filters apply to that view; recipients see their own private tags and the owner's
 `ec2:SharedTag/` tags. Recipients can change their private tags but cannot change the owner's shared tags.
 Reads neither create recipient-owned aliases nor change source tags or mappings. Revocation removes visibility.
