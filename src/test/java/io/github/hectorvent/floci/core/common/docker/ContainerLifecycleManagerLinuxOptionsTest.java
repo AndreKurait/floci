@@ -25,9 +25,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -84,6 +86,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
                 .withMemorySwappiness(10)
                 .withPidMode("host")
                 .withApparmorProfile("floci-native")
+                .withStopSignal("SIGRTMIN+3")
                 .withNetworkSysctl("net.ipv4.ip_forward", "1")
                 .build();
 
@@ -102,6 +105,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertEquals(Map.of("net.ipv4.ip_forward", "1"), hostConfig.getSysctls());
         assertEquals("host", hostConfig.getPidMode());
         assertEquals(List.of("apparmor=floci-native"), hostConfig.getSecurityOpts());
+        verify(createCmd).withStopSignal("SIGRTMIN+3");
     }
 
     @Test
@@ -122,6 +126,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertNull(hostConfig.getSysctls());
         assertNull(hostConfig.getPidMode());
         assertNull(hostConfig.getSecurityOpts());
+        verify(createCmd, never()).withStopSignal(anyString());
     }
 
     @Test

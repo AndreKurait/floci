@@ -170,6 +170,7 @@ public class ContainerBuilder {
         private String cgroupnsMode;
         private String pidMode;
         private String apparmorProfile;
+        private String stopSignal;
         private String user;
         private final List<String> groupAdd = new ArrayList<>();
         private final List<String> dnsServers = new ArrayList<>();
@@ -308,6 +309,12 @@ public class ContainerBuilder {
          */
         public Builder withInit() {
             this.init = true;
+            return this;
+        }
+
+        /** Selects the signal Docker sends before enforcing its stop deadline. */
+        public Builder withStopSignal(String stopSignal) {
+            this.stopSignal = stopSignal;
             return this;
         }
 
@@ -821,7 +828,7 @@ public class ContainerBuilder {
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
                             shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness,
-                            networkSysctls, pidMode, apparmorProfile),
+                            networkSysctls, pidMode, apparmorProfile, stopSignal),
                     javaTrustStore
             );
         }

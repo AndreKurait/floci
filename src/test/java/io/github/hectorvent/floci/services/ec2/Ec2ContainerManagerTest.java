@@ -1992,6 +1992,7 @@ class Ec2ContainerManagerTest {
             assertEquals(userData, instance.getUserData(), "metadata retains the original user data");
             boolean guestOwnsBootstrap = cloudInit && !"minimal".equals(runtime);
             verify(harness.builder, never()).withApparmorProfile(anyString());
+            verify(harness.builder, never()).withStopSignal(anyString());
             if (guestOwnsBootstrap) {
                 verify(harness.dockerClient, never()).execCreateCmd(TEST_CONTAINER_ID);
                 verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
@@ -2028,6 +2029,7 @@ class Ec2ContainerManagerTest {
             assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
             assertEquals("running", instance.getState().getName());
             verify(harness.builder).withApparmorProfile(profile);
+            verify(harness.builder).withStopSignal("SIGRTMIN+3");
             assertTrue(helperCommands.stream().anyMatch(command -> command.contains("prepare-init")));
             assertTrue(harness.executedCommands.stream().anyMatch(command ->
                     Arrays.equals(command, new String[]{"test", "-f", Ec2SystemdV1Runtime.READY})));

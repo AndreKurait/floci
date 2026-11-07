@@ -124,6 +124,21 @@ def boot_case(image, guest_image, profile, output):
 set -eu
 mkdir -p /var/lib/floci-native-check
 printf 'ran\\n' >> /var/lib/floci-native-check/runs
+: > /var/lib/floci-native-check/shutdowns
+cat > /etc/systemd/system/floci-native-shutdown-check.service <<'NATIVE_SHUTDOWN_SERVICE'
+[Unit]
+Description=Native shutdown qualification
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/bin/sh -c 'echo stopped >> /var/lib/floci-native-check/shutdowns'
+[Install]
+WantedBy=multi-user.target
+NATIVE_SHUTDOWN_SERVICE
+systemctl daemon-reload
+systemctl enable floci-native-shutdown-check.service
+systemctl start floci-native-shutdown-check.service
 token=$(curl --fail --silent --show-error --noproxy '*' --max-time 10 -X PUT \
 -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
 curl --fail --silent --show-error --noproxy '*' --max-time 10 \
@@ -153,7 +168,7 @@ curl --fail --silent --show-error --noproxy '*' --max-time 10 \
                     test -f /var/lib/cloud/instance/boot-finished
                     test "$(cat /var/lib/floci-native-check/instance-id)" = "$1"
                     test "$(wc -l < /var/lib/floci-native-check/runs)" = 1
-                    systemctl is-active --quiet sshd crond
+                    systemctl is-active --quiet sshd crond floci-native-shutdown-check.service
                     """, "native-ready", instance, check=False)
                 return guest if ready.returncode == 0 else False
 
@@ -186,6 +201,27 @@ curl --fail --silent --show-error --noproxy '*' --max-time 10 \
             assert rebooted["Id"] == guest["Id"]
             assert_profile(rebooted["Id"], profile or "unconfined")
             record["reboot_seconds"] = time.monotonic() - began
+            shutdowns_before = int(docker("exec", guest["Id"], "sh", "-ec",
+                                         "wc -l < /var/lib/floci-native-check/shutdowns").stdout)
+            began = time.monotonic()
+            ec2.stop_instances(InstanceIds=[instance])
+            wait_for("Native EC2 stop", lambda: ec2.describe_instances(
+                InstanceIds=[instance])["Reservations"][0]["Instances"][0]["State"]["Name"] == "stopped")
+            stopped = inspect(guest["Id"])
+            record["stop_state"] = stopped["State"]
+            assert not stopped["State"]["Running"] and not stopped["State"]["OOMKilled"], stopped["State"]
+            assert stopped["State"]["ExitCode"] in (0, 130), stopped["State"]
+            assert stopped["Config"]["StopSignal"] == "SIGRTMIN+3"
+            ec2.start_instances(InstanceIds=[instance])
+            restarted = wait_for("Native boot after EC2 stop/start", booted)
+            assert restarted["Id"] == guest["Id"]
+            assert restarted["State"]["StartedAt"] != rebooted["State"]["StartedAt"]
+            assert_profile(restarted["Id"], profile or "unconfined")
+            shutdowns_after = int(docker("exec", guest["Id"], "sh", "-ec",
+                                        "wc -l < /var/lib/floci-native-check/shutdowns").stdout)
+            assert shutdowns_after == shutdowns_before + 1, (shutdowns_before, shutdowns_after)
+            record["stop_start_seconds"] = time.monotonic() - began
+            record["native_service_shutdown_passed"] = True
         record["sdk_cleanup_passed"] = True
         record["status"] = "passed"
     except BaseException:

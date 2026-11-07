@@ -302,6 +302,9 @@ public class ContainerLifecycleManager {
         if (spec.entrypoint() != null && !spec.entrypoint().isEmpty()) {
             createCmd.withEntrypoint(spec.entrypoint());
         }
+        if (spec.linuxOptions().stopSignal() != null) {
+            createCmd.withStopSignal(spec.linuxOptions().stopSignal());
+        }
         if (spec.workingDir() != null && !spec.workingDir().isBlank()) {
             createCmd.withWorkingDir(spec.workingDir());
         }

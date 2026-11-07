@@ -85,7 +85,10 @@ Native executables register the manifest and its inputs as classpath resources,
 so automatic helper builds receive the same context as JVM builds.
 
 StartInstances and RebootInstances release the same boot gate for the new
-container PID. Termination removes only this instance's empty service groups
+container PID. The `systemd-v1` runtime selects `SIGRTMIN+3` as Docker's stop
+signal so native init shuts down its services. The normal stop deadline still
+bounds an unresponsive guest. Other runtimes, including legacy `systemd`, retain
+the image's stop signal. Termination removes only this instance's empty service groups
 before retiring its helper. Kernel cgroup deletion is asynchronous: bounded
 read-only remounts allow an empty named root to retire after its children are
 released. Retirement stops when another guest still has groups. Other cgroup

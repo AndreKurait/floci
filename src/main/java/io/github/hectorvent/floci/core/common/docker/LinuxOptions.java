@@ -23,6 +23,7 @@ import java.util.Map;
  * @param networkSysctls settings for the container's own network namespace
  * @param pidMode Docker PID namespace mode (null = private namespace)
  * @param apparmorProfile Docker AppArmor profile (null = daemon default)
+ * @param stopSignal signal Docker sends before its stop deadline (null = image default)
  */
 public record LinuxOptions(
         List<String> capAdd,
@@ -34,7 +35,8 @@ public record LinuxOptions(
         Long memorySwappiness,
         Map<String, String> networkSysctls,
         String pidMode,
-        String apparmorProfile
+        String apparmorProfile,
+        String stopSignal
 ) {
     public LinuxOptions {
         if (apparmorProfile != null && apparmorProfile.isBlank()) {
@@ -46,6 +48,14 @@ public record LinuxOptions(
                 throw new IllegalArgumentException("Expected a network-namespace sysctl and value");
             }
         });
+    }
+
+    public LinuxOptions(List<String> capAdd, List<String> capDrop, List<Device> devices,
+                        Long shmSizeBytes, Map<String, String> tmpfs, Long memorySwapBytes,
+                        Long memorySwappiness, Map<String, String> networkSysctls, String pidMode,
+                        String apparmorProfile) {
+        this(capAdd, capDrop, devices, shmSizeBytes, tmpfs, memorySwapBytes, memorySwappiness,
+                networkSysctls, pidMode, apparmorProfile, null);
     }
 
     public LinuxOptions(List<String> capAdd, List<String> capDrop, List<Device> devices,

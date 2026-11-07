@@ -895,7 +895,9 @@ public class Ec2ContainerManager {
             specBuilder.withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true"));
         }
         if (image.systemdV1()) {
-            specBuilder.withCgroupnsMode("private").withCapAdd("SYS_ADMIN").withCapAdd("SYS_BOOT")
+            // SIGTERM reexecutes native init; its container shutdown signal halts services.
+            specBuilder.withStopSignal("SIGRTMIN+3")
+                    .withCgroupnsMode("private").withCapAdd("SYS_ADMIN").withCapAdd("SYS_BOOT")
                     .withApparmorProfile(config.services().ec2().nativeInitApparmorProfile().orElse("unconfined"))
                     .withEnv("container", "docker")
                     .withEntrypoint(List.of("/bin/sh", "-c", Ec2SystemdV1Runtime.GATE))
