@@ -3046,7 +3046,9 @@ role through `iam:PassRole` before creating the API. Absent targets, HTTP URL
 targets and caller credentials pass no role.
 
 REST API OpenAPI and Swagger imports require `iam:PassRole` for every assigned
-integration role before creating, merging or overwriting resources. The service
-parser resolves AWS variables and ANY-method operations. Unused extensions,
-ignored integration types and caller credentials pass no role. Authorizer and
-HTTP API import checks remain separate follow-ups.
+integration and Lambda authorizer role before creating, merging or overwriting
+resources. The service parser resolves AWS variables and ANY-method operations.
+Unused extensions, ignored integration types, Cognito authorizers and caller
+credentials pass no role. Omitted authorizer credentials on a merge retain the
+existing assignment; null credentials clear it without passing a new role.
+HTTP API import checks remain separate work.
