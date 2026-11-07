@@ -70,6 +70,14 @@ class AwsQueryServiceResolverTest {
             "DeleteTags, 2011-01-01, autoscaling",
             "DeleteTags, none, ec2",
             "DescribeTags, 2012-06-01, elasticloadbalancing",
+            "CreateSnapshot, none, ec2",
+            "DeleteSnapshot, none, ec2",
+            "CreateSnapshot, 2016-11-15, ec2",
+            "DeleteSnapshot, 2016-11-15, ec2",
+            "CreateSnapshot, 2015-02-02, elasticache",
+            "DeleteSnapshot, 2015-02-02, elasticache",
+            "CreateSnapshot, 2012-12-01, ec2",
+            "DeleteSnapshot, 2012-12-01, ec2",
             "GetTemplate, 2010-12-01, email",
             "GetTemplate, none, cloudformation",
             "DescribeEnvironments, 2010-12-01, elasticbeanstalk",
@@ -94,6 +102,15 @@ class AwsQueryServiceResolverTest {
                 descriptor("iam", ServiceProtocol.QUERY)));
 
         assertEquals("iam", resolver.resolve(authorization("iam"), "CreateUser", "2015-02-02"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"CreateSnapshot", "DeleteSnapshot"})
+    void snapshotSignedScopeOutranksTheUnversionedFallback(String action) {
+        when(catalog.byCredentialScope("elasticache")).thenReturn(Optional.of(
+                descriptor("elasticache", ServiceProtocol.QUERY)));
+
+        assertEquals("elasticache", resolver.resolve(authorization("elasticache"), action, null));
     }
 
     @Test
