@@ -3052,3 +3052,12 @@ Unused extensions, ignored integration types, Cognito authorizers and caller
 credentials pass no role. Omitted authorizer credentials on a merge retain the
 existing assignment; null credentials clear it without passing a new role.
 HTTP API import checks remain separate work.
+
+### Temporary credential issue time
+
+New local temporary credentials record their issuance time. Shared IAM principal context
+exposes this timestamp as `aws:TokenIssueTime` for policy conditions, preserving it across
+storage serialization and later requests. Long-term access keys do not include this key.
+Older persisted session records without an issuance timestamp leave it absent; Floci does
+not derive a replacement timestamp from expiration or restart time. This does not add
+MFA/session-tag context or issue new service execution-role sessions.
