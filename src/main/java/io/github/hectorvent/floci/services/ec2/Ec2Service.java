@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog.CatalogInstanceType;
+import io.github.hectorvent.floci.services.ec2.Ec2SystemdV1Runtime.GuestIdentityChangedException;
 import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.CapacityReservation;
@@ -1272,6 +1273,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         Instance instance = entry.value();
         try {
             restoreInstanceFirewall(instance);
+        } catch (GuestIdentityChangedException failure) {
+            LOG.warnv(failure, "Leaving unverified EC2 guest {0} untouched during recovery", instance.getInstanceId());
+            return false;
         } catch (Exception e) {
             LOG.warnv("Could not restore EC2 firewall for {0}: {1}", instance.getInstanceId(), e.getMessage());
             containerManager.stopForShutdown(instance);
@@ -4496,6 +4500,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // is in-memory record construction, and the slow part, the container launch, still runs
         // outside.
         ResolvedAmiImage dockerImage = null;
+        String launchableImageId = null;
         synchronized (imageRegistryLock) {
             requireNotDeregistered(region, imageId);
             // Planned under the lock DeregisterImage deletes snapshots under, so a snapshot a
@@ -4511,9 +4516,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 // ancestor supplies the guest runtime (systemd vs minimal, cloud-init), which a
                 // committed layer does not change; the captured file system, when there is one,
                 // then replaces the image to actually run.
-                String launchableImageId = image != null && !callerAccountId().equals(image.getOwnerId())
-                        && !foreignImageEntries(region, imageId).isEmpty()
-                        ? sharedImageAncestor(region, image) : resolveLaunchableImageId(region, imageId);
+                launchableImageId = launchableImageForCaller(region, imageId, image);
                 dockerImage = amiImageResolver.resolveImage(launchableImageId);
                 String captured = capturedImageFor(region, imageId);
                 if (captured != null) {
@@ -4589,6 +4592,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             inst.setInstanceId(instanceId);
                             inst.setOwnerId(callerAccountId());
                             inst.setImageId(imageId);
+                            inst.setLaunchableImageId(launchableImageId);
                             inst.setState(InstanceState.pending());
                             inst.setInstanceType(effectiveInstanceType);
                             inst.setSpot(spot);
@@ -6787,6 +6791,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         Instance copy = new Instance();
         copy.setInstanceId(source.getInstanceId());
         copy.setImageId(source.getImageId());
+        copy.setLaunchableImageId(source.getLaunchableImageId());
         copy.setState(source.getState());
         copy.setStateTransitionReason(source.getStateTransitionReason());
         copy.setInstanceType(source.getInstanceType());
@@ -9824,15 +9829,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // The new AMI inherits what it was captured from rather than the registerImage defaults,
         // so DescribeImages does not report a generic x86_64 / /dev/sda1 image with no devices.
         Image sourceImage = findImageForCapture(region, source.getImageId());
+        String architecture = source.getArchitecture();
+        if (architecture == null && sourceImage != null) {
+            architecture = sourceImage.getArchitecture();
+        }
+        String rootDeviceName = source.getRootDeviceName();
+        if (rootDeviceName == null && sourceImage != null) {
+            rootDeviceName = sourceImage.getRootDeviceName();
+        }
+        String launchableImageId = source.getLaunchableImageId() != null ? source.getLaunchableImageId()
+                : launchableImageForCaller(region, source.getImageId(), sourceImage);
         Image image = registerImage(region, name, description,
-                sourceImage != null ? sourceImage.getArchitecture() : null,
-                sourceImage != null ? sourceImage.getRootDeviceName() : null,
+                architecture, rootDeviceName,
                 captureBlockDeviceMappings(region, source, sourceImage), false);
 
         // Carry the launchable ancestor so RunInstances on this AMI starts the same guest instead
         // of falling through to the catalog default. This is also the fallback when the file
         // system cannot be captured below.
-        image.setSourceImageId(resolveLaunchableImageId(region, source.getImageId()));
+        image.setSourceImageId(launchableImageId);
         // The resolved image rather than the instance's id: an instance launched by a catalog alias
         // records the alias.
         image.setCreationSourceImageId(sourceImage != null ? sourceImage.getImageId() : source.getImageId());
@@ -9902,16 +9916,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // may have given a different type from the source AMI's.
         Volume rootVolume = source.getRootVolumeId() == null ? null
                 : volumes.get(key(region, source.getRootVolumeId())).orElse(null);
-        if (rootVolume != null && sourceImage != null) {
-            mappings.stream()
-                    .filter(m -> m.getEbs() != null
-                            && Objects.equals(m.getDeviceName(), sourceImage.getRootDeviceName()))
-                    .forEach(m -> setVolumePerformance(m.getEbs(), rootVolume));
+        if (rootVolume != null) {
+            for (VolumeAttachment attachment : rootVolume.getAttachments()) {
+                if (source.getInstanceId().equals(attachment.getInstanceId())) {
+                    mappings.removeIf(mapping -> Objects.equals(mapping.getDeviceName(), attachment.getDevice()));
+                    mappings.addFirst(attachedMapping(rootVolume, attachment));
+                    break;
+                }
+            }
         }
-        Set<String> devices = mappings.stream()
-                .map(BlockDeviceMapping::getDeviceName)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toSet());
+        Set<String> devices = new HashSet<>();
         for (Volume volume : volumes.scan(k -> true)) {
             if (!region.equals(volume.getRegion())
                     || volume.getVolumeId().equals(source.getRootVolumeId())) {
@@ -9922,6 +9936,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         || !devices.add(attachment.getDevice())) {
                     continue;
                 }
+                mappings.removeIf(mapping -> Objects.equals(mapping.getDeviceName(), attachment.getDevice()));
                 mappings.add(attachedMapping(volume, attachment));
             }
         }
@@ -10241,7 +10256,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (imageId == null || imageId.isBlank()) {
             return null;
         }
-        Image registered = registeredImages.get(key(region, imageId)).orElse(null);
+        Image registered = imageForCaller(region, imageId)
+                .or(() -> sharedImageForCaller(region, imageId)).orElse(null);
         if (registered != null) {
             return registered;
         }
@@ -10903,6 +10919,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
         }
         throw new AwsException("InvalidAMIID.Unavailable", "The source image ancestry cannot be resolved.", 400);
+    }
+
+    private String launchableImageForCaller(String region, String imageId, Image image) {
+        if (image == null && !foreignImageEntries(region, imageId).isEmpty()) {
+            throw new AwsException("InvalidAMIID.NotFound", "The source image ancestry is unavailable.", 400);
+        }
+        return image != null && !callerAccountId().equals(image.getOwnerId())
+                && !foreignImageEntries(region, imageId).isEmpty()
+                ? sharedImageAncestor(region, image) : resolveLaunchableImageId(region, imageId);
     }
 
     /**

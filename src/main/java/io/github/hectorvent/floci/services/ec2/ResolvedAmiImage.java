@@ -6,6 +6,7 @@ public record ResolvedAmiImage(String dockerImage, String guestRuntime, boolean 
                                String dockerPlatform, List<Ec2ImageCatalog.VolumeMount> volumeMounts) {
     public static final String DEFAULT_RUNTIME = "minimal";
     public static final String SYSTEMD_RUNTIME = "systemd";
+    public static final String SYSTEMD_V1_RUNTIME = "systemd-v1";
     public static final String IMAGE_RUNTIME = "image";
 
     public ResolvedAmiImage {
@@ -21,7 +22,11 @@ public record ResolvedAmiImage(String dockerImage, String guestRuntime, boolean 
     }
 
     public boolean systemd() {
-        return SYSTEMD_RUNTIME.equals(guestRuntime);
+        return SYSTEMD_RUNTIME.equals(guestRuntime) || systemdV1();
+    }
+
+    public boolean systemdV1() {
+        return SYSTEMD_V1_RUNTIME.equals(guestRuntime);
     }
 
     public boolean imageRuntime() {

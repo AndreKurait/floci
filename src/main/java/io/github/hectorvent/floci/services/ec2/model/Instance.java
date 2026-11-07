@@ -84,6 +84,8 @@ public class Instance {
     private String creditSpecificationCpuCredits;
 
     // Docker backing fields (not serialised to AWS wire format)
+    // Retain the admitted runtime ancestor when a shared AMI later becomes unavailable.
+    private String launchableImageId;
     private String dockerContainerId;
     private String containerBridgeIp;
     // Separate from IMDS source registration: set only after public routing is prepared.
@@ -117,6 +119,11 @@ public class Instance {
 
     public String getImageId() { return imageId; }
     public void setImageId(String imageId) { this.imageId = imageId; }
+
+    /** Runtime ancestor admitted at launch, independent of later source-image permission changes. */
+    public String getLaunchableImageId() { return launchableImageId; }
+    /** Persist the runtime binding without changing the AWS-visible ImageId. */
+    public void setLaunchableImageId(String launchableImageId) { this.launchableImageId = launchableImageId; }
 
     public InstanceState getState() { return state; }
     public synchronized void setState(InstanceState state) {

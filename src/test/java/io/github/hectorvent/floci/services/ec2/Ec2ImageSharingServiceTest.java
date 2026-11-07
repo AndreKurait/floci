@@ -30,9 +30,11 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -50,6 +52,129 @@ class Ec2ImageSharingServiceTest {
     private final Ec2ImageCatalog catalog = catalog();
     private final Ec2Service owner = service(OWNER);
     private final Ec2Service recipient = service(RECIPIENT);
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void legacySharedGuestCaptureRecoversItsCatalogRuntimeAndRootDevice(boolean withDataVolume) {
+        Image source = source();
+        if (withDataVolume) {
+            EbsBlockDevice ebs = new EbsBlockDevice();
+            ebs.setSnapshotId(snapshotId(source));
+            BlockDeviceMapping data = new BlockDeviceMapping();
+            data.setDeviceName("/dev/sdf");
+            data.setEbs(ebs);
+            source.setBlockDeviceMappings(List.of(source.getBlockDeviceMappings().getFirst(), data));
+        }
+        grant(source);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service launcher = service(RECIPIENT, false, manager);
+        Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setLaunchableImageId(null);
+        instance.setArchitecture(null);
+        instance.setRootDeviceName(null);
+        if (withDataVolume) {
+            Volume data = launcher.describeVolumes(REGION, List.of(), Map.of()).stream()
+                    .filter(volume -> !volume.getVolumeId().equals(instance.getRootVolumeId())).findFirst().orElseThrow();
+            data.setSize(32);
+        }
+        when(manager.commitInstance(eq(instance), anyString())).thenReturn("example/legacy-capture:1");
+
+        Image captured = launcher.createImage(REGION, instance.getInstanceId(), "legacy-capture", null, true);
+
+        assertEquals("ami-catalog-worker", captured.getSourceImageId());
+        assertEquals(source.getArchitecture(), captured.getArchitecture());
+        assertEquals(source.getRootDeviceName(), captured.getRootDeviceName());
+        assertEquals(captured.getRootDeviceName(), captured.getBlockDeviceMappings().getFirst().getDeviceName());
+        if (withDataVolume) {
+            EbsBlockDevice capturedData = captured.getBlockDeviceMappings().stream()
+                    .filter(mapping -> "/dev/sdf".equals(mapping.getDeviceName())).findFirst().orElseThrow().getEbs();
+            assertEquals(32, capturedData.getVolumeSize());
+            assertNotEquals(snapshotId(source), capturedData.getSnapshotId());
+        }
+        Instance restored = launcher.runInstances(REGION, captured.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
+        verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
+        ResolvedAmiImage original = new AmiImageResolver(catalog).resolveImage("ami-catalog-worker");
+        assertEquals(new ResolvedAmiImage("example/legacy-capture:1", original.guestRuntime(),
+                original.cloudInit(), original.dockerPlatform(), original.volumeMounts()), runtime.getValue());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unavailableLegacySharedAncestryDoesNotLeaveAPartiallyRegisteredCapture(boolean revoke) {
+        Image source = source();
+        grant(source);
+        Ec2Service launcher = service(RECIPIENT, false, mock(Ec2ContainerManager.class));
+        Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setLaunchableImageId(null);
+        if (revoke) {
+            owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
+        } else {
+            source.setSourceImageId("ami-missing-ancestor");
+        }
+        Set<String> images = Set.copyOf(store("ec2-registered-images.json").keys());
+        Set<String> snapshots = Set.copyOf(store("ec2-snapshots.json").keys());
+
+        assertEquals("InvalidAMIID.NotFound", assertThrows(AwsException.class,
+                () -> launcher.createImage(REGION, instance.getInstanceId(), "refused-capture", null, true))
+                .getErrorCode());
+
+        assertEquals(images, store("ec2-registered-images.json").keys());
+        assertEquals(snapshots, store("ec2-snapshots.json").keys());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void captureOfSharedCatalogGuestRetainsItsAdmittedRuntimeAfterShareRevocation(boolean revoke) {
+        Image source = source();
+        grant(source);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service launcher = service(RECIPIENT, false, manager);
+        Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        Volume root = launcher.describeVolumes(REGION, List.of(instance.getRootVolumeId()), Map.of()).getFirst();
+        root.setSize(24);
+        root.setVolumeType("gp3");
+        root.setIops(4500);
+        root.setThroughput(250);
+        root.setEncrypted(true);
+        root.getAttachments().getFirst().setDeleteOnTermination(false);
+        when(manager.commitInstance(eq(instance), anyString())).thenReturn("example/captured:1");
+        if (revoke) {
+            owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
+        }
+
+        Image captured = launcher.createImage(REGION, instance.getInstanceId(), "recipient-capture", null, true);
+
+        assertEquals(instance.getArchitecture(), captured.getArchitecture());
+        assertEquals(instance.getRootDeviceName(), captured.getRootDeviceName());
+        assertEquals("ami-catalog-worker", captured.getSourceImageId());
+        assertNotNull(captured.getBlockDeviceMappings(), "Captured root mapping must survive share revocation");
+        assertEquals(1, captured.getBlockDeviceMappings().size());
+        BlockDeviceMapping capturedRoot = captured.getBlockDeviceMappings().getFirst();
+        assertEquals(instance.getRootDeviceName(), capturedRoot.getDeviceName());
+        assertEquals(root.getSize(), capturedRoot.getEbs().getVolumeSize());
+        assertEquals(root.getVolumeType(), capturedRoot.getEbs().getVolumeType());
+        assertEquals(4500, capturedRoot.getEbs().getIops());
+        assertEquals(250, capturedRoot.getEbs().getThroughput());
+        assertTrue(capturedRoot.getEbs().getEncrypted());
+        assertFalse(capturedRoot.getEbs().getDeleteOnTermination());
+        Instance restored = launcher.runInstances(REGION, captured.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        Volume restoredRoot = launcher.describeVolumes(REGION, List.of(restored.getRootVolumeId()),
+                Map.of()).getFirst();
+        assertEquals(root.getSize(), restoredRoot.getSize());
+        assertEquals(root.getVolumeType(), restoredRoot.getVolumeType());
+        ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
+        verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
+        ResolvedAmiImage original = new AmiImageResolver(catalog).resolveImage("ami-catalog-worker");
+        assertEquals(new ResolvedAmiImage("example/captured:1", original.guestRuntime(),
+                original.cloudInit(), original.dockerPlatform(), original.volumeMounts()), runtime.getValue());
+        assertEquals(RECIPIENT, captured.getOwnerId());
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})

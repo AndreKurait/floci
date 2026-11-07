@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
@@ -15,10 +16,13 @@ import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -64,6 +68,78 @@ class Ec2VolumeBlockDeviceManagerTest {
         lifecycleManager = mock(ContainerLifecycleManager.class);
         manager = new Ec2VolumeBlockDeviceManager(dockerClient, mock(ContainerBuilder.class),
                 lifecycleManager, config);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rawHotAttachDoesNotCreateDevicesInAnUnprivilegedGuest(boolean privileged) {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-hot-attach");
+        instance.setDockerContainerId("guest-container");
+        Volume volume = new Volume();
+        volume.setVolumeId("vol-hot-attach");
+        volume.setSize(8);
+        InspectContainerResponse guest = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(guest.getHostConfig().getPrivileged()).thenReturn(privileged);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(inspect.exec()).thenReturn(guest);
+        when(dockerClient.inspectContainerCmd("guest-container")).thenReturn(inspect);
+        when(lifecycleManager.isContainerRunning("guest-container")).thenReturn(true);
+        List<List<String>> helperCommands = ContainerExecStubs.completeEveryExec(
+                dockerClient, HELPER_ID, 0, "/dev/loop7", "");
+        List<List<String>> guestCommands = ContainerExecStubs.completeEveryExec(
+                dockerClient, "guest-container", 0, "", "");
+
+        assertEquals(privileged ? Optional.of("/dev/xvdf") : Optional.empty(),
+                manager.attachVolume(volume, instance, "/dev/xvdf"));
+
+        assertEquals(privileged ? 1 : 0, helperCommands.size());
+        assertEquals(privileged ? 1 : 0, guestCommands.size());
+
+        manager.detachVolume(volume, instance, "/dev/xvdf");
+
+        assertEquals(privileged ? 2 : 0, guestCommands.size(),
+                "Detaching a metadata-only attachment must preserve an existing guest device path");
+    }
+
+    @Test
+    void rawGuestDisappearingAfterRunningCheckStillReleasesItsLoopDevice() {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-disappeared");
+        instance.setDockerContainerId("disappeared-guest");
+        Volume volume = new Volume();
+        volume.setVolumeId("vol-disappeared");
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(inspect.exec()).thenThrow(new NotFoundException("guest disappeared after running check"));
+        when(dockerClient.inspectContainerCmd("disappeared-guest")).thenReturn(inspect);
+        when(lifecycleManager.isContainerRunning("disappeared-guest")).thenReturn(true);
+        List<List<String>> helperCommands = ContainerExecStubs.completeEveryExec(
+                dockerClient, HELPER_ID, 0, "", "");
+
+        assertEquals(Optional.empty(), manager.attachVolume(volume, instance, "/dev/xvdf"));
+        assertTrue(helperCommands.isEmpty(), "Metadata-only attach must not allocate a loop device");
+
+        assertDoesNotThrow(() -> manager.detachVolume(volume, instance, "/dev/xvdf"));
+
+        assertEquals(1, helperCommands.size());
+        assertTrue(helperCommands.getFirst().contains("detach"));
+        assertTrue(helperCommands.getFirst().contains("/volumes/vol-disappeared.raw"));
+        verify(dockerClient, never()).execCreateCmd("disappeared-guest");
+    }
+
+    @Test
+    void disappearedManagedGuestDoesNotFallBackToMetadataOnly() {
+        Instance instance = managedInstance();
+        instance.setDockerContainerId("disappeared-managed-guest");
+        Volume volume = managedVolume(instance);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(inspect.exec()).thenThrow(new NotFoundException("managed guest disappeared"));
+        when(dockerClient.inspectContainerCmd(instance.getDockerContainerId())).thenReturn(inspect);
+        when(lifecycleManager.isContainerRunning(instance.getDockerContainerId())).thenReturn(true);
+
+        assertThrows(NotFoundException.class, () -> manager.attachVolume(volume, instance, "/dev/xvdf"));
+        assertThrows(NotFoundException.class, () -> manager.detachVolume(volume, instance, "/dev/xvdf"));
+        verify(dockerClient, never()).execCreateCmd(anyString());
     }
 
     @Test

@@ -302,6 +302,9 @@ public class ContainerLifecycleManager {
         if (spec.entrypoint() != null && !spec.entrypoint().isEmpty()) {
             createCmd.withEntrypoint(spec.entrypoint());
         }
+        if (spec.linuxOptions().stopSignal() != null) {
+            createCmd.withStopSignal(spec.linuxOptions().stopSignal());
+        }
         if (spec.workingDir() != null && !spec.workingDir().isBlank()) {
             createCmd.withWorkingDir(spec.workingDir());
         }
@@ -1484,6 +1487,12 @@ public class ContainerLifecycleManager {
             hostConfig.withPrivileged(true);
         }
         LinuxOptions linux = spec.linuxOptions();
+        if (linux.apparmorProfile() != null) {
+            hostConfig.withSecurityOpts(List.of("apparmor=" + linux.apparmorProfile()));
+        }
+        if (linux.pidMode() != null && !linux.pidMode().isBlank()) {
+            hostConfig.withPidMode(linux.pidMode());
+        }
         if (!linux.networkSysctls().isEmpty()) {
             hostConfig.withSysctls(linux.networkSysctls());
         }

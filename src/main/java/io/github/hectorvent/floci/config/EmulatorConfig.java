@@ -3557,6 +3557,13 @@ public interface EmulatorConfig {
         @WithDefault("floci/network-helper:local")
         String metadataHelperImage();
 
+        /**
+         * Docker AppArmor profile for systemd-v1 guests and their init helpers.
+         * Unset uses unconfined because docker-default denies the required mounts.
+         * A custom profile must already be loaded on the workload Docker host.
+         */
+        Optional<String> nativeInitApparmorProfile();
+
         /** Optional EC2 catalog file; includeDefaultImages in that file retains the bundled catalog. */
         Optional<String> imageCatalogPath();
 

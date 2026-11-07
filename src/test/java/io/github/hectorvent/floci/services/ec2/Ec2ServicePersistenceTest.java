@@ -1329,4 +1329,27 @@ class Ec2ServicePersistenceTest {
         backend.load();
         return backend;
     }
+
+    @Test
+    void capturedGuestKeepsItsPersistedRuntimeAfterTheSharedSourceIsUnavailable(@TempDir Path dir) {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-persisted-shared-guest");
+        instance.setImageId("ami-unavailable-shared-source");
+        instance.setLaunchableImageId("ami-admitted-arm-ancestor");
+        instance.setArchitecture("arm64");
+        instance.setRootDeviceName("/dev/xvda");
+        instance.setRegion(REGION);
+        instance.setOwnerId("000000000000");
+        instance.setState(InstanceState.running());
+        load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})
+                .put(REGION + "::" + instance.getInstanceId(), instance);
+
+        Ec2Service restarted = newService(dir);
+        Image captured = restarted.createImage(REGION, instance.getInstanceId(), "after-restart", null, true);
+
+        assertEquals("ami-admitted-arm-ancestor", captured.getSourceImageId());
+        assertEquals("arm64", captured.getArchitecture());
+        assertEquals("/dev/xvda", captured.getRootDeviceName());
+        assertEquals(instance.getImageId(), captured.getCreationSourceImageId());
+    }
 }

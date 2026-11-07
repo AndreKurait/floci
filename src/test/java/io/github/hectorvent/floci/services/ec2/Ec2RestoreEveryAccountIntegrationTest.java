@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.services.ec2.Ec2SystemdV1Runtime.GuestIdentityChangedException;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
@@ -25,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -87,6 +89,22 @@ class Ec2RestoreEveryAccountIntegrationTest {
         verify(containerManager, never()).stopForShutdown(argThat(stopped -> isSame(stopped, instance)));
         assertEquals("running", RequestScopes.callAs(OTHER_ACCOUNT,
                 () -> describe(instance.getInstanceId()).getFirst().getState().getName()));
+    }
+
+    @Test
+    void foreignNativeGuestIsLeftUntouchedAndOtherInstancesStillRecover() throws Throwable {
+        Instance foreign = runningInstanceOf(OTHER_ACCOUNT);
+        Instance valid = runningInstanceOf("444455556666");
+        doThrow(new GuestIdentityChangedException("EC2 init guest ownership changed"))
+                .when(containerManager).restoreSecurityGroups(
+                        argThat(restored -> isSame(restored, foreign)), any(), any(), any());
+
+        restoreOutsideAnyRequest();
+
+        verify(containerManager, never()).stopForShutdown(argThat(stopped -> isSame(stopped, foreign)));
+        verify(containerManager, never()).restoreMetadataRegistration(argThat(restored -> isSame(restored, foreign)));
+        verify(portForwardManager, never()).restore(argThat(restored -> isSame(restored, foreign)));
+        verify(containerManager).restoreMetadataRegistration(argThat(restored -> isSame(restored, valid)));
     }
 
     @Test
