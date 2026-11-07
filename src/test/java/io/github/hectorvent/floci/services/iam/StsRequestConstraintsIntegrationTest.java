@@ -55,7 +55,7 @@ class StsRequestConstraintsIntegrationTest {
      * is not built.
      */
     @Test
-    void theMfaMembersAreReadWhereNothingReadThemBefore() {
+    void mfaShapesAreValidatedBeforeAuthentication() {
         sts("GetSessionToken")
             .formParam("SerialNumber", "Serial#")
         .when().post("/").then().statusCode(400)
@@ -84,8 +84,9 @@ class StsRequestConstraintsIntegrationTest {
         sts("GetSessionToken")
             .formParam("SerialNumber", "arn:aws:iam::000000000000:mfa/user")
             .formParam("TokenCode", "123456")
-        .when().post("/").then().statusCode(200)
-            .body(SESSION_KEY, containsString("ASIA"));
+        .when().post("/").then().statusCode(403)
+            .body(CODE, equalTo("AccessDenied"))
+            .body(MESSAGE, equalTo("MultiFactorAuthentication failed."));
     }
 
     /**

@@ -364,3 +364,15 @@ Role chaining limits `AssumeRole` to one hour, including when the target role pe
 session. A live role credential must carry its matching session token. `GetSessionToken` user
 credentials are not role chaining. The cap is checked after trust and role-maximum validation,
 before registering the new session.
+
+### GetSessionToken MFA context
+
+GetSessionToken records whether its credentials were issued with verified MFA. A request without
+MFA has `aws:MultiFactorAuthPresent=false`; a request with a valid code from the caller's assigned
+virtual MFA device has `true`. Invalid, unassigned or another user's devices are refused before
+session registration. Virtual codes use the shared TOTP implementation with one adjacent
+30-second window on either side. Existing credentials without recorded MFA provenance and
+GetFederationToken credentials leave the condition key absent.
+
+Hardware and account-root MFA devices are not supported. MFA for AssumeRole, MFA age context,
+and GetSessionToken's separate IAM/STS API restrictions remain outside this implementation.
