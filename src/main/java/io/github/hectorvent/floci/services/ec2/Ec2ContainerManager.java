@@ -1254,9 +1254,11 @@ public class Ec2ContainerManager {
             }
             return;
         }
+        String accountId = instance.getOwnerId() != null ? instance.getOwnerId() : regionResolver.getAccountId();
         InstanceState pending = InstanceState.pending();
         instance.setState(pending);
-        submitLifecycleOperation(containerId, () -> {
+        submitLifecycleOperation(containerId, () -> RequestScopes.runAs(
+                accountId, instance.getRegion(), () -> {
             boolean setUpMetadataEndpoint = false;
             try {
                 if (beforeStart != null) {
@@ -1337,7 +1339,7 @@ public class Ec2ContainerManager {
             if (setUpMetadataEndpoint) {
                 setUpMetadataEndpointWhileRunning(instance, containerId, running);
             }
-        });
+        }));
     }
 
     /**

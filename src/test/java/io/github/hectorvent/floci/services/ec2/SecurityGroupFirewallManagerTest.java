@@ -351,12 +351,7 @@ class SecurityGroupFirewallManagerTest {
     }
 
     private static SecurityGroupFirewallManager dnsManager(DockerClient dockerClient) {
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(dockerClient,
-                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
-                mock(EmbeddedDnsServer.class)));
-        doNothing().when(manager).reconcileAll();
-        doNothing().when(manager).admit(anyString(), anyBoolean());
-        return manager;
+        return SecurityGroupDnsFixture.manager(dockerClient, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS));
     }
 
     private static void registerOrigin(SecurityGroupFirewallManager manager, String eni, String helper,
