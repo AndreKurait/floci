@@ -14,6 +14,8 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.iam.model.IamException;
+import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.ssm.model.SsmException;
 import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.model.Credentials;
 
@@ -46,8 +48,8 @@ class IamPrincipalTagsIntegrationTest {
 
     @Test
     void issuedUserCredentialsHonorTagConditionedExplicitDenial() throws Exception {
-        String policy = "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\"},"
-                + "{\"Effect\":\"Deny\",\"Action\":\"iam:ListRoles\",\"Resource\":\"*\","
+        String policy = "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"ssm:DescribeParameters\",\"Resource\":\"*\"},"
+                + "{\"Effect\":\"Deny\",\"Action\":\"ssm:DescribeParameters\",\"Resource\":\"*\","
                 + "\"Condition\":{\"StringEquals\":{\"aws:PrincipalTag/blocked\":\"yes\"}}}]}";
         try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "principal-tag-session-", "list", policy);
              StsClient sts = StsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
@@ -55,13 +57,15 @@ class IamPrincipalTagsIntegrationTest {
                              AwsBasicCredentials.create(user.accessKeyId(), user.secretAccessKey()))).build();
              IamClient root = client(AwsBasicCredentials.create("test", "test"))) {
             Credentials session = sts.getSessionToken().credentials();
-            try (IamClient caller = client(AwsSessionCredentials.create(session.accessKeyId(), session.secretAccessKey(),
-                    session.sessionToken()))) {
-                assertNotNull(caller.listRoles());
+            try (SsmClient caller = SsmClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                    .credentialsProvider(StaticCredentialsProvider.create(AwsSessionCredentials.create(
+                            session.accessKeyId(), session.secretAccessKey(), session.sessionToken()))).build()) {
+                assertNotNull(caller.describeParameters());
                 root.tagUser(request -> request.userName(user.name()).tags(tag -> tag.key("blocked").value("yes")));
-                assertEquals(403, assertThrows(IamException.class, () -> caller.listRoles()).statusCode());
+                assertEquals("AccessDeniedException", assertThrows(SsmException.class,
+                        () -> caller.describeParameters()).awsErrorDetails().errorCode());
                 root.untagUser(request -> request.userName(user.name()).tagKeys("blocked"));
-                assertNotNull(caller.listRoles());
+                assertNotNull(caller.describeParameters());
             } finally {
                 iam.unregisterSession("000000000000", session.accessKeyId());
             }
