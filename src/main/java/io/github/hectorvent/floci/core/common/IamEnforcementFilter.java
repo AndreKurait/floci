@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.iam.StsRequestShapes;
 import io.github.hectorvent.floci.services.iam.StsSessionTags;
+import io.github.hectorvent.floci.services.iam.StsSourceIdentity;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
@@ -569,6 +570,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
             IamConditionContextResolver.formParameters(ctx).forEach(parameters::putSingle);
             try {
+                String sourceIdentity = StsSourceIdentity.resolve(parameters.getFirst("SourceIdentity"),
+                        iamService.findSourceIdentity(akid, requestContext.getSessionToken()));
+                if (sourceIdentity != null) {
+                    conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
+                    conditionContext.put("sts:SourceIdentity", List.of(sourceIdentity));
+                }
                 StsSessionTags.read(parameters);
                 List<String> transitiveKeys = StsSessionTags.transitiveKeys(
                         IamConditionContextResolver.formParameters(ctx));
