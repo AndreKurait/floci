@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer;
 import io.github.hectorvent.floci.services.apigateway.ExecuteApiSigV4Authorizer.Failure;
@@ -62,7 +63,7 @@ class WebSocketHandlerFailureTest {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.hostname()).thenReturn(Optional.of("localhost"));
         handler = new WebSocketHandler(apiService, connections, selection, events, invoker,
-                authorizer, mock(RegionResolver.class), config, mapper, vertx, sigV4);
+                authorizer, mock(RegionResolver.class), config, mapper, vertx, sigV4, mock(CallerCallAuthorizer.class));
         when(vertx.executeBlocking(any(Callable.class))).thenAnswer(invocation -> {
             Callable<Object> task = invocation.getArgument(0);
             Promise<Object> completion = Promise.promise();
