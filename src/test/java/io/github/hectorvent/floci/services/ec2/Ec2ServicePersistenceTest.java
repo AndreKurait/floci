@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.ec2.model.DhcpOptions;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
@@ -71,6 +72,29 @@ import static org.mockito.Mockito.when;
 class Ec2ServicePersistenceTest {
 
     private static final String REGION = "us-east-1";
+
+    @Test
+    void capturedGuestKeepsItsPersistedRuntimeAfterTheSharedSourceIsUnavailable(@TempDir Path dir) {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-persisted-shared-guest");
+        instance.setImageId("ami-unavailable-shared-source");
+        instance.setLaunchableImageId("ami-admitted-arm-ancestor");
+        instance.setArchitecture("arm64");
+        instance.setRootDeviceName("/dev/xvda");
+        instance.setRegion(REGION);
+        instance.setOwnerId("000000000000");
+        instance.setState(InstanceState.running());
+        load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})
+                .put(REGION + "::" + instance.getInstanceId(), instance);
+
+        Ec2Service restarted = newService(dir);
+        Image captured = restarted.createImage(REGION, instance.getInstanceId(), "after-restart", null, true);
+
+        assertEquals("ami-admitted-arm-ancestor", captured.getSourceImageId());
+        assertEquals("arm64", captured.getArchitecture());
+        assertEquals("/dev/xvda", captured.getRootDeviceName());
+        assertEquals(instance.getImageId(), captured.getCreationSourceImageId());
+    }
 
     @Test
     void deletedLatestLaunchTemplateVersionIsNotReusedAfterRestart(@TempDir Path dir) {

@@ -320,6 +320,11 @@ CreateImage and CopyImage use their explicit source, even when the output name
 matches another registration binding. Names without a declared binding retain
 the existing metadata registration and default-image fallback behavior.
 The mapping does not import snapshot bytes or prove that a guest boots.
+New container-backed instances retain the runtime ancestor admitted at launch.
+Creating an image from a guest launched from a shared catalog-bound AMI keeps
+the instance's architecture, root device and runtime even after sharing is
+revoked or Floci restarts. Instances saved without this binding retain the legacy
+source-image lookup. This does not enable sharing captured Docker layers.
 
 `CopyImage` accepts a name already used by another AMI, including another copy
 of the same source or a different architecture. Each copy receives its own AMI

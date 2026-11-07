@@ -33,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -50,6 +51,35 @@ class Ec2ImageSharingServiceTest {
     private final Ec2ImageCatalog catalog = catalog();
     private final Ec2Service owner = service(OWNER);
     private final Ec2Service recipient = service(RECIPIENT);
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void captureOfSharedCatalogGuestRetainsItsAdmittedRuntimeAfterShareRevocation(boolean revoke) {
+        Image source = source();
+        grant(source);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service launcher = service(RECIPIENT, false, manager);
+        Instance instance = launcher.runInstances(REGION, source.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        when(manager.commitInstance(eq(instance), anyString())).thenReturn("example/captured:1");
+        if (revoke) {
+            owner.modifyImageLaunchPermissions(REGION, source.getImageId(), List.of(), List.of(RECIPIENT), false);
+        }
+
+        Image captured = launcher.createImage(REGION, instance.getInstanceId(), "recipient-capture", null, true);
+
+        assertEquals(instance.getArchitecture(), captured.getArchitecture());
+        assertEquals(instance.getRootDeviceName(), captured.getRootDeviceName());
+        assertEquals("ami-catalog-worker", captured.getSourceImageId());
+        Instance restored = launcher.runInstances(REGION, captured.getImageId(), "m6g.large", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
+        verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
+        ResolvedAmiImage original = new AmiImageResolver(catalog).resolveImage("ami-catalog-worker");
+        assertEquals(new ResolvedAmiImage("example/captured:1", original.guestRuntime(),
+                original.cloudInit(), original.dockerPlatform(), original.volumeMounts()), runtime.getValue());
+        assertEquals(RECIPIENT, captured.getOwnerId());
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
