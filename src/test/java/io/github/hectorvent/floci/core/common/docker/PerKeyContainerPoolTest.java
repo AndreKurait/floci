@@ -4,6 +4,8 @@ import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.core.common.docker.PerKeyContainerPool.StartedContainer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -22,7 +24,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -195,6 +199,46 @@ class PerKeyContainerPoolTest {
         verify(lifecycleManager).stopAndRemove("container-a", null);
         verify(lifecycleManager).stopAndRemove("container-b", null);
         verifyNoMoreInteractions(lifecycleManager);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void resetDoesNotForgetAReplacementStartedWhileOldCleanupIsBlocked(boolean cleanupFails) throws Exception {
+        String oldUrl = startFakePing(200);
+        pool.ensureReady("shared-key", () -> new StartedContainer("old-container", oldUrl));
+        fakeContainers.getFirst().stop(0);
+        String newUrl = startFakePing(200);
+        CountDownLatch cleaningOld = new CountDownLatch(1);
+        CountDownLatch releaseCleanup = new CountDownLatch(1);
+        AtomicInteger oldStops = new AtomicInteger();
+        doAnswer(invocation -> {
+            if (oldStops.incrementAndGet() == 1) {
+                cleaningOld.countDown();
+                assertTrue(releaseCleanup.await(10, TimeUnit.SECONDS));
+                if (cleanupFails) {
+                    throw new IllegalStateException("old cleanup failed");
+                }
+            }
+            return null;
+        }).when(lifecycleManager).stopAndRemove("old-container", null);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> reset = worker.submit(pool::stopAll);
+            assertTrue(cleaningOld.await(5, TimeUnit.SECONDS));
+            assertEquals(newUrl, pool.ensureReady("shared-key",
+                    () -> new StartedContainer("new-container", newUrl)));
+            releaseCleanup.countDown();
+            reset.get(5, TimeUnit.SECONDS);
+
+            assertTrue(pool.isTracked("shared-key"), "Reset must retain the new generation's container");
+            verify(lifecycleManager, never()).stopAndRemove("new-container", null);
+            pool.stopAll();
+            verify(lifecycleManager).stopAndRemove("new-container", null);
+        } finally {
+            releaseCleanup.countDown();
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
+        }
     }
 
     @Test
