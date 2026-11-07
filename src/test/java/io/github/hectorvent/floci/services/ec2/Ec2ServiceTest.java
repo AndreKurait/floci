@@ -7250,6 +7250,40 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void createImageWithoutInstanceRootDeviceFallsBackToSourceImage() {
+        Ec2ImageCatalog catalog = mock(Ec2ImageCatalog.class);
+        Ec2ImageCatalog.CatalogImage source = new Ec2ImageCatalog.CatalogImage();
+        source.imageId = "ami-src";
+        source.architecture = "x86_64";
+        source.rootDeviceType = "ebs";
+        source.rootDeviceName = "/dev/xvda";
+        when(catalog.findByIdOrAlias("ami-src")).thenReturn(Optional.of(source));
+        Ec2Service service = liveService(capturingContainerManager(), minimalImageResolver(), catalog);
+        String instanceId = runOne(service, "ami-src");
+
+        service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                .getFirst().getInstances().getFirst().setRootDeviceName(null);
+
+        Image image = service.createImage("us-east-1", instanceId, "captured", null, true);
+
+        assertEquals("/dev/xvda", image.getRootDeviceName());
+        assertEquals(1, image.getBlockDeviceMappings().size());
+        BlockDeviceMapping root = image.getBlockDeviceMappings().getFirst();
+        assertEquals("/dev/xvda", root.getDeviceName());
+        assertNotNull(root.getEbs().getSnapshotId());
+
+        // The rebuilt root describes the volume RunInstances actually created for the
+        // source, so DescribeImages does not report a type the instance never had.
+        assertEquals("gp3", root.getEbs().getVolumeType());
+        assertEquals(8, root.getEbs().getVolumeSize());
+
+        // The mapping's snapshot is registered, so DescribeSnapshots can resolve it.
+        List<Snapshot> snapshots = service.describeSnapshots("us-east-1",
+                List.of(root.getEbs().getSnapshotId()), null, Map.of());
+        assertEquals(1, snapshots.size());
+    }
+
+    @Test
     void createImageTakesItsOwnSnapshotRatherThanTheSourceAmisOne() {
         Ec2Service service = liveService(capturingContainerManager(), minimalImageResolver());
         Image source = service.registerImage("us-east-1", "source-image", null, null, "/dev/sda1",

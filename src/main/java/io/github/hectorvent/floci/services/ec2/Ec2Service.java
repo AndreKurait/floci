@@ -9831,8 +9831,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (architecture == null && sourceImage != null) {
             architecture = sourceImage.getArchitecture();
         }
+        String rootDeviceName = source.getRootDeviceName();
+        if (rootDeviceName == null && sourceImage != null) {
+            rootDeviceName = sourceImage.getRootDeviceName();
+        }
         Image image = registerImage(region, name, description,
-                architecture, source.getRootDeviceName(),
+                architecture, rootDeviceName,
                 captureBlockDeviceMappings(region, source, sourceImage), false);
 
         // Carry the launchable ancestor so RunInstances on this AMI starts the same guest instead
