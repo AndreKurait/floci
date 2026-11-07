@@ -21,6 +21,9 @@ account SCPs and Lambda resource policies apply; cross-account invocations requi
 both identity and resource-policy grants. Every uncached invocation rechecks the role,
 so revocation takes effect on the next request. The same resolved target is authorized
 and invoked.
+Trust and target-policy evaluation use the same server-clock instant for
+`aws:CurrentTime` and `aws:EpochTime`. Time-conditioned grants and denies are
+reevaluated on each invocation. This request time is not `aws:TokenIssueTime`.
 
 Role checks do not synthesize service-specific trust `SourceArn` or `SourceAccount`
 conditions. Caller-passthrough credentials, HTTP/WebSocket integrations and Lambda
