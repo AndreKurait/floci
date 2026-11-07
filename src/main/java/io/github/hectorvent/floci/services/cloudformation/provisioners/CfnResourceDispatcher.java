@@ -65,6 +65,17 @@ public class CfnResourceDispatcher {
                 .orElseGet(() -> objectMapper.getNodeFactory().textNode(value));
     }
 
+    public boolean requiresOwnershipRecovery(StackResource resource) {
+        return !isStub(resource.getPhysicalId(), resource.getAttributes())
+                && registry.forType(resource.getResourceType())
+                .map(owner -> owner.requiresOwnershipRecovery(resource)).orElse(false);
+    }
+
+    public void recoverOwnership(StackResource resource, JsonNode properties, ProvisionContext context) {
+        registry.forType(resource.getResourceType())
+                .ifPresent(owner -> owner.recoverOwnership(resource, properties, context));
+    }
+
     /**
      * Provisions a single resource and returns the populated StackResource (physical id and
      * attributes set).
@@ -253,6 +264,9 @@ public class CfnResourceDispatcher {
      * beats the {@code Custom::} fallback the registry applies.
      */
     public void delete(StackResource resource, String region) {
+        if (isStub(resource.getPhysicalId(), resource.getAttributes())) {
+            return;
+        }
         String resourceType = resource.getResourceType();
         CfnResourceProvisioner owner = registry.forType(resourceType).orElse(null);
         if (owner != null) {
