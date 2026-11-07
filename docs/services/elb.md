@@ -118,14 +118,27 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   preserve the configured success-code matcher, and do not follow redirects.
 - One health-check deadline covers connection, TLS handshake and response headers.
   Partial bytes do not renew it. Expiry closes the probe and counts toward `Target.Timeout`.
-- Health probes connect directly without JVM proxy settings. A timed-out lookup keeps
+- Health probes ignore JVM proxy settings and use the ALB's managed backend transport
+  when native VPC networking is enabled. A timed-out lookup keeps
   its target and shared worker slot until the underlying work actually exits. This bounds
   background work even when name resolution ignores interruption.
 - Backend TLS uses the runtime's supported protocols and ciphers. Floci does not reproduce
   AWS ALB's backend security-policy selection from the frontend listener policy.
-- ALB listeners share the emulator's network address. Stored subnet and security-group
-  associations do not create a load-balancer VPC network boundary or enforce frontend
-  ingress and backend egress rules. These listeners cannot yet reproduce NAT allowlisting failures.
+- With native VPC networking and security-group enforcement enabled, each ALB subnet has a
+  service-held ENI and protected namespace. HTTP/HTTPS requests, WebSocket handshakes, and
+  health checks originate from those private addresses using the ALB's security groups.
+  Target ingress can reference the ALB security group; ALB egress and VPC routes still apply.
+  A missing backend namespace fails the connection instead of using the emulator's network.
+  `SetSecurityGroups` updates these ENIs, `SetSubnets` reconciles them, and deletion removes
+  their helpers before releasing their addresses. Saved ENI identities support restoration.
+- The managed backend transport uses the stock Dante SOCKS5 server in the network helper.
+  Only the emulator's control address may connect to that listener. Its return-route exception
+  matches replies to that connection; target traffic follows the normal VPC rules.
+  Custom network-helper images must include `sockd`, supplied by Alpine's `dante-server` package.
+- ALB frontend listeners still share the emulator's network address. This backend transport
+  does not enforce frontend security-group ingress or provide a native public ALB address.
+  NLB TCP listeners retain their existing transport. Native ALB backend networking currently
+  follows the native VPC implementation's IPv4 boundary.
 - TCP listeners relay bytes bidirectionally without parsing HTTP or terminating TLS. TLS passthrough requires a TCP listener, with certificates configured at the target, not at the listener. Targets are selected per connection using round-robin among healthy targets, falling back to registered targets when none are healthy. The default TCP idle timeout is 350 seconds, configurable via the `tcp.idle_timeout.seconds` listener attribute (60 to 6000 seconds).
 - TCP listeners require a dedicated local port. Floci still shares its address across load balancers, so a second listener on an in-use TCP port registers successfully and logs a warning, but serves no traffic until the listener holding the port is deleted or moved, and ports reserved by Floci remain unavailable. Address isolation and TLS-terminating NLB listeners are not provided by the TCP proxy.
 - An asynchronous socket-bind failure retains the admitted listeners and retries while they
@@ -138,7 +151,9 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - Unusable saved listeners are retained for correction and logged individually so other saved listeners can start.
 - HTTP or HTTPS listeners sharing a local port must use the same protocol. Requests select a load balancer by its DNS name, a public Route 53 alias, a hostname declared by its rules, or a certificate hostname; ambiguous hostnames return 502. TCP never serves a port alongside either protocol; see the TCP note above.
 - Load balancer, target group, listener, rule, and tag state is persisted through Floci storage and rebuilt on service startup.
-- Load balancers are created in `active` state.
+- Load balancers return `active` after their required backend namespaces are ready.
+  Native ALBs remain `provisioning` during preparation. Failed preparation attempts clean up
+  their owned resources; a cleanup failure retains the failed balancer and ENI identities for deletion.
 - `CreateLoadBalancer` takes `Subnets` or `SubnetMappings` for every load balancer type, and both together are refused with `ValidationError`. An Application Load Balancer takes at least two: with one or none it returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` and creates nothing. The count comes before any subnet is looked up, as on AWS, so one subnet that does not exist gets that error too. A Network or Gateway Load Balancer with neither returns `ValidationError` `At least one subnet must be specified`. CloudFormation refuses such an `AWS::ElasticLoadBalancingV2::LoadBalancer` the same way when it creates or replaces the balancer; an update that keeps the balancer and names no subnets leaves it on its subnets.
 - `SetSubnets`, like `CreateLoadBalancer`, takes `Subnets` or `SubnetMappings`, and both together are refused with `ValidationError`. With neither it returns the same `ValidationError` as `CreateLoadBalancer` for the balancer's type, `At least two subnets in two different Availability Zones must be specified` for an Application Load Balancer and `At least one subnet must be specified` for a Network or Gateway Load Balancer, and leaves the balancer on its subnets. A `SetSubnets` that names subnets is counted as `CreateLoadBalancer` counts them, following the two-zone rule its API reference states: one subnet for an Application Load Balancer, in `Subnets` or `SubnetMappings`, returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` before any subnet is looked up, and leaves the balancer on its subnets. AWS does not document the error for this case, so Floci gives `CreateLoadBalancer`'s error, in the same order. A CloudFormation update that keeps an Application Load Balancer and names one subnet fails with that error and rolls back. A Network Load Balancer can be set onto one subnet. The `SetSubnets` API reference requires a Gateway Load Balancer's `Subnets` to include every subnet it is already on; Floci does not enforce that.
 - Single-zone Application Load Balancers (opt-in, off by default): AWS refuses an Application Load Balancer in fewer than two Availability Zones, as above. For local setups that model single-zone deployments, `floci.services.elbv2.single-zone-alb-accounts` (`FLOCI_SERVICES_ELBV2_SINGLE_ZONE_ALB_ACCOUNTS`, comma-separated 12-digit account ids; spaces around an id are ignored) lowers that minimum to one zone for the accounts it lists: for a listed account, `CreateLoadBalancer` and `SetSubnets` (including CloudFormation's) take an Application Load Balancer on one subnet, for either scheme. Neither `Subnets` nor `SubnetMappings` is still refused with the same message. Unlisted accounts, and every account while the setting is unset, keep the two-zone rule; Network and Gateway Load Balancers are unchanged. A value that is not a 12-digit account id is rejected during startup.

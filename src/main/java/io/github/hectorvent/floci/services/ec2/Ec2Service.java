@@ -17679,6 +17679,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         networkInterfaces.put(key(region, networkInterfaceId), ni);
     }
 
+    /** Updates the policy identity of an interface already held by a service. */
+    public void setNetworkInterfaceGroupsForService(String region, String networkInterfaceId,
+                                                    List<String> groupIds) {
+        synchronized (attachmentTopologyLock(region)) {
+            NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+            if (ni.getAttachment() != null || !"in-use".equals(ni.getStatus())) {
+                throw new AwsException("InvalidNetworkInterface.InUse",
+                        "The network interface is not held by a service.", 400);
+            }
+            ni.setGroups(resolveSecurityGroups(region, ni.getVpcId(), groupIds, null));
+            networkInterfaces.put(key(region, networkInterfaceId), ni);
+        }
+    }
+
     /**
      * Returns a service-held ENI to {@code available}, the mirror of
      * {@link #holdNetworkInterfaceForService}. Silent on an interface that is already gone, or one

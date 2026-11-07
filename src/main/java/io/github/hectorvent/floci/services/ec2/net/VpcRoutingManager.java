@@ -457,7 +457,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 .toList();
         String script = VpcRoutingCommands.endpoint(identity.logicalAddress(), endpoint.privateDevice,
                 local, hops, denied, endpoint.resolvers, identity.controlConnections(),
-                identity.instanceMetadataAllowed(), own == null ? null : own.device, inbound);
+                identity.instanceMetadataAllowed(), own == null ? null : own.device, inbound,
+                identity.controlListeners());
         if (endpoint.publicAddress != null && endpoint.publicAddress.separateTransport()) {
             NativePublicAddress address = endpoint.publicAddress;
             script += VpcRoutingCommands.publicInstanceSource(identity.logicalAddress(), address.address(),
