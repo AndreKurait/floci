@@ -1195,3 +1195,10 @@ normalized OpenAPI plan as the importer, including YAML and ANY-method operation
 creating or replacing API resources. Caller credentials, omitted or null credentials, HTTP
 integration credentials and JWT authorizer fields do not pass an execution role. This check
 does not add OpenAPI reference resolution or AWS-variable substitution beyond the existing importer.
+
+When IAM enforcement is enabled, HTTP API Lambda integrations with an execution role
+require API Gateway role trust and invocation permission through the shared identity,
+resource-policy, permissions-boundary and SCP evaluators. Cross-account targets also
+require a resource-policy grant. Authorization and invocation use one qualified target.
+Caller-identity passthrough remains a separate path; this does not qualify forwarding
+its permissions, full condition context, or issuance of execution-role STS sessions.

@@ -3029,16 +3029,24 @@ public class ApiGatewayExecuteController {
         LOG.debugv("execute-api v2: {0} {1}/{2}{3} → Lambda {4}", httpMethod, apiId, stageName, path, functionName);
 
         try {
+            String credentials = integration.getCredentialsArn();
             if (("AWS_PROXY".equalsIgnoreCase(integrationType) || "AWS".equalsIgnoreCase(integrationType))
-                    && (integration.getCredentialsArn() == null || integration.getCredentialsArn().isBlank())) {
+                    && !"*".equals(credentials) && !callerCredentialsPassthrough(credentials)) {
                 String accountId = regionResolver.getAccountId();
                 functionName = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
                         region, accountId);
-                String functionRegion = AwsArnUtils.parse(functionName).region();
-                String sourceArn = AwsArnUtils.Arn.of("execute-api", functionRegion, accountId,
-                        apiId + "/" + stageName + "/" + httpMethod + path).toString();
-                if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionName,
-                        sourceArn, accountId) == Decision.DENY) {
+                Decision decision;
+                if (credentials == null || credentials.isBlank()) {
+                    String functionRegion = AwsArnUtils.parse(functionName).region();
+                    String sourceArn = AwsArnUtils.Arn.of("execute-api", functionRegion, accountId,
+                            apiId + "/" + stageName + "/" + httpMethod + path).toString();
+                    decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionName,
+                            sourceArn, accountId);
+                } else {
+                    decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                            "lambda:InvokeFunction", functionName, accountId, regionResolver.getPartition());
+                }
+                if (decision == Decision.DENY) {
                     return httpApiError(500, "Internal Server Error");
                 }
             }
