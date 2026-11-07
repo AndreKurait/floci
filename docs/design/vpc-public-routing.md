@@ -60,8 +60,11 @@ the upstream's Docker address or a general internet route.
 Additional explicitly named public hosts may use this same destination for
 known VPC clients. Exact names may contain underscores or a single label;
 literal IP addresses are not names. Exact names do not imply suffix or wildcard matches.
-Native DNS records and forwarding rules retain precedence; non-VPC lookups
-retain their existing resolution. This configuration supplies a transport
+Native DNS records and forwarding rules retain precedence. Outside a VPC, exact
+declared peers use owned DNS records or the configured upstream resolvers, including
+names beneath AWS domain suffixes. Broad AWS spoofing must not replace a declared
+peer's address with the emulator's API listener. Other AWS names retain the
+usual emulator address. This configuration supplies a transport
 destination, not an implementation of any peer protocol or authorization.
 
 For an explicitly declared public hostname, a public Route 53 alias to an owned

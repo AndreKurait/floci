@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.TlsConfigSource;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -99,6 +100,35 @@ class EmbeddedDnsPublicAwsApiTest {
         assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
                 server(false, List.of(), List.of(), VPC, List.of("api.peer.example"))
                         .planQuery("api.peer.example", CLIENT, CONTROL, 1));
+    }
+
+    @Test
+    void declaredAwsDomainPeersUseUpstreamDnsOutsideTheVpc() {
+        for (String suffix : TlsConfigSource.awsEndpointSuffixes()) {
+            String name = "callback.staging.us-east-1." + suffix;
+            EmbeddedDnsServer dns = server(true, List.of(), List.of(), VPC, List.of(name));
+            for (int type : List.of(1, 28)) {
+                assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                        dns.planQuery(name.toUpperCase(Locale.ROOT), "172.17.0.20", CONTROL, type));
+            }
+            assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                    addresses(dns, name, CLIENT));
+            assertEquals(List.of(CONTROL), addresses(dns, "child." + name, "172.17.0.20"));
+            assertEquals(List.of(CONTROL), addresses(dns, "ec2.us-east-1." + suffix, "172.17.0.20"));
+        }
+    }
+
+    @Test
+    void declaredAwsDomainPeersPreserveOwnedAnswersAndDisabledRouting() {
+        String name = "callback.staging.us-east-1.amazonaws.com";
+        DnsRecordSource records = host -> name.equals(host)
+                ? Optional.of(DnsAnswer.records(List.of("198.51.100.7"), 30)) : Optional.empty();
+        assertEquals(List.of("198.51.100.7"),
+                addresses(server(true, List.of(records), List.of(), VPC, List.of(name)),
+                        name, "172.17.0.20"));
+        assertEquals(List.of(CONTROL),
+                addresses(server(false, List.of(), List.of(), VPC, List.of(name)),
+                        name, "172.17.0.20"));
     }
 
     @Test

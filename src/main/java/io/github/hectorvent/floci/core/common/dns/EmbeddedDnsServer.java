@@ -491,7 +491,8 @@ public class EmbeddedDnsServer {
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, origin);
         boolean routedApi = publicAwsApi && origin != null && TlsConfigSource.awsEndpointSuffixes().stream()
                 .anyMatch(suffix -> DomainNames.isWithin(name.toLowerCase(Locale.ROOT), suffix));
-        Optional<DnsAnswer> emulatorName = resolveEmulatorName(name,
+        boolean externalPeer = publicAwsApi && origin == null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT));
+        Optional<DnsAnswer> emulatorName = externalPeer ? Optional.empty() : resolveEmulatorName(name,
                 routedApi ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
