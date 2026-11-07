@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -44,6 +45,9 @@ class EksPodIdentityDockerIntegrationTest {
                     "floci.services.eks.pod-identity-webhook", "true",
                     "floci.tls.enabled", "true",
                     "floci.tls.aws-https-port", "0",
+                    // Profile overrides do not reach TlsConfigSource. Match its private proxy listeners.
+                    "quarkus.http.proxy.use-proxy-protocol", "true",
+                    "quarkus.http.host", "127.0.0.1",
                     "quarkus.http.test-port", "4510",
                     "quarkus.http.test-ssl-port", "4511",
                     "floci.port", "4595",
@@ -186,6 +190,10 @@ class EksPodIdentityDockerIntegrationTest {
     }
 
     private String execInContainer(String containerId, String cmd) {
-        return ContainerExec.runMerged(dockerClient, containerId, new String[]{"sh", "-c", cmd}, 30).stdout();
+        ContainerExec.Result result = ContainerExec.runMerged(
+                dockerClient, containerId, new String[]{"sh", "-c", cmd}, 30);
+        assertFalse(result.timedOut(), "Container command timed out");
+        assertEquals(0, result.exitCode(), result.summary());
+        return result.stdout();
     }
 }
