@@ -184,7 +184,7 @@ class ApiGatewayAliasDnsIntegrationTest {
                 installed = ResourceRecordSet.builder().name(domain).type("A").ttl(45L)
                         .resourceRecords(record -> record.value("127.0.0.1")).build();
                 change(route53, zone, ChangeAction.UPSERT, installed);
-                assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(listener, domain, 1)));
+                assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(listener, domain, 1), 45));
                 installed = alias(domain, targetName, "WRONG");
                 change(route53, zone, ChangeAction.UPSERT, installed);
                 assertEquals(5, rcode(query(listener, domain, 1)));
@@ -266,6 +266,10 @@ class ApiGatewayAliasDnsIntegrationTest {
     }
 
     private static byte[] address(byte[] answer) {
+        return address(answer, 60);
+    }
+
+    private static byte[] address(byte[] answer, int expectedTtl) {
         ByteBuffer packet = ByteBuffer.wrap(answer);
         packet.position(12);
         EmbeddedDnsServer.readName(packet, answer);
@@ -273,7 +277,7 @@ class ApiGatewayAliasDnsIntegrationTest {
         EmbeddedDnsServer.readName(packet, answer);
         assertEquals(1, packet.getShort());
         packet.getShort();
-        assertEquals(60, packet.getInt());
+        assertEquals(expectedTtl, packet.getInt());
         assertEquals(4, packet.getShort());
         byte[] value = new byte[4];
         packet.get(value);
