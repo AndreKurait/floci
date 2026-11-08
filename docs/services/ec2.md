@@ -23,6 +23,22 @@ These checks support the [EC2 launch and lifecycle policy examples](https://docs
 They do not add the other EC2 launch condition keys, such as volume encryption
 or instance-type restrictions.
 
+Network interface and VPC endpoint actions are checked on the resources the Service Authorization
+Reference gives them, as named by the request: `CreateNetworkInterface` on
+`network-interface/*`, the `SubnetId` and each `SecurityGroupId.N`; `DeleteNetworkInterface` and
+`CreateNetworkInterfacePermission` on the interface; `AttachNetworkInterface` on the instance and
+the interface; `DetachNetworkInterface` on the instance and the interface its `AttachmentId` joins
+(any instance and interface of the account when the attachment is unknown); `CreateVpcEndpoint` on
+`vpc-endpoint/*`, the VPC, and each subnet, group and route table; `ModifyVpcEndpoint` on the
+endpoint and each subnet, group and route table it adds or removes; `DeleteVpcEndpoints` on each
+endpoint; and `CreateTags`/`DeleteTags` on a named interface or endpoint. A policy scoped to these
+ARNs, such as an AWS managed service-linked role policy, then authorizes them as on AWS.
+`DescribeNetworkInterfaces` and `DescribeNetworkInterfacePermissions` act on no resource type and
+stay on `*`. Each resource checked by its own ARN carries that resource's stored tags as
+`aws:ResourceTag/<key>`, so `AmazonOpenSearchServiceRolePolicy`'s `ModifyVpcEndpoint` and
+`DeleteVpcEndpoints` statements reach the endpoints tagged `OpenSearchManaged=true` and no other; an
+untagged resource carries no key.
+
 ## Placement-group metadata
 
 `CreatePlacementGroup`, `DescribePlacementGroups`, and `DeletePlacementGroup` support native EC2 Query clients.
@@ -55,21 +71,6 @@ instance membership, share groups, or implement parent groups, host spread, or c
 Omitted spread/partition defaults and simultaneous name/ID selectors are outside this supported slice
 and return an error. Unknown or empty filters are rejected. These local limits and the refusal after
 a concurrent replacement do not establish AWS's error precedence, defaults, or concurrency behavior.
-
-Network interface and VPC endpoint actions are checked on the resources the Service Authorization
-Reference gives them, as named by the request: `CreateNetworkInterface` on
-`network-interface/*`, the `SubnetId` and each `SecurityGroupId.N`; `DeleteNetworkInterface` and
-`CreateNetworkInterfacePermission` on the interface; `AttachNetworkInterface` on the instance and
-the interface; `DetachNetworkInterface` on the instance and the interface its `AttachmentId` joins
-(any instance and interface of the account when the attachment is unknown); `CreateVpcEndpoint` on
-`vpc-endpoint/*`, the VPC, and each subnet, group and route table; `ModifyVpcEndpoint` on the
-endpoint and each subnet, group and route table it adds or removes; `DeleteVpcEndpoints` on each
-endpoint; and `CreateTags`/`DeleteTags` on a named interface or endpoint. A policy scoped to these
-ARNs, such as an AWS managed service-linked role policy, then authorizes them as on AWS.
-`DescribeNetworkInterfaces` and `DescribeNetworkInterfacePermissions` act on no resource type and
-stay on `*`. Outside `CreateTags` and `DeleteTags`, `aws:ResourceTag` is not read for these actions,
-so a statement conditioned on it (`ModifyVpcEndpoint` and `DeleteVpcEndpoints` in
-`AmazonOpenSearchServiceRolePolicy`) does not match.
 
 ## Instance Execution Model
 

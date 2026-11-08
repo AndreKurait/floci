@@ -52,6 +52,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -1021,6 +1022,38 @@ class IamConditionContextResolverTest {
                 resolver.resolve("ec2", "ec2:DeleteTags",
                         formRequest("Action=DeleteTags&ResourceId.1=i-0123456789&Tag.1.Key=Team"))
                         .get("aws:ResourceTag/Team"));
+    }
+
+    @Test
+    void anEc2ResourceIsCheckedWithItsOwnStoredTagsFromTheAccountItsArnNames() {
+        when(ec2Service.resourceTags("111111111111", "eu-west-1", "vpce-0123456789"))
+                .thenReturn(List.of(new Tag("OpenSearchManaged", "true")));
+
+        assertEquals(Map.of("aws:ResourceTag/OpenSearchManaged", List.of("true")),
+                resolver.ec2ResourceTags("arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789")
+                        .orElseThrow());
+    }
+
+    @Test
+    void anUntaggedEc2ResourceLeavesEveryResourceTagKeyAbsent() {
+        when(ec2Service.resourceTags("111111111111", "eu-west-1", "vpce-0123456789")).thenReturn(List.of());
+
+        assertEquals(Map.of(), resolver.ec2ResourceTags(
+                "arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789").orElseThrow());
+    }
+
+    @Test
+    void anArnWithoutAnAccountIsReadInTheCallersAccountAndAWildcardIsNotRead() {
+        when(ec2Service.resourceTags("123456789012", "us-east-1", "ami-0123456789"))
+                .thenReturn(List.of(new Tag("Team", "payments")));
+
+        assertEquals(List.of("payments"), resolver.ec2ResourceTags("arn:aws:ec2:us-east-1::image/ami-0123456789")
+                .orElseThrow().get("aws:ResourceTag/Team"));
+        for (String notOne : List.of("*", "arn:aws:ec2:us-east-1:123456789012:vpc-endpoint/*",
+                "arn:aws:s3:::bucket", "arn:aws:ec2:us-east-1:123456789012:instance/i-*",
+                "arn:aws:ec2:us-east-1:123456789012:placement-group/web")) {
+            assertTrue(resolver.ec2ResourceTags(notOne).isEmpty(), notOne);
+        }
     }
 
     @Test

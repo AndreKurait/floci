@@ -2749,7 +2749,12 @@ floci populates:
   `ec2:DeleteTags`, `ec2:TerminateInstances` and `ec2:DescribeInstances` (the first
   `ResourceId.N` or `InstanceId.N`), and for `s3:GetBucketTagging`, `s3:DeleteBucket` and the
   `s3:PutBucketTagging` that `DeleteBucketTagging` is checked as (the bucket). A request naming several EC2 resources is evaluated
-  once per resource and denied when any of them fails the condition, as on AWS.
+  once per resource and denied when any of them fails the condition, as on AWS. Every EC2 resource a
+  request is checked on by its own ARN (a VPC endpoint for `ec2:DeleteVpcEndpoints` and
+  `ec2:ModifyVpcEndpoint`, an interface, a subnet, a group, an image) is checked with that resource's own
+  stored tags, read in the account and Region its ARN names; an untagged resource and a type wildcard
+  such as `vpc-endpoint/*` carry no key, so a condition on one does not match. A check on `*` keeps the
+  first target's tags as above.
   `logs:CreateLogStream`, `logs:DeleteLogStream`, `logs:TagResource`, `logs:UntagResource`,
   `logs:ListTagsForResource`, `logs:DeleteLogGroup`, `logs:PutRetentionPolicy` and
   `logs:DeleteRetentionPolicy` use the owning log group's tags.
@@ -3052,9 +3057,9 @@ Service developer guide's service-linked role page documents. The policy is unde
 `arn:<partition>:iam::aws:policy/aws-service-role/` and is read from the bundled managed policy
 catalog, so `ListAttachedRolePolicies` lists it and a session on the role is authorized by it under
 IAM enforcement. The network interface and VPC endpoint actions the policy scopes to EC2 resource
-ARNs are checked on those ARNs (see the EC2 service doc). Its statements conditioned on
-`aws:ResourceTag` (`ec2:ModifyVpcEndpoint`, `ec2:DeleteVpcEndpoints`) do not match, since an
-endpoint's tags are not read for them. A role for any other
+ARNs are checked on those ARNs (see the EC2 service doc), and its `ec2:ModifyVpcEndpoint` and
+`ec2:DeleteVpcEndpoints` statements, conditioned on `aws:ResourceTag/OpenSearchManaged`, reach
+exactly the endpoints tagged `OpenSearchManaged=true`. A role for any other
 service is created with its trust policy alone.
 
 Four deviations to be aware of:
