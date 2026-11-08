@@ -1316,7 +1316,8 @@ public class AutoScalingService implements PassedRoleLookup {
             AsgInstance instance = asg.getInstances().stream()
                     .filter(member -> instanceId.equals(member.getInstanceId()))
                     .findFirst().orElseThrow(() -> instanceNotFound(instanceId));
-            if ("Terminating".equals(instance.getLifecycleState())) {
+            if ("Terminating".equals(instance.getLifecycleState())
+                    && !selectedRefreshOriginalIsRunning(region, asg, instance)) {
                 throw new AwsException("ScalingActivityInProgress",
                         "Instance '" + instanceId + "' is already being terminated.", 400);
             }
