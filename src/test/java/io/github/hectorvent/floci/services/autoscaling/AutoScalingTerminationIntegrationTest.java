@@ -13,6 +13,8 @@ import software.amazon.awssdk.services.autoscaling.model.AutoScalingGroup;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.awaitility.Awaitility.await;
@@ -57,15 +59,27 @@ class AutoScalingTerminationIntegrationTest {
                     assertEquals(decrement ? 1 : 2, current.desiredCapacity());
                     assertEquals(decrement ? 1 : 2, activeCount(current));
                     assertFalse(current.instances().stream().anyMatch(item -> instance.equals(item.instanceId())));
-                    Activity completed = client.describeScalingActivities(request -> request.autoScalingGroupName(name))
-                            .activities().stream().filter(item -> response.activityId().equals(item.activityId()))
-                            .findFirst().orElseThrow();
+                    List<Activity> matching = client.describeScalingActivities(request -> request
+                            .autoScalingGroupName(name).activityIds(response.activityId())).activities();
+                    assertEquals(1, matching.size(), "The service must filter activities by the requested ID");
+                    Activity completed = matching.getFirst();
+                    assertEquals(response.activityId(), completed.activityId());
                     assertEquals("Successful", completed.statusCodeAsString());
                     assertEquals(100, completed.progress());
                     assertNotNull(completed.endTime());
                     assertEquals(response.startTime(), completed.startTime());
                     assertEquals(response.description(), completed.description());
                 });
+                List<String> requested = client.describeScalingActivities(request -> request.autoScalingGroupName(name))
+                        .activities().stream().map(Activity::activityId).limit(2).toList();
+                assertEquals(2, requested.size());
+                List<String> returned = client.describeScalingActivities(request -> request
+                        .autoScalingGroupName(name).activityIds(requested.get(0), requested.get(1), requested.get(0)))
+                        .activities().stream().map(Activity::activityId).toList();
+                assertEquals(2, returned.size());
+                assertEquals(Set.copyOf(requested), Set.copyOf(returned));
+                assertTrue(client.describeScalingActivities(request -> request.autoScalingGroupName(name)
+                        .activityIds(UUID.randomUUID().toString())).activities().isEmpty());
             });
         }
     }

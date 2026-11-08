@@ -119,6 +119,10 @@ class AutoScalingTerminationTest {
         assertEquals("termination refused", failed.getStatusMessage());
         assertNotNull(failed.getEndTime());
         assertEquals(1, group.getInstances().size());
+        AwsException repeated = assertThrows(AwsException.class,
+                () -> service.terminateInstanceInAutoScalingGroup(REGION, INSTANCE, true));
+        assertEquals("ScalingActivityInProgress", repeated.getErrorCode());
+        assertEquals(0, group.getDesiredCapacity());
         reconciler.reconcile(group);
         assertTrue(group.getInstances().isEmpty());
         assertEquals("Failed", activity(response.getActivityId()).getStatusCode());
