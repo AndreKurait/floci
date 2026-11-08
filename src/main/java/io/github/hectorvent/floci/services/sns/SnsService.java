@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
@@ -78,6 +79,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
@@ -1157,10 +1159,31 @@ public class SnsService implements Resettable, ResourceProvider {
                     400);
         }
 
-        String topicStoreKey = topicKey(region, effectiveArn);
-        Topic topic = topicStore.get(topicStoreKey)
+        Topic topic = findTopic(effectiveArn, region)
                 .orElseThrow(() -> new AwsException("NotFound", "Topic does not exist.", 404));
+        return asTopicOwner(effectiveArn, () -> publishToTopic(topic, effectiveArn, payloadSize, message, subject,
+                messageStructure, messageAttributes, messageGroupId, messageDeduplicationId, region));
+    }
 
+    /**
+     * Runs a publish's fan-out as the account that owns the topic. A Publish may name another
+     * account's topic: AWS resolves the topic in the account its ARN names and authorizes the
+     * caller by that topic's access policy, which IAM enforcement evaluates against the topic's
+     * own account before the request reaches this service. Delivery then happens on the topic
+     * owner's behalf, so every account-scoped lookup it makes must see the owner, not the caller.
+     */
+    private <T> T asTopicOwner(String topicArn, Supplier<T> fanOut) {
+        String owner = AwsArnUtils.accountOrDefault(topicArn, regionResolver.getAccountId());
+        if (owner == null || owner.equals(regionResolver.getAccountId())) {
+            return fanOut.get();
+        }
+        return RequestScopes.callAs(owner, fanOut);
+    }
+
+    private String publishToTopic(Topic topic, String effectiveArn, int payloadSize, String message,
+                                  String subject, String messageStructure,
+                                  Map<String, MessageAttributeValue> messageAttributes,
+                                  String messageGroupId, String messageDeduplicationId, String region) {
         requireWithinMaxMessageSize(payloadSize, maxMessageSize(topic));
 
         validateTopicMessageStructure(message, messageStructure);
@@ -1606,10 +1629,13 @@ public class SnsService implements Resettable, ResourceProvider {
     }
 
     public BatchPublishResult publishBatch(String topicArn, List<Map<String, Object>> entries, String region) {
-        String topicStoreKey = topicKey(region, topicArn);
-        Topic topic = topicStore.get(topicStoreKey)
+        Topic topic = findTopic(topicArn, region)
                 .orElseThrow(() -> new AwsException("NotFound", "Topic does not exist.", 404));
+        return asTopicOwner(topicArn, () -> publishBatchToTopic(topic, topicArn, entries, region));
+    }
 
+    private BatchPublishResult publishBatchToTopic(Topic topic, String topicArn, List<Map<String, Object>> entries,
+                                                   String region) {
         int batchSize = 0;
         for (Map<String, Object> entry : entries) {
             String message = (String) entry.get("Message");
