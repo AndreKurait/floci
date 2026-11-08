@@ -920,14 +920,15 @@ public class AutoScalingQueryHandler {
     }
 
     private Response handleTerminateInstance(MultivaluedMap<String, String> p, String region) {
-        service.terminateInstanceInAutoScalingGroup(region,
+        ScalingActivity activity = service.terminateInstanceInAutoScalingGroup(region,
                 p.getFirst("InstanceId"),
                 "true".equalsIgnoreCase(p.getFirst("ShouldDecrementDesiredCapacity")));
-        return ok(new XmlBuilder()
+        XmlBuilder xml = new XmlBuilder()
                 .start("TerminateInstanceInAutoScalingGroupResponse", NS)
-                  .start("TerminateInstanceInAutoScalingGroupResult")
-                  .end("TerminateInstanceInAutoScalingGroupResult")
-                  .raw(AwsQueryResponse.responseMetadata())
+                  .start("TerminateInstanceInAutoScalingGroupResult");
+        appendActivityXml(xml, activity, "Activity");
+        return ok(xml.end("TerminateInstanceInAutoScalingGroupResult")
+                .raw(AwsQueryResponse.responseMetadata())
                 .end("TerminateInstanceInAutoScalingGroupResponse").build());
     }
 
@@ -1419,8 +1420,11 @@ public class AutoScalingQueryHandler {
     // ── Activities ────────────────────────────────────────────────────────────
 
     private Response handleDescribeScalingActivities(MultivaluedMap<String, String> p, String region) {
+        Set<String> activityIds = new HashSet<>(indexedMembers(p, "ActivityIds"));
         List<ScalingActivity> activities = service.describeScalingActivities(
-                region, p.getFirst("AutoScalingGroupName"));
+                region, p.getFirst("AutoScalingGroupName")).stream()
+                .filter(activity -> activityIds.isEmpty() || activityIds.contains(activity.getActivityId()))
+                .toList();
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeScalingActivitiesResponse", NS)
                   .start("DescribeScalingActivitiesResult")
@@ -1440,7 +1444,11 @@ public class AutoScalingQueryHandler {
     }
 
     private static void appendActivityXml(XmlBuilder xml, ScalingActivity a) {
-        xml.start("member")
+        appendActivityXml(xml, a, "member");
+    }
+
+    private static void appendActivityXml(XmlBuilder xml, ScalingActivity a, String element) {
+        xml.start(element)
            .elem("ActivityId", a.getActivityId())
            .elem("AutoScalingGroupName", a.getAutoScalingGroupName())
            .elem("StatusCode", a.getStatusCode())
@@ -1450,7 +1458,7 @@ public class AutoScalingQueryHandler {
         if (a.getCause() != null) { xml.elem("Cause", a.getCause()); }
         if (a.getEndTime() != null) { xml.elem("EndTime", ISO_FMT.format(a.getEndTime())); }
         if (a.getStatusMessage() != null) { xml.elem("StatusMessage", a.getStatusMessage()); }
-        xml.end("member");
+        xml.end(element);
     }
 
     // ── Metadata responses ────────────────────────────────────────────────────

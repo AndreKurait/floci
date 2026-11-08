@@ -479,12 +479,16 @@ public class AutoScalingReconciler {
         AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         staleInstances.forEach(instance -> asgService.completeStandbyActivity(instance, "Failed",
                 "The EC2 instance is no longer running."));
+        List<String> untracked = untrackedTerminations(staleInstances, instanceIds);
+        staleInstances.forEach(instance -> asgService.completeTerminationActivity(instance, "Successful", null));
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
-        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
-                "Removing stale EC2 instance reference(s): " + instanceIds,
-                "Persisted Auto Scaling state referenced instance containers that are no longer running.",
-                "Successful");
+        if (!untracked.isEmpty()) {
+            asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                    "Removing stale EC2 instance reference(s): " + untracked,
+                    "Persisted Auto Scaling state referenced instance containers that are no longer running.",
+                    "Successful");
+        }
         LOG.infov("ASG {0}: removed stale instance reference(s) {1}",
                 asg.getAutoScalingGroupName(), instanceIds);
     }
@@ -701,17 +705,31 @@ public class AutoScalingReconciler {
             List<String> stillPresent = instanceIds.stream()
                     .filter(id -> !isMissingOrTerminalEc2Instance(asg, id, TERMINATED_STATES))
                     .toList();
-            if (!stillPresent.isEmpty()) {
-                recordFailedActivity(asg, description + stillPresent, cause, e);
+            List<String> untracked = untrackedTerminations(selected, stillPresent);
+            selected.stream().filter(instance -> stillPresent.contains(instance.getInstanceId()))
+                    .forEach(instance -> asgService.completeTerminationActivity(instance, "Failed", statusMessage(e, "")));
+            if (!untracked.isEmpty()) {
+                recordFailedActivity(asg, description + untracked, cause, e);
             }
             return;
         }
 
+        List<String> untracked = untrackedTerminations(selected, instanceIds);
+        selected.stream().filter(instance -> instanceIds.contains(instance.getInstanceId()))
+                .forEach(instance -> asgService.completeTerminationActivity(instance, "Successful", null));
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
-        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
-                description + instanceIds, cause, "Successful");
+        if (!untracked.isEmpty()) {
+            asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                    description + untracked, cause, "Successful");
+        }
         LOG.infov("ASG {0}: terminated selected instance(s) {1}", asg.getAutoScalingGroupName(), instanceIds);
+    }
+
+    private static List<String> untrackedTerminations(List<AsgInstance> selected, List<String> instanceIds) {
+        return selected.stream().filter(instance -> instanceIds.contains(instance.getInstanceId()))
+                .filter(instance -> instance.getTerminationActivityId() == null)
+                .map(AsgInstance::getInstanceId).toList();
     }
 
     private static boolean isActiveLifecycleState(String state) {

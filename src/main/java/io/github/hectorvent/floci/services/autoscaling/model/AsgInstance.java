@@ -27,6 +27,7 @@ public class AsgInstance {
     // The EnterStandby or ExitStandby activity the reconciler completes when this instance finishes moving
     // into or out of standby; null otherwise, and for members stored before standby was supported.
     private String standbyActivityId;
+    private String terminationActivityId;
     private Map<String, LaunchLifecycleAction> launchLifecycleActions = new LinkedHashMap<>();
 
     public AsgInstance() {}
@@ -66,6 +67,9 @@ public class AsgInstance {
 
     public String getStandbyActivityId() { return standbyActivityId; }
     public void setStandbyActivityId(String v) { this.standbyActivityId = v; }
+
+    public String getTerminationActivityId() { return terminationActivityId; }
+    public void setTerminationActivityId(String v) { this.terminationActivityId = v; }
 
     public Map<String, LaunchLifecycleAction> getLaunchLifecycleActions() { return launchLifecycleActions; }
     public void setLaunchLifecycleActions(Map<String, LaunchLifecycleAction> v) {

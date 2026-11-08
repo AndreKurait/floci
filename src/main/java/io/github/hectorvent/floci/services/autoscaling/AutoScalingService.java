@@ -671,6 +671,8 @@ public class AutoScalingService implements PassedRoleLookup {
             }
             active.forEach(instance -> completeStandbyActivity(instance, "Cancelled",
                     "The Auto Scaling group was deleted."));
+            active.forEach(instance -> completeTerminationActivity(instance, "Cancelled",
+                    "The Auto Scaling group was deleted."));
             groups.remove(key);
             instanceRefreshes.entrySet().removeIf(e -> region.equals(e.getValue().getRegion())
                     && name.equals(e.getValue().getAutoScalingGroupName()));
@@ -1005,6 +1007,13 @@ public class AutoScalingService implements PassedRoleLookup {
         }
     }
 
+    void completeTerminationActivity(AsgInstance instance, String status, String message) {
+        if (instance.getTerminationActivityId() != null) {
+            completeActivity(instance.getTerminationActivityId(), status, message);
+            instance.setTerminationActivityId(null);
+        }
+    }
+
     public void setInstanceProtection(String region, String groupName, List<String> instanceIds,
                                       boolean protectedFromScaleIn) {
         if (instanceIds == null || instanceIds.isEmpty()) {
@@ -1300,24 +1309,39 @@ public class AutoScalingService implements PassedRoleLookup {
                         && ec2.getState() != null && "running".equals(ec2.getState().getName()));
     }
 
-    public void terminateInstanceInAutoScalingGroup(String region, String instanceId,
-                                                     boolean decrementDesiredCapacity) {
+    public ScalingActivity terminateInstanceInAutoScalingGroup(String region, String instanceId,
+                                                                boolean decrementDesiredCapacity) {
+        List<ScalingActivity> started = new ArrayList<>(1);
         updateGroupOfInstance(region, instanceId, asg -> {
+            AsgInstance instance = asg.getInstances().stream()
+                    .filter(member -> instanceId.equals(member.getInstanceId()))
+                    .findFirst().orElseThrow(() -> instanceNotFound(instanceId));
+            if ("Terminating".equals(instance.getLifecycleState())
+                    && !selectedRefreshOriginalIsRunning(region, asg, instance)) {
+                throw new AwsException("ScalingActivityInProgress",
+                        "Instance '" + instanceId + "' is already being terminated.", 400);
+            }
             InstanceRefresh refresh = activeInstanceRefresh(asg);
             completeInstanceRefreshIfSettled(region, asg.getAutoScalingGroupName(), asg);
             releaseRefreshOwnership(refresh, List.of(instanceId));
-            asg.getInstances().stream()
-                    .filter(i -> instanceId.equals(i.getInstanceId()))
-                    .findFirst()
-                    .ifPresent(instance -> {
-                        completeStandbyActivity(instance, "Cancelled", "The instance was selected for termination.");
-                        instance.setLifecycleState("Terminating");
-                    });
+            completeStandbyActivity(instance, "Cancelled", "The instance was selected for termination.");
+            instance.setLifecycleState("Terminating");
+            instance.setScaleInTermination(true);
+            int previousDesired = asg.getDesiredCapacity();
             if (decrementDesiredCapacity) {
-                int newDesired = Math.max(asg.getMinSize(), asg.getDesiredCapacity() - 1);
+                int newDesired = Math.max(asg.getMinSize(), previousDesired - 1);
                 asg.setDesiredCapacity(newDesired);
             }
+            String cause = "At " + Instant.now().truncatedTo(ChronoUnit.SECONDS) + " instance " + instanceId
+                    + " was taken out of service in response to a user request"
+                    + (previousDesired != asg.getDesiredCapacity() ? ", shrinking the capacity from "
+                    + previousDesired + " to " + asg.getDesiredCapacity() : "") + ".";
+            ScalingActivity activity = recordActivity(region, asg.getAutoScalingGroupName(),
+                    "Terminating EC2 instance: " + instanceId, cause, "InProgress");
+            instance.setTerminationActivityId(activity.getActivityId());
+            started.add(copyOf(activity));
         });
+        return started.getFirst();
     }
 
     private static List<AsgInstance> membersInState(AutoScalingGroup asg, List<String> instanceIds,
