@@ -1118,7 +1118,9 @@ public interface EmulatorConfig {
         /**
          * {@code immediate} follows the job run states without running anything; {@code docker} runs
          * each Spark job run's {@code spark-submit}, and each Hive job run's {@code hive}, in a container of the
-         * application's custom image, or else of the release's EMR Serverless image.
+         * application's custom image, or else of the release's EMR Serverless image; {@code refuse} admits each
+         * job run and ends it FAILED at once, saying that job execution is not available, for deployments that
+         * must not report a run that did not execute.
          */
         @WithDefault("immediate")
         String runnerMode();

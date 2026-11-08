@@ -65,6 +65,11 @@ import java.util.regex.Pattern;
  * and FAILED otherwise. Cancelling it, or its execution timeout, makes it CANCELLING until the driver
  * is stopped, then CANCELLED.
  *
+ * <p>In the {@code refuse} runner mode no run executes and none pretends to: StartJobRun admits the run as
+ * in the other modes (validation, client token, auto-start) and the run ends FAILED at once, never
+ * started, its {@code stateDetails} saying that job execution is not available here. It is not tried
+ * again.
+ *
  * <p>Every public method is synchronized: admitting a run (look up its client token, then write
  * it), settling one and cancelling one each read and then write a run, and must not interleave. A
  * container run's changes come from the thread that runs it, under the same lock.
@@ -83,6 +88,7 @@ public class EmrServerlessJobRunService implements Resettable {
     private static final String MODE_BATCH = "BATCH";
     private static final String MODE_STREAMING = "STREAMING";
     private static final String RUNNER_DOCKER = "docker";
+    private static final String RUNNER_REFUSE = "refuse";
     // The service a container run's driver belongs to, which names it and labels it.
     private static final String SERVICE = "emr-serverless";
     private static final String SPARK_DEFAULTS = "spark-defaults";
@@ -111,6 +117,8 @@ public class EmrServerlessJobRunService implements Resettable {
     static final String DRIVER_NOT_THE_APPLICATIONS = "Floci runs a Spark application's sparkSubmit job runs and a"
             + " Hive application's hive job runs, and this job run's driver is not its application's type.";
     static final String INTERRUPTED = "Floci stopped while the job run was in progress.";
+    static final String EXECUTION_REFUSED = "Job execution is not available on this emulator:"
+            + " floci.services.emrserverless.runner-mode is refuse, so no job run executes.";
 
     private static final Set<String> TERMINAL_STATES = Set.of(STATE_SUCCESS, STATE_FAILED, STATE_CANCELLED);
     private static final List<String> STATES = List.of("SUBMITTED", "PENDING", "SCHEDULED", STATE_RUNNING,
@@ -161,6 +169,8 @@ public class EmrServerlessJobRunService implements Resettable {
     private final String imageTemplate;
     private final String hiveImageTemplate;
     private final String dockerNetwork;
+    // The refuse runner mode: every run ends FAILED as it is admitted.
+    private final boolean refuseExecution;
     // Container runs a thread is running; one not here that has not ended was left by a restart.
     private final Set<String> executing = new HashSet<>();
     // Raised by each reset, so a run's thread from before it writes nothing back after the wipe.
@@ -178,7 +188,8 @@ public class EmrServerlessJobRunService implements Resettable {
                 Executors.newCachedThreadPool(Thread.ofPlatform().daemon().name("emr-serverless-run-", 0).factory()),
                 config.services().emrserverless().imageTemplate().orElse(null),
                 config.services().emrserverless().hiveImageTemplate().orElse(null),
-                config.services().emrserverless().dockerNetwork().orElse(null));
+                config.services().emrserverless().dockerNetwork().orElse(null),
+                RUNNER_REFUSE.equalsIgnoreCase(config.services().emrserverless().runnerMode()));
         // Before any run of this process starts: a driver an earlier one left belongs to a run read as FAILED.
         if (this.sparkRunner != null && config.services().emrserverless().reconcileContainersOnStartup()) {
             sparkRunner.removeLeftoverDrivers(SERVICE);
@@ -205,6 +216,16 @@ public class EmrServerlessJobRunService implements Resettable {
                                ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
                                SparkJobRunner sparkRunner, Executor runExecutor,
                                String imageTemplate, String hiveImageTemplate, String dockerNetwork) {
+        this(store, applications, iamService, regionResolver, requestContext, objectMapper, runDurationSeconds, clock,
+                sparkRunner, runExecutor, imageTemplate, hiveImageTemplate, dockerNetwork, false);
+    }
+
+    EmrServerlessJobRunService(AccountAwareStorageBackend<JobRunRecord> store, EmrServerlessService applications,
+                               IamService iamService, RegionResolver regionResolver, RequestContext requestContext,
+                               ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
+                               SparkJobRunner sparkRunner, Executor runExecutor,
+                               String imageTemplate, String hiveImageTemplate, String dockerNetwork,
+                               boolean refuseExecution) {
         if (runDurationSeconds < 0) {
             throw new IllegalArgumentException(
                     "floci.services.emrserverless.job-run-duration-seconds must not be negative: " + runDurationSeconds);
@@ -222,6 +243,7 @@ public class EmrServerlessJobRunService implements Resettable {
         this.imageTemplate = imageTemplate;
         this.hiveImageTemplate = hiveImageTemplate;
         this.dockerNetwork = dockerNetwork;
+        this.refuseExecution = refuseExecution;
     }
 
     @PreDestroy
@@ -254,7 +276,12 @@ public class EmrServerlessJobRunService implements Resettable {
         }
         JobRunRecord record = applications.admitJobRun(applicationId, app -> checkBatchTimeout(app, body), app -> {
             JobRunRecord admitted = newRun(app, body, original);
-            if (sparkRunner != null) {
+            if (refuseExecution) {
+                admitted.getJobRun().setStateDetails(EXECUTION_REFUSED);
+                finish(admitted, STATE_FAILED, admitted.getJobRun().getCreatedAt());
+                LOG.infov("Refused EMR Serverless job run {0}: the refuse runner mode executes no job",
+                        admitted.getJobRun().getJobRunId());
+            } else if (sparkRunner != null) {
                 launch(admitted, app);
             }
             return admitted;
@@ -471,7 +498,8 @@ public class EmrServerlessJobRunService implements Resettable {
         run.setAttempt(FIRST_ATTEMPT);
         run.setAttemptCreatedAt(now);
         run.setAttemptUpdatedAt(now);
-        if (sparkRunner == null) {
+        // A refused run never starts.
+        if (sparkRunner == null && !refuseExecution) {
             run.setStartedAt(now);
         }
 

@@ -102,6 +102,66 @@ class EmrServerlessJobRunServiceTest {
         assertEquals(0, run.getTotalExecutionDurationSeconds());
     }
 
+    private EmrServerlessJobRunService refusingService() {
+        return new EmrServerlessJobRunService(store, applications, iamService, new RegionResolver(REGION, ACCOUNT_ID),
+                null, objectMapper, 0, clock, null, Runnable::run, null, null, null, true);
+    }
+
+    @Test
+    void refuseModeAdmitsARunAndEndsItFailedWithoutStartingIt() {
+        EmrServerlessJobRunService service = refusingService();
+        JobRun run = service.startJobRun(applicationId, request(null, null));
+
+        assertEquals("FAILED", run.getState());
+        assertEquals(EmrServerlessJobRunService.EXECUTION_REFUSED, run.getStateDetails());
+        assertNull(run.getStartedAt());
+        assertEquals(run.getCreatedAt(), run.getEndedAt());
+        assertEquals(0, run.getTotalExecutionDurationSeconds());
+        clock.advance(Duration.ofHours(13));
+        JobRun read = service.getJobRun(applicationId, run.getJobRunId(), null);
+        assertEquals("FAILED", read.getState());
+        assertEquals(EmrServerlessJobRunService.EXECUTION_REFUSED, read.getStateDetails());
+        assertEquals(1, service.listJobRunAttempts(applicationId, run.getJobRunId(), null, null).items().size());
+        AwsException notCancellable = assertThrows(AwsException.class,
+                () -> service.cancelJobRun(applicationId, run.getJobRunId()));
+        assertEquals("ValidationException", notCancellable.getErrorCode());
+    }
+
+    @Test
+    void refuseModeFailsStreamingRunsAndRetriedRequestsTooAndStillAutoStartsTheApplication() {
+        EmrServerlessJobRunService service = refusingService();
+        StartJobRunRequest streaming = request("STREAMING", null);
+        JobRun run = service.startJobRun(applicationId, streaming);
+
+        assertEquals("FAILED", run.getState());
+        assertEquals(run.getJobRunId(), service.startJobRun(applicationId, streaming).getJobRunId());
+        assertEquals("FAILED", service.getJobRun(applicationId, run.getJobRunId(), null).getState());
+        assertTrue(Set.of("STARTING", "STARTED").contains(applications.getApplication(applicationId).getState()));
+        assertEquals(List.of("FAILED"), service.listJobRuns(applicationId, null, null, null, null, null, null)
+                .items().stream().map(summary -> summary.getState()).toList());
+    }
+
+    @Test
+    void refuseRunnerModeIsReadFromTheConfiguration() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().emrserverless().runnerMode()).thenReturn("refuse");
+        when(config.services().emrserverless().imageTemplate()).thenReturn(Optional.empty());
+        when(config.services().emrserverless().hiveImageTemplate()).thenReturn(Optional.empty());
+        when(config.services().emrserverless().dockerNetwork()).thenReturn(Optional.empty());
+        EmrServerlessSparkRunner sparkRunner = mock(EmrServerlessSparkRunner.class);
+        EmrServerlessJobRunService service = new EmrServerlessJobRunService(new InMemoryStorageFactory(ACCOUNT_ID),
+                applications, iamService, new RegionResolver(REGION, ACCOUNT_ID), null, objectMapper, config, clock,
+                sparkRunner);
+        try {
+            JobRun run = service.startJobRun(applicationId, request(null, null));
+            assertEquals("FAILED", run.getState());
+            assertEquals(EmrServerlessJobRunService.EXECUTION_REFUSED, run.getStateDetails());
+            verify(sparkRunner, times(0)).removeLeftoverDrivers(any());
+        } finally {
+            service.shutdown();
+        }
+    }
+
     @Test
     void positiveDurationKeepsTheRunRunningUntilItHasPassed() {
         EmrServerlessJobRunService service = service(30);
