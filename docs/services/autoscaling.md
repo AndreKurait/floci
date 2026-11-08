@@ -160,6 +160,11 @@ described below.
 Standby transitions complete asynchronously through the reconciler. Entering standby
 preserves the EC2 instance and its group tags. See the lifecycle and capacity rules below.
 
+`TerminateInstanceInAutoScalingGroup` returns an `InProgress` activity. Poll its ID in
+`DescribeScalingActivities` for the reconciliation outcome. The activity remains pending
+while Classic connections drain and survives storage reloads. An EC2 termination failure
+completes that request as `Failed`; deleting the group cancels a pending request.
+
 `CreateAutoScalingGroup` defaults an omitted tag `PropagateAtLaunch` to `true`;
 an explicit `false` keeps that tag on the group. `CreateOrUpdateTags` requires the
 flag on every tag, including existing tags. If any flag is omitted, the request

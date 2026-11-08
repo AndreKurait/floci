@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
+import io.github.hectorvent.floci.services.autoscaling.model.ScalingActivity;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -47,6 +48,24 @@ class AutoScalingStandbyStorageTest {
             "DescribeScalingActivitiesResponse.DescribeScalingActivitiesResult.Activities.member";
     @TempDir Path directory;
     private final List<StorageFactory> factories = new ArrayList<>();
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void acceptedTerminationCompletesTheSameActivityAfterRestart(String mode) throws IOException {
+        AutoScalingService service = storedService(mode);
+        storeGroup(service);
+        ScalingActivity accepted = service.terminateInstanceInAutoScalingGroup(REGION, "i-a", true);
+        service = restart(mode);
+        assertEquals("Terminating", lifecycle(service, "i-a"));
+        assertEquals("InProgress", activity(service, accepted.getActivityId(), "StatusCode"));
+        Ec2Service ec2 = reconcile(service, Set.of());
+        verify(ec2).terminateInstances(REGION, List.of("i-a"));
+        service = restart(mode);
+        assertEquals(List.of("i-b"), memberIds(service));
+        assertEquals("Successful", activity(service, accepted.getActivityId(), "StatusCode"));
+        assertEquals("100", activity(service, accepted.getActivityId(), "Progress"));
+        assertFalse(activity(service, accepted.getActivityId(), "EndTime").isBlank());
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"persistent", "hybrid", "wal"})
