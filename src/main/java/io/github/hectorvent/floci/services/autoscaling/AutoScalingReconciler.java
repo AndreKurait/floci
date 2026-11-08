@@ -225,6 +225,7 @@ public class AutoScalingReconciler {
     public void reconcile(AutoScalingGroup asg) {
         asgService.reconcileIfPresent(asg, () -> {
             settleStandbyMoves(asg);
+            asgService.settleLaunchLifecycleActions(asg, Instant.now());
             removeTerminatingInstances(asg);
             removeStaleInstances(asg);
             promoteReadyInstances(asg);
@@ -357,17 +358,15 @@ public class AutoScalingReconciler {
 
     static long activeCapacity(AutoScalingGroup asg) {
         return asg.getInstances().stream()
-                .filter(i -> {
-                    String state = i.getLifecycleState();
-                    return "Pending".equals(state) || "InService".equals(state);
-                })
+                .filter(instance -> isActiveLifecycleState(instance.getLifecycleState()))
                 .count();
     }
 
     private void promoteReadyInstances(AutoScalingGroup asg) {
         boolean changed = false;
         for (AsgInstance asgInst : asg.getInstances()) {
-            if (!"Pending".equals(asgInst.getLifecycleState())) {
+            if (!"Pending".equals(asgInst.getLifecycleState())
+                    && !"Pending:Proceed".equals(asgInst.getLifecycleState())) {
                 continue;
             }
             try {
@@ -383,6 +382,11 @@ public class AutoScalingReconciler {
                 }
                 if ("running".equals(ec2State)) {
                     boolean returningFromStandby = asgInst.getStandbyActivityId() != null;
+                    if (!returningFromStandby && "Pending".equals(asgInst.getLifecycleState())
+                            && asgService.beginLaunchLifecycleActions(asg, asgInst, Instant.now())) {
+                        changed = true;
+                        continue;
+                    }
                     registerWithTargetGroups(asg, asgInst, returningFromStandby);
                     registerWithClassicLoadBalancers(asg, asgInst, returningFromStandby);
                     asgInst.setLifecycleState("InService");
@@ -543,7 +547,7 @@ public class AutoScalingReconciler {
             return !ec2Service.isInstanceContainerRunning(instance.getInstanceId())
                     && terminateExitedInstance(asg, instance.getInstanceId());
         }
-        if ("Pending".equals(lifecycleState)) {
+        if (AutoScalingService.isPendingLaunch(lifecycleState)) {
             if (instance.getStandbyActivityId() != null) {
                 return isFailedStandbyReturn(asg, instance.getInstanceId());
             }
@@ -711,7 +715,7 @@ public class AutoScalingReconciler {
     }
 
     private static boolean isActiveLifecycleState(String state) {
-        return "Pending".equals(state) || "InService".equals(state);
+        return AutoScalingService.isPendingLaunch(state) || "InService".equals(state);
     }
 
     private boolean scaleOut(AutoScalingGroup asg, int count) {
@@ -1017,8 +1021,9 @@ public class AutoScalingReconciler {
 
     private void scaleIn(AutoScalingGroup asg, int count) {
         List<AsgInstance> candidates = asg.getInstances().stream()
-                .filter(i -> "InService".equals(i.getLifecycleState()))
+                .filter(instance -> isActiveLifecycleState(instance.getLifecycleState()))
                 .filter(i -> !i.isProtectedFromScaleIn())
+                .sorted(Comparator.comparing(instance -> !"InService".equals(instance.getLifecycleState())))
                 .collect(Collectors.toList());
 
         List<AsgInstance> toTerminate = candidates.subList(0, Math.min(count, candidates.size()));

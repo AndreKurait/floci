@@ -45,6 +45,10 @@ public class AutoScalingService implements PassedRoleLookup {
     /** The tag Auto Scaling puts on every instance it launches or attaches, valued with the group's name. */
     static final String GROUP_NAME_TAG = "aws:autoscaling:groupName";
 
+    static boolean isPendingLaunch(String state) {
+        return "Pending".equals(state) || "Pending:Wait".equals(state) || "Pending:Proceed".equals(state);
+    }
+
     private static final Set<String> DETACHABLE_STATES = Set.of("InService", "Standby", "Pending:Retained",
             "Terminating:Retained", "Warmed:Pending:Retained", "Warmed:Terminating:Retained");
 
@@ -1597,23 +1601,50 @@ public class AutoScalingService implements PassedRoleLookup {
         synchronized (lockFor(asgKey(region, asgName))) {
             requireGroup(region, asgName);
             validateLifecycleHookName(hookName);
+            if (heartbeatTimeout != null && (heartbeatTimeout < 30 || heartbeatTimeout > 7200)) {
+                throw new AwsException("ValidationError", "HeartbeatTimeout must be between 30 and 7200 seconds", 400);
+            }
+            if (defaultResult != null && !Set.of("CONTINUE", "ABANDON").contains(defaultResult)) {
+                throw new AwsException("ValidationError", "DefaultResult must be CONTINUE or ABANDON", 400);
+            }
             String key = hookKey(region, asgName, hookName);
-            LifecycleHook hook = hooks.computeIfAbsent(key, k -> new LifecycleHook());
+            LifecycleHook hook = hooks.getOrDefault(key, new LifecycleHook());
+            if (transition != null && !Set.of("autoscaling:EC2_INSTANCE_LAUNCHING",
+                    "autoscaling:EC2_INSTANCE_TERMINATING").contains(transition)) {
+                throw new AwsException("ValidationError", "Invalid LifecycleTransition", 400);
+            }
+            if (transition == null && hook.getLifecycleTransition() == null) {
+                throw new AwsException("ValidationError", "LifecycleTransition is required for a new hook", 400);
+            }
             hook.setLifecycleHookName(hookName);
             hook.setAutoScalingGroupName(asgName);
-            hook.setLifecycleTransition(transition);
-            hook.setNotificationTargetArn(notificationTargetArn);
-            hook.setRoleArn(roleArn);
-            hook.setNotificationMetadata(notificationMetadata);
+            if (transition != null) { hook.setLifecycleTransition(transition); }
+            if (notificationTargetArn != null) { hook.setNotificationTargetArn(notificationTargetArn); }
+            if (roleArn != null) { hook.setRoleArn(roleArn); }
+            if (notificationMetadata != null) { hook.setNotificationMetadata(notificationMetadata); }
             if (heartbeatTimeout != null) { hook.setHeartbeatTimeout(heartbeatTimeout); }
             if (defaultResult != null) { hook.setDefaultResult(defaultResult); }
+            hook.setGlobalTimeout(Math.min(172800, hook.getHeartbeatTimeout() * 100));
             hooks.put(key, hook);
         }
     }
 
     public void deleteLifecycleHook(String region, String asgName, String hookName) {
         validateLifecycleHookName(hookName);
-        hooks.remove(hookKey(region, asgName, hookName));
+        synchronized (lockFor(asgKey(region, asgName))) {
+            AutoScalingGroup group = requireGroup(region, asgName);
+            for (AsgInstance instance : group.getInstances()) {
+                LaunchLifecycleAction action = instance.getLaunchLifecycleActions().get(hookName);
+                if ("Pending:Wait".equals(instance.getLifecycleState()) && action != null && action.result() == null) {
+                    instance.getLaunchLifecycleActions().put(hookName,
+                            action.complete("ABANDON", "Lifecycle hook deleted"));
+                }
+            }
+            hooks.remove(hookKey(region, asgName, hookName));
+            settleLaunchLifecycleActions(group, Instant.now());
+            saveAutoScalingGroupIfPresent(group);
+            requestReconciliation(group);
+        }
     }
 
     /**
@@ -1630,7 +1661,8 @@ public class AutoScalingService implements PassedRoleLookup {
         // reject a hook created through the normal path — it exists to fail loudly, not silently
         // no-op, if a corrupted or hand-authored physical id ever reaches this delete path.
         validateLifecycleHookName(hookName);
-        List<String> keys = new ArrayList<>();
+        record HookLocation(String region, String groupName) {}
+        List<HookLocation> selected = new ArrayList<>();
         for (Map.Entry<String, LifecycleHook> entry : hooks.entrySet()) {
             LifecycleHook hook = entry.getValue();
             if (hook == null || !hookName.equals(hook.getLifecycleHookName())) {
@@ -1639,9 +1671,12 @@ public class AutoScalingService implements PassedRoleLookup {
             if (region != null && !entry.getKey().startsWith(region + "::")) {
                 continue;
             }
-            keys.add(entry.getKey());
+            selected.add(new HookLocation(entry.getKey().substring(0, entry.getKey().indexOf("::")),
+                    hook.getAutoScalingGroupName()));
         }
-        keys.forEach(hooks::remove);
+        for (HookLocation hook : selected) {
+            deleteLifecycleHook(hook.region(), hook.groupName(), hookName);
+        }
     }
 
     public List<LifecycleHook> describeLifecycleHooks(String region, String asgName, List<String> hookNames) {
@@ -1660,11 +1695,104 @@ public class AutoScalingService implements PassedRoleLookup {
 
     public void completeLifecycleAction(String region, String asgName, String hookName,
                                          String instanceId, String actionResult, String token) {
-        // Stored-only — Phase 2 reconciler observes this via the instance lifecycle state
-        requireGroup(region, asgName);
+        if (actionResult == null || !Set.of("CONTINUE", "ABANDON").contains(actionResult)) {
+            throw new AwsException("ValidationError", "LifecycleActionResult must be CONTINUE or ABANDON", 400);
+        }
+        synchronized (lockFor(asgKey(region, asgName))) {
+            AutoScalingGroup group = requireGroup(region, asgName);
+            AsgInstance instance = findLaunchLifecycleAction(group, hookName, instanceId, token, Instant.now());
+            LaunchLifecycleAction action = instance.getLaunchLifecycleActions().get(hookName);
+            instance.getLaunchLifecycleActions().put(hookName,
+                    action.complete(actionResult, "Lifecycle action completed"));
+            settleLaunchLifecycleActions(group, Instant.now());
+            saveAutoScalingGroupIfPresent(group);
+            requestReconciliation(group);
+        }
+    }
+
+    public void recordLifecycleActionHeartbeat(String region, String asgName, String hookName,
+                                                String instanceId, String token) {
+        synchronized (lockFor(asgKey(region, asgName))) {
+            AutoScalingGroup group = requireGroup(region, asgName);
+            Instant now = Instant.now();
+            AsgInstance instance = findLaunchLifecycleAction(group, hookName, instanceId, token, now);
+            LaunchLifecycleAction action = instance.getLaunchLifecycleActions().get(hookName);
+            instance.getLaunchLifecycleActions().put(hookName, action.heartbeat(now));
+            saveAutoScalingGroupIfPresent(group);
+        }
+    }
+
+    private AsgInstance findLaunchLifecycleAction(AutoScalingGroup group, String hookName,
+                                                   String instanceId, String token, Instant now) {
         validateLifecycleHookName(hookName);
         if (token != null) {
             validateLifecycleActionToken(token);
+        }
+        if ((token == null || token.isBlank()) && (instanceId == null || instanceId.isBlank())) {
+            throw new AwsException("ValidationError", "Specify LifecycleActionToken or InstanceId", 400);
+        }
+        for (AsgInstance instance : group.getInstances()) {
+            if (!"Pending:Wait".equals(instance.getLifecycleState())
+                    || (instanceId != null && !instanceId.equals(instance.getInstanceId()))) {
+                continue;
+            }
+            LaunchLifecycleAction action = instance.getLaunchLifecycleActions().get(hookName);
+            if (action != null && action.result() == null && !action.expired(now)
+                    && (token == null || token.equals(action.token()))) {
+                return instance;
+            }
+        }
+        throw new AwsException("ValidationError", "No active Lifecycle Action found for the supplied hook and instance", 400);
+    }
+
+    /** Called under the group lock before a newly running instance can register with a load balancer. */
+    boolean beginLaunchLifecycleActions(AutoScalingGroup group, AsgInstance instance, Instant now) {
+        List<LifecycleHook> launching = describeLifecycleHooks(
+                group.getRegion(), group.getAutoScalingGroupName(), null).stream()
+                .filter(hook -> "autoscaling:EC2_INSTANCE_LAUNCHING".equals(hook.getLifecycleTransition()))
+                .toList();
+        if (launching.isEmpty()) {
+            return false;
+        }
+        for (LifecycleHook hook : launching) {
+            instance.getLaunchLifecycleActions().put(hook.getLifecycleHookName(),
+                    LaunchLifecycleAction.start(hook, now));
+        }
+        instance.setLifecycleState("Pending:Wait");
+        return true;
+    }
+
+    /** Resolve all hooks for each waiting instance; a single abandonment prevents admission. */
+    void settleLaunchLifecycleActions(AutoScalingGroup group, Instant now) {
+        boolean changed = false;
+        for (AsgInstance instance : group.getInstances()) {
+            if (!"Pending:Wait".equals(instance.getLifecycleState())
+                    || instance.getLaunchLifecycleActions().isEmpty()) {
+                continue;
+            }
+            changed |= instance.getLaunchLifecycleActions().values().stream()
+                    .anyMatch(action -> action.result() == null && action.expired(now));
+            instance.getLaunchLifecycleActions().replaceAll((name, action) ->
+                    action.result() == null && action.expired(now)
+                            ? action.complete(action.defaultResult(), "Heartbeat Timeout") : action);
+            LaunchLifecycleAction abandoned = instance.getLaunchLifecycleActions().values().stream()
+                    .filter(action -> "ABANDON".equals(action.result())).findFirst().orElse(null);
+            if (abandoned != null) {
+                changed = true;
+                instance.setLifecycleState("Terminating");
+                instance.setScaleInTermination(false);
+                recordActivity(group.getRegion(), group.getAutoScalingGroupName(),
+                        "Launching a new EC2 instance: " + instance.getInstanceId(),
+                        "Lifecycle Action with token " + abandoned.token() + " was abandoned: " + abandoned.reason(),
+                        "Failed");
+            } else if (instance.getLaunchLifecycleActions().values().stream()
+                    .allMatch(action -> "CONTINUE".equals(action.result()))) {
+                changed = true;
+                instance.setLifecycleState("Pending:Proceed");
+            }
+        }
+        if (changed) {
+            saveAutoScalingGroupIfPresent(group);
         }
     }
 
@@ -2495,7 +2623,7 @@ public class AutoScalingService implements PassedRoleLookup {
 
     private static boolean isRefreshCandidate(AsgInstance instance, AutoScalingGroup asg, boolean skipMatching) {
         String state = instance.getLifecycleState();
-        if (!"Pending".equals(state) && !"InService".equals(state)) {
+        if (!isPendingLaunch(state) && !"InService".equals(state)) {
             return false;
         }
         if (!skipMatching) {
@@ -2516,7 +2644,7 @@ public class AutoScalingService implements PassedRoleLookup {
         int matchingInService = 0;
         for (AsgInstance instance : asg.getInstances()) {
             String state = instance.getLifecycleState();
-            if ("Terminating".equals(state) || "Pending".equals(state)) {
+            if ("Terminating".equals(state) || isPendingLaunch(state)) {
                 remaining++;
                 continue;
             }
