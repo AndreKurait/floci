@@ -188,6 +188,15 @@ abstract class CodeDeployAgentDockerFixture {
         cleanup.addFirst(() -> iam.removeRoleFromInstanceProfile(request ->
                 request.instanceProfileName(name).roleName(name + "-guest")));
         String deploymentRole = createRole(iam, name + "-deployment", "codedeploy.amazonaws.com");
+        iam.putRolePolicy(request -> request.roleName(name + "-deployment").policyName("lifecycle")
+                .policyDocument("""
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":[
+                          "autoscaling:PutLifecycleHook","autoscaling:DeleteLifecycleHook",
+                          "autoscaling:RecordLifecycleActionHeartbeat","autoscaling:CompleteLifecycleAction"
+                        ],"Resource":"*"}]}
+                        """));
+        cleanup.addFirst(() -> iam.deleteRolePolicy(request ->
+                request.roleName(name + "-deployment").policyName("lifecycle")));
         assertTrue(guestRole.contains(":role/"));
 
         String vpc = ec2.createVpc(request -> request.cidrBlock("10.94.0.0/16")).vpc().vpcId();

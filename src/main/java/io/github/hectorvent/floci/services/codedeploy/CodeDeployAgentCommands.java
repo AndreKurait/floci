@@ -50,6 +50,11 @@ public class CodeDeployAgentCommands {
 
     public synchronized Session open(String account, String region, String executionId, String groupId,
                                      Collection<String> hosts, Map<String, Object> specification) {
+        return open(account, region, executionId, groupId, hosts, specification, true);
+    }
+
+    synchronized Session open(String account, String region, String executionId, String groupId,
+                              Collection<String> hosts, Map<String, Object> specification, boolean reserveGroup) {
         if (stopped) {
             throw new IllegalStateException("Command service is stopped");
         }
@@ -59,9 +64,16 @@ public class CodeDeployAgentCommands {
         if (selected.isEmpty() || sessions.containsKey(key)) {
             throw new IllegalArgumentException("A deployment needs unique execution identity and selected hosts");
         }
-        if (reservations.containsKey(group)) {
+        if (reserveGroup && reservations.containsKey(group)) {
             throw new AwsException("DeploymentLimitExceededException",
                     "The deployment group already has an active deployment", 400);
+        }
+        for (String host : selected) {
+            if (hostSessions.getOrDefault(new HostKey(account, region, host), Set.of()).stream()
+                    .anyMatch(session -> session.group.equals(group))) {
+                throw new AwsException("DeploymentLimitExceededException",
+                        "The instance already has an active deployment in this deployment group", 400);
+            }
         }
         String payload;
         try {
@@ -71,7 +83,9 @@ public class CodeDeployAgentCommands {
         }
         Session session = new Session(key, group, selected, payload);
         sessions.put(key, session);
-        reservations.put(group, session);
+        if (reserveGroup) {
+            reservations.put(group, session);
+        }
         selected.forEach(host -> hostSessions.computeIfAbsent(new HostKey(account, region, host),
                 ignored -> new LinkedHashSet<>()).add(session));
         return session;

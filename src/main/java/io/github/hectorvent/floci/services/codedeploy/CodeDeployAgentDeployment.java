@@ -44,6 +44,9 @@ public class CodeDeployAgentDeployment {
     private static final Logger LOG = Logger.getLogger(CodeDeployAgentDeployment.class);
     private static final List<String> PHASES = List.of("ApplicationStop", "DownloadBundle", "BeforeInstall",
             "Install", "AfterInstall", "ApplicationStart", "ValidateService");
+    private static final List<String> LAUNCH_PHASES = List.of("ApplicationStop", "DownloadBundle", "BeforeInstall",
+            "Install", "AfterInstall", "ApplicationStart", "ValidateService",
+            "BeforeAllowTraffic", "AllowTraffic", "AfterAllowTraffic");
     private static final List<String> TRAFFIC_PHASES = List.of("BeforeBlockTraffic", "BlockTraffic", "AfterBlockTraffic",
             "ApplicationStop", "DownloadBundle", "BeforeInstall", "Install", "AfterInstall",
             "ApplicationStart", "ValidateService", "BeforeAllowTraffic", "AllowTraffic", "AfterAllowTraffic");
@@ -90,6 +93,22 @@ public class CodeDeployAgentDeployment {
 
     public Prepared prepare(String region, DeploymentGroup group, String config, Map<String, Object> revision,
                             String fileExistsBehavior) {
+        return prepare(region, group, config, revision, fileExistsBehavior, null);
+    }
+
+    Prepared prepareAutomatic(String region, DeploymentGroup group, String config, Map<String, Object> revision,
+                              String fileExistsBehavior, String instanceId) {
+        List<Instance> selected = ec2.describeInstances(region, List.of(instanceId), null).stream()
+                .flatMap(reservation -> reservation.getInstances().stream()).toList();
+        if (selected.size() != 1 || selected.getFirst().getState() == null
+                || !"running".equals(selected.getFirst().getState().getName())) {
+            throw new AwsException("InvalidInstanceStatusException", "The automatic deployment host is not running", 400);
+        }
+        return prepare(region, group, config, revision, fileExistsBehavior, instanceId);
+    }
+
+    private Prepared prepare(String region, DeploymentGroup group, String config, Map<String, Object> revision,
+                             String fileExistsBehavior, String automaticInstance) {
         if (fileExistsBehavior == null || !Set.of("DISALLOW", "OVERWRITE", "RETAIN").contains(fileExistsBehavior)) {
             throw new AwsException("InvalidFileExistsBehaviorException",
                     "fileExistsBehavior must be DISALLOW, OVERWRITE or RETAIN", 400);
@@ -141,7 +160,7 @@ public class CodeDeployAgentDeployment {
         CodeDeployClassicTraffic.Plan trafficPlan = style != null
                 && "WITH_TRAFFIC_CONTROL".equals(style.get("deploymentOption"))
                 ? traffic.prepare(account, region, group) : null;
-        List<String> ids = selectInstances(region, group);
+        List<String> ids = automaticInstance == null ? selectInstances(region, group) : List.of(automaticInstance);
         Map<String, String> hosts = new LinkedHashMap<>();
         ids.forEach(id -> hosts.put(id, AwsArnUtils.Arn.of("ec2", region, account, "instance/" + id).toString()));
         return new Prepared(account, region, group.getDeploymentGroupId(), effectiveConfig,
@@ -219,7 +238,7 @@ public class CodeDeployAgentDeployment {
                         Map.of("FileExistsBehavior", prepared.fileExistsBehavior())),
                 "Revision", Map.of("RevisionType", "S3", "S3Revision", prepared.source()));
         return commands.open(prepared.account(), prepared.region(), deployment.getDeploymentId(), prepared.groupId(),
-                prepared.hosts().values(), specification);
+                prepared.hosts().values(), specification, !"autoScaling".equals(deployment.getCreator()));
     }
 
     public void run(Prepared prepared, CodeDeployAgentCommands.Session session, Deployment deployment,
@@ -232,12 +251,15 @@ public class CodeDeployAgentDeployment {
         List<CompletableFuture<Boolean>> workers = new ArrayList<>();
         AtomicBoolean terminating = new AtomicBoolean();
         BooleanSupplier cancelled = () -> stop.get() || terminating.get();
+        boolean launch = "autoScaling".equals(deployment.getCreator());
+        List<String> phases = launch ? LAUNCH_PHASES
+                : prepared.traffic() == null ? PHASES : TRAFFIC_PHASES;
         Outcome outcome;
         try {
             deployment.setStartTime(now());
             deployment.setStatus("InProgress");
             int succeeded = 0;
-            if (!ONE_AT_A_TIME.equals(prepared.config())) {
+            if (!launch && !ONE_AT_A_TIME.equals(prepared.config())) {
                 int unavailableLimit = HALF_AT_A_TIME.equals(prepared.config()) ? targets.size() / 2 : targets.size();
                 int next = 0;
                 int failed = 0;
@@ -251,7 +273,7 @@ public class CodeDeployAgentDeployment {
                         pending.add(result);
                         Thread.ofVirtual().name("codedeploy-agent-" + target.get("targetId")).start(() -> {
                             try {
-                                result.complete(runHost(prepared, session, target, cancelled));
+                                result.complete(runHost(prepared, session, target, cancelled, phases));
                             } catch (Throwable failure) {
                                 result.completeExceptionally(failure);
                             }
@@ -274,7 +296,7 @@ public class CodeDeployAgentDeployment {
                 }
             } else {
                 for (Map<String, Object> target : targets) {
-                    if (!runHost(prepared, session, target, cancelled)) {
+                    if (!runHost(prepared, session, target, cancelled, phases)) {
                         break;
                     }
                     succeeded++;
@@ -318,11 +340,11 @@ public class CodeDeployAgentDeployment {
     }
 
     private boolean runHost(Prepared prepared, CodeDeployAgentCommands.Session session,
-                             Map<String, Object> target, BooleanSupplier cancelled)
+                             Map<String, Object> target, BooleanSupplier cancelled, List<String> phases)
             throws InterruptedException, ExecutionException {
         String host = prepared.hosts().get(target.get("targetId"));
         update(target, "InProgress");
-        for (String phase : prepared.traffic() == null ? PHASES : TRAFFIC_PHASES) {
+        for (String phase : phases) {
             if (cancelled.getAsBoolean()) {
                 throw new CancellationException("Deployment was stopped");
             }
@@ -334,8 +356,10 @@ public class CodeDeployAgentDeployment {
                 if ("BlockTraffic".equals(phase) || "AllowTraffic".equals(phase)) {
                     event.put("startTime", now());
                     event.put("status", "InProgress");
-                    traffic.change(prepared.traffic(), (String) target.get("targetId"),
-                            "AllowTraffic".equals(phase), phaseTimeout, cancelled);
+                    if (prepared.traffic() != null) {
+                        traffic.change(prepared.traffic(), (String) target.get("targetId"),
+                                "AllowTraffic".equals(phase), phaseTimeout, cancelled);
+                    }
                     event.put("endTime", now());
                     event.put("status", "Succeeded");
                     continue;

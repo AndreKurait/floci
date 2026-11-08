@@ -319,8 +319,10 @@ its captured `DefaultResult`; later hook updates do not rewrite actions already
 in progress. Deleting a launch hook abandons its outstanding actions. Action
 tokens, deadlines and results are stored with the owning instance.
 
-Termination lifecycle actions, lifecycle notification delivery to SNS or SQS,
-and CodeDeploy-managed hook installation are not implemented yet.
+CodeDeploy installs and completes managed launch hooks for its attached deployment
+groups; see [Auto Scaling launch deployments](codedeploy.md#auto-scaling-launch-deployments).
+Termination lifecycle actions and lifecycle notification delivery to SNS or SQS
+are not implemented yet.
 
 ### Scaling Policies
 

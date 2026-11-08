@@ -1722,6 +1722,26 @@ public class AutoScalingService implements PassedRoleLookup {
         }
     }
 
+    public record LaunchInstance(String instanceId, String lifecycleState, LaunchLifecycleAction action) {}
+
+    /** A managed deployment observes immutable actions under the same lock that completes them. */
+    public List<LaunchInstance> launchInstances(String region, String asgName, String hookName) {
+        synchronized (lockFor(asgKey(region, asgName))) {
+            AutoScalingGroup group = groups.get(asgKey(region, asgName));
+            if (group == null) {
+                return List.of();
+            }
+            List<LaunchInstance> instances = new ArrayList<>();
+            for (AsgInstance instance : group.getInstances()) {
+                LaunchLifecycleAction action = instance.getLaunchLifecycleActions().get(hookName);
+                if (action != null) {
+                    instances.add(new LaunchInstance(instance.getInstanceId(), instance.getLifecycleState(), action));
+                }
+            }
+            return List.copyOf(instances);
+        }
+    }
+
     private AsgInstance findLaunchLifecycleAction(AutoScalingGroup group, String hookName,
                                                    String instanceId, String token, Instant now) {
         validateLifecycleHookName(hookName);

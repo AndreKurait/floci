@@ -50,6 +50,26 @@ class CodeDeployAgentCommandsTest {
     }
 
     @Test
+    void automaticLaunchesCanOverlapTheGroupButNeverItsExistingHost() {
+        CodeDeployAgentCommands.Session user = open("d-user", HOST);
+        String launched = HOST + "-new";
+        CodeDeployAgentCommands.Session launch = mailbox.open(
+                ACCOUNT, REGION, "d-launch", "group", List.of(launched), Map.of(), false);
+        assertThrows(AwsException.class, () -> mailbox.open(
+                ACCOUNT, REGION, "d-overlap", "group", List.of(HOST), Map.of(), false));
+        assertThrows(AwsException.class, () -> mailbox.open(
+                ACCOUNT, REGION, "d-duplicate", "group", List.of(launched), Map.of(), false));
+        mailbox.close(user);
+        assertThrows(AwsException.class, () -> mailbox.open(
+                ACCOUNT, REGION, "d-user-overlap", "group", List.of(launched), Map.of()));
+        CodeDeployAgentCommands.Session nextUser = open("d-user-next", HOST);
+        mailbox.close(launch);
+        assertThrows(AwsException.class, () -> open("d-third-user", HOST + "-third"));
+        mailbox.close(nextUser);
+        mailbox.open(ACCOUNT, REGION, "d-after", "group", List.of(launched), Map.of());
+    }
+
+    @Test
     void agentAcknowledgementAndCompletionDriveTheResultAndRetriesRemainIdempotent() {
         CodeDeployAgentCommands.Session session = open("d-first", HOST);
         CodeDeployAgentCommands.Ticket ticket = mailbox.enqueue(session, HOST, "DownloadBundle");

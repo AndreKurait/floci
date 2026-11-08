@@ -28,9 +28,11 @@ further host can be taken offline, and requires all hosts to have been attempted
 with at least half succeeding, rounding up. Custom health policies, target-group
 traffic control, and blue/green Server deployments are rejected before queuing
 agent commands.
-Prior revision-health scheduling and Auto Scaling launch hooks are not
-implemented. Group membership cannot establish that newly launched instances
-received the last successful revision.
+Auto Scaling launch deployments select a new waiting instance and install the
+last successful revision before completing their managed launch action. They
+can overlap a normal deployment to different hosts. A newer successful revision
+triggers a follow-on update unless the group's outdated-instance strategy is
+`IGNORE`. Prior revision-health scheduling remains unsupported.
 Enabled deployment alarms, restart mode, outdated-instance filtering, ignored
 stop failures, and per-request alarm, target or EC2-process overrides
 are rejected rather than silently discarded.
@@ -205,5 +207,7 @@ secure endpoint's separate permission requirement.
 
 Configuration-only API tests, a command-protocol simulator and a
 `CreateDeployment` success response are insufficient. Native AMI initialization,
-complete service rollouts and Auto Scaling launch hooks remain separate
-qualifications until their real paths execute.
+complete service rollouts and native Auto Scaling launch deployments remain
+separate qualifications until their real paths execute. The signed SDK launch
+tests use explicit agent mailbox replies; they establish orchestration behavior,
+not guest installation.
