@@ -151,16 +151,17 @@ public class CodeDeployJsonHandler {
         String deploymentConfigName = req.has("deploymentConfigName") ? req.path("deploymentConfigName").asText() : null;
         String serviceRoleArn = req.has("serviceRoleArn") ? req.path("serviceRoleArn").asText() : null;
         Map<String, Object> fields = extractGroupFields(req);
-        DeploymentGroup group = service.updateDeploymentGroup(region, appName, currentGroupName, newGroupName,
+        CodeDeployService.UpdatedDeploymentGroup result = service.updateDeploymentGroupWithHooks(
+                region, appName, currentGroupName, newGroupName,
                 deploymentConfigName, serviceRoleArn, fields);
-        return Response.ok(Map.of()).build();
+        return Response.ok(Map.of("hooksNotCleanedUp", result.hooksNotCleanedUp())).build();
     }
 
     private Response deleteDeploymentGroup(JsonNode req, String region) {
         String appName = req.path("applicationName").asText(null);
         String groupName = req.path("deploymentGroupName").asText(null);
-        service.deleteDeploymentGroup(region, appName, groupName);
-        return Response.ok(Map.of("hooksNotCleanedUp", List.of())).build();
+        return Response.ok(Map.of("hooksNotCleanedUp",
+                service.deleteDeploymentGroupWithHooks(region, appName, groupName))).build();
     }
 
     private Response listDeploymentGroups(JsonNode req, String region) {

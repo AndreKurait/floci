@@ -504,6 +504,21 @@ class CodeDeployAgentDeploymentTest {
         assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
     }
 
+    @Test
+    void automaticLaunchUsesLaunchEventsWithoutTakingExistingCapacityOffline() throws Exception {
+        members(FIRST);
+        Running run = start(prepare("CodeDeployDefault.HalfAtATime"), "autoScaling");
+        succeed(FIRST);
+        complete(FIRST, "BeforeAllowTraffic", "Succeeded", "{}");
+        complete(FIRST, "AfterAllowTraffic", "Succeeded", "{}");
+        done(run);
+        assertEquals("Succeeded", run.deployment().getStatus());
+        List<?> events = (List<?>) run.targets().getFirst().get("lifecycleEvents");
+        assertEquals(List.of("ApplicationStop", "DownloadBundle", "BeforeInstall", "Install", "AfterInstall",
+                "ApplicationStart", "ValidateService", "BeforeAllowTraffic", "AllowTraffic", "AfterAllowTraffic"),
+                events.stream().map(event -> ((Map<?, ?>) event).get("lifecycleEventName")).toList());
+    }
+
     private void succeed(String instance) {
         for (String phase : PHASES) {
             complete(instance, phase, "Succeeded", "{}");
@@ -564,11 +579,16 @@ class CodeDeployAgentDeploymentTest {
     }
 
     private Running start(CodeDeployAgentDeployment.Prepared prepared) {
+        return start(prepared, "user");
+    }
+
+    private Running start(CodeDeployAgentDeployment.Prepared prepared, String creator) {
         Deployment deployment = new Deployment();
         deployment.setDeploymentId("d-test");
         deployment.setApplicationName("app");
         deployment.setDeploymentGroupName("group");
         deployment.setStatus("Queued");
+        deployment.setCreator(creator);
         List<Map<String, Object>> targets = prepared.instanceIds().stream().map(id -> {
             Map<String, Object> target = new ConcurrentHashMap<>();
             target.put("targetId", id);

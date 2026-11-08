@@ -40,7 +40,7 @@ existing application storage and region visibility.
 | `CreateDeploymentGroup` | Stores group config; supports `ecsServices` and `loadBalancerInfo` for ECS blue/green; deployment config defaults to `CodeDeployDefault.OneAtATime` |
 | `GetDeploymentGroup` | Returns group metadata |
 | `UpdateDeploymentGroup` | Partial update; supports rename via `newDeploymentGroupName` |
-| `DeleteDeploymentGroup` | Returns `hooksNotCleanedUp: []` |
+| `DeleteDeploymentGroup` | Removes managed launch hooks and reports any `hooksNotCleanedUp` |
 | `ListDeploymentGroups` | Returns all group names for an application |
 | `BatchGetDeploymentGroups` | Returns info for multiple groups |
 
@@ -127,6 +127,34 @@ revision and its file handling policy; the original result remains visible.
 Per-deployment rollback settings override the group's settings. Successful
 revision history persists across restarts and is scoped to the account, Region
 and group ID. Automatic alarm and request-stop policy triggers remain unsupported.
+
+### Auto Scaling launch deployments
+
+Creating or updating a Server deployment group with Auto Scaling groups installs
+a managed launch hook in each group. These operations use the CodeDeploy service
+role. Groups stored by an older Floci version gain their hooks on the next
+`UpdateDeploymentGroup`. A new instance waits while the agent installs the last
+successful S3 revision, including its recorded object version, ETag and file handling policy. A group with
+no successful revision releases its first instances for an initial deployment.
+
+The managed hook has a ten-minute heartbeat timeout. The coordinator sends
+five-minute heartbeats while a deployment is running. Success completes
+the launch action with `CONTINUE`; failure or stop completes it with `ABANDON`, so
+Auto Scaling replaces the failed instance. Normal agent deadlines still apply.
+Launch deployments run the application and allow-traffic events, without block-traffic
+events. They select only the new instance and can run alongside a normal deployment
+to other members. Two deployments in the same group cannot occupy the same host.
+
+If a normal deployment finishes while an older launch revision is being installed,
+a follow-on deployment updates the new instance after admission. Setting the group's
+`outdatedInstancesStrategy` to `IGNORE` retains the older revision. Finishing an
+automatic deployment never replaces the group's successful-revision history.
+
+Detach and delete remove the managed hooks. Both `UpdateDeploymentGroup` and
+`DeleteDeploymentGroup` return actual `hooksNotCleanedUp` references when cleanup
+is denied; custom hooks are preserved. Termination deployments and delivery of
+lifecycle notifications through a customer-visible SNS or SQS resource remain
+unsupported. The local coordinator observes stored launch actions directly.
 
 With IAM enforcement enabled, the default host-agent API authenticates signed
 instance-profile credentials and limits them to that instance's commands. It
