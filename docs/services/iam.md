@@ -800,6 +800,13 @@ resource or trust policy that referred to the old name still refers to it after 
 | GetContextKeysForCustomPolicy | Lists the context keys referenced across a set of policy documents. |
 | GetContextKeysForPrincipalPolicy | Lists the context keys referenced across a resolved principal's policies, plus any additional documents supplied. |
 
+Both simulation operations populate `aws:ResourceArn` and `aws:ARN` for each evaluated
+resource, including the default `*` when `ResourceArns` is omitted. Each action/resource pair
+gets its own condition context, including when results are paginated. Explicit `ContextEntries`
+override `aws:ResourceArn` case-insensitively. Overrides of `aws:ARN` require the lowercase
+`aws:` namespace, while the `ARN` suffix is case-insensitive. Other missing condition keys
+remain absent.
+
 `GetContextKeysForCustomPolicy` and `GetContextKeysForPrincipalPolicy` return every Condition
 operator's key, and every `${...}` policy variable found in a Resource pattern or a Condition
 value, in the order statements are found. A variable's default value (`${key, 'default'}`) is
