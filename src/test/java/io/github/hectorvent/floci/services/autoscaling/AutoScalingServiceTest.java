@@ -40,6 +40,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -1691,9 +1692,16 @@ class AutoScalingServiceTest {
     void completeLifecycleActionAllowsNullTokenWhenInstanceIdIdentifiesTheAction() {
         service.putLifecycleHook(REGION, "test-asg", "hook-1", "autoscaling:EC2_INSTANCE_LAUNCHING",
                 null, null, null, null, null);
+        AutoScalingGroup group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        AsgInstance pending = new AsgInstance();
+        pending.setInstanceId("i-0123456789abcdef0");
+        pending.setLifecycleState("Pending");
+        group.getInstances().add(pending);
+        service.beginLaunchLifecycleActions(group, pending, Instant.now());
 
         assertDoesNotThrow(() -> service.completeLifecycleAction(REGION, "test-asg", "hook-1",
                 "i-0123456789abcdef0", "CONTINUE", null));
+        assertEquals("Pending:Proceed", pending.getLifecycleState());
     }
 
     @Test

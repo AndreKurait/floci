@@ -3,13 +3,16 @@ package io.github.hectorvent.floci.services.autoscaling.model;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class AsgInstance {
 
     private String instanceId;
     private String availabilityZone;
-    // Pending | InService | EnteringStandby | Standby | Terminating | Terminated | Detached
+    // Pending | Pending:Wait | Pending:Proceed | InService | EnteringStandby | Standby | Terminating | Terminated | Detached
     private String lifecycleState;
     private String healthStatus;     // Healthy | Unhealthy
     private String launchConfigurationName;
@@ -24,6 +27,7 @@ public class AsgInstance {
     // The EnterStandby or ExitStandby activity the reconciler completes when this instance finishes moving
     // into or out of standby; null otherwise, and for members stored before standby was supported.
     private String standbyActivityId;
+    private Map<String, LaunchLifecycleAction> launchLifecycleActions = new LinkedHashMap<>();
 
     public AsgInstance() {}
 
@@ -62,4 +66,9 @@ public class AsgInstance {
 
     public String getStandbyActivityId() { return standbyActivityId; }
     public void setStandbyActivityId(String v) { this.standbyActivityId = v; }
+
+    public Map<String, LaunchLifecycleAction> getLaunchLifecycleActions() { return launchLifecycleActions; }
+    public void setLaunchLifecycleActions(Map<String, LaunchLifecycleAction> v) {
+        this.launchLifecycleActions = v == null ? new LinkedHashMap<>() : new LinkedHashMap<>(v);
+    }
 }

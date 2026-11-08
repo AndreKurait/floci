@@ -306,6 +306,22 @@ always excludes `Standby` members, including when `Wait` (the AWS default) or
 | `CompleteLifecycleAction` | Signals `CONTINUE` or `ABANDON` for a pending lifecycle action |
 | `RecordLifecycleActionHeartbeat` | Extends the heartbeat timeout for an in-progress lifecycle action |
 
+Launch hooks keep a newly running EC2 host in `Pending:Wait`. Waiting hosts count
+toward desired capacity and are not registered with the group's load balancers.
+Every launch hook must complete with `CONTINUE` before the host moves through
+`Pending:Proceed` to `InService`. An `ABANDON` result terminates the host and lets
+ordinary capacity reconciliation replace it.
+
+Completion and heartbeat calls identify an active action by its hook and either
+instance ID or action token. Heartbeats extend the captured timeout, bounded by
+48 hours or 100 heartbeat periods, whichever is smaller. An expired action uses
+its captured `DefaultResult`; later hook updates do not rewrite actions already
+in progress. Deleting a launch hook abandons its outstanding actions. Action
+tokens, deadlines and results are stored with the owning instance.
+
+Termination lifecycle actions, lifecycle notification delivery to SNS or SQS,
+and CodeDeploy-managed hook installation are not implemented yet.
+
 ### Scaling Policies
 
 | Operation | Notes |

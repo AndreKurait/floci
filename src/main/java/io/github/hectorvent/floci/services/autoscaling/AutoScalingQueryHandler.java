@@ -86,7 +86,7 @@ public class AutoScalingQueryHandler {
                 case "DeleteLifecycleHook"          -> handleDeleteLifecycleHook(p, region);
                 case "DescribeLifecycleHooks"       -> handleDescribeLifecycleHooks(p, region);
                 case "CompleteLifecycleAction"      -> handleCompleteLifecycleAction(p, region);
-                case "RecordLifecycleActionHeartbeat" -> handleRecordLifecycleActionHeartbeat();
+                case "RecordLifecycleActionHeartbeat" -> handleRecordLifecycleActionHeartbeat(p, region);
                 // Scaling policies
                 case "PutScalingPolicy"             -> handlePutScalingPolicy(p, region);
                 case "DeletePolicy"                 -> handleDeletePolicy(p, region);
@@ -1128,7 +1128,10 @@ public class AutoScalingQueryHandler {
                 .end("CompleteLifecycleActionResponse").build());
     }
 
-    private Response handleRecordLifecycleActionHeartbeat() {
+    private Response handleRecordLifecycleActionHeartbeat(MultivaluedMap<String, String> p, String region) {
+        service.recordLifecycleActionHeartbeat(region,
+                p.getFirst("AutoScalingGroupName"), p.getFirst("LifecycleHookName"),
+                p.getFirst("InstanceId"), p.getFirst("LifecycleActionToken"));
         return ok(new XmlBuilder()
                 .start("RecordLifecycleActionHeartbeatResponse", NS)
                   .start("RecordLifecycleActionHeartbeatResult").end("RecordLifecycleActionHeartbeatResult")
