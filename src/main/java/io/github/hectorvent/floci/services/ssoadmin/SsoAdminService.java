@@ -84,6 +84,7 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
     private static final Pattern CUSTOMER_MANAGED_POLICY_PATH = Pattern.compile("((/[A-Za-z0-9\\.,\\+@=_-]+)*)/");
     private static final Pattern REGION_NAME = Pattern.compile("([a-z]+-){2,3}\\d");
     private static final Pattern APPLICATION_PROVIDER_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":sso::aws:applicationProvider/[a-zA-Z0-9-/]+");
+    private static final Pattern APPLICATION_PROVIDER_ID = Pattern.compile("[a-zA-Z0-9-/]+");
     private static final Pattern APPLICATION_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":sso::\\d{12}:application/(?:sso)?ins-[a-zA-Z0-9-.]{16}/apl-[a-zA-Z0-9]{16}");
     private static final Pattern TRUSTED_TOKEN_ISSUER_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":sso::\\d{12}:trustedTokenIssuer/(?:sso)?ins-[a-zA-Z0-9-.]{16}/tti-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}");
     private static final Pattern APPLICATION_ACCESS_SCOPE = Pattern.compile("([A-Za-z0-9_]{1,50})(:[A-Za-z0-9_]{1,50}){0,1}(:[A-Za-z0-9_]{1,50}){0,1}");
@@ -144,6 +145,8 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
     private final String defaultRegion;
     /** The seeded instance lives in the deployment's home region, so its ARN takes that partition. */
     private final String bootstrapInstanceArn;
+    /** AWS-managed provider ids CreateApplication admits besides {@code custom}; set from configuration. */
+    private List<String> additionalApplicationProviders = List.of();
 
     @Inject
     public SsoAdminService(StorageFactory storageFactory, IdentityStoreService identityStoreService,
@@ -180,6 +183,27 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
                 requestContext,
                 config.defaultAccountId(),
                 config.defaultRegion());
+        additionalApplicationProviders(config.services().ssoadmin().additionalApplicationProviders().orElse(List.of()));
+    }
+
+    /**
+     * Admits the given AWS-managed application provider ids in CreateApplication besides {@code custom}.
+     * Blank entries and {@code custom} itself are ignored; an id that is not a provider resource id is refused.
+     */
+    void additionalApplicationProviders(List<String> providerIds) {
+        List<String> admitted = new ArrayList<>();
+        for (String providerId : providerIds) {
+            String id = providerId.strip();
+            if (id.isEmpty() || "custom".equals(id) || admitted.contains(id)) {
+                continue;
+            }
+            if (!APPLICATION_PROVIDER_ID.matcher(id).matches()) {
+                throw new IllegalArgumentException(
+                        "floci.services.ssoadmin.additional-application-providers has an invalid provider id: " + id);
+            }
+            admitted.add(id);
+        }
+        additionalApplicationProviders = List.copyOf(admitted);
     }
 
     SsoAdminService(StorageBackend<String, PermissionSet> permissionSets,
@@ -1384,8 +1408,8 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
         if (providerArn.length() > 1224 || !APPLICATION_PROVIDER_ARN.matcher(providerArn).matches()) {
             throw validation("ApplicationProviderArn is invalid.");
         }
-        String customProviderArn = globalArn("sso", region, "aws", "applicationProvider/custom");
-        if (!customProviderArn.equals(providerArn)) {
+        if (!customApplicationProviderArn(region).equals(providerArn) && additionalApplicationProviders.stream()
+                .noneMatch(id -> globalArn("sso", region, "aws", "applicationProvider/" + id).equals(providerArn))) {
             throw notFound("Application provider not found: " + providerArn);
         }
         String name = required(request, "Name");
