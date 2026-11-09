@@ -18,6 +18,10 @@ floci:
       helper-image: floci/network-helper:local
   default-region: us-east-1
   default-account-id: "000000000000"
+  dns:
+    # Host DNS remains opt-in; listener tests use their own addresses and ephemeral ports.
+    # listen-address: 127.0.0.1                    # FLOCI_DNS_LISTEN_ADDRESS
+    container-fallback-enabled: true
   partitions:
     strict: false
     allow-unknown-regions: false

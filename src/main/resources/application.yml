@@ -301,6 +301,9 @@ floci:
         flush-interval-ms: 5000
 
   dns:
+    # Opt in to host DNS, or select a container listener, on a reachable local IPv4 address.
+    # UDP/TCP port 53 must be available. Unset: automatic container DNS only.
+    # listen-address: 127.0.0.1                    # FLOCI_DNS_LISTEN_ADDRESS
     # Extra hostname suffixes resolved to Floci's container IP by the embedded DNS server.
     # Useful when migrating from LocalStack — add localhost.localstack.cloud to avoid
     # changing Lambda endpoint environment variables.

@@ -323,6 +323,8 @@ class EventBridgeSchedulerIntegrationTest {
             public DnsConfig dns() {
                 return new DnsConfig() {
                     @Override
+                    public Optional<String> listenAddress() { return Optional.empty(); }
+                    @Override
                     public Optional<List<String>> extraSuffixes() { return Optional.empty(); }
                     @Override
                     public boolean containerFallbackEnabled() { return true; }
