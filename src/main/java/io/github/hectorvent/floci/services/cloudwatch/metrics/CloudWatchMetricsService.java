@@ -519,9 +519,10 @@ public class CloudWatchMetricsService {
             MetricPercentiles.percentile(alarm.getExtendedStatistic());
         }
         String lowSampleCount = alarm.getEvaluateLowSampleCountPercentile();
-        if (lowSampleCount != null && !"evaluate".equals(lowSampleCount)) {
+        if (lowSampleCount != null && !MetricPercentiles.EVALUATE.equals(lowSampleCount)
+                && !MetricPercentiles.IGNORE.equals(lowSampleCount)) {
             throw CloudWatchMetricsException.invalidParameterValue(
-                    "EvaluateLowSampleCountPercentile currently supports only evaluate.");
+                    "EvaluateLowSampleCountPercentile must be evaluate or ignore.");
         }
         boolean created = alarmStore.get(region + "::" + alarm.getAlarmName()).isEmpty();
         putAlarm(alarm, region);
