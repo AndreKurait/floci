@@ -141,7 +141,7 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean publicAwsApi();
 
-        /** Optional explicit IPv4 front door for the public endpoint TCP bridge. */
+        /** Explicit IPv4 front door for the public TCP bridge and matching recursive VPC DNS answers. */
         Optional<String> publicAwsApiUpstreamHost();
 
         @WithDefault("80")

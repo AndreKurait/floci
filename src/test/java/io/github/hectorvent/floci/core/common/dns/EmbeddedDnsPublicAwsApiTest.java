@@ -145,6 +145,51 @@ class EmbeddedDnsPublicAwsApiTest {
     }
 
     @Test
+    void configuredPublicUpstreamOnlyChangesRecursiveAnswersForKnownVpcClients() {
+        EmbeddedDnsServer dns = server(true, List.of(), List.of(), VPC, List.of(), CONTROL);
+        assertEquals(EmbeddedDnsServer.QueryPlan.ROUTED_UPSTREAM,
+                dns.planQuery("pending.peer.example", CLIENT, CONTROL, 1));
+        assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                dns.planQuery("pending.peer.example", "172.17.0.20", CONTROL, 1));
+        assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                server(false, List.of(), List.of(), VPC, List.of(), CONTROL)
+                        .planQuery("pending.peer.example", CLIENT, CONTROL, 1));
+        DnsClientVpcSource.ClientVpc incomplete =
+                new DnsClientVpcSource.ClientVpc("", "us-east-1", "vpc-caller");
+        assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
+                server(true, List.of(), List.of(), incomplete, List.of(), CONTROL)
+                        .planQuery("pending.peer.example", CLIENT, CONTROL, 1));
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                addresses(dns, "sts.us-east-1.amazonaws.com", CLIENT));
+    }
+
+    @Test
+    void nativeRecordsPrivateZonesAndResolverRulesPrecedeThePublicUpstream() {
+        DnsRecordSource records = new DnsRecordSource() {
+            @Override
+            public Optional<DnsAnswer> resolveIpv4(String name) {
+                return "native.peer.example".equals(name)
+                        ? Optional.of(DnsAnswer.records(List.of(CONTROL), 30)) : Optional.empty();
+            }
+
+            @Override
+            public Optional<DnsAnswer> resolvePrivate(String name, int type,
+                                                       DnsClientVpcSource.ClientVpc origin) {
+                return "sts.us-east-1.amazonaws.com".equals(name)
+                        ? Optional.of(DnsAnswer.records(List.of(CONTROL), 30)) : Optional.empty();
+            }
+        };
+        DnsForwardingRule rule = DnsForwardingRule.forwardTo("corp.example",
+                List.of(new DnsForwardingRule.Target("10.87.0.53")));
+        DnsForwardingRuleSource rules = (account, region, vpc) -> List.of(rule);
+        EmbeddedDnsServer dns = server(true, List.of(records), List.of(rules), VPC, List.of(), CONTROL);
+        assertEquals(List.of(CONTROL), addresses(dns, "native.peer.example", CLIENT));
+        assertEquals(List.of(CONTROL), addresses(dns, "sts.us-east-1.amazonaws.com", CLIENT));
+        assertEquals(EmbeddedDnsServer.QueryPlan.forwardingTo(rule.targets()),
+                dns.planQuery("api.corp.example", CLIENT, CONTROL, 1));
+    }
+
+    @Test
     void exactPeerNamesSupportSingleLabelsAndUnderscoresWithoutSuffixExpansion() {
         for (String name : List.of("peer", "peer_service.example", "_peer", "123",
                 "1.2.3.999", "x".repeat(63) + ".example")) {
@@ -177,10 +222,17 @@ class EmbeddedDnsPublicAwsApiTest {
     private static EmbeddedDnsServer server(boolean enabled, List<DnsRecordSource> records,
                                             List<DnsForwardingRuleSource> rules,
                                             DnsClientVpcSource.ClientVpc identity, List<String> publicHosts) {
+        return server(enabled, records, rules, identity, publicHosts, null);
+    }
+
+    private static EmbeddedDnsServer server(boolean enabled, List<DnsRecordSource> records,
+                                            List<DnsForwardingRuleSource> rules,
+                                            DnsClientVpcSource.ClientVpc identity, List<String> publicHosts,
+                                            String publicUpstream) {
         DnsClientVpcSource clients = address -> CLIENT.equals(address)
                 ? Optional.of(identity) : Optional.empty();
         return new EmbeddedDnsServer(List.copyOf(TlsConfigSource.awsEndpointSuffixes()),
-                records, rules, List.of(clients), enabled, publicHosts);
+                records, rules, List.of(clients), enabled, publicHosts, publicUpstream);
     }
 
     private static List<String> addresses(EmbeddedDnsServer server, String name, String client) {

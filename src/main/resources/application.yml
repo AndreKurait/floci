@@ -186,6 +186,7 @@ floci:
       enabled: false
       public-aws-api: false
       # Optional exact IPv4 front door; unset retains Floci's own listener.
+      # Matching upstream DNS A answers use the routed public address for known VPC clients.
       # public-aws-api-upstream-host: ""
       public-aws-api-upstream-http-port: 80
       public-aws-api-upstream-https-port: 443
