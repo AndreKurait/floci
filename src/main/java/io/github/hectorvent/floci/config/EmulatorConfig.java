@@ -3621,6 +3621,15 @@ public interface EmulatorConfig {
         Optional<List<String>> capDrop();
 
         /**
+         * Linux capabilities to add to guest containers, for images whose own startup grants
+         * file capabilities (for example {@code setcap cap_syslog+ep}) outside Docker's default
+         * set. Security-group enforcement still removes NET_ADMIN and NET_RAW from these. A
+         * capability may not be both added and dropped. Set privileged=false for this to matter.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_ADD}, comma-separated.
+         */
+        Optional<List<String>> capAdd();
+
+        /**
          * Read-only bind mounts supplied by the deployment before the guest starts.
          * Sources are absolute Linux paths on the Docker daemon host, not the Floci process host.
          * Indexed environment entries use {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE}
