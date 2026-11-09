@@ -1040,9 +1040,25 @@ A rejected update preserves the configuration and revision. Empty subnet and sec
 group lists detach the function, and the response then omits `VpcConfig`. Published
 versions retain their network configuration when `$LATEST` changes.
 
-These checks validate the declaration. Function containers still use the configured
-Docker network; `VpcConfig` does not yet enforce VPC packet routing, security-group
-rules, or NAT egress.
+For Docker execution with `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`,
+each VPC-connected execution environment gets an ENI in a declared subnet and a
+protected network namespace. Subnet selection rotates across the declared subnets
+when new environments start. Security-group rules are installed before function
+code starts, and SDK rule changes update warm environments. A missing ingress or
+egress rule drops real packets, leaving the function's own client to time out.
+
+The namespace permits the exact IP and TCP port of that environment's Runtime API,
+so blocked application traffic does not prevent invocation delivery or results.
+This does not open the emulator's other API ports. EC2 instance metadata is blocked.
+Privileged containers and Docker network, port, DNS or host overrides cannot be
+combined with protected VPC execution. Ordinary environment retirement removes the
+container before releasing its helper and ENI; startup retires surviving owned
+helpers and their workloads.
+
+This currently allocates an ENI per execution environment. Hyperplane ENI sharing,
+attachment-time IAM permission checks, VPC routes, NACLs and NAT translation are
+not emulated by this path. Packets still use Docker transport addresses. The
+security-group flag is opt-in and applies to Docker execution.
 
 `RuntimeVersionConfig.RuntimeVersionArn` is returned for managed (non-image)
 runtimes. Its value is derived from the runtime name, so it is stable across

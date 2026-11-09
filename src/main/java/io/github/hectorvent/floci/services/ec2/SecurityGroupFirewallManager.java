@@ -478,7 +478,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
         SecurityGroupNftCompiler.Endpoint updated = new SecurityGroupNftCompiler.Endpoint(
                 identity.accountId(), identity.region(), identity.vpcId(), identity.eniId(),
-                identity.logicalAddress(), identity.transportAddress(), Set.copyOf(groupIds), attached);
+                identity.logicalAddress(), identity.transportAddress(), Set.copyOf(groupIds), attached,
+                identity.controlConnections(), identity.instanceMetadataAllowed());
         endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists),
                 current.dnsOrigin()));
         reconcileAll();
@@ -569,7 +570,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             SecurityGroupNftCompiler.Endpoint updated = new SecurityGroupNftCompiler.Endpoint(
                     identity.accountId(), identity.region(), identity.vpcId(), identity.eniId(),
-                    identity.logicalAddress(), identity.transportAddress(), identity.groupIds(), attached);
+                    identity.logicalAddress(), identity.transportAddress(), identity.groupIds(), attached,
+                    identity.controlConnections(), identity.instanceMetadataAllowed());
             endpoints.put(entry.getKey(), new ProtectedEndpoint(updated, current.helperId(),
                     Map.copyOf(prefixLists), current.dnsOrigin()));
         }
