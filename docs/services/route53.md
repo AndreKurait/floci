@@ -64,6 +64,13 @@ Route53 emulation supporting hosted zones, reusable delegation sets, resource re
 
 Floci resolves private hosted zone DNS records directly through its embedded DNS server on port 53. Cluster containers (such as EKS k3s containers) and workloads wired to embedded DNS automatically query Floci as their primary resolver.
 
+When Floci runs as a host process, set `FLOCI_DNS_LISTEN_ADDRESS` to a local IPv4
+address reachable from its workload containers. This starts the same UDP and
+TCP resolver on port 53 and advertises that address to spawned containers.
+Startup fails if the explicit address is invalid or either listener cannot
+bind. The host process needs permission to bind port 53. Leave the setting
+unset for automatic container DNS only.
+
 - **Record Types**: Resolves IPv4 `A` records (including `CNAME` and `ALIAS` target chasing across private zones, EC2 internal names, and external hostnames). When a private CNAME targets a public hostname, Floci resolves the target addresses off the event loop so container stub resolvers succeed. Multiple values are returned as separate answers.
 - **TTL and Negative Answers**: Answers carry the record set's `TTL`. A chased `CNAME` chain is flattened to `A` records, so it answers with the shortest TTL in the chain; an alias answers with its target's TTL, and an alias or `CNAME` to a name outside the private zones answers with at most 60 seconds, since Floci cannot see that target's TTL. A name absent from the zone receives NXDOMAIN; a name that exists without an `A` record (only `TXT`, for example, or only records beneath it) receives NOERROR with no answers. A private `CNAME` chain preserves that distinction from its target, including after the target is created or deleted. A wildcard record such as `*.example.internal` answers only when neither the name nor an ancestor closer than the wildcard exists, so a record at `api.team.example.internal` keeps the wildcard from answering for `team.example.internal` or anything beneath it.
 - **Zone Visibility and Fallthrough**: Floci identifies the caller account, region and VPC from workloads protected by security-group enforcement (`FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`). Private answers, including aliases and CNAMEs, use only zones associated with that VPC. Association filtering happens before choosing the most specific zone. Unprotected workloads and other unknown or unassociated callers use public DNS; an associated private zone with no matching record answers negatively without falling back to public records. Association and disassociation changes apply to subsequent queries. Cloud Map uses the same backing-zone visibility rules.
