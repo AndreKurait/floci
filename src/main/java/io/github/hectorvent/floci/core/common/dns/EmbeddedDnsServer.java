@@ -14,14 +14,20 @@ import io.vertx.core.WorkerExecutor;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.datagram.DatagramSocketOptions;
+import io.vertx.core.net.NetServer;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.DatagramPacket;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
@@ -41,7 +47,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Embedded UDP/53 DNS server that runs inside the Floci container and is injected
+ * Embedded UDP/TCP DNS server on port 53 that runs inside the Floci container and is injected
  * into every spawned container (Lambda, RDS, ElastiCache) as their DNS resolver.
  *
  * Resolves *.{floci.hostname} (and any configured extra-suffixes) to Floci's own
@@ -170,11 +176,10 @@ public class EmbeddedDnsServer {
                 }
             }
 
-            listen(vertx, myIp, DNS_PORT)
-                    .onSuccess(socket -> LOG.infov(
-                            "Embedded DNS server started on {0}:53, resolving {1} → {0}", myIp, suffixes))
-                    .onFailure(error -> LOG.warnv(
-                            "Embedded DNS server failed to bind on {0}:53: {1}", myIp, error.getMessage()));
+            listenAll(vertx, myIp, DNS_PORT)
+                    .onSuccess(listeners -> LOG.infov("Embedded DNS UDP and TCP servers started on {0}:53", myIp))
+                    .onFailure(error ->
+                    LOG.warnv("Embedded DNS server failed to bind on {0}:53: {1}", myIp, error.getMessage()));
         } catch (Exception e) {
             LOG.warnv("Failed to initialize embedded DNS server: {0}", e.getMessage());
         }
@@ -217,6 +222,20 @@ public class EmbeddedDnsServer {
         });
     }
 
+    record Listeners(DatagramSocket udp, NetServer tcp) {
+        Future<Void> close() {
+            return udp.close().compose(ignored -> tcp.close());
+        }
+    }
+
+    Future<Listeners> listenAll(Vertx vertx, String address, int port) {
+        return DnsTcpListener.listen(vertx, address, port,
+                        (query, sender) -> answerQuery(vertx, query, sender, address, true))
+                .compose(tcp -> listen(vertx, address, tcp.actualPort())
+                        .map(udp -> new Listeners(udp, tcp))
+                        .recover(error -> tcp.close().compose(ignored -> Future.failedFuture(error))));
+    }
+
     static String resolveServerIp(EmulatorConfig config, CurrentContainerNetworkResolver networkResolver)
             throws UnknownHostException {
         Optional<String> address = networkResolver.resolveContainerIp();
@@ -233,6 +252,14 @@ public class EmbeddedDnsServer {
 
     void handleQuery(Vertx vertx, DatagramSocket socket, byte[] data,
                              String senderHost, int senderPort, String myIp) {
+        answerQuery(vertx, data, senderHost, myIp, false).onSuccess(response -> {
+            if (response != null) {
+                socket.send(Buffer.buffer(response), senderPort, senderHost);
+            }
+        }).onFailure(error -> LOG.warnv("DNS query failed: {0}", error.getMessage()));
+    }
+
+    private Future<byte[]> answerQuery(Vertx vertx, byte[] data, String senderHost, String myIp, boolean tcp) {
         try {
             ByteBuffer buf = ByteBuffer.wrap(data);
             short txId = buf.getShort();
@@ -243,7 +270,7 @@ public class EmbeddedDnsServer {
             buf.getShort(); // arcount
 
             if ((flags & 0x8000) != 0 || qdCount < 1) {
-                return; // not a standard query
+                return Future.succeededFuture(); // not a standard query
             }
 
             int questionOffset = buf.position(); // always 12 for a standard query
@@ -252,16 +279,14 @@ public class EmbeddedDnsServer {
             short qclass = buf.getShort();
             int questionEnd = buf.position();
 
-            vertx.<QueryPlan>executeBlocking(() -> planQuery(qname, senderHost, myIp, qtype), false)
-                    .onSuccess(plan -> {
+            return vertx.<QueryPlan>executeBlocking(() -> planQuery(qname, senderHost, myIp, qtype), false)
+                    .compose(plan -> {
                         if (plan.answer().isEmpty()) {
                             if (plan.ruleTargets().isEmpty()) {
-                                forwardAsync(vertx, socket, data, senderHost, senderPort);
-                            } else {
-                                forwardToRuleTargets(vertx, socket, data, senderHost, senderPort,
-                                        plan.ruleTargets(), qname, txId, questionOffset, questionEnd);
+                                return forwardAsync(vertx, data, tcp);
                             }
-                            return;
+                            return forwardToRuleTargets(vertx, data, plan.ruleTargets(), tcp,
+                                    qname, txId, questionOffset, questionEnd);
                         }
                         DnsAnswer records = plan.answer().orElseThrow();
                         if (records.isPublicAuthorityAnswer()
@@ -269,16 +294,16 @@ public class EmbeddedDnsServer {
                             records = DnsAnswer.refused();
                         }
                         byte[] response = records.isPublicAuthorityAnswer()
-                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records)
+                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records, tcp)
                                 : !records.isEmpty()
-                                ? buildAResponse(data, txId, questionOffset, questionEnd, records)
+                                ? buildAResponse(data, txId, questionOffset, questionEnd, records, tcp)
                                 : buildEmptyResponse(data, txId, questionOffset, questionEnd,
                                         records.nameExists() ? 0 : 3);
-                        socket.send(Buffer.buffer(response), senderPort, senderHost, v -> {});
-                    })
-                    .onFailure(e -> LOG.warnv("DNS record lookup failed for {0}: {1}", qname, e.getMessage()));
+                        return Future.succeededFuture(response);
+                    });
         } catch (Exception e) {
             LOG.debugv("DNS packet error: {0}", e.getMessage());
+            return Future.succeededFuture();
         }
     }
 
@@ -579,14 +604,20 @@ public class EmbeddedDnsServer {
     }
 
     byte[] buildAResponse(byte[] query, short txId, int questionOffset, int questionEnd, DnsAnswer answer) {
+        return buildAResponse(query, txId, questionOffset, questionEnd, answer, false);
+    }
+
+    private byte[] buildAResponse(byte[] query, short txId, int questionOffset, int questionEnd,
+                                  DnsAnswer answer, boolean tcp) {
         List<DnsRecord> records = answer.records();
         int questionLength = questionEnd - questionOffset;
         List<byte[]> data = records.stream().map(DnsRecord::data).toList();
         UdpPayload payload = udpPayload(query, questionEnd);
+        int limit = tcp ? DnsTcpListener.MAX_MESSAGE_SIZE : payload.size();
         int responseLength = 12 + questionLength + (payload.edns() ? 11 : 0);
         int answerCount = 0;
         for (byte[] recordData : data) {
-            if (responseLength + 12 + recordData.length > payload.size()) {
+            if (responseLength + 12 + recordData.length > limit) {
                 break;
             }
             responseLength += 12 + recordData.length;
@@ -621,8 +652,13 @@ public class EmbeddedDnsServer {
     }
 
     byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd, DnsAnswer answer) {
+        return buildPublicResponse(query, txId, questionOffset, questionEnd, answer, false);
+    }
+
+    private byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd,
+                                       DnsAnswer answer, boolean tcp) {
         if (!answer.isEmpty()) {
-            return buildAResponse(query, txId, questionOffset, questionEnd, answer);
+            return buildAResponse(query, txId, questionOffset, questionEnd, answer, tcp);
         }
         int flags = 0x8000 | (query[2] & 0x79) << 8 | answer.responseCode();
         DnsAnswer.Authority authority = answer.authority();
@@ -634,7 +670,8 @@ public class EmbeddedDnsServer {
         UdpPayload payload = udpPayload(query, questionEnd);
         int questionLength = questionEnd - questionOffset;
         int length = 12 + questionLength + (payload.edns() ? 11 : 0);
-        boolean fits = length + owner.length + 10 + soa.length <= payload.size();
+        boolean fits = length + owner.length + 10 + soa.length
+                <= (tcp ? DnsTcpListener.MAX_MESSAGE_SIZE : payload.size());
         ByteBuffer response = ByteBuffer.allocate(length + (fits ? owner.length + 10 + soa.length : 0));
         response.putShort(txId).putShort((short) (flags | 0x0400 | (fits ? 0 : 0x0200)));
         response.putShort((short) 1).putShort((short) 0).putShort((short) (fits ? 1 : 0))
@@ -686,18 +723,15 @@ public class EmbeddedDnsServer {
         }
     }
 
-    private void forwardAsync(Vertx vertx, DatagramSocket socket, byte[] query,
-                              String senderHost, int senderPort) {
+    private Future<byte[]> forwardAsync(Vertx vertx, byte[] query, boolean tcp) {
         List<String> upstreams = upstreamDnsServers;
         if (upstreams.isEmpty()) {
-            return;
+            return Future.succeededFuture();
         }
-        submitForward(forwardPool(vertx), () -> forwardToUpstreams(query, upstreams, DNS_PORT))
-                .onSuccess(response ->
-                        socket.send(Buffer.buffer(response), senderPort, senderHost, v -> {}))
-                .onFailure(e ->
-                        LOG.warnv("DNS forwarding failed on all upstreams {0}: {1}",
-                                upstreams, e.getMessage()));
+        List<DnsForwardingRule.Target> targets = upstreams.stream()
+                .map(upstream -> new DnsForwardingRule.Target(upstream, DNS_PORT)).toList();
+        return submitForward(forwardPool(vertx),
+                () -> tcp ? forwardToTargetsTcp(query, targets) : forwardToTargets(query, targets));
     }
 
     /**
@@ -709,20 +743,61 @@ public class EmbeddedDnsServer {
      * falling back to the upstream resolvers. The rule said where the name lives, so an upstream
      * answer for it would be the wrong answer, and resolution of every other name is untouched.
      */
-    private void forwardToRuleTargets(Vertx vertx, DatagramSocket socket, byte[] query,
-                                      String senderHost, int senderPort,
-                                      List<DnsForwardingRule.Target> targets, String qname,
+    private Future<byte[]> forwardToRuleTargets(Vertx vertx, byte[] query,
+                                      List<DnsForwardingRule.Target> targets, boolean tcp, String qname,
                                       short txId, int questionOffset, int questionEnd) {
-        submitForward(forwardPool(vertx), () -> forwardToTargets(query, shuffled(targets)))
-                .onSuccess(response ->
-                        socket.send(Buffer.buffer(response), senderPort, senderHost, v -> {}))
-                .onFailure(e -> {
+        return submitForward(forwardPool(vertx), () -> tcp
+                ? forwardToTargetsTcp(query, shuffled(targets)) : forwardToTargets(query, shuffled(targets)))
+                .recover(e -> {
                     LOG.warnv("Resolver rule forwarding for {0} failed on every target {1}: {2}",
                             qname, targets, e.getMessage());
-                    socket.send(Buffer.buffer(
-                                    buildServerFailureResponse(query, txId, questionOffset, questionEnd)),
-                            senderPort, senderHost, v -> {});
+                    return Future.succeededFuture(
+                            buildServerFailureResponse(query, txId, questionOffset, questionEnd));
                 });
+    }
+
+    static byte[] forwardToTargetsTcp(byte[] query, List<DnsForwardingRule.Target> targets) throws Exception {
+        Exception last = null;
+        for (DnsForwardingRule.Target target : targets) {
+            try (Socket socket = new Socket()) {
+                long deadline = System.nanoTime() + FORWARD_TIMEOUT_MS * 1_000_000L;
+                socket.connect(new InetSocketAddress(target.address(), target.port()), FORWARD_TIMEOUT_MS);
+                DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+                output.write(ByteBuffer.allocate(query.length + 2).putShort((short) query.length).put(query).array());
+                output.flush();
+                while (true) {
+                    byte[] prefix = readTcpBytes(socket, 2, deadline);
+                    int length = Short.toUnsignedInt(ByteBuffer.wrap(prefix).getShort());
+                    byte[] response = readTcpBytes(socket, length, deadline);
+                    if (isValidResponse(query, response, response.length)) {
+                        return response;
+                    }
+                }
+            } catch (Exception e) {
+                last = e;
+                LOG.debugv("DNS TCP forward to {0} failed: {1}", target.address(), e.getMessage());
+            }
+        }
+        throw last != null ? last : new IOException("no resolvers to forward to");
+    }
+
+    private static byte[] readTcpBytes(Socket socket, int length, long deadline) throws IOException {
+        byte[] bytes = new byte[length];
+        InputStream input = socket.getInputStream();
+        int offset = 0;
+        while (offset < length) {
+            long remainingNs = deadline - System.nanoTime();
+            if (remainingNs <= 0) {
+                throw new SocketTimeoutException("DNS TCP forward timeout");
+            }
+            socket.setSoTimeout((int) Math.max(1, remainingNs / 1_000_000L));
+            int count = input.read(bytes, offset, length - offset);
+            if (count == -1) {
+                throw new EOFException("DNS TCP response ended before its advertised length");
+            }
+            offset += count;
+        }
+        return bytes;
     }
 
     /**
