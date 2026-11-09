@@ -967,6 +967,13 @@ public interface EmulatorConfig {
     interface SsoAdminServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * AWS-managed application provider ids ({@code applicationProvider/<id>}) that CreateApplication
+         * admits besides {@code custom}, for a deployment that emulates a service creating its own
+         * IAM Identity Center application. Empty by default.
+         */
+        Optional<List<String>> additionalApplicationProviders();
     }
 
     interface SsoOidcServiceConfig {
