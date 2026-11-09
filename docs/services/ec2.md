@@ -802,6 +802,11 @@ their metadata version or parsers.
 | `GET /latest/meta-data/hostname` | Private DNS name |
 | `GET /latest/meta-data/mac` | MAC address of first ENI |
 | `GET /latest/meta-data/security-groups` | Security group names |
+| `GET /latest/meta-data/ipv6` | The primary interface's IPv6 address; 404 without one |
+| `GET /latest/meta-data/network/interfaces/macs/` | One `<mac>/` line per interface |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/ipv6s` | That interface's IPv6 addresses; 404 without one |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/subnet-ipv6-cidr-blocks` | Its subnet's associated IPv6 blocks |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/vpc-ipv6-cidr-blocks` | Its VPC's associated IPv6 blocks |
 | `GET /latest/meta-data/placement/availability-zone` | AZ |
 | `GET /latest/meta-data/placement/region` | Region |
 | `GET /latest/meta-data/services/` | Service metadata keys (`domain` and `partition`); also accepts the path without a trailing slash |
@@ -892,7 +897,7 @@ naming different VPCs find nothing.
 
 | Action | Description |
 |--------|-------------|
-| RunInstances | Creates one or more local EC2 instances, starting Docker-backed runtime when not in mock mode. Security groups come from `SecurityGroupId.N` or, as Terraform sends them with an interface spec, from the primary interface's `NetworkInterface.1.SecurityGroupId.N`; both in one request is `InvalidParameterCombination`. |
+| RunInstances | Creates one or more local EC2 instances, starting Docker-backed runtime when not in mock mode. Security groups come from `SecurityGroupId.N` or, as Terraform sends them with an interface spec, from the primary interface's `NetworkInterface.1.SecurityGroupId.N`; both in one request is `InvalidParameterCombination`. A launch into a subnet with `AssignIpv6AddressOnCreation` and an associated IPv6 block gives the implicit primary interface one IPv6 address from that block (never one of its first four addresses or one a live instance interface in the subnet holds), reported as the instance's `ipv6Address` and in the interface's `ipv6AddressesSet`; `Ipv6AddressCount` and `Ipv6Address.N` on RunInstances are not read. |
 | CreateFleet | Creates an instant local fleet from launch-template configurations and on-demand or spot overrides. DryRun returns the AWS-compatible `DryRunOperation` error without launching instances. |
 | DescribeInstances | Lists or returns stored EC2 instances. |
 | TerminateInstances | Terminates instances and updates their stored lifecycle state. |

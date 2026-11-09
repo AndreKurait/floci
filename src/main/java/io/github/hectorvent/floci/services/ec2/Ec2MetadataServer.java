@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
@@ -38,6 +39,7 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -252,6 +254,18 @@ public class Ec2MetadataServer {
         metadataGet(router, "meta-data/hostname", "1.0").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
         metadataGet(router, "meta-data/mac", "2011-01-01").handler(ctx -> handleMac(ctx));
         metadataGet(router, "meta-data/security-groups", "1.0").handler(ctx -> handleSecurityGroups(ctx));
+        // IPv6: the primary interface's address, and per interface (keyed by MAC) its addresses and the IPv6
+        // blocks of its subnet and VPC. Each answers 404 for an interface without IPv6.
+        metadataGet(router, "meta-data/ipv6", "2021-01-03")
+                .handler(ctx -> handleText(ctx, Ec2MetadataServer::primaryIpv6));
+        metadataGet(router, "meta-data/network/interfaces/macs", "2011-01-01").handler(this::handleMacListing);
+        metadataGet(router, "meta-data/network/interfaces/macs/", "2011-01-01").handler(this::handleMacListing);
+        metadataGet(router, "meta-data/network/interfaces/macs/:mac/ipv6s", "2016-06-30")
+                .handler(ctx -> handleInterfaceIpv6(ctx, InstanceNetworkInterface::getIpv6Addresses));
+        metadataGet(router, "meta-data/network/interfaces/macs/:mac/subnet-ipv6-cidr-blocks", "2016-06-30")
+                .handler(ctx -> handleInterfaceIpv6(ctx, InstanceNetworkInterface::getSubnetIpv6CidrBlocks));
+        metadataGet(router, "meta-data/network/interfaces/macs/:mac/vpc-ipv6-cidr-blocks", "2016-06-30")
+                .handler(ctx -> handleInterfaceIpv6(ctx, InstanceNetworkInterface::getVpcIpv6CidrBlocks));
         metadataGet(router, "meta-data/placement/availability-zone", "2008-02-01").handler(ctx -> handleText(ctx, inst ->
                 inst.getPlacement() != null
                         ? inst.getPlacement().getAvailabilityZone()
@@ -490,6 +504,61 @@ public class Ec2MetadataServer {
         ctx.response().setStatusCode(200)
                 .putHeader("content-type", "text/plain")
                 .end(mac != null ? mac : "02:42:ac:11:00:02");
+    }
+
+    private void handleMacListing(RoutingContext ctx) {
+        Instance inst = resolveInstance(ctx);
+        if (inst == null) {
+            return;
+        }
+        ctx.response().setStatusCode(200).putHeader("content-type", "text/plain").end(macListing(inst));
+    }
+
+    private void handleInterfaceIpv6(RoutingContext ctx,
+                                     Function<InstanceNetworkInterface, List<String>> values) {
+        Instance inst = resolveInstance(ctx);
+        if (inst == null) {
+            return;
+        }
+        Optional<String> answer = interfaceValues(inst, ctx.pathParam("mac"), values);
+        if (answer.isEmpty()) {
+            ctx.response().setStatusCode(404).end("not-available");
+            return;
+        }
+        ctx.response().setStatusCode(200).putHeader("content-type", "text/plain").end(answer.get());
+    }
+
+    /** The primary interface's first IPv6 address, the {@code meta-data/ipv6} answer; null without one. */
+    static String primaryIpv6(Instance inst) {
+        for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
+            if (eni.getDeviceIndex() == 0 && !eni.getIpv6Addresses().isEmpty()) {
+                return eni.getIpv6Addresses().get(0);
+            }
+        }
+        return null;
+    }
+
+    /** {@code network/interfaces/macs/}: one {@code <mac>/} line per interface. */
+    static String macListing(Instance inst) {
+        StringBuilder sb = new StringBuilder();
+        for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
+            if (eni.getMacAddress() != null) {
+                sb.append(sb.isEmpty() ? "" : "\n").append(eni.getMacAddress()).append('/');
+            }
+        }
+        return sb.toString();
+    }
+
+    /** One line per value of the interface with this MAC, or empty (404) when it has none, as IMDS answers. */
+    static Optional<String> interfaceValues(Instance inst, String mac,
+                                            Function<InstanceNetworkInterface, List<String>> values) {
+        for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
+            if (mac != null && mac.equalsIgnoreCase(eni.getMacAddress())) {
+                List<String> found = values.apply(eni);
+                return found.isEmpty() ? Optional.empty() : Optional.of(String.join("\n", found));
+            }
+        }
+        return Optional.empty();
     }
 
     private void handleSecurityGroups(RoutingContext ctx) {
