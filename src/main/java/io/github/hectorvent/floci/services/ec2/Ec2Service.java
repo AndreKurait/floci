@@ -4522,15 +4522,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     dockerImage = new ResolvedAmiImage(captured, dockerImage.guestRuntime(),
                             dockerImage.cloudInit(), dockerImage.dockerPlatform(), dockerImage.volumeMounts());
                 }
+                List<Ec2ImageCatalog.VolumeMount> launchMounts = new ArrayList<>();
                 for (Ec2ImageCatalog.VolumeMount mapping : dockerImage.volumeMounts()) {
                     List<LaunchVolume> matches = launchVolumes.stream()
                             .filter(volume -> isSameDevice(volume.deviceName(), mapping.device())).toList();
-                    if (isSameDevice(mapping.device(), rootDeviceName) || matches.size() != 1
-                            || matches.getFirst().snapshotId() != null) {
+                    boolean root = isSameDevice(mapping.device(), rootDeviceName);
+                    // A launch that maps no volume at the declared device gets no managed mount, as the
+                    // same AMI on EC2 boots whether or not a launch maps that volume; the image's own
+                    // startup then keeps its root filesystem.
+                    if (matches.isEmpty() && !root) {
+                        continue;
+                    }
+                    if (root || matches.size() != 1 || matches.getFirst().snapshotId() != null) {
                         throw new AwsException("InvalidParameterValue",
                                 "Image data-volume mount requires one snapshot-free non-root mapping: "
                                         + mapping.device(), 400);
                     }
+                    launchMounts.add(mapping);
+                }
+                if (launchMounts.size() != dockerImage.volumeMounts().size()) {
+                    dockerImage = new ResolvedAmiImage(dockerImage.dockerImage(), dockerImage.guestRuntime(),
+                            dockerImage.cloudInit(), dockerImage.dockerPlatform(), launchMounts);
                 }
             }
             if (dryRun) {
