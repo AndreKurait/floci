@@ -14,14 +14,15 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Evaluates every CloudWatch alarm that carries metric-math configuration
- * (namespace/metricName/period/evaluationPeriods/comparisonOperator), transitions its
+ * Evaluates single-metric and supported metric-math CloudWatch alarms, transitions their
  * {@code StateValue} the way real CloudWatch would, and while it is in {@code ALARM}
  * dispatches {@code AlarmActions} through {@link AlarmActionHandler} on every tick — not
  * just the first transition into that state, so an action deferred by a handler (e.g. a
@@ -113,7 +114,8 @@ public class AlarmEvaluator {
             return;
         }
         String region = alarm.getRegion();
-        int period = alarm.getPeriod();
+        MetricMath math = alarm.getMetrics().isEmpty() ? null : metricsService.alarmMath(alarm);
+        int period = math == null ? alarm.getPeriod() : math.alarmPeriod();
         int evaluationPeriods = alarm.getEvaluationPeriods();
         int range = evaluationRange(evaluationPeriods);
         long nowBucket = (Instant.now().getEpochSecond() / period) * period;
@@ -121,19 +123,28 @@ public class AlarmEvaluator {
         long oldestBucket = lastCompleteBucket - (long) period * (range - 1);
         Instant start = Instant.ofEpochSecond(oldestBucket);
         Instant end = Instant.ofEpochSecond(lastCompleteBucket + period - 1);
-        String statistic = alarm.getExtendedStatistic() != null
-                ? alarm.getExtendedStatistic() : alarm.getStatistic();
-
-        List<CloudWatchMetricsService.Datapoint> retrieved = metricsService.getMetricStatistics(
-                alarm.getNamespace(), alarm.getMetricName(), alarm.getDimensions(),
-                start, end, period, List.of(statistic), alarm.getUnit(), region);
-
+        Map<Instant, Double> samples = new HashMap<>();
+        if (math == null) {
+            String statistic = alarm.getExtendedStatistic() != null
+                    ? alarm.getExtendedStatistic() : alarm.getStatistic();
+            for (CloudWatchMetricsService.Datapoint point : metricsService.getMetricStatistics(
+                    alarm.getNamespace(), alarm.getMetricName(), alarm.getDimensions(),
+                    start, end, period, List.of(statistic), alarm.getUnit(), region)) {
+                samples.put(point.timestamp(), CloudWatchMetricsService.resolveStatValue(point, statistic));
+            }
+        } else {
+            CloudWatchMetricsService.MetricDataResult result =
+                    metricsService.metricMathData(math, start, end.plusSeconds(1), region).getFirst();
+            for (int i = 0; i < result.timestamps().size(); i++) {
+                samples.put(result.timestamps().get(i), result.values().get(i));
+            }
+        }
         Double[] buckets = new Double[range];
-        for (CloudWatchMetricsService.Datapoint dp : retrieved) {
-            long bucket = (dp.timestamp().getEpochSecond() / period) * period;
+        for (Map.Entry<Instant, Double> sample : samples.entrySet()) {
+            long bucket = (sample.getKey().getEpochSecond() / period) * period;
             int index = (int) ((bucket - oldestBucket) / period);
             if (index >= 0 && index < range) {
-                buckets[index] = CloudWatchMetricsService.resolveStatValue(dp, statistic);
+                buckets[index] = sample.getValue();
             }
         }
 
@@ -279,13 +290,13 @@ public class AlarmEvaluator {
 
     private static boolean isEvaluable(MetricAlarm alarm) {
         return alarm.getRegion() != null
-                && alarm.getMetrics().isEmpty()
-                && alarm.getNamespace() != null && !alarm.getNamespace().isBlank()
-                && alarm.getMetricName() != null && !alarm.getMetricName().isBlank()
-                && alarm.getPeriod() != null && alarm.getPeriod() > 0
                 && alarm.getEvaluationPeriods() > 0
-                && (alarm.getStatistic() != null || alarm.getExtendedStatistic() != null)
-                && alarm.getComparisonOperator() != null;
+                && alarm.getComparisonOperator() != null
+                && (!alarm.getMetrics().isEmpty()
+                    || (alarm.getNamespace() != null && !alarm.getNamespace().isBlank()
+                        && alarm.getMetricName() != null && !alarm.getMetricName().isBlank()
+                        && alarm.getPeriod() != null && alarm.getPeriod() > 0
+                        && (alarm.getStatistic() != null || alarm.getExtendedStatistic() != null)));
     }
 
     private static boolean breaches(double value, String comparisonOperator, double threshold) {

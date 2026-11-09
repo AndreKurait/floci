@@ -557,7 +557,9 @@ public class CloudWatchMetricsJsonHandler {
                 }
 
                 queries.add(new CloudWatchMetricsService.MetricDataQuery(
-                        id, metricStat, expression, label, returnData));
+                        id, metricStat, expression, label, returnData,
+                        qNode.hasNonNull("Period") ? qNode.path("Period").asInt() : null,
+                        qNode.hasNonNull("AccountId") ? qNode.path("AccountId").asText() : null));
             }
         }
 

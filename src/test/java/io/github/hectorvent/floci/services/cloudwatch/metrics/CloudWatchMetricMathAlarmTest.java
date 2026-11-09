@@ -50,7 +50,7 @@ class CloudWatchMetricMathAlarmTest {
     }
 
     private void initialize(StorageBackend<String, Alarm> alarmStore) {
-        RegionResolver resolver = new RegionResolver(REGION, "000000000000");
+        RegionResolver resolver = new RegionResolver(REGION, "123456789012");
         CloudWatchMetricsService service = new CloudWatchMetricsService(new InMemoryStorage<>(), alarmStore, resolver);
         CloudWatchDashboardsService dashboards = new CloudWatchDashboardsService(new InMemoryStorage<>(), resolver);
         jsonHandler = new CloudWatchMetricsJsonHandler(service, dashboards, null, MAPPER);
