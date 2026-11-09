@@ -1093,6 +1093,9 @@ floci:
       reconcile-containers-on-startup: true
     ssoadmin:
       enabled: true
+      # AWS-managed application provider ids CreateApplication admits besides custom, comma-separated
+      # (FLOCI_SERVICES_SSOADMIN_ADDITIONAL_APPLICATION_PROVIDERS).
+      # additional-application-providers:
     ssooidc:
       enabled: true
       local-principal-id: ${FLOCI_SERVICES_SSOOIDC_LOCAL_PRINCIPAL_ID:}

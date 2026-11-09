@@ -1229,6 +1229,42 @@ class SsoAdminServiceTest {
     }
 
     @Test
+    void createApplicationAdmitsOnlyTheConfiguredAwsManagedProviders() {
+        SsoAdminService emptyService = emptyService();
+        SsoInstance instance = emptyService.createInstance(mapper.createObjectNode(), ACCOUNT_ID, "eu-west-1");
+        ObjectNode request = mapper.createObjectNode();
+        request.put("InstanceArn", instance.instanceArn());
+        request.put("Name", "ServiceApplication");
+        request.put("ApplicationProviderArn", "arn:aws:sso::aws:applicationProvider/example-service");
+        assertError("ResourceNotFoundException", () -> emptyService.createApplication(request, ACCOUNT_ID, "eu-west-1"));
+
+        emptyService.additionalApplicationProviders(List.of(" example-service ", "custom", "", "example/team", "example/team"));
+
+        SsoApplication application = emptyService.createApplication(request, ACCOUNT_ID, "eu-west-1");
+        assertEquals("arn:aws:sso::aws:applicationProvider/example-service", application.applicationProviderArn());
+        request.put("Name", "TeamApplication");
+        request.put("ApplicationProviderArn", "arn:aws:sso::aws:applicationProvider/example/team");
+        assertEquals("arn:aws:sso::aws:applicationProvider/example/team",
+                emptyService.createApplication(request, ACCOUNT_ID, "eu-west-1").applicationProviderArn());
+        for (String missing : List.of("arn:aws:sso::aws:applicationProvider/other-service",
+                "arn:aws-cn:sso::aws:applicationProvider/example-service")) {
+            request.put("ApplicationProviderArn", missing);
+            assertError("ResourceNotFoundException", () -> emptyService.createApplication(request, ACCOUNT_ID, "eu-west-1"));
+        }
+        ObjectNode describe = mapper.createObjectNode()
+                .put("ApplicationProviderArn", "arn:aws:sso::aws:applicationProvider/example-service");
+        assertError("ResourceNotFoundException", () -> emptyService.describeApplicationProvider(describe, "eu-west-1"));
+    }
+
+    @Test
+    void additionalApplicationProvidersRefuseAnIdThatIsNotAProviderResourceId() {
+        SsoAdminService emptyService = emptyService();
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> emptyService.additionalApplicationProviders(List.of("not a provider")));
+        assertTrue(refused.getMessage().contains("not a provider"));
+    }
+
+    @Test
     void addRegionValidatesAndRejectsDuplicates() {
         ObjectNode request = mapper.createObjectNode();
         request.put("InstanceArn", service.getInstanceArn());
