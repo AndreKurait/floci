@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Alarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 import io.github.hectorvent.floci.services.cloudwatch.metricstreams.CloudWatchMetricStreamsService;
@@ -145,6 +146,81 @@ class CloudWatchMetricMathTest {
         JsonNode result = (JsonNode) json.handle("GetMetricData", request, REGION).getEntity();
         assertEquals(1, result.path("MetricDataResults").get(0).path("Values").size());
         assertEquals(25.0, result.path("MetricDataResults").get(0).path("Values").get(0).asDouble());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void sqsBacklogAlarmWithFillIsAcceptedAndEvaluatesFilledZerosInsteadOfMissingData() {
+        AlarmEvaluator evaluator = new AlarmEvaluator(service, mock(Instance.class));
+        try {
+            // The evaluator reads the wall clock, so a scenario that straddles a minute boundary is re-run.
+            for (int attempt = 0; attempt < 3; attempt++) {
+                String queue = "dead-letters-" + attempt;
+                long minute = Instant.now().getEpochSecond() / 60;
+                Instant closed = Instant.ofEpochSecond(minute * 60 - 60);
+                service.putMetricAlarm(backlogAlarm(queue), REGION);
+                assertEquals("FILL(visible, 0) + FILL(notVisible, 0)",
+                        stored().getMetrics().getFirst().expression());
+                // A datum in the still-open period is neither evaluated nor allowed to stop the fill.
+                putQueue(queue, "ApproximateNumberOfMessagesNotVisible", 9, closed.plusSeconds(60));
+                // TreatMissingData=breaching would raise ALARM if any evaluated period were missing.
+                evaluator.evaluate(stored());
+                String empty = stored().getStateValue();
+                putQueue(queue, "ApproximateNumberOfMessagesVisible", 4, closed);
+                evaluator.evaluate(stored());
+                String backlog = stored().getStateValue();
+                if (Instant.now().getEpochSecond() / 60 == minute) {
+                    assertEquals("OK", empty);
+                    assertEquals("ALARM", backlog);
+                    return;
+                }
+            }
+            throw new AssertionError("Every attempt straddled a minute boundary");
+        } finally {
+            evaluator.stop();
+        }
+    }
+
+    @Test
+    void getMetricDataFillsEveryPeriodOfTheRequestedRange() {
+        putQueue("dead-letters", "ApproximateNumberOfMessagesVisible", 3, bucket);
+        ObjectNode request = MAPPER.createObjectNode()
+                .put("StartTime", bucket.minusSeconds(150).getEpochSecond())
+                .put("EndTime", bucket.plusSeconds(60).getEpochSecond());
+        request.set("MetricDataQueries", MAPPER.valueToTree(backlogAlarm("dead-letters").getMetrics()));
+        JsonNode values = ((JsonNode) json.handle("GetMetricData", request, REGION).getEntity())
+                .path("MetricDataResults").get(0).path("Values");
+        assertEquals(4, values.size());
+        assertEquals(3.0, values.get(3).asDouble());
+        assertEquals(0.0, values.get(0).asDouble());
+    }
+
+    private void putQueue(String queue, String name, double value, Instant timestamp) {
+        service.putMetricData("AWS/SQS", List.of(MetricDatum.of(name, "Count", value,
+                List.of(new Dimension("QueueName", queue)), timestamp.getEpochSecond())), REGION);
+    }
+
+    private static MetricAlarm backlogAlarm(String queue) {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("math");
+        alarm.setMetrics(List.of(
+                new AlarmMetricDataQuery("expr_1", "FILL(visible, 0) + FILL(notVisible, 0)", null, true,
+                        null, null, null),
+                queueMetric(queue, "visible", "ApproximateNumberOfMessagesVisible"),
+                queueMetric(queue, "notVisible", "ApproximateNumberOfMessagesNotVisible")));
+        alarm.setEvaluationPeriods(1);
+        alarm.setThreshold(0.0);
+        alarm.setComparisonOperator("GreaterThanThreshold");
+        alarm.setTreatMissingData("breaching");
+        alarm.setActionsEnabled(false);
+        return alarm;
+    }
+
+    private static AlarmMetricDataQuery queueMetric(String queue, String id, String name) {
+        return new AlarmMetricDataQuery(id, null, null, false, null, null,
+                new AlarmMetricDataQuery.MetricStat(new AlarmMetricDataQuery.Metric("AWS/SQS", name,
+                        List.of(new AlarmMetricDataQuery.MetricDimension("QueueName", queue))), 60, "Maximum",
+                        null));
     }
 
     private void put(String name, double value) {
