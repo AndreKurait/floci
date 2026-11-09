@@ -56,6 +56,102 @@ public final class Ec2MetadataProxy {
                 imdsProbeCommand("http://169.254.169.254"));
     }
 
+    public static String[] ec2RoutingCommand(String flociHost, int imdsPort) {
+        return ec2RoutingCommand(flociHost, imdsPort, true);
+    }
+
+    static String[] ec2RoutingCommand(String flociHost, int imdsPort, boolean metadataEnabled) {
+        if (flociHost == null || flociHost.length() > 253
+                || !flociHost.matches("[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
+                || imdsPort < 1 || imdsPort > 65535) {
+            throw new IllegalArgumentException("IMDS requires an IPv4 address or hostname and a valid port");
+        }
+        // Resolve inside the namespace: host.docker.internal may exist only in its /etc/hosts.
+        // DNS is exempt from security groups; a direct HTTP request to the backend is not.
+        String resolveTarget = flociHost.matches("[0-9.]+") ? "target_ip='" + flociHost + "'"
+                : "target_ip=$(getent ahostsv4 '" + flociHost + "' | awk 'NR == 1 {print $1; exit}')";
+        String rule = "-d 169.254.169.254/32 -p tcp --dport 80 -m comment --comment floci-imds"
+                + " -j DNAT --to-destination \"$target_ip:" + imdsPort + "\"";
+        return new String[]{"sh", "-c", String.join("\n",
+                "set -eu",
+                CLEAR_APPLICATION_PATHS,
+                "refuse() { echo \"$1\" >&2; exit 1; }",
+                "addresses=$(ip -4 -o addr show)",
+                "if printf '%s\\n' \"$addresses\" | grep -Eq 'inet 169\\.254\\.169\\.254/'; then",
+                "  refuse 'IMDS refuses an existing local 169.254.169.254 address; recreate the guest without the legacy proxy'",
+                "fi",
+                resolveTarget,
+                "case \"$target_ip\" in ''|*[!0-9.]*|.*|*.|*..*) refuse 'IMDS target did not resolve to IPv4' ;; esac",
+                "saved_ifs=$IFS; IFS=.; set -- $target_ip; IFS=$saved_ifs",
+                "[ \"$#\" -eq 4 ] || refuse 'Invalid IMDS IPv4 target'",
+                "for octet in \"$@\"; do",
+                "  case \"$octet\" in ''|0[0-9]*|[0-9][0-9][0-9][0-9]*) refuse 'Invalid IMDS IPv4 target' ;; esac",
+                "  [ \"$octet\" -le 255 ] || refuse 'Invalid IMDS IPv4 target'",
+                "done",
+                // Linux Docker bridges can use 240/4 for local transport. Multicast remains invalid.
+                "[ \"$1\" -ge 1 ] && [ \"$1\" -ne 127 ]"
+                        + " && { [ \"$1\" -le 223 ] || [ \"$1\" -ge 240 ]; }"
+                        + " && [ \"$target_ip\" != 255.255.255.255 ]"
+                        + " || refuse 'IMDS target must be a remote unicast IPv4 address'",
+                "case \"$target_ip\" in 169.254.*) refuse 'IMDS target must not be link-local' ;; esac",
+                "if printf '%s\\n' \"$addresses\" | grep -Fq \"inet $target_ip/\"; then",
+                "  refuse 'IMDS target must not be a guest interface address'",
+                "fi",
+                // Source selection precedes OUTPUT DNAT. With another default bridge, the
+                // original link-local route otherwise selects a foreign source that Docker
+                // masquerades when DNAT reroutes the packet to the metadata bridge.
+                "target_route=$(ip -4 route get \"$target_ip\")",
+                "case \"$target_route\" in broadcast*|local*|unreachable*|prohibit*|blackhole*)"
+                        + " refuse 'IMDS target requires a remote unicast route' ;; esac",
+                "route_device=; route_source=",
+                "set -- $target_route",
+                "while [ \"$#\" -gt 0 ]; do",
+                "  case \"$1\" in dev) route_device=${2-} ;; src) route_source=${2-} ;; esac",
+                "  shift",
+                "done",
+                "case \"$route_device\" in ''|lo|*[!A-Za-z0-9_.:-]*) refuse 'Invalid IMDS route device' ;; esac",
+                "case \"$route_source\" in ''|*[!0-9.]*) refuse 'Invalid IMDS route source' ;; esac",
+                "ip -4 -o addr show dev \"$route_device\" | grep -Fq \"inet $route_source/\""
+                        + " || refuse 'IMDS route source is not on its selected guest interface'",
+                "check_metadata_route() {",
+                "  set -- $(ip -4 route show table main exact 169.254.169.254/32)",
+                "  [ \"$#\" -eq 7 ] || return 1",
+                "  { [ \"$1\" = 169.254.169.254 ] || [ \"$1\" = 169.254.169.254/32 ]; }"
+                        + " && [ \"$2\" = dev ] && [ \"$3\" = \"$route_device\" ] || return 1",
+                "  [ \"$4\" = scope ] && [ \"$5\" = link ] && [ \"$6\" = src ] && [ \"$7\" = \"$route_source\" ]",
+                "}",
+                "existing_route=$(ip -4 route show table main exact 169.254.169.254/32)",
+                "if [ -n \"$existing_route\" ]; then",
+                "  check_metadata_route || refuse 'Conflicting existing IMDS host route'",
+                "fi",
+                "rules=$(iptables -w 2 -t nat -S OUTPUT)",
+                "owned_count=$(printf '%s\\n' \"$rules\" | grep -Ec -- '--comment \"?floci-imds\"?( |$)' || true)",
+                "case \"$owned_count\" in",
+                "  0) : ;;",
+                "  1) iptables -w 2 -t nat -C OUTPUT " + rule
+                        + " || refuse 'Conflicting existing Floci IMDS routing rule' ;;",
+                "  *) refuse 'Multiple existing Floci IMDS routing rules' ;;",
+                "esac",
+                "if [ -z \"$existing_route\" ]; then",
+                "  ip -4 route add 169.254.169.254/32 dev \"$route_device\" scope link src \"$route_source\"",
+                "fi",
+                "check_metadata_route || refuse 'IMDS host route changed during configuration'",
+                "if [ \"$owned_count\" -eq 0 ]; then",
+                "  iptables -w 2 -t nat -I OUTPUT 1 " + rule,
+                "fi",
+                "rules=$(iptables -w 2 -t nat -S OUTPUT)",
+                "owned_count=$(printf '%s\\n' \"$rules\" | grep -Ec -- '--comment \"?floci-imds\"?( |$)' || true)",
+                "[ \"$owned_count\" -eq 1 ] || refuse 'Floci IMDS routing changed during configuration'",
+                "iptables -w 2 -t nat -C OUTPUT " + rule,
+                // Disabled IMDS must still be routed locally rather than escaping to the host.
+                metadataEnabled ? ":" : "exit 0",
+                "for i in 1 2 3 4 5 6; do",
+                "  " + imdsProbeCommand("http://169.254.169.254"),
+                "  sleep 1",
+                "done",
+                "refuse 'IMDSv2 routing readiness failed'")};
+    }
+
     /**
      * Ready once an IMDSv2 token reads the instance ID, which also holds on an instance whose
      * HttpTokens is required. A refused or empty token ends the attempt rather than falling back to

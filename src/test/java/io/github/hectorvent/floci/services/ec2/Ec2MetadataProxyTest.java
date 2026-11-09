@@ -28,6 +28,55 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class Ec2MetadataProxyTest {
 
+    @ParameterizedTest
+    @CsvSource({
+            "10.0.0.3, true",
+            "172.18.0.3, true",
+            "240.199.44.3, true",
+            "255.0.0.3, true",
+            "0.1.2.3, false",
+            "127.0.0.3, false",
+            "169.254.1.3, false",
+            "224.0.0.3, false",
+            "239.0.0.3, false",
+            "255.255.255.255, false"
+    })
+    void metadataRoutingAllowsDockerUnicastAndRejectsSpecialTargets(String address, boolean accepted,
+                                                                   @TempDir Path directory) throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        HelperShellFixture.writeTool(bin, "ip", """
+                case "$*" in
+                  "-4 -o addr show"|"-4 -o addr show dev eth0")
+                    printf '2: eth0 inet 10.0.0.2/24 scope global eth0\\n' ;;
+                  "-4 route get "*) printf '%s dev eth0 src 10.0.0.2\\n' "$4" ;;
+                  "-4 route show table main exact 169.254.169.254/32")
+                    if [ -f "$TEST_ROUTE" ]; then
+                      printf '169.254.169.254 dev eth0 scope link src 10.0.0.2\\n'
+                    fi ;;
+                  "-4 route add "*) touch "$TEST_ROUTE" ;;
+                  *) exit 95 ;;
+                esac
+                """);
+        HelperShellFixture.writeTool(bin, "iptables", """
+                case "$*" in
+                  *"-S OUTPUT")
+                    if [ -f "$TEST_NAT" ]; then
+                      printf '%s\\n' '-A OUTPUT -m comment --comment floci-imds -j DNAT'
+                    fi ;;
+                  *"-I OUTPUT 1 "*) touch "$TEST_NAT" ;;
+                  *"-C OUTPUT "*) test -f "$TEST_NAT" ;;
+                  *) exit 96 ;;
+                esac
+                """);
+        int result = HelperShellFixture.run(Ec2MetadataProxy.ec2RoutingCommand(address, 9169, false), directory,
+                Map.of("PATH", bin + ":/usr/bin:/bin", "TEST_ROUTE", directory.resolve("route").toString(),
+                        "TEST_NAT", directory.resolve("nat").toString()));
+
+        assertEquals(accepted ? 0 : 1, result, HelperShellFixture.output(directory));
+        assertEquals(accepted, Files.exists(directory.resolve("route")));
+        assertEquals(accepted, Files.exists(directory.resolve("nat")));
+    }
+
     @Test
     void installCommandContainsSupportedPackageManagers() {
         String[] command = Ec2MetadataProxy.installCommand();

@@ -80,7 +80,7 @@ public class Ec2MetadataServer {
         this.clock = clock;
     }
 
-    /** Called by Ec2ContainerManager after a container starts to register its IP. */
+    /** Registers the network namespace before an EC2 guest starts. */
     public void registerContainer(String containerIp, String instanceId, Instance instance) {
         if (containerIp != null && !containerIp.isBlank()) {
             credentials.register(instance);
@@ -137,10 +137,9 @@ public class Ec2MetadataServer {
 
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
-        // Ahead of every route, so a path IMDS does not serve also answers 401 when the instance
-        // requires tokens, as on AWS. A method-free route, so methods IMDS does not serve keep the
-        // router's own answers rather than all becoming 405.
-        router.route().handler(this::refuseTokenlessReadsWhenTokensAreRequired);
+        // Apply instance options before any route, including issuing tokens. Methods IMDS does
+        // not serve retain the router's answers when the instance permits metadata access.
+        router.route().handler(this::enforceMetadataOptions);
 
         // IMDSv2 token endpoint
         router.put("/latest/api/token").handler(this::handleToken);
@@ -502,15 +501,24 @@ public class Ec2MetadataServer {
     }
 
     /**
-     * An instance whose HttpTokens is required refuses IMDSv1: as AWS does, a GET or HEAD without a
-     * token gets 401 before any data is looked up, whatever the path. (No route serves HEAD, so one
-     * with a token gets the router's answer: 405 on a path a GET route serves, 404 elsewhere.)
+     * Disabled endpoints serve neither metadata nor tokens. An enabled endpoint whose HttpTokens
+     * is required refuses tokenless GET and HEAD requests before looking up any data.
      */
-    private void refuseTokenlessReadsWhenTokensAreRequired(RoutingContext ctx) {
+    private void enforceMetadataOptions(RoutingContext ctx) {
         HttpMethod method = ctx.request().method();
         String token = ctx.request().getHeader("x-aws-ec2-metadata-token");
+        Instance inst = resolveInstanceByIp(ctx);
+        if (inst == null && token != null) {
+            SessionToken session = tokens.get(token);
+            if (session != null && !session.isExpiredAt(clock.instant())) {
+                inst = session.instance();
+            }
+        }
+        if (inst != null && "disabled".equals(inst.effectiveMetadataOptions().getHttpEndpoint())) {
+            ctx.response().setStatusCode(404).end();
+            return;
+        }
         if ((HttpMethod.GET.equals(method) || HttpMethod.HEAD.equals(method)) && (token == null || token.isBlank())) {
-            Instance inst = resolveInstanceByIp(ctx);
             if (inst != null && "required".equals(inst.effectiveMetadataOptions().getHttpTokens())) {
                 ctx.response().setStatusCode(401).end();
                 return;
