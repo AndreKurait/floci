@@ -16,12 +16,16 @@ import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.Config;
 import org.jboss.logging.Logger;
 
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.IntConsumer;
@@ -75,6 +79,7 @@ public class TlsProxyServer {
     private final int httpBackendPort;
     private final int httpsBackendPort;
     private final List<NetServer> proxyServers = new ArrayList<>();
+    private volatile URI localApiUri;
     /**
      * Ports whose bind definitively failed. Absent means bound, or not resolved yet: callers
      * default to treating the port as the proxy's until the outcome is known, which is what stops
@@ -120,6 +125,14 @@ public class TlsProxyServer {
         failedPorts.forEach(handler::accept);
     }
     private NetClient client;
+
+    /** In-process API calls must enter the proxy that supplies the private listener's PROXY preface. */
+    public URI localApiEndpoint(URI directListener) {
+        if (directListener == null || !config.tls().enabled()) {
+            return directListener;
+        }
+        return localApiUri;
+    }
 
     @Inject
     public TlsProxyServer(Vertx vertx, EmulatorConfig config, Config mpConfig) {
@@ -176,13 +189,25 @@ public class TlsProxyServer {
             if (port == config.port()) {
                 try {
                     bind.toCompletionStage().toCompletableFuture().join();
-                } catch (CompletionException e) {
+                    localApiUri = connectUri(host, server.actualPort());
+                } catch (RuntimeException e) {
                     stop();
                     Throwable cause = e.getCause() != null ? e.getCause() : e;
                     throw new IllegalStateException(
                             "TLS proxy failed to bind public port " + port, cause);
                 }
             }
+        }
+    }
+
+    private static URI connectUri(String host, int port) {
+        try {
+            InetAddress address = InetAddress.getByName(host);
+            String connectHost = address.isAnyLocalAddress()
+                    ? (address instanceof Inet6Address ? "::1" : "127.0.0.1") : host;
+            return new URI("http", null, connectHost, port, "/", null, null);
+        } catch (UnknownHostException | URISyntaxException error) {
+            throw new IllegalArgumentException("Cannot address the bound local API listener", error);
         }
     }
 
@@ -313,6 +338,7 @@ public class TlsProxyServer {
 
     @PreDestroy
     void stop() {
+        localApiUri = null;
         sharedTlsRoutes.clear();
         for (NetServer server : proxyServers) {
             server.close();
