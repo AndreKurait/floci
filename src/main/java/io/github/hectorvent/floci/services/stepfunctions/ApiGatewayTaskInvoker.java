@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.Digests;
@@ -64,11 +65,12 @@ public class ApiGatewayTaskInvoker {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3))
             .followRedirects(HttpClient.Redirect.NEVER).build();
     private final HttpServer httpServer;
+    private final TlsProxyServer proxy;
 
     @Inject
     public ApiGatewayTaskInvoker(ApiGatewayService apiGateway, IamService iam,
                                  AssumeRolePolicyEvaluator trust, LambdaTaskAuthorizer authorizer, EmulatorConfig config,
-                                 ObjectMapper mapper, HttpServer httpServer) {
+                                 ObjectMapper mapper, HttpServer httpServer, TlsProxyServer proxy) {
         this.apiGateway = apiGateway;
         this.iam = iam;
         this.trust = trust;
@@ -76,6 +78,7 @@ public class ApiGatewayTaskInvoker {
         this.config = config;
         this.mapper = mapper;
         this.httpServer = httpServer;
+        this.proxy = proxy;
     }
 
     @PreDestroy
@@ -135,7 +138,7 @@ public class ApiGatewayTaskInvoker {
         if (length != null && !length.equals(List.of(Integer.toString(payload.length)))) {
             throw unsupported("Content-Length must match the serialized request body");
         }
-        URI listener = httpServer.getLocalBaseUri();
+        URI listener = proxy.localApiEndpoint(httpServer.getLocalBaseUri());
         if (listener == null) {
             throw new AslExecutor.FailStateException("ApiGateway.IllegalStateException", "API listener is not ready");
         }

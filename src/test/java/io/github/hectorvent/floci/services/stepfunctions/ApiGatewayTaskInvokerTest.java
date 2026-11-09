@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpServer;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.auth.CredentialScope;
 import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
@@ -88,7 +89,9 @@ class ApiGatewayTaskInvokerTest {
         when(resourcePolicies.isUnsatisfied()).thenReturn(true);
         LambdaTaskAuthorizer authorizer = new LambdaTaskAuthorizer(iam, policies, trust, resourcePolicies, scps);
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
-        invoker = new ApiGatewayTaskInvoker(api, iam, trust, authorizer, config, mapper, listener);
+        TlsProxyServer proxy = mock(TlsProxyServer.class);
+        when(proxy.localApiEndpoint(any())).thenAnswer(call -> call.getArgument(0));
+        invoker = new ApiGatewayTaskInvoker(api, iam, trust, authorizer, config, mapper, listener, proxy);
         machine = new StateMachine();
         machine.setStateMachineArn("arn:aws:states:eu-west-1:" + ACCOUNT + ":stateMachine:Owned");
         machine.setRoleArn(ROLE);

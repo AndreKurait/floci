@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.stepfunctions;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
@@ -40,19 +41,22 @@ public class SdkComputeTaskInvoker {
     private final EmulatorConfig config;
     private final ObjectMapper mapper;
     private final HttpServer httpServer;
+    private final TlsProxyServer proxy;
     private final LambdaTaskAuthorizer authorizer;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3))
             .followRedirects(HttpClient.Redirect.NEVER).build();
 
     @Inject
     public SdkComputeTaskInvoker(IamService iam, AssumeRolePolicyEvaluator trust, EmulatorConfig config,
-                                 ObjectMapper mapper, HttpServer httpServer, LambdaTaskAuthorizer authorizer) {
+                                 ObjectMapper mapper, HttpServer httpServer, LambdaTaskAuthorizer authorizer,
+                                 TlsProxyServer proxy) {
         this.iam = iam;
         this.trust = trust;
         this.config = config;
         this.mapper = mapper;
         this.httpServer = httpServer;
         this.authorizer = authorizer;
+        this.proxy = proxy;
     }
 
     @PreDestroy
@@ -75,7 +79,7 @@ public class SdkComputeTaskInvoker {
         AwsArnUtils.Arn owner = AwsArnUtils.parse(machine.getStateMachineArn());
         AwsArnUtils.Arn role = authorize(machine, owner, credentialsRoleArn);
         String roleArn = credentialsRoleArn == null ? machine.getRoleArn() : credentialsRoleArn;
-        URI listener = httpServer.getLocalBaseUri();
+        URI listener = proxy.localApiEndpoint(httpServer.getLocalBaseUri());
         if (listener == null) {
             throw failure(model, prefix, "ServiceUnavailable", "The AWS API listener is not ready");
         }
