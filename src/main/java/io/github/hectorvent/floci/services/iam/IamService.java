@@ -1432,6 +1432,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * <p>A {@code CustomSuffix} is joined with an underscore because that is the separator callers
      * parse back out: Terraform recovers {@code custom_suffix} by splitting the role name on
      * {@code _}, and that attribute forces replacement, so a name without one never converges.
+     *
+     * <p>IAM attaches the linked service's AWS managed permissions policy to the role it creates;
+     * {@link ServiceLinkedRoles#managedPolicyName} lists the services whose policy is known, and a
+     * role for any other service carries its trust policy alone.
      */
     public IamRole createServiceLinkedRole(String awsServiceName, String customSuffix, String description) {
         if (customSuffix != null && !customSuffix.isEmpty()
@@ -1484,9 +1488,29 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             IamRole role = createRole(roleName, ServiceLinkedRoles.PATH + principal + "/",
                     trustPolicy, description, 0, Map.of());
             role.setServiceLinkedRole(true);
+            ServiceLinkedRoles.managedPolicyName(awsServiceName)
+                    .map(name -> linkedServicePolicyArn(role, name))
+                    .ifPresent(policyArn -> role.getAttachedPolicyArns().add(policyArn));
             roles.put(roleName, role);
             return role;
         }
+    }
+
+    /**
+     * The ARN of the AWS managed policy IAM attaches to a service-linked role, read from the catalog
+     * of the partition the role was created in, so the path is the one AWS publishes rather than
+     * one assumed here. The mapping names only policies the bundle carries, which a test holds it
+     * to, so a miss is a data defect and fails the create loudly instead of leaving a role with no
+     * permissions that the linked service would then be denied with.
+     */
+    private String linkedServicePolicyArn(IamRole role, String policyName) {
+        String partition = AwsArnUtils.parse(role.getArn()).partition();
+        return awsManagedPolicies(partition).values().stream()
+                .filter(policy -> policyName.equals(policy.getPolicyName()))
+                .map(IamPolicy::getArn)
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("AWS managed policy " + policyName
+                        + " is not in the " + partition + " managed policy catalog"));
     }
 
     /**
