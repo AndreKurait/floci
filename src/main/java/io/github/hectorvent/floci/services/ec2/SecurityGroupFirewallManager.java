@@ -307,6 +307,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 if (result.exitCode() != 0) {
                     throw new IllegalStateException("Cannot configure namespace DNS: " + result.summary());
                 }
+                ContainerExec.Result routing = ContainerExec.run(dockerClient, helperId,
+                        new String[]{"sh", "-c", VpcResolverRouting.commands(resolver)}, 10).throwIfTimedOut(helperId);
+                if (routing.exitCode() != 0) {
+                    throw new IllegalStateException("Cannot route the VPC link-local resolver: " + routing.summary());
+                }
             }
             return new Namespace(helperId, ip);
         } catch (Exception e) {
