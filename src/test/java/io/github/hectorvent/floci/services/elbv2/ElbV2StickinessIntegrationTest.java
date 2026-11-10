@@ -61,6 +61,7 @@ class ElbV2StickinessIntegrationTest {
         registerTarget(targetGroupArn, "127.0.0.1", second.actualPort());
         createListener(loadBalancerArn, targetGroupArn, listenerPort);
         await().atMost(Duration.ofSeconds(3)).ignoreExceptions()
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .untilAsserted(() -> assertEquals(200, request(null).statusCode()));
     }
 
@@ -128,12 +129,14 @@ class ElbV2StickinessIntegrationTest {
         Response initial = request(null);
         unhealthy.set(initial.asString());
         // The admission probe can defer the next check past the first five-second group tick.
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
-            List<String> states = query("DescribeTargetHealth", "TargetGroupArn", targetGroupArn).xmlPath()
-                    .getList("DescribeTargetHealthResponse.DescribeTargetHealthResult"
-                            + ".TargetHealthDescriptions.member.TargetHealth.State");
-            assertTrue(states.contains("unhealthy"));
-        });
+        await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    List<String> states = query("DescribeTargetHealth", "TargetGroupArn", targetGroupArn).xmlPath()
+                            .getList("DescribeTargetHealthResponse.DescribeTargetHealthResult"
+                                    + ".TargetHealthDescriptions.member.TargetHealth.State");
+                    assertTrue(states.contains("unhealthy"));
+                });
         Response replacement = request("AWSALB=" + initial.getCookie("AWSALB"));
         assertNotEquals(initial.asString(), replacement.asString());
         assertNotNull(replacement.getCookie("AWSALB"));

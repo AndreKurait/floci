@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import io.github.hectorvent.floci.testing.ParkingStore;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -141,8 +142,10 @@ class Ec2SecurityGroupPublicationRaceTest {
                     return error;
                 }
             });
-            await().atMost(5, TimeUnit.SECONDS).until(() -> deleted.isDone()
-                    || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> deleted.isDone()
+                            || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
             factory.interfaces.release();
             NetworkInterface networkInterface = created.get(5, TimeUnit.SECONDS);
             AwsException error = deleted.get(5, TimeUnit.SECONDS);
@@ -207,8 +210,10 @@ class Ec2SecurityGroupPublicationRaceTest {
                     return error;
                 }
             });
-            await().atMost(5, TimeUnit.SECONDS).until(() -> deleted.isDone()
-                    || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> deleted.isDone()
+                            || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
             factory.instances.release();
             Reservation reservation = created.get(5, TimeUnit.SECONDS);
             AwsException error = deleted.get(5, TimeUnit.SECONDS);
@@ -383,8 +388,10 @@ class Ec2SecurityGroupPublicationRaceTest {
                     return error;
                 }
             });
-            await().atMost(5, TimeUnit.SECONDS).until(() -> deleted.isDone()
-                    || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> deleted.isDone()
+                            || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
             factory.groups.release();
             AwsException modifyError = modified.get(5, TimeUnit.SECONDS);
             AwsException deleteError = deleted.get(5, TimeUnit.SECONDS);

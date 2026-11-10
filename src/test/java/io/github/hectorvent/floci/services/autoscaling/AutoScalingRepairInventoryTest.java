@@ -72,14 +72,20 @@ class AutoScalingRepairInventoryTest {
         try {
             reconciler.requestAll();
             verify(service, never()).describeAutoScalingGroups(null, null);
-            await().atMost(Duration.ofSeconds(5)).until(() -> repaired.size() == 4096);
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> repaired.size() == 4096);
             reconciler.requestAll();
-            await().atMost(Duration.ofSeconds(5)).until(() -> repaired.size() == 4200);
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> repaired.size() == 4200);
             assertTrue(repaired.contains("us-gov-west-1/group-4199"));
             reconciler.requestAll();
             reconciler.requestAll();
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                    verify(service, atLeast(2)).describeAutoScalingGroups("us-east-1", List.of("group-0")));
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
+                            verify(service, atLeast(2)).describeAutoScalingGroups("us-east-1", List.of("group-0")));
             verify(service, never()).autoScalingGroupAccountIds();
             verify(service, never()).describeAutoScalingGroups(null, null);
         } finally {
@@ -117,8 +123,10 @@ class AutoScalingRepairInventoryTest {
             release.countDown();
             assertTrue(drained.await(5, TimeUnit.SECONDS));
             reconciler.requestAll();
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
-                    verify(service).describeAutoScalingGroups("us-west-2", List.of("tail")));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
+                            verify(service).describeAutoScalingGroups("us-west-2", List.of("tail")));
             verify(service).describeAutoScalingGroups("us-west-2", List.of("tail"));
         } finally {
             release.countDown();
@@ -140,10 +148,12 @@ class AutoScalingRepairInventoryTest {
                 service, mock(Ec2Service.class), mock(ElbV2Service.class));
         try {
             reconciler.requestAll();
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                verify(service).describeAutoScalingGroups("us-east-1", List.of("first"));
-                verify(service).describeAutoScalingGroups("us-west-2", List.of("second"));
-            });
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        verify(service).describeAutoScalingGroups("us-east-1", List.of("first"));
+                        verify(service).describeAutoScalingGroups("us-west-2", List.of("second"));
+                    });
         } finally {
             reconciler.stop();
         }

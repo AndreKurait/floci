@@ -98,9 +98,11 @@ class ElbClassicFrontendRetirementTest {
         try {
             assertTrue(stopping.await(5, TimeUnit.SECONDS));
             health.start();
-            await().atMost(Duration.ofSeconds(5)).until(() -> controlAttempted.get()
-                    || health.getState() == Thread.State.BLOCKED && Arrays.stream(health.getStackTrace())
-                            .anyMatch(frame -> frame.getClassName().equals("java.util.concurrent.ConcurrentHashMap")));
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> controlAttempted.get()
+                            || health.getState() == Thread.State.BLOCKED && Arrays.stream(health.getStackTrace())
+                                    .anyMatch(frame -> frame.getClassName().equals("java.util.concurrent.ConcurrentHashMap")));
             assertFalse(controlAttempted.get(), "Queued health must wait for frontend retirement");
         } finally {
             finishStop.countDown();

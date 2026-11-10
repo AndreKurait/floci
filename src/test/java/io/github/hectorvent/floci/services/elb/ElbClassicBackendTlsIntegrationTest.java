@@ -216,8 +216,10 @@ class ElbClassicBackendTlsIntegrationTest {
         awaitHealth("InService");
         drip.set(true);
         awaitHealth("OutOfService");
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertTrue(closedDrips.get() >= 2,
-                "Both failed probes must close their sockets rather than retaining the backend connection"));
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertTrue(closedDrips.get() >= 2,
+                        "Both failed probes must close their sockets rather than retaining the backend connection"));
     }
 
     private HttpServer backend(boolean tls) throws Exception {
@@ -259,14 +261,16 @@ class ElbClassicBackendTlsIntegrationTest {
     private void awaitHealth(String state) {
         health.runArmedChecks();
         health.runArmedChecks();
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            DescribeInstanceHealthResponse response = client.describeInstanceHealth(r -> r.loadBalancerName(name));
-            assertEquals(1, response.instanceStates().size());
-            assertEquals(state, response.instanceStates().getFirst().state());
-            if ("OutOfService".equals(state)) {
-                assertEquals("Instance", response.instanceStates().getFirst().reasonCode(),
-                        "An unprobed instance is not evidence");
-            }
-        });
+        await().atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    DescribeInstanceHealthResponse response = client.describeInstanceHealth(r -> r.loadBalancerName(name));
+                    assertEquals(1, response.instanceStates().size());
+                    assertEquals(state, response.instanceStates().getFirst().state());
+                    if ("OutOfService".equals(state)) {
+                        assertEquals("Instance", response.instanceStates().getFirst().reasonCode(),
+                                "An unprobed instance is not evidence");
+                    }
+                });
     }
 }

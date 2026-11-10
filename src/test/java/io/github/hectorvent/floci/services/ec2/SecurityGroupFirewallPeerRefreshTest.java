@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -45,7 +46,7 @@ class SecurityGroupFirewallPeerRefreshTest extends SecurityGroupFirewallPeerFixt
                 threads.add(thread);
             }
             // Setup holds: the whole burst is queued on the firewall monitor before any of it runs.
-            await().atMost(5, TimeUnit.SECONDS).until(() ->
+            await().atMost(5, TimeUnit.SECONDS).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).until(() ->
                     threads.stream().allMatch(thread -> thread.getState() == Thread.State.BLOCKED));
         }
         for (Thread thread : threads) {
@@ -107,7 +108,9 @@ class SecurityGroupFirewallPeerRefreshTest extends SecurityGroupFirewallPeerFixt
         assertThrows(IllegalStateException.class, () -> manager.register(endpoint(2), helper(2), Map.of()));
 
         // The reverted newcomer is forgotten and the quarantined peers converge again without it.
-        await().atMost(10, TimeUnit.SECONDS).untilAsserted(() -> assertFinal(2));
+        await().atMost(10, TimeUnit.SECONDS)
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertFinal(2));
         for (int index = 0; index < 2; index++) {
             assertFalse(installed.get(helper(index)).contains(" 172.18.0.4 "),
                     "peer " + index + " still enforces the failed registration's address");

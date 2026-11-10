@@ -208,8 +208,10 @@ class Ec2CapacityReservationMovePersistenceTest {
                     fixture.service.createTags(REGION, List.of(source.getCapacityReservationId()),
                             List.of(new Tag("purpose", "move")));
                 });
-                await().atMost(Duration.ofSeconds(10)).until(() -> tags.isDone()
-                        || taggingThread.get() != null && taggingThread.get().getState() == Thread.State.BLOCKED);
+                await().atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> tags.isDone()
+                                || taggingThread.get() != null && taggingThread.get().getState() == Thread.State.BLOCKED);
                 resume.countDown();
                 move.get(10, TimeUnit.SECONDS);
                 tags.get(10, TimeUnit.SECONDS);
@@ -356,8 +358,10 @@ class Ec2CapacityReservationMovePersistenceTest {
                     fixture.service.moveCapacityReservationInstances(REGION, admittedSource.getCapacityReservationId(),
                             other.getCapacityReservationId(), 1, "admission-race");
                 });
-                await().atMost(Duration.ofSeconds(10)).until(() -> mutation.isDone()
-                        || mutationThread.get() != null && mutationThread.get().getState() == Thread.State.BLOCKED);
+                await().atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> mutation.isDone()
+                                || mutationThread.get() != null && mutationThread.get().getState() == Thread.State.BLOCKED);
                 assertTrue(!mutation.isDone(), "Mutation must wait for atomic admission publication");
                 resume.countDown();
                 Instance instance = admission.get(10, TimeUnit.SECONDS);

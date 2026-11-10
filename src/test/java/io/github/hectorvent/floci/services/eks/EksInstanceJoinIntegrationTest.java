@@ -68,8 +68,10 @@ class EksInstanceJoinIntegrationTest {
             String script = "#!/bin/bash\n/etc/eks/bootstrap.sh " + clusterName;
             String instanceId = launchInstance(account, "us-east-1", "t3.medium", script);
 
-            await().atMost(Duration.ofSeconds(10)).until(() ->
-                    RequestScopes.callAs(account, () -> eksService.isInstanceJoined(clusterName, instanceId)));
+            await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() ->
+                            RequestScopes.callAs(account, () -> eksService.isInstanceJoined(clusterName, instanceId)));
             List<Instance> joined = RequestScopes.callAs(account, () -> eksService.getJoinedInstances(clusterName));
             assertEquals(1, joined.size());
             Instance joinedInst = joined.getFirst();

@@ -30,6 +30,7 @@ import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
+import io.github.hectorvent.floci.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -41,8 +42,10 @@ import org.mockito.ArgumentCaptor;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.EnumSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -1595,10 +1598,8 @@ class AutoScalingServiceTest {
             change.start();
             assertTrue(read.await(5, TimeUnit.SECONDS));
             delete.start();
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (delete.isAlive() && delete.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
-                Thread.sleep(1);
-            }
+            ThreadStates.awaitState(delete, EnumSet.of(Thread.State.BLOCKED, Thread.State.TERMINATED),
+                    Duration.ofSeconds(5), "the delete");
             assertTrue(!delete.isAlive() || delete.getState() == Thread.State.BLOCKED);
             resume.countDown();
             change.join(5000);

@@ -121,7 +121,7 @@ class ElbV2SharedHttpsPortTest {
         GeneratedCertificate albCertificate = generator.generateSelfSignedCertificate(
                 "service.example.test", List.of(), KeyAlgorithm.RSA_2048);
         SSLContext trust = trust(apiCertificate, albCertificate);
-        int publicPort = FreePorts.anyInterfacePort();
+        int publicPort = 0;
         int sharedPort = FreePorts.anyInterfacePort();
         EmulatorConfig config = configuration(publicPort, sharedPort);
         Vertx vertx = Vertx.vertx();

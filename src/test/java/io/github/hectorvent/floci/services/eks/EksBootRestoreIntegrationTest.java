@@ -53,11 +53,13 @@ class EksBootRestoreIntegrationTest {
     @Test
     void bootCreatesEksServiceWithoutAnEksRequest() {
         // Boot restores once the HTTP port listens, from an async observer, so this can run first.
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            Map<InjectableBean<?>, Object> created = Arc.container().getActiveContext(ApplicationScoped.class)
-                    .getState().getContextualInstances();
-            assertTrue(created.keySet().stream().anyMatch(bean -> bean.getBeanClass() == EksService.class),
-                    "EksService must be created at boot, not on the first EKS request");
-        });
+        await().atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    Map<InjectableBean<?>, Object> created = Arc.container().getActiveContext(ApplicationScoped.class)
+                            .getState().getContextualInstances();
+                    assertTrue(created.keySet().stream().anyMatch(bean -> bean.getBeanClass() == EksService.class),
+                            "EksService must be created at boot, not on the first EKS request");
+                });
     }
 }

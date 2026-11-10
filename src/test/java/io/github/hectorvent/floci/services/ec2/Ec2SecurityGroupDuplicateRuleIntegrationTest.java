@@ -304,10 +304,12 @@ class Ec2SecurityGroupDuplicateRuleIntegrationTest {
     }
 
     private void awaitStatus(String expected) {
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(25)).untilAsserted(() -> {
-            String actual = cfn.describeStacks(request -> request.stackName(stack))
-                    .stacks().getFirst().stackStatusAsString();
-            assertEquals(expected, actual);
-        });
+        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(25))
+                .pollDelay(Duration.ZERO)
+                .untilAsserted(() -> {
+                    String actual = cfn.describeStacks(request -> request.stackName(stack))
+                            .stacks().getFirst().stackStatusAsString();
+                    assertEquals(expected, actual);
+                });
     }
 }

@@ -67,8 +67,10 @@ class ElbV2HealthCheckerTest {
             checkers.add(checker);
             TargetDescription target = target("127.0.0.1", server.actualPort());
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertEquals("unhealthy",
-                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertEquals("unhealthy",
+                            checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
             assertEquals("Target.FailedHealthChecks",
                     checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
         } finally {
@@ -105,8 +107,10 @@ class ElbV2HealthCheckerTest {
                     "A probe awaiting its response must not occupy the shared worker");
             pendingResponse.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
             ElbV2HealthChecker observed = checker;
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
-                    observed.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertEquals("healthy",
+                            observed.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
         } finally {
             try {
                 if (checker != null) {
@@ -140,8 +144,10 @@ class ElbV2HealthCheckerTest {
             TargetDescription target = target("127.0.0.1", server.actualPort());
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
             assertEquals(0, received.get(2, TimeUnit.SECONDS), "A TCP health check must send no HTTP payload");
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
-                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertEquals("healthy",
+                            checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
         } finally {
             server.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         }
@@ -159,8 +165,10 @@ class ElbV2HealthCheckerTest {
         group.setHealthCheckProtocol("TCP");
         TargetDescription target = target("127.0.0.1", port);
         checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-        await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("unhealthy",
-                checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+        await().atMost(Duration.ofSeconds(2))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals("unhealthy",
+                        checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
     }
 
     @Test
@@ -173,13 +181,15 @@ class ElbV2HealthCheckerTest {
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
 
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
-                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("healthy", health.state());
-                assertNull(health.reason());
-                assertNull(health.description());
-            });
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                                targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+                        assertEquals("healthy", health.state());
+                        assertNull(health.reason());
+                        assertNull(health.description());
+                    });
         } finally {
             close(server);
         }
@@ -195,13 +205,15 @@ class ElbV2HealthCheckerTest {
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
 
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
-                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("unhealthy", health.state());
-                assertEquals("Target.ResponseCodeMismatch", health.reason());
-                assertEquals("Health checks failed with these codes: [503]", health.description());
-            });
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                                targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+                        assertEquals("unhealthy", health.state());
+                        assertEquals("Target.ResponseCodeMismatch", health.reason());
+                        assertEquals("Health checks failed with these codes: [503]", health.description());
+                    });
         } finally {
             close(server);
         }
@@ -217,13 +229,15 @@ class ElbV2HealthCheckerTest {
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
 
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
-                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("unhealthy", health.state());
-                assertEquals("Target.Timeout", health.reason());
-                assertEquals("Request timed out", health.description());
-            });
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                                targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+                        assertEquals("unhealthy", health.state());
+                        assertEquals("Target.Timeout", health.reason());
+                        assertEquals("Request timed out", health.description());
+                    });
         } finally {
             close(server);
         }
@@ -254,21 +268,27 @@ class ElbV2HealthCheckerTest {
         try {
             checker.addTargets(group.getTargetGroupArn(), List.of(blocked), group);
             entered.get(2, TimeUnit.SECONDS);
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertEquals("Target.Timeout",
-                    checker.getHealth(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()).reason()));
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertEquals("Target.Timeout",
+                            checker.getHealth(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()).reason()));
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
-                    checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort())));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertEquals("healthy",
+                            checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort())));
             await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
                 checker.probeAll(group.getTargetGroupArn(), group);
                 assertEquals(1, lookups.get(), "A timed-out lookup still owns its target's probe");
             });
             release.complete(null);
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
-                checker.probeAll(group.getTargetGroupArn(), group);
-                assertEquals("healthy",
-                        checker.getState(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()));
-            });
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        checker.probeAll(group.getTargetGroupArn(), group);
+                        assertEquals("healthy",
+                                checker.getState(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()));
+                    });
         } finally {
             release.complete(null);
             close(server);
@@ -285,13 +305,15 @@ class ElbV2HealthCheckerTest {
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
 
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
-                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("healthy", health.state());
-                assertNull(health.reason());
-                assertNull(health.description());
-            });
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                                targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+                        assertEquals("healthy", health.state());
+                        assertNull(health.reason());
+                        assertNull(health.description());
+                    });
         } finally {
             close(server);
         }
@@ -308,13 +330,15 @@ class ElbV2HealthCheckerTest {
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
 
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
-                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("initial", health.state());
-                assertEquals("Elb.InitialHealthChecking", health.reason());
-                assertEquals("Initial health checks in progress", health.description());
-            });
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                                targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+                        assertEquals("initial", health.state());
+                        assertEquals("Elb.InitialHealthChecking", health.reason());
+                        assertEquals("Initial health checks in progress", health.description());
+                    });
         } finally {
             close(server);
         }
@@ -472,9 +496,11 @@ class ElbV2HealthCheckerTest {
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
 
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals(
-                    "healthy",
-                    checker.getHealth(targetGroup.getTargetGroupArn(), target.getId(), traffic.actualPort()).state()));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertEquals(
+                            "healthy",
+                            checker.getHealth(targetGroup.getTargetGroupArn(), target.getId(), traffic.actualPort()).state()));
         } finally {
             close(traffic);
             close(health);
@@ -523,8 +549,10 @@ class ElbV2HealthCheckerTest {
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", slow.actualPort())), group);
             HttpServerResponse response = slowRequest.get(2, TimeUnit.SECONDS);
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", fast.actualPort())), group);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
-                    checker.getState(group.getTargetGroupArn(), "127.0.0.1", fast.actualPort())));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertEquals("healthy",
+                            checker.getState(group.getTargetGroupArn(), "127.0.0.1", fast.actualPort())));
             assertTrue(!response.ended());
             response.end();
         } finally {
@@ -548,7 +576,9 @@ class ElbV2HealthCheckerTest {
                 targets.add(target("127.0.0.1", 10000 + i));
             }
             checker.addTargets(group.getTargetGroupArn(), targets, group);
-            await().atMost(Duration.ofSeconds(3)).until(() -> requests.size() == 32);
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> requests.size() == 32);
             // All 33 probes are queued, and the 33rd cannot start while the 32 slots are held
             KeyedWorkQueue.Snapshot blocked = checker.probeSnapshot();
             assertEquals(33, blocked.keys());
@@ -558,10 +588,14 @@ class ElbV2HealthCheckerTest {
             for (HttpServerResponse response : List.copyOf(requests)) {
                 response.end();
             }
-            await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 33);
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> requests.size() == 33);
             requests.get(32).end();
-            await().atMost(Duration.ofSeconds(2)).until(() -> targets.stream().allMatch(target ->
-                    "healthy".equals(checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()))));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> targets.stream().allMatch(target ->
+                            "healthy".equals(checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()))));
         } finally {
             close(server);
         }
@@ -593,10 +627,14 @@ class ElbV2HealthCheckerTest {
         }
         try {
             checker.addTargets(group.getTargetGroupArn(), held, group);
-            await().atMost(Duration.ofSeconds(3)).until(() -> lookups.get() == 32);
-            await().atMost(Duration.ofSeconds(3)).until(() -> held.stream().allMatch(target ->
-                    "Target.Timeout".equals(checker.getHealth(
-                            group.getTargetGroupArn(), target.getId(), target.getPort()).reason())));
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> lookups.get() == 32);
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> held.stream().allMatch(target ->
+                            "Target.Timeout".equals(checker.getHealth(
+                                    group.getTargetGroupArn(), target.getId(), target.getPort()).reason())));
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
             await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
                 checker.probeAll(group.getTargetGroupArn(), group);
@@ -606,11 +644,13 @@ class ElbV2HealthCheckerTest {
                         "An expired caller deadline must not release a still-running worker's slot");
             });
             release.complete(null);
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
-                checker.probeAll(group.getTargetGroupArn(), group);
-                assertEquals("healthy",
-                        checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()));
-            });
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        checker.probeAll(group.getTargetGroupArn(), group);
+                        assertEquals("healthy",
+                                checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()));
+                    });
         } finally {
             release.complete(null);
             close(server);
@@ -631,7 +671,9 @@ class ElbV2HealthCheckerTest {
             checker.startMonitoring(group);
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
             time.advance(REGISTRATION_PROBE_DELAY);
-            await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 1);
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> requests.size() == 1);
             for (int registration = 0; registration < 40; registration++) {
                 switch (removal) {
                     case "deregister" -> checker.removeTargets(group.getTargetGroupArn(), List.of(target), group);
@@ -650,14 +692,20 @@ class ElbV2HealthCheckerTest {
             assertEquals(0, beforeAnswer.completed());
             assertEquals(1, requests.size());
             requests.getFirst().end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
-            await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 2);
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> requests.size() == 2);
             // The late probe has finished, so its result had its chance to reach the new registration
-            await().atMost(Duration.ofSeconds(5)).until(() -> checker.probeSnapshot().completed() == 1);
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> checker.probeSnapshot().completed() == 1);
             assertEquals("Elb.RegistrationInProgress",
                     checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
             requests.get(1).setStatusCode(503).end();
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("unhealthy",
-                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertEquals("unhealthy",
+                            checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
         } finally {
             close(server);
         }
@@ -862,16 +910,20 @@ class ElbV2HealthCheckerTest {
                 group.setHealthCheckProtocol("HTTPS");
             }
             releaseLookup.complete(null);
-            await().atMost(Duration.ofSeconds(2)).until(() -> requests.get() == 1);
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> requests.get() == 1);
             if (changeProtocol) {
                 awaitCompletedProbes(checker, 1);
                 assertEquals("initial", checker.getState(
                         group.getTargetGroupArn(), target.getId(), target.getPort()),
                         "A result for the previous settings must not change current health");
             } else {
-                await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
-                        assertEquals("healthy", checker.getState(
-                                group.getTargetGroupArn(), target.getId(), target.getPort())));
+                await().atMost(Duration.ofSeconds(2))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() ->
+                                assertEquals("healthy", checker.getState(
+                                        group.getTargetGroupArn(), target.getId(), target.getPort())));
             }
         } finally {
             releaseLookup.complete(null);

@@ -174,9 +174,11 @@ class ElbV2BackendTlsIntegrationTest {
         });
         try {
             createTarget("HTTP", health.actualPort(), tls ? "HTTPS" : "HTTP", health.actualPort(), "200");
-            await().atMost(Duration.ofSeconds(5)).until(() -> proxied.get() > 0
-                    || "healthy".equals(elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
-                            .targetHealthDescriptions().getFirst().targetHealth().stateAsString()));
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> proxied.get() > 0
+                            || "healthy".equals(elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
+                                    .targetHealthDescriptions().getFirst().targetHealth().stateAsString()));
             assertEquals(0, proxied.get(), "The JVM proxy must not receive target health probes");
             awaitHealth("healthy", null);
         } finally {
@@ -362,8 +364,10 @@ class ElbV2BackendTlsIntegrationTest {
             server.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         });
         cleanup.add(() -> {
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertTrue(closed.size() >= 2,
-                    "Both timed-out probe connections must be closed without fixture cleanup"));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertTrue(closed.size() >= 2,
+                            "Both timed-out probe connections must be closed without fixture cleanup"));
             assertTrue(closed.stream().allMatch(wait -> wait.compareTo(Duration.ofSeconds(4)) < 0),
                     "Peer connections exceeded the configured health deadline: " + closed);
         });
@@ -436,11 +440,13 @@ class ElbV2BackendTlsIntegrationTest {
         cleanup.add(() -> elb.deleteListener(r -> r.listenerArn(listener)));
         elb.registerTargets(r -> r.targetGroupArn(groupArn)
                 .targets(TargetDescription.builder().id("127.0.0.1").port(port).build()));
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress("127.0.0.1", listenerPort), 1000);
-            }
-        });
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    try (Socket socket = new Socket()) {
+                        socket.connect(new InetSocketAddress("127.0.0.1", listenerPort), 1000);
+                    }
+                });
     }
 
     private void awaitHealth(String state, String reason) {
@@ -448,19 +454,21 @@ class ElbV2BackendTlsIntegrationTest {
     }
 
     private void awaitHealth(String state, String reason, boolean triggerProbe) {
-        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
-            if (triggerProbe) {
-                RequestScopes.runAs(ACCOUNT, Region.EU_WEST_1.id(), () -> {
-                    TargetGroup group = elbService.getTargetGroup(Region.EU_WEST_1.id(), groupArn);
-                    assertNotNull(group);
-                    healthChecker.probeAll(groupArn, group);
+        await().atMost(Duration.ofSeconds(20))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    if (triggerProbe) {
+                        RequestScopes.runAs(ACCOUNT, Region.EU_WEST_1.id(), () -> {
+                            TargetGroup group = elbService.getTargetGroup(Region.EU_WEST_1.id(), groupArn);
+                            assertNotNull(group);
+                            healthChecker.probeAll(groupArn, group);
+                        });
+                    }
+                    List<TargetHealthDescription> targets = elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
+                            .targetHealthDescriptions();
+                    assertEquals(1, targets.size());
+                    assertEquals(state, targets.getFirst().targetHealth().stateAsString());
+                    assertEquals(reason, targets.getFirst().targetHealth().reasonAsString());
                 });
-            }
-            List<TargetHealthDescription> targets = elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
-                    .targetHealthDescriptions();
-            assertEquals(1, targets.size());
-            assertEquals(state, targets.getFirst().targetHealth().stateAsString());
-            assertEquals(reason, targets.getFirst().targetHealth().reasonAsString());
-        });
     }
 }

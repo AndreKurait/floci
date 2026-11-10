@@ -379,10 +379,12 @@ class ElbClassicDataPlaneIntegrationTest {
     }
 
     private void awaitHealth(String state) {
-        await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
-                elb("DescribeInstanceHealth").formParam("LoadBalancerName", name).post("/").then().statusCode(200)
-                        .body("DescribeInstanceHealthResponse.DescribeInstanceHealthResult.InstanceStates.member.State",
-                                equalTo(state)));
+        await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100))
+                .pollDelay(Duration.ZERO)
+                .untilAsserted(() ->
+                        elb("DescribeInstanceHealth").formParam("LoadBalancerName", name).post("/").then().statusCode(200)
+                                .body("DescribeInstanceHealthResponse.DescribeInstanceHealthResult.InstanceStates.member.State",
+                                        equalTo(state)));
     }
 
     private String createZone(String account) {

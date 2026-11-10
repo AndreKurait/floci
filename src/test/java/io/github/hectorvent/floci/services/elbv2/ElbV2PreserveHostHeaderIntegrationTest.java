@@ -75,15 +75,17 @@ class ElbV2PreserveHostHeaderIntegrationTest {
             targetGroupArn = createTargetGroup("preserve-host-header-tg", "ip", backend.actualPort());
             registerTarget(targetGroupArn, "127.0.0.1", backend.actualPort());
             listenerArn = createListener(loadBalancerArn, targetGroupArn, LISTENER_PORT);
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
-                Response response = given().baseUri("http://127.0.0.1").port(LISTENER_PORT).get("/headers");
-                assertEquals(200, response.statusCode());
-                assertEquals("ok", response.asString());
-                assertEquals(List.of("a=1; Path=/", "b=2; Path=/", "c=3; Path=/"),
-                        response.headers().getValues("Set-Cookie"));
-                assertEquals(List.of("one", "two"), response.headers().getValues("X-Multi"));
-                assertEquals(List.of(), response.headers().getValues("Keep-Alive"));
-            });
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        Response response = given().baseUri("http://127.0.0.1").port(LISTENER_PORT).get("/headers");
+                        assertEquals(200, response.statusCode());
+                        assertEquals("ok", response.asString());
+                        assertEquals(List.of("a=1; Path=/", "b=2; Path=/", "c=3; Path=/"),
+                                response.headers().getValues("Set-Cookie"));
+                        assertEquals(List.of("one", "two"), response.headers().getValues("X-Multi"));
+                        assertEquals(List.of(), response.headers().getValues("Keep-Alive"));
+                    });
         } finally {
             deleteListener(listenerArn);
             deleteTargetGroup(targetGroupArn);
@@ -303,15 +305,17 @@ class ElbV2PreserveHostHeaderIntegrationTest {
     }
 
     private static void assertForwardedHost(String expectedHost) {
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> given()
-                .baseUri("http://127.0.0.1")
-                .port(LISTENER_PORT)
-                .header("Host", CLIENT_HOST)
-            .when()
-                .get("/")
-            .then()
-                .statusCode(200)
-                .body(equalTo(expectedHost)));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given()
+                        .baseUri("http://127.0.0.1")
+                        .port(LISTENER_PORT)
+                        .header("Host", CLIENT_HOST)
+                    .when()
+                        .get("/")
+                    .then()
+                        .statusCode(200)
+                        .body(equalTo(expectedHost)));
     }
 
 }
