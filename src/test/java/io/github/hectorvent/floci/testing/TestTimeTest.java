@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -107,7 +108,7 @@ class TestTimeTest {
     @Test
     void submittedWorkWaitsForTheTestToRunIt() throws Exception {
         AtomicBoolean ran = new AtomicBoolean();
-        var future = time.scheduler().submit(() -> {
+        Future<String> future = time.scheduler().submit(() -> {
             ran.set(true);
             return "done";
         });
