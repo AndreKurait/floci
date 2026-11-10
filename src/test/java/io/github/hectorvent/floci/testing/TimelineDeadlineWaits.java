@@ -196,7 +196,8 @@ public final class TimelineDeadlineWaits implements DeadlineWaits {
             }
             int parkedSamples = 0;
             while (waiter.isAlive() && !waiters.contains(waiter)) {
-                parkedSamples = ThreadStates.PARKED_OR_DONE.contains(waiter.getState()) ? parkedSamples + 1 : 0;
+                // Not while it queues for the timeline's lock to put its next expiry there.
+                parkedSamples = time.blockedOffTheTimeline(waiter) ? parkedSamples + 1 : 0;
                 if (parkedSamples >= SETTLED_SAMPLES) {
                     return;
                 }
