@@ -39,7 +39,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
@@ -68,7 +67,7 @@ class EcsStablePortRolloutServiceTest {
 
     @ParameterizedTest
     @MethodSource("stablePortDeployments")
-    void deploymentReleasesStablePortBeforeStartingReplacement(PublicationMode publication, boolean force) {
+    void deploymentReleasesStablePortBeforeStartingReplacement(PublicationMode publication, boolean force) throws Exception {
         try (Harness harness = new Harness(publication)) {
             EcsServiceModel service = harness.createService("web", Map.of("minimumHealthyPercent", 0));
             harness.ecs.reconcileServices();
@@ -87,7 +86,8 @@ class EcsStablePortRolloutServiceTest {
 
             assertEquals("STOPPED", original.getDesiredStatus());
             assertEquals(0, harness.runningTasks("web").size());
-            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPED", original.getLastStatus());
             harness.ecs.reconcileServices();
 
             EcsTask replacement = harness.runningTasks("web").getFirst();
@@ -136,7 +136,7 @@ class EcsStablePortRolloutServiceTest {
     }
 
     @Test
-    void protocolChangeStillWaitsForTheCurrentTcpPublisherToReleaseTheHostPort() {
+    void protocolChangeStillWaitsForTheCurrentTcpPublisherToReleaseTheHostPort() throws Exception {
         try (Harness harness = new Harness()) {
             harness.createService("web", Map.of("minimumHealthyPercent", 0));
             harness.ecs.reconcileServices();
@@ -148,14 +148,15 @@ class EcsStablePortRolloutServiceTest {
 
             assertEquals("STOPPED", original.getDesiredStatus());
             assertEquals(0, harness.runningTasks("web").size());
-            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPED", original.getLastStatus());
             harness.ecs.reconcileServices();
             assertEquals(revision.getTaskDefinitionArn(), harness.runningTasks("web").getFirst().getTaskDefinitionArn());
         }
     }
 
     @Test
-    void retainedStoppingTaskIsRetriedBeforeAnyReplacementIsPlaced() {
+    void retainedStoppingTaskIsRetriedBeforeAnyReplacementIsPlaced() throws Exception {
         try (Harness harness = new Harness()) {
             harness.createService("web", Map.of("minimumHealthyPercent", 0));
             harness.ecs.reconcileServices();
@@ -174,20 +175,22 @@ class EcsStablePortRolloutServiceTest {
 
             harness.forceDeployment("web");
             harness.ecs.reconcileServices();
-            await().atMost(TIMEOUT).until(() -> stops.get() > 0);
-            await().atMost(TIMEOUT).untilAsserted(() -> {
-                harness.ecs.reconcileServices();
-                assertEquals("STOPPING", original.getLastStatus());
-                assertEquals(0, harness.runningTasks("web").size());
-                assertTrue(stops.get() >= 2, "incomplete removal is retried");
-            });
+            harness.ecs.awaitPendingStops();
+            assertEquals(1, stops.get());
+            assertEquals("STOPPING", original.getLastStatus());
+            // Each later pass retries the stop once, and places no replacement while it is incomplete.
+            harness.ecs.reconcileServices();
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPING", original.getLastStatus());
+            assertEquals(0, harness.runningTasks("web").size());
+            assertEquals(2, stops.get(), "incomplete removal is retried");
             verify(harness.manager, times(1)).startTask(any(), any(), any(), anyString());
 
             removalAllowed.set(true);
-            await().atMost(TIMEOUT).untilAsserted(() -> {
-                harness.ecs.reconcileServices();
-                assertEquals("STOPPED", original.getLastStatus());
-            });
+            harness.ecs.reconcileServices();
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPED", original.getLastStatus());
+            assertEquals(3, stops.get());
             harness.ecs.reconcileServices();
             assertEquals(1, harness.runningTasks("web").size());
             assertNotEquals(original.getTaskArn(), harness.runningTasks("web").getFirst().getTaskArn());
@@ -195,7 +198,7 @@ class EcsStablePortRolloutServiceTest {
     }
 
     @Test
-    void retainedNamespaceHelperKeepsTaskStoppingUntilItsPublishedPortIsReleased() {
+    void retainedNamespaceHelperKeepsTaskStoppingUntilItsPublishedPortIsReleased() throws Exception {
         try (Harness harness = new Harness()) {
             ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
             EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
@@ -214,20 +217,22 @@ class EcsStablePortRolloutServiceTest {
             EcsTask original = harness.runningTasks("web").getFirst();
 
             harness.forceDeployment("web");
-            await().atMost(TIMEOUT).untilAsserted(() -> {
-                harness.ecs.reconcileServices();
-                assertEquals("STOPPING", original.getLastStatus());
-                assertEquals(0, harness.runningTasks("web").size());
-                assertTrue(attempts.get() >= 2, "namespace removal remains retryable");
-                verify(credentials, atLeastOnce()).revoke(original.getTaskArn());
-            });
+            harness.ecs.reconcileServices();
+            harness.ecs.awaitPendingStops();
+            assertEquals(1, attempts.get());
+            assertEquals("STOPPING", original.getLastStatus());
+            harness.ecs.reconcileServices();
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPING", original.getLastStatus());
+            assertEquals(0, harness.runningTasks("web").size());
+            assertEquals(2, attempts.get(), "namespace removal remains retryable");
+            verify(credentials, atLeastOnce()).revoke(original.getTaskArn());
             verify(harness.manager, times(1)).startTask(any(), any(), any(), anyString());
 
             removalAllowed.set(true);
-            await().atMost(TIMEOUT).untilAsserted(() -> {
-                harness.ecs.reconcileServices();
-                assertEquals("STOPPED", original.getLastStatus());
-            });
+            harness.ecs.reconcileServices();
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPED", original.getLastStatus());
             harness.ecs.reconcileServices();
             assertEquals(1, harness.runningTasks("web").size());
         }
@@ -269,7 +274,8 @@ class EcsStablePortRolloutServiceTest {
             } finally {
                 release.countDown();
             }
-            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPED", original.getLastStatus());
         }
     }
 
@@ -310,7 +316,7 @@ class EcsStablePortRolloutServiceTest {
     }
 
     @Test
-    void protectedTaskDelaysStablePortReplacementUntilProtectionIsRemoved() {
+    void protectedTaskDelaysStablePortReplacementUntilProtectionIsRemoved() throws Exception {
         try (Harness harness = new Harness()) {
             harness.createService("web", Map.of("minimumHealthyPercent", 0));
             harness.ecs.reconcileServices();
@@ -325,7 +331,8 @@ class EcsStablePortRolloutServiceTest {
 
             harness.ecs.updateTaskProtection(CLUSTER, List.of(original.getTaskArn()), false, null, REGION);
             harness.ecs.reconcileServices();
-            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPED", original.getLastStatus());
             harness.ecs.reconcileServices();
             assertEquals(1, harness.runningTasks("web").size());
             assertNotEquals(original.getTaskArn(), harness.runningTasks("web").getFirst().getTaskArn());
@@ -339,7 +346,7 @@ class EcsStablePortRolloutServiceTest {
 
     @ParameterizedTest
     @MethodSource("replacementFirstMinima")
-    void positiveAndDefaultMinimaKeepReplacementFirst(Map<String, Object> configuration) {
+    void positiveAndDefaultMinimaKeepReplacementFirst(Map<String, Object> configuration) throws Exception {
         try (Harness harness = new Harness()) {
             harness.createService("web", configuration);
             harness.ecs.reconcileServices();
@@ -351,7 +358,8 @@ class EcsStablePortRolloutServiceTest {
             assertEquals(2, harness.runningTasks("web").size());
 
             harness.ecs.reconcileServices();
-            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPED", original.getLastStatus());
             assertEquals(1, harness.runningTasks("web").size());
         }
     }
@@ -374,7 +382,7 @@ class EcsStablePortRolloutServiceTest {
     }
 
     @Test
-    void daemonStillReplacesItsTaskAfterStoppingItWithoutHostPublishing() {
+    void daemonStillReplacesItsTaskAfterStoppingItWithoutHostPublishing() throws Exception {
         try (Harness harness = new Harness(PublicationMode.PRIVATE_AWSVPC)) {
             harness.createService("web", Map.of("minimumHealthyPercent", 0), "DAEMON");
             harness.ecs.reconcileServices();
@@ -384,7 +392,8 @@ class EcsStablePortRolloutServiceTest {
             harness.ecs.reconcileServices();
             assertEquals("STOPPED", original.getDesiredStatus());
             assertEquals(0, harness.runningTasks("web").size());
-            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
+            harness.ecs.awaitPendingStops();
+            assertEquals("STOPPED", original.getLastStatus());
             harness.ecs.reconcileServices();
 
             EcsTask replacement = harness.runningTasks("web").getFirst();

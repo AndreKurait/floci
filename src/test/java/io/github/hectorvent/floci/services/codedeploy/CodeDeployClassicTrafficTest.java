@@ -8,12 +8,14 @@ import io.github.hectorvent.floci.services.elb.ElbClassicHealthChecker;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -25,7 +27,6 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -37,6 +38,9 @@ class CodeDeployClassicTrafficTest {
     private static final String NAME = "frontend";
     private static final String INSTANCE = "i-deploy";
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
+    private static final Duration PHASE_LIMIT = Duration.ofHours(1);
+    private static final Duration POLL = Duration.ofMillis(200);
+    private final TestTime time = TestTime.create();
     private ElbClassicService loadBalancers;
     private ServiceRoleCallAuthorizer authorizer;
     private CodeDeployClassicTraffic traffic;
@@ -50,7 +54,7 @@ class CodeDeployClassicTrafficTest {
     void setUp() {
         loadBalancers = mock(ElbClassicService.class);
         authorizer = mock(ServiceRoleCallAuthorizer.class);
-        traffic = new CodeDeployClassicTraffic(loadBalancers, authorizer, new ObjectMapper());
+        traffic = new CodeDeployClassicTraffic(loadBalancers, authorizer, new ObjectMapper(), new TimelineTimer(time));
         plan = new CodeDeployClassicTraffic.Plan(ACCOUNT, REGION, ROLE, List.of(NAME));
         registered = new AtomicBoolean(true);
         draining = new AtomicBoolean(false);
@@ -88,18 +92,27 @@ class CodeDeployClassicTrafficTest {
         AtomicBoolean cancelled = new AtomicBoolean();
         CompletableFuture<Void> blocked = change(false, cancelled);
         try {
-            await().atMost(TIMEOUT).untilAsserted(() ->
-                    verify(loadBalancers, atLeastOnce()).describeInstanceHealth(REGION, NAME, List.of(INSTANCE)));
+            time.awaitSleepers(1);
+            verify(loadBalancers, atLeastOnce()).describeInstanceHealth(REGION, NAME, List.of(INSTANCE));
             assertFalse(registered.get());
+            time.advance(Duration.ofMinutes(1));
             assertFalse(blocked.isDone());
             draining.set(false);
+            time.advance(POLL.minusMillis(1));
+            assertFalse(blocked.isDone());
+            time.advance(Duration.ofMillis(1));
             blocked.get(5, TimeUnit.SECONDS);
             health.set("OutOfService");
             CompletableFuture<Void> allowed = change(true, cancelled);
             try {
-                await().atMost(TIMEOUT).untilTrue(registered);
+                time.awaitSleepers(1);
+                assertTrue(registered.get());
+                time.advance(Duration.ofMinutes(1));
                 assertFalse(allowed.isDone());
                 health.set("InService");
+                time.advance(POLL.minusMillis(1));
+                assertFalse(allowed.isDone());
+                time.advance(Duration.ofMillis(1));
                 allowed.get(5, TimeUnit.SECONDS);
             } finally {
                 cancelled.set(true);
@@ -122,9 +135,12 @@ class CodeDeployClassicTrafficTest {
         AtomicBoolean cancelled = new AtomicBoolean();
         CompletableFuture<Void> blocked = change(false, cancelled);
         try {
-            await().atMost(TIMEOUT).untilFalse(registered);
+            time.awaitSleepers(1);
+            assertFalse(registered.get());
             cancelled.set(true);
-            await().atMost(TIMEOUT).until(blocked::isDone);
+            time.advance(POLL.minusMillis(1));
+            assertFalse(blocked.isDone());
+            time.advance(Duration.ofMillis(1));
             assertThrows(CancellationException.class, () -> blocked.get(5, TimeUnit.SECONDS));
             verify(loadBalancers, never()).registerInstances(anyString(), anyString(), anyList());
             assertFalse(registered.get());
@@ -139,8 +155,42 @@ class CodeDeployClassicTrafficTest {
     void incompleteTrafficStateFailsItsDeadline(boolean allow) {
         draining.set(!allow);
         health.set("OutOfService");
-        assertThrows(TimeoutException.class, () ->
-                traffic.change(plan, INSTANCE, allow, Duration.ofMillis(10), () -> false));
+        Instant started = time.now();
+        AtomicReference<Duration> lastPoll = new AtomicReference<>();
+        when(loadBalancers.deregisteringInstances(REGION, NAME)).thenAnswer(call -> {
+            lastPoll.set(Duration.between(started, time.now()));
+            return draining.get() ? Set.of(INSTANCE) : Set.of();
+        });
+
+        TimeoutException failure = assertThrows(TimeoutException.class, () ->
+                onTestThread().change(plan, INSTANCE, allow, PHASE_LIMIT, () -> false));
+
+        assertEquals(allow ? "Classic load balancer health did not become InService"
+                : "Classic load balancer connections did not finish draining", failure.getMessage());
+        // The state is still polled at the limit itself, and the failure comes no earlier and no later.
+        assertEquals(PHASE_LIMIT, lastPoll.get());
+        assertEquals(PHASE_LIMIT, Duration.between(started, time.now()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void trafficStateReachedAtTheDeadlineStillCompletes(boolean allow) throws Exception {
+        Instant deadline = time.now().plus(PHASE_LIMIT);
+        when(loadBalancers.deregisteringInstances(REGION, NAME)).thenAnswer(call ->
+                !allow && time.now().isBefore(deadline) ? Set.of(INSTANCE) : Set.of());
+        when(loadBalancers.describeInstanceHealth(REGION, NAME, List.of(INSTANCE))).thenAnswer(call ->
+                Map.of(INSTANCE, new ElbClassicHealthChecker.InstanceHealth(
+                        time.now().isBefore(deadline) ? "OutOfService" : "InService", "N/A", "")));
+
+        onTestThread().change(plan, INSTANCE, allow, PHASE_LIMIT, () -> false);
+
+        assertEquals(deadline, time.now());
+    }
+
+    /** For a change the test runs on its own thread: each poll interval moves the timeline on. */
+    private CodeDeployClassicTraffic onTestThread() {
+        return new CodeDeployClassicTraffic(loadBalancers, authorizer, new ObjectMapper(),
+                TimelineTimer.selfAdvancing(time));
     }
 
     @Test
@@ -193,7 +243,7 @@ class CodeDeployClassicTrafficTest {
         CompletableFuture<Void> result = new CompletableFuture<>();
         Thread.ofVirtual().start(() -> {
             try {
-                traffic.change(plan, INSTANCE, allow, TIMEOUT, cancelled::get);
+                traffic.change(plan, INSTANCE, allow, PHASE_LIMIT, cancelled::get);
                 result.complete(null);
             } catch (Throwable error) {
                 result.completeExceptionally(error);

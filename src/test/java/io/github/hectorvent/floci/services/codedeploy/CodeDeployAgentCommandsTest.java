@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.codedeploy;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -15,7 +16,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -31,6 +31,10 @@ class CodeDeployAgentCommandsTest {
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";
     private static final String HOST = "arn:aws:ec2:us-east-1:111111111111:instance/i-agent";
+    private static final Duration POLL_WAIT = Duration.ofSeconds(60);
+    private static final Duration REDELIVERY = Duration.ofSeconds(5);
+    private final TestTime time = TestTime.create();
+    private final TimelineTimer timer = new TimelineTimer(time);
     private CodeDeployAgentCommands mailbox;
 
     @BeforeEach
@@ -44,9 +48,18 @@ class CodeDeployAgentCommandsTest {
     }
 
     private CodeDeployAgentCommands mailbox(Duration pollWait, Duration redelivery) {
+        return new CodeDeployAgentCommands(new ObjectMapper(), signer(), pollWait, redelivery);
+    }
+
+    /** The production poll wait and redelivery interval, on the test's timeline. */
+    private CodeDeployAgentCommands timelineMailbox() {
+        return new CodeDeployAgentCommands(new ObjectMapper(), signer(), POLL_WAIT, REDELIVERY, timer);
+    }
+
+    private static CodeDeploySpecificationSigner signer() {
         CodeDeploySpecificationSigner signer = mock(CodeDeploySpecificationSigner.class);
         when(signer.sign(anyString())).thenAnswer(call -> "signed:" + call.getArgument(0));
-        return new CodeDeployAgentCommands(new ObjectMapper(), signer, pollWait, redelivery);
+        return signer;
     }
 
     @Test
@@ -245,12 +258,15 @@ class CodeDeployAgentCommandsTest {
 
     @Test
     void aPollBeforeDeploymentAdmissionWakesOnlyForItsOwnAccountAndHost() throws Exception {
-        mailbox = mailbox(Duration.ofSeconds(5), Duration.ofMinutes(1));
+        mailbox = timelineMailbox();
         CompletableFuture<Map<String, Object>> other = waitingPoll("222222222222", HOST);
         CompletableFuture<Map<String, Object>> selected = waitingPoll(ACCOUNT, HOST);
+        timer.forgetWaits();
         CodeDeployAgentCommands.Session session = open("d-new", HOST);
         mailbox.enqueue(session, HOST, "DownloadBundle");
         assertTrue(selected.get(2, TimeUnit.SECONDS).containsKey("HostCommand"));
+        // The other account's poll was woken too; it is back in its wait before the check.
+        timer.awaitWaitOn(mailbox);
         assertFalse(other.isDone());
         mailbox.shutdown();
         assertEquals(Map.of(), other.get(2, TimeUnit.SECONDS));
@@ -258,12 +274,16 @@ class CodeDeployAgentCommandsTest {
 
     @Test
     void acknowledgementAndTheNextPhaseWakeAPollWithoutRedeliveringTheBusyCommand() throws Exception {
-        mailbox = mailbox(Duration.ofSeconds(5), Duration.ofMinutes(1));
+        mailbox = timelineMailbox();
         CodeDeployAgentCommands.Session session = open("d-phases", HOST);
         mailbox.enqueue(session, HOST, "DownloadBundle");
         String first = identifier(mailbox.poll(ACCOUNT, REGION, HOST));
         CompletableFuture<Map<String, Object>> next = waitingPoll(ACCOUNT, HOST);
+        timer.forgetWaits();
         mailbox.acknowledge(ACCOUNT, REGION, first);
+        timer.awaitWaitOn(mailbox);
+        time.advance(REDELIVERY);
+        assertFalse(next.isDone(), "An acknowledged command is not delivered again");
         mailbox.complete(ACCOUNT, REGION, first, "Succeeded", "");
         mailbox.enqueue(session, HOST, "Install");
         Map<String, Object> response = next.get(2, TimeUnit.SECONDS);
@@ -272,21 +292,57 @@ class CodeDeployAgentCommandsTest {
     }
 
     @Test
-    void aLostResponseBecomesAvailableAgainWithoutAcknowledgingTheCommand() {
-        Duration redelivery = Duration.ofMillis(60);
-        mailbox = mailbox(Duration.ofSeconds(2), redelivery);
+    void aLostResponseBecomesAvailableAgainWithoutAcknowledgingTheCommand() throws Exception {
+        mailbox = timelineMailbox();
         CodeDeployAgentCommands.Session session = open("d-lost-response", HOST);
         CodeDeployAgentCommands.Ticket ticket = mailbox.enqueue(session, HOST, "Install");
-        long started = System.nanoTime();
         String first = identifier(mailbox.poll(ACCOUNT, REGION, HOST));
-        assertEquals(first, identifier(mailbox.poll(ACCOUNT, REGION, HOST)));
-        assertTrue(System.nanoTime() - started >= redelivery.toNanos());
+        CompletableFuture<Map<String, Object>> again = waitingPoll(ACCOUNT, HOST);
+        time.advance(REDELIVERY.minusMillis(1));
+        assertFalse(again.isDone());
+        time.advance(Duration.ofMillis(1));
+        assertEquals(first, identifier(again.get(2, TimeUnit.SECONDS)));
         assertFalse(ticket.accepted().toCompletableFuture().isDone());
         assertFalse(ticket.result().toCompletableFuture().isDone());
     }
 
     @Test
-    void anIdlePollHasABoundedDeadlineAndInterruptionPreservesTheInterruptFlag() throws Exception {
+    void aLostResponseIsRedeliveredAgainAfterEachRedeliveryInterval() throws Exception {
+        mailbox = timelineMailbox();
+        CodeDeployAgentCommands.Session session = open("d-lost-twice", HOST);
+        mailbox.enqueue(session, HOST, "Install");
+        String first = identifier(mailbox.poll(ACCOUNT, REGION, HOST));
+        time.advance(REDELIVERY);
+        assertEquals(first, identifier(mailbox.poll(ACCOUNT, REGION, HOST)));
+        CompletableFuture<Map<String, Object>> third = waitingPoll(ACCOUNT, HOST);
+        time.advance(REDELIVERY.minusMillis(1));
+        assertFalse(third.isDone());
+        time.advance(Duration.ofMillis(1));
+        assertEquals(first, identifier(third.get(2, TimeUnit.SECONDS)));
+    }
+
+    @Test
+    void anIdlePollReturnsEmptyExactlyWhenItsPollWaitEnds() throws Exception {
+        mailbox = timelineMailbox();
+        CompletableFuture<Map<String, Object>> idle = waitingPoll(ACCOUNT, HOST);
+        time.advance(POLL_WAIT.minusMillis(1));
+        assertFalse(idle.isDone());
+        time.advance(Duration.ofMillis(1));
+        assertEquals(Map.of(), idle.get(2, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void aCommandQueuedLateInThePollWaitIsStillDeliveredToThatPoll() throws Exception {
+        mailbox = timelineMailbox();
+        CompletableFuture<Map<String, Object>> idle = waitingPoll(ACCOUNT, HOST);
+        time.advance(POLL_WAIT.minusMillis(1));
+        CodeDeployAgentCommands.Session session = open("d-late", HOST);
+        mailbox.enqueue(session, HOST, "Install");
+        assertEquals("Install", ((Map<?, ?>) idle.get(2, TimeUnit.SECONDS).get("HostCommand")).get("CommandName"));
+    }
+
+    @Test
+    void anIdlePollOnTheSystemTimerHasABoundedDeadlineAndInterruptionPreservesTheInterruptFlag() throws Exception {
         Duration timeout = Duration.ofMillis(60);
         mailbox = mailbox(timeout, Duration.ofSeconds(5));
         long started = System.nanoTime();
@@ -304,11 +360,13 @@ class CodeDeployAgentCommandsTest {
         worker.join();
     }
 
-    private CompletableFuture<Map<String, Object>> waitingPoll(String account, String host) {
+    /** Starts a poll that has nothing to deliver and returns once it is waiting. */
+    private CompletableFuture<Map<String, Object>> waitingPoll(String account, String host)
+            throws InterruptedException {
         CompletableFuture<Map<String, Object>> response = new CompletableFuture<>();
-        Thread worker = Thread.ofVirtual().start(() -> response.complete(mailbox.poll(account, REGION, host)));
-        await().atMost(Duration.ofSeconds(2)).until(() ->
-                worker.getState() == Thread.State.TIMED_WAITING || response.isDone());
+        timer.forgetWaits();
+        Thread.ofVirtual().start(() -> response.complete(mailbox.poll(account, REGION, host)));
+        timer.awaitWaitOn(mailbox);
         assertFalse(response.isDone(), "The poll must wait for eligible work");
         return response;
     }

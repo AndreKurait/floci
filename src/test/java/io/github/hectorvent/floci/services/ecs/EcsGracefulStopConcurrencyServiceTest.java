@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.TaskStatus;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
+import io.github.hectorvent.floci.testing.ThreadStates;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -26,10 +27,9 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
@@ -127,7 +127,8 @@ class EcsGracefulStopConcurrencyServiceTest {
             service.updateService(CLUSTER, "fast", null, null, null, null, true, REGION);
             tick(service);
             tick(service);
-            await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, fastOld)));
+            service.awaitPendingStop(fastOld.getTaskArn());
+            assertEquals("STOPPED", lastStatus(service, fastOld));
             assertNotEquals(fastOld.getTaskArn(), onlyRunningTask(service, "fast").getTaskArn());
 
             assertEquals("STOPPING", lastStatus(service, slowOld), "the slow task is still in its grace period");
@@ -135,7 +136,8 @@ class EcsGracefulStopConcurrencyServiceTest {
         } finally {
             releaseSlowStop.countDown();
         }
-        await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, slowOld)));
+        service.awaitPendingStops();
+        assertEquals("STOPPED", lastStatus(service, slowOld));
     }
 
     @Test
@@ -162,7 +164,8 @@ class EcsGracefulStopConcurrencyServiceTest {
         } finally {
             releaseSlowStop.countDown();
         }
-        await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, old)));
+        service.awaitPendingStops();
+        assertEquals("STOPPED", lastStatus(service, old));
         tick(service);
         tick(service);
 
@@ -189,14 +192,14 @@ class EcsGracefulStopConcurrencyServiceTest {
 
         service.updateService(CLUSTER, "flaky", null, 0, null, REGION);
         tick(service);
-        await().atMost(TICK_BUDGET).untilAsserted(() ->
-                verify(containerManager).stopTaskAndCollectExitCodes(handleOf(task)));
+        service.awaitPendingStops();
+        verify(containerManager).stopTaskAndCollectExitCodes(handleOf(task));
         assertEquals("STOPPING", lastStatus(service, task), "a stop that failed leaves the task STOPPING");
 
-        await().atMost(TICK_BUDGET).until(() -> {
-            tick(service);
-            return "STOPPED".equals(lastStatus(service, task));
-        });
+        // The very next tick retries it.
+        tick(service);
+        service.awaitPendingStops();
+        assertEquals("STOPPED", lastStatus(service, task));
         verify(containerManager, times(2)).stopTaskAndCollectExitCodes(handleOf(task));
     }
 
@@ -222,8 +225,9 @@ class EcsGracefulStopConcurrencyServiceTest {
             Thread teardownThread = new Thread(teardown, "test-ecs-teardown");
             teardownThread.setDaemon(true);
             teardownThread.start();
-            assertThrows(TimeoutException.class, () -> teardown.get(500, TimeUnit.MILLISECONDS),
-                    "the teardown waits for the stop already running");
+            // With the stop still held open, a teardown that has parked is waiting for that stop.
+            ThreadStates.awaitParkedOrDone(teardownThread);
+            assertFalse(teardown.isDone(), "the teardown waits for the stop already running");
         } finally {
             releaseSlowStop.countDown();
         }
@@ -249,7 +253,8 @@ class EcsGracefulStopConcurrencyServiceTest {
         service.updateService(CLUSTER, "after-reset", null, 0, null, REGION);
         tick(service);
 
-        await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, task)));
+        service.awaitPendingStops();
+        assertEquals("STOPPED", lastStatus(service, task));
     }
 
     @Test
@@ -318,17 +323,17 @@ class EcsGracefulStopConcurrencyServiceTest {
             // StopTask, woken by the failure, can take the monitor back.
             synchronized (task) {
                 failFirstStop.countDown();
-                for (int i = 0; i < 100 && !retryEntered.await(50, TimeUnit.MILLISECONDS); i++) {
-                    service.reconcile();
-                }
-                assertEquals(0, retryEntered.getCount(), "no tick retried the failed stop");
+                // A stop that fails ends without the task's monitor, so it is over before the tick.
+                service.awaitPendingStops();
+                service.reconcile();
+                assertTrue(retryEntered.await(5, TimeUnit.SECONDS), "the tick did not retry the failed stop");
             }
         } finally {
             failFirstStop.countDown();
             releaseRetry.countDown();
         }
 
-        await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, task)));
+        service.awaitPendingStops();
         EcsTask stopped = describe(service, task);
         assertEquals("STOPPED", stopped.getLastStatus());
         assertEquals(137, stopped.getContainers().getFirst().getExitCode());

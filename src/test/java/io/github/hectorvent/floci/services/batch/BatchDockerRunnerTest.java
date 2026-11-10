@@ -11,8 +11,12 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.services.batch.model.BatchJob;
 import io.github.hectorvent.floci.services.batch.model.BatchNodeExecution;
 import io.github.hectorvent.floci.services.batch.model.BatchRunResult;
+import io.github.hectorvent.floci.services.batch.model.BatchTimeout;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -22,6 +26,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -253,6 +258,124 @@ class BatchDockerRunnerTest {
         assertEquals(137, secondResult.get().exitCode());
         verify(lifecycleManager).stopAndRemove("container-0", null);
         verify(lifecycleManager).stopAndRemove("container-1", null);
+    }
+
+    @Test
+    void anAttemptStillRunningPastItsTimeoutIsPolledAtTheLimitAndThenTimedOut() {
+        TestTime time = TestTime.create();
+        Instant started = time.now();
+        AtomicInteger polls = new AtomicInteger();
+        AtomicReference<Instant> lastPoll = new AtomicReference<>();
+        BatchDockerRunner runner = timedRunner(new TimelineRunTimer(time), () -> {
+            polls.incrementAndGet();
+            lastPoll.set(time.now());
+            return true;
+        });
+
+        BatchRunResult result = runner.run(jobWithTimeout(60), 1);
+
+        assertTrue(result.timedOut());
+        assertEquals(137, result.exitCode());
+        assertEquals("Job timed out", result.reason());
+        // The container is looked at every 250 ms, the last time at the 60 s limit itself.
+        assertEquals(started.plusSeconds(60), lastPoll.get());
+        assertEquals(241, polls.get());
+        assertEquals(started.toEpochMilli(), result.startedAt());
+        assertEquals(started.plusSeconds(60).plusMillis(250).toEpochMilli(), result.stoppedAt());
+    }
+
+    @Test
+    void aContainerThatExitsAtItsTimeoutLimitIsNotTimedOut() {
+        TestTime time = TestTime.create();
+        Instant limit = time.now().plusSeconds(60);
+        BatchDockerRunner runner = timedRunner(new TimelineRunTimer(time), () -> time.now().isBefore(limit));
+
+        BatchRunResult result = runner.run(jobWithTimeout(60), 1);
+
+        assertFalse(result.timedOut());
+        assertEquals(0, result.exitCode());
+        assertEquals(limit.toEpochMilli(), result.stoppedAt());
+    }
+
+    @Test
+    void steppingTheWallClockDuringAnAttemptDoesNotShortenItsTimeout() {
+        TestTime time = TestTime.create();
+        Instant started = time.now();
+        TimelineRunTimer timer = new TimelineRunTimer(time);
+        BatchDockerRunner runner = timedRunner(timer, () -> {
+            if (!time.now().isBefore(started.plusSeconds(1))) {
+                // The host's clock is set an hour ahead one second into the attempt.
+                timer.wallClockAhead = Duration.ofHours(1);
+            }
+            return time.now().isBefore(started.plusSeconds(30));
+        });
+
+        BatchRunResult result = runner.run(jobWithTimeout(60), 1);
+
+        assertFalse(result.timedOut());
+        assertEquals(0, result.exitCode());
+        assertEquals(started.plusSeconds(30), time.now());
+    }
+
+    /** A runner on {@code timer} whose one container is running for as long as {@code running} says. */
+    private BatchDockerRunner timedRunner(BatchDockerRunner.RunTimer timer, BooleanSupplier running) {
+        EmulatorConfig config = config(Optional.empty());
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.BatchServiceConfig batch = mock(EmulatorConfig.BatchServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.batch()).thenReturn(batch);
+        when(batch.dockerNetwork()).thenReturn(Optional.empty());
+        when(config.port()).thenReturn(4566);
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+        when(dockerClient.inspectContainerCmd("container-id").exec().getState().getRunning())
+                .thenAnswer(invocation -> running.getAsBoolean());
+        when(dockerClient.inspectContainerCmd("container-id").exec().getState().getExitCodeLong()).thenReturn(0L);
+        ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
+        ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
+        when(containerBuilder.newContainer(anyString())).thenReturn(builder);
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
+        return new BatchDockerRunner(containerBuilder, lifecycleManager, mock(ContainerLogStreamer.class),
+                config, mock(ContainerDetector.class), timer);
+    }
+
+    private BatchJob jobWithTimeout(int attemptDurationSeconds) {
+        BatchJob job = job();
+        BatchTimeout timeout = new BatchTimeout();
+        timeout.setAttemptDurationSeconds(attemptDurationSeconds);
+        job.setTimeout(timeout);
+        return job;
+    }
+
+    /**
+     * A run timer on a {@link TestTime} timeline for a run on the test's own thread: each sleep moves
+     * the timeline on. The wall clock can be set ahead of the timeline, as a host's clock can be.
+     */
+    private static final class TimelineRunTimer implements BatchDockerRunner.RunTimer {
+        private final TestTime time;
+        private volatile Duration wallClockAhead = Duration.ZERO;
+
+        TimelineRunTimer(TestTime time) {
+            this.time = time;
+        }
+
+        @Override
+        public long currentTimeMillis() {
+            return time.currentTimeMillis() + wallClockAhead.toMillis();
+        }
+
+        @Override
+        public long nanoTime() {
+            return time.nanoTime();
+        }
+
+        @Override
+        public void sleepMillis(long millis) {
+            time.sleepAdvancing(Duration.ofMillis(millis));
+        }
     }
 
     private BatchJob job() {

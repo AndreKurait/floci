@@ -32,13 +32,20 @@ public class CodeDeployClassicTraffic {
     private final ElbClassicService loadBalancers;
     private final ServiceRoleCallAuthorizer authorizer;
     private final ObjectMapper mapper;
+    private final CodeDeployTimer timer;
 
     @Inject
     public CodeDeployClassicTraffic(ElbClassicService loadBalancers, ServiceRoleCallAuthorizer authorizer,
                                      ObjectMapper mapper) {
+        this(loadBalancers, authorizer, mapper, CodeDeployTimer.SYSTEM);
+    }
+
+    CodeDeployClassicTraffic(ElbClassicService loadBalancers, ServiceRoleCallAuthorizer authorizer,
+                             ObjectMapper mapper, CodeDeployTimer timer) {
         this.loadBalancers = loadBalancers;
         this.authorizer = authorizer;
         this.mapper = mapper;
+        this.timer = timer;
     }
 
     Plan prepare(String account, String region, DeploymentGroup group) {
@@ -67,7 +74,7 @@ public class CodeDeployClassicTraffic {
 
     void change(Plan plan, String instance, boolean allow, Duration timeout, BooleanSupplier cancelled)
             throws InterruptedException, TimeoutException {
-        long deadline = System.nanoTime() + timeout.toNanos();
+        long deadline = timer.nanoTime() + timeout.toNanos();
         String action = allow ? "RegisterInstancesWithLoadBalancer" : "DeregisterInstancesFromLoadBalancer";
         for (String name : plan.loadBalancers()) {
             checkCancelled(cancelled);
@@ -94,12 +101,12 @@ public class CodeDeployClassicTraffic {
             if (complete) {
                 return;
             }
-            long remaining = deadline - System.nanoTime();
+            long remaining = deadline - timer.nanoTime();
             if (remaining <= 0) {
                 throw new TimeoutException(allow ? "Classic load balancer health did not become InService"
                         : "Classic load balancer connections did not finish draining");
             }
-            TimeUnit.NANOSECONDS.sleep(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(200)));
+            timer.sleepNanos(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(200)));
         }
     }
 
