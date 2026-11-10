@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -20,9 +21,14 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.w3c.dom.Document;
 
+import javax.xml.XMLConstants;
+import javax.xml.namespace.NamespaceContext;
 import javax.xml.xpath.XPath;
 import javax.xml.xpath.XPathFactory;
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -33,7 +39,7 @@ class CloudWatchMetricMathAlarmTest {
     private static final String REGION = "us-east-1";
     private static final String ALARM_NAME = "metric-math-round-trip";
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final String XML_ALARM = "/DescribeAlarmsResponse/DescribeAlarmsResult/MetricAlarms/member";
+    private static final String XML_ALARM = "/cw:DescribeAlarmsResponse/cw:DescribeAlarmsResult/cw:MetricAlarms/cw:member";
 
     private CloudWatchMetricsJsonHandler jsonHandler;
     private CloudWatchMetricsQueryHandler queryHandler;
@@ -132,26 +138,49 @@ class CloudWatchMetricMathAlarmTest {
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         params.putSingle("AlarmNames.member.1", ALARM_NAME);
         String xml = (String) queryHandler.handle("DescribeAlarms", params, REGION).getEntity();
-        return XmlParser.parseDocument(xml);
+        Document document = XmlParser.parseDocument(xml);
+        assertEquals(AwsNamespaces.CW, document.getDocumentElement().getNamespaceURI());
+        return document;
+    }
+
+    private static XPath cloudWatchXPath() {
+        XPath xpath = XPathFactory.newInstance().newXPath();
+        xpath.setNamespaceContext(new NamespaceContext() {
+            @Override
+            public String getNamespaceURI(String prefix) {
+                return "cw".equals(prefix) ? AwsNamespaces.CW : XMLConstants.NULL_NS_URI;
+            }
+
+            @Override
+            public String getPrefix(String namespaceURI) {
+                return AwsNamespaces.CW.equals(namespaceURI) ? "cw" : null;
+            }
+
+            @Override
+            public Iterator<String> getPrefixes(String namespaceURI) {
+                return AwsNamespaces.CW.equals(namespaceURI) ? List.of("cw").iterator() : Collections.emptyIterator();
+            }
+        });
+        return xpath;
     }
 
     private void assertMetricMathAlarm(ObjectNode request) throws Exception {
         JsonNode alarm = describeJson();
         assertEquals(request.path("Metrics"), alarm.path("Metrics"));
         Document document = describeXml();
-        XPath xpath = XPathFactory.newInstance().newXPath();
+        XPath xpath = cloudWatchXPath();
         for (String field : new String[]{"Period", "MetricName", "Namespace", "Statistic", "ExtendedStatistic",
                 "Unit", "Dimensions"}) {
             assertFalse(alarm.has(field), "metric-math JSON must not contain " + field);
-            assertEquals("0", xpath.evaluate("count(" + XML_ALARM + "/" + field + ")", document),
+            assertEquals("0", xpath.evaluate("count(" + XML_ALARM + "/cw:" + field + ")", document),
                     "metric-math XML must not contain " + field);
         }
-        assertEquals("3", xpath.evaluate("count(" + XML_ALARM + "/Metrics/member)", document));
-        assertEquals("5", xpath.evaluate(XML_ALARM + "/Threshold", document).replace(".0", ""));
-        assertEquals("2", xpath.evaluate(XML_ALARM + "/EvaluationPeriods", document));
+        assertEquals("3", xpath.evaluate("count(" + XML_ALARM + "/cw:Metrics/cw:member)", document));
+        assertEquals("5", xpath.evaluate(XML_ALARM + "/cw:Threshold", document).replace(".0", ""));
+        assertEquals("2", xpath.evaluate(XML_ALARM + "/cw:EvaluationPeriods", document));
         assertEquals(5.0, alarm.path("Threshold").asDouble());
         assertEquals(2, alarm.path("EvaluationPeriods").asInt());
-        assertXmlMatchesJson(request.path("Metrics"), XML_ALARM + "/Metrics", document, xpath);
+        assertXmlMatchesJson(request.path("Metrics"), XML_ALARM + "/cw:Metrics", document, xpath);
     }
 
     private void assertSingleMetricAlarm(int period) throws Exception {
@@ -162,21 +191,21 @@ class CloudWatchMetricMathAlarmTest {
         assertEquals("Sum", alarm.path("Statistic").asText());
         assertFalse(alarm.has("Metrics"));
         Document document = describeXml();
-        XPath xpath = XPathFactory.newInstance().newXPath();
-        assertEquals(Integer.toString(period), xpath.evaluate(XML_ALARM + "/Period", document));
-        assertEquals("0", xpath.evaluate("count(" + XML_ALARM + "/Metrics)", document));
+        XPath xpath = cloudWatchXPath();
+        assertEquals(Integer.toString(period), xpath.evaluate(XML_ALARM + "/cw:Period", document));
+        assertEquals("0", xpath.evaluate("count(" + XML_ALARM + "/cw:Metrics)", document));
     }
 
     private static void assertXmlMatchesJson(JsonNode value, String path, Document document, XPath xpath)
             throws Exception {
         if (value.isArray()) {
-            assertEquals(Integer.toString(value.size()), xpath.evaluate("count(" + path + "/member)", document));
+            assertEquals(Integer.toString(value.size()), xpath.evaluate("count(" + path + "/cw:member)", document));
             for (int index = 0; index < value.size(); index++) {
-                assertXmlMatchesJson(value.get(index), path + "/member[" + (index + 1) + "]", document, xpath);
+                assertXmlMatchesJson(value.get(index), path + "/cw:member[" + (index + 1) + "]", document, xpath);
             }
         } else if (value.isObject()) {
             for (Map.Entry<String, JsonNode> field : value.properties()) {
-                assertXmlMatchesJson(field.getValue(), path + "/" + field.getKey(), document, xpath);
+                assertXmlMatchesJson(field.getValue(), path + "/cw:" + field.getKey(), document, xpath);
             }
         } else {
             assertEquals(value.asText(), xpath.evaluate(path, document), path);

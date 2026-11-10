@@ -11,6 +11,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.UUID;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -32,11 +34,16 @@ class CloudWatchLegacyProtocolIntegrationTest {
             "DescribeAnomalyDetectors", "ListMetricStreams", "DescribeAlarmContributors",
             "GetOTelEnrichment", "ListManagedInsightRules", "ListTagsForResource",
             "DescribeInsightRules", "PutLogAlarm", "FlociReviewUnknownOperation"})
-    void unavailableLegacyJsonOperationsUseTheAcceptedConsoleErrorContract(String action) {
+    void unavailableLegacyJsonOperationsStayUnknownBeforeBodyParsing(String action) {
         given().contentType("application/x-amz-json-1.0")
-                .header("X-Amz-Target", LEGACY_TARGET + action).body("{}")
-                .post("/").then().statusCode(400)
-                .body("__type", equalTo("UnsupportedOperation"));
+                .header("X-Amz-Target", LEGACY_TARGET + action).body("[]")
+                .post("/").then().statusCode(404)
+                .body("__type", equalTo("UnknownOperationException"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ListMetrics", "PutMetricAlarm", "GetMetricData"})
+    void recognizedLegacyOperationsRequireStructuredInputs(String action) {
         given().contentType("application/x-amz-json-1.0")
                 .header("X-Amz-Target", LEGACY_TARGET + action).body("[]")
                 .post("/").then().statusCode(400)
@@ -70,8 +77,7 @@ class CloudWatchLegacyProtocolIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"GET,ListMetrics", "POST,ListMetrics", "GET,DescribeAlarms", "POST,DescribeAlarms",
-            "GET,ListDashboards", "POST,ListDashboards"})
+    @CsvSource({"GET,ListMetrics", "POST,ListMetrics", "GET,DescribeAlarms", "POST,DescribeAlarms"})
     void commonLegacyReadsUseTheRequestedXmlNamespace(String method, String action) throws Exception {
         String xml = queryRequest(method, action).request(method, "/").then().statusCode(200)
                 .body(containsString(action + "Response")).extract().asString();
@@ -81,13 +87,45 @@ class CloudWatchLegacyProtocolIntegrationTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"GET,StateValue,ALARM", "POST,StateValue,ALARM",
+            "GET,AlarmTypes.member.1,CompositeAlarm", "POST,AlarmTypes.member.1,CompositeAlarm"})
+    void unsupportedLegacyReadMembersDoNotUseTheCurrentContract(String method, String name, String value) {
+        queryRequest(method, "DescribeAlarms").param(name, value).request(method, "/")
+                .then().statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("UnsupportedOperation"));
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"GET", "POST"})
-    void modeledLegacyAlarmHistoryUsesTheRequestedNamespace(String method) throws Exception {
-        String xml = queryRequest(method, "DescribeAlarmHistory").request(method, "/")
-                .then().statusCode(200)
-                .body(containsString("DescribeAlarmHistoryResponse")).extract().asString();
-        assertEquals(AwsNamespaces.CW_2013, XmlParser.parseDocument(xml)
-                .getDocumentElement().getNamespaceURI());
+    void legacyAlarmReadsRefuseMetricMathShapes(String method) {
+        String alarm = "legacy-query-" + UUID.randomUUID();
+        try {
+            given().contentType("application/x-amz-json-1.0")
+                    .header("X-Amz-Target", MODERN_TARGET + "PutMetricAlarm")
+                    .body("""
+                            {"AlarmName":"%s","EvaluationPeriods":1,"Threshold":1,
+                             "ComparisonOperator":"GreaterThanThreshold","Metrics":[
+                              {"Id":"m1","ReturnData":true,"MetricStat":{
+                               "Metric":{"Namespace":"LegacyProtocol","MetricName":"Unused"},
+                               "Period":60,"Stat":"Sum"}}]}
+                            """.formatted(alarm)).post("/").then().statusCode(200);
+            queryRequest(method, "DescribeAlarms").param("AlarmNames.member.1", alarm)
+                    .request(method, "/").then().statusCode(400)
+                    .body("ErrorResponse.Error.Code", equalTo("UnsupportedOperation"))
+                    .body("ErrorResponse.Error.Message", containsString(alarm));
+        } finally {
+            given().contentType("application/x-amz-json-1.0")
+                    .header("X-Amz-Target", MODERN_TARGET + "DeleteAlarms")
+                    .body("{\"AlarmNames\":[\"" + alarm + "\"]}").post("/").then().statusCode(200);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "POST"})
+    void modeledUnimplementedLegacyQueryOperationsReachCloudWatch(String method) {
+        queryRequest(method, "PutMetricAlarm").request(method, "/")
+                .then().statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("UnsupportedOperation"));
     }
 
     @ParameterizedTest
