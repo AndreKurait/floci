@@ -19,6 +19,7 @@ import io.floci.aws.services.sqs.model.MessageAttributeValue;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
@@ -37,6 +38,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 class SnsServiceTest {
@@ -1069,6 +1071,48 @@ class SnsServiceTest {
                 "event", new MessageAttributeValue("refund", "String"));
         assertTrue(snsService.matchesFilterPolicy(sub, null, matching));
         assertFalse(snsService.matchesFilterPolicy(sub, null, nonMatching));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void publishFindsLegacySubscriptionsWithoutChangingTheirOwningAccount(boolean foreign, boolean batch) {
+        String subscriberAccount = foreign ? "000000000002" : ACCOUNT;
+        String topicArn = "arn:aws:sns:" + REGION + ":" + ACCOUNT + ":legacy-fanout";
+        String endpoint = "arn:aws:lambda:" + REGION + ":" + subscriberAccount + ":function:recipient";
+        InMemoryStorage<String, Topic> rawTopics = new InMemoryStorage<>();
+        InMemoryStorage<String, Subscription> rawSubscriptions = new InMemoryStorage<>();
+        rawTopics.put("topic::" + REGION + "::" + topicArn, new Topic("legacy-fanout", topicArn));
+        LambdaService lambda = mock(LambdaService.class);
+        SnsService subscriber = new SnsService(
+                new AccountAwareStorageBackend<>(rawTopics, null, subscriberAccount),
+                new AccountAwareStorageBackend<>(rawSubscriptions, null, subscriberAccount),
+                new RegionResolver(REGION, subscriberAccount), null, lambda);
+        Subscription accepted = subscriber.subscribe(topicArn, "lambda", endpoint, REGION, Map.of());
+        Subscription pending = subscriber.subscribe(topicArn, "lambda", endpoint + "-pending", REGION,
+                Map.of("PendingConfirmation", "true"));
+        subscriber.subscribe(topicArn, "lambda", endpoint + "-filtered", REGION,
+                Map.of("FilterPolicy", "{\"event\":[\"other\"]}"));
+        String other = subscriber.createTopic("unrelated", null, null, REGION).getTopicArn();
+        subscriber.subscribe(other, "lambda", endpoint + "-unrelated", REGION, Map.of());
+        String subscriptionKey = subscriberAccount + "/sub::" + REGION + "::" + accepted.getSubscriptionArn();
+        assertSame(accepted, rawSubscriptions.get(subscriptionKey).orElseThrow());
+        SnsService owner = new SnsService(new AccountAwareStorageBackend<>(rawTopics, null, ACCOUNT),
+                new AccountAwareStorageBackend<>(rawSubscriptions, null, ACCOUNT),
+                new RegionResolver(REGION, ACCOUNT), null, lambda);
+        assertEquals(topicArn, owner.createTopic("legacy-fanout", null, null, REGION).getTopicArn());
+
+        if (batch) {
+            assertTrue(owner.publishBatch(topicArn, List.of(Map.of("Id", "entry", "Message", "event")), REGION)
+                    .failed().isEmpty());
+        } else {
+            assertNotNull(owner.publish(topicArn, null, "event", null, REGION));
+        }
+
+        verify(lambda).invoke(eq(REGION), eq(endpoint), any(byte[].class), eq(InvocationType.Event));
+        verifyNoMoreInteractions(lambda);
+        assertSame(accepted, rawSubscriptions.get(subscriptionKey).orElseThrow());
+        assertEquals(subscriberAccount, accepted.getAccountId());
+        assertEquals("true", pending.getAttributes().get("PendingConfirmation"));
     }
 
     @Test

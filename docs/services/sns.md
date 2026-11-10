@@ -59,11 +59,19 @@ policy set starts from the default one AWS gives a new topic, and `GetTopicAttri
 Under IAM enforcement the topic policy decides what AWS services may publish to the topic, such as
 [SES's event destinations and notifications](ses.md#iam-enforcement), and takes part in an IAM
 caller's request the way any [resource-based policy](iam.md#resource-based-policies) does when the
-request names the topic in a JSON-protocol body. A Query-protocol request carries the topic in its
-form body, which enforcement does not read yet, so the topic policy plays no part in it. A
+request names the topic in either a JSON-protocol or Query-protocol body. A
 Query-protocol request that IAM enforcement refuses answers `AuthorizationError` (HTTP 403), the
 error every SNS operation lists for a caller denied access, which SDKs raise as
 `AuthorizationErrorException`.
+
+Publishing resolves the topic in its ARN owner account. Fan-out includes matching subscriptions
+stored under other subscriber accounts, including legacy records, without moving their ownership.
+Pending subscriptions and subscription filters still apply.
+
+S3 object-event notifications require a topic policy allowing the S3 service principal to publish
+when IAM enforcement is enabled. The bucket ARN and bucket owner supply `aws:SourceArn` and
+`aws:SourceAccount`; a denied notification is logged without rejecting the object write.
+Notification configuration validation and its test-event behavior are unchanged.
 
 ## Lambda delivery permissions
 

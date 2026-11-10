@@ -6,6 +6,7 @@ import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.services.sqs.model.Message;
 import io.floci.aws.testing.IamEnforcementProfile;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
@@ -14,8 +15,21 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.sns.SnsClient;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.QueueAttributeName;
 
+import java.net.URI;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
@@ -41,6 +55,9 @@ class S3NotificationDestinationIamEnforcementIntegrationTest {
     @Inject SqsService sqsService;
     @InjectSpy SnsService snsService;
     @Inject ObjectMapper objectMapper;
+
+    @TestHTTPResource("/")
+    URI endpoint;
 
     private String bucket;
 
@@ -115,6 +132,68 @@ class S3NotificationDestinationIamEnforcementIntegrationTest {
         } finally {
             deleteTopic(BUCKET_ACCOUNT, ownTopicArn);
             deleteTopic(OTHER_ACCOUNT, otherTopicArn);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "principal", "sourceArn", "sourceAccount", "deny", "allow", "revoked"})
+    void objectNotificationsRequireTheTopicsServiceGrant(String policyCase) throws Exception {
+        StaticCredentialsProvider recipient = StaticCredentialsProvider.create(
+                AwsBasicCredentials.create(OTHER_ACCOUNT, "test"));
+        try (SnsClient sns = SnsClient.builder().endpointOverride(endpoint).region(Region.of(REGION))
+                     .credentialsProvider(recipient).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
+             SqsClient sqs = SqsClient.builder().endpointOverride(endpoint).region(Region.of(REGION))
+                     .credentialsProvider(recipient).httpClientBuilder(UrlConnectionHttpClient.builder()).build();
+             S3Client s3 = S3Client.builder().endpointOverride(endpoint).region(Region.of(REGION))
+                     .forcePathStyle(true).credentialsProvider(StaticCredentialsProvider.create(
+                             AwsBasicCredentials.create(BUCKET_ACCOUNT, "test")))
+                     .httpClientBuilder(UrlConnectionHttpClient.builder()).build()) {
+            String topic = sns.createTopic(request -> request.name("notification-" + UUID.randomUUID())).topicArn();
+            String queue = null;
+            try {
+                queue = sqs.createQueue(request -> request.queueName("notification-" + UUID.randomUUID())).queueUrl();
+                String queueUrl = queue;
+                String queueArn = sqs.getQueueAttributes(request -> request.queueUrl(queueUrl)
+                        .attributeNames(QueueAttributeName.QUEUE_ARN)).attributes().get(QueueAttributeName.QUEUE_ARN);
+                sqs.setQueueAttributes(request -> request.queueUrl(queueUrl).attributes(Map.of(QueueAttributeName.POLICY,
+                        """
+                        {"Statement":[{"Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},
+                        "Action":"sqs:SendMessage","Resource":"%s",
+                        "Condition":{"ArnEquals":{"aws:SourceArn":"%s"}}}]}
+                        """.formatted(queueArn, topic))));
+                sns.subscribe(request -> request.topicArn(topic).protocol("sqs").endpoint(queueArn));
+                putTopicNotification(topic).statusCode(200);
+                if (!"missing".equals(policyCase)) {
+                    String principal = "principal".equals(policyCase) ? "events.amazonaws.com" : "s3.amazonaws.com";
+                    String sourceArn = "arn:aws:s3:::" + bucket + ("sourceArn".equals(policyCase) ? "-wrong" : "");
+                    String account = "sourceAccount".equals(policyCase) ? OTHER_ACCOUNT : BUCKET_ACCOUNT;
+                    String effect = "deny".equals(policyCase) ? "Deny" : "Allow";
+                    sns.setTopicAttributes(request -> request.topicArn(topic).attributeName("Policy").attributeValue(
+                            """
+                            {"Statement":[{"Effect":"%s","Principal":{"Service":"%s"},
+                            "Action":"sns:Publish","Resource":"%s","Condition":{
+                            "ArnEquals":{"aws:SourceArn":"%s"},"StringEquals":{"aws:SourceAccount":"%s"}}}]}
+                            """.formatted(effect, principal, topic, sourceArn, account)));
+                }
+                if ("revoked".equals(policyCase)) {
+                    s3.putObject(request -> request.bucket(bucket).key("event"), RequestBody.fromString("first"));
+                    assertEquals(1, sqs.receiveMessage(request -> request.queueUrl(queueUrl)).messages().size());
+                    sqs.purgeQueue(request -> request.queueUrl(queueUrl));
+                    sns.setTopicAttributes(request -> request.topicArn(topic).attributeName("Policy")
+                            .attributeValue("{\"Statement\":[]}"));
+                }
+                s3.putObject(request -> request.bucket(bucket).key("event"), RequestBody.fromString("event"));
+                assertEquals("event", s3.getObjectAsBytes(request -> request.bucket(bucket).key("event")).asUtf8String());
+                int delivered = sqs.receiveMessage(request -> request.queueUrl(queueUrl)).messages().size();
+                assertEquals("allow".equals(policyCase) ? 1 : 0, delivered, policyCase);
+            } finally {
+                s3.deleteObject(request -> request.bucket(bucket).key("event"));
+                if (queue != null) {
+                    String queueUrl = queue;
+                    sqs.deleteQueue(request -> request.queueUrl(queueUrl));
+                }
+                sns.deleteTopic(request -> request.topicArn(topic));
+            }
         }
     }
 
