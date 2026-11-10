@@ -96,10 +96,12 @@ class ElbClassicNodeHealthTest {
         startAndAwaitFirstChecks();
         assertEquals("OutOfService", health.getHealth(lb, INSTANCE).state());
         health.runArmedChecks();
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
-            assertEquals("InService", health.getHealth(lb, INSTANCE).state());
-            verify(frontends).healthChanged(lb, bad, ElbClassicHealthChecker.InstanceHealth.failedChecks());
-        });
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    assertEquals("InService", health.getHealth(lb, INSTANCE).state());
+                    verify(frontends).healthChanged(lb, bad, ElbClassicHealthChecker.InstanceHealth.failedChecks());
+                });
         verify(frontends, never()).healthChanged(lb, bad, ElbClassicHealthChecker.InstanceHealth.inService());
         verify(frontends).healthChanged(lb, good, ElbClassicHealthChecker.InstanceHealth.inService());
     }
@@ -121,7 +123,9 @@ class ElbClassicNodeHealthTest {
         } finally {
             release.countDown();
         }
-        await().atMost(Duration.ofSeconds(3)).until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
     }
 
     @ParameterizedTest
@@ -129,7 +133,9 @@ class ElbClassicNodeHealthTest {
     void replacingANodeOrRegistrationDoesNotReuseItsPreviousSuccessfulChecks(boolean replaceNode) {
         startAndAwaitFirstChecks();
         health.runArmedChecks();
-        await().atMost(Duration.ofSeconds(3)).until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
         ElbClassicFrontendManager.Probe replacement = replaceNode ? node("eni-a", "replacement")
                 : new ElbClassicFrontendManager.Probe(good.frontend(), INSTANCE, good.address(), 1);
         AtomicInteger checks = new AtomicInteger();
@@ -140,12 +146,16 @@ class ElbClassicNodeHealthTest {
         nodes.set(List.of(replacement, bad));
         assertEquals("OutOfService", health.getHealth(lb, INSTANCE).state());
         health.runArmedChecks();
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
-                verify(frontends).healthChanged(lb, replacement, ElbClassicHealthChecker.InstanceHealth.registering()));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
+                        verify(frontends).healthChanged(lb, replacement, ElbClassicHealthChecker.InstanceHealth.registering()));
         assertEquals(1, checks.get());
         assertEquals("OutOfService", health.getHealth(lb, INSTANCE).state());
         health.runArmedChecks();
-        await().atMost(Duration.ofSeconds(3)).until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
     }
 
     @Test
@@ -153,7 +163,9 @@ class ElbClassicNodeHealthTest {
         lb.getInstanceIds().add(INSTANCE);
         startAndAwaitFirstChecks();
         health.runArmedChecks();
-        await().atMost(Duration.ofSeconds(3)).until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
         lb.getInstanceIds().add("i-new");
         health.startMonitoring(lb);
         health.reconcileInstances(lb);
@@ -179,12 +191,16 @@ class ElbClassicNodeHealthTest {
             goodReachable.set(false);
             health.runArmedChecks();
             health.runArmedChecks();
-            await().atMost(Duration.ofSeconds(3)).until(() -> goodChecks.get() == 4 && badChecks.get() == 4);
+            await().atMost(Duration.ofSeconds(3))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> goodChecks.get() == 4 && badChecks.get() == 4);
         } finally {
             release.countDown();
         }
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
-                assertEquals(ElbClassicHealthChecker.InstanceHealth.failedChecks(), health.getHealth(lb, INSTANCE)));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
+                        assertEquals(ElbClassicHealthChecker.InstanceHealth.failedChecks(), health.getHealth(lb, INSTANCE)));
         InOrder changes = inOrder(frontends);
         changes.verify(frontends).healthChanged(lb, good, ElbClassicHealthChecker.InstanceHealth.registering());
         changes.verify(frontends).healthChanged(lb, good, ElbClassicHealthChecker.InstanceHealth.inService());
@@ -194,12 +210,14 @@ class ElbClassicNodeHealthTest {
     private void startAndAwaitFirstChecks() {
         health.startMonitoring(lb);
         health.registerInstances(lb, List.of(INSTANCE));
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
-            assertEquals(1, goodChecks.get());
-            assertEquals(1, badChecks.get());
-            verify(frontends).healthChanged(lb, good, ElbClassicHealthChecker.InstanceHealth.registering());
-            verify(frontends).healthChanged(lb, bad, ElbClassicHealthChecker.InstanceHealth.registering());
-        });
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    assertEquals(1, goodChecks.get());
+                    assertEquals(1, badChecks.get());
+                    verify(frontends).healthChanged(lb, good, ElbClassicHealthChecker.InstanceHealth.registering());
+                    verify(frontends).healthChanged(lb, bad, ElbClassicHealthChecker.InstanceHealth.registering());
+                });
     }
 
     private static ElbClassicFrontendManager.Probe node(String eni, String generation) {
