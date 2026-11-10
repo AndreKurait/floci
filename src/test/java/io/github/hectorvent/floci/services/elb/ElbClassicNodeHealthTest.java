@@ -131,11 +131,8 @@ class ElbClassicNodeHealthTest {
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void replacingANodeOrRegistrationDoesNotReuseItsPreviousSuccessfulChecks(boolean replaceNode) {
-        startAndAwaitFirstChecks();
-        health.runArmedChecks();
-        await().atMost(Duration.ofSeconds(3))
-                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
-                .until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
+        // Stubbed before the checker starts: its workers call this mock, and a call of theirs
+        // landing between when(...) and thenAnswer(...) would take this answer for itself.
         ElbClassicFrontendManager.Probe replacement = replaceNode ? node("eni-a", "replacement")
                 : new ElbClassicFrontendManager.Probe(good.frontend(), INSTANCE, good.address(), 1);
         AtomicInteger checks = new AtomicInteger();
@@ -143,6 +140,11 @@ class ElbClassicNodeHealthTest {
             checks.incrementAndGet();
             return true;
         });
+        startAndAwaitFirstChecks();
+        health.runArmedChecks();
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "InService".equals(health.getHealth(lb, INSTANCE).state()));
         nodes.set(List.of(replacement, bad));
         assertEquals("OutOfService", health.getHealth(lb, INSTANCE).state());
         health.runArmedChecks();
