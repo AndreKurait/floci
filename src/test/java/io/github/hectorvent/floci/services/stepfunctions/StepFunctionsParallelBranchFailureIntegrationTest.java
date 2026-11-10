@@ -6,12 +6,13 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 
+import static io.github.hectorvent.floci.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * A {@code Parallel} fails the moment any of its branches fails, whichever branch is listed first,
@@ -93,17 +94,6 @@ class StepFunctionsParallelBranchFailureIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private static Response describeExecution(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"executionArn": "%s"}
-                        """.formatted(execArn))
-                .when()
-                .post("/");
-    }
-
     private static Response getExecutionHistory(String execArn) {
         Response resp = given()
                 .header("X-Amz-Target", "AWSStepFunctions.GetExecutionHistory")
@@ -117,17 +107,8 @@ class StepFunctionsParallelBranchFailureIntegrationTest {
         return resp;
     }
 
-    private static Response waitForTerminalExecution(String execArn, long limitMillis) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + limitMillis;
-        while (System.currentTimeMillis() < deadline) {
-            Response resp = describeExecution(execArn);
-            if (!"RUNNING".equals(resp.jsonPath().getString("status"))) {
-                return resp;
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution " + execArn + " was still RUNNING after " + limitMillis + " ms");
-        return null;
+    private static Response waitForTerminalExecution(String execArn, long limitMillis) {
+        return waitForTerminalState(execArn, Duration.ofMillis(limitMillis));
     }
 
     private static String quote(String raw) {

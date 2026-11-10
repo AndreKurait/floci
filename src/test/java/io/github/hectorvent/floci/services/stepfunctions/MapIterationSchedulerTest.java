@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -7,6 +8,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -16,15 +18,18 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.LongSupplier;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 class MapIterationSchedulerTest {
+
+    private static final Duration WAIT_BUDGET = Duration.ofMillis(200);
+    private static final Duration ONE_NANO = Duration.ofNanos(1);
 
     @Test
     void appliesAwsConcurrencyCeilingsForInlineAndDistributedMaps() {
@@ -155,22 +160,12 @@ class MapIterationSchedulerTest {
         CountDownLatch neverRelease = new CountDownLatch(1);
         CountDownLatch blockedInterrupted = new CountDownLatch(inFlight);
         List<Integer> cut = new CopyOnWriteArrayList<>();
-        AtomicInteger clockReads = new AtomicInteger();
-        // Start the real 200 ms queue wait only after the worker window is ready.
-        LongSupplier nanoTime = () -> {
-            if (clockReads.getAndIncrement() > 0) {
-                try {
-                    assertTrue(started.await(10, TimeUnit.SECONDS), "the worker window did not start");
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new AssertionError("interrupted while waiting for workers", e);
-                }
-            }
-            return 0;
-        };
+        TestTime time = TestTime.create();
+        TimelineWaits waits = new TimelineWaits(time);
+        long deadlineNanos = time.nanoTime() + WAIT_BUDGET.toNanos();
 
         try {
-            Assertions.assertTimeoutPreemptively(Duration.ofSeconds(15), () ->
+            CompletableFuture<TimeoutException> run = AslExecutorFixture.start(() ->
                     assertThrows(TimeoutException.class, () -> MapIterationScheduler.execute(
                             itemCount, maxConcurrency, index -> () -> {
                                 started.countDown();
@@ -181,8 +176,17 @@ class MapIterationSchedulerTest {
                                     blockedInterrupted.countDown();
                                     throw e;
                                 }
-                            }, TimeUnit.MILLISECONDS.toNanos(200), cut::add, nanoTime)));
+                            }, deadlineNanos, cut::add, time::nanoTime, waits)));
+            assertTrue(started.await(10, TimeUnit.SECONDS), "the worker window did not start");
+            waits.awaitWaiting(1);
 
+            time.advance(WAIT_BUDGET.minus(ONE_NANO));
+            assertEquals(1, waits.waiting(), "the wait for an iteration lasts until the budget is spent");
+            assertFalse(run.isDone());
+            assertEquals(inFlight, blockedInterrupted.getCount(), "no iteration is interrupted before that");
+
+            time.advance(ONE_NANO);
+            AslExecutorFixture.finished(run);
             assertTrue(blockedInterrupted.await(10, TimeUnit.SECONDS),
                     "every blocked iteration should be interrupted after the timed wait expires");
             assertEquals(List.of(), cut, "deadline expiry must not name an iteration as failed");
@@ -190,6 +194,7 @@ class MapIterationSchedulerTest {
             neverRelease.countDown();
         }
     }
+
     @Test
     void namesEachInFlightIterationBeforeCancellingItOnFailure() throws Exception {
         CountDownLatch othersStarted = new CountDownLatch(2);

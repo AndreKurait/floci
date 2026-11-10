@@ -11,14 +11,16 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
+import static io.github.hectorvent.floci.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Integration tests for the optimized {@code arn:aws:states:::events:putEvents} task integration.
@@ -334,22 +336,22 @@ class StepFunctionsPutEventsIntegrationTest {
     }
 
     private JsonNode receiveSingleMessage(String queueUrl) throws Exception {
-        for (int i = 0; i < 20; i++) {
-            Response resp = given()
-                    .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
-                    .contentType(SQS_CONTENT_TYPE)
-                    .body("{\"QueueUrl\":\"%s\",\"MaxNumberOfMessages\":1,\"WaitTimeSeconds\":1}"
-                            .formatted(queueUrl))
-                    .when().post("/");
-            resp.then().statusCode(200);
-            JsonNode messages = mapper.readTree(resp.body().asString()).path("Messages");
-            if (messages.size() == 1) {
-                return messages.get(0);
-            }
-            Thread.sleep(100);
-        }
-        fail("No event was delivered to " + queueUrl);
-        return null;
+        // Room for 20 empty receives: each one long-polls for 1 s, plus a 100 ms pause.
+        return await("an event delivered to " + queueUrl)
+                .atMost(Duration.ofSeconds(22))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    Response resp = given()
+                            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+                            .contentType(SQS_CONTENT_TYPE)
+                            .body("{\"QueueUrl\":\"%s\",\"MaxNumberOfMessages\":1,\"WaitTimeSeconds\":1}"
+                                    .formatted(queueUrl))
+                            .when().post("/");
+                    resp.then().statusCode(200);
+                    return mapper.readTree(resp.body().asString()).path("Messages");
+                }, messages -> messages.size() == 1)
+                .get(0);
     }
 
     private static String createStateMachine(String name, String definition) {
@@ -374,29 +376,6 @@ class StepFunctionsPutEventsIntegrationTest {
                 .when().post("/");
         resp.then().statusCode(200);
         return resp.jsonPath().getString("executionArn");
-    }
-
-    private static Response waitForTerminalState(String execArn) {
-        for (int i = 0; i < 100; i++) {
-            Response resp = given()
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(SFN_CONTENT_TYPE)
-                    .body("""
-                            {"executionArn": "%s"}
-                            """.formatted(execArn))
-                    .when().post("/");
-            if (!"RUNNING".equals(resp.jsonPath().getString("status"))) {
-                return resp;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                fail("Interrupted while waiting for execution " + execArn);
-            }
-        }
-        fail("Execution did not complete within timeout: " + execArn);
-        return null;
     }
 
     private static String quote(String raw) {

@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.MapRun;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachineAlias;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -22,8 +23,6 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZoneOffset;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -45,26 +44,31 @@ class StepFunctionsListExecutionsServiceTest {
     private static final Instant TOKEN_TIME = Instant.parse("2026-01-01T00:00:00Z");
 
     private AccountAwareStorageBackend<Execution> executionStore;
-    private MutableClock clock;
+    private TestTime time;
     private StepFunctionsService service;
 
     @BeforeEach
     void setUp() {
-        StorageFactory factory = mock(StorageFactory.class);
         executionStore = spy(AccountAwareStorageBackend.inMemory(ACCOUNT));
-        clock = new MutableClock(TOKEN_TIME);
+        time = TestTime.startingAt(TOKEN_TIME);
+        service = newService(time.clock());
+
+        put("new", 3.0, "SUCCEEDED");
+        put("running", 2.0, "RUNNING");
+        put("old", 1.0, "SUCCEEDED");
+    }
+
+    /** A service over the same executions, reading the time from {@code clock}. */
+    private StepFunctionsService newService(Clock clock) {
+        StorageFactory factory = mock(StorageFactory.class);
         doReturn(AccountAwareStorageBackend.<StateMachine>inMemory(ACCOUNT))
                 .doReturn(executionStore)
                 .doReturn(AccountAwareStorageBackend.<Activity>inMemory(ACCOUNT))
                 .doReturn(AccountAwareStorageBackend.<MapRun>inMemory(ACCOUNT))
                 .doReturn(AccountAwareStorageBackend.<StateMachineAlias>inMemory(ACCOUNT))
                 .when(factory).create(anyString(), anyString(), any());
-        service = new StepFunctionsService(factory, new RegionResolver("us-east-1", ACCOUNT), null,
+        return new StepFunctionsService(factory, new RegionResolver("us-east-1", ACCOUNT), null,
                 new ObjectMapper(), mock(SfnMockLoader.class), mock(StepFunctionsEventPublisher.class), clock);
-
-        put("new", 3.0, "SUCCEEDED");
-        put("running", 2.0, "RUNNING");
-        put("old", 1.0, "SUCCEEDED");
     }
 
     @Test
@@ -97,13 +101,13 @@ class StepFunctionsListExecutionsServiceTest {
     void continuationTokenExpiresAfterTwentyFourHours() {
         String token = service.listExecutions(ARN, null, 1, null).nextToken();
 
-        clock.advance(Duration.ofHours(24));
+        time.advance(Duration.ofHours(24));
         PaginatedResult<StepFunctionsService.ExecutionSnapshot> atBoundary = service.listExecutions(
                 ARN, null, 1, token);
         assertEquals(List.of("running"), atBoundary.items().stream()
                 .map(snapshot -> snapshot.execution().getName()).toList());
 
-        clock.advance(Duration.ofMillis(1));
+        time.advance(Duration.ofMillis(1));
         AwsException error = assertThrows(AwsException.class,
                 () -> service.listExecutions(ARN, null, 1, token));
         assertEquals("InvalidToken", error.getErrorCode());
@@ -138,9 +142,9 @@ class StepFunctionsListExecutionsServiceTest {
         String namespace = "states:executions:" + Base64Url.encode(
                 Digests.sha256(scope.getBytes(StandardCharsets.UTF_8)));
 
-        clock.advance(Duration.ofHours(24).plusMillis(1));
+        time.advance(Duration.ofHours(24).plusMillis(1));
         int issueTimeEnd = payload.indexOf(':', namespace.length() + 1);
-        String edited = Base64Url.encode(namespace + ":" + clock.millis() + payload.substring(issueTimeEnd));
+        String edited = Base64Url.encode(namespace + ":" + time.clock().millis() + payload.substring(issueTimeEnd));
 
         AwsException error = assertThrows(AwsException.class,
                 () -> service.listExecutions(ARN, null, 1, edited));
@@ -161,9 +165,11 @@ class StepFunctionsListExecutionsServiceTest {
     void continuationTokenIssuedInTheFutureIsRejected() {
         String token = service.listExecutions(ARN, null, 1, null).nextToken();
 
-        clock.advance(Duration.ofMillis(-1));
+        // The timeline only moves forward, so the token goes to a service whose clock reads one
+        // millisecond less than the one that issued it.
+        StepFunctionsService earlier = newService(Clock.offset(time.clock(), Duration.ofMillis(-1)));
         AwsException error = assertThrows(AwsException.class,
-                () -> service.listExecutions(ARN, null, 1, token));
+                () -> earlier.listExecutions(ARN, null, 1, token));
         assertEquals("InvalidToken", error.getErrorCode());
     }
 
@@ -279,32 +285,5 @@ class StepFunctionsListExecutionsServiceTest {
         execution.setStatus(status);
         execution.setStartDate(startDate);
         executionStore.put(execution.getExecutionArn(), execution);
-    }
-
-    private static final class MutableClock extends Clock {
-        private Instant current;
-
-        private MutableClock(Instant current) {
-            this.current = current;
-        }
-
-        @Override
-        public ZoneId getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(ZoneId zone) {
-            return this;
-        }
-
-        @Override
-        public Instant instant() {
-            return current;
-        }
-
-        private void advance(Duration duration) {
-            current = current.plus(duration);
-        }
     }
 }

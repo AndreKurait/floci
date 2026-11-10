@@ -10,10 +10,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import static io.github.hectorvent.floci.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Wire-level coverage for Map concurrency configuration and ordered results. The scheduler's
@@ -183,7 +183,7 @@ class StepFunctionsMapConcurrencyIntegrationTest {
         assertTrue(output.path("caught").asBoolean());
     }
 
-    private String run(String definition, String input) throws InterruptedException {
+    private String run(String definition, String input) {
         String name = "map-concurrency-" + System.nanoTime();
         Response create = given()
                 .header("X-Amz-Target", "AWSStepFunctions.CreateStateMachine")
@@ -201,23 +201,9 @@ class StepFunctionsMapConcurrencyIntegrationTest {
         start.then().statusCode(200);
         String execArn = start.jsonPath().getString("executionArn");
 
-        for (int i = 0; i < 100; i++) {
-            Response d = given()
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(SFN_CONTENT_TYPE)
-                    .body("{\"executionArn\":\"" + execArn + "\"}")
-                    .when().post("/");
-            String status = d.jsonPath().getString("status");
-            if ("SUCCEEDED".equals(status)) {
-                return d.jsonPath().getString("output");
-            }
-            if ("FAILED".equals(status)) {
-                fail("Execution failed: " + d.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete");
-        return null;
+        Response d = waitForTerminalState(execArn);
+        assertEquals("SUCCEEDED", d.jsonPath().getString("status"), "Execution failed: " + d.body().asString());
+        return d.jsonPath().getString("output");
     }
 
     private static String quote(String raw) {

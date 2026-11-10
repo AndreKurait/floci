@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
+import io.github.hectorvent.floci.testing.ThreadStates;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -11,9 +12,12 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -133,20 +137,18 @@ class AslExecutorNestedSyncFailureTest {
     @Test
     void aTerminalStatusIsReadTogetherWithTheFieldsWrittenBeforeItsMonitorIsReleased() throws Exception {
         // The child's worker writes its terminal fields under the execution's monitor. This writer
-        // publishes the status first and holds the monitor for 200 ms before writing the rest, and
-        // the parent's first read of the child lands inside that window, so a reader that skipped
-        // the monitor would build the cause from a half-written child.
+        // publishes the status first and keeps the monitor until the parent's read of the child is
+        // blocked on it, and only then writes the rest. A reader that skipped the monitor never
+        // blocks there: it builds the cause from a half-written child, and the writer gives up.
         Execution live = child("RUNNING", null, null);
         CountDownLatch statusWritten = new CountDownLatch(1);
+        AtomicReference<Thread> reader = new AtomicReference<>();
         Thread writer = new Thread(() -> {
             synchronized (live) {
                 live.setStatus("FAILED");
                 statusWritten.countDown();
-                try {
-                    Thread.sleep(200);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
+                ThreadStates.awaitState(reader.get(), EnumSet.of(Thread.State.BLOCKED), Duration.ofSeconds(10),
+                        "the parent's read of the child");
                 live.setError("Boom");
                 live.setCause("custom cause");
                 live.setStopDate(1790676767.071);
@@ -154,6 +156,7 @@ class AslExecutorNestedSyncFailureTest {
         });
         when(sfnService.describeExecution(CHILD_ARN)).thenAnswer(invocation -> {
             if (writer.getState() == Thread.State.NEW) {
+                reader.set(Thread.currentThread());
                 writer.start();
                 statusWritten.await();
             }

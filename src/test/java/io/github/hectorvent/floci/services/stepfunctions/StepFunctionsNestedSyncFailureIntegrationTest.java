@@ -8,15 +8,16 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
+import static io.github.hectorvent.floci.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * A {@code states:startExecution.sync} Task whose child does not succeed fails with
@@ -148,16 +149,8 @@ class StepFunctionsNestedSyncFailureIntegrationTest {
                 .post("/");
     }
 
-    private static Response waitForTerminalExecution(String execArn) throws InterruptedException {
-        for (int poll = 0; poll < 200; poll++) {
-            Response resp = describeExecution(execArn);
-            if (!"RUNNING".equals(resp.jsonPath().getString("status"))) {
-                return resp;
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution " + execArn + " was still RUNNING after 20 seconds");
-        return null;
+    private static Response waitForTerminalExecution(String execArn) {
+        return waitForTerminalState(execArn, Duration.ofSeconds(20));
     }
 
     private static String quote(String raw) {
