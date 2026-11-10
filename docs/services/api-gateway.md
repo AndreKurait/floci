@@ -1299,6 +1299,11 @@ boundaries and SCPs use the shared caller evaluator. Policy changes apply to
 every request, and a permitted endpoint cannot access another API or stage's
 connection. IAM-disabled local connection management remains unsigned.
 
+Policy denial returns 403 `ForbiddenException` before connection lookup; an
+authorized request for another API's, stage's or region's connection returns 410.
+POST retains its 128 KiB payload limit after authorization, including when the
+connection is absent.
+
 ### CloudFormation V2 authorizer update rollback
 
 CloudFormation in-place updates to standalone V2 authorizers snapshot their complete

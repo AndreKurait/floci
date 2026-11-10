@@ -248,8 +248,7 @@ public class ApiGatewayExecuteController {
                                              String connectionId, HttpHeaders headers, UriInfo uriInfo, byte[] body) {
         Optional<ApiGatewayV2Service.ApiOwner> owner = apiGatewayV2Service.findApiOwner(apiId);
         if (owner.isEmpty()) {
-            return Response.status(403).entity(jsonMessage("Forbidden"))
-                    .type(MediaType.APPLICATION_JSON).build();
+            return forbiddenConnectionRequest();
         }
         ApiGatewayV2Service.ApiOwner apiOwner = owner.get();
         applyApiOwnerContext(apiOwner);
@@ -257,7 +256,9 @@ public class ApiGatewayExecuteController {
             ExecuteApiSigV4Authorizer.Result signature = sigV4Authorizer.authorize(
                     method, headers, uriInfo, body, routeContext.signedRequestPath());
             if (!signature.authorized()) {
-                return httpApiIamRejection(signature);
+                LOG.debugv("execute-api rejected a connection management request: {0} ({1})",
+                        signature.failure(), signature.detail());
+                return forbiddenConnectionRequest();
             }
             ExecuteApiSigV4Authorizer.CallerIdentity caller = signature.identity();
             String resource = AwsArnUtils.Arn.of("execute-api", apiOwner.region(), apiOwner.accountId(),
@@ -266,9 +267,13 @@ public class ApiGatewayExecuteController {
                     caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
                     "execute-api:ManageConnections", resource, AwsRegions.partitionFor(apiOwner.region()),
                     routeContext.sourceIp(), isSecureTransport(uriInfo)) != Decision.ALLOW) {
-                return Response.status(403).entity(jsonMessage("Forbidden"))
-                        .type(MediaType.APPLICATION_JSON).build();
+                return forbiddenConnectionRequest();
             }
+        }
+        if ("POST".equals(method) && body != null && body.length > MAX_CONNECTIONS_PAYLOAD_BYTES) {
+            return Response.status(413)
+                    .entity(new AwsErrorResponse("PayloadTooLargeException", "Payload too large"))
+                    .type(MediaType.APPLICATION_JSON).build();
         }
         ConnectionInfo info = webSocketConnectionManager.getConnectionInfo(connectionId);
         if (info == null || !apiId.equals(info.getApiId()) || !stageName.equals(info.getStageName())
@@ -285,16 +290,16 @@ public class ApiGatewayExecuteController {
         };
     }
 
+    private Response forbiddenConnectionRequest() {
+        return Response.status(403).header("x-amzn-ErrorType", "ForbiddenException")
+                .entity(new AwsErrorResponse("ForbiddenException", "Forbidden"))
+                .type(MediaType.APPLICATION_JSON).build();
+    }
+
     /** Maximum payload size for @connections POST (128 KB, matching AWS limit). */
     private static final int MAX_CONNECTIONS_PAYLOAD_BYTES = 128 * 1024;
 
     private Response handlePostToConnection(String connectionId, byte[] body) {
-        if (body != null && body.length > MAX_CONNECTIONS_PAYLOAD_BYTES) {
-            return Response.status(413)
-                    .entity(new AwsErrorResponse("PayloadTooLargeException", "Payload too large"))
-                    .type(MediaType.APPLICATION_JSON)
-                    .build();
-        }
         try {
             webSocketConnectionManager.sendMessage(connectionId, new String(body, StandardCharsets.UTF_8));
             return Response.ok().build();

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
@@ -133,7 +134,8 @@ class ManageConnectionsRetainedContractTest {
         policy(ALLOW.replace("Allow", "Deny"));
         try (Response response = controller.handlePost(headers, uri, "api", "prod", "@connections/missing", new byte[131073])) {
             assertEquals(403, response.getStatus());
-            assertEquals("{\"message\":\"Forbidden\"}", response.getEntity().toString());
+            assertEquals("ForbiddenException", response.getHeaderString("x-amzn-ErrorType"));
+            assertEquals(new AwsErrorResponse("ForbiddenException", "Forbidden"), response.getEntity());
         }
         verifyNoInteractions(connections);
     }
@@ -173,16 +175,15 @@ class ManageConnectionsRetainedContractTest {
         try (Response response = controller.handlePost(headers, uri, "api", "prod", "@connections/connection", new byte[131073])) {
             assertEquals(413, response.getStatus());
         }
-        verify(connections).getConnectionInfo("connection");
         verify(connections, never()).sendMessage(anyString(), anyString());
     }
 
     @Test
-    void missingConnectionRetainsSelectedLocalPrecedenceOverOversizedPayload() {
+    void allowedOversizedPayloadRetainsPrecedenceOverMissingConnection() {
         try (Response response = controller.handlePost(headers, uri, "api", "prod", "@connections/missing", new byte[131073])) {
-            assertEquals(410, response.getStatus());
+            assertEquals(413, response.getStatus());
         }
-        verify(connections, never()).sendMessage(anyString(), anyString());
+        verifyNoInteractions(connections);
     }
 
     private void policy(String value) {
