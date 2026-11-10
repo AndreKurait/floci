@@ -1,0 +1,32 @@
+name: CodeDeploy acquisition evidence
+on:
+  push:
+    branches: [ci/codedeploy-acquire-evidence-20261110]
+permissions:
+  contents: read
+jobs:
+  acquire:
+    if: github.repository == 'AndreKurait/floci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Capture bounded acquisition evidence
+        run: python3 .github/ci/codedeploy_acquire_evidence.py
+      - name: Remove owned container if capture was interrupted
+        if: always()
+        env:
+          DIAGNOSTIC_NAME: codedeploy-acquire-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if docker container inspect "$DIAGNOSTIC_NAME" >/dev/null 2>&1; then
+            docker rm --force --volumes "$DIAGNOSTIC_NAME"
+          fi
+          test -z "$(docker container ls --all --quiet --filter "label=floci.diagnostic=$DIAGNOSTIC_NAME")"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: codedeploy-acquire-evidence
+          path: |
+            acquire-evidence/*.json
+            acquire-evidence/*.log
+          retention-days: 7
