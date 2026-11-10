@@ -599,7 +599,10 @@ public final class TestTime {
             this.interrupts = interrupts;
         }
 
-        /** Wakes the thread, then holds the timeline still until it has stopped running again. */
+        /**
+         * Wakes the thread, then holds the timeline still until it has stopped running again: back
+         * on the timeline, blocked somewhere else, or finished.
+         */
         @Override
         void fire() {
             long deadline = System.nanoTime() + settleTimeout.toNanos();
@@ -624,8 +627,22 @@ public final class TestTime {
                 lock.unlock();
             }
             int parkedSamples = 0;
-            while (thread.isAlive() && !isParked(thread)) {
-                parkedSamples = ThreadStates.PARKED_OR_DONE.contains(thread.getState()) ? parkedSamples + 1 : 0;
+            while (thread.isAlive()) {
+                boolean blockedElsewhere;
+                lock.lock();
+                try {
+                    if (isParked(thread)) {
+                        return;
+                    }
+                    // Queued for this lock, the thread is on its way into its next sleep or wait:
+                    // it looks parked but has not come to rest. Read with the lock held, it cannot
+                    // leave that queue in between.
+                    blockedElsewhere = ThreadStates.PARKED_OR_DONE.contains(thread.getState())
+                            && !lock.hasQueuedThread(thread);
+                } finally {
+                    lock.unlock();
+                }
+                parkedSamples = blockedElsewhere ? parkedSamples + 1 : 0;
                 if (parkedSamples >= SETTLED_SAMPLES) {
                     return;
                 }
