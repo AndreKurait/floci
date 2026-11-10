@@ -1416,9 +1416,10 @@ public class CodeDeployService {
                         instanceId, "AWS-RunShellScript", Map.of("commands", List.of(script)),
                         timeout, region);
 
-                long deadline = clock.millis() + timeout * 1000L;
+                long timeoutNanos = TimeUnit.SECONDS.toNanos(timeout);
+                long started = timer.nanoTime();
                 String invocationStatus = "InProgress";
-                while (clock.millis() < deadline && "InProgress".equals(invocationStatus)) {
+                while (timer.nanoTime() - started < timeoutNanos && "InProgress".equals(invocationStatus)) {
                     timer.sleepNanos(SSM_POLL_INTERVAL.toNanos());
                     invocationStatus = ssmCommandService.getCommandInvocationStatus(commandId, instanceId, region);
                 }

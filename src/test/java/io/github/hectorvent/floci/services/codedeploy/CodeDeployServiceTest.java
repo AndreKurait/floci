@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
+import io.github.hectorvent.floci.testing.MutableClock;
 import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -242,6 +243,32 @@ class CodeDeployServiceTest {
 
         assertEquals("Succeeded", awaitTerminal(deploymentId, Duration.ofSeconds(5)).getStatus());
     }
+
+    @Test
+    void steppingTheWallClockDuringAnSsmHookDoesNotShortenItsTimeout() {
+        MutableClock wallClock = new MutableClock();
+        CodeDeployService stepped = newService(Duration.ofHours(1), wallClock);
+        stepped.registerOnPremisesInstance(REGION, "instance-1", "arn:aws:sts::000000000000:session/s",
+                "arn:aws:iam::000000000000:user/u");
+        when(ssmCommandService.isInstanceRegistered("instance-1", REGION)).thenReturn(true);
+        when(ssmCommandService.sendCommandToInstance(eq("instance-1"), anyString(), any(), eq(300), eq(REGION)))
+                .thenReturn("cmd-stepped");
+        Instant scriptEnds = time.now().plusSeconds(60);
+        when(ssmCommandService.getCommandInvocationStatus("cmd-stepped", "instance-1", REGION))
+                .thenAnswer(invocation -> time.now().isBefore(scriptEnds) ? "InProgress" : "Success");
+
+        String deploymentId = createServerDeployment(stepped, "app-ssm-stepped", "group-ssm-stepped", 300);
+        time.awaitSleepers(1);
+        // The host's clock is set forward by more than the timeout while one second really passes.
+        wallClock.advance(Duration.ofHours(2));
+        time.advance(Duration.ofSeconds(1));
+        assertEquals("InProgress", stepped.getDeployment(REGION, deploymentId).getStatus());
+
+        time.advance(Duration.ofSeconds(59));
+        assertEquals("Succeeded", awaitTerminal(stepped, deploymentId, Duration.ofSeconds(5)).getStatus());
+    }
+
+    // ---- Lambda platform hooks ----------------------------------------------------------
 
     @ParameterizedTest
     @CsvSource({
