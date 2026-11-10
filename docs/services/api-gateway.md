@@ -1179,8 +1179,8 @@ use Lambda resource-based permissions.
 
 This local role evaluation does not issue STS credentials or establish all
 service-specific trust condition keys. Integration caller-passthrough credentials
-are not an authorizer credential mode. HTTP/WebSocket role enforcement and live
-AWS or native-image parity remain outside this support.
+are not an authorizer credential mode. Live AWS or native-image parity remains
+outside this support.
 
 WebSocket REQUEST authorizers without `authorizerCredentialsArn` check the Lambda
 resource policy when IAM enforcement is enabled. The check uses the API account,
