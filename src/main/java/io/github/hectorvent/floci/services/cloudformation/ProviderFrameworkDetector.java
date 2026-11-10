@@ -38,9 +38,9 @@ public class ProviderFrameworkDetector {
      * the emulator — {@code Custom::CreateOrganizationAccounts} creates one account per poll, so 15
      * accounts take five times as long as three — and a total budget would need re-tuning for every
      * config set while guillotining Lambdas that were succeeding. Measuring idleness still fails a
-     * genuinely hung resource cleanly instead of hanging. Non-final so tests can shorten it.
+     * genuinely hung resource cleanly instead of hanging.
      */
-    private Duration asyncCustomResourceTimeout = Duration.ofMinutes(3);
+    private static final Duration ASYNC_CUSTOM_RESOURCE_TIMEOUT = Duration.ofMinutes(3);
 
     private final LambdaService lambdaService;
 
@@ -62,7 +62,7 @@ public class ProviderFrameworkDetector {
      */
     Duration responseTimeout(String serviceToken, String region, Duration synchronousTimeout) {
         return isProviderFrameworkOnEvent(serviceToken, region)
-                ? asyncCustomResourceTimeout : synchronousTimeout;
+                ? ASYNC_CUSTOM_RESOURCE_TIMEOUT : synchronousTimeout;
     }
 
     /**
@@ -89,10 +89,5 @@ public class ProviderFrameworkDetector {
                     serviceToken, e.getMessage());
             return false;
         }
-    }
-
-    /** Test hook: shortens the async-callback wait so the timeout bound can be exercised quickly. */
-    void setAsyncCustomResourceTimeoutForTesting(Duration timeout) {
-        this.asyncCustomResourceTimeout = timeout;
     }
 }
