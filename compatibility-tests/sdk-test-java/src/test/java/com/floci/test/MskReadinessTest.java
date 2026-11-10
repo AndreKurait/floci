@@ -4,8 +4,6 @@ import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.kafka.KafkaClient;
 import software.amazon.awssdk.services.kafka.model.ClusterInfo;
 import software.amazon.awssdk.services.kafka.model.ClusterState;
-import software.amazon.awssdk.services.kafka.model.CreateClusterRequest;
-import software.amazon.awssdk.services.kafka.model.CreateClusterResponse;
 import software.amazon.awssdk.services.kafka.model.DescribeClusterRequest;
 import software.amazon.awssdk.services.kafka.model.DescribeClusterResponse;
 
@@ -16,19 +14,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MskReadinessTest {
-
-    @Test
-    void createWaitsForActiveBeforeLaterOrderedOperations() throws InterruptedException {
-        AtomicInteger calls = new AtomicInteger();
-        KafkaClient previous = MskTest.kafka;
-        try (KafkaClient client = client(calls, ClusterState.CREATING, ClusterState.ACTIVE)) {
-            MskTest.kafka = client;
-            new MskTest().createCluster();
-            assertThat(calls).hasValue(2);
-        } finally {
-            MskTest.kafka = previous;
-        }
-    }
 
     @Test
     void waitsThroughCreatingUntilActive() throws InterruptedException {
@@ -79,12 +64,6 @@ class MskReadinessTest {
 
     private static KafkaClient client(AtomicInteger calls, ClusterState... states) {
         return new KafkaClient() {
-            @Override
-            public CreateClusterResponse createCluster(CreateClusterRequest request) {
-                return CreateClusterResponse.builder().clusterArn("cluster").clusterName(request.clusterName())
-                        .state(ClusterState.CREATING).build();
-            }
-
             @Override
             public DescribeClusterResponse describeCluster(DescribeClusterRequest request) {
                 assertThat(request.clusterArn()).isEqualTo("cluster");

@@ -21,7 +21,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class MskTest {
 
     private static final Logger LOG = Logger.getLogger(MskTest.class);
-    static KafkaClient kafka;
+    private static KafkaClient kafka;
     private static String clusterArn;
     private static String scramSecretArn;
     private static String scramKeyId;
