@@ -412,7 +412,7 @@ public class CloudWatchMetricsService {
             }
         }
         MetricMath plan = new MetricMath(queries);
-        plan.quotaMetrics().forEach(CloudWatchMetricsService::validateQuotaMetric);
+        plan.quotaMetrics().forEach(CloudWatchMetricsService::quotaFor);
         return plan;
     }
 
@@ -457,20 +457,32 @@ public class CloudWatchMetricsService {
         }, stat -> quotaValue(stat, region));
     }
 
-    private static void validateQuotaMetric(MetricStat metric) {
-        if (!"AWS/Lambda".equals(metric.namespace()) || !"ConcurrentExecutions".equals(metric.metricName())
-                || (metric.dimensions() != null && !metric.dimensions().isEmpty())) {
-            throw CloudWatchMetricsException.invalidParameterValue(
-                    "SERVICE_QUOTA currently supports account-wide AWS/Lambda ConcurrentExecutions.");
+    /**
+     * The quota {@code SERVICE_QUOTA(metric)} reads: the one whose Service Quotas
+     * {@code UsageMetric} is this metric, namespace, name and dimensions alike. The function takes
+     * "TS that is a usage metric" and "Returns the service quota for the given usage metric"
+     * (CloudWatch User Guide, "Using metric math"). A metric no quota in Floci's catalog uses is
+     * refused, since there is no quota to return.
+     */
+    private static ServiceQuotasService.QuotaReference quotaFor(MetricStat metric) {
+        Map<String, String> dimensions = new LinkedHashMap<>();
+        if (metric.dimensions() != null) {
+            metric.dimensions().forEach(dimension -> dimensions.put(dimension.name(), dimension.value()));
         }
+        return ServiceQuotasService.quotaForUsageMetric(metric.namespace(), metric.metricName(), dimensions)
+                .orElseThrow(() -> CloudWatchMetricsException.invalidParameterValue(
+                        "SERVICE_QUOTA requires a usage metric that a service quota tracks; no quota in "
+                                + "Floci's Service Quotas catalog has the usage metric " + metric.namespace()
+                                + " " + metric.metricName() + " " + dimensions + "."));
     }
 
     private double quotaValue(MetricStat metric, String region) {
-        validateQuotaMetric(metric);
+        ServiceQuotasService.QuotaReference quota = quotaFor(metric);
         if (serviceQuotas == null) {
             throw CloudWatchMetricsException.invalidParameterValue("The Service Quotas reader is unavailable.");
         }
-        return serviceQuotas.getServiceQuota("lambda", "L-B99A9384", region, regionResolver.getAccountId())
+        return serviceQuotas.getServiceQuota(quota.serviceCode(), quota.quotaCode(), region,
+                        regionResolver.getAccountId())
                 .path("Quota").path("Value").asDouble(Double.NaN);
     }
 
