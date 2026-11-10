@@ -33,12 +33,23 @@ public class KmsJsonHandler {
     private final KmsService service;
     private final ObjectMapper objectMapper;
     private final RegionResolver regionResolver;
+    private final KmsListedGranteeServicePrincipals listedPrincipals;
 
     @Inject
-    public KmsJsonHandler(KmsService service, ObjectMapper objectMapper, RegionResolver regionResolver) {
+    public KmsJsonHandler(KmsService service, ObjectMapper objectMapper, RegionResolver regionResolver,
+                          KmsListedGranteeServicePrincipals listedPrincipals) {
         this.service = service;
         this.objectMapper = objectMapper;
         this.regionResolver = regionResolver;
+        this.listedPrincipals = listedPrincipals;
+    }
+
+    KmsJsonHandler(KmsService service, ObjectMapper objectMapper, RegionResolver regionResolver) {
+        this(service, objectMapper, regionResolver, null);
+    }
+
+    private String listed(Object principal) {
+        return listedPrincipals == null ? (String) principal : listedPrincipals.listed((String) principal);
     }
 
     private static final Set<String> KEY_ID_OPERATIONS = Set.of(
@@ -310,7 +321,7 @@ public class KmsJsonHandler {
             ObjectNode entry = array.addObject();
             entry.put("GrantId", (String) grant.get("GrantId"));
             entry.put("KeyId", (String) grant.get("KeyId"));
-            entry.put("GranteePrincipal", (String) grant.get("GranteePrincipal"));
+            entry.put("GranteePrincipal", listed(grant.get("GranteePrincipal")));
             entry.put("CreationDate", ((Number) grant.get("CreationDate")).longValue());
             if (grant.get("Name") != null) {
                 entry.put("Name", (String) grant.get("Name"));
@@ -323,7 +334,7 @@ public class KmsJsonHandler {
             List<String> operationValues = (List<String>) grant.get("Operations");
             operationValues.forEach(operations::add);
             if (grant.get("RetiringPrincipal") != null) {
-                entry.put("RetiringPrincipal", (String) grant.get("RetiringPrincipal"));
+                entry.put("RetiringPrincipal", listed(grant.get("RetiringPrincipal")));
             }
         }
         response.put("Truncated", (boolean) result.get("Truncated"));
