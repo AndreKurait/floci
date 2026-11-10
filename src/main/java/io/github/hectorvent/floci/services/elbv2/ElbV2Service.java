@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
@@ -561,10 +562,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         return new CapacityReservation(null, null, null);
     }
 
-    /**
-     * Floci Query extension reporting synthetic status without reserving ALB capacity.
-     */
-    public String describeProvisionedCapacity(String region, String arn) {
+    public record ProvisionedCapacity(int minimumLBCapacityUnits, String status, int decreasesRemaining) {}
+
+    /** Legacy capacity view for an application load balancer without a reservation. */
+    public ProvisionedCapacity describeProvisionedCapacity(String region, String arn) {
         AwsArnUtils.Arn parsed;
         try {
             parsed = AwsArnUtils.parse(arn);
@@ -575,7 +576,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 || !parsed.accountId().matches("[0-9]{12}")
                 || !parsed.resource().matches("loadbalancer/app/[A-Za-z0-9-]{1,32}/[0-9a-f]{16}")
                 || !region.equals(parsed.region())
-                || !regionResolver.partitionForRegion(region).equals(parsed.partition())) {
+                // Match createLoadBalancer's ARN derivation, including persisted custom-region ARNs.
+                || !AwsRegions.partitionFor(region).equals(parsed.partition())) {
             throw new AwsException("ValidationError",
                     "LoadBalancerArn must identify an application load balancer in the request region.", 400);
         }
@@ -586,12 +588,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (!"application".equals(lb.getType())) {
             throw new AwsException("ValidationError", "LoadBalancerArn must identify an application load balancer.", 400);
         }
-        return switch (lb.getState()) {
-            case "active" -> "disabled";
-            case "provisioning" -> "pending";
-            case null, default -> throw new AwsException("InternalFailure",
-                    "Load balancer is not active or provisioning.", 500);
-        };
+        // Capacity is never reserved in Floci, so none of the four daily decreases has been consumed.
+        return new ProvisionedCapacity(0, "disabled", 4);
     }
 
     public void setSecurityGroups(String region, String arn, List<String> sgIds) {

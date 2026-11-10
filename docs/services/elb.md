@@ -33,7 +33,7 @@ through a suffix match or upstream DNS fallback.
 | ModifyLoadBalancerAttributes | Updates persisted load balancer attributes. |
 | DescribeLoadBalancerAttributes | Returns attributes stored for a load balancer. |
 | DescribeCapacityReservation | Returns the stored capacity reservation fields for a load balancer. |
-| DescribeProvisionedCapacity | Floci extension returning synthetic status without allocating ALB capacity. |
+| DescribeProvisionedCapacity | Legacy capacity view for an application load balancer without a reservation. |
 | SetSecurityGroups | Replaces the security groups associated with a load balancer. |
 | SetSubnets | Replaces the subnets associated with a load balancer. |
 | SetIpAddressType | Updates the IP address type stored for a load balancer. |
@@ -179,14 +179,17 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - `SetSubnets`, like `CreateLoadBalancer`, takes `Subnets` or `SubnetMappings`, and both together are refused with `ValidationError`. With neither it returns the same `ValidationError` as `CreateLoadBalancer` for the balancer's type, `At least two subnets in two different Availability Zones must be specified` for an Application Load Balancer and `At least one subnet must be specified` for a Network or Gateway Load Balancer, and leaves the balancer on its subnets. A `SetSubnets` that names subnets is counted as `CreateLoadBalancer` counts them, following the two-zone rule its API reference states: one subnet for an Application Load Balancer, in `Subnets` or `SubnetMappings`, returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` before any subnet is looked up, and leaves the balancer on its subnets. AWS does not document the error for this case, so Floci gives `CreateLoadBalancer`'s error, in the same order. A CloudFormation update that keeps an Application Load Balancer and names one subnet fails with that error and rolls back. A Network Load Balancer can be set onto one subnet. The `SetSubnets` API reference requires a Gateway Load Balancer's `Subnets` to include every subnet it is already on; Floci does not enforce that.
 - Single-zone Application Load Balancers (opt-in, off by default): AWS refuses an Application Load Balancer in fewer than two Availability Zones, as above. For local setups that model single-zone deployments, `floci.services.elbv2.single-zone-alb-accounts` (`FLOCI_SERVICES_ELBV2_SINGLE_ZONE_ALB_ACCOUNTS`, comma-separated 12-digit account ids; spaces around an id are ignored) lowers that minimum to one zone for the accounts it lists: for a listed account, `CreateLoadBalancer` and `SetSubnets` (including CloudFormation's) take an Application Load Balancer on one subnet, for either scheme. Neither `Subnets` nor `SubnetMappings` is still refused with the same message. Unlisted accounts, and every account while the setting is unset, keep the two-zone rule; Network and Gateway Load Balancers are unchanged. A value that is not a 12-digit account id is rejected during startup.
 - `DescribeProvisionedCapacity` is a Floci Query extension, using version `2015-12-01`
-  and one `LoadBalancerArn`. It returns synthetic `ProvisionedCapacity.Status=disabled`
-  for an active application load balancer, or `pending` while provisioning. It rejects
-  invalid scope, other types and other states, and hides deleted or inaccessible load
-  balancers. With IAM enforcement enabled, its policy action is
+  and one `LoadBalancerArn`. Its `ProvisionedCapacity` has `MinimumLBCapacityUnits=0`,
+  `Status=disabled` and `DecreasesRemaining=4`; `LastModifiedTime` is absent.
+  Capacity is never reserved, so no daily decreases are consumed. Load balancer
+  startup or health does not imply a pending capacity reservation. Per-account
+  capacity quota overrides and reservation mutations are not implemented.
+  The action rejects invalid scope and other types, and hides deleted or inaccessible
+  load balancers. With IAM enforcement enabled, its policy action is
   `elasticloadbalancing:DescribeProvisionedCapacity`, scoped to the named load balancer.
   The public AWS ELBv2 endpoint rejected this action with `InvalidAction` in a live
-  comparison; these statuses do not describe AWS capacity. The public
-  `DescribeCapacityReservation` action remains separate. No capacity is allocated.
+  comparison using an ordinary account; it is not in the public SDK model. The public
+  `DescribeCapacityReservation` action remains separate.
 - EC2 refuses deletion of subnets and VPCs still referenced by load balancers with `DependencyViolation`. These account- and region-scoped dependencies follow persisted load balancer state; changing subnets or deleting the load balancer releases its old references. A CloudFormation update that names other subnets in `Subnets` or `SubnetMappings` moves the load balancer the way `SetSubnets` does, and a rolled-back update moves it back. An independent target group does not prevent subnet or VPC deletion.
 - HTTP listener sockets are preserved when listener actions change and are restarted only when socket-level settings such as port change.
 - Gateway listeners require `Protocol` and `Port` to be omitted on create and modify. Their control-plane response reports `GENEVE` without a port. CloudFormation preserves omitted gateway listener settings on create and update; other load balancer types retain their existing `HTTP` and port 80 defaults.
