@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -42,6 +43,7 @@ import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -403,6 +405,65 @@ class SecurityGroupFirewallManagerTest {
                 replacement.vpcId(), "eni-replacement", "10.0.1.10", "172.18.0.2", Set.of(), List.of()),
                 "helper-replacement", Map.of());
         assertEquals(Optional.of(replacement), origins.vpcForClient("172.18.0.2"));
+    }
+
+    @Test
+    void failedRegistrationRestoresThePreviousDnsScope() {
+        SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class));
+        doNothing().when(manager).refreshPeers();
+        registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.2", "vpc-a");
+        doThrow(new IllegalStateException("admission failed")).when(manager).admit(anyString(), anyBoolean());
+
+        assertThrows(IllegalStateException.class,
+                () -> registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.3", "vpc-b"));
+
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a")),
+                manager.vpcForClient("172.18.0.2"));
+        assertTrue(manager.vpcForClient("172.18.0.3").isEmpty());
+    }
+
+    @Test
+    void reconciliationRemovesOriginsOfStoppedHelpers() {
+        SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class, RETURNS_DEEP_STUBS));
+        registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.2", "vpc-a");
+        doCallRealMethod().when(manager).reconcileAll();
+
+        manager.reconcileAll();
+
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+    }
+
+    @Test
+    void pendingReplacementDoesNotExposeUncommittedDnsOrigin() throws Exception {
+        SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class));
+        registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.2", "vpc-a");
+        CountDownLatch admitting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            admitting.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return null;
+        }).when(manager).admit(anyString(), anyBoolean());
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> replacement = executor.submit(
+                    () -> registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.3", "vpc-b"));
+            try {
+                assertTrue(admitting.await(5, TimeUnit.SECONDS));
+                Future<?> lookup = executor.submit(() -> {
+                    assertTrue(manager.vpcForClient("172.18.0.3").isEmpty());
+                    assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc(
+                                    "111111111111", "us-east-1", "vpc-a")),
+                            manager.vpcForClient("172.18.0.2"));
+                });
+                lookup.get(1, TimeUnit.SECONDS);
+            } finally {
+                release.countDown();
+                replacement.get(5, TimeUnit.SECONDS);
+            }
+        }
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-b")),
+                manager.vpcForClient("172.18.0.3"));
     }
 
     @Test
