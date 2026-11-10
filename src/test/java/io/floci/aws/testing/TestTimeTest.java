@@ -3,6 +3,7 @@ package io.floci.aws.testing;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.lang.reflect.Method;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -19,6 +20,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -447,6 +449,48 @@ class TestTimeTest {
         assertEquals(List.of("message at " + START.plusSeconds(50), "another at " + START.plusSeconds(50)),
                 polled.subList(2, 4));
         assertEquals(0, time.waiters());
+    }
+
+    @Test
+    void aCallReturningAfterDeadlineSelectionIsNotInterruptedByItsWake() throws Exception {
+        CompletableFuture<String> response = new CompletableFuture<>();
+        CompletableFuture<String> result = new CompletableFuture<>();
+        CountDownLatch returned = new CountDownLatch(1);
+        Semaphore continueAfterWake = new Semaphore(0);
+        AtomicBoolean staleInterrupt = new AtomicBoolean();
+        Thread waiter = Thread.ofPlatform().name("returned-before-wake").start(() -> {
+            try {
+                result.complete(time.within(Duration.ofSeconds(1), response::get));
+                returned.countDown();
+                continueAfterWake.acquireUninterruptibly();
+                staleInterrupt.set(Thread.currentThread().isInterrupted());
+            } catch (Exception e) {
+                result.completeExceptionally(e);
+            }
+        });
+        try {
+            time.awaitWaiters(1);
+            // Split selection from firing to force the return between these two real timeline steps.
+            Method takeDue = TestTime.class.getDeclaredMethod("takeDue", Instant.class);
+            takeDue.setAccessible(true);
+            Object due = takeDue.invoke(time, START.plusSeconds(1));
+            response.complete("returned normally");
+            assertTrue(returned.await(5, TimeUnit.SECONDS));
+            assertEquals("returned normally", result.get(5, TimeUnit.SECONDS));
+            Method fire = due.getClass().getDeclaredMethod("fire");
+            fire.setAccessible(true);
+            fire.invoke(due);
+            continueAfterWake.release();
+            waiter.join(5000);
+            assertFalse(waiter.isAlive());
+            assertFalse(staleInterrupt.get(), "the selected deadline must not interrupt a call that already returned");
+            assertEquals(0, time.waiters());
+        } finally {
+            response.complete("cleanup");
+            continueAfterWake.release();
+            waiter.interrupt();
+            waiter.join(5000);
+        }
     }
 
     @Test

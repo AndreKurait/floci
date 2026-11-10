@@ -605,6 +605,9 @@ public final class TestTime {
             long deadline = System.nanoTime() + settleTimeout.toNanos();
             lock.lock();
             try {
+                if (returned) {
+                    return;
+                }
                 woken = true;
                 if (interrupts) {
                     thread.interrupt();
