@@ -5,6 +5,7 @@ import io.floci.aws.core.common.concurrent.DeadlineWaits;
 import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
@@ -55,6 +56,38 @@ public final class TimelineDeadlineWaits implements DeadlineWaits {
             throw new TimeoutException();
         }
         return bounded(timeoutNanos, future::get);
+    }
+
+    @Override
+    public boolean await(CountDownLatch latch, long timeoutNanos) throws InterruptedException {
+        if (timeoutNanos <= 0) {
+            return latch.getCount() == 0;
+        }
+        try {
+            return bounded(timeoutNanos, () -> {
+                latch.await();
+                return true;
+            });
+        } catch (TimeoutException expired) {
+            return false;
+        } catch (ExecutionException impossible) {
+            throw new IllegalStateException(impossible);
+        }
+    }
+
+    /** The caller holds {@code monitor}; a notification or the timeline reaching the timeout ends the wait. */
+    @Override
+    public void waitOn(Object monitor, long timeoutNanos) throws InterruptedException {
+        try {
+            bounded(timeoutNanos, () -> {
+                monitor.wait();
+                return null;
+            });
+        } catch (TimeoutException expected) {
+            // The timeline reached the timeout: the caller rechecks its condition, as after a timed wait.
+        } catch (ExecutionException impossible) {
+            throw new IllegalStateException(impossible);
+        }
     }
 
     /**
