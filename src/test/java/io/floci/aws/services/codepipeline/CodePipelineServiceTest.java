@@ -33,6 +33,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -1169,6 +1170,50 @@ class CodePipelineServiceTest {
             assertEquals("Succeeded", completed.getStatus());
             assertEquals("Stopping", execution.getStatus());
             assertTrue(execution.isStopRequested());
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    @Test
+    void aStopThatLosesToTheRunsOwnEndingIsRefusedInsteadOfReplacingIt() throws Exception {
+        // A run ends under its execution's monitor, Stopped in answer to the stop signal or Failed
+        // or Succeeded on its own, and then leaves. A stop that raised its signal or checked the
+        // status outside that monitor could write Stopping after the ending, where it stood for
+        // good: no run was left to finish it.
+        String pipeline = "stop-losing-to-the-run-ending";
+        String executionId = "ending-execution";
+        try (ExecutorService requests = Executors.newSingleThreadExecutor()) {
+            createExternalActionPipeline(service, pipeline, """
+                    {"name":"Approve","actionTypeId":{
+                      "category":"Approval","owner":"AWS","provider":"Manual","version":"1"}}
+                    """);
+            CodePipelineExecution execution = waitingExecution(storage, pipeline, executionId, 1, "External");
+            AtomicReference<Thread> stoppingThread = new AtomicReference<>();
+            Future<JsonNode> stopped;
+            synchronized (execution) {
+                stopped = requests.submit(() -> {
+                    stoppingThread.set(Thread.currentThread());
+                    return handle("StopPipelineExecution", """
+                            {
+                              "pipelineName": "%s",
+                              "pipelineExecutionId": "%s",
+                              "abandon": true
+                            }
+                            """.formatted(pipeline, executionId));
+                });
+                ThreadStates.awaitBlockedOrDone(stoppingThread, stopped);
+                assertFalse(execution.isStopRequested());
+                assertEquals("InProgress", execution.getStatus());
+                // The run ends here, as it does under this monitor.
+                execution.setStatus("Succeeded");
+            }
+            ExecutionException refused = assertThrows(ExecutionException.class,
+                    () -> stopped.get(5, TimeUnit.SECONDS));
+            AwsException cause = (AwsException) refused.getCause();
+            assertEquals("PipelineExecutionNotStoppableException", cause.getErrorCode());
+            assertEquals("Succeeded", execution.getStatus());
+            assertFalse(execution.isStopRequested());
         } finally {
             service.shutdown();
         }
