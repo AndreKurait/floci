@@ -74,7 +74,7 @@ class EmbeddedDnsHostStartupTest {
                     Arrays.copyOfRange(udp, udp.length - 4, udp.length));
             server.stop();
             assertTrue(server.getServerIp().isEmpty());
-            await().atMost(Duration.ofSeconds(5)).ignoreException(BindException.class).untilAsserted(() -> {
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).ignoreException(BindException.class).untilAsserted(() -> {
                 try (ServerSocket tcp = bindTcp(port);
                      DatagramSocket rebound = new DatagramSocket(port, InetAddress.ofLiteral(ADDRESS))) {
                     assertEquals(port, tcp.getLocalPort());
