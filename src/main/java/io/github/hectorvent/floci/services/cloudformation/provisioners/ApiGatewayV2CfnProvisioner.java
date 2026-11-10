@@ -57,6 +57,8 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     private static final String BODY_INTEGRATION_IDS_ATTR = "__FlociApiGatewayV2BodyIntegrationIds";
     private static final String BODY_AUTHORIZER_IDS_ATTR = "__FlociApiGatewayV2BodyAuthorizerIds";
 
+    private static final String API_REPLACEMENT_BODY_IDS_ATTR = "__FlociApiGatewayV2ReplacementBodyIds";
+
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final S3Service s3Service;
     private final ObjectMapper objectMapper;
@@ -147,7 +149,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     private void deleteReplacement(String type, String identity, String region) {
         int separator = identity == null ? -1 : identity.indexOf('/');
-        if (VPC_LINK.equals(type)) {
+        if (VPC_LINK.equals(type) || API.equals(type)) {
             delete(type, identity, region);
             return;
         }
@@ -164,7 +166,12 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     @Override
     public void delete(StackResource resource, String region) {
         switch (resource.getResourceType()) {
-            case API -> deleteApi(region, resource.getPhysicalId());
+            case API -> {
+                for (String identity : ReplacementCleanup.owedPhysicalIds(resource)) {
+                    delete(API, identity, region);
+                }
+                delete(API, resource.getPhysicalId(), region);
+            }
             case AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT -> {
                 for (String identity : ReplacementCleanup.owedPhysicalIds(resource)) {
                     deleteReplacement(resource.getResourceType(), identity, region);
@@ -200,6 +207,9 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void delete(String resourceType, String physicalId, String region) {
+        if (API.equals(resourceType) && physicalId != null && !physicalId.isBlank()) {
+            deleteApi(region, physicalId);
+        }
         if (VPC_LINK.equals(resourceType) && physicalId != null && !physicalId.isBlank()) {
             CfnDeletes.safeDelete("API Gateway V2 VPC link", physicalId,
                     () -> apiGatewayV2Service.deleteVpcLink(region, physicalId), "NotFoundException");
@@ -242,6 +252,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(API_REPLACEMENT_BODY_IDS_ATTR);
         resource.getAttributes().remove(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(CfnRollback.VPC_LINK_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR);
@@ -256,6 +267,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
                 return true;
             }
         } finally {
+            restoreReplacementBodyIds(resource);
             if (isChild(resource)) {
                 resource.setPhysicalId(childPhysicalId(cleanup.getPhysicalId()));
             }
@@ -322,6 +334,11 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         // Read before anything changes, so a document that cannot be read leaves the API as it was.
         JsonNode body = OpenApiDocuments.resolve(props, engine, s3Service, objectMapper);
 
+        if (ctx.isUpdate() && !req.get("protocolType").equals(
+                apiGatewayV2Service.getApi(region, ctx.priorPhysicalId()).getProtocolType())) {
+            replaceApi(r, body, ctx, req);
+            return;
+        }
         boolean created = !ctx.isUpdate();
         Api api;
         if (created) {
@@ -329,13 +346,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         } else {
             api = apiGatewayV2Service.updateApi(region, ctx.priorPhysicalId(), req);
         }
-        r.setPhysicalId(api.getApiId());
-        r.getAttributes().put("ApiId", api.getApiId());
-        r.getAttributes().put("ApiEndpoint", api.getApiEndpoint());
-        // The ARN prefix a Lambda permission's SourceArn is built from; AWS returns
-        // arn:<partition>:execute-api:<region>:<account>:<apiId> for this attribute.
-        r.getAttributes().put("ExecuteApiArn",
-                AwsArnUtils.Arn.of("execute-api", region, ctx.accountId(), api.getApiId()).toString());
+        setApiAttributes(r, api, ctx);
         // A Body that cannot be materialized fails the provision after the API exists. Its own
         // rollback has already removed what it generated, or kept the ids of what it could not, and
         // on a kept API put back the routes, integrations and authorizers it replaced; what
@@ -345,6 +356,69 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
                 () -> deleteApi(region, api.getApiId()),
                 () -> { },
                 () -> reconcileBodyRoutes(r, region, api.getApiId(), body));
+    }
+
+    private void replaceApi(StackResource resource, JsonNode body, ProvisionContext ctx,
+                            Map<String, Object> request) {
+        Map<String, String> previous = new HashMap<>(resource.getAttributes());
+        Api replacement = apiGatewayV2Service.createApi(ctx.region(), request);
+        setApiAttributes(resource, replacement, ctx);
+        ReplacementCleanup.record(resource, ctx, previous);
+        ObjectNode bodyIds = objectMapper.createObjectNode();
+        bodyIds.put("apiId", ctx.priorPhysicalId());
+        for (String key : List.of(BODY_ROUTE_IDS_ATTR, BODY_INTEGRATION_IDS_ATTR, BODY_AUTHORIZER_IDS_ATTR)) {
+            if (previous.containsKey(key)) {
+                bodyIds.put(key, previous.get(key));
+            }
+            resource.getAttributes().remove(key);
+        }
+        resource.getAttributes().put(API_REPLACEMENT_BODY_IDS_ATTR, bodyIds.toString());
+        try {
+            reconcileBodyRoutes(resource, ctx.region(), replacement.getApiId(), body);
+        } catch (RuntimeException failure) {
+            try {
+                rollbackUpdate(resource);
+            } catch (RuntimeException cleanupFailure) {
+                if (cleanupFailure != failure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+                resource.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR,
+                        "Could not delete replacement API " + replacement.getApiId());
+            }
+            throw failure;
+        }
+    }
+
+    private void restoreReplacementBodyIds(StackResource resource) {
+        String raw = resource.getAttributes().get(API_REPLACEMENT_BODY_IDS_ATTR);
+        if (raw == null) {
+            return;
+        }
+        try {
+            JsonNode previous = objectMapper.readTree(raw);
+            if (!previous.path("apiId").asText().equals(resource.getPhysicalId())) {
+                return;
+            }
+            for (String key : List.of(BODY_ROUTE_IDS_ATTR, BODY_INTEGRATION_IDS_ATTR, BODY_AUTHORIZER_IDS_ATTR)) {
+                resource.getAttributes().remove(key);
+                if (previous.has(key)) {
+                    resource.getAttributes().put(key, previous.path(key).asText());
+                }
+            }
+            resource.getAttributes().remove(API_REPLACEMENT_BODY_IDS_ATTR);
+        } catch (JsonProcessingException failure) {
+            throw new IllegalStateException("Could not read replacement API body ownership", failure);
+        }
+    }
+
+    private void setApiAttributes(StackResource r, Api api, ProvisionContext ctx) {
+        r.setPhysicalId(api.getApiId());
+        r.getAttributes().put("ApiId", api.getApiId());
+        r.getAttributes().put("ApiEndpoint", api.getApiEndpoint());
+        // The ARN prefix a Lambda permission's SourceArn is built from; AWS returns
+        // arn:<partition>:execute-api:<region>:<account>:<apiId> for this attribute.
+        r.getAttributes().put("ExecuteApiArn",
+                AwsArnUtils.Arn.of("execute-api", ctx.region(), ctx.accountId(), api.getApiId()).toString());
     }
 
     /**
