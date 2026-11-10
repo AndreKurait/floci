@@ -203,6 +203,11 @@ public class ElbV2HealthChecker implements Resettable {
         return "healthy".equals(state) || "initial".equals(state);
     }
 
+    /** Probe queue counters; a probe is counted as completed only after its result was published or dropped. */
+    KeyedWorkQueue.Snapshot probeSnapshot() {
+        return probes.snapshot();
+    }
+
     private synchronized void probeAll(String tgArn, long timerId) {
         Monitoring monitoring = timers.get(tgArn);
         Map<String, TargetState> targets = states.get(tgArn);
