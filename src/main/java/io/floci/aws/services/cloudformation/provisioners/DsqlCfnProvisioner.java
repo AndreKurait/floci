@@ -9,7 +9,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.time.Duration;
-import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -17,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 /**
  * CloudFormation provisioning for {@code AWS::DSQL::Cluster}. {@code Ref} is the cluster's
@@ -32,16 +32,31 @@ public class DsqlCfnProvisioner implements CfnResourceProvisioner {
 
     private static final String TYPE = "AWS::DSQL::Cluster";
     private static final Duration READY_TIMEOUT = Duration.ofMinutes(5);
+    private static final Duration READY_POLL = Duration.ofMillis(200);
     /** Measured: {@code 2026-10-16T15:49:38.488Z}, milliseconds always written. */
     private static final DateTimeFormatter CREATION_TIME =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
     private static final Set<String> SETTLED = Set.of("ACTIVE", "PENDING_SETUP");
 
     private final DsqlService dsqlService;
+    private final LongSupplier nanoTime;
+    private final Sleeper sleeper;
 
     @Inject
     public DsqlCfnProvisioner(DsqlService dsqlService) {
+        this(dsqlService, System::nanoTime, Thread::sleep);
+    }
+
+    /** For tests that put the wait for a new cluster on a timeline they control. */
+    DsqlCfnProvisioner(DsqlService dsqlService, LongSupplier nanoTime, Sleeper sleeper) {
         this.dsqlService = dsqlService;
+        this.nanoTime = nanoTime;
+        this.sleeper = sleeper;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(Duration delay) throws InterruptedException;
     }
 
     @Override
@@ -110,18 +125,18 @@ public class DsqlCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private DsqlCluster awaitSettled(String region, String identifier) {
-        Instant deadline = Instant.now().plus(READY_TIMEOUT);
+        long started = nanoTime.getAsLong();
         while (true) {
             DsqlCluster cluster = dsqlService.getCluster(region, identifier);
             if (SETTLED.contains(cluster.getStatus())) {
                 return cluster;
             }
-            if ("FAILED".equals(cluster.getStatus()) || Instant.now().isAfter(deadline)) {
+            if ("FAILED".equals(cluster.getStatus()) || nanoTime.getAsLong() - started >= READY_TIMEOUT.toNanos()) {
                 throw new AwsException("InternalFailure", "Cluster " + identifier + " did not become ACTIVE"
                         + " (status " + cluster.getStatus() + ")", 500);
             }
             try {
-                Thread.sleep(200);
+                sleeper.sleep(READY_POLL);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AwsException("InternalFailure", "Interrupted while cluster " + identifier

@@ -1,8 +1,10 @@
 package io.floci.aws.services.cloudformation;
 
+import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -227,24 +229,12 @@ class CloudFormationS3BucketReplacementIntegrationTest {
     }
 
     private static void await(String stackName, String status) {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = describeStack(stackName);
-            if (xml.contains("<StackStatus>" + status + "</StackStatus>")) {
-                return;
-            }
-            if (xml.contains("_FAILED</StackStatus>")) {
-                break;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
+        String wanted = "<StackStatus>" + status + "</StackStatus>";
+        String xml = CfnStackWaits.lastStateWithin(Duration.ofSeconds(10), () -> describeStack(stackName),
+                described -> described.contains(wanted) || described.contains("_FAILED</StackStatus>"));
+        if (!xml.contains(wanted)) {
+            fail("stack " + stackName + " never reached " + status + ": " + xml);
         }
-        fail("stack " + stackName + " never reached " + status + ": " + xml);
     }
 
     private static void createBucket(String bucket) {

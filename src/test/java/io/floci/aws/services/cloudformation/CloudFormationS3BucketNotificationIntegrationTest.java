@@ -11,6 +11,7 @@ import io.restassured.response.ValidatableResponse;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -351,21 +352,14 @@ class CloudFormationS3BucketNotificationIntegrationTest {
         .when().post("/").then().statusCode(200)
             .extract().jsonPath().getString("ProgressEvent.RequestToken");
 
-        String status = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            status = given()
+        String status = CfnStackWaits.lastStateWithin(Duration.ofSeconds(10), () -> given()
                 .config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, ContentType.TEXT)))
                 .contentType(ct)
                 .header("X-Amz-Target", "CloudApiService.GetResourceRequestStatus")
                 .body("{\"RequestToken\":\"" + token + "\"}")
             .when().post("/").then().statusCode(200)
-                .extract().jsonPath().getString("ProgressEvent.OperationStatus");
-            if ("SUCCESS".equals(status) || "FAILED".equals(status)) {
-                break;
-            }
-            Thread.sleep(50);
-        }
+                .extract().jsonPath().getString("ProgressEvent.OperationStatus"),
+                operationStatus -> "SUCCESS".equals(operationStatus) || "FAILED".equals(operationStatus));
         assertEquals("FAILED", status);
         given().when().head("/" + name).then().statusCode(404);
     }

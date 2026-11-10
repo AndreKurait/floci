@@ -7,10 +7,12 @@ import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.dsql.DsqlService;
 import io.floci.aws.services.dsql.model.DsqlCluster;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -27,6 +29,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -44,7 +47,8 @@ class DsqlCfnProvisionerTest {
     private static final String POLICY = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
 
     private final DsqlService dsql = mock(DsqlService.class);
-    private final DsqlCfnProvisioner provisioner = new DsqlCfnProvisioner(dsql);
+    private final TestTime time = TestTime.create();
+    private final DsqlCfnProvisioner provisioner = new DsqlCfnProvisioner(dsql, time::nanoTime, time::sleepAdvancing);
     private final ObjectMapper mapper = new ObjectMapper();
 
     @Test
@@ -66,6 +70,75 @@ class DsqlCfnProvisionerTest {
         assertEquals("PENDING_SETUP", resource.getAttributes().get("Status"));
         assertEquals("1792496211976", resource.getAttributes().get("PolicyVersion"));
         assertEquals(ARN, resource.getAttributes().get("ResourceArn"));
+    }
+
+    @Test
+    void aCreatePollsEveryFifthOfASecondUntilTheClusterIsActive() {
+        DsqlCluster cluster = createdClusterBecomes("ACTIVE", TestTime.DEFAULT_START.plusMillis(400));
+        StackResource resource = resource();
+
+        provisioner.provision(resource, props("{}"), context(null));
+
+        assertEquals(TestTime.DEFAULT_START.plusMillis(400), time.now());
+        verify(dsql, times(3)).getCluster(REGION, ID);
+        assertEquals("ACTIVE", resource.getAttributes().get("Status"));
+        assertEquals(cluster.getIdentifier(), resource.getPhysicalId());
+    }
+
+    @Test
+    void aClusterThatFailsEndsTheWaitAtOnce() {
+        createdClusterBecomes("FAILED", TestTime.DEFAULT_START.plusMillis(200));
+
+        AwsException failed = assertThrows(AwsException.class,
+                () -> provisioner.provision(resource(), props("{}"), context(null)));
+
+        assertEquals("Cluster " + ID + " did not become ACTIVE (status FAILED)", failed.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plusMillis(200), time.now());
+    }
+
+    @Test
+    void aClusterStillCreatingAfterFiveMinutesFailsTheResource() {
+        createdClusterBecomes("ACTIVE", null);
+
+        AwsException failed = assertThrows(AwsException.class,
+                () -> provisioner.provision(resource(), props("{}"), context(null)));
+
+        assertEquals("Cluster " + ID + " did not become ACTIVE (status CREATING)", failed.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)), time.now());
+        verify(dsql, times(1501)).getCluster(REGION, ID);
+    }
+
+    @Test
+    void aClusterThatBecomesActiveAtTheFiveMinuteDeadlineStillSettles() {
+        createdClusterBecomes("ACTIVE", TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)));
+        StackResource resource = resource();
+
+        provisioner.provision(resource, props("{}"), context(null));
+
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)), time.now());
+        assertEquals("ACTIVE", resource.getAttributes().get("Status"));
+    }
+
+    @Test
+    void aClusterThatBecomesActiveJustAfterTheDeadlineIsNotWaitedFor() {
+        createdClusterBecomes("ACTIVE", TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)).plusNanos(1));
+
+        AwsException failed = assertThrows(AwsException.class,
+                () -> provisioner.provision(resource(), props("{}"), context(null)));
+
+        assertEquals("Cluster " + ID + " did not become ACTIVE (status CREATING)", failed.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)), time.now());
+    }
+
+    /** A created cluster that reads as CREATING until the timeline reaches {@code instant}; always, when null. */
+    private DsqlCluster createdClusterBecomes(String status, Instant instant) {
+        DsqlCluster cluster = cluster("CREATING", Map.of());
+        when(dsql.createCluster(any(), any(), any(), any(), any(), any(), any(), any(), anyBoolean())).thenReturn(cluster);
+        when(dsql.getCluster(REGION, ID)).thenAnswer(call -> {
+            cluster.setStatus(instant == null || time.now().isBefore(instant) ? "CREATING" : status);
+            return cluster;
+        });
+        return cluster;
     }
 
     @Test

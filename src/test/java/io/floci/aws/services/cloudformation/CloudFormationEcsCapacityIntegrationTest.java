@@ -6,6 +6,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
@@ -211,17 +213,10 @@ class CloudFormationEcsCapacityIntegrationTest {
     }
 
     private String awaitStackSettled(String stackArn) throws Exception {
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            String xml = describeStacks(stackArn);
-            if (xml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")
-                    || xml.contains("<StackStatus>DELETE_FAILED</StackStatus>")) {
-                return xml;
-            }
-            Thread.sleep(200);
-        }
-        throw new AssertionError("Stack did not settle into DELETE_COMPLETE/DELETE_FAILED: "
-                + describeStacks(stackArn));
+        return CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> describeStacks(stackArn),
+                xml -> xml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")
+                        || xml.contains("<StackStatus>DELETE_FAILED</StackStatus>"),
+                xml -> "Stack did not settle into DELETE_COMPLETE/DELETE_FAILED: " + xml);
     }
 
     private String describeStacks(String stackArn) {

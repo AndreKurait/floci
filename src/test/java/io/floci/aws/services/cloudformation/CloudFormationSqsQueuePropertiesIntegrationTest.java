@@ -5,6 +5,7 @@ import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -77,7 +78,7 @@ class CloudFormationSqsQueuePropertiesIntegrationTest {
         assertFalse(updated.containsKey("RedriveAllowPolicy"), "a dropped RedriveAllowPolicy is removed");
 
         cloudFormation(STACK, "DeleteStack", null);
-        await().untilAsserted(() -> given()
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).untilAsserted(() -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "GetQueueUrl")
                 .formParam("QueueName", queueUrl.substring(queueUrl.lastIndexOf('/') + 1))
