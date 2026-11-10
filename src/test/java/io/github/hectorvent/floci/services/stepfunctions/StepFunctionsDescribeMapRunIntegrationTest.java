@@ -11,7 +11,10 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -523,20 +526,12 @@ class StepFunctionsDescribeMapRunIntegrationTest {
     }
 
     private static Response waitForTerminalState(String execArn) {
-        for (int i = 0; i < 150; i++) {
-            Response resp = describeExecution(execArn);
-            if (!"RUNNING".equals(resp.jsonPath().getString("status"))) {
-                return resp;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                fail("Interrupted while waiting for execution " + execArn);
-            }
-        }
-        fail("Execution did not complete within timeout: " + execArn);
-        return null;
+        return await("execution " + execArn + " to leave RUNNING")
+                .atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> describeExecution(execArn),
+                        response -> !"RUNNING".equals(response.jsonPath().getString("status")));
     }
 
     private static String quote(String raw) {

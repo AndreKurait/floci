@@ -11,6 +11,9 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.time.Duration;
+
+import static io.github.hectorvent.floci.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -179,47 +182,18 @@ class StepFunctionsEcsRunTaskIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private String waitForExecution(String execArn) throws InterruptedException {
-        for (int i = 0; i < 80; i++) {
-            Response resp = describeExecution(execArn);
-            String status = resp.jsonPath().getString("status");
-            if ("SUCCEEDED".equals(status)) {
-                return resp.jsonPath().getString("output");
-            }
-            if ("FAILED".equals(status) || "ABORTED".equals(status)) {
-                fail("Execution " + status + ": " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete within timeout");
-        return null;
+    private String waitForExecution(String execArn) {
+        Response resp = waitForTerminalState(execArn, Duration.ofSeconds(8));
+        String status = resp.jsonPath().getString("status");
+        assertEquals("SUCCEEDED", status, "Execution " + status + ": " + resp.body().asString());
+        return resp.jsonPath().getString("output");
     }
 
-    private Response waitForFailedExecution(String execArn) throws InterruptedException {
-        for (int i = 0; i < 80; i++) {
-            Response resp = describeExecution(execArn);
-            String status = resp.jsonPath().getString("status");
-            if ("FAILED".equals(status)) {
-                return resp;
-            }
-            if ("SUCCEEDED".equals(status)) {
-                fail("Execution should have failed but succeeded: " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete within timeout");
-        return null;
-    }
-
-    private Response describeExecution(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"executionArn": "%s"}
-                        """.formatted(execArn))
-                .when()
-                .post("/");
+    private Response waitForFailedExecution(String execArn) {
+        Response resp = waitForTerminalState(execArn, Duration.ofSeconds(8));
+        assertEquals("FAILED", resp.jsonPath().getString("status"),
+                "Execution should have failed but succeeded: " + resp.body().asString());
+        return resp;
     }
 
     private static String quote(String raw) {

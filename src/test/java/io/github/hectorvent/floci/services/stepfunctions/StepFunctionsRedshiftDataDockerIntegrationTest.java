@@ -13,9 +13,11 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
+import java.time.Duration;
+
+import static io.github.hectorvent.floci.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.fail;
 
 @QuarkusTest
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -144,26 +146,10 @@ class StepFunctionsRedshiftDataDockerIntegrationTest {
                 .contentType(CONTENT_TYPE)
                 .body("{\"stateMachineArn\":\"%s\",\"input\":\"{}\"}".formatted(stateMachineArn))
                 .when().post("/").then().statusCode(200).extract().path("executionArn");
-        for (int i = 0; i < 300; i++) {
-            Response response = given()
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(CONTENT_TYPE)
-                    .body("{\"executionArn\":\"%s\"}".formatted(executionArn))
-                    .when().post("/");
-            String status = response.jsonPath().getString("status");
-            if (!"RUNNING".equals(status)) {
-                assertEquals("SUCCEEDED", status, "cause: " + response.jsonPath().getString("cause"));
-                return response.jsonPath().getString("output");
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                fail("Interrupted while waiting for " + executionArn);
-            }
-        }
-        fail("Execution did not complete: " + executionArn);
-        return null;
+        Response response = waitForTerminalState(executionArn, Duration.ofSeconds(30));
+        String status = response.jsonPath().getString("status");
+        assertEquals("SUCCEEDED", status, "cause: " + response.jsonPath().getString("cause"));
+        return response.jsonPath().getString("output");
     }
 
     private static String quote(String raw) {

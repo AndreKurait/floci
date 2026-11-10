@@ -14,6 +14,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import jakarta.inject.Inject;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -27,13 +28,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 
 import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
@@ -437,14 +436,11 @@ class StepFunctionsSqsTaskIamIntegrationTest {
     }
 
     private void await(String execution, String eventType) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        do {
-            if (!eventsOfType(execution, eventType).isEmpty()) {
-                return;
-            }
-            Thread.sleep(25);
-        } while (System.nanoTime() < deadline);
-        fail("No " + eventType + " event in " + execution);
+        Awaitility.await("a " + eventType + " event in " + execution)
+                .atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> !eventsOfType(execution, eventType).isEmpty());
     }
 
     private List<JsonNode> eventsOfType(String execution, String type) throws Exception {

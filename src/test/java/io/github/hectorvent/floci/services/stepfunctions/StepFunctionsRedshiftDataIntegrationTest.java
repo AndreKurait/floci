@@ -16,10 +16,12 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
+
+import static io.github.hectorvent.floci.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.never;
@@ -272,20 +274,7 @@ class StepFunctionsRedshiftDataIntegrationTest {
     private static Response terminalExecution(String definition, String input) {
         String stateMachineArn = createStateMachine(definition);
         String executionArn = startExecution(stateMachineArn, input);
-        for (int i = 0; i < 150; i++) {
-            Response response = describeExecution(executionArn);
-            if (!"RUNNING".equals(response.jsonPath().getString("status"))) {
-                return response;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                fail("Interrupted while waiting for execution " + executionArn);
-            }
-        }
-        fail("Execution did not complete within timeout: " + executionArn);
-        return null;
+        return waitForTerminalState(executionArn, Duration.ofSeconds(15));
     }
 
     private static String createStateMachine(String definition) {
@@ -310,14 +299,6 @@ class StepFunctionsRedshiftDataIntegrationTest {
                 .when().post("/");
         response.then().statusCode(200);
         return response.jsonPath().getString("executionArn");
-    }
-
-    private static Response describeExecution(String executionArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(CONTENT_TYPE)
-                .body("{\"executionArn\":\"%s\"}".formatted(executionArn))
-                .when().post("/");
     }
 
     private static String quote(String raw) {
