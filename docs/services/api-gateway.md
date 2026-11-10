@@ -1314,5 +1314,13 @@ deployments when their `ApiId` changes. Replacement cleanup tracks the owning AP
 alongside each child ID, including stages with the same name on different APIs.
 `Ref` continues to return the child ID or stage name. A later stack failure restores
 the previous child; `UpdateReplacePolicy: Retain` keeps a displaced child. Stage
-name changes also replace the stage. Cleanup requires the recorded `ApiId`;
-migration of older resources without that ownership record remains separate work.
+name changes also replace the stage. Cleanup uses the recorded `ApiId`.
+
+Older persisted children without `ApiId` recover ownership from the previous stack
+template, saved parameters and resource identities before update or deletion.
+Recovered metadata is saved before a child changes, and failed updates retain the
+previous stack tags. Policy-retained resources and resources explicitly retained by
+`DeleteStack` need no ownership recovery. Unresolved historical ownership fails
+without scanning other APIs or guessing from live exports, dynamic references or
+current SSM values. Stored-record reload support does not establish process-crash
+atomicity.
