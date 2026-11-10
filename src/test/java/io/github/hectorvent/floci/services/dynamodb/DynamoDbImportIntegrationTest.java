@@ -8,6 +8,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.concurrent.CountDownLatch;
@@ -18,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -491,22 +493,8 @@ class DynamoDbImportIntegrationTest {
     }
 
     private String pollStatus(Supplier<Response> call, String statusPath) {
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            String status = call.get().then().statusCode(200).extract().jsonPath().getString(statusPath);
-            if (!"IN_PROGRESS".equals(status)) {
-                return status;
-            }
-            sleep(100);
-        }
-        return "TIMEOUT";
-    }
-
-    private static void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        return await().atMost(Duration.ofSeconds(10)).until(
+                () -> call.get().then().statusCode(200).extract().jsonPath().getString(statusPath),
+                status -> !"IN_PROGRESS".equals(status));
     }
 }
