@@ -20,9 +20,9 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -2584,10 +2584,9 @@ class CodePipelineIntegrationTest {
     }
 
     private Response waitForJob(String provider) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-        Response response;
-        do {
-            response = post("PollForJobs", """
+        return await("a custom action job for " + provider).atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> post("PollForJobs", """
                     {
                         "actionTypeId": {
                             "category": "Build",
@@ -2596,49 +2595,30 @@ class CodePipelineIntegrationTest {
                             "version": "1"
                         }
                     }
-                    """.formatted(provider));
-            if (response.jsonPath().getList("jobs").size() == 1) {
-                return response;
-            }
-            Thread.sleep(50);
-        } while (Instant.now().isBefore(deadline));
-        throw new AssertionError("Custom action job was not created");
+                    """.formatted(provider)), response -> response.jsonPath().getList("jobs").size() == 1);
     }
 
     private void waitForExecution(String pipelineName, String executionId, String expected) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-        String status;
-        do {
-            status = post("GetPipelineExecution", """
+        await("pipeline " + pipelineName + " to reach " + expected).atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> post("GetPipelineExecution", """
                     {"pipelineName": "%s", "pipelineExecutionId": "%s"}
                     """.formatted(pipelineName, executionId))
-                    .jsonPath().getString("pipelineExecution.status");
-            if (expected.equals(status)) {
-                return;
-            }
-            if ("Failed".equals(status)) {
-                throw new AssertionError("Pipeline failed");
-            }
-            Thread.sleep(50);
-        } while (Instant.now().isBefore(deadline));
-        throw new AssertionError("Pipeline did not reach " + expected + ", last status: " + status);
+                    .jsonPath().getString("pipelineExecution.status"), status -> {
+                        if (!expected.equals(status) && "Failed".equals(status)) {
+                            throw new AssertionError("Pipeline failed");
+                        }
+                        return expected.equals(status);
+                    });
     }
 
     private Response waitForApprovalStatus(String pipelineName, String expectedStatus) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-        Response response;
-        String status;
-        do {
-            response = post("GetPipelineState", """
+        return await("approval action of " + pipelineName + " to reach " + expectedStatus)
+                .atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> post("GetPipelineState", """
                     {"name": "%s"}
-                    """.formatted(pipelineName));
-            status = response.jsonPath().getString("stageStates[0].actionStates[0].latestExecution.status");
-            if (expectedStatus.equals(status)) {
-                return response;
-            }
-            Thread.sleep(50);
-        } while (Instant.now().isBefore(deadline));
-        throw new AssertionError("Approval action did not reach " + expectedStatus + ", last status: " + status);
+                    """.formatted(pipelineName)), response -> expectedStatus.equals(response.jsonPath()
+                            .getString("stageStates[0].actionStates[0].latestExecution.status")));
     }
 
     private void waitForStageStatus(String pipelineName, String stageName, String expected) {
@@ -2667,36 +2647,24 @@ class CodePipelineIntegrationTest {
     }
 
     private String waitForApprovalToken(String pipelineName, int actionIndex) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-        String token;
-        do {
-            token = post("GetPipelineState", """
+        return await("an approval token for pipeline " + pipelineName).atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> post("GetPipelineState", """
                     {"name": "%s"}
                     """.formatted(pipelineName))
                     .jsonPath().getString(
-                            "stageStates[0].actionStates[%d].latestExecution.token".formatted(actionIndex));
-            if (token != null) {
-                return token;
-            }
-            Thread.sleep(50);
-        } while (Instant.now().isBefore(deadline));
-        throw new AssertionError("Approval token was not issued for pipeline " + pipelineName);
+                            "stageStates[0].actionStates[%d].latestExecution.token".formatted(actionIndex)),
+                        Objects::nonNull);
     }
 
     private void waitForActiveExecutions(String pipelineName, int expected) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-        do {
-            int active = post("ListPipelineExecutions", "{\"pipelineName\": \"%s\"}".formatted(pipelineName))
+        await(expected + " active executions of " + pipelineName).atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> post("ListPipelineExecutions", "{\"pipelineName\": \"%s\"}".formatted(pipelineName))
                     .jsonPath().getList("pipelineExecutionSummaries.status", String.class).stream()
                     .filter("InProgress"::equals)
                     .toList()
-                    .size();
-            if (active >= expected) {
-                return;
-            }
-            Thread.sleep(50);
-        } while (Instant.now().isBefore(deadline));
-        throw new AssertionError("Pipeline did not reach " + expected + " active executions");
+                    .size() >= expected);
     }
 
     private static String approvalPipeline(String name, String executionMode) {
