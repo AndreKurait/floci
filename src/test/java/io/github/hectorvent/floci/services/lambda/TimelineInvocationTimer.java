@@ -31,6 +31,11 @@ public final class TimelineInvocationTimer implements InvocationTimer {
     }
 
     @Override
+    public long nanoTime() {
+        return time.nanoTime();
+    }
+
+    @Override
     public void failAfter(CompletableFuture<?> future, long timeoutMs) {
         time.scheduler().schedule(() -> {
             future.completeExceptionally(new TimeoutException());

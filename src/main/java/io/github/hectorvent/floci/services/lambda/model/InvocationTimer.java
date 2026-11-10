@@ -8,8 +8,8 @@ import java.util.concurrent.TimeoutException;
 
 /**
  * The time an invocation is measured on and the waits made on its behalf. Everything outside tests
- * uses {@link #SYSTEM}; the interface exists so that a test can run function timeouts and retry
- * delays on a timeline it controls. It is only ever passed through constructors.
+ * uses {@link #SYSTEM}; the interface exists so that a test can run function timeouts, retry
+ * delays and shutdown grace periods on a timeline it controls. It is only ever passed through constructors.
  */
 public interface InvocationTimer {
 
@@ -18,6 +18,11 @@ public interface InvocationTimer {
         @Override
         public long currentTimeMillis() {
             return System.currentTimeMillis();
+        }
+
+        @Override
+        public long nanoTime() {
+            return System.nanoTime();
         }
 
         @Override
@@ -44,6 +49,9 @@ public interface InvocationTimer {
 
     /** Milliseconds since the epoch. */
     long currentTimeMillis();
+
+    /** A monotonic reading in nanoseconds, for measuring elapsed time. */
+    long nanoTime();
 
     /** Fails {@code future} with a {@link TimeoutException} unless it completes within {@code timeoutMs}. */
     void failAfter(CompletableFuture<?> future, long timeoutMs);
