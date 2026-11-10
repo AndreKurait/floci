@@ -1195,6 +1195,49 @@ class CodePipelineServiceTest {
         }
     }
 
+    @Test
+    void aStopPublishesNothingOutsideTheMonitorItsRunFinishesUnder() throws Exception {
+        // A run answers the stop signal with Stopped under its execution's monitor, then leaves.
+        // A stop that raised the signal outside that monitor let the run answer between the signal
+        // and the Stopping status, and that Stopping then stood for good: no run was left to end it.
+        String pipeline = "atomic-stop-pipeline";
+        try {
+            createExternalActionPipeline(service, pipeline, """
+                    {"name":"Approve","actionTypeId":{
+                    "category":"Approval","owner":"AWS","provider":"Manual","version":"1"}}
+                    """);
+            String id = startExecution(service, pipeline);
+            await().pollInterval(Duration.ofMillis(1)).atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                    assertFalse(handle("ListActionExecutions", """
+                            {"pipelineName":"%s","filter":{"pipelineExecutionId":"%s"}}
+                            """.formatted(pipeline, id)).path("actionExecutionDetails").isEmpty()));
+            CodePipelineExecution execution = storage.executionStore
+                    .getForAccount(ACCOUNT, REGION + ":" + pipeline + ":" + id).orElseThrow();
+            CompletableFuture<Void> stopped = new CompletableFuture<>();
+            Thread stop = Thread.ofPlatform().daemon().name("stop-request").unstarted(() -> {
+                try {
+                    stopExecution(service, pipeline, id, true);
+                    stopped.complete(null);
+                } catch (Exception e) {
+                    stopped.completeExceptionally(e);
+                }
+            });
+
+            synchronized (execution) {
+                stop.start();
+                await().pollInterval(Duration.ofMillis(1)).atMost(Duration.ofSeconds(3))
+                        .until(() -> stop.getState() == Thread.State.BLOCKED);
+                assertFalse(execution.isStopRequested());
+                assertEquals("InProgress", execution.getStatus());
+            }
+
+            stopped.get(3, TimeUnit.SECONDS);
+            waitForExecutionStatus(service, pipeline, id, "Stopped");
+        } finally {
+            service.shutdown();
+        }
+    }
+
     private CodePipelineService serviceWith(CodeBuildService codeBuildService,
                                             CodeDeployService codeDeployService) {
         return new CodePipelineService(

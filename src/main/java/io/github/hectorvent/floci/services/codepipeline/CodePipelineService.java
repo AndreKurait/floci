@@ -678,29 +678,34 @@ public class CodePipelineService {
     private ObjectNode stopPipelineExecution(JsonNode request, String region, String account) {
         CodePipelineExecution execution = requireExecution(
                 account, region, text(request, "pipelineName"), text(request, "pipelineExecutionId"));
-        if (isTerminal(execution.getStatus())) {
-            throw new AwsException("PipelineExecutionNotStoppableException",
-                    "Pipeline execution is already in a terminal state", 400);
+        // One transition under the monitor the run takes for its own: a run answers the stop signal
+        // with Stopped, or ends on its own with Failed or Succeeded, and leaves. Written around
+        // either, this Stopping would replace a terminal status with one no run is left to finish.
+        synchronized (execution) {
+            if (isTerminal(execution.getStatus())) {
+                throw new AwsException("PipelineExecutionNotStoppableException",
+                        "Pipeline execution is already in a terminal state", 400);
+            }
+            // Publish the stop mode before the stop signal. The provider polling loop reads
+            // stopRequested first, so observing it also observes the matching abandon value.
+            execution.setAbandon(request.path("abandon").asBoolean(false));
+            execution.setStopRequested(true);
+            execution.setStatus("Stopping");
+            execution.setStatusSummary(request.path("reason").asText("Stop requested."));
+            execution.setLastUpdateTime(now());
+            if (execution.getCurrentStage() != null) {
+                execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Stopping");
+            }
+            if (execution.isAbandon()) {
+                execution.getActionExecutions().stream()
+                        .filter(a -> "InProgress".equals(a.getStatus()))
+                        .forEach(a -> {
+                            a.setStatus("Abandoned");
+                            a.setLastUpdateTime(now());
+                        });
+            }
+            putExecution(execution);
         }
-        // Publish the stop mode before the stop signal. The provider polling loop reads
-        // stopRequested first, so observing it also observes the matching abandon value.
-        execution.setAbandon(request.path("abandon").asBoolean(false));
-        execution.setStopRequested(true);
-        execution.setStatus("Stopping");
-        execution.setStatusSummary(request.path("reason").asText("Stop requested."));
-        execution.setLastUpdateTime(now());
-        if (execution.getCurrentStage() != null) {
-            execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Stopping");
-        }
-        if (execution.isAbandon()) {
-            execution.getActionExecutions().stream()
-                    .filter(a -> "InProgress".equals(a.getStatus()))
-                    .forEach(a -> {
-                        a.setStatus("Abandoned");
-                        a.setLastUpdateTime(now());
-                    });
-        }
-        putExecution(execution);
         eventPublisher.pipelineStateChange(execution, "STOPPING");
         return mapper.createObjectNode().put("pipelineExecutionId", execution.getPipelineExecutionId());
     }
@@ -1860,10 +1865,12 @@ public class CodePipelineService {
     }
 
     private void failForCondition(CodePipelineExecution execution, String stageName, String conditionType) {
-        execution.setStatus("Failed");
-        execution.setStatusSummary(
-                "Condition " + conditionType + " failed in stage " + stageName + ".");
-        putExecution(execution);
+        synchronized (execution) {
+            execution.setStatus("Failed");
+            execution.setStatusSummary(
+                    "Condition " + conditionType + " failed in stage " + stageName + ".");
+            putExecution(execution);
+        }
     }
 
     private void finishExecutionRun(CodePipelineExecution execution) {
@@ -1960,7 +1967,9 @@ public class CodePipelineService {
                     .toList();
             CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
             if (futures.stream().anyMatch(CompletableFuture::isCompletedExceptionally)) {
-                execution.setStatus("Failed");
+                synchronized (execution) {
+                    execution.setStatus("Failed");
+                }
             }
         });
     }
@@ -2005,8 +2014,10 @@ public class CodePipelineService {
             state.setErrorDetails(Map.of(
                     "code", e instanceof AwsException aws ? aws.getErrorCode() : "ActionExecutionFailed",
                     "message", Objects.toString(e.getMessage(), "Action failed")));
-            execution.setStatus("Failed");
-            execution.setStatusSummary("Action " + state.getActionName() + " failed: " + state.getSummary());
+            synchronized (execution) {
+                execution.setStatus("Failed");
+                execution.setStatusSummary("Action " + state.getActionName() + " failed: " + state.getSummary());
+            }
         } finally {
             state.setLastUpdateTime(now());
             putExecution(execution);
@@ -2619,19 +2630,22 @@ public class CodePipelineService {
         if (!execution.isStopRequested()) {
             return false;
         }
-        boolean anyRunning = execution.getActionExecutions().stream()
-                .anyMatch(a -> "InProgress".equals(a.getStatus()));
-        if (!execution.isAbandon() && anyRunning) {
-            return false;
+        // Under the monitor the stop was published under, so this follows the whole of it.
+        synchronized (execution) {
+            boolean anyRunning = execution.getActionExecutions().stream()
+                    .anyMatch(a -> "InProgress".equals(a.getStatus()));
+            if (!execution.isAbandon() && anyRunning) {
+                return false;
+            }
+            execution.setStatus("Stopped");
+            execution.setStatusSummary("Pipeline execution stopped.");
+            execution.setLastUpdateTime(now());
+            if (execution.getCurrentStage() != null) {
+                execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Stopped");
+            }
+            putExecution(execution);
+            return true;
         }
-        execution.setStatus("Stopped");
-        execution.setStatusSummary("Pipeline execution stopped.");
-        execution.setLastUpdateTime(now());
-        if (execution.getCurrentStage() != null) {
-            execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Stopped");
-        }
-        putExecution(execution);
-        return true;
     }
 
     private void initializeTransitions(CodePipelinePipeline pipeline) {
