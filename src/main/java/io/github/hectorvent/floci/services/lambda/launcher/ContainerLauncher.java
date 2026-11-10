@@ -59,6 +59,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -319,6 +320,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withName(containerName)
                 .withEnv(env)
                 .withMemoryMb(fn.getMemorySize())
+                .withInit()
                 .withDockerNetwork(config.services().lambda().dockerNetwork())
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
@@ -503,7 +505,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // (e.g. aws-lambda-web-adapter) never start without this. Best-effort: an extension
         // launch failure shouldn't fail the whole container launch, since a function with no
         // extensions is the common case and this must be a no-op for it.
-        launchExtensions(dockerClient, containerId, fn.getFunctionName(), runtimeApiServer, logDestination, provisioned);
+        CompletableFuture<Void> extensionExit = launchExtensions(
+                dockerClient, containerId, fn.getFunctionName(), runtimeApiServer, logDestination, provisioned);
 
         // Init-readiness barrier: the execs above are detached, so without waiting here the caller
         // could enqueue the first invocation before an extension is ready to receive it — the
@@ -524,6 +527,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         handle.setLogStream(logHandle);
         handle.setExitWatcher(exitWatcher);
+        handle.setExtensionExit(extensionExit);
 
         return handle;
         } catch (RuntimeException e) {
@@ -783,21 +787,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         server.quiesce();
         handle.cancelExitWatcher();
 
-        // Then SIGTERM the container. The runtime library's default SIGTERM handler exits
-        // the process while the runtime API socket is still up, matching real AWS Lambda's
-        // shutdown flow.
+        // The container init forwards SIGTERM to the runtime while the runtime API socket
+        // stays up. Running the runtime directly as PID 1 would suppress the default
+        // SIGTERM action for runtimes without a handler, forcing the full kill timeout.
         //
-        // stopTimeoutSeconds is the ceiling docker waits for PID 1 to exit before SIGKILL,
-        // not a grace floor: the runtime typically exits promptly, so `docker stop`
-        // returns shortly after and this value rarely matters end-to-end. Sized against
-        // AWS's documented Shutdown-phase tiers as a defensive upper bound only — 2s
-        // when at least one extension is registered (matching AWS's 2000ms
-        // external-extensions budget), else 1s. NOTE: extensions run as sibling
-        // `docker exec`s (not children of PID 1) and are killed when the container
-        // exits; the 2s ceiling does not provide a guaranteed grace window for
-        // extension shutdown work — only that we will not preempt PID 1 for at least
-        // that long if it happens to be slow.
-        int stopTimeoutSeconds = server.hasRegisteredExtensions() ? 2 : 1;
+        // External extensions run as sibling execs and die when the container exits.
+        // Let their SHUTDOWN work and final output finish before signaling the runtime.
+        // Functions without extensions take the already-completed future immediately.
+        int stopTimeoutSeconds = shutdownTimeout(handle, server.hasRegisteredExtensions());
         RuntimeException cleanupFailure = null;
         try {
             lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
@@ -846,6 +843,29 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             dnsResolver.remove(handle.getDnsResolverVolume(), null);
             handle.setDnsResolverVolume(null);
         }
+    }
+
+    static int shutdownTimeout(ContainerHandle handle, boolean hasExtensions) {
+        if (!hasExtensions) {
+            return 1;
+        }
+        if (handle.extensionExit().isDone()) {
+            return 2;
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        try {
+            handle.extensionExit().get(2, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return 0;
+        } catch (ExecutionException | TimeoutException | CancellationException failure) {
+            LOG.debugv(failure, "Extension shutdown did not complete cleanly for container {0}",
+                    handle.getContainerId());
+        }
+        long remaining = Math.max(0, deadline - System.nanoTime());
+        // Docker accepts whole seconds. Rounding down keeps the total within the
+        // extension budget rather than adding another grace period after it expires.
+        return (int) TimeUnit.NANOSECONDS.toSeconds(remaining);
     }
 
     public static boolean isAwsCredentialVariable(String name) {
@@ -1614,13 +1634,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     /** Where a container's output is sent: the CloudWatch log group/stream and its region. */
     private record LogDestination(String accountId, String logGroup, String logStream, String region) { }
 
-    private void launchExtensions(DockerClient dockerClient, String containerId, String functionName,
+    private CompletableFuture<Void> launchExtensions(DockerClient dockerClient, String containerId, String functionName,
                                   RuntimeApiServer runtimeApiServer, LogDestination logDestination, boolean strict) {
         List<String> extensionNames = listExtensionBinaries(dockerClient, containerId, functionName, strict);
         // Arm the readiness barrier before starting any extension process, so the latch already
         // exists when the first one starts polling /extension/event/next — otherwise a
         // fast-starting extension could become ready before there is anything to count it down.
         runtimeApiServer.expectExtensions(extensionNames.size());
+        List<CompletableFuture<Void>> exits = new ArrayList<>();
         for (String name : extensionNames) {
             try {
                 String path = EXTENSIONS_DIR + "/" + name;
@@ -1638,10 +1659,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 // the container log and an observability extension's output would vanish entirely.
                 // Draining is also required in its own right — an unread exec pipe fills up and
                 // stalls the extension process.
-                dockerClient.execStartCmd(execId).exec(logStreamer.execLogCallbackForAccount(
+                ExtensionLogCallback callback = new ExtensionLogCallback(logStreamer.execLogCallbackForAccount(
                         logDestination.accountId(), logDestination.logGroup(), logDestination.logStream(),
                         logDestination.region(),
                         "lambda:" + functionName + ":" + name));
+                dockerClient.execStartCmd(execId).exec(callback);
+                exits.add(callback.completion());
                 LOG.infov("Launched extension {0} for function {1} (container {2})",
                         name, functionName, containerId);
             } catch (Exception e) {
@@ -1652,6 +1675,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                         name, functionName);
             }
         }
+        return CompletableFuture.allOf(exits.toArray(CompletableFuture[]::new));
     }
 
     /**

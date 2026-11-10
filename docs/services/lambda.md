@@ -595,6 +595,18 @@ If an invocation finishes after the shutdown deadline, releasing its still-owned
 container starts a separate bounded cleanup attempt. This does not extend the
 initial shutdown wait.
 
+Lambda containers use the engine's init process to forward signals and reap children.
+A runtime without a SIGTERM handler therefore exits normally instead of inheriting
+PID 1's special signal behavior and waiting for the forced-kill timeout. The one-second
+runtime stop timeout remains a fallback ceiling, not a minimum delay.
+
+External extensions receive SHUTDOWN while the Runtime API remains available. Floci
+waits for their exec output streams to finish within a shared two-second budget before
+stopping the container, so prompt extension cleanup and final logs are preserved.
+An extension that does not finish cannot add another stop grace period after that
+budget expires. Functions without extensions incur no extension wait. This is Floci's
+container teardown behavior, not an implementation of AWS's underlying compute fabric.
+
 When using `floci-cli`, set `floci stop --timeout <seconds>` above the configured
 drain budget. The CLI currently defaults to 10 seconds, including for `floci restart`.
 For a longer drain, explicitly stop with the larger timeout and then start Floci.
