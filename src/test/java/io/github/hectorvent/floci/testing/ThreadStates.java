@@ -27,11 +27,12 @@ public final class ThreadStates {
      * Returns once {@code thread} is blocked entering a monitor or parked on a lock, or {@code task} has
      * finished, whichever comes first. Code that serializes correctly leaves the second request blocked
      * behind the first; code that does not lets it run to the end, which the caller's assertions
-     * then catch. Polls every 5 ms and gives up after five seconds rather than hang a broken test.
+     * then catch. Polls every 5 ms and fails after five seconds if neither condition is reached.
      */
     public static void awaitBlockedOrDone(AtomicReference<Thread> thread, Future<?> task)
             throws InterruptedException {
-        awaitBlockedOrDone(thread::get, task::isDone, 5);
+        assertTrue(awaitBlockedOrDone(thread::get, task::isDone, 5),
+                "worker blocked or finished before timeout");
     }
 
     /**
