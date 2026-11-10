@@ -15,10 +15,17 @@ integrations, the source ARN uses the function's region, as documented by AWS.
 Removing a grant prevents subsequent integration invocations. An existing cached
 API response does not invoke Lambda again.
 
-Configured role or caller-passthrough credentials retain their existing behavior;
-this check does not implement their authorization. HTTP/WebSocket integrations
-and Lambda authorizers are outside this REST integration permission check.
-IAM enforcement disabled retains the existing permissive behavior.
+Configured execution roles require API Gateway trust and permission to invoke the
+exact Lambda function, version or alias. Identity policies, permissions boundaries,
+account SCPs and Lambda resource policies apply; cross-account invocations require
+both identity and resource-policy grants. Every uncached invocation rechecks the role,
+so revocation takes effect on the next request. The same resolved target is authorized
+and invoked.
+
+Role checks do not synthesize service-specific trust `SourceArn` or `SourceAccount`
+conditions. Caller-passthrough credentials, HTTP/WebSocket integrations and Lambda
+authorizers remain separate paths. IAM enforcement disabled retains the existing
+permissive behavior.
 
 
 ## JWT issuer network policy

@@ -99,6 +99,39 @@ class ServiceRoleCallAuthorizerTest {
         verifyNoInteractions(iam);
     }
 
+    @Test
+    void absentSourceContextMustSatisfyTheRolesActualTrustPolicy() {
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},
+                "Action":"sts:AssumeRole","Condition":{"Null":{
+                "aws:SourceArn":"true","aws:SourceAccount":"true"}}}}""");
+        assertEquals(Decision.ALLOW, authorizer.authorizeWithoutSourceContext(
+                "events", ROLE, INVOKE, FUNCTION, ACCOUNT, "aws"));
+        role.setAssumeRolePolicyDocument(TRUST);
+        assertEquals(Decision.DENY, authorizer.authorizeWithoutSourceContext(
+                "events", ROLE, INVOKE, FUNCTION, ACCOUNT, "aws"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"aws,aws,true", "aws,aws-cn,false", "aws,aws-us-gov,false",
+            "aws-cn,aws,false", "aws-cn,aws-cn,true", "aws-cn,aws-us-gov,false",
+            "aws-us-gov,aws,false", "aws-us-gov,aws-cn,false", "aws-us-gov,aws-us-gov,true"})
+    void absentSourceContextPreservesTheOwnerAndTargetPartitionBoundary(
+            String ownerPartition, String targetPartition, boolean samePartition) {
+        String executionRole = ROLE.replace("arn:aws:", "arn:" + ownerPartition + ":");
+        String target = FUNCTION.replace("arn:aws:", "arn:" + targetPartition + ":");
+        role.setArn(executionRole);
+        role.setAssumeRolePolicyDocument("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},
+                "Action":"sts:AssumeRole"}}""");
+        when(iam.resolvePrincipalContext(executionRole)).thenReturn(CallerContext.of(List.of(ALLOW)));
+        assertEquals(samePartition ? Decision.ALLOW : Decision.DENY,
+                authorizer.authorizeWithoutSourceContext(
+                        "events", executionRole, INVOKE, target, ACCOUNT, ownerPartition));
+        assertEquals(Decision.DENY, authorizer.authorizeWithoutSourceContext(
+                "events", executionRole, INVOKE, target, OTHER, ownerPartition));
+    }
+
     private Decision decide(String target) {
         return authorizer.authorize("events", ROLE, INVOKE, target, RULE, ACCOUNT);
     }
