@@ -52,6 +52,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
+import java.util.function.LongSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -78,6 +79,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     private final Map<String, ClosedTask> closedTaskTokens = new LinkedHashMap<>();
     private static final long CLOSED_TOKEN_RETENTION_NANOS = TimeUnit.MINUTES.toNanos(5);
     private static final int MAX_CLOSED_TOKENS = 1024;
+    // How long GetActivityTask holds its long poll open before answering with no task.
+    private static final long ACTIVITY_TASK_POLL_NANOS = TimeUnit.SECONDS.toNanos(60);
 
     private record PendingTask(String accountId, String resourceArn,
                                CompletableFuture<JsonNode> future, TaskResult result) {}
@@ -113,6 +116,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     private final SfnMockLoader mockLoader;
     private final StepFunctionsEventPublisher eventPublisher;
     private final Clock clock;
+    // The monotonic clock task-token heartbeats and closures are stamped on: the one the executor
+    // measures their deadlines against. Tests move it forward.
+    private final LongSupplier nanoTime;
+    private final BoundedWaits waits;
     private final SignedMarkers listExecutionTokens = new SignedMarkers();
 
     // Fields that are valid only in JSONPath mode. Validated against real AWS:
@@ -175,6 +182,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                                 AslExecutor aslExecutor, ObjectMapper objectMapper,
                                 SfnMockLoader mockLoader, StepFunctionsEventPublisher eventPublisher,
                                 Clock clock) {
+        this(storageFactory, regionResolver, aslExecutor, objectMapper, mockLoader, eventPublisher,
+                clock, System::nanoTime, BoundedWaits.BLOCKING);
+    }
+
+    /** Test seam: the monotonic clock and the bounded waits, which production never replaces. */
+    StepFunctionsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                         AslExecutor aslExecutor, ObjectMapper objectMapper,
+                         SfnMockLoader mockLoader, StepFunctionsEventPublisher eventPublisher,
+                         Clock clock, LongSupplier nanoTime, BoundedWaits waits) {
         this.stateMachineStore = storageFactory.create("stepfunctions", "sfn-state-machines.json",
                 new TypeReference<Map<String, StateMachine>>() {});
         this.executionStore = storageFactory.create("stepfunctions", "sfn-executions.json",
@@ -194,6 +210,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         this.mockLoader = mockLoader;
         this.eventPublisher = eventPublisher;
         this.clock = clock;
+        this.nanoTime = nanoTime;
+        this.waits = waits;
     }
 
     public void clear() {
@@ -1274,7 +1292,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         BlockingQueue<ActivityTask> queue = activityQueues.computeIfAbsent(activityArn,
                 k -> new LinkedBlockingQueue<>());
         try {
-            return queue.poll(60, TimeUnit.SECONDS);
+            return waits.poll(queue, ACTIVITY_TASK_POLL_NANOS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return null;
@@ -1295,7 +1313,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         synchronized (this) {
             if (tokenResetsInProgress == 0) {
                 pendingTaskTokens.put(token, new PendingTask(accountId, authorizationArn, future, null));
-                taskHeartbeatNanos.put(token, System.nanoTime());
+                taskHeartbeatNanos.put(token, nanoTime.getAsLong());
                 return future;
             }
         }
@@ -1339,7 +1357,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             return pending.resourceArn();
         }
         ClosedTask closed = token == null ? null : closedTaskTokens.get(token);
-        if (closed != null && System.nanoTime() - closed.closedAtNanos() < CLOSED_TOKEN_RETENTION_NANOS) {
+        if (closed != null && nanoTime.getAsLong() - closed.closedAtNanos() < CLOSED_TOKEN_RETENTION_NANOS) {
             requireTokenScope(closed.accountId(), closed.resourceArn(), callerAccountId, region);
             return closed.resourceArn();
         }
@@ -1353,7 +1371,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
      */
     public long lastTaskHeartbeatNanos(String taskToken) {
         Long reportedAt = taskToken != null ? taskHeartbeatNanos.get(taskToken) : null;
-        return reportedAt != null ? reportedAt : System.nanoTime();
+        return reportedAt != null ? reportedAt : nanoTime.getAsLong();
     }
 
     enum TokenTimeout { NONE, CLAIMED, EXECUTION, TASK, HEARTBEAT }
@@ -1395,7 +1413,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     }
 
     private void rememberClosed(String token, PendingTask pending) {
-        long now = System.nanoTime();
+        long now = nanoTime.getAsLong();
         closedTaskTokens.entrySet().removeIf(entry -> now - entry.getValue().closedAtNanos()
                 >= CLOSED_TOKEN_RETENTION_NANOS);
         closedTaskTokens.put(token, new ClosedTask(pending.accountId(), pending.resourceArn(), now));
@@ -1415,7 +1433,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             return pending;
         }
         ClosedTask closed = token == null ? null : closedTaskTokens.get(token);
-        if (closed != null && System.nanoTime() - closed.closedAtNanos() >= CLOSED_TOKEN_RETENTION_NANOS) {
+        if (closed != null && nanoTime.getAsLong() - closed.closedAtNanos() >= CLOSED_TOKEN_RETENTION_NANOS) {
             closedTaskTokens.remove(token);
             closed = null;
         }
@@ -1476,7 +1494,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     /** A foreign, closed or unknown token cannot refresh a task's heartbeat. */
     public synchronized void sendTaskHeartbeat(String taskToken) {
         requirePendingTask(taskToken);
-        taskHeartbeatNanos.put(taskToken, System.nanoTime());
+        taskHeartbeatNanos.put(taskToken, nanoTime.getAsLong());
     }
 
     // ──────────────────────────── Map runs ────────────────────────────

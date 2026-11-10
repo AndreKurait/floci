@@ -10,6 +10,7 @@ import io.floci.aws.services.stepfunctions.model.HistoryEvent;
 import io.floci.aws.services.stepfunctions.model.MockedResponseStep;
 import io.floci.aws.services.stepfunctions.model.MockedTestCase;
 import io.floci.aws.services.stepfunctions.model.StateMachine;
+import io.floci.aws.testing.TestTime;
 import io.quarkus.test.junit.QuarkusTest;
 import io.vertx.mutiny.core.Vertx;
 import jakarta.enterprise.inject.Instance;
@@ -17,11 +18,14 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -38,8 +42,12 @@ class AslExecutorMockedResponsesTest {
     private static final String REGION = "us-east-2";
     private static final String ACCOUNT = "000000000000";
     private static final String UNSUPPORTED_RESOURCE = "arn:aws:states:::unsupported:invoke";
+    /** The {@code IntervalSeconds} of the retriers below, with a {@code BackoffRate} of 1. */
+    private static final Duration RETRY_INTERVAL = Duration.ofSeconds(1);
+    private static final Duration ONE_NANOSECOND = Duration.ofNanos(1);
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final TestTime time = TestTime.create();
     private LambdaExecutorService lambdaExecutor;
     private AslExecutor executor;
 
@@ -58,6 +66,9 @@ class AslExecutorMockedResponsesTest {
                 .config(config)
                 .vertx(vertx)
                 .customResourceLiveness(null)
+                .clock(time.clock())
+                .sleeper(time::sleepNanos)
+                .nanoTime(time::nanoTime)
                 .build();
     }
 
@@ -124,7 +135,7 @@ class AslExecutorMockedResponsesTest {
                 throwStep(0, 0, "ApiGateway.429", "Too many requests"),
                 returnStep(1, 2, "{\"retried\": true}"))));
 
-        Execution execution = run("""
+        Execution execution = runThroughOneBackoff("""
                 {
                   "StartAt": "Call API",
                   "States": {
@@ -213,7 +224,7 @@ class AslExecutorMockedResponsesTest {
         MockedTestCase mocks = testCase(Map.of("Call API", List.of(
                 throwStep(0, 0, "ApiGateway.429", "Too many requests"))));
 
-        Execution execution = run("""
+        Execution execution = runThroughOneBackoff("""
                 {
                   "StartAt": "Call API",
                   "States": {
@@ -242,7 +253,7 @@ class AslExecutorMockedResponsesTest {
         MockedTestCase mocks = testCase(Map.of("Call API", List.of(
                 throwStep(0, 0, "ApiGateway.429", "Too many requests"))));
 
-        Execution execution = run("""
+        Execution execution = runThroughOneBackoff("""
                 {
                   "StartAt": "Call API",
                   "States": {
@@ -325,6 +336,7 @@ class AslExecutorMockedResponsesTest {
         verify(s3).listObjects(eq("b"), any(), any(), anyInt());
     }
 
+    /** Runs a definition that must not pause; one that does fails instead of waiting. */
     private Execution run(String definition, MockedTestCase mocks) {
         return run(definition, mocks, "{}");
     }
@@ -334,6 +346,31 @@ class AslExecutorMockedResponsesTest {
     }
 
     private Execution run(String definition, MockedTestCase mocks, String input, String executionName) {
+        Execution execution = AslExecutorFixture.finished(
+                AslExecutorFixture.start(() -> execute(definition, mocks, input, executionName)));
+        assertEquals(0, time.sleepers());
+        return execution;
+    }
+
+    /**
+     * Runs a definition whose first attempt is retried after {@link #RETRY_INTERVAL}: one
+     * nanosecond before the interval is over the run is still backing off, and it needs no further
+     * time once it is.
+     */
+    private Execution runThroughOneBackoff(String definition, MockedTestCase mocks) {
+        CompletableFuture<Execution> running = AslExecutorFixture.start(
+                () -> execute(definition, mocks, "{}", "mock-test-execution"));
+        time.awaitSleepers(1);
+        time.advance(RETRY_INTERVAL.minus(ONE_NANOSECOND));
+        assertEquals(1, time.sleepers());
+        assertFalse(running.isDone());
+        time.advance(ONE_NANOSECOND);
+        Execution execution = AslExecutorFixture.finished(running);
+        assertEquals(0, time.sleepers());
+        return execution;
+    }
+
+    private Execution execute(String definition, MockedTestCase mocks, String input, String executionName) {
         StateMachine stateMachine = new StateMachine();
         stateMachine.setName("mock-test");
         stateMachine.setStateMachineArn("arn:aws:states:%s:%s:stateMachine:mock-test".formatted(REGION, ACCOUNT));
