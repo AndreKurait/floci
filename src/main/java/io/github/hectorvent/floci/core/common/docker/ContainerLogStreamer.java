@@ -407,6 +407,7 @@ public class ContainerLogStreamer {
         private final ReentrantReadWriteLock callbackGate = new ReentrantReadWriteLock(true);
         private final BiConsumer<StreamType, String> lineConsumer;
         private final long closeGraceMillis;
+        private final ScheduledExecutorService closeScheduler;
         private final CompletableFuture<Void> attachment = new CompletableFuture<>();
         private volatile Throwable attachmentFailure;
         // Guarded by 'buffers'. Set only by the Docker transport terminal callback; afterwards onNext
@@ -421,16 +422,23 @@ public class ContainerLogStreamer {
         private boolean emitting;
 
         LogReassemblyCallback(Consumer<String> lineConsumer) {
-            this(lineConsumer, DEFAULT_CLOSE_GRACE_MILLIS);
+            this(lineConsumer, CLOSE_DRAIN_SCHEDULER);
         }
 
-        LogReassemblyCallback(Consumer<String> lineConsumer, long closeGraceMillis) {
-            this(closeGraceMillis, (stream, line) -> lineConsumer.accept(line));
+        /** The default close grace, timed by a scheduler a test moves itself. */
+        LogReassemblyCallback(Consumer<String> lineConsumer, ScheduledExecutorService closeScheduler) {
+            this(DEFAULT_CLOSE_GRACE_MILLIS, (stream, line) -> lineConsumer.accept(line), closeScheduler);
         }
 
         LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer) {
+            this(closeGraceMillis, lineConsumer, CLOSE_DRAIN_SCHEDULER);
+        }
+
+        private LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer,
+                                      ScheduledExecutorService closeScheduler) {
             this.lineConsumer = lineConsumer;
             this.closeGraceMillis = closeGraceMillis;
+            this.closeScheduler = closeScheduler;
         }
 
         @Override
@@ -535,7 +543,7 @@ public class ContainerLogStreamer {
                     if (terminated || fallbackFinalization != null) {
                         return;
                     }
-                    fallbackFinalization = CLOSE_DRAIN_SCHEDULER.schedule(
+                    fallbackFinalization = closeScheduler.schedule(
                             this::closeTransportAndFlush, closeGraceMillis, TimeUnit.MILLISECONDS);
                 }
             }

@@ -130,7 +130,9 @@ class S3CrossAccountNotificationSdkIntegrationTest {
         S3Exception denied = assertThrows(S3Exception.class, () -> writer.putObject(
                 request -> request.bucket(bucket).key("denied.json"), RequestBody.fromString("denied")));
         assertEquals("AccessDenied", denied.awsErrorDetails().errorCode());
-        assertTrue(sqs.receiveMessage(request -> request.queueUrl(queue).waitTimeSeconds(1)).messages().isEmpty());
+        // S3 hands an event to the topic, and the topic to the queue, on the upload's own request:
+        // what the refused upload produced was in the queue before its refusal was answered.
+        assertTrue(sqs.receiveMessage(request -> request.queueUrl(queue).waitTimeSeconds(0)).messages().isEmpty());
     }
 
     private AccessKey createS3User(String account, Region region, String action) {
@@ -165,7 +167,8 @@ class S3CrossAccountNotificationSdkIntegrationTest {
 
     private static JsonNode nextEvent(SqsClient sqs, String queue) throws Exception {
         AtomicReference<Message> found = new AtomicReference<>();
-        await().alias("S3 event in the bucket owner's topic").atMost(Duration.ofSeconds(10)).until(() -> {
+        await().alias("S3 event in the bucket owner's topic").pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(10)).until(() -> {
             List<Message> messages = sqs.receiveMessage(request -> request.queueUrl(queue)
                     .maxNumberOfMessages(1).waitTimeSeconds(1)).messages();
             if (messages.isEmpty()) {

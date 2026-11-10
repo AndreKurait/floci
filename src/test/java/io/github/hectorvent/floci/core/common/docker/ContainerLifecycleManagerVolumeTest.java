@@ -24,6 +24,8 @@ import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
+import io.github.hectorvent.floci.testing.TestTime;
+import io.github.hectorvent.floci.testing.TimelineDeadlineWaits;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -43,7 +45,12 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntConsumer;
 import java.util.function.IntFunction;
@@ -310,18 +317,73 @@ class ContainerLifecycleManagerVolumeTest {
         }
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void strictContainerCleanupRetainsOwnershipWhenTheRemovalWaitTimesOutOrIsInterrupted(boolean interrupt)
-            throws Exception {
+    @Test
+    void strictContainerCleanupRetainsOwnershipWhenTheRemovalWaitIsInterrupted() throws Exception {
         String id = "still-removing";
+        Closeable logStream = mock(Closeable.class);
+        Closeable waitStream = mock(Closeable.class);
+        ConflictException removalFailure = removalStillInProgress(id, waitStream, true);
+
+        try {
+            IllegalStateException failure = assertTimeout(Duration.ofSeconds(10), () ->
+                    assertThrows(IllegalStateException.class, () -> manager.stopAndRemoveStrict(id, logStream)));
+            assertSame(removalFailure, failure.getCause());
+            assertTrue(Thread.currentThread().isInterrupted());
+            verify(logStream, never()).close();
+            verify(waitStream, atLeastOnce()).close();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void strictContainerCleanupRetainsOwnershipWhenTheRemovalIsStillRunningAfterFiveSeconds() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        manager = new ContainerLifecycleManager(dockerClient, imageCacheService, containerDetector, config,
+                RetryingTarCopier.DEFAULT_BACKOFF_MS, (callback, timeout, unit) -> {
+                    try {
+                        waits.bounded(unit.toNanos(timeout), callback::awaitCompletion);
+                        return true;
+                    } catch (TimeoutException expired) {
+                        return false;
+                    } catch (ExecutionException impossible) {
+                        throw new AssertionError(impossible);
+                    }
+                });
+        String id = "still-removing";
+        Closeable logStream = mock(Closeable.class);
+        Closeable waitStream = mock(Closeable.class);
+        ConflictException removalFailure = removalStillInProgress(id, waitStream, false);
+
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> cleanup = caller.submit(() -> manager.stopAndRemoveStrict(id, logStream));
+            waits.awaitWaiting(1);
+
+            time.advance(Duration.ofSeconds(5).minusNanos(1));
+            assertFalse(cleanup.isDone(), "the cleanup gave up before the removal had its five seconds");
+            verify(waitStream, never()).close();
+
+            time.advance(Duration.ofNanos(1));
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> cleanup.get(5, TimeUnit.SECONDS));
+            IllegalStateException cleanupFailure = assertInstanceOf(IllegalStateException.class, failure.getCause());
+            assertSame(removalFailure, cleanupFailure.getCause());
+            verify(logStream, never()).close();
+            verify(waitStream, atLeastOnce()).close();
+        } finally {
+            caller.shutdownNow();
+        }
+    }
+
+    /** A stopped container whose removal conflicts with one in progress that never reports completion. */
+    private ConflictException removalStillInProgress(String id, Closeable waitStream, boolean interrupt) {
         StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
         RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
         WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
-        Closeable logStream = mock(Closeable.class);
-        Closeable waitStream = mock(Closeable.class);
         when(dockerClient.stopContainerCmd(id)).thenReturn(stop);
         when(dockerClient.removeContainerCmd(id)).thenReturn(remove);
         ConflictException removalFailure = new ConflictException("removal already in progress");
@@ -338,17 +400,7 @@ class ContainerLifecycleManagerVolumeTest {
             }
             return callback;
         });
-
-        try {
-            IllegalStateException failure = assertTimeout(Duration.ofSeconds(10), () ->
-                    assertThrows(IllegalStateException.class, () -> manager.stopAndRemoveStrict(id, logStream)));
-            assertSame(removalFailure, failure.getCause());
-            assertEquals(interrupt, Thread.currentThread().isInterrupted());
-            verify(logStream, never()).close();
-            verify(waitStream, atLeastOnce()).close();
-        } finally {
-            Thread.interrupted();
-        }
+        return removalFailure;
     }
 
     @ParameterizedTest

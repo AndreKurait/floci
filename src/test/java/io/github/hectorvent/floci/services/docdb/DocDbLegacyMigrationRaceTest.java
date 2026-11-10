@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.docdb.model.DocDbInstance;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.rds.RdsService;
+import io.github.hectorvent.floci.testing.LockWaits;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
@@ -222,7 +223,8 @@ class DocDbLegacyMigrationRaceTest {
             }
         });
         clusterDeleter.start();
-        clusterDeleter.join(TimeUnit.SECONDS.toMillis(2));
+        // It waits for the monitor the held instance delete owns; one of its own would let it finish here.
+        LockWaits.awaitBlockedBehind(clusterDeleter, instanceDeleter);
 
         pausing.release();
         instanceDeleter.join(TimeUnit.SECONDS.toMillis(10));
@@ -377,8 +379,8 @@ class DocDbLegacyMigrationRaceTest {
             }
         });
         deleter.start();
-        // Sharing the monitor is what stops the delete finishing here: it should still be waiting.
-        deleter.join(TimeUnit.SECONDS.toMillis(1));
+        // Sharing the monitor is what stops the delete finishing here: it waits for the one the move owns.
+        LockWaits.awaitBlockedBehind(deleter, mover);
 
         pausing.release();
         mover.join(TimeUnit.SECONDS.toMillis(10));

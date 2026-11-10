@@ -6,6 +6,8 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.core.DefaultDockerClientConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.testing.LockWaits;
+import org.apache.hc.core5.concurrent.BasicFuture;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -753,11 +755,14 @@ class DockerClientProducerTest {
                 }
 
                 try (Socket first = accepted.poll(10, TimeUnit.SECONDS);
-                     Socket second = accepted.poll(10, TimeUnit.SECONDS);
-                     Socket third = accepted.poll(1, TimeUnit.SECONDS)) {
+                     Socket second = accepted.poll(10, TimeUnit.SECONDS)) {
                     assertNotNull(first, "first stream should connect");
                     assertNotNull(second, "second stream should connect");
-                    assertNull(third, "third stream should wait for a pooled connection instead of opening one");
+                    // The third stream is parked in the pool's lease, which is where a caller waits
+                    // for one of the two connections to come back; it has opened none of its own.
+                    LockWaits.awaitTimedWaitIn(BasicFuture.class, "get", 1);
+                    assertNull(accepted.poll(),
+                            "third stream should wait for a pooled connection instead of opening one");
                 }
             } finally {
                 client.close();

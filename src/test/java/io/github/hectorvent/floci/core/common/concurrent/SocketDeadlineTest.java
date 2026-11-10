@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.core.common.concurrent;
 
+import io.github.hectorvent.floci.testing.TestTime;
 import io.github.hectorvent.floci.testing.ThreadStates;
+import io.github.hectorvent.floci.testing.TimelineDeadlineWaits;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -123,5 +125,82 @@ class SocketDeadlineTest {
                     throw failure;
                 })));
         assertEquals(1, exits.get());
+    }
+
+    @Test
+    void anOperationStillRunningWhenItsSecondsAreUpTimesOutAndIsInterrupted() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        CountDownLatch exited = new CountDownLatch(1);
+        CountDownLatch never = new CountDownLatch(1);
+        AtomicInteger exits = new AtomicInteger();
+        FutureTask<String> result = new FutureTask<>(() -> SocketDeadline.call(10, () -> {
+            started.countDown();
+            try {
+                never.await();
+            } catch (InterruptedException e) {
+                interrupted.countDown();
+                throw e;
+            }
+            return "late";
+        }, () -> {
+            exits.incrementAndGet();
+            exited.countDown();
+        }, waits));
+        Thread caller = Thread.ofVirtual().start(result);
+        try {
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            waits.awaitWaiting(1);
+
+            time.advance(Duration.ofSeconds(10).minusNanos(1));
+            assertFalse(result.isDone(), "the call gave up before its ten seconds had passed");
+            assertEquals(1, interrupted.getCount());
+            assertEquals(1, waits.waiting());
+
+            time.advance(Duration.ofNanos(1));
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> result.get(5, TimeUnit.SECONDS));
+            assertInstanceOf(SocketTimeoutException.class, failure.getCause());
+            assertEquals("Socket operation exceeded 10 seconds", failure.getCause().getMessage());
+            assertTrue(interrupted.await(5, TimeUnit.SECONDS), "the timed out operation must be interrupted");
+            assertTrue(exited.await(5, TimeUnit.SECONDS));
+            assertEquals(1, exits.get());
+        } finally {
+            never.countDown();
+            caller.join(5000);
+            assertFalse(caller.isAlive());
+        }
+    }
+
+    @Test
+    void anOperationThatFinishesOneNanosecondBeforeTheDeadlineReturnsItsResult() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        CountDownLatch started = new CountDownLatch(1);
+        CompletableFuture<String> answer = new CompletableFuture<>();
+        AtomicInteger exits = new AtomicInteger();
+        FutureTask<String> result = new FutureTask<>(() -> SocketDeadline.call(10, () -> {
+            started.countDown();
+            return answer.get();
+        }, exits::incrementAndGet, waits));
+        Thread caller = Thread.ofVirtual().start(result);
+        try {
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            waits.awaitWaiting(1);
+            time.advance(Duration.ofSeconds(10).minusNanos(1));
+            assertFalse(result.isDone());
+
+            answer.complete("healthy");
+
+            assertEquals("healthy", result.get(5, TimeUnit.SECONDS));
+            assertEquals(1, exits.get());
+            assertEquals(0, time.pendingTasks(), "a finished call must leave no deadline behind");
+        } finally {
+            answer.complete("healthy");
+            caller.join(5000);
+            assertFalse(caller.isAlive());
+        }
     }
 }

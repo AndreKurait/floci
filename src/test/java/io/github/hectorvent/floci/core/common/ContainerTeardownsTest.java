@@ -1,9 +1,12 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.testing.TestTime;
+import io.github.hectorvent.floci.testing.TimelineDeadlineWaits;
 import jakarta.enterprise.inject.Instance;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -17,8 +20,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ContainerTeardownsTest {
@@ -99,5 +107,144 @@ class ContainerTeardownsTest {
         ContainerTeardowns.stopInParallel(List.of(1, 2),
                 ignored -> attempts.incrementAndGet(), LOG, System.nanoTime() - 1);
         assertEquals(0, attempts.get());
+    }
+
+    @Test
+    void stopsStillRunningAtTheFifteenSecondDeadlineAreInterruptedAndReported() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        Logger log = mock(Logger.class);
+        HeldStops stops = new HeldStops(3);
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> drain = caller.submit(
+                    () -> ContainerTeardowns.stopInParallel(List.of(0, 1, 2), stops::stop, log, waits));
+            stops.awaitStarted();
+            waits.awaitWaiting(1);
+
+            time.advance(Duration.ofSeconds(15).minusNanos(1));
+            assertFalse(drain.isDone(), "the drain gave up before its fifteen seconds had passed");
+            assertEquals(1, waits.waiting());
+            assertEquals(Set.of(), stops.interrupted);
+
+            time.advance(Duration.ofNanos(1));
+            drain.get(5, TimeUnit.SECONDS);
+            stops.awaitInterrupted();
+            assertEquals(Set.of(0, 1, 2), stops.interrupted);
+            verify(log, times(3)).warn("Container drain did not finish before the shared deadline");
+        } finally {
+            stops.release();
+            caller.shutdownNow();
+        }
+    }
+
+    @Test
+    void stopsThatFinishOneNanosecondBeforeTheDeadlineAreNotReported() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        Logger log = mock(Logger.class);
+        HeldStops stops = new HeldStops(3);
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> drain = caller.submit(
+                    () -> ContainerTeardowns.stopInParallel(List.of(0, 1, 2), stops::stop, log, waits));
+            stops.awaitStarted();
+            waits.awaitWaiting(1);
+            time.advance(Duration.ofSeconds(15).minusNanos(1));
+
+            stops.release();
+            drain.get(5, TimeUnit.SECONDS);
+
+            assertEquals(Set.of(0, 1, 2), stops.finished);
+            assertEquals(Set.of(), stops.interrupted);
+            verify(log, never()).warn(any());
+            assertEquals(0, time.pendingTasks(), "a finished drain must leave no deadline behind");
+        } finally {
+            stops.release();
+            caller.shutdownNow();
+        }
+    }
+
+    @Test
+    void aSharedDeadlineIsNotRestartedByTheTimeAlreadySpent() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        Logger log = mock(Logger.class);
+        HeldStops stops = new HeldStops(1);
+        long deadline = waits.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        time.advance(Duration.ofSeconds(2));
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> drain = caller.submit(
+                    () -> ContainerTeardowns.stopInParallel(List.of(0), stops::stop, log, deadline, waits));
+            stops.awaitStarted();
+            waits.awaitWaiting(1);
+
+            time.advance(Duration.ofSeconds(3).minusNanos(1));
+            assertFalse(drain.isDone());
+            assertEquals(Set.of(), stops.interrupted);
+
+            time.advance(Duration.ofNanos(1));
+            drain.get(5, TimeUnit.SECONDS);
+            stops.awaitInterrupted();
+            verify(log).warn("Container drain did not finish before the shared deadline");
+        } finally {
+            stops.release();
+            caller.shutdownNow();
+        }
+    }
+
+    @Test
+    void aDeadlineOneNanosecondAwayStillStartsEveryStopAndAnExpiredOneStartsNone() {
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        Logger log = mock(Logger.class);
+        Set<Integer> attempted = ConcurrentHashMap.newKeySet();
+
+        ContainerTeardowns.stopInParallel(List.of(1, 2), attempted::add, log, waits.nanoTime() + 1, waits);
+        assertEquals(Set.of(1, 2), attempted);
+        verify(log, never()).warnv(any(String.class), any(Object.class));
+
+        attempted.clear();
+        ContainerTeardowns.stopInParallel(List.of(1, 2), attempted::add, log, waits.nanoTime(), waits);
+        assertEquals(Set.of(), attempted);
+        verify(log).warnv("Container drain deadline expired with {0} resource(s) pending", 2);
+    }
+
+    /** Stops that block until released or interrupted, and record which of the two ended them. */
+    private static final class HeldStops {
+        private final CountDownLatch started;
+        private final CountDownLatch interruptions;
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final Set<Integer> finished = ConcurrentHashMap.newKeySet();
+        private final Set<Integer> interrupted = ConcurrentHashMap.newKeySet();
+
+        HeldStops(int count) {
+            this.started = new CountDownLatch(count);
+            this.interruptions = new CountDownLatch(count);
+        }
+
+        void stop(Integer resource) {
+            started.countDown();
+            try {
+                release.await();
+                finished.add(resource);
+            } catch (InterruptedException e) {
+                interrupted.add(resource);
+                interruptions.countDown();
+            }
+        }
+
+        void awaitStarted() throws InterruptedException {
+            assertTrue(started.await(5, TimeUnit.SECONDS), "every stop must start");
+        }
+
+        void awaitInterrupted() throws InterruptedException {
+            assertTrue(interruptions.await(5, TimeUnit.SECONDS), "every unfinished stop must be interrupted");
+        }
+
+        void release() {
+            release.countDown();
+        }
     }
 }

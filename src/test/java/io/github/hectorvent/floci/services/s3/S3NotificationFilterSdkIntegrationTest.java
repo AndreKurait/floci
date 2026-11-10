@@ -113,7 +113,9 @@ class S3NotificationFilterSdkIntegrationTest {
                         event.path("s3").path("object").path("key").asText(), StandardCharsets.UTF_8));
                 assertEquals(uploaded.eTag().replace("\"", ""),
                         event.path("s3").path("object").path("eTag").asText());
-                assertTrue(sqs.receiveMessage(request -> request.queueUrl(queue).waitTimeSeconds(1))
+                // S3 hands an event to the topic, and the topic to the queue, on the upload's own request:
+                // what the rejected keys produced was in the queue before their uploads answered.
+                assertTrue(sqs.receiveMessage(request -> request.queueUrl(queue).waitTimeSeconds(0))
                         .messages().isEmpty(), "Rejected keys must not produce a notification.");
             }
         }
@@ -122,7 +124,7 @@ class S3NotificationFilterSdkIntegrationTest {
     private static JsonNode nextEvent(SqsClient sqs, String queue) throws Exception {
         AtomicReference<Message> found = new AtomicReference<>();
         await().alias("S3 notification after matching the decoded filter")
-                .atMost(Duration.ofSeconds(10)).until(() -> {
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(10)).until(() -> {
                     List<Message> messages = sqs.receiveMessage(request -> request.queueUrl(queue)
                             .maxNumberOfMessages(1).waitTimeSeconds(1)).messages();
                     if (messages.isEmpty()) {

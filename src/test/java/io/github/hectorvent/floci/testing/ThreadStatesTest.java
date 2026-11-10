@@ -19,13 +19,17 @@ class ThreadStatesTest {
 
     @Test
     void awaitBlockedOrDoneFailsWhenFutureWorkerNeverStarts() {
+        TestTime time = TestTime.create();
         FutureTask<Void> task = new FutureTask<>(() -> null);
         try {
             AssertionError failure = assertThrows(AssertionError.class,
-                    () -> ThreadStates.awaitBlockedOrDone(new AtomicReference<>(), task));
+                    () -> ThreadStates.awaitBlockedOrDone(new AtomicReference<>(), task, time::nanoTime,
+                            millis -> time.sleepAdvancing(Duration.ofMillis(millis))));
 
             assertTrue(failure.getMessage().startsWith("worker blocked or finished before timeout"));
             assertFalse(task.isDone());
+            assertEquals(TestTime.DEFAULT_START.plusSeconds(5), time.now(),
+                    "the wait gives up exactly when its five seconds are over");
         } finally {
             task.cancel(false);
         }
