@@ -5,9 +5,9 @@ import io.github.hectorvent.floci.testing.TestTime;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -86,21 +86,19 @@ final class TimelineTimer implements CodeDeployTimer {
     }
 
     /**
-     * Waits on the monitor with no time limit of its own: a task on the timeline notifies the monitor
-     * when the wait is over, so the waiter wakes only when notified or when the test advances that far.
+     * {@code monitor.wait(timeout)} with the timeout on the timeline: the waiter wakes only when
+     * notified or when the test advances to its deadline.
      */
     @Override
     public void waitOn(Object monitor, long nanos) throws InterruptedException {
-        ScheduledFuture<?> wake = time.scheduler().schedule(() -> {
-            synchronized (monitor) {
-                monitor.notifyAll();
-            }
-        }, nanos, TimeUnit.NANOSECONDS);
         try {
-            monitorWaits.release();
-            monitor.wait();
-        } finally {
-            wake.cancel(false);
+            time.within(Duration.ofNanos(nanos), () -> {
+                monitorWaits.release();
+                monitor.wait();
+                return null;
+            });
+        } catch (TimeoutException expired) {
+            // A timed wait returns normally at its deadline; the caller rechecks its condition.
         }
     }
 

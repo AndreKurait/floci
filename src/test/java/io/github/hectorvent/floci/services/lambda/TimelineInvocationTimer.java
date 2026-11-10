@@ -3,8 +3,8 @@ package io.github.hectorvent.floci.services.lambda;
 import io.github.hectorvent.floci.services.lambda.model.InvocationTimer;
 import io.github.hectorvent.floci.testing.TestTime;
 
+import java.time.Duration;
 import java.time.Instant;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
@@ -60,15 +60,7 @@ public final class TimelineInvocationTimer implements InvocationTimer {
     @Override
     public <T> T await(CompletableFuture<T> future, long timeoutMs)
             throws InterruptedException, ExecutionException, TimeoutException {
-        Instant deadline = time.now().plusMillis(timeoutMs);
-        while (!future.isDone() && time.now().isBefore(deadline)) {
-            Optional<Instant> next = time.nextTaskDue().filter(due -> due.isBefore(deadline));
-            advanceTo(next.orElse(deadline));
-        }
-        if (!future.isDone()) {
-            throw new TimeoutException();
-        }
-        return future.get();
+        return time.getAdvancing(future, Duration.ofMillis(timeoutMs));
     }
 
     private void advanceTo(Instant instant) {

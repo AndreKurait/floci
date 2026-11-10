@@ -12,13 +12,8 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -31,8 +26,8 @@ class CfnResourceSignalsTest {
     private final CfnResourceSignals signals = new CfnResourceSignals();
     private final List<String> events = new ArrayList<>();
     private final TestTime time = TestTime.create();
-    private final Semaphore deadlinesSet = new Semaphore(0);
-    private final CfnResourceSignals timed = new CfnResourceSignals(this::getOnTimeline);
+    private final CfnResourceSignals timed = new CfnResourceSignals(
+            (completion, timeoutNanos) -> time.get(completion, Duration.ofNanos(timeoutNanos)));
 
     @Test
     void signalsReceivedDuringProvisioningSurviveUntilTheWaitStarts() throws Exception {
@@ -61,7 +56,7 @@ class CfnResourceSignalsTest {
         FutureTask<String> outcome = startWaiting(pending);
         Instant deadline = time.now().plus(Duration.ofMinutes(15));
         time.advance(Duration.ofMinutes(15).minusNanos(1));
-        assertEquals(Optional.of(deadline), time.nextTaskDue());
+        assertEquals(Optional.of(deadline), time.nextDue());
         assertFalse(outcome.isDone());
 
         time.advance(Duration.ofNanos(1));
@@ -77,7 +72,7 @@ class CfnResourceSignalsTest {
         FutureTask<String> outcome = startWaiting(pending);
         Instant deadline = time.now().plus(Duration.ofMinutes(5));
         time.advance(Duration.ofMinutes(5).minusNanos(1));
-        assertEquals(Optional.of(deadline), time.nextTaskDue());
+        assertEquals(Optional.of(deadline), time.nextDue());
         assertFalse(outcome.isDone());
 
         time.advance(Duration.ofNanos(1));
@@ -95,7 +90,7 @@ class CfnResourceSignalsTest {
         timed.signal("stack", "Compute", "first", "SUCCESS", events::add);
         assertNull(succeeded.get(10, TimeUnit.SECONDS));
         assertEquals(1, events.size());
-        assertEquals(0, time.pendingTasks());
+        assertEquals(0, time.waiters());
         timed.finish("stack", "Compute", onTime);
 
         CfnResourceSignals.Pending late = beginOnTimeline("""
@@ -219,28 +214,7 @@ class CfnResourceSignalsTest {
     private FutureTask<String> startWaiting(CfnResourceSignals.Pending pending) throws InterruptedException {
         FutureTask<String> outcome = new FutureTask<>(pending::await);
         Thread.ofVirtual().name("signal-wait").start(outcome);
-        assertTrue(deadlinesSet.tryAcquire(10, TimeUnit.SECONDS), "the wait never set its deadline");
+        time.awaitWaiters(1);
         return outcome;
-    }
-
-    /**
-     * {@code Future.get(timeout)} with the timeout on the test's timeline: the deadline is a task the
-     * timeline runs, so the wait ends when a signal completes it or the test advances to the deadline.
-     */
-    private String getOnTimeline(CompletableFuture<String> completion, long timeoutNanos)
-            throws InterruptedException, ExecutionException, TimeoutException {
-        CompletableFuture<String> expired = new CompletableFuture<>();
-        ScheduledFuture<?> deadline = time.scheduler().schedule(() -> expired.complete(null),
-                timeoutNanos, TimeUnit.NANOSECONDS);
-        deadlinesSet.release();
-        try {
-            CompletableFuture.anyOf(completion, expired).get();
-        } finally {
-            deadline.cancel(false);
-        }
-        if (completion.isDone()) {
-            return completion.get();
-        }
-        throw new TimeoutException();
     }
 }

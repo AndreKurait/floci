@@ -14,11 +14,13 @@ import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -27,6 +29,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 
 /**
  * Time a test controls: a clock, a scheduler and a sleep that share one timeline, which moves only
@@ -55,14 +58,37 @@ import java.util.concurrent.locks.ReentrantLock;
  * with no delay ({@link #runDue} runs just that). The production code keeps its configured
  * durations; the test decides when they elapse.
  *
- * <p>Timed waits the code makes on its own ({@code Thread.sleep}, {@code poll(timeout)},
- * {@code awaitNanos}) are outside this timeline. Give that code a sleeper or a scheduler to call
- * instead, and pass {@code time::sleep} or {@link #scheduler()}.
+ * <p>Timed waits the code makes on its own ({@code Thread.sleep}, {@code get(timeout)},
+ * {@code poll(timeout)}, {@code awaitNanos}) are outside this timeline. Give that code a seam to call
+ * instead and pass the stand-in:
+ * <ul>
+ *   <li>{@code Thread.sleep} becomes {@link #sleep};</li>
+ *   <li>a delayed or periodic task goes to {@link #scheduler()};</li>
+ *   <li>{@code future.get(timeout)} becomes {@link #get}, {@code queue.poll(timeout)} becomes
+ *       {@link #poll}, and any other timed wait ({@code monitor.wait(timeout)},
+ *       {@code condition.awaitNanos}, {@code latch.await(timeout)}) becomes {@link #within} around
+ *       its untimed form.</li>
+ * </ul>
+ * A thread in one of those waits is released by whatever it waits for, as in production, or by the
+ * {@code advance} that reaches its deadline, which then waits for the thread to come to rest again.
+ *
+ * <p>Code the test calls on its own thread cannot park for an {@code advance} nobody is left to
+ * make: give it {@link #sleepAdvancing} and {@link #getAdvancing}, which move the timeline on
+ * themselves, or step through its work with {@link #advanceUntil}.
  */
 public final class TestTime {
 
     /** Where a timeline starts unless the test says otherwise. */
     public static final Instant DEFAULT_START = Instant.parse("2026-01-01T00:00:00Z");
+
+    /**
+     * A blocking call with no time limit of its own, such as {@code queue::take} or
+     * {@code future::get}, for {@link #within} to bound on the timeline.
+     */
+    @FunctionalInterface
+    public interface BlockingCall<T, X extends Exception> {
+        T call() throws X, InterruptedException;
+    }
 
     private static final Duration DEFAULT_SETTLE_TIMEOUT = Duration.ofSeconds(10);
     /** Keeps {@link #nanoTime} visibly unrelated to the epoch, like {@link System#nanoTime}. */
@@ -156,7 +182,7 @@ public final class TestTime {
         }
         lock.lockInterruptibly();
         try {
-            Sleep sleep = new Sleep(now.plus(duration), nextSequence++, Thread.currentThread());
+            Parked sleep = new Parked(now.plus(duration), nextSequence++, Thread.currentThread(), false);
             queue.add(sleep);
             changed.signalAll();
             try {
@@ -192,6 +218,119 @@ public final class TestTime {
         Objects.requireNonNull(duration, "duration");
         if (!duration.isNegative()) {
             advance(duration);
+        }
+    }
+
+    /**
+     * Runs {@code call}, a blocking call with no time limit of its own, with {@code timeout} measured
+     * on this timeline: the stand-in for any timed wait, such as
+     * {@code within(timeout, () -> condition.await())} for {@code condition.awaitNanos}. Returns what
+     * the call returns if it comes back by itself. If {@link #advance} reaches the deadline first, the
+     * waiting thread is interrupted out of the call and this throws {@link TimeoutException}; the
+     * advance goes on once the thread has parked again or finished. A call that returns just as the
+     * deadline is reached wins. The waiting thread counts among the {@link #waiters}.
+     *
+     * <p>Times out at once, without calling, for a zero or negative timeout. Not for a task the
+     * timeline itself is running, which would stop the timeline: use {@link #getAdvancing} there.
+     */
+    public <T, X extends Exception> T within(Duration timeout, BlockingCall<T, X> call)
+            throws X, InterruptedException, TimeoutException {
+        Objects.requireNonNull(timeout, "timeout");
+        Objects.requireNonNull(call, "call");
+        if (Thread.interrupted()) {
+            throw new InterruptedException();
+        }
+        if (timeout.isZero() || timeout.isNegative()) {
+            throw new TimeoutException();
+        }
+        if (advancing.isHeldByCurrentThread()) {
+            throw new IllegalStateException("a blocking wait inside a task the timeline is running would stop "
+                    + "the timeline; use getAdvancing or advanceUntil");
+        }
+        Parked wait;
+        lock.lockInterruptibly();
+        try {
+            wait = new Parked(now.plus(timeout), nextSequence++, Thread.currentThread(), true);
+            queue.add(wait);
+            changed.signalAll();
+        } finally {
+            lock.unlock();
+        }
+        T result = null;
+        InterruptedException interruption = null;
+        boolean timedOut;
+        try {
+            result = call.call();
+        } catch (InterruptedException e) {
+            interruption = e;
+        } finally {
+            timedOut = leave(wait, interruption != null);
+        }
+        if (interruption == null) {
+            return result;
+        }
+        if (timedOut) {
+            throw new TimeoutException();
+        }
+        throw interruption;
+    }
+
+    /**
+     * {@code future.get(timeout)} with the timeout on this timeline: returns when the future completes,
+     * and throws {@link TimeoutException} when {@link #advance} reaches the deadline first. See
+     * {@link #within}. Called from a task the timeline is running, it is {@link #getAdvancing}.
+     */
+    public <T> T get(Future<T> future, Duration timeout)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        Objects.requireNonNull(future, "future");
+        Objects.requireNonNull(timeout, "timeout");
+        if (future.isDone() || timeout.isZero() || timeout.isNegative()) {
+            return future.get(0, TimeUnit.NANOSECONDS);
+        }
+        if (advancing.isHeldByCurrentThread()) {
+            return getAdvancing(future, timeout);
+        }
+        return this.<T, ExecutionException>within(timeout, future::get);
+    }
+
+    /**
+     * A {@code future.get(timeout)} that passes by itself: moves the timeline on from the calling
+     * thread, one due instant at a time, until the future is done or {@code timeout} has passed, so
+     * the clock stops where the future completed. For code that waits on the test's own thread for
+     * something the timeline's own tasks will complete.
+     */
+    public <T> T getAdvancing(Future<T> future, Duration timeout)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        Objects.requireNonNull(future, "future");
+        Objects.requireNonNull(timeout, "timeout");
+        if (!timeout.isNegative()) {
+            advanceUntil(future::isDone, timeout);
+        }
+        return future.get(0, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * {@code queue.poll(timeout)} with the timeout on this timeline: the next element once there is
+     * one, or {@code null} when {@link #advance} reaches the deadline first. See {@link #within}.
+     */
+    public <T> T poll(BlockingQueue<T> queue, Duration timeout) throws InterruptedException {
+        Objects.requireNonNull(queue, "queue");
+        Objects.requireNonNull(timeout, "timeout");
+        if (Thread.interrupted()) {
+            throw new InterruptedException();
+        }
+        T head = queue.poll();
+        if (head != null || timeout.isZero() || timeout.isNegative()) {
+            return head;
+        }
+        if (advancing.isHeldByCurrentThread()) {
+            advanceUntil(() -> !queue.isEmpty(), timeout);
+            return queue.poll();
+        }
+        try {
+            return this.<T, RuntimeException>within(timeout, queue::take);
+        } catch (TimeoutException expired) {
+            return null;
         }
     }
 
@@ -241,6 +380,38 @@ public final class TestTime {
         advance(Duration.ZERO);
     }
 
+    /**
+     * Moves the timeline on one due instant at a time, running what is due there, until
+     * {@code condition} holds or {@code limit} has passed, whichever comes first. Returns whether the
+     * condition holds, with the clock at the instant it first did, or at the limit.
+     *
+     * <pre>{@code
+     * assertTrue(time.advanceUntil(() -> deployment.state() == BAKING, Duration.ofMinutes(10)));
+     * assertEquals(start.plusSeconds(60), time.now());
+     * }</pre>
+     */
+    public boolean advanceUntil(BooleanSupplier condition, Duration limit) {
+        Objects.requireNonNull(condition, "condition");
+        Objects.requireNonNull(limit, "limit");
+        if (limit.isNegative()) {
+            throw new IllegalArgumentException("time only moves forward, not by " + limit);
+        }
+        advancing.lock();
+        try {
+            Instant deadline = now.plus(limit);
+            while (!condition.getAsBoolean()) {
+                Instant next = nextDue().filter(due -> !due.isAfter(deadline)).orElse(deadline);
+                advanceTo(next.isAfter(now) ? next : now);
+                if (next.equals(deadline)) {
+                    return condition.getAsBoolean();
+                }
+            }
+            return true;
+        } finally {
+            advancing.unlock();
+        }
+    }
+
     /** How many scheduled tasks are waiting for their time, periodic ones counted once. */
     public int pendingTasks() {
         lock.lock();
@@ -262,11 +433,34 @@ public final class TestTime {
         }
     }
 
+    /**
+     * When the next thing on this timeline is due, if anything is waiting: a scheduled task, the end
+     * of a sleep or the deadline of a timed wait.
+     */
+    public Optional<Instant> nextDue() {
+        lock.lock();
+        try {
+            return Optional.ofNullable(queue.peek()).map(entry -> entry.due);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** How many threads are parked in {@link #sleep} right now. */
     public int sleepers() {
         lock.lock();
         try {
-            return sleeperCount();
+            return parkedCount(false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** How many threads are in a timed wait right now: {@link #within}, {@link #get} or {@link #poll}. */
+    public int waiters() {
+        lock.lock();
+        try {
+            return parkedCount(true);
         } finally {
             lock.unlock();
         }
@@ -279,20 +473,33 @@ public final class TestTime {
      * timeout.
      */
     public void awaitSleepers(int count) {
+        awaitParked(count, false, "sleeping");
+    }
+
+    /**
+     * {@link #awaitSleepers} for timed waits: waits, in real time, until at least {@code count}
+     * threads have their deadline on the timeline, so that the advance that follows measures it from
+     * now. Such a thread may not have blocked yet; the deadline reaches it either way.
+     */
+    public void awaitWaiters(int count) {
+        awaitParked(count, true, "waiting");
+    }
+
+    private void awaitParked(int count, boolean timedWaits, String doing) {
         long deadline = System.nanoTime() + settleTimeout.toNanos();
         lock.lock();
         try {
-            while (sleeperCount() < count) {
+            while (parkedCount(timedWaits) < count) {
                 long remaining = deadline - System.nanoTime();
                 if (remaining <= 0) {
-                    throw new AssertionError("expected " + count + " sleeping thread(s) within " + settleTimeout
-                            + ", found " + sleeperCount());
+                    throw new AssertionError("expected " + count + " " + doing + " thread(s) within "
+                            + settleTimeout + ", found " + parkedCount(timedWaits));
                 }
                 changed.awaitNanos(remaining);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted waiting for " + count + " sleeping thread(s)", e);
+            throw new AssertionError("interrupted waiting for " + count + " " + doing + " thread(s)", e);
         } finally {
             lock.unlock();
         }
@@ -300,7 +507,8 @@ public final class TestTime {
 
     /**
      * How long, in real time, {@link #advance} waits for a woken thread to park again or finish, and
-     * {@link #awaitSleepers} for threads to arrive, before failing the test. Ten seconds by default.
+     * {@link #awaitSleepers} and {@link #awaitWaiters} for threads to arrive, before failing the test.
+     * Ten seconds by default.
      */
     public TestTime settleTimeout(Duration timeout) {
         this.settleTimeout = Objects.requireNonNull(timeout, "timeout");
@@ -312,8 +520,9 @@ public final class TestTime {
         return "TestTime[" + now + "]";
     }
 
-    private int sleeperCount() {
-        return (int) queue.stream().filter(entry -> entry instanceof Sleep).count();
+    private int parkedCount(boolean timedWaits) {
+        return (int) queue.stream()
+                .filter(entry -> entry instanceof Parked parked && parked.interrupts == timedWaits).count();
     }
 
     /** Removes the earliest entry due by {@code target} and moves the clock up to it. */
@@ -334,10 +543,30 @@ public final class TestTime {
         }
     }
 
-    private boolean isSleeping(Thread thread) {
+    private boolean isParked(Thread thread) {
         lock.lock();
         try {
-            return queue.stream().anyMatch(entry -> entry instanceof Sleep sleep && sleep.thread == thread);
+            return queue.stream().anyMatch(entry -> entry instanceof Parked parked && parked.thread == thread);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Ends a timed wait and says whether its deadline was reached. A deadline that fired while the
+     * call was returning on its own left an interrupt nobody consumed; it belongs to this wait, so it
+     * is cleared here.
+     */
+    private boolean leave(Parked wait, boolean interruptConsumed) {
+        lock.lock();
+        try {
+            queue.remove(wait);
+            wait.returned = true;
+            changed.signalAll();
+            if (wait.woken && !interruptConsumed) {
+                Thread.interrupted();
+            }
+            return wait.woken;
         } finally {
             lock.unlock();
         }
@@ -356,14 +585,18 @@ public final class TestTime {
         abstract void fire();
     }
 
-    private final class Sleep extends Entry {
+    /** A thread waiting for an instant: asleep in {@link #sleep}, or blocked elsewhere in a timed wait. */
+    private final class Parked extends Entry {
         final Thread thread;
+        /** Whether the thread is blocked outside this class, where only an interrupt reaches it. */
+        final boolean interrupts;
         boolean woken;
         boolean returned;
 
-        Sleep(Instant due, long sequence, Thread thread) {
+        Parked(Instant due, long sequence, Thread thread, boolean interrupts) {
             super(due, sequence);
             this.thread = thread;
+            this.interrupts = interrupts;
         }
 
         /** Wakes the thread, then holds the timeline still until it has stopped running again. */
@@ -373,6 +606,9 @@ public final class TestTime {
             lock.lock();
             try {
                 woken = true;
+                if (interrupts) {
+                    thread.interrupt();
+                }
                 changed.signalAll();
                 while (!returned) {
                     long remaining = deadline - System.nanoTime();
@@ -388,7 +624,7 @@ public final class TestTime {
                 lock.unlock();
             }
             int parkedSamples = 0;
-            while (thread.isAlive() && !isSleeping(thread)) {
+            while (thread.isAlive() && !isParked(thread)) {
                 parkedSamples = ThreadStates.PARKED_OR_DONE.contains(thread.getState()) ? parkedSamples + 1 : 0;
                 if (parkedSamples >= SETTLED_SAMPLES) {
                     return;
@@ -402,7 +638,8 @@ public final class TestTime {
 
         private AssertionError stillRunning() {
             AssertionError error = new AssertionError(thread.getName() + " was still running " + settleTimeout
-                    + " after its sleep ended at " + due + "; it must sleep again, block or finish");
+                    + " after its " + (interrupts ? "timed wait" : "sleep") + " ended at " + due
+                    + "; it must sleep again, block or finish");
             error.setStackTrace(thread.getStackTrace());
             return error;
         }
