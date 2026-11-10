@@ -142,8 +142,8 @@ public class Ec2ContainerManager {
     static final String LABEL_RESOURCE_ID = ContainerStorageHelper.RESOURCE_ID_LABEL;
     static final String LABEL_REGION = ContainerStorageHelper.REGION_LABEL;
 
-    static int containerBridgeIpAttempts = 30;
-    static long containerBridgeIpPollMillis = 500;
+    private static final int CONTAINER_BRIDGE_IP_ATTEMPTS = 30;
+    private static final long CONTAINER_BRIDGE_IP_POLL_MILLIS = 500;
 
     private final Ec2ContainerPause pause;
     private final ContainerBuilder containerBuilder;
@@ -269,6 +269,32 @@ public class Ec2ContainerManager {
         this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver,
                 dockerClient, portAllocator, config, metadataServer, portForwardManager, regionResolver,
                 containerNetworkReachability, vpcNetworkManager, reachableEndpoint, instanceTypeCatalog);
+        this.firewallManager = firewallManager;
+    }
+
+    /** The injected wiring with its pauses on {@code pause}, for tests that own the timeline. */
+    Ec2ContainerManager(ContainerBuilder containerBuilder,
+                        ContainerLifecycleManager lifecycleManager,
+                        ContainerLogStreamer logStreamer,
+                        ContainerDetector containerDetector,
+                        DockerHostResolver dockerHostResolver,
+                        DockerClient dockerClient,
+                        PortAllocator portAllocator,
+                        EmulatorConfig config,
+                        Ec2MetadataServer metadataServer,
+                        Ec2PortForwardManager portForwardManager,
+                        RegionResolver regionResolver,
+                        ContainerNetworkReachability containerNetworkReachability,
+                        VpcNetworkManager vpcNetworkManager,
+                        ContainerReachableEndpoint reachableEndpoint,
+                        SecurityGroupFirewallManager firewallManager,
+                        Ec2InstanceTypeCatalog instanceTypeCatalog,
+                        Ec2ContainerPause pause) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver, dockerClient,
+                portAllocator, config, metadataServer, portForwardManager, regionResolver,
+                containerNetworkReachability, vpcNetworkManager, reachableEndpoint, instanceTypeCatalog,
+                createLaunchExecutor(), createServiceNetworkRetryExecutor(),
+                Duration.ofMinutes(USER_DATA_EXECUTION_TIMEOUT_MINUTES), pause);
         this.firewallManager = firewallManager;
     }
 
@@ -2073,7 +2099,7 @@ public class Ec2ContainerManager {
 
     private String waitForContainerBridgeIp(String containerId, String instanceId, Instance instance)
             throws InterruptedException {
-        for (int i = 0; i < containerBridgeIpAttempts; i++) {
+        for (int i = 0; i < CONTAINER_BRIDGE_IP_ATTEMPTS; i++) {
             if (instance != null && isLaunchCancelled(instance)) {
                 return null;
             }
@@ -2081,7 +2107,7 @@ public class Ec2ContainerManager {
             if (containerIp != null && !containerIp.isBlank()) {
                 return containerIp;
             }
-            pause.pause(containerBridgeIpPollMillis);
+            pause.pause(CONTAINER_BRIDGE_IP_POLL_MILLIS);
         }
         LOG.warnv("Timed out waiting for EC2 instance {0} container {1} bridge IP", instanceId, containerId);
         return null;

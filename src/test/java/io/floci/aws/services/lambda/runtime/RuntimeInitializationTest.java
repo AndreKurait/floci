@@ -81,7 +81,9 @@ class RuntimeInitializationTest {
     @Test
     void runtimeNextBeforeExtensionDiscoveryCannotCompleteInitialization() throws Exception {
         CompletableFuture<HttpResponse<String>> pending = next();
-        await().atMost(Duration.ofSeconds(2)).until(() -> server.waitingContextsSize() == 1);
+        await().atMost(Duration.ofSeconds(2))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> server.waitingContextsSize() == 1);
         assertThrows(TimeoutException.class, () -> server.awaitInitialization(20));
         server.expectExtensions(1);
         String extension = register("example-extension");

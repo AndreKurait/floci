@@ -863,6 +863,7 @@ class RuntimeApiServerTest {
 
         Context dispatchContext = dispatchObserved.get(5, TimeUnit.SECONDS);
         await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(10))
+                .pollDelay(Duration.ZERO)
                 .until(() -> server.pendingQueueSize() == 1 && server.inFlightSize() == 0);
         CompletableFuture<Void> dispatchReturned = new CompletableFuture<>();
         dispatchContext.runOnContext(ignored -> dispatchReturned.complete(null));
@@ -910,6 +911,7 @@ class RuntimeApiServerTest {
         server.enqueue(invocation);
 
         await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(10))
+                .pollDelay(Duration.ZERO)
                 .until(() -> server.pendingQueueSize() == 1 && server.inFlightSize() == 0);
 
         assertEquals(1, server.pendingQueueSize(),
@@ -2326,6 +2328,7 @@ class RuntimeApiServerTest {
             }
 
             await().alias("all concurrent runtime pollers parked").atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                     .until(() -> servers.stream().allMatch(s -> s.waitingContextsSize() == 1));
             for (CompletableFuture<HttpResponse<String>> f : pending) {
                 assertFalse(f.isDone(), "all pollers should be parked, none held on a blocking thread");
@@ -2392,6 +2395,7 @@ class RuntimeApiServerTest {
                         .GET().build(),
                 HttpResponse.BodyHandlers.ofString());
         await().alias("extension poll reached the server").atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .until(() -> server.isExtensionParked(extensionId) || pending.isDone());
         return pending;
     }

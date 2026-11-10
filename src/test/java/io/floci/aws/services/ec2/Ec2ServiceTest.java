@@ -1588,8 +1588,10 @@ class Ec2ServiceTest {
                     deleter.set(Thread.currentThread());
                     service.deleteEgressOnlyInternetGateway(region, eigwId);
                 });
-                Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> deleting.isDone()
-                        || (deleter.get() != null && deleter.get().getState() == Thread.State.BLOCKED));
+                Awaitility.await().atMost(Duration.ofSeconds(5))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> deleting.isDone()
+                                || (deleter.get() != null && deleter.get().getState() == Thread.State.BLOCKED));
                 assertFalse(deleting.isDone(), "delete must take the gateway's tag lock");
             }
             deleting.get(5, TimeUnit.SECONDS);
@@ -2652,8 +2654,10 @@ class Ec2ServiceTest {
                 (associateFirst ? delete : associate).run();
             });
             String secondMethod = associateFirst ? "deleteNetworkInterface" : "associateAddress";
-            Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> second.isDone()
-                    || isBlockedIn(secondWorker.get(), secondMethod, firstWorker.get()));
+            Awaitility.await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> second.isDone()
+                            || isBlockedIn(secondWorker.get(), secondMethod, firstWorker.get()));
             parking.release();
             first.get(10, TimeUnit.SECONDS);
             if (associateFirst) {
@@ -3512,8 +3516,10 @@ class Ec2ServiceTest {
                         service.associateVpcCidrBlock("us-east-1", vpc.getVpcId(), "198.18.0.0/16");
                     }
                 });
-                Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> editing.isDone()
-                        || (editor.get() != null && editor.get().getState() == Thread.State.BLOCKED));
+                Awaitility.await().atMost(Duration.ofSeconds(5))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> editing.isDone()
+                                || (editor.get() != null && editor.get().getState() == Thread.State.BLOCKED));
                 assertFalse(editing.isDone(), "CIDR edits must not mutate the list while subnet validation scans it");
                 resume.countDown();
                 assertEquals("10.1.1.0/24", creating.get(5, TimeUnit.SECONDS).getCidrBlock());
@@ -5707,8 +5713,10 @@ class Ec2ServiceTest {
                 return request.apply(second);
             });
             Awaitility.await("the second request to finish or to wait in storeNewKeyPair")
-                    .atMost(Duration.ofSeconds(30)).until(() -> secondResult.isDone()
-                    || isBlockedIn(secondWorker.get(), "storeNewKeyPair", firstWorker.get()));
+                    .atMost(Duration.ofSeconds(30))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> secondResult.isDone()
+                            || isBlockedIn(secondWorker.get(), "storeNewKeyPair", firstWorker.get()));
             parking.release();
 
             KeyPair stored = firstResult.get(30, TimeUnit.SECONDS);
@@ -5758,8 +5766,10 @@ class Ec2ServiceTest {
                 return service.deleteKeyPair("us-east-1", "retagged", null);
             });
             Awaitility.await("the delete to finish or to wait in deleteKeyPair")
-                    .atMost(Duration.ofSeconds(30)).until(() -> deleting.isDone()
-                    || isBlockedIn(deleteWorker.get(), "deleteKeyPair", tagWorker.get()));
+                    .atMost(Duration.ofSeconds(30))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> deleting.isDone()
+                            || isBlockedIn(deleteWorker.get(), "deleteKeyPair", tagWorker.get()));
             parking.release();
             tagging.get(30, TimeUnit.SECONDS);
 

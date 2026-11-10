@@ -93,11 +93,13 @@ class ElbV2HostHeaderIntegrationTest {
         cleanup.add(() -> elb.deleteListener(r -> r.listenerArn(listener)));
         elb.registerTargets(r -> r.targetGroupArn(group)
                 .targets(TargetDescription.builder().id("127.0.0.1").port(backend.actualPort()).build()));
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            try (Socket socket = new Socket("127.0.0.1", listenerPort)) {
-                assertTrue(socket.isConnected());
-            }
-        });
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    try (Socket socket = new Socket("127.0.0.1", listenerPort)) {
+                        assertTrue(socket.isConnected());
+                    }
+                });
     }
 
     @AfterEach

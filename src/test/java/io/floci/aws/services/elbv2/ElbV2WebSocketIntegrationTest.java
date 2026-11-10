@@ -99,13 +99,15 @@ class ElbV2WebSocketIntegrationTest {
         targetGroupArn = createTargetGroup("websocket-tg", "ip", backend.actualPort());
         registerTarget(targetGroupArn, "127.0.0.1", backend.actualPort());
         listenerArn = createListener(loadBalancerArn, targetGroupArn, LISTENER_PORT);
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> given()
-                .baseUri("http://127.0.0.1")
-                .port(LISTENER_PORT)
-            .when()
-                .get("/")
-            .then()
-                .statusCode(400));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given()
+                        .baseUri("http://127.0.0.1")
+                        .port(LISTENER_PORT)
+                    .when()
+                        .get("/")
+                    .then()
+                        .statusCode(400));
     }
 
     @AfterEach

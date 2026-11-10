@@ -38,6 +38,7 @@ import io.floci.aws.services.lambda.model.LambdaFunction;
 import io.floci.aws.services.lambda.model.LambdaLayerVersion;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServerFactory;
+import io.floci.aws.testing.ThreadStates;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -2539,11 +2540,21 @@ class ContainerLauncherTest {
         fn.setPackageType("Image");
         fn.setImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:latest");
 
-        // Readiness is delayed: awaitExtensionsReady only reports success after a pause, standing
-        // in for extension processes that take a moment to start up and poll for their first event.
+        // Readiness is delayed: awaitExtensionsReady only reports success once the launching thread
+        // has been seen held up on it, standing in for extension processes that take a moment to
+        // start up and poll for their first event. A launch that returned without waiting reaches
+        // the assertion below with readiness still outstanding.
+        Thread launching = Thread.currentThread();
         AtomicBoolean readinessComplete = new AtomicBoolean(false);
         when(runtimeApiServer.awaitExtensionsReady(anyLong())).thenAnswer(inv -> {
-            Thread.sleep(150);
+            CountDownLatch launchHeldUp = new CountDownLatch(1);
+            Thread watcher = new Thread(() -> {
+                ThreadStates.awaitParkedOrDone(launching);
+                launchHeldUp.countDown();
+            });
+            watcher.setDaemon(true);
+            watcher.start();
+            assertTrue(launchHeldUp.await(10, TimeUnit.SECONDS), "launch was never seen waiting on readiness");
             readinessComplete.set(true);
             return true;
         });

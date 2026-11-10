@@ -69,9 +69,11 @@ class ElbV2TraceHeaderIntegrationTest {
         targetGroupArn = createTargetGroup("trace-header-tg", "ip", backend.actualPort());
         registerTarget(targetGroupArn, "127.0.0.1", backend.actualPort());
         listenerArn = createListener(loadBalancerArn, targetGroupArn, listenerPort);
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> given()
-                .baseUri("http://127.0.0.1").port(listenerPort)
-                .get("/").then().statusCode(200));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given()
+                        .baseUri("http://127.0.0.1").port(listenerPort)
+                        .get("/").then().statusCode(200));
     }
 
     @AfterEach

@@ -147,11 +147,13 @@ class ElbV2TcpDataPlaneIntegrationTest {
                 .defaultActions(Action.builder().type(ActionTypeEnum.FORWARD)
                         .targetGroupArn(targetGroupArn).build()))
                 .listeners().getFirst().listenerArn();
-        await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class).untilAsserted(() -> {
-            try (Socket socket = connect(listenerPort)) {
-                assertEquals(listenerPort, socket.getPort());
-            }
-        });
+        await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class)
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    try (Socket socket = connect(listenerPort)) {
+                        assertEquals(listenerPort, socket.getPort());
+                    }
+                });
     }
 
     private void awaitHealthyTarget() {
@@ -163,14 +165,16 @@ class ElbV2TcpDataPlaneIntegrationTest {
     }
 
     private void completeInitialHealthChecks(int expectedTargets) {
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            List<TargetHealthDescription> descriptions = client.describeTargetHealth(
-                    request -> request.targetGroupArn(targetGroupArn)).targetHealthDescriptions();
-            assertEquals(expectedTargets, descriptions.size());
-            assertTrue(descriptions.stream().allMatch(description ->
-                    description.targetHealth().state() == TargetHealthStateEnum.HEALTHY
-                            || "Elb.InitialHealthChecking".equals(description.targetHealth().reasonAsString())));
-        });
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    List<TargetHealthDescription> descriptions = client.describeTargetHealth(
+                            request -> request.targetGroupArn(targetGroupArn)).targetHealthDescriptions();
+                    assertEquals(expectedTargets, descriptions.size());
+                    assertTrue(descriptions.stream().allMatch(description ->
+                            description.targetHealth().state() == TargetHealthStateEnum.HEALTHY
+                                    || "Elb.InitialHealthChecking".equals(description.targetHealth().reasonAsString())));
+                });
         // Keep the real network probes and threshold, without waiting for the periodic timer.
         healthChecker.probeAll(targetGroupArn, service.getTargetGroup("us-east-1", targetGroupArn));
     }
@@ -321,11 +325,13 @@ class ElbV2TcpDataPlaneIntegrationTest {
             listenerPort = reservation.getLocalPort();
         }
         client.modifyListener(request -> request.listenerArn(listenerArn).port(listenerPort));
-        await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class).untilAsserted(() -> {
-            try (Socket socket = connect(listenerPort)) {
-                assertEcho(socket, new byte[]{0, 7, (byte) 0xff});
-            }
-        });
+        await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class)
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    try (Socket socket = connect(listenerPort)) {
+                        assertEcho(socket, new byte[]{0, 7, (byte) 0xff});
+                    }
+                });
         assertPortReleased(oldPort);
     }
 
@@ -385,16 +391,18 @@ class ElbV2TcpDataPlaneIntegrationTest {
             client.deleteListener(request -> request.listenerArn(listenerArn));
             listenerArn = null;
 
-            await().atMost(Duration.ofSeconds(5)).ignoreExceptions().untilAsserted(() -> {
-                try (Socket socket = connect(listenerPort)) {
-                    socket.setSoTimeout(2000);
-                    socket.getOutputStream().write(("GET / HTTP/1.1\r\nHost: " + other.dnsName()
-                            + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
-                    String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
-                    assertTrue(response.startsWith("HTTP/1.1 200"), response);
-                    assertTrue(response.endsWith("parked"), response);
-                }
-            });
+            await().atMost(Duration.ofSeconds(5)).ignoreExceptions()
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        try (Socket socket = connect(listenerPort)) {
+                            socket.setSoTimeout(2000);
+                            socket.getOutputStream().write(("GET / HTTP/1.1\r\nHost: " + other.dnsName()
+                                    + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+                            String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
+                            assertTrue(response.startsWith("HTTP/1.1 200"), response);
+                            assertTrue(response.endsWith("parked"), response);
+                        }
+                    });
         } finally {
             client.deleteLoadBalancer(request -> request.loadBalancerArn(other.loadBalancerArn()));
         }
@@ -425,20 +433,22 @@ class ElbV2TcpDataPlaneIntegrationTest {
                     .loadBalancerArn(other.loadBalancerArn())).listeners().getFirst().listenerArn());
             occupied.close();
 
-            await().atMost(Duration.ofSeconds(5)).ignoreExceptions().untilAsserted(() -> {
-                try (Socket socket = connect(port)) {
-                    if (protocol == ProtocolEnum.TCP) {
-                        assertEcho(socket, new byte[]{0, 9, 13, 10});
-                    } else {
-                        socket.setSoTimeout(2000);
-                        socket.getOutputStream().write(("GET / HTTP/1.1\r\nHost: " + other.dnsName()
-                                + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
-                        String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
-                        assertTrue(response.startsWith("HTTP/1.1 200"), response);
-                        assertTrue(response.endsWith("recovered"), response);
-                    }
-                }
-            });
+            await().atMost(Duration.ofSeconds(5)).ignoreExceptions()
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        try (Socket socket = connect(port)) {
+                            if (protocol == ProtocolEnum.TCP) {
+                                assertEcho(socket, new byte[]{0, 9, 13, 10});
+                            } else {
+                                socket.setSoTimeout(2000);
+                                socket.getOutputStream().write(("GET / HTTP/1.1\r\nHost: " + other.dnsName()
+                                        + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+                                String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
+                                assertTrue(response.startsWith("HTTP/1.1 200"), response);
+                                assertTrue(response.endsWith("recovered"), response);
+                            }
+                        }
+                    });
         } finally {
             client.deleteLoadBalancer(request -> request.loadBalancerArn(other.loadBalancerArn()));
         }
@@ -457,12 +467,14 @@ class ElbV2TcpDataPlaneIntegrationTest {
             client.registerTargets(request -> request.targetGroupArn(targetGroupArn).targets(TargetDescription.builder()
                     .id("127.0.0.1").port(second.actualPort()).build()));
             completeInitialHealthChecks(2);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
-                List<TargetHealthStateEnum> states = client.describeTargetHealth(request -> request
-                                .targetGroupArn(targetGroupArn)).targetHealthDescriptions().stream()
-                        .map(description -> description.targetHealth().state()).toList();
-                assertEquals(List.of(TargetHealthStateEnum.HEALTHY, TargetHealthStateEnum.HEALTHY), states);
-            });
+            await().atMost(Duration.ofSeconds(15))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        List<TargetHealthStateEnum> states = client.describeTargetHealth(request -> request
+                                        .targetGroupArn(targetGroupArn)).targetHealthDescriptions().stream()
+                                .map(description -> description.targetHealth().state()).toList();
+                        assertEquals(List.of(TargetHealthStateEnum.HEALTHY, TargetHealthStateEnum.HEALTHY), states);
+                    });
             Set<Integer> replies = new HashSet<>();
             for (int index = 0; index < 2; index++) {
                 try (Socket socket = connect(listenerPort)) {

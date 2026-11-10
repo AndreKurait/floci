@@ -68,11 +68,7 @@ public class SqsEventSourcePoller implements Resettable {
     private final ConcurrentHashMap<String, PendingBatch> pendingBatches = new ConcurrentHashMap<>();
     // Wall clock for the batching-window deadline; overridable so tests can advance it without sleeping.
     private volatile LongSupplier clockMs = System::currentTimeMillis;
-    private final ExecutorService pollExecutor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "esm-poller");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService pollExecutor;
 
     @Inject
     public SqsEventSourcePoller(Vertx vertx, SqsService sqsService,
@@ -81,6 +77,18 @@ public class SqsEventSourcePoller implements Resettable {
                                 EsmStore esmStore, EmulatorConfig config,
                                 ObjectMapper objectMapper,
                                 PipesFilterMatcher filterMatcher) {
+        this(vertx, sqsService, executorService, targetResolver, esmStore, config, objectMapper,
+                filterMatcher, newPollExecutor());
+    }
+
+    /** Test seam: {@code pollExecutor} runs the polls, so a test can run them inline. */
+    SqsEventSourcePoller(Vertx vertx, SqsService sqsService,
+                         LambdaExecutorService executorService,
+                         LambdaTargetResolver targetResolver,
+                         EsmStore esmStore, EmulatorConfig config,
+                         ObjectMapper objectMapper,
+                         PipesFilterMatcher filterMatcher,
+                         ExecutorService pollExecutor) {
         this.vertx = vertx;
         this.sqsService = sqsService;
         this.executorService = executorService;
@@ -91,6 +99,15 @@ public class SqsEventSourcePoller implements Resettable {
         this.baseUrl = config.effectiveBaseUrl();
         this.objectMapper = objectMapper;
         this.filterMatcher = filterMatcher;
+        this.pollExecutor = pollExecutor;
+    }
+
+    private static ExecutorService newPollExecutor() {
+        return Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "esm-poller");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public void startPersistedPollers() {
