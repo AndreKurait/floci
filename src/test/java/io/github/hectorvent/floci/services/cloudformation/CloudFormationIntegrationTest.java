@@ -7611,21 +7611,15 @@ class CloudFormationIntegrationTest {
             .formParam("TemplateBody", parentTemplate)
         .when().post("/").then().statusCode(200);
 
-        String xml = null;
-        long deadline = System.currentTimeMillis() + 20_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = given()
+        String xml = CfnStackWaits.lastStateWithin(Duration.ofSeconds(20), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackName)
             .when().post("/")
             .then().statusCode(200)
-            .extract().asString();
-            if (xml.contains("<StackStatus>ROLLBACK_COMPLETE</StackStatus>")
-                    || xml.contains("<StackStatus>CREATE_COMPLETE</StackStatus>")) {
-                break;
-            }
-        }
+            .extract().asString(),
+                state -> state.contains("<StackStatus>ROLLBACK_COMPLETE</StackStatus>")
+                        || state.contains("<StackStatus>CREATE_COMPLETE</StackStatus>"));
 
         assertThat(xml, containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
         assertThat(xml, not(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>")));
