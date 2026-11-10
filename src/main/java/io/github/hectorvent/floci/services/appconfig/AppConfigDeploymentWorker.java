@@ -17,12 +17,17 @@ import java.util.concurrent.TimeUnit;
 public class AppConfigDeploymentWorker {
     private static final Logger LOG = Logger.getLogger(AppConfigDeploymentWorker.class);
     private final AppConfigService service;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
-            task -> new Thread(task, "appconfig-deployment-monitor"));
+    private final ScheduledExecutorService scheduler;
 
     @Inject
     public AppConfigDeploymentWorker(AppConfigService service) {
+        this(service, Executors.newSingleThreadScheduledExecutor(
+                task -> new Thread(task, "appconfig-deployment-monitor")));
+    }
+
+    AppConfigDeploymentWorker(AppConfigService service, ScheduledExecutorService scheduler) {
         this.service = service;
+        this.scheduler = scheduler;
     }
 
     @PostConstruct
