@@ -3,6 +3,7 @@ package io.floci.aws.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
 import io.floci.aws.services.apigateway.AuthorizerPolicyEvaluator;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
 import io.floci.aws.services.apigatewayv2.AuthorizerPolicyFixtures;
@@ -92,7 +93,8 @@ class WebSocketAuthorizerPolicyTest {
                     return new InvokeResult(200, null, payload.getBytes(StandardCharsets.UTF_8), null, "request");
                 });
         WebSocketAuthorizerService service = new WebSocketAuthorizerService(gateway, lambda, builder, mapper,
-                new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)));
+                new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)),
+                mock(ServiceCallAuthorizer.class), builder.regionResolver);
         WebSocketAuthorizerService.AuthorizerResult result = service.invokeAndEvaluate("us-east-1", "api", "test", "auth",
                 "connection", 0, Map.of(), Map.of(), sourceIp, secureTransport, "agent", Map.of());
         assertEquals(expectedStatus, result.statusCode());

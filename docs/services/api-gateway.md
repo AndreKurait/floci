@@ -1223,3 +1223,11 @@ normalized OpenAPI plan as the importer, including YAML and ANY-method operation
 creating or replacing API resources. Caller credentials, omitted or null credentials, HTTP
 integration credentials and JWT authorizer fields do not pass an execution role. This check
 does not add OpenAPI reference resolution or AWS-variable substitution beyond the existing importer.
+are not an authorizer credential mode. WebSocket role enforcement and live
+
+WebSocket REQUEST authorizers without `authorizerCredentialsArn` check the Lambda
+resource policy when IAM enforcement is enabled. The check uses the API account,
+the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns the existing authorizer
+configuration error before invocation. Configured authorizer roles retain their
+separate execution path; this check does not implement role assumption.
