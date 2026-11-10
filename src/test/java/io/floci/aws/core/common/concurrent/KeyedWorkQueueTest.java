@@ -13,6 +13,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
@@ -177,6 +178,49 @@ class KeyedWorkQueueTest {
             assertEquals(0, queue.snapshot().keys());
         } finally {
             queue.close();
+        }
+    }
+
+    @Test
+    void closeBeforeAdmissionDoesNotCountUnprocessedWork() {
+        AtomicInteger runs = new AtomicInteger();
+        try (KeyedWorkQueue<String> queue = new KeyedWorkQueue<>("before-admission", 1, 2,
+                key -> runs.incrementAndGet())) {
+            synchronized (queue) {
+                assertTrue(queue.submit("first"));
+                assertEquals(1, queue.snapshot().active());
+                queue.close();
+            }
+            await().atMost(Duration.ofSeconds(2)).until(() -> queue.snapshot().active() == 0);
+            assertEquals(0, runs.get());
+            assertEquals(0, queue.snapshot().keys());
+            assertEquals(0, queue.snapshot().completed());
+            assertEquals(0, queue.snapshot().failures());
+        }
+    }
+
+    @Test
+    void errorCountsFailureAndPropagatesWithoutStrandingQueuedWork() {
+        AssertionError failure = new AssertionError("expected worker error");
+        AtomicReference<Throwable> uncaught = new AtomicReference<>();
+        AtomicInteger runs = new AtomicInteger();
+        try (KeyedWorkQueue<String> queue = new KeyedWorkQueue<>("error-test", 1, 2, key -> {
+            if (runs.incrementAndGet() == 1) {
+                Thread.currentThread().setUncaughtExceptionHandler((thread, thrown) -> uncaught.set(thrown));
+                throw failure;
+            }
+        })) {
+            synchronized (queue) {
+                assertTrue(queue.submit("first"));
+                assertTrue(queue.submit("second"));
+            }
+            await().atMost(Duration.ofSeconds(2)).until(() -> queue.snapshot().completed() == 2);
+            await().atMost(Duration.ofSeconds(2)).until(() -> uncaught.get() != null);
+            assertSame(failure, uncaught.get());
+            assertEquals(2, runs.get());
+            assertEquals(0, queue.snapshot().active());
+            assertEquals(0, queue.snapshot().keys());
+            assertEquals(1, queue.snapshot().failures());
         }
     }
 
