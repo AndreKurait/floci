@@ -678,7 +678,8 @@ class ElbV2ListenerOwnershipTest {
             plane.elbV2Service = mock(ElbV2Service.class);
             LoadBalancer balancer = new LoadBalancer();
             balancer.setDnsName(HOST);
-            when(plane.elbV2Service.getLoadBalancer(eq(REGION), anyString())).thenReturn(balancer);
+            when(plane.elbV2Service.getLoadBalancerForListener(eq(REGION), anyString(), anyString()))
+                    .thenReturn(balancer);
             plane.certificateResolver = mock(CertificateReferenceResolver.class);
             CertificateGenerator.GeneratedCertificate pair = new CertificateGenerator().generateSelfSignedCertificate(
                     HOST, List.of(), KeyAlgorithm.RSA_2048);

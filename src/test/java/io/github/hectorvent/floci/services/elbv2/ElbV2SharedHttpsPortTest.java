@@ -70,7 +70,8 @@ class ElbV2SharedHttpsPortTest {
         Listener listener = listener(443);
         LoadBalancer loadBalancer = new LoadBalancer();
         loadBalancer.setDnsName("alb.example.test");
-        when(plane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn())).thenReturn(loadBalancer);
+        when(plane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn())).thenReturn(loadBalancer);
         GeneratedCertificate certificate = new CertificateGenerator().generateSelfSignedCertificate(
                 "service.example.test", List.of(), KeyAlgorithm.RSA_2048);
         when(plane.certificateResolver.publishedMaterial(
@@ -144,7 +145,8 @@ class ElbV2SharedHttpsPortTest {
                 Listener listener = listener(sharedPort);
                 LoadBalancer loadBalancer = new LoadBalancer();
                 loadBalancer.setDnsName("alb.example.test");
-                when(plane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+                when(plane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                         .thenReturn(loadBalancer);
                 when(plane.certificateResolver.publishedMaterial(
                         listener.getListenerArn(), "us-west-2", listener.getCertificates().getFirst()))
