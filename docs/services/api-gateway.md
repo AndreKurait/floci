@@ -1231,3 +1231,5 @@ the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
 qualified Lambda target. Missing permission returns the existing authorizer
 configuration error before invocation. Configured authorizer roles retain their
 separate execution path; this check does not implement role assumption.
+
+WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
