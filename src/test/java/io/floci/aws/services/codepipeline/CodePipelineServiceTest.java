@@ -47,11 +47,13 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -63,15 +65,27 @@ class CodePipelineServiceTest {
 
     private static final String REGION = "us-east-1";
     private static final String ACCOUNT = "000000000000";
+    private static final String LAMBDA_ACTION = """
+            {"name":"Invoke","actionTypeId":{"category":"Invoke","owner":"AWS","provider":"Lambda","version":"1"},
+             "configuration":{"FunctionName":"function"}}
+            """;
+    private static final String CODEDEPLOY_ACTION = """
+            {"name":"Deploy","actionTypeId":{"category":"Deploy","owner":"AWS","provider":"CodeDeploy","version":"1"},
+             "configuration":{"ApplicationName":"application","DeploymentGroupName":"deployment-group"}}
+            """;
+    // Epoch seconds the wall clock cannot return.
+    private static final double BEFORE_ABANDON = 1.0;
+    private static final double ABANDONED_AT = 2.0;
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final CapturingStorageFactory storage = new CapturingStorageFactory();
+    private final LambdaService lambdaService = mock(LambdaService.class);
     private final CodePipelineService service = new CodePipelineService(
             storage,
             mapper,
             mock(CodeBuildService.class),
             mock(CodeDeployService.class),
-            mock(LambdaService.class),
+            lambdaService,
             mock(S3Service.class), configWithPollInterval(500L));
 
     @Test
@@ -1202,6 +1216,7 @@ class CodePipelineServiceTest {
             queued.get(5, TimeUnit.SECONDS);
             assertTrue(execution.getActionExecutions().isEmpty(), "No provider may be admitted after stop");
             assertEquals("Stopping", execution.getStatus());
+            verify(lambdaService, never()).invoke(anyString(), anyString(), any(), any());
         } finally {
             service.shutdown();
         }
@@ -1210,22 +1225,10 @@ class CodePipelineServiceTest {
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void lateProviderCompletionCannotOverwriteAbandonedAction(boolean fails) throws Exception {
-        LambdaService lambdaService = mock(LambdaService.class);
         CountDownLatch providerEntered = new CountDownLatch(1);
         CountDownLatch releaseProvider = new CountDownLatch(1);
-        when(lambdaService.invoke(anyString(), anyString(), any(), any())).thenAnswer(invocation -> {
-            providerEntered.countDown();
-            if (!releaseProvider.await(5, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("Provider was not released");
-            }
-            if (fails) {
-                throw new IllegalStateException("late provider failure");
-            }
-            return new InvokeResult(200, null, new byte[0], null, "request");
-        });
-        CodePipelineService pipelineService = new CodePipelineService(storage, mapper,
-                mock(CodeBuildService.class), mock(CodeDeployService.class), lambdaService,
-                mock(S3Service.class), configWithPollInterval(500L));
+        CodePipelineService pipelineService = serviceOnSharedStorage(mock(CodeDeployService.class),
+                blockingLambda(providerEntered, releaseProvider, fails));
         String pipeline = "abandon-before-provider-completion";
         String executionId = "running-execution";
         try (ExecutorService workers = Executors.newSingleThreadExecutor()) {
@@ -1239,14 +1242,23 @@ class CodePipelineServiceTest {
                     pipelineService.runAction(new CodePipelinePipeline(), execution, "External", action));
             try {
                 assertTrue(providerEntered.await(5, TimeUnit.SECONDS));
-                stopExecution(pipelineService, pipeline, executionId, true);
                 ActionExecution state = execution.getActionExecutions().getFirst();
-                Double abandonedAt = state.getLastUpdateTime();
+                // The service clock has millisecond resolution, so a late rewrite could repeat a
+                // real timestamp. Pin values it cannot produce instead of sleeping between writes.
+                synchronized (execution) {
+                    state.setLastUpdateTime(BEFORE_ABANDON);
+                }
+                stopExecution(pipelineService, pipeline, executionId, true);
+                synchronized (execution) {
+                    assertNotEquals(BEFORE_ABANDON, state.getLastUpdateTime(), "Abandon stamps the action");
+                    state.setLastUpdateTime(ABANDONED_AT);
+                }
                 releaseProvider.countDown();
                 running.get(5, TimeUnit.SECONDS);
                 assertEquals("Abandoned", state.getStatus());
                 assertEquals("Action abandoned.", state.getSummary());
-                assertEquals(abandonedAt, state.getLastUpdateTime());
+                assertNull(state.getErrorDetails());
+                assertEquals(ABANDONED_AT, state.getLastUpdateTime());
                 assertEquals("Stopping", execution.getStatus());
             } finally {
                 releaseProvider.countDown();
@@ -1255,6 +1267,186 @@ class CodePipelineServiceTest {
             pipelineService.shutdown();
             service.shutdown();
         }
+    }
+
+    @Test
+    void lateProviderFailureDuringStopAndWaitFailsTheActionButNotTheExecution() throws Exception {
+        CountDownLatch providerEntered = new CountDownLatch(1);
+        CountDownLatch releaseProvider = new CountDownLatch(1);
+        CodePipelineService pipelineService = serviceOnSharedStorage(mock(CodeDeployService.class),
+                blockingLambda(providerEntered, releaseProvider, true));
+        String pipeline = "stop-and-wait-before-provider-failure";
+        String executionId = "running-execution";
+        try (ExecutorService workers = Executors.newSingleThreadExecutor()) {
+            JsonNode action = mapper.readTree(LAMBDA_ACTION);
+            createExternalActionPipeline(pipelineService, pipeline, LAMBDA_ACTION);
+            CodePipelineExecution execution = waitingExecution(storage, pipeline, executionId, 1, "External");
+            Future<?> running = workers.submit(() ->
+                    pipelineService.runAction(new CodePipelinePipeline(), execution, "External", action));
+            try {
+                assertTrue(providerEntered.await(5, TimeUnit.SECONDS));
+                stopExecution(pipelineService, pipeline, executionId, false);
+                ActionExecution state = execution.getActionExecutions().getFirst();
+                assertEquals("InProgress", state.getStatus(), "Stop and wait lets the action finish");
+                releaseProvider.countDown();
+                running.get(5, TimeUnit.SECONDS);
+                assertEquals("Failed", state.getStatus());
+                assertEquals("late provider failure", state.getSummary());
+                assertEquals("ActionExecutionFailed", state.getErrorDetails().get("code"));
+                assertEquals("Stopping", execution.getStatus());
+                assertEquals("Stop requested.", execution.getStatusSummary());
+            } finally {
+                releaseProvider.countDown();
+            }
+        } finally {
+            pipelineService.shutdown();
+            service.shutdown();
+        }
+    }
+
+    @Test
+    void stopAndWaitAfterAbandonCannotReviveAnAbandonedAction() throws Exception {
+        CodeDeployService codeDeployService = mock(CodeDeployService.class);
+        CountDownLatch pollEntered = new CountDownLatch(1);
+        CountDownLatch releasePoll = new CountDownLatch(1);
+        when(codeDeployService.createDeployment(anyString(), anyString(), anyString(),
+                any(), any(), anyString())).thenReturn("deployment-1");
+        when(codeDeployService.getDeployment(anyString(), anyString()))
+                .thenReturn(deployment("InProgress"))
+                .thenAnswer(invocation -> {
+                    pollEntered.countDown();
+                    if (!releasePoll.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Poll was not released");
+                    }
+                    return deployment("Failed");
+                });
+        CodePipelineService pipelineService = serviceOnSharedStorage(codeDeployService, mock(LambdaService.class));
+        String pipeline = "stop-and-wait-after-abandon";
+        String executionId = "running-execution";
+        try (ExecutorService workers = Executors.newSingleThreadExecutor()) {
+            JsonNode action = mapper.readTree(CODEDEPLOY_ACTION);
+            createExternalActionPipeline(pipelineService, pipeline, CODEDEPLOY_ACTION);
+            CodePipelineExecution execution = waitingExecution(storage, pipeline, executionId, 1, "External");
+            Future<?> running = workers.submit(() ->
+                    pipelineService.runAction(new CodePipelinePipeline(), execution, "External", action));
+            try {
+                // The worker is inside a poll, so it observes neither stop until the deployment has failed.
+                assertTrue(pollEntered.await(5, TimeUnit.SECONDS));
+                stopExecution(pipelineService, pipeline, executionId, true);
+                stopExecution(pipelineService, pipeline, executionId, false);
+                assertTrue(execution.isAbandon(), "A stop and wait cannot downgrade an abandon");
+                releasePoll.countDown();
+                running.get(5, TimeUnit.SECONDS);
+                ActionExecution state = execution.getActionExecutions().getFirst();
+                assertEquals("Abandoned", state.getStatus());
+                assertEquals("Action abandoned.", state.getSummary());
+                assertNull(state.getErrorDetails());
+                assertEquals("Stopping", execution.getStatus());
+            } finally {
+                releasePoll.countDown();
+            }
+        } finally {
+            pipelineService.shutdown();
+            service.shutdown();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void stopAfterTheLastAbandonCheckStillDecidesALateExternalFailure(boolean abandon) throws Exception {
+        CodeDeployService codeDeployService = mock(CodeDeployService.class);
+        CodePipelineService pipelineService = serviceOnSharedStorage(codeDeployService, mock(LambdaService.class));
+        String pipeline = "stop-before-external-failure-is-recorded";
+        String executionId = "running-execution";
+        Deployment failed = mock(Deployment.class);
+        AtomicInteger statusReads = new AtomicInteger();
+        // The first read ends the poll loop. The second follows the last abandon check, so a stop
+        // issued there reaches only the failure handling.
+        when(failed.getStatus()).thenAnswer(invocation -> {
+            if (statusReads.incrementAndGet() == 2) {
+                stopExecution(pipelineService, pipeline, executionId, abandon);
+            }
+            return "Failed";
+        });
+        when(codeDeployService.createDeployment(anyString(), anyString(), anyString(),
+                any(), any(), anyString())).thenReturn("deployment-1");
+        when(codeDeployService.getDeployment(anyString(), anyString())).thenReturn(failed);
+        try {
+            createExternalActionPipeline(pipelineService, pipeline, CODEDEPLOY_ACTION);
+            CodePipelineExecution execution = waitingExecution(storage, pipeline, executionId, 1, "External");
+
+            pipelineService.runAction(new CodePipelinePipeline(), execution, "External",
+                    mapper.readTree(CODEDEPLOY_ACTION));
+
+            assertTrue(execution.isStopRequested(), "The stop must have been issued inside the provider");
+            ActionExecution state = execution.getActionExecutions().getFirst();
+            if (abandon) {
+                assertEquals("Abandoned", state.getStatus());
+                assertEquals("Action abandoned.", state.getSummary());
+                assertNull(state.getErrorDetails());
+            } else {
+                assertEquals("Failed", state.getStatus());
+                assertEquals("CodeDeploy deployment finished with Failed", state.getSummary());
+                assertEquals("ActionExecutionFailed", state.getErrorDetails().get("code"));
+            }
+            assertEquals("Stopping", execution.getStatus());
+            assertEquals("Stop requested.", execution.getStatusSummary());
+        } finally {
+            pipelineService.shutdown();
+            service.shutdown();
+        }
+    }
+
+    @Test
+    void actionAbandonedBeforeItsProviderStartsNeverLaunchesTheProvider() throws Exception {
+        LambdaService lambda = mock(LambdaService.class);
+        CodePipelineEventPublisher events = mock(CodePipelineEventPublisher.class);
+        CodePipelineService pipelineService = new CodePipelineService(storage, mapper,
+                mock(CodeBuildService.class), mock(CodeDeployService.class), lambda, mock(S3Service.class),
+                events, 500L, 1L, TimeUnit.SECONDS.toNanos(5), () -> { });
+        String pipeline = "abandon-before-provider-launch";
+        String executionId = "admitted-execution";
+        try {
+            createExternalActionPipeline(pipelineService, pipeline, LAMBDA_ACTION);
+            CodePipelineExecution execution = waitingExecution(storage, pipeline, executionId, 1, "External");
+            // STARTED is published after admission and before the provider call.
+            doAnswer(invocation -> {
+                stopExecution(pipelineService, pipeline, executionId, true);
+                return null;
+            }).when(events).actionStateChange(any(), any(), eq("STARTED"));
+
+            pipelineService.runAction(new CodePipelinePipeline(), execution, "External",
+                    mapper.readTree(LAMBDA_ACTION));
+
+            ActionExecution state = execution.getActionExecutions().getFirst();
+            assertEquals("Abandoned", state.getStatus());
+            assertEquals("Action abandoned.", state.getSummary());
+            verify(lambda, never()).invoke(anyString(), anyString(), any(), any());
+            verify(events).actionStateChange(execution, state, "ABANDONED");
+        } finally {
+            pipelineService.shutdown();
+            service.shutdown();
+        }
+    }
+
+    private CodePipelineService serviceOnSharedStorage(CodeDeployService codeDeployService, LambdaService lambda) {
+        return new CodePipelineService(storage, mapper, mock(CodeBuildService.class), codeDeployService,
+                lambda, mock(S3Service.class), configWithPollInterval(500L));
+    }
+
+    private LambdaService blockingLambda(CountDownLatch entered, CountDownLatch release, boolean fails) {
+        LambdaService lambda = mock(LambdaService.class);
+        when(lambda.invoke(anyString(), anyString(), any(), any())).thenAnswer(invocation -> {
+            entered.countDown();
+            if (!release.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Provider was not released");
+            }
+            if (fails) {
+                throw new IllegalStateException("late provider failure");
+            }
+            return new InvokeResult(200, null, new byte[0], null, "request");
+        });
+        return lambda;
     }
 
     @Test

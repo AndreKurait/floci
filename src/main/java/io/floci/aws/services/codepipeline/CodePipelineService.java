@@ -652,7 +652,10 @@ public class CodePipelineService {
             }
             // Admission and stop use the same monitor. A queued action cannot
             // register itself after this stop has traversed the active actions.
-            execution.setAbandon(request.path("abandon").asBoolean(false));
+            // Publish the stop mode before the stop signal. Readers outside the monitor read
+            // stopRequested first, so observing it also observes the matching abandon value.
+            // Abandon only escalates: a later stop-and-wait must not revive abandoned actions.
+            execution.setAbandon(execution.isAbandon() || request.path("abandon").asBoolean(false));
             execution.setStopRequested(true);
             execution.setStatus("Stopping");
             execution.setStatusSummary(request.path("reason").asText("Stop requested."));
@@ -860,22 +863,25 @@ public class CodePipelineService {
             throw new AwsException("InvalidApprovalTokenException", "Approval token is invalid", 400);
         }
 
-        if (!"InProgress".equals(approval.getStatus())) {
-            throw new AwsException("ApprovalAlreadyCompletedException",
-                    "The approval action has already been approved or rejected.", 400);
-        }
+        // Check and decide under the stop monitor so a result cannot replace a concurrent abandon.
+        synchronized (execution) {
+            if (!"InProgress".equals(approval.getStatus())) {
+                throw new AwsException("ApprovalAlreadyCompletedException",
+                        "The approval action has already been approved or rejected.", 400);
+            }
 
-        boolean approved = "Approved".equals(status);
-        approval.setStatus(approved ? "Succeeded" : "Failed");
-        approval.setSummary(summary);
-        approval.setLastUpdateTime(now());
-        if (!approved) {
-            execution.setStatus("Failed");
-            execution.setStatusSummary("Action " + actionName + " failed: " + summary);
-            execution.getStageExecutionStatuses().put(stageName, "Failed");
-            execution.setLastUpdateTime(now());
+            boolean approved = "Approved".equals(status);
+            approval.setStatus(approved ? "Succeeded" : "Failed");
+            approval.setSummary(summary);
+            approval.setLastUpdateTime(now());
+            if (!approved) {
+                execution.setStatus("Failed");
+                execution.setStatusSummary("Action " + actionName + " failed: " + summary);
+                execution.getStageExecutionStatuses().put(stageName, "Failed");
+                execution.setLastUpdateTime(now());
+            }
+            putExecution(execution);
         }
-        putExecution(execution);
         return mapper.createObjectNode().put("approvedAt", now());
     }
 
@@ -1965,7 +1971,11 @@ public class CodePipelineService {
         }
         eventPublisher.actionStateChange(execution, state, "STARTED");
         try {
-            executeProvider(pipeline, execution, action, state);
+            // A stop may have abandoned the action since admission. Best effort: one can still
+            // arrive between this check and the provider call.
+            if (isInProgress(execution, state)) {
+                executeProvider(pipeline, execution, action, state);
+            }
             synchronized (execution) {
                 if ("InProgress".equals(state.getStatus())) {
                     state.setStatus("Succeeded");
@@ -2004,6 +2014,12 @@ public class CodePipelineService {
             if (terminalState != null) {
                 eventPublisher.actionStateChange(execution, state, terminalState);
             }
+        }
+    }
+
+    private static boolean isInProgress(CodePipelineExecution execution, ActionExecution state) {
+        synchronized (execution) {
+            return "InProgress".equals(state.getStatus());
         }
     }
 
@@ -2437,6 +2453,9 @@ public class CodePipelineService {
     private boolean recordExternalActionFailureWhileStopping(CodePipelineExecution execution,
                                                               ActionExecution state, String message) {
         synchronized (execution) {
+            if ("Abandoned".equals(state.getStatus())) {
+                return true;
+            }
             if (!execution.isStopRequested()) {
                 return false;
             }
@@ -2474,9 +2493,14 @@ public class CodePipelineService {
 
     private void waitForApproval(CodePipelineExecution execution, JsonNode action,
                                  ActionExecution state) throws InterruptedException {
-        state.setToken(UUID.randomUUID().toString());
-        state.setSummary("Waiting for approval.");
-        putExecution(execution);
+        synchronized (execution) {
+            if (!"InProgress".equals(state.getStatus())) {
+                return;
+            }
+            state.setToken(UUID.randomUUID().toString());
+            state.setSummary("Waiting for approval.");
+            putExecution(execution);
+        }
         String notificationArn = action.path("configuration").path("NotificationArn").asText(null);
         if (notificationArn != null && !notificationArn.isBlank()) {
             eventPublisher.approvalNeeded(execution, state, notificationArn,
@@ -2487,8 +2511,10 @@ public class CodePipelineService {
         while ("InProgress".equals(state.getStatus()) && !execution.isStopRequested()) {
             TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
         }
-        if (execution.isStopRequested()) {
-            state.setStatus(execution.isAbandon() ? "Abandoned" : "Stopped");
+        synchronized (execution) {
+            if (execution.isStopRequested() && !"Abandoned".equals(state.getStatus())) {
+                state.setStatus(execution.isAbandon() ? "Abandoned" : "Stopped");
+            }
         }
         if ("Failed".equals(state.getStatus())) {
             throw new AwsException("ActionExecutionFailed", state.getSummary(), 400);
@@ -2532,10 +2558,7 @@ public class CodePipelineService {
             if ("Failed".equals(current.getStatus())) {
                 String message = current.getData().path("result").path("failureDetails").path("message")
                         .asText("Custom action failed");
-                if (execution.isStopRequested()) {
-                    state.setStatus("Failed");
-                    state.setSummary(message);
-                    state.setErrorDetails(Map.of("code", "ActionExecutionFailed", "message", message));
+                if (recordExternalActionFailureWhileStopping(execution, state, message)) {
                     return;
                 }
                 throw new AwsException("ActionExecutionFailed", message, 400);
