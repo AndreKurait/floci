@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.rds.proxy.RdsProxyTlsCertificates;
 import io.github.hectorvent.floci.services.rds.proxy.RdsSigV4Validator;
 import io.github.hectorvent.floci.services.redshift.RedshiftAuditLogPublisher;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.testing.TestTime;
 import io.github.hectorvent.floci.testutil.FreePorts;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -17,13 +18,16 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -32,13 +36,21 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class RedshiftAuthProxyTest {
+
+    private static final int BIND_ATTEMPTS = 40;
+    private static final Duration BIND_RETRY_PAUSE = Duration.ofMillis(25);
+    /** The last bind attempt comes after one pause for each attempt before it: 975 ms in. */
+    private static final Duration LAST_BIND_ATTEMPT_AT = BIND_RETRY_PAUSE.multipliedBy(BIND_ATTEMPTS - 1);
 
     @Test
     void failedLoginAuditsTheRequestedUserAndDatabase() throws Exception {
@@ -255,39 +267,131 @@ class RedshiftAuthProxyTest {
         awaitActiveConnections(0);
     }
 
-    private void awaitActiveConnections(int expected) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (proxy.activeConnections() != expected && System.nanoTime() < deadline) {
-            Thread.sleep(25);
-        }
-        assertEquals(expected, proxy.activeConnections());
+    private void awaitActiveConnections(int expected) {
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(proxy::activeConnections, equalTo(expected));
     }
 
     @Test
     void startRetriesTheBindWhileThePortIsMomentarilyStillInUse() throws Exception {
+        TestTime time = TestTime.create();
         fakeBackend = new ServerSocket(0);
         int proxyPort = FreePorts.anyInterfacePort();
+        AtomicInteger bindAttempts = new AtomicInteger();
 
         // Hold the port, mimicking a just-closed predecessor the kernel has not released
-        // yet; free it shortly after so the retrying bind can finally take it.
-        ServerSocket squatter = new ServerSocket();
-        squatter.setReuseAddress(true);
-        squatter.bind(new InetSocketAddress(proxyPort));
-        Thread.ofVirtual().start(() -> {
-            try {
-                Thread.sleep(200);
-                squatter.close();
-            } catch (Exception ignored) {
-            }
-        });
+        // yet; free it 200 ms into the retry window so the retrying bind can finally take it.
+        ServerSocket squatter = squatOn(proxyPort);
+        time.scheduler().schedule(() -> closeSquatter(squatter), 200, TimeUnit.MILLISECONDS);
 
-        proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", fakeBackend.getLocalPort(),
-                "admin", "Secret123", "dev",
-                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
-                mock(S3Service.class), mock(IamService.class), 5000, 5000, 100);
+        proxy = proxyRetryingTheBindOn(time, bindAttempts);
         proxy.start(proxyPort); // must not throw despite the port being busy at first
 
-        assertTrue(portAccepts(proxyPort), "proxy never bound the port after the squatter released it");
+        assertEquals(Duration.ofMillis(200), Duration.between(TestTime.DEFAULT_START, time.now()),
+                "the bind is retried every 25 ms until the port is free");
+        assertEquals(9, bindAttempts.get(), "eight attempts find the port busy, the ninth binds it");
+        assertPortAccepts(proxyPort);
+    }
+
+    @Test
+    void startBindsAPortThatIsFreedJustBeforeTheLastAttempt() throws Exception {
+        TestTime time = TestTime.create();
+        fakeBackend = new ServerSocket(0);
+        int proxyPort = FreePorts.anyInterfacePort();
+        AtomicInteger bindAttempts = new AtomicInteger();
+        ServerSocket squatter = squatOn(proxyPort);
+        time.scheduler().schedule(() -> closeSquatter(squatter),
+                LAST_BIND_ATTEMPT_AT.toMillis(), TimeUnit.MILLISECONDS);
+
+        proxy = proxyRetryingTheBindOn(time, bindAttempts);
+        proxy.start(proxyPort);
+
+        assertEquals(LAST_BIND_ATTEMPT_AT, Duration.between(TestTime.DEFAULT_START, time.now()));
+        assertEquals(BIND_ATTEMPTS, bindAttempts.get());
+        assertPortAccepts(proxyPort);
+    }
+
+    @Test
+    void startFailsWithTheBindFailureWhenThePortIsStillInUseAtTheLastAttempt() throws Exception {
+        TestTime time = TestTime.create();
+        fakeBackend = new ServerSocket(0);
+        int proxyPort = FreePorts.anyInterfacePort();
+        AtomicInteger bindAttempts = new AtomicInteger();
+        ServerSocket squatter = squatOn(proxyPort);
+        try {
+            // One retry pause later than the last attempt: nothing is left to take the freed port.
+            time.scheduler().schedule(() -> closeSquatter(squatter),
+                    LAST_BIND_ATTEMPT_AT.plus(BIND_RETRY_PAUSE).toMillis(), TimeUnit.MILLISECONDS);
+            RedshiftAuthProxy retrying = proxyRetryingTheBindOn(time, bindAttempts);
+
+            assertThrows(BindException.class, () -> retrying.start(proxyPort));
+
+            assertEquals(BIND_ATTEMPTS, bindAttempts.get());
+            assertEquals(0, time.pendingTasks(), "the port was freed only after the last attempt had failed");
+        } finally {
+            closeSquatter(squatter);
+        }
+    }
+
+    @Test
+    void startDoesNotRetryAFailureThatIsNotABusyPort() {
+        TestTime time = TestTime.create();
+        AtomicInteger bindAttempts = new AtomicInteger();
+        IOException refused = new IOException("not a bind failure");
+        RedshiftAuthProxy failing = new RedshiftAuthProxy("111111111111:c1", "localhost", 1,
+                "admin", "Secret123", "dev",
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.REJECT,
+                mock(S3Service.class), mock(IamService.class), 5000, 5000, 100) {
+            @Override
+            ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
+                bindAttempts.incrementAndGet();
+                throw refused;
+            }
+
+            @Override
+            void pauseBeforeBindRetry(long millis) {
+                time.sleepAdvancing(Duration.ofMillis(millis));
+            }
+        };
+
+        assertSame(refused, assertThrows(IOException.class, () -> failing.start(0)));
+
+        assertEquals(1, bindAttempts.get());
+        assertEquals(TestTime.DEFAULT_START, time.now(), "no retry pause was taken");
+    }
+
+    /** A proxy whose pause between bind attempts passes on {@code time} and whose attempts are counted. */
+    private RedshiftAuthProxy proxyRetryingTheBindOn(TestTime time, AtomicInteger bindAttempts) {
+        return new RedshiftAuthProxy("111111111111:c1", "localhost", fakeBackend.getLocalPort(),
+                "admin", "Secret123", "dev",
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
+                mock(S3Service.class), mock(IamService.class), 5000, 5000, 100) {
+            @Override
+            ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
+                bindAttempts.incrementAndGet();
+                return super.listenSocket(proxyPort, backlog);
+            }
+
+            @Override
+            void pauseBeforeBindRetry(long millis) {
+                time.sleepAdvancing(Duration.ofMillis(millis));
+            }
+        };
+    }
+
+    private static ServerSocket squatOn(int port) throws IOException {
+        ServerSocket squatter = new ServerSocket();
+        squatter.setReuseAddress(true);
+        squatter.bind(new InetSocketAddress(port));
+        return squatter;
+    }
+
+    private static void closeSquatter(ServerSocket squatter) {
+        try {
+            squatter.close();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     @Test
@@ -330,19 +434,10 @@ class RedshiftAuthProxyTest {
                 new CertificateGenerator());
     }
 
-    private static boolean portAccepts(int port) {
-        for (int attempt = 0; attempt < 50; attempt++) {
-            try (Socket ignored = new Socket("localhost", port)) {
-                return true;
-            } catch (IOException e) {
-                try {
-                    Thread.sleep(20);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-            }
+    /** {@code start} has bound the listener by the time it returns, so the first connect is accepted. */
+    private static void assertPortAccepts(int port) throws IOException {
+        try (Socket client = new Socket("localhost", port)) {
+            assertTrue(client.isConnected());
         }
-        return false;
     }
 }
