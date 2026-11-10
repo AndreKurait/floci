@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 
 import java.io.Closeable;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Wraps a running Lambda Docker container and its associated Runtime API server.
@@ -22,6 +23,7 @@ public class ContainerHandle {
     private volatile long lastUsedMs;
     private Closeable logStream;
     private LambdaExitWatcher exitWatcher;
+    private CompletableFuture<Void> extensionExit = CompletableFuture.completedFuture(null);
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -73,6 +75,10 @@ public class ContainerHandle {
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
 
     void setExitWatcher(LambdaExitWatcher exitWatcher) { this.exitWatcher = exitWatcher; }
+
+    void setExtensionExit(CompletableFuture<Void> extensionExit) { this.extensionExit = extensionExit; }
+
+    CompletableFuture<Void> extensionExit() { return extensionExit; }
 
     void cancelExitWatcher() {
         if (exitWatcher != null) {
