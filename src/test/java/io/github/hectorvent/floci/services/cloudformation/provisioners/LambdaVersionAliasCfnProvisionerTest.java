@@ -10,11 +10,13 @@ import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.ProvisionedConcurrencyPool;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 import org.mockito.Mockito;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -49,6 +51,9 @@ class LambdaVersionAliasCfnProvisionerTest {
     private final LambdaAliasDeployment deployments = mock(LambdaAliasDeployment.class);
     private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(
             lambda, concurrency, deployments);
+    private final TestTime time = TestTime.create();
+    private final LambdaVersionAliasCfnProvisioner timed = new LambdaVersionAliasCfnProvisioner(
+            lambda, concurrency, deployments, time::nanoTime, time::sleepAdvancing);
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
@@ -279,8 +284,9 @@ class LambdaVersionAliasCfnProvisionerTest {
         when(concurrency.get("us-east-1", "my-fn", "production", "000000000000"))
                 .thenReturn(capacity("READY", 2, null));
         StackResource r = resource("AWS::Lambda::Alias", "Alias");
-        provisioner.provision(r, props, ctx());
+        timed.provision(r, props, ctx());
         verify(concurrency).get("us-east-1", "my-fn", "production", "000000000000");
+        assertEquals(TestTime.DEFAULT_START.plusMillis(200), time.now(), "one 200 ms poll");
         assertEquals(ALIAS_ARN, r.getPhysicalId());
     }
 
@@ -297,15 +303,45 @@ class LambdaVersionAliasCfnProvisionerTest {
     }
 
     @Test
-    void aliasInitializationHasABoundedDeadline() throws Exception {
+    void aliasInitializationFailsAfterFiveMinutesWithoutReadyCapacity() throws Exception {
         JsonNode props = provisionedProperties();
+        capacityBecomesReadyAt(null);
+        AwsException failure = assertThrows(AwsException.class,
+                () -> timed.provision(resource("AWS::Lambda::Alias", "Alias"), props, ctx()));
+        assertEquals("InternalFailure", failure.getErrorCode());
+        assertEquals("Provisioned concurrency for alias production did not become READY (status IN_PROGRESS): "
+                + "initialization deadline exceeded", failure.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)), time.now());
+        verify(concurrency, Mockito.times(1500)).get("us-east-1", "my-fn", "production", "000000000000");
+    }
+
+    @Test
+    void capacityThatBecomesReadyAtTheFiveMinuteDeadlineStillCompletesTheAlias() throws Exception {
+        JsonNode props = provisionedProperties();
+        capacityBecomesReadyAt(TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)));
+        StackResource r = resource("AWS::Lambda::Alias", "Alias");
+        timed.provision(r, props, ctx());
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)), time.now());
+        assertEquals(ALIAS_ARN, r.getPhysicalId());
+    }
+
+    @Test
+    void capacityThatBecomesReadyJustAfterTheDeadlineIsNotWaitedFor() throws Exception {
+        JsonNode props = provisionedProperties();
+        capacityBecomesReadyAt(TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)).plusNanos(1));
+        AwsException failure = assertThrows(AwsException.class,
+                () -> timed.provision(resource("AWS::Lambda::Alias", "Alias"), props, ctx()));
+        assertTrue(failure.getMessage().contains("initialization deadline exceeded"), failure.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofMinutes(5)), time.now());
+    }
+
+    /** The capacity reads as IN_PROGRESS until the timeline reaches {@code instant}; always, when null. */
+    private void capacityBecomesReadyAt(Instant instant) {
         when(concurrency.put("us-east-1", "my-fn", "production", 2, "000000000000"))
                 .thenReturn(capacity("IN_PROGRESS", 0, null));
-        LambdaVersionAliasCfnProvisioner bounded = new LambdaVersionAliasCfnProvisioner(
-                lambda, concurrency, mock(LambdaAliasDeployment.class), Duration.ZERO);
-        assertThrows(AwsException.class,
-                () -> bounded.provision(resource("AWS::Lambda::Alias", "Alias"), props, ctx()));
-        Mockito.verify(concurrency, Mockito.never()).get(any(), any(), any(), any());
+        when(concurrency.get("us-east-1", "my-fn", "production", "000000000000")).thenAnswer(call ->
+                instant == null || time.now().isBefore(instant)
+                        ? capacity("IN_PROGRESS", 0, null) : capacity("READY", 2, null));
     }
 
     @Test

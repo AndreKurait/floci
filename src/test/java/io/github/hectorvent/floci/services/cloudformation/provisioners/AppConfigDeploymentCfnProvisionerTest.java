@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.appconfig.model.Deployment;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -18,7 +19,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -39,13 +40,13 @@ import static org.mockito.Mockito.when;
 class AppConfigDeploymentCfnProvisionerTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private final AppConfigService service = mock(AppConfigService.class);
-    private final AtomicLong now = new AtomicLong();
+    private final TestTime time = TestTime.create();
     private final List<Duration> waits = new ArrayList<>();
     private final List<StackEvent> events = new ArrayList<>();
     private final AppConfigDeploymentCfnProvisioner provisioner = new AppConfigDeploymentCfnProvisioner(
-            service, Duration.ofSeconds(2), now::get, delay -> {
+            service, time::nanoTime, delay -> {
                 waits.add(delay);
-                now.addAndGet(delay.toNanos());
+                time.sleepAdvancing(delay);
             });
     private final ProvisionContext context = new ProvisionContext(CloudFormationTemplateEngine.standalone(
             "000000000000", "us-east-1", "deployment", JSON, value -> value),
@@ -125,17 +126,47 @@ class AppConfigDeploymentCfnProvisionerTest {
     }
 
     @Test
-    void aBoundedWaitFailsAndRevertsTheCreatedDeployment() {
+    void aDeploymentStillRunningAfterTwentyFourHoursFailsAndIsReverted() {
         startReturns("DEPLOYING");
-        when(service.getDeployment("app0001", "env0001", 7)).thenReturn(deployment("DEPLOYING"));
+        deploymentIsNextSeenAfter(Duration.ofHours(24).minusNanos(1), "DEPLOYING");
 
         AwsException failure = assertThrows(AwsException.class,
                 () -> provisioner.provision(resource(), JSON.valueToTree(properties()), context));
 
-        assertTrue(failure.getMessage().contains("within 2s"));
-        assertEquals(Duration.ofSeconds(2).toNanos(), now.get());
+        assertEquals(List.of(Duration.ofNanos(1)), waits, "one nanosecond before the deadline the wait goes on");
+        assertTrue(failure.getMessage().contains("did not complete within 86400s (state DEPLOYING)."),
+                failure.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofHours(24)), time.now());
         assertEquals(1, events.size(), "Unchanged progress must not flood stack events.");
         verify(service).stopDeployment("app0001", "env0001", 7, true);
+    }
+
+    @Test
+    void aDeploymentThatCompletesAtTheTwentyFourHourDeadlineIsAccepted() {
+        startReturns("DEPLOYING");
+        deploymentIsNextSeenAfter(Duration.ofHours(24).minusNanos(1), "COMPLETE");
+        StackResource resource = resource();
+
+        provisioner.provision(resource, JSON.valueToTree(properties()), context);
+
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofHours(24)), time.now());
+        assertEquals("COMPLETE", resource.getAttributes().get("State"));
+        verify(service, never()).stopDeployment("app0001", "env0001", 7, true);
+    }
+
+    /**
+     * The first status read returns DEPLOYING only after {@code stalled} has passed, as a read held up
+     * for that long would; every later read returns {@code then}.
+     */
+    private void deploymentIsNextSeenAfter(Duration stalled, String then) {
+        AtomicBoolean first = new AtomicBoolean(true);
+        when(service.getDeployment("app0001", "env0001", 7)).thenAnswer(call -> {
+            if (first.compareAndSet(true, false)) {
+                time.advance(stalled);
+                return deployment("DEPLOYING");
+            }
+            return deployment(then);
+        });
     }
 
     @Test
@@ -161,7 +192,7 @@ class AppConfigDeploymentCfnProvisionerTest {
         startReturns("DEPLOYING");
         when(service.getDeployment("app0001", "env0001", 7)).thenReturn(deployment("DEPLOYING"));
         AppConfigDeploymentCfnProvisioner interrupted = new AppConfigDeploymentCfnProvisioner(
-                service, Duration.ofHours(24), now::get, delay -> {
+                service, time::nanoTime, delay -> {
                     throw new InterruptedException("stop test");
                 });
         try {

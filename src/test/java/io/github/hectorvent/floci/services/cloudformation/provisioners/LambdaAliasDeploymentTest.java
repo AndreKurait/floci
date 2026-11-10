@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.codedeploy.CodeDeployService;
 import io.github.hectorvent.floci.services.codedeploy.model.Deployment;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -17,7 +18,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -27,9 +28,12 @@ class LambdaAliasDeploymentTest {
     private static final String REGION = "us-west-2";
     private final ObjectMapper mapper = new ObjectMapper();
     private final CodeDeployService service = mock(CodeDeployService.class);
-    private final AtomicLong nanos = new AtomicLong();
-    private final LambdaAliasDeployment runner = new LambdaAliasDeployment(
-            service, Duration.ofHours(24), nanos::get, delay -> nanos.addAndGet(delay.toNanos()));
+    private final TestTime time = TestTime.create();
+    private final List<Duration> waits = new ArrayList<>();
+    private final LambdaAliasDeployment runner = new LambdaAliasDeployment(service, time::nanoTime, delay -> {
+        waits.add(delay);
+        time.sleepAdvancing(delay);
+    });
 
     private JsonNode policy() throws Exception {
         return mapper.readTree("""
@@ -73,7 +77,7 @@ class LambdaAliasDeploymentTest {
         List<StackEvent> events = new ArrayList<>();
         StackResource resource = resource();
         runner.shift(resource, REGION, alias(), "2", policy(), events::add);
-        assertEquals(Duration.ofMillis(400).toNanos(), nanos.get());
+        assertEquals(TestTime.DEFAULT_START.plusMillis(400), time.now());
         assertEquals("deployment", resource.getAttributes().get(LambdaAliasDeployment.DEPLOYMENT_ATTR));
         assertTrue(events.stream().allMatch(event -> event.getResourceStatus().equals("UPDATE_IN_PROGRESS")));
         ArgumentCaptor<Map<String, Object>> revision = ArgumentCaptor.captor();
@@ -112,20 +116,58 @@ class LambdaAliasDeploymentTest {
                 .thenReturn(state("InProgress"), state("InProgress"), state("Stopped"));
         runner.stopBeforeRestore(resource, REGION, event -> {});
         verify(service).stopDeployment(REGION, "deployment");
-        assertEquals(Duration.ofMillis(200).toNanos(), nanos.get());
+        assertEquals(TestTime.DEFAULT_START.plusMillis(200), time.now());
     }
 
     @Test
-    void timeoutRequestsStopAndRetainsTheDeploymentForCleanup() throws Exception {
+    void aDeploymentStillRunningAfterTwentyFourHoursIsStoppedAndRetainedForCleanup() throws Exception {
         start();
-        when(service.getDeployment(REGION, "deployment")).thenReturn(state("InProgress"));
-        LambdaAliasDeployment bounded = new LambdaAliasDeployment(
-                service, Duration.ZERO, nanos::get, delay -> fail("Expired wait must not sleep"));
+        deploymentIsNextSeenAfter(Duration.ofHours(24).minusNanos(1), "InProgress");
         StackResource resource = resource();
         JsonNode policy = policy();
-        assertThrows(AwsException.class, () -> bounded.shift(resource, REGION, alias(), "2", policy, event -> {}));
+        AwsException failure = assertThrows(AwsException.class,
+                () -> runner.shift(resource, REGION, alias(), "2", policy, event -> {}));
+        assertEquals(List.of(Duration.ofNanos(1)), waits, "one nanosecond before the deadline the wait goes on");
+        assertTrue(failure.getMessage().contains("did not finish within 86400 seconds."), failure.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofHours(24)), time.now());
         verify(service).stopDeployment(REGION, "deployment");
         assertEquals("deployment", resource.getAttributes().get(LambdaAliasDeployment.DEPLOYMENT_ATTR));
+    }
+
+    @Test
+    void aWaitThatHasAlreadyExpiredDoesNotSleepAgain() throws Exception {
+        start();
+        deploymentIsNextSeenAfter(Duration.ofHours(24), "InProgress");
+        StackResource resource = resource();
+        JsonNode policy = policy();
+        assertThrows(AwsException.class, () -> runner.shift(resource, REGION, alias(), "2", policy, event -> {}));
+        assertEquals(List.of(), waits, "Expired wait must not sleep");
+        verify(service).stopDeployment(REGION, "deployment");
+        assertEquals("deployment", resource.getAttributes().get(LambdaAliasDeployment.DEPLOYMENT_ATTR));
+    }
+
+    @Test
+    void aDeploymentThatSucceedsAtTheTwentyFourHourDeadlineIsAccepted() throws Exception {
+        start();
+        deploymentIsNextSeenAfter(Duration.ofHours(24).minusNanos(1), "Succeeded");
+        runner.shift(resource(), REGION, alias(), "2", policy(), event -> {});
+        assertEquals(TestTime.DEFAULT_START.plus(Duration.ofHours(24)), time.now());
+        verify(service, never()).stopDeployment(REGION, "deployment");
+    }
+
+    /**
+     * The first status read returns InProgress only after {@code stalled} has passed, as a read held up
+     * for that long would; every later read returns {@code then}.
+     */
+    private void deploymentIsNextSeenAfter(Duration stalled, String then) {
+        AtomicBoolean first = new AtomicBoolean(true);
+        when(service.getDeployment(REGION, "deployment")).thenAnswer(call -> {
+            if (first.compareAndSet(true, false)) {
+                time.advance(stalled);
+                return state("InProgress");
+            }
+            return state(then);
+        });
     }
 
     @Test
@@ -133,7 +175,7 @@ class LambdaAliasDeploymentTest {
         start();
         when(service.getDeployment(REGION, "deployment")).thenReturn(state("InProgress"));
         LambdaAliasDeployment interrupted = new LambdaAliasDeployment(
-                service, Duration.ofHours(24), nanos::get, delay -> {
+                service, time::nanoTime, delay -> {
                     throw new InterruptedException("cancelled");
                 });
         JsonNode policy = policy();

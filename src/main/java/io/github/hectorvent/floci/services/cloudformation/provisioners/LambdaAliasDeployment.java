@@ -25,20 +25,19 @@ public class LambdaAliasDeployment {
     static final String DEPLOYMENT_ATTR = "__FlociLambdaAliasDeployment";
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Duration POLL_INTERVAL = Duration.ofMillis(200);
+    private static final Duration TIMEOUT = Duration.ofHours(24);
 
     private final CodeDeployService service;
-    private final Duration timeout;
     private final LongSupplier nanoTime;
     private final Sleeper sleeper;
 
     @Inject
     public LambdaAliasDeployment(CodeDeployService service) {
-        this(service, Duration.ofHours(24), System::nanoTime, Thread::sleep);
+        this(service, System::nanoTime, Thread::sleep);
     }
 
-    LambdaAliasDeployment(CodeDeployService service, Duration timeout, LongSupplier nanoTime, Sleeper sleeper) {
+    LambdaAliasDeployment(CodeDeployService service, LongSupplier nanoTime, Sleeper sleeper) {
         this.service = service;
-        this.timeout = timeout;
         this.nanoTime = nanoTime;
         this.sleeper = sleeper;
     }
@@ -149,11 +148,11 @@ public class LambdaAliasDeployment {
                         "CodeDeploy deployment " + identifier + " is " + state);
                 lastState = state;
             }
-            long remaining = timeout.toNanos() - (nanoTime.getAsLong() - started);
+            long remaining = TIMEOUT.toNanos() - (nanoTime.getAsLong() - started);
             if (remaining <= 0) {
                 service.stopDeployment(region, identifier);
                 throw invalid("CodeDeploy deployment " + identifier + " did not finish within "
-                        + timeout.toSeconds() + " seconds.");
+                        + TIMEOUT.toSeconds() + " seconds.");
             }
             try {
                 sleeper.sleep(Duration.ofNanos(Math.min(remaining, POLL_INTERVAL.toNanos())));
