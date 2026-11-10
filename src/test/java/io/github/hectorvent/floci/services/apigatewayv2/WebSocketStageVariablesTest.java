@@ -129,8 +129,7 @@ class WebSocketStageVariablesTest {
             assertTrue(response.contains("stage-var-success"),
                     "Response should indicate the Lambda was invoked successfully via stage variable substitution, got: " + response);
 
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws);
         } finally {
             // Cleanup route
             given().when().delete("/v2/apis/" + wsApiId + "/routes/" + routeId)
@@ -191,8 +190,7 @@ class WebSocketStageVariablesTest {
             String response = capture.getResponse(3, TimeUnit.SECONDS);
             assertEquals("Internal server error", JsonPath.from(response).getString("message"));
 
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws);
         } finally {
             // Cleanup route
             given().when().delete("/v2/apis/" + wsApiId + "/routes/" + routeId)
@@ -256,8 +254,7 @@ class WebSocketStageVariablesTest {
             assertTrue(response.contains("stage-var-success"),
                     "Response should indicate the Lambda was invoked successfully via multiple stage variable substitution, got: " + response);
 
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws);
         } finally {
             // Cleanup route
             given().when().delete("/v2/apis/" + wsApiId + "/routes/" + routeId)
