@@ -13,9 +13,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * {@link SqsTiming} on a {@link TestTime} timeline. A long poll or a throttled move task parks
- * here on its own thread and is released by what releases it in production (the queue changing,
- * the cancel latch opening) or by the test advancing the timeline to the end of the wait. Real
+ * {@link SqsTiming} on a {@link TestTime} timeline. A long poll, a throttled move task or a reset
+ * waiting for operations to drain parks here on its own thread and is released by what releases
+ * it in production (the queue changing, the cancel latch opening, the last operation leaving) or
+ * by the test advancing the timeline to the end of the wait. Real
  * time passing releases nothing; a wait nobody ends fails after {@link #STUCK_AFTER_SECONDS}.
  *
  * <p>Each wait is reported to the test before it parks, so the test knows the thread is waiting
@@ -82,6 +83,27 @@ final class TimelineSqsTiming implements SqsTiming {
         } finally {
             due.cancel(false);
             watcher.interrupt();
+        }
+    }
+
+    @Override
+    public void timedWait(Object monitor, long timeoutNanos) throws InterruptedException {
+        // The caller holds the monitor, so the wake cannot run before the wait below has released it.
+        ScheduledFuture<?> due = time.scheduler().schedule(() -> {
+            synchronized (monitor) {
+                monitor.notifyAll();
+            }
+        }, timeoutNanos, TimeUnit.NANOSECONDS);
+        parks.add(Duration.ofNanos(timeoutNanos));
+        long parkedAt = System.nanoTime();
+        try {
+            monitor.wait(TimeUnit.SECONDS.toMillis(STUCK_AFTER_SECONDS));
+            if (System.nanoTime() - parkedAt >= TimeUnit.SECONDS.toNanos(STUCK_AFTER_SECONDS)) {
+                throw new AssertionError("a wait is still parked: its monitor was not notified and the timeline"
+                        + " was not advanced by its " + Duration.ofNanos(timeoutNanos) + " timeout");
+            }
+        } finally {
+            due.cancel(false);
         }
     }
 
