@@ -1162,6 +1162,16 @@ public class ApiGatewayExecuteController {
                     auth.getIdentitySource(), ttl, identities != null ? identities : List.of());
             RestLambdaAuthorizer.Result verified = restLambdaAuthorizer.get(key);
             if (verified == null) {
+                if (auth.getAuthorizerCredentials() == null || auth.getAuthorizerCredentials().isBlank()) {
+                    String functionArn = LambdaArnUtils.functionArn(function, regionResolver.getPartition(),
+                            region, regionResolver.getAccountId());
+                    String sourceArn = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
+                            apiId + "/authorizers/" + auth.getId()).toString();
+                    if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                            sourceArn, regionResolver.getAccountId()) == Decision.DENY) {
+                        return authorizerError(scope, GatewayResponseType.AUTHORIZER_CONFIGURATION_ERROR, 500);
+                    }
+                }
                 try (RestLambdaAuthorizer.Invocation pending = restLambdaAuthorizer.beginInvocation(key)) {
                     InvokeResult invocation = lambdaService.invokeTarget(region, function,
                             event.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
@@ -1181,7 +1191,7 @@ public class ApiGatewayExecuteController {
             return new AuthorizerResult(null, verified.principalId(), verified.context(),
                     verified.usageIdentifierKey());
         } catch (Exception exception) {
-            LOG.warnv("Authorizer failure: {0}", exception.getMessage());
+            LOG.warnv(exception, "Authorizer failure: {0}", exception.getMessage());
             return authorizerError(scope, GatewayResponseType.AUTHORIZER_FAILURE, 500);
         }
     }
