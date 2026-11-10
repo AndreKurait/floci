@@ -221,7 +221,8 @@ class CloudFormationIotAuthorizerIntegrationTest {
     /** Waits for the stack to be gone, which a DELETE_FAILED stack never is. */
     private void deleteStack(String stack) {
         cfn(stack, "DeleteStack", null).then().statusCode(200);
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
             Response response = cfn(stack, "DescribeStacks", null);
             assertEquals(400, response.statusCode(), response.asString());
             assertTrue(response.asString().contains("does not exist"), response.asString());
@@ -230,7 +231,8 @@ class CloudFormationIotAuthorizerIntegrationTest {
     }
 
     private static String awaitStatus(String stack, String status) {
-        return await().atMost(Duration.ofSeconds(15)).until(
+        return await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(
                 () -> cfn(stack, "DescribeStacks", null).then().statusCode(200).extract().asString(),
                 body -> status.equals(XmlParser.extractFirst(body, "StackStatus", null)));
     }

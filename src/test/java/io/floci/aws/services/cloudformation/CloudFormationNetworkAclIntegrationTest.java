@@ -4,6 +4,8 @@ import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 
@@ -118,21 +120,16 @@ class CloudFormationNetworkAclIntegrationTest {
 
     /** DeleteStack runs asynchronously; poll until the custom ACL disappears. */
     private static void awaitNetworkAclGone(String aclId) throws InterruptedException {
-        for (int i = 0; i < 100; i++) {
-            String acls = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(5), () -> given()
                 .formParam("Action", "DescribeNetworkAcls")
                 .header("Authorization", EC2_AUTH)
             .when()
                 .post("/")
             .then()
                 .statusCode(200)
-                .extract().asString();
-            if (!acls.contains(aclId)) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        throw new AssertionError("Timed out waiting for network ACL " + aclId + " to be deleted");
+                .extract().asString(),
+                acls -> !acls.contains(aclId),
+                acls -> "Timed out waiting for network ACL " + aclId + " to be deleted");
     }
 
     private static String between(String haystack, String open, String close) {
