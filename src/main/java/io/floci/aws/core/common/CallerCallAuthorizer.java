@@ -21,7 +21,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Evaluates a downstream call using an already authenticated caller's credentials. */
+/** Evaluates calls through the shared IAM pipeline using verified or explicitly anonymous callers. */
 @ApplicationScoped
 public class CallerCallAuthorizer {
 
@@ -69,6 +69,38 @@ public class CallerCallAuthorizer {
             return Decision.DENY;
         }
         return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action, resourceArn, resource, localRoot));
+    }
+
+    /**
+     * Evaluates an unauthenticated public endpoint's resource policy. An endpoint without a
+     * policy retains public access; an attached policy must explicitly allow the anonymous
+     * caller. The transport supplies the source address, never a forwarded identity header.
+     */
+    public Decision authorizeAnonymousResource(String action, String resourceArn, String sourceIp,
+                                               boolean secureTransport) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return Decision.ALLOW;
+        }
+        if (!AwsArnUtils.isArn(resourceArn)) {
+            return Decision.DENY;
+        }
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        List<String> documents = ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn)
+                .stream().map(ResourcePolicy::policyDocument)
+                .filter(document -> document != null && !document.isBlank()).toList();
+        if (documents.isEmpty()) {
+            return Decision.ALLOW;
+        }
+        Map<String, List<String>> context = new HashMap<>();
+        if (sourceIp != null && !sourceIp.isBlank()) {
+            context.put("aws:SourceIp", List.of(sourceIp));
+        }
+        context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(),
+                "anonymous", resource.accountId());
+        ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents, RequestPrincipal.anonymous(),
+                action, resourceArn, context);
+        return grant == ResourcePolicyDecision.ALLOW ? Decision.ALLOW : Decision.DENY;
     }
 
     private Decision authorizeCaller(String accessKey, String callerArn, String action, String resourceArn,
