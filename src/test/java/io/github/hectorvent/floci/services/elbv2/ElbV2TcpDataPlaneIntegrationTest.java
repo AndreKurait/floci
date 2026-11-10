@@ -651,20 +651,18 @@ class ElbV2TcpDataPlaneIntegrationTest {
     }
 
     private static void assertPortReleased(int port) {
-        await().atMost(Duration.ofSeconds(5)).ignoreException(BindException.class)
-                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
-                .untilAsserted(() -> {
-                    assertThrows(ConnectException.class, () -> {
-                        try (Socket socket = connect(port)) {
-                            assertEquals(port, socket.getPort());
-                        }
-                    });
-                    try (ServerSocket reservation = new ServerSocket()) {
-                        reservation.setReuseAddress(true);
-                        reservation.bind(new InetSocketAddress("0.0.0.0", port));
-                        assertEquals(port, reservation.getLocalPort());
-                    }
-                });
+        await().atMost(Duration.ofSeconds(5)).ignoreException(BindException.class).untilAsserted(() -> {
+            assertThrows(ConnectException.class, () -> {
+                try (Socket socket = connect(port)) {
+                    assertEquals(port, socket.getPort());
+                }
+            });
+            try (ServerSocket reservation = new ServerSocket()) {
+                reservation.setReuseAddress(true);
+                reservation.bind(new InetSocketAddress("0.0.0.0", port));
+                assertEquals(port, reservation.getLocalPort());
+            }
+        });
     }
 
     private static void assertEcho(Socket socket, byte[] payload) throws IOException {
