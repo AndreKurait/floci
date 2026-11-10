@@ -296,6 +296,18 @@ public class RuntimeApiServer {
         }
     }
 
+    /** Registration names and whether they receive SHUTDOWN, captured under the lifecycle lock. */
+    public Map<String, Boolean> extensionShutdownSubscriptions() {
+        synchronized (lock) {
+            Map<String, Boolean> subscriptions = new HashMap<>();
+            for (RegisteredExtension extension : extensions.values()) {
+                subscriptions.merge(extension.getName(),
+                        extension.isSubscribedTo(ExtensionEvent.Type.SHUTDOWN), Boolean::logicalOr);
+            }
+            return subscriptions;
+        }
+    }
+
     /**
      * True once a registered extension reported an init or exit error. The execution environment
      * is condemned: {@code WarmPool} must not return this container to the pool or hand it out

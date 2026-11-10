@@ -2,18 +2,32 @@ package io.floci.aws.services.lambda.launcher;
 
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
+import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 import org.junit.jupiter.api.Test;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class ExtensionLogCallbackTest {
+    @Test
+    void cleanupRetriesKeepTheFirstExtensionDeadline() {
+        ContainerHandle handle = new ContainerHandle("container", "function", null, null);
+        assertEquals(100L, handle.beginExtensionShutdown(100L));
+        assertEquals(100L, handle.beginExtensionShutdown(2_000_000_100L));
+    }
 
     @Test
     void completionFollowsFinalLogDelivery() throws Exception {
@@ -52,27 +66,63 @@ class ExtensionLogCallbackTest {
     }
 
     @Test
-    void noExtensionsRetainsRuntimeFallbackWithoutWaiting() {
-        ContainerHandle handle = new ContainerHandle("id", "fn", null, null);
-        handle.setExtensionExit(new CompletableFuture<>());
-        assertEquals(1, ContainerLauncher.shutdownTimeout(handle, false));
+    void invokeOnlyAndUnregisteredExtensionsDoNotBlockShutdown() {
+        ContainerHandle handle = handle(Map.of("invoke-only", false, "no-events", false));
+        handle.setExtensionExits(Map.of(
+                "invoke-only", new CompletableFuture<>(),
+                "no-events", new CompletableFuture<>(),
+                "not-registered", new CompletableFuture<>()));
+        assertTrue(handle.extensionShutdownCompletion().isDone());
     }
 
     @Test
-    void completedExtensionsDoNotConsumeGrace() {
-        ContainerHandle handle = new ContainerHandle("id", "fn", null, null);
-        assertEquals(2, ContainerLauncher.shutdownTimeout(handle, true));
+    void shutdownWaitTracksOnlySubscribedExternalExtensions() {
+        ContainerHandle handle = handle(Map.of("shutdown", true, "invoke-only", false, "internal", true));
+        CompletableFuture<Void> exit = new CompletableFuture<>();
+        handle.setExtensionExits(Map.of("shutdown", exit, "invoke-only", new CompletableFuture<>()));
+        CompletableFuture<Void> shutdown = handle.extensionShutdownCompletion();
+        assertFalse(shutdown.isDone());
+        exit.complete(null);
+        assertTrue(shutdown.isDone());
     }
 
     @Test
-    void unresponsiveExtensionCannotAddAnotherStopGracePeriod() {
-        ContainerHandle handle = new ContainerHandle("id", "fn", null, null);
-        handle.setExtensionExit(new CompletableFuture<>());
-        long start = System.nanoTime();
+    void registrationAliasRetainsUnmatchedExternalProcessGrace() {
+        ContainerHandle handle = handle(Map.of("custom-name", true, "invoke-only", false));
+        CompletableFuture<Void> exit = new CompletableFuture<>();
+        handle.setExtensionExits(Map.of("binary-name", exit, "invoke-only", new CompletableFuture<>()));
+        CompletableFuture<Void> shutdown = handle.extensionShutdownCompletion();
+        assertFalse(shutdown.isDone());
+        exit.complete(null);
+        assertTrue(shutdown.isDone());
+    }
 
-        assertEquals(0, ContainerLauncher.shutdownTimeout(handle, true));
+    @Test
+    void expiredBudgetDoesNotFabricateProcessCompletion() throws Exception {
+        ContainerHandle handle = handle(Map.of("shutdown", true));
+        CompletableFuture<Void> exit = new CompletableFuture<>();
+        handle.setExtensionExits(Map.of("shutdown", exit));
 
-        assertTrue(System.nanoTime() - start >= TimeUnit.SECONDS.toNanos(2));
-        assertFalse(handle.extensionExit().isDone(), "A shutdown timeout must not fabricate extension completion");
+        ContainerLauncher.awaitExtensionShutdown(handle, 0);
+
+        assertFalse(exit.isDone());
+        assertFalse(handle.extensionShutdownCompletion().isDone());
+    }
+
+    @Test
+    void failedTransportRetainsProcessGraceUntilTheDeadline() throws Exception {
+        ContainerHandle handle = handle(Map.of("shutdown", true));
+        handle.setExtensionExits(Map.of("shutdown",
+                CompletableFuture.failedFuture(new IOException("exec disconnected"))));
+
+        assertFalse(handle.extensionShutdownCompletion().isDone());
+        ContainerLauncher.awaitExtensionShutdown(handle, 0);
+        assertFalse(handle.extensionShutdownCompletion().isDone());
+    }
+
+    private static ContainerHandle handle(Map<String, Boolean> subscriptions) {
+        RuntimeApiServer server = mock(RuntimeApiServer.class);
+        when(server.extensionShutdownSubscriptions()).thenReturn(subscriptions);
+        return new ContainerHandle("id", "fn", server, null);
     }
 }

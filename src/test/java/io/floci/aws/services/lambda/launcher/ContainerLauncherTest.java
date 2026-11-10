@@ -73,12 +73,17 @@ import java.util.OptionalInt;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static io.floci.aws.testing.DockerDaemonVersionFixtures.stubDaemonVersion;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -1444,9 +1449,10 @@ class ContainerLauncherTest {
         fn.setCodeLocalPath(codePath.toString());
         when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
                 new SessionCreds("ASIARETRYSESSION", "role-secret", "role-token")));
-        when(runtimeApiServer.hasRegisteredExtensions()).thenReturn(extensions);
+        when(runtimeApiServer.extensionShutdownSubscriptions())
+                .thenReturn(extensions ? Map.of("internal", true) : Map.of());
         ContainerHandle handle = launcher.launch(fn);
-        int timeout = extensions ? 2 : 1;
+        int timeout = 1;
         IllegalStateException failure = new IllegalStateException("Docker removal failed");
         doThrow(failure).doNothing().when(lifecycleManager)
                 .stopAndRemoveStrict("container-123", null, timeout);
@@ -2452,6 +2458,101 @@ class ContainerLauncherTest {
         inOrder.verify(lifecycleManager).startCreated(eq("container-123"), any());
         inOrder.verify(dockerClient).copyArchiveFromContainerCmd("container-123", "/opt/extensions");
         inOrder.verify(dockerClient, atLeastOnce()).execCreateCmd("container-123");
+    }
+
+    @Test
+    void launchTracksSubscribedExecCompletionAndStopRetainsRuntimeGrace() throws Exception {
+        List<ExecCreateCmd> launches = stubExtensionDiscovery("shutdown", "invoke-only");
+        List<ResultCallback<Frame>> callbacks = new ArrayList<>();
+        when(logStreamer.execLogCallbackForAccount(anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenAnswer(invocation -> new ResultCallback.Adapter<Frame>() { });
+        when(dockerClient.execStartCmd(argThat(id -> id != null && id.startsWith("exec-launch-"))))
+                .thenAnswer(invocation -> {
+                    ExecStartCmd start = mock(ExecStartCmd.class);
+                    when(start.exec(any())).thenAnswer(startInvocation -> {
+                        ResultCallback<Frame> callback = startInvocation.getArgument(0);
+                        callbacks.add(callback);
+                        return callback;
+                    });
+                    return start;
+                });
+        when(runtimeApiServer.extensionShutdownSubscriptions())
+                .thenReturn(Map.of("shutdown", true, "invoke-only", false));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("shutdown-order");
+        fn.setPackageType("Image");
+        fn.setImageUri("example:latest");
+        ContainerHandle handle = launcher.launch(fn);
+        CompletableFuture<Void> complete = handle.extensionShutdownCompletion();
+        assertFalse(complete.isDone());
+        callbacks.get(capturedLaunchPaths(launches).indexOf("/opt/extensions/shutdown")).onComplete();
+        assertTrue(complete.isDone(), "INVOKE-only exec must not hold shutdown open");
+
+        launcher.stop(handle);
+
+        InOrder order = inOrder(runtimeApiServer, lifecycleManager);
+        order.verify(runtimeApiServer).quiesce();
+        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+        order.verify(runtimeApiServer).close();
+    }
+
+    @Test
+    void stopRestoresInterruptAfterCompletingCleanup() {
+        ContainerHandle handle = launcher.launch(imageFunction());
+        doAnswer(invocation -> {
+            assertFalse(Thread.currentThread().isInterrupted(), "Daemon cleanup must be allowed to run");
+            return null;
+        }).when(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+        Thread.currentThread().interrupt();
+        try {
+            launcher.stop(handle);
+            assertTrue(Thread.currentThread().isInterrupted());
+            verify(runtimeApiServer).close();
+            verify(runtimeApiServerFactory).release(runtimeApiServer);
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void stopWaitsForSubscribedExitAndAllowsInterruptDuringTheWait(boolean interrupt) throws Exception {
+        ContainerHandle handle = launcher.launch(imageFunction());
+        CompletableFuture<Void> exit = new CompletableFuture<>();
+        handle.setExtensionExits(Map.of("shutdown", exit));
+        CountDownLatch selectingExits = new CountDownLatch(1);
+        when(runtimeApiServer.extensionShutdownSubscriptions()).thenAnswer(invocation -> {
+            selectingExits.countDown();
+            return Map.of("shutdown", true);
+        });
+        doAnswer(invocation -> {
+            assertFalse(Thread.currentThread().isInterrupted());
+            return null;
+        }).when(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+        AtomicReference<Thread> worker = new AtomicReference<>();
+        try (ExecutorService cleanup = Executors.newSingleThreadExecutor()) {
+            Future<Boolean> stopped = cleanup.submit(() -> {
+                worker.set(Thread.currentThread());
+                launcher.stop(handle);
+                return Thread.currentThread().isInterrupted();
+            });
+            try {
+                assertTrue(selectingExits.await(5, TimeUnit.SECONDS));
+                await().atMost(5, TimeUnit.SECONDS).until(() ->
+                        stopped.isDone() || worker.get().getState() == Thread.State.TIMED_WAITING);
+                assertFalse(stopped.isDone(), "A subscribed exec must hold cleanup until exit or interruption");
+                verify(lifecycleManager, never()).stopAndRemoveStrict(anyString(), any(), anyInt());
+                if (interrupt) {
+                    worker.get().interrupt();
+                } else {
+                    exit.complete(null);
+                }
+                assertEquals(interrupt, stopped.get(5, TimeUnit.SECONDS));
+                verify(runtimeApiServer).close();
+            } finally {
+                exit.complete(null);
+            }
+        }
     }
 
     /**

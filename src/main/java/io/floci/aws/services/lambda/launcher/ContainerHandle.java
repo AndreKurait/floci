@@ -4,6 +4,9 @@ import io.floci.aws.services.lambda.model.ContainerState;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 
 import java.io.Closeable;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -21,7 +24,8 @@ public class ContainerHandle {
     private volatile ContainerState state;
     private volatile long lastUsedMs;
     private Closeable logStream;
-    private CompletableFuture<Void> extensionExit = CompletableFuture.completedFuture(null);
+    private Map<String, CompletableFuture<Void>> extensionExits = Map.of();
+    private Long extensionShutdownStartedNanos;
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -61,9 +65,36 @@ public class ContainerHandle {
 
     public Closeable getLogStream() { return logStream; }
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
-    void setExtensionExit(CompletableFuture<Void> extensionExit) { this.extensionExit = extensionExit; }
+    void setExtensionExits(Map<String, CompletableFuture<Void>> extensionExits) {
+        this.extensionExits = Map.copyOf(extensionExits);
+    }
 
-    CompletableFuture<Void> extensionExit() { return extensionExit; }
+    synchronized long beginExtensionShutdown(long nowNanos) {
+        if (extensionShutdownStartedNanos == null) {
+            extensionShutdownStartedNanos = nowNanos;
+        }
+        return extensionShutdownStartedNanos;
+    }
+
+    CompletableFuture<Void> extensionShutdownCompletion() {
+        Map<String, Boolean> subscriptions = runtimeApiServer.extensionShutdownSubscriptions();
+        boolean unmatchedSubscriber = subscriptions.entrySet().stream()
+                .anyMatch(entry -> entry.getValue() && !extensionExits.containsKey(entry.getKey()));
+        List<CompletableFuture<Void>> completions = new ArrayList<>();
+        extensionExits.forEach((name, exit) -> {
+            Boolean subscribed = subscriptions.get(name);
+            // Floci permits registration under a name different from the executable.
+            // Keep those unmatched processes in the wait when an unmatched name subscribes.
+            if (Boolean.TRUE.equals(subscribed) || subscribed == null && unmatchedSubscriber) {
+                CompletableFuture<Void> drained = new CompletableFuture<>();
+                // A disconnected log stream does not prove the extension exited. It
+                // retains its grace period, bounded by the caller's shutdown deadline.
+                exit.thenRun(() -> drained.complete(null));
+                completions.add(drained);
+            }
+        });
+        return CompletableFuture.allOf(completions.toArray(CompletableFuture[]::new));
+    }
 
     /**
      * True once an extension in this container reported an init or exit error. Real AWS treats

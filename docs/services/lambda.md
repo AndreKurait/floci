@@ -583,12 +583,20 @@ A runtime without a SIGTERM handler therefore exits normally instead of inheriti
 PID 1's special signal behavior and waiting for the forced-kill timeout. The one-second
 runtime stop timeout remains a fallback ceiling, not a minimum delay.
 
-External extensions receive SHUTDOWN while the Runtime API remains available. Floci
-waits for their exec output streams to finish within a shared two-second budget before
-stopping the container, so prompt extension cleanup and final logs are preserved.
-An extension that does not finish cannot add another stop grace period after that
-budget expires. Functions without extensions incur no extension wait. This is Floci's
-container teardown behavior, not an implementation of AWS's underlying compute fabric.
+External extensions subscribed to SHUTDOWN receive the event while the Runtime API
+remains available. Floci waits up to two seconds for their exec output streams to
+finish, preserving prompt cleanup and final logs. An INVOKE-only extension does not
+add an extension wait, and a disconnected log stream cannot masquerade as a finished
+extension.
+
+The runtime then gets its one-second signal grace even if an extension used its full
+budget. These sequential Docker shutdown phases can take up to three seconds, plus
+daemon and cleanup overhead. This deliberately differs from AWS's overlapping
+shutdown phases: terminating the container's init sooner would kill its sibling
+extension processes before they finished. Both waits end as soon as their processes
+finish; functions without SHUTDOWN-subscribed external extensions skip the first wait.
+The extension deadline is retained if daemon cleanup needs a retry. A runtime SIGTERM
+handler cannot flush through an extension that already exited in the earlier phase.
 
 When using `floci-cli`, set `floci stop --timeout <seconds>` above the configured
 drain budget. The CLI currently defaults to 10 seconds, including for `floci restart`.
