@@ -30,13 +30,15 @@ Trust and target-policy evaluation use the same server-clock instant for
 `aws:CurrentTime` and `aws:EpochTime`. Time-conditioned grants and denies are
 reevaluated on each invocation; this request time is not `aws:TokenIssueTime`.
 
-Role trust evaluation does not synthesize API Gateway source condition keys:
-service-specific source context and actual issued STS session identities are not
-modeled here. The role principal is evaluated without issuing session credentials.
-Caller-passthrough credentials retain their existing behavior and remain outside
-this role check. HTTP/WebSocket integrations and Lambda authorizers are separate
-permission paths.
-IAM enforcement disabled retains the existing permissive behavior.
+After trust succeeds, each evaluation resolves a temporary local role credential
+through IAM. Its session identity supplies `aws:userid` and its recorded issuance
+time supplies `aws:TokenIssueTime`. The authorization credential is revoked after
+evaluation; the Lambda workload retains its own execution-role credentials.
+
+Role checks do not synthesize service-specific trust `SourceArn` or `SourceAccount`
+conditions. Caller-passthrough credentials, HTTP/WebSocket integrations and Lambda
+authorizers remain separate paths. IAM enforcement disabled retains the existing
+permissive behavior.
 
 
 ## JWT issuer network policy
@@ -1280,8 +1282,7 @@ Caller policy evaluation supplies `aws:CurrentTime` and `aws:EpochTime` from the
 server clock. The same instant is used for caller session expiry and time-based
 identity, session, boundary, SCP and resource-policy conditions. REST anonymous
 and custom-authorizer resource-policy checks also receive these time keys.
-These values do not come from client-supplied date headers. This does not add
-other global condition keys or issue STS sessions for service execution roles.
+These values do not come from client-supplied date headers.
 
 REST resource-policy evaluation for callers without verified AWS credentials leaves
 `aws:PrincipalIsAWSService` absent. `Bool` matching `false` does not match an
