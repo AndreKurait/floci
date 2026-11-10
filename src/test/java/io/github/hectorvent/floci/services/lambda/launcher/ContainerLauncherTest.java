@@ -1126,6 +1126,11 @@ class ContainerLauncherTest {
 
     @Test
     void launchFunction_appliesConfiguredDockerFlagsToRealContainer() throws Exception {
+        InspectNetworkCmd inspectNetwork = mock(InspectNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.inspectNetworkCmd()).thenReturn(inspectNetwork);
+        Network network = mock(Network.class);
+        when(network.getInternal()).thenReturn(false);
+        when(inspectNetwork.exec()).thenReturn(network);
         lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.9");
         when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
@@ -1898,6 +1903,29 @@ class ContainerLauncherTest {
         assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_SESSION_TOKEN=")),
                 "AWS_SESSION_TOKEN should not be injected when awsConfigPath is set");
         verify(executionRoleCredentials, never()).forFunction(any());
+    }
+
+    @Test
+    void resolverRemovalFailureDoesNotLeakRuntimeApiPort() {
+        ContainerHandle handle = launcher.launch(imageFunction());
+        handle.setDnsResolverVolume("owned-resolver");
+        doThrow(new IllegalStateException("volume removal failed"))
+                .when(lifecycleManager).removeVolumeStrict("owned-resolver");
+
+        assertThrows(IllegalStateException.class, () -> launcher.stop(handle));
+
+        InOrder order = inOrder(lifecycleManager, runtimeApiServer, runtimeApiServerFactory);
+        order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
+        order.verify(runtimeApiServer).close();
+        order.verify(runtimeApiServerFactory).release(runtimeApiServer);
+        order.verify(lifecycleManager).removeVolumeStrict("owned-resolver");
+        doNothing().when(lifecycleManager).removeVolumeStrict("owned-resolver");
+        launcher.stop(handle);
+        launcher.stop(handle);
+        verify(runtimeApiServerFactory, times(1)).release(runtimeApiServer);
+        verify(runtimeApiServer, times(1)).close();
+        verify(lifecycleManager, times(2)).removeVolumeStrict("owned-resolver");
+        assertNull(handle.getDnsResolverVolume());
     }
 
     @Test

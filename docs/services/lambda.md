@@ -1151,6 +1151,19 @@ FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud
 FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud,localhost.example.internal
 ```
 
+On an internal Docker bridge, Docker's embedded resolver does not forward external
+queries. When a Lambda has configured DNS servers, Floci supplies a read-only
+resolver file before the runtime starts. Docker's resolver remains first for
+container aliases; configured servers handle queries Docker cannot forward.
+The runtime retains its image
+user, entrypoint, and filesystem permissions. A small, labelled Docker volume
+holds the file and is removed when the Lambda execution environment is removed.
+Preparation uses Docker APIs, including with a remote daemon; no helper process
+runs and no additional image is needed. Explicit resolver mounts and containers
+sharing another container's network namespace keep their existing DNS setup.
+Failed helper or resolver-volume removal remains queued for the existing cleanup
+sweep. Retrying cleanup does not release the Runtime API port a second time.
+
 ### Real AWS Credentials
 
 By default, a Lambda function whose execution role exists in Floci's IAM store receives temporary credentials for that role. SDK calls made by the function identify as `assumed-role/<role>/<function-name>`, and IAM enforcement evaluates the role's policies. If the role is unknown to Floci, the container keeps the compatibility fallback described below.
