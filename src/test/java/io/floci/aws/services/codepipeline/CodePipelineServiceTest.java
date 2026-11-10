@@ -17,11 +17,14 @@ import io.floci.aws.services.codepipeline.model.CodePipelineExecution.ActionExec
 import io.floci.aws.services.codepipeline.model.CodePipelinePipeline;
 import io.floci.aws.services.codepipeline.model.CodePipelinePipeline.TransitionState;
 import io.floci.aws.services.lambda.LambdaService;
+import io.floci.aws.services.lambda.model.InvokeResult;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.s3.model.S3Object;
 import io.floci.aws.testing.ThreadStates;
 import io.smallrye.config.SmallRyeConfigBuilder;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
@@ -1170,6 +1173,86 @@ class CodePipelineServiceTest {
             assertEquals("Stopping", execution.getStatus());
             assertTrue(execution.isStopRequested());
         } finally {
+            service.shutdown();
+        }
+    }
+
+    @Test
+    void queuedActionCannotRegisterAfterStopHasTraversedTheExecution() throws Exception {
+        String pipeline = "stop-before-action-admission";
+        String executionId = "queued-execution";
+        try (ExecutorService workers = Executors.newSingleThreadExecutor()) {
+            JsonNode action = mapper.readTree("""
+                    {"name":"Invoke","actionTypeId":{"category":"Invoke","owner":"AWS","provider":"Lambda","version":"1"},
+                     "configuration":{"FunctionName":"function"}}
+                    """);
+            createExternalActionPipeline(service, pipeline, action.toString());
+            CodePipelineExecution execution = waitingExecution(storage, pipeline, executionId, 1, "External");
+            AtomicReference<Thread> worker = new AtomicReference<>();
+            Future<?> queued;
+            synchronized (execution) {
+                queued = workers.submit(() -> {
+                    worker.set(Thread.currentThread());
+                    service.runAction(new CodePipelinePipeline(), execution, "External", action);
+                });
+                ThreadStates.awaitBlockedOrDone(worker, queued);
+                assertFalse(queued.isDone());
+                stopExecution(service, pipeline, executionId, true);
+            }
+            queued.get(5, TimeUnit.SECONDS);
+            assertTrue(execution.getActionExecutions().isEmpty(), "No provider may be admitted after stop");
+            assertEquals("Stopping", execution.getStatus());
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void lateProviderCompletionCannotOverwriteAbandonedAction(boolean fails) throws Exception {
+        LambdaService lambdaService = mock(LambdaService.class);
+        CountDownLatch providerEntered = new CountDownLatch(1);
+        CountDownLatch releaseProvider = new CountDownLatch(1);
+        when(lambdaService.invoke(anyString(), anyString(), any(), any())).thenAnswer(invocation -> {
+            providerEntered.countDown();
+            if (!releaseProvider.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Provider was not released");
+            }
+            if (fails) {
+                throw new IllegalStateException("late provider failure");
+            }
+            return new InvokeResult(200, null, new byte[0], null, "request");
+        });
+        CodePipelineService pipelineService = new CodePipelineService(storage, mapper,
+                mock(CodeBuildService.class), mock(CodeDeployService.class), lambdaService,
+                mock(S3Service.class), configWithPollInterval(500L));
+        String pipeline = "abandon-before-provider-completion";
+        String executionId = "running-execution";
+        try (ExecutorService workers = Executors.newSingleThreadExecutor()) {
+            JsonNode action = mapper.readTree("""
+                    {"name":"Invoke","actionTypeId":{"category":"Invoke","owner":"AWS","provider":"Lambda","version":"1"},
+                     "configuration":{"FunctionName":"function"}}
+                    """);
+            createExternalActionPipeline(pipelineService, pipeline, action.toString());
+            CodePipelineExecution execution = waitingExecution(storage, pipeline, executionId, 1, "External");
+            Future<?> running = workers.submit(() ->
+                    pipelineService.runAction(new CodePipelinePipeline(), execution, "External", action));
+            try {
+                assertTrue(providerEntered.await(5, TimeUnit.SECONDS));
+                stopExecution(pipelineService, pipeline, executionId, true);
+                ActionExecution state = execution.getActionExecutions().getFirst();
+                Double abandonedAt = state.getLastUpdateTime();
+                releaseProvider.countDown();
+                running.get(5, TimeUnit.SECONDS);
+                assertEquals("Abandoned", state.getStatus());
+                assertEquals("Action abandoned.", state.getSummary());
+                assertEquals(abandonedAt, state.getLastUpdateTime());
+                assertEquals("Stopping", execution.getStatus());
+            } finally {
+                releaseProvider.countDown();
+            }
+        } finally {
+            pipelineService.shutdown();
             service.shutdown();
         }
     }

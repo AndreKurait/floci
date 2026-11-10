@@ -645,31 +645,32 @@ public class CodePipelineService {
     private ObjectNode stopPipelineExecution(JsonNode request, String region, String account) {
         CodePipelineExecution execution = requireExecution(
                 account, region, text(request, "pipelineName"), text(request, "pipelineExecutionId"));
-        if (isTerminal(execution.getStatus())) {
-            throw new AwsException("PipelineExecutionNotStoppableException",
-                    "Pipeline execution is already in a terminal state", 400);
-        }
-        // Publish the stop mode before the stop signal. The provider polling loop reads
-        // stopRequested first, so observing it also observes the matching abandon value.
-        execution.setAbandon(request.path("abandon").asBoolean(false));
-        execution.setStopRequested(true);
-        execution.setStatus("Stopping");
-        execution.setStatusSummary(request.path("reason").asText("Stop requested."));
-        execution.setLastUpdateTime(now());
-        if (execution.getCurrentStage() != null) {
-            execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Stopping");
-        }
-        if (execution.isAbandon()) {
-            synchronized (execution) {
+        synchronized (execution) {
+            if (isTerminal(execution.getStatus())) {
+                throw new AwsException("PipelineExecutionNotStoppableException",
+                        "Pipeline execution is already in a terminal state", 400);
+            }
+            // Admission and stop use the same monitor. A queued action cannot
+            // register itself after this stop has traversed the active actions.
+            execution.setAbandon(request.path("abandon").asBoolean(false));
+            execution.setStopRequested(true);
+            execution.setStatus("Stopping");
+            execution.setStatusSummary(request.path("reason").asText("Stop requested."));
+            execution.setLastUpdateTime(now());
+            if (execution.getCurrentStage() != null) {
+                execution.getStageExecutionStatuses().put(execution.getCurrentStage(), "Stopping");
+            }
+            if (execution.isAbandon()) {
                 execution.getActionExecutions().stream()
                         .filter(a -> "InProgress".equals(a.getStatus()))
                         .forEach(a -> {
                             a.setStatus("Abandoned");
+                            a.setSummary("Action abandoned.");
                             a.setLastUpdateTime(now());
                         });
             }
+            putExecution(execution);
         }
-        putExecution(execution);
         eventPublisher.pipelineStateChange(execution, "STOPPING");
         return mapper.createObjectNode().put("pipelineExecutionId", execution.getPipelineExecutionId());
     }
@@ -1941,8 +1942,8 @@ public class CodePipelineService {
         return !"Succeeded".equals(previousStatuses.get(action.path("name").asText()));
     }
 
-    private void runAction(CodePipelinePipeline pipeline, CodePipelineExecution execution,
-                           String stageName, JsonNode action) {
+    void runAction(CodePipelinePipeline pipeline, CodePipelineExecution execution,
+                   String stageName, JsonNode action) {
         ActionExecution state = new ActionExecution();
         state.setActionExecutionId(UUID.randomUUID().toString());
         state.setStageName(stageName);
@@ -1956,29 +1957,44 @@ public class CodePipelineService {
         state.setStartTime(now());
         state.setLastUpdateTime(state.getStartTime());
         synchronized (execution) {
+            if (execution.isStopRequested()) {
+                return;
+            }
             execution.getActionExecutions().add(state);
             putExecution(execution);
         }
         eventPublisher.actionStateChange(execution, state, "STARTED");
         try {
             executeProvider(pipeline, execution, action, state);
-            if ("InProgress".equals(state.getStatus())) {
-                state.setStatus("Succeeded");
-            }
-            if (state.getSummary() == null) {
-                state.setSummary("Action completed.");
+            synchronized (execution) {
+                if ("InProgress".equals(state.getStatus())) {
+                    state.setStatus("Succeeded");
+                }
+                if (state.getSummary() == null) {
+                    state.setSummary("Action completed.");
+                }
             }
         } catch (Exception e) {
-            state.setStatus("Failed");
-            state.setSummary(e.getMessage());
-            state.setErrorDetails(Map.of(
-                    "code", e instanceof AwsException aws ? aws.getErrorCode() : "ActionExecutionFailed",
-                    "message", Objects.toString(e.getMessage(), "Action failed")));
-            execution.setStatus("Failed");
-            execution.setStatusSummary("Action " + state.getActionName() + " failed: " + state.getSummary());
+            synchronized (execution) {
+                if (!"Abandoned".equals(state.getStatus())) {
+                    state.setStatus("Failed");
+                    state.setSummary(e.getMessage());
+                    state.setErrorDetails(Map.of(
+                            "code", e instanceof AwsException aws ? aws.getErrorCode() : "ActionExecutionFailed",
+                            "message", Objects.toString(e.getMessage(), "Action failed")));
+                    if (!execution.isStopRequested()) {
+                        execution.setStatus("Failed");
+                        execution.setStatusSummary("Action " + state.getActionName() + " failed: " + state.getSummary());
+                    }
+                }
+            }
         } finally {
-            state.setLastUpdateTime(now());
-            putExecution(execution);
+            synchronized (execution) {
+                if (!"Abandoned".equals(state.getStatus())) {
+                    state.setLastUpdateTime(now());
+                }
+                putExecution(execution);
+            }
             String terminalState = switch (state.getStatus()) {
                 case "Succeeded" -> "SUCCEEDED";
                 case "Failed" -> "FAILED";
@@ -2408,23 +2424,30 @@ public class CodePipelineService {
     }
 
     private boolean abandonExternalActionIfRequested(CodePipelineExecution execution, ActionExecution state) {
-        if (!execution.isStopRequested() || !execution.isAbandon()) {
-            return false;
+        synchronized (execution) {
+            if (!execution.isStopRequested() || !execution.isAbandon()) {
+                return false;
+            }
+            state.setStatus("Abandoned");
+            state.setSummary("Action abandoned.");
+            return true;
         }
-        state.setStatus("Abandoned");
-        state.setSummary("Action abandoned.");
-        return true;
     }
 
     private boolean recordExternalActionFailureWhileStopping(CodePipelineExecution execution,
                                                               ActionExecution state, String message) {
-        if (!execution.isStopRequested()) {
-            return false;
+        synchronized (execution) {
+            if (!execution.isStopRequested()) {
+                return false;
+            }
+            if (abandonExternalActionIfRequested(execution, state)) {
+                return true;
+            }
+            state.setStatus("Failed");
+            state.setSummary(message);
+            state.setErrorDetails(Map.of("code", "ActionExecutionFailed", "message", message));
+            return true;
         }
-        state.setStatus("Failed");
-        state.setSummary(message);
-        state.setErrorDetails(Map.of("code", "ActionExecutionFailed", "message", message));
-        return true;
     }
 
     private void executeLambda(CodePipelineExecution execution, JsonNode action, ActionExecution state) {
