@@ -646,7 +646,8 @@ public class ApiGatewayExecuteController {
                 authorizerResult.principalId(), authorizerResult.context(), resolvedApiKey, iamIdentity);
 
         functionName = resolvedLambdaIntegrationTarget(scope, functionName);
-        Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path);
+        Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path,
+                headers, uriInfo, body);
         if (permissionError != null) {
             return permissionError;
         }
@@ -677,15 +678,31 @@ public class ApiGatewayExecuteController {
     }
 
     private Response lambdaIntegrationPermission(GatewayResponseScope scope, Integration integration,
-                                                  String functionArn, String httpMethod, String path) {
+                                                  String functionArn, String httpMethod, String path,
+                                                  HttpHeaders headers, UriInfo uriInfo, byte[] body) {
         String credentials = integration.getCredentials();
         Decision decision;
         if (credentials != null && !credentials.isBlank()) {
-            if (callerCredentialsPassthrough(credentials)) {
+            if ("*".equals(credentials)) {
+                // Retained local compatibility spelling, not the documented AWS caller sentinel.
                 return null;
             }
-            decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
-                    "lambda:InvokeFunction", functionArn, regionResolver.getAccountId(), regionResolver.getPartition());
+            if (callerCredentialsPassthrough(credentials)) {
+                ExecuteApiSigV4Authorizer.CallerIdentity caller = scope.iamIdentity();
+                if (caller == null) {
+                    ExecuteApiSigV4Authorizer.Result verified = sigV4Authorizer.authorize(
+                            httpMethod, headers, uriInfo, body, routeContext.signedRequestPath());
+                    if (verified.authorized()) {
+                        caller = verified.identity();
+                    }
+                }
+                decision = callerCallAuthorizer.authorize(caller == null ? null : caller.accessKey(),
+                        caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                        "lambda:InvokeFunction", functionArn, regionResolver.getPartition());
+            } else {
+                decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                        "lambda:InvokeFunction", functionArn, regionResolver.getAccountId(), regionResolver.getPartition());
+            }
         } else {
             // Lambda's API Gateway guide uses the function's region in a cross-region source ARN.
             String sourceArn = buildMethodArn(AwsArnUtils.parse(functionArn).region(), scope.apiId(),
@@ -701,9 +718,6 @@ public class ApiGatewayExecuteController {
     }
 
     private boolean callerCredentialsPassthrough(String credentials) {
-        if ("*".equals(credentials)) {
-            return true;
-        }
         if (!AwsArnUtils.isArnFor(credentials, "iam")) {
             return false;
         }
@@ -2061,7 +2075,8 @@ public class ApiGatewayExecuteController {
                             "Cannot resolve Lambda function name from URI: " + integration.getUri(), 400);
                 }
                 functionName = resolvedLambdaIntegrationTarget(scope, functionName);
-                Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path);
+                Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path,
+                        headers, uriInfo, body);
                 if (permissionError != null) {
                     return permissionError;
                 }
