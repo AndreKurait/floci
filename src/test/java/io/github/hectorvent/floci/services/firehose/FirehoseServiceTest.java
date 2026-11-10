@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.firehose.model.RedshiftDestination;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
+import io.github.hectorvent.floci.testing.LockWaits;
 import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -37,7 +38,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
@@ -141,23 +141,6 @@ class FirehoseServiceTest {
         AccountAwareStorageBackend<Map<String, String>> store =
                 (AccountAwareStorageBackend<Map<String, String>>) backends.get("firehose/source-iterators.json");
         return store.getForAccount("000000000000", "us-east-1/" + deliveryStream);
-    }
-
-    /**
-     * Spin until {@code thread} is parked entering a monitor or {@code task} has finished,
-     * whichever comes first, so the assertions that follow see a settled state rather than
-     * a thread that was merely never scheduled.
-     */
-    private static void awaitParkedOrDone(AtomicReference<Thread> thread, Future<?> task)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (System.nanoTime() < deadline && !task.isDone()) {
-            Thread th = thread.get();
-            if (th != null && th.getState() == Thread.State.BLOCKED) {
-                return;
-            }
-            Thread.sleep(5);
-        }
     }
 
     private static S3Destination destination(String bucketArn, String compressionFormat) {
@@ -1094,7 +1077,11 @@ class FirehoseServiceTest {
             Future<?> poll = pool.submit(firehoseService::pollKinesisSources);
             assertTrue(pollRead.await(2, TimeUnit.SECONDS), "the poll must read its page");
             // A takes "first" with its checkpoint and parks inside the S3 write.
-            Future<?> flushA = pool.submit(() -> firehoseService.flush("sourced-stream"));
+            AtomicReference<Thread> aThread = new AtomicReference<>();
+            Future<?> flushA = pool.submit(() -> {
+                aThread.set(Thread.currentThread());
+                firehoseService.flush("sourced-stream");
+            });
             assertTrue(firstWriteStarted.await(2, TimeUnit.SECONDS), "flush A must reach its S3 write");
             // P buffers "second" and leaves a checkpoint past both records pending.
             resumePoll.countDown();
@@ -1105,7 +1092,8 @@ class FirehoseServiceTest {
                 bThread.set(Thread.currentThread());
                 firehoseService.flush("sourced-stream");
             });
-            awaitParkedOrDone(bThread, flushB);
+            // B is stopped at the stream's flush lock, which A keeps until its write returns.
+            LockWaits.awaitBlockedBehind(bThread, aThread, flushB);
 
             // Committing B's checkpoint now would persist a position past "first" while
             // "first" is not durable: a restart before A's retry would skip it forever.
@@ -1113,8 +1101,7 @@ class FirehoseServiceTest {
                     "no checkpoint may be committed while an earlier batch is unresolved");
             verify(s3Service, times(1)).putObject(anyString(), anyString(), any(byte[].class), anyString(),
                     anyMap(), any(PutObjectOptions.class));
-            assertThrows(TimeoutException.class, () -> flushB.get(500, TimeUnit.MILLISECONDS),
-                    "a later flush must wait for the earlier batch to resolve");
+            assertFalse(flushB.isDone(), "a later flush must wait for the earlier batch to resolve");
 
             releaseFirstWrite.countDown();
             flushA.get(2, TimeUnit.SECONDS);

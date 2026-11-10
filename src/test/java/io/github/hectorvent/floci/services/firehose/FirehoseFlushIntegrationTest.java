@@ -83,7 +83,8 @@ class FirehoseFlushIntegrationTest {
         // advancing it; the real 1s tick then finds the buffer due.
         clock.advance(Duration.ofSeconds(61));
 
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
             given()
                 .when()
                 .get("/" + bucket + "/" + firstDeliveredKey(bucket))
@@ -151,17 +152,18 @@ class FirehoseFlushIntegrationTest {
         // interval trigger below would never fire.
         firehoseService.tickSafely();
 
-        // The frozen test-scope Clock only elapses when advanced; the real 1s tick then
-        // finds the buffer due, same as intervalTriggerDeliversAfterIntervalInSecondsElapses.
+        // The frozen test-scope Clock only elapses when advanced; the next tick then finds the
+        // buffer due. intervalTriggerDeliversAfterIntervalInSecondsElapses leaves that tick to the
+        // flusher's own thread; here the test runs it, as it ran the ones above.
         clock.advance(Duration.ofSeconds(61));
+        firehoseService.tickSafely();
 
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-            given()
-                .when()
-                .get("/" + bucket + "/" + firstDeliveredKey(bucket))
-                .then()
-                .statusCode(200)
-                .body(equalTo("new\n")));
+        given()
+            .when()
+            .get("/" + bucket + "/" + firstDeliveredKey(bucket))
+            .then()
+            .statusCode(200)
+            .body(equalTo("new\n"));
     }
 
     private void createKinesisStream(String streamName) {
