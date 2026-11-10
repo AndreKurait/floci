@@ -115,7 +115,7 @@ public class CodePipelineService {
     private final S3Service s3Service;
     private final CodePipelineEventPublisher eventPublisher;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    private final ScheduledExecutorService sourcePoller = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService sourcePoller;
     private final KeyedLockPool pipelineLocks = new KeyedLockPool();
     private final KeyedLockPool sourcePollLocks = new KeyedLockPool();
     private static final String MANUAL_TRIGGER_DETAIL = "manual";
@@ -138,10 +138,10 @@ public class CodePipelineService {
     /** Internal override type: a rollback pins a GitHub source action to the target's commit. */
     private static final String GITHUB_COMMIT_ID = "GITHUB_COMMIT_ID";
 
-    private static final long DEFAULT_RUN_FINISH_WAIT_NANOS = TimeUnit.SECONDS.toNanos(5);
+    static final long DEFAULT_RUN_FINISH_WAIT_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     /** Matches the {@code source-poll-interval-ms} default in application.yml. */
-    private static final long DEFAULT_SOURCE_POLL_INTERVAL_MS = 500L;
+    static final long DEFAULT_SOURCE_POLL_INTERVAL_MS = 500L;
 
     /**
      * Package-private constructor for the tests that build the service without CDI. The source
@@ -197,12 +197,24 @@ public class CodePipelineService {
         return fallback;
     }
 
-    @SuppressWarnings("unchecked")
     CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
                         CodeBuildService codeBuildService, CodeDeployService codeDeployService,
                         LambdaService lambdaService, S3Service s3Service,
                         CodePipelineEventPublisher eventPublisher, long sourcePollIntervalMs, long workerPollIntervalMs,
                         long runFinishWaitNanos, Runnable beforeOverrideTimeoutCleanup) {
+        this(storageFactory, mapper, codeBuildService, codeDeployService, lambdaService, s3Service,
+                eventPublisher, sourcePollIntervalMs, workerPollIntervalMs, runFinishWaitNanos,
+                beforeOverrideTimeoutCleanup, Executors.newSingleThreadScheduledExecutor());
+    }
+
+    /** Package-private so tests can run the S3 source poller on a scheduler they control. */
+    @SuppressWarnings("unchecked")
+    CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
+                        CodeBuildService codeBuildService, CodeDeployService codeDeployService,
+                        LambdaService lambdaService, S3Service s3Service,
+                        CodePipelineEventPublisher eventPublisher, long sourcePollIntervalMs, long workerPollIntervalMs,
+                        long runFinishWaitNanos, Runnable beforeOverrideTimeoutCleanup,
+                        ScheduledExecutorService sourcePoller) {
         this.pipelineStore = storageFactory.create(
                 "codepipeline", "codepipeline-pipelines.json", new TypeReference<Map<String, CodePipelinePipeline>>() {});
         this.executionStore = storageFactory.create(
@@ -221,6 +233,7 @@ public class CodePipelineService {
                 DEFAULT_WORKER_POLL_INTERVAL_MS);
         this.runFinishWaitNanos = runFinishWaitNanos;
         this.beforeOverrideTimeoutCleanup = beforeOverrideTimeoutCleanup;
+        this.sourcePoller = sourcePoller;
     }
 
     public JsonNode handle(String action, JsonNode request, String region, String account) {

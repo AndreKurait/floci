@@ -1,11 +1,20 @@
 package io.github.hectorvent.floci.services.codepipeline;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.codebuild.CodeBuildService;
+import io.github.hectorvent.floci.services.codedeploy.CodeDeployService;
+import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.testing.TestTime;
+import io.quarkus.arc.Arc;
+import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
-import jakarta.inject.Inject;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -37,28 +46,67 @@ class CodePipelineIntegrationTest {
     private static final String CONTENT_TYPE = "application/x-amz-json-1.1";
     private static final String TARGET = "CodePipeline_20150709.";
 
-    @Inject
-    EmulatorConfig config;
+    /** floci.services.codepipeline.source-poll-interval-ms as shipped in the main application.yml. */
+    private static final Duration SOURCE_POLL_INTERVAL =
+            Duration.ofMillis(CodePipelineService.DEFAULT_SOURCE_POLL_INTERVAL_MS);
+    private static final TestTime time = TestTime.create();
+    private static CodePipelineService service;
 
     /**
-     * Sleeps for {@code cycles} times the configured source poll interval. The assertions that
-     * follow these waits check that no execution, or no additional execution, was started, and they
-     * are only meaningful if the poller actually ran and declined, so the wait scales with the
-     * interval instead of hard-coding milliseconds that stop covering enough cycles when the
-     * interval changes.
-     *
-     * <p>This is wall clock, not a handshake with the scheduler. The poller runs on a fixed delay,
-     * so its period is the interval plus however long a pass takes, and fewer than {@code cycles}
-     * passes may complete within the sleep. Several cycles are requested to leave margin for that,
-     * not to guarantee a number of completed passes.
+     * Runs {@code cycles} passes of the S3 source poller, each on the calling thread, by letting that
+     * many poll intervals pass. Every pass has completed when this returns, so an assertion that no
+     * execution, or no additional execution, was started holds for passes that ran and declined.
      */
-    private void awaitSourcePollCycles(int cycles) throws InterruptedException {
-        Thread.sleep(config.services().codepipeline().sourcePollIntervalMs() * cycles);
+    private static void runSourcePollCycles(int cycles) {
+        time.advance(SOURCE_POLL_INTERVAL.multipliedBy(cycles));
     }
 
+    /**
+     * Requires that a source change made since the last poll is not picked up one millisecond before
+     * the next poll is due, lets that millisecond pass, and returns the executions listed right after.
+     */
+    private static Response executionsStartedByTheNextSourcePoll(String pipelineName, int alreadyStarted) {
+        time.advance(SOURCE_POLL_INTERVAL.minusMillis(1));
+        post("ListPipelineExecutions", """
+                {"pipelineName": "%s"}
+                """.formatted(pipelineName))
+                .then()
+                .statusCode(200)
+                .body("pipelineExecutionSummaries", hasSize(alreadyStarted));
+        time.advance(Duration.ofMillis(1));
+        Response executions = post("ListPipelineExecutions", """
+                {"pipelineName": "%s"}
+                """.formatted(pipelineName));
+        executions.then().statusCode(200).body("pipelineExecutionSummaries", hasSize(alreadyStarted + 1));
+        return executions;
+    }
+
+    /**
+     * Serves the HTTP API from the real service with its S3 source poller on the test's timeline, at
+     * the production interval. It keeps its own stores: the injected service shares the runtime
+     * stores and polls them in real time, which would start the executions these tests time.
+     * {@code CodePipelineSourcePollerWiringIntegrationTest} covers that real poller.
+     */
     @BeforeAll
-    static void configureRestAssured() {
+    static void pollSourcesOnAControlledTimeline() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+        service = new CodePipelineService(new InMemoryStorageFactory("000000000000"), bean(ObjectMapper.class),
+                bean(CodeBuildService.class), bean(CodeDeployService.class), bean(LambdaService.class),
+                bean(S3Service.class), bean(CodePipelineEventPublisher.class),
+                SOURCE_POLL_INTERVAL.toMillis(),
+                bean(EmulatorConfig.class).services().codepipeline().workerPollIntervalMs(),
+                CodePipelineService.DEFAULT_RUN_FINISH_WAIT_NANOS, () -> { }, time.scheduler());
+        service.resumePersistedExecutions();
+        QuarkusMock.installMockForType(service, CodePipelineService.class);
+    }
+
+    @AfterAll
+    static void stopTheControlledService() {
+        service.shutdown();
+    }
+
+    private static <T> T bean(Class<T> type) {
+        return Arc.container().instance(type).get();
     }
 
     @Test
@@ -416,7 +464,7 @@ class CodePipelineIntegrationTest {
                 """))
                 .then().statusCode(200);
 
-        awaitSourcePollCycles(5);
+        runSourcePollCycles(5);
         post("ListPipelineExecutions", """
                 {"pipelineName": "%s"}
                 """.formatted(pipelineName))
@@ -426,7 +474,7 @@ class CodePipelineIntegrationTest {
 
         putObject("codepipeline-poll-source", "source.zip", "changed artifact");
 
-        Response executions = waitForPipelineExecutionCount(pipelineName, 1);
+        Response executions = executionsStartedByTheNextSourcePoll(pipelineName, 0);
         String executionId = executions.jsonPath().getString("pipelineExecutionSummaries[0].pipelineExecutionId");
         waitForExecution(pipelineName, executionId, "Succeeded");
 
@@ -445,7 +493,7 @@ class CodePipelineIntegrationTest {
                 .statusCode(200)
                 .body(equalTo("changed artifact"));
 
-        awaitSourcePollCycles(5);
+        runSourcePollCycles(5);
         post("ListPipelineExecutions", """
                 {"pipelineName": "%s"}
                 """.formatted(pipelineName))
@@ -502,7 +550,7 @@ class CodePipelineIntegrationTest {
                 """))
                 .then().statusCode(200);
 
-        awaitSourcePollCycles(3);
+        runSourcePollCycles(3);
         post("ListPipelineExecutions", """
                 {"pipelineName": "%s"}
                 """.formatted(pipelineName))
@@ -512,7 +560,7 @@ class CodePipelineIntegrationTest {
 
         putObject("codepipeline-poll-missing-source", "source.zip", "first available artifact");
 
-        Response executions = waitForPipelineExecutionCount(pipelineName, 1);
+        Response executions = executionsStartedByTheNextSourcePoll(pipelineName, 0);
         String executionId = executions.jsonPath().getString("pipelineExecutionSummaries[0].pipelineExecutionId");
         waitForExecution(pipelineName, executionId, "Succeeded");
         post("GetPipelineExecution", """
@@ -573,7 +621,7 @@ class CodePipelineIntegrationTest {
                 .then().statusCode(200);
 
         putObject("codepipeline-poll-disabled-source", "source.zip", "changed artifact");
-        awaitSourcePollCycles(5);
+        runSourcePollCycles(5);
 
         post("ListPipelineExecutions", """
                 {"pipelineName": "%s"}
@@ -2555,21 +2603,6 @@ class CodePipelineIntegrationTest {
             Thread.sleep(50);
         } while (Instant.now().isBefore(deadline));
         throw new AssertionError("Custom action job was not created");
-    }
-
-    private Response waitForPipelineExecutionCount(String pipelineName, int expectedCount) throws Exception {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-        Response response;
-        do {
-            response = post("ListPipelineExecutions", """
-                    {"pipelineName": "%s"}
-                    """.formatted(pipelineName));
-            if (response.jsonPath().getList("pipelineExecutionSummaries").size() == expectedCount) {
-                return response;
-            }
-            Thread.sleep(50);
-        } while (Instant.now().isBefore(deadline));
-        throw new AssertionError("Pipeline execution count did not reach " + expectedCount);
     }
 
     private void waitForExecution(String pipelineName, String executionId, String expected) throws Exception {
