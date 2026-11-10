@@ -3,6 +3,7 @@ package io.floci.aws.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigateway.AwsServiceRouter;
 import io.floci.aws.services.apigateway.VtlTemplateEngine;
 import io.floci.aws.services.lambda.LambdaService;
@@ -29,7 +30,7 @@ class WebSocketIntegrationInvokerSubstitutionTest {
                 mock(LambdaService.class),
                 mock(AwsServiceRouter.class),
                 new ObjectMapper(),
-                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class));
+                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class));
     }
 
     @Test

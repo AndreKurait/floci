@@ -1233,3 +1233,5 @@ configuration error before invocation. Configured authorizer roles retain their
 separate execution path; this check does not implement role assumption.
 
 WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
+
+WebSocket Lambda integrations with a configured execution role check API Gateway service trust and the role's identity, resource, permissions-boundary and SCP policies when IAM enforcement is enabled. The API owner account and partition constrain the role; qualified targets are resolved once before authorization and invocation. The caller-credentials sentinel and legacy bare-star compatibility path remain separate from role enforcement. Issued execution-role STS sessions and full condition-context forwarding are not modeled by this check.
