@@ -147,19 +147,23 @@ public class LambdaVpcNetworkManager {
     /** Called only after the workload has been confirmed removed. */
     void release(Attachment attachment) {
         RequestScopes.callAs(attachment.accountId(), attachment.region(), () -> {
-            // Keep the ENI reserved if the helper cannot be removed.
-            lifecycle.removeIfExistsStrict(attachment.helperId());
             try {
+                // Retirement quarantines this namespace before refreshing its peers.
                 firewall.unregister(attachment.eniId());
             } catch (RuntimeException failure) {
-                // A different endpoint may fail reconciliation after this helper is gone.
+                // A peer refresh failure must not leak this attachment. Keep its ENI
+                // reserved if the captured helper cannot be removed.
                 try {
+                    lifecycle.removeIfExistsStrict(attachment.helperId());
                     releaseInterface(attachment.region(), attachment.eniId());
                 } catch (RuntimeException cleanupFailure) {
-                    failure.addSuppressed(cleanupFailure);
+                    if (cleanupFailure != failure) {
+                        failure.addSuppressed(cleanupFailure);
+                    }
                 }
                 throw failure;
             }
+            lifecycle.removeIfExistsStrict(attachment.helperId());
             releaseInterface(attachment.region(), attachment.eniId());
             return null;
         });
