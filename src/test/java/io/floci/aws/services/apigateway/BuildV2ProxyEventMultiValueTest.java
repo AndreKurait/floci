@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -55,7 +56,7 @@ class BuildV2ProxyEventMultiValueTest {
         controller = new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, mock(ServiceCallAuthorizer.class), null);
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, mock(ServiceCallAuthorizer.class), null, mock(ServiceRoleCallAuthorizer.class));
     }
 
     enum Builder { INTEGRATION, AUTHORIZER }

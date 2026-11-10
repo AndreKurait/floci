@@ -3,6 +3,7 @@ package io.floci.aws.services.apigateway;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.Base64Url;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -31,7 +32,7 @@ class JwtClaimsWireFormatTest {
                 null, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, null, mock(ServiceCallAuthorizer.class), null);
+        , null, null, null, mock(ServiceCallAuthorizer.class), null, mock(ServiceRoleCallAuthorizer.class));
     }
 
     private static String unsignedToken(String claimsJson) {

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigateway.model.ApiGatewayResource;
 import io.floci.aws.services.apigateway.model.Authorizer;
 import io.floci.aws.services.apigateway.model.Integration;
@@ -90,7 +91,8 @@ class RestAuthorizerFailureTest {
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
                 new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, cache,
-                new AuthorizerPolicyEvaluator(evaluator), null, direct, null);
+                new AuthorizerPolicyEvaluator(evaluator), null, direct, null,
+                mock(ServiceRoleCallAuthorizer.class));
     }
 
     @ParameterizedTest
