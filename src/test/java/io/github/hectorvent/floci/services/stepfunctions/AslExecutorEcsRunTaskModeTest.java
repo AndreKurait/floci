@@ -23,7 +23,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -77,7 +76,8 @@ class AslExecutorEcsRunTaskModeTest {
         // The .sync wait reads the execution back to notice a StopExecution; RUNNING unless a test says otherwise.
         sfnService = mock(StepFunctionsService.class);
         when(sfnService.describeExecution(any())).thenAnswer(invocation -> parent(invocation.getArgument(0), "RUNNING"));
-        executor = newExecutor(TimeUnit.NANOSECONDS::sleep);
+        // A poll interval passes by itself: the worker moves the timeline on instead of waiting for it.
+        executor = newExecutor(nanos -> time.sleepAdvancing(Duration.ofNanos(nanos)));
     }
 
     private AslExecutor newExecutor(AslExecutor.Sleeper sleeper) {
