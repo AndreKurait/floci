@@ -5,9 +5,11 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.*;
 
+import java.time.Duration;
 import java.time.Instant;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.*;
 
 @QuarkusTest
@@ -179,7 +181,7 @@ class EventBridgeReplayIntegrationTest {
 
     @Test
     @Order(7)
-    void startReplayAndPollUntilCompleted() throws InterruptedException {
+    void startReplayAndPollUntilCompleted() {
         // drain any prior messages delivered by putEvents
         given()
                 .contentType(SQS_CT)
@@ -206,18 +208,17 @@ class EventBridgeReplayIntegrationTest {
                 .body("ReplayArn", notNullValue())
                 .body("State", anyOf(equalTo("STARTING"), equalTo("RUNNING"), equalTo("COMPLETED")));
 
-        // poll until COMPLETED (up to 5 s)
-        String state = "STARTING";
-        for (int i = 0; i < 50 && !"COMPLETED".equals(state) && !"FAILED".equals(state); i++) {
-            Thread.sleep(100);
-            state = given()
-                    .contentType(EB_CT)
-                    .header("X-Amz-Target", "AWSEvents.DescribeReplay")
-                    .body("{\"ReplayName\":\"test-replay-1\"}")
-                    .when().post("/")
-                    .then().statusCode(200)
-                    .extract().jsonPath().getString("State");
-        }
+        // The replay runs on its own thread: wait for it to reach a terminal state (up to 5 s)
+        String state = await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> given()
+                        .contentType(EB_CT)
+                        .header("X-Amz-Target", "AWSEvents.DescribeReplay")
+                        .body("{\"ReplayName\":\"test-replay-1\"}")
+                        .when().post("/")
+                        .then().statusCode(200)
+                        .extract().jsonPath().getString("State"),
+                        current -> "COMPLETED".equals(current) || "FAILED".equals(current));
 
         Assertions.assertEquals("COMPLETED", state, "Replay did not reach COMPLETED state");
     }
