@@ -33,10 +33,12 @@ class AutoScalingEventReconciliationIntegrationTest {
             try {
                 first.setDesiredCapacity(request -> request.autoScalingGroupName(name).desiredCapacity(1));
                 second.setDesiredCapacity(request -> request.autoScalingGroupName(name).desiredCapacity(1));
-                await().atMost(Duration.ofSeconds(4)).untilAsserted(() -> {
-                    assertReady(first, name, "111111111111", "us-east-1");
-                    assertReady(second, name, "222222222222", "us-gov-west-1");
-                });
+                await().atMost(Duration.ofSeconds(4))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() -> {
+                            assertReady(first, name, "111111111111", "us-east-1");
+                            assertReady(second, name, "222222222222", "us-gov-west-1");
+                        });
                 first.deleteAutoScalingGroup(request -> request.autoScalingGroupName(name).forceDelete(true));
                 assertTrue(first.describeAutoScalingGroups(request -> request.autoScalingGroupNames(name))
                         .autoScalingGroups().isEmpty());

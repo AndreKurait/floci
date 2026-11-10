@@ -221,19 +221,23 @@ class AutoScalingStandbyLifecycleIntegrationTest {
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(ACCOUNT, "test")))
                 .build()) {
             ec2.stopInstances(request -> request.instanceIds(id));
-            await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                    assertEquals("stopped", ec2.describeInstances(request -> request.instanceIds(id))
-                            .reservations().getFirst().instances().getFirst().state().nameAsString()));
+            await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
+                            assertEquals("stopped", ec2.describeInstances(request -> request.instanceIds(id))
+                                    .reservations().getFirst().instances().getFirst().state().nameAsString()));
             assertEquals("Standby", describeInstance(id).lifecycleState());
             assertEquals("HEALTHY", describeInstance(id).healthStatus());
             Activity exiting = client.exitStandby(request -> request.autoScalingGroupName(name).instanceIds(id))
                     .activities().getFirst();
-            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-                assertEquals(2, activeInstanceIds().size());
-                assertFalse(group().instances().stream().anyMatch(instance -> id.equals(instance.instanceId())));
-                assertEquals("terminated", ec2.describeInstances(request -> request.instanceIds(id))
-                        .reservations().getFirst().instances().getFirst().state().nameAsString());
-            });
+            await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        assertEquals(2, activeInstanceIds().size());
+                        assertFalse(group().instances().stream().anyMatch(instance -> id.equals(instance.instanceId())));
+                        assertEquals("terminated", ec2.describeInstances(request -> request.instanceIds(id))
+                                .reservations().getFirst().instances().getFirst().state().nameAsString());
+                    });
             assertTrafficMembers(activeInstanceIds());
             Activity cancelled = client.describeScalingActivities(request -> request.autoScalingGroupName(name))
                     .activities().stream().filter(activity -> exiting.activityId().equals(activity.activityId()))
@@ -251,12 +255,16 @@ class AutoScalingStandbyLifecycleIntegrationTest {
     }
 
     private void awaitLifecycle(String id, String state) {
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                assertEquals(state, describeInstance(id).lifecycleState()));
+        await().atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
+                        assertEquals(state, describeInstance(id).lifecycleState()));
     }
 
     private void awaitActiveInstances(int count) {
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals(count, activeInstanceIds().size()));
+        await().atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals(count, activeInstanceIds().size()));
     }
 
     private List<String> activeInstanceIds() {
@@ -265,14 +273,16 @@ class AutoScalingStandbyLifecycleIntegrationTest {
     }
 
     private void assertCompleted(String activityId) {
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            Activity activity = client.describeScalingActivities(request -> request.autoScalingGroupName(name))
-                    .activities().stream().filter(item -> activityId.equals(item.activityId()))
-                    .findFirst().orElseThrow();
-            assertEquals("Successful", activity.statusCodeAsString());
-            assertEquals(100, activity.progress());
-            assertNotNull(activity.endTime());
-        });
+        await().atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    Activity activity = client.describeScalingActivities(request -> request.autoScalingGroupName(name))
+                            .activities().stream().filter(item -> activityId.equals(item.activityId()))
+                            .findFirst().orElseThrow();
+                    assertEquals("Successful", activity.statusCodeAsString());
+                    assertEquals(100, activity.progress());
+                    assertNotNull(activity.endTime());
+                });
     }
 
     private AutoScalingGroup group() {
