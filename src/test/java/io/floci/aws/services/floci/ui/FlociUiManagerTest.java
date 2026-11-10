@@ -546,10 +546,11 @@ class FlociUiManagerTest {
         // The sidecar is gone (ABSENT) and unreachable (nothing listens on localhost:4500), so
         // status() must trigger a second async restart. That restart no longer re-adopts the dead
         // container, so the kick is observed by the start running a second time at all.
-        manager.status();
-
         await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(2, TimeUnit.SECONDS)
-                .untilAsserted(() -> verify(lifecycleManager, times(2)).findByName("floci-ui"));
+                .untilAsserted(() -> {
+                    manager.status();
+                    verify(lifecycleManager, times(2)).findByName("floci-ui");
+                });
     }
 
     @Test
