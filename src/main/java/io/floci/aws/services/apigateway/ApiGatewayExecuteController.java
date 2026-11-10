@@ -23,6 +23,7 @@ import io.floci.aws.core.common.AwsErrorResponse;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsPartition;
 import io.floci.aws.core.common.AwsPartitions;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.CookieHeaders;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
@@ -145,6 +146,7 @@ public class ApiGatewayExecuteController {
     private final RestLambdaAuthorizer restLambdaAuthorizer;
     private final AuthorizerPolicyEvaluator authorizerPolicyEvaluator;
     private final CloudMapInstanceResolver cloudMapInstanceResolver;
+    private final CallerCallAuthorizer callerCallAuthorizer;
 
     @Inject
     public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, CognitoUserPoolAuthorizer cognitoAuthorizer,
@@ -161,7 +163,8 @@ public class ApiGatewayExecuteController {
                                        ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
                                        CloudMapInstanceResolver cloudMapInstanceResolver,
-                                       ServiceCallAuthorizer serviceCallAuthorizer) {
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
@@ -185,6 +188,7 @@ public class ApiGatewayExecuteController {
         this.restLambdaAuthorizer = restLambdaAuthorizer;
         this.authorizerPolicyEvaluator = authorizerPolicyEvaluator;
         this.cloudMapInstanceResolver = cloudMapInstanceResolver;
+        this.callerCallAuthorizer = callerCallAuthorizer;
     }
 
     /** Matches an ELBv2 listener ARN (ALB {@code app/} or NLB {@code net/}); group 1 = region. */
@@ -499,6 +503,14 @@ public class ApiGatewayExecuteController {
                 return restIamRejection(scope, iamResult);
             }
             iamIdentity = iamResult.identity();
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod, path);
+            if (callerCallAuthorizer.authorize(iamIdentity == null ? null : iamIdentity.accessKey(),
+                    iamIdentity == null ? null : iamIdentity.accountId(),
+                    iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,
+                    AwsArnUtils.parse(invokeArn).partition()) != Decision.ALLOW) {
+                return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                        "User is not authorized to access this resource");
+            }
         }
 
         scope = scope.withIdentity(resolvedApiKey, iamIdentity);
