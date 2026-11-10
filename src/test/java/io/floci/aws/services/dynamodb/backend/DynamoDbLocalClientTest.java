@@ -14,15 +14,21 @@ import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Scope;
 import io.floci.aws.testutil.FreePorts;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
@@ -34,11 +40,19 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /** The signed HTTP client that forwards DynamoDB wire calls to an external DynamoDB Local. */
 class DynamoDbLocalClientTest {
 
     private static final Scope SCOPE = new Scope("123456789012", "eu-west-1");
+    // For a client whose HTTP layer is replaced: nothing is ever sent to it.
+    private static final URI UNUSED_ENDPOINT = URI.create("http://127.0.0.1:8000");
     private static final Pattern AUTHORIZATION = Pattern.compile(
             "AWS4-HMAC-SHA256 Credential=([^/]+)/(\\d{8})/([^/]+)/dynamodb/aws4_request, "
                     + "SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature=([0-9a-f]{64})");
@@ -46,6 +60,8 @@ class DynamoDbLocalClientTest {
     private final ObjectMapper mapper = new ObjectMapper();
     private final AtomicReference<Received> received = new AtomicReference<>();
     private final AtomicInteger hits = new AtomicInteger();
+    // A handler that must outlast the client's timeout waits here; tearDown lets it go.
+    private final CountDownLatch held = new CountDownLatch(1);
     private HttpServer server;
     private DynamoDbLocalClient client;
 
@@ -59,6 +75,7 @@ class DynamoDbLocalClientTest {
 
     @AfterEach
     void tearDown() {
+        held.countDown();
         if (client != null) {
             client.close();
         }
@@ -160,38 +177,74 @@ class DynamoDbLocalClientTest {
 
     @Test
     void timedOutRequestIsSentOnce() throws Exception {
+        HttpClient http = mock(HttpClient.class);
+        when(http.send(any(HttpRequest.class), any())).thenThrow(new HttpTimeoutException("request timed out"));
+        client = new DynamoDbLocalClient(UNUSED_ENDPOINT, Duration.ofMillis(200), mapper, http);
+
+        assertThrows(HttpTimeoutException.class,
+                () -> client.send(SCOPE, Api.DYNAMODB, "ListTables", mapper.createObjectNode()));
+
+        verify(http, times(1)).send(any(HttpRequest.class), any());
+    }
+
+    @Test
+    void aRequestTheServerHoldsTimesOutOverRealHttpAndReachesItOnce() throws Exception {
+        // Real-time wiring check: the JDK client enforces the timeout the request carries.
         start(exchange -> {
             hits.incrementAndGet();
-            Thread.sleep(2000);
+            held.await();
             reply(exchange, 200, "{}");
         }, Duration.ofMillis(200));
 
         assertThrows(HttpTimeoutException.class,
                 () -> client.send(SCOPE, Api.DYNAMODB, "ListTables", mapper.createObjectNode()));
-        Thread.sleep(500);
         assertEquals(1, hits.get());
     }
 
     @Test
     void aShorterBudgetCutsTheRequestTimeout() throws Exception {
-        start(exchange -> {
-            Thread.sleep(2000);
-            reply(exchange, 200, "{}");
-        }, Duration.ofSeconds(5));
+        HttpClient http = answering("{}");
+        client = new DynamoDbLocalClient(UNUSED_ENDPOINT, Duration.ofSeconds(5), mapper, http);
 
-        assertThrows(HttpTimeoutException.class, () -> client.send(SCOPE, Api.DYNAMODB, "ListTables",
-                mapper.createObjectNode(), Duration.ofMillis(200)));
+        client.send(SCOPE, Api.DYNAMODB, "ListTables", mapper.createObjectNode(), Duration.ofMillis(200));
+
+        assertEquals(Optional.of(Duration.ofMillis(200)), sentTo(http).timeout());
     }
 
     @Test
     void aLongerBudgetKeepsTheRequestTimeout() throws Exception {
-        start(exchange -> {
-            Thread.sleep(2000);
-            reply(exchange, 200, "{}");
-        }, Duration.ofMillis(200));
+        HttpClient http = answering("{}");
+        client = new DynamoDbLocalClient(UNUSED_ENDPOINT, Duration.ofMillis(200), mapper, http);
 
-        assertThrows(HttpTimeoutException.class, () -> client.send(SCOPE, Api.DYNAMODB, "ListTables",
-                mapper.createObjectNode(), Duration.ofSeconds(5)));
+        client.send(SCOPE, Api.DYNAMODB, "ListTables", mapper.createObjectNode(), Duration.ofSeconds(5));
+
+        assertEquals(Optional.of(Duration.ofMillis(200)), sentTo(http).timeout());
+    }
+
+    @Test
+    void aCallWithoutABudgetCarriesTheConfiguredRequestTimeout() throws Exception {
+        HttpClient http = answering("{}");
+        client = new DynamoDbLocalClient(UNUSED_ENDPOINT, Duration.ofSeconds(5), mapper, http);
+
+        client.send(SCOPE, Api.DYNAMODB, "ListTables", mapper.createObjectNode());
+
+        assertEquals(Optional.of(Duration.ofSeconds(5)), sentTo(http).timeout());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static HttpClient answering(String body) throws Exception {
+        HttpResponse<byte[]> response = mock(HttpResponse.class);
+        when(response.statusCode()).thenReturn(200);
+        when(response.body()).thenReturn(body.getBytes(StandardCharsets.UTF_8));
+        HttpClient http = mock(HttpClient.class);
+        doReturn(response).when(http).send(any(HttpRequest.class), any());
+        return http;
+    }
+
+    private static HttpRequest sentTo(HttpClient http) throws Exception {
+        ArgumentCaptor<HttpRequest> sent = ArgumentCaptor.forClass(HttpRequest.class);
+        verify(http).send(sent.capture(), any());
+        return sent.getValue();
     }
 
     private void start(Responder responder) throws IOException {

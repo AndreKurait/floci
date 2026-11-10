@@ -1,5 +1,6 @@
 package io.floci.aws.services.elasticache.proxy;
 
+import io.floci.aws.testing.TestTime;
 import io.floci.aws.testutil.FreePorts;
 import org.junit.jupiter.api.Test;
 
@@ -7,11 +8,16 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class AbstractRedisAuthProxyRelayTest {
+
+    private static final Duration ONE_NANO = Duration.ofNanos(1);
+    private static final Duration RELAY_JOIN_TIMEOUT =
+            Duration.ofMillis(AbstractRedisAuthProxy.RELAY_JOIN_TIMEOUT_MILLIS);
 
     @Test
     void closingBackendReleasesClientConnection() throws Exception {
@@ -96,10 +102,52 @@ class AbstractRedisAuthProxyRelayTest {
     }
 
     @Test
-    void keepsHealthyIdleConnectionOpenBeyondRelayShutdownDeadline() throws Exception {
+    void aRelayWhoseBackendStaysOpenIsClosedWhenTheJoinTimeoutEnds() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineRelayJoin joins = new TimelineRelayJoin(time);
         try (ServerSocket backendServer = new ServerSocket(0)) {
             int proxyPort = FreePorts.anyInterfacePort();
-            TestProxy proxy = new TestProxy("127.0.0.1", backendServer.getLocalPort());
+            TestProxy proxy = proxyJoiningOn(joins, backendServer.getLocalPort());
+            proxy.start(proxyPort);
+
+            try (Socket client = new Socket("127.0.0.1", proxyPort)) {
+                client.setSoTimeout(30_000);
+                client.getOutputStream().write("*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII));
+                client.getOutputStream().flush();
+                client.shutdownOutput();
+                try (Socket backend = backendServer.accept()) {
+                    while (backend.getInputStream().read() != -1) {
+                        // Drain until the client half-close reaches the backend.
+                    }
+
+                    assertEquals(RELAY_JOIN_TIMEOUT, joins.awaitJoin(), "the client direction, which has ended");
+                    assertEquals(RELAY_JOIN_TIMEOUT, joins.awaitJoin(),
+                            "the backend direction, which is still open");
+
+                    time.advance(RELAY_JOIN_TIMEOUT.minus(ONE_NANO));
+                    assertEquals(1, joins.waiting(), "the proxy is still waiting for the backend direction");
+                    backend.getOutputStream().write("response".getBytes(StandardCharsets.US_ASCII));
+                    backend.getOutputStream().flush();
+                    assertEquals("response", new String(client.getInputStream().readNBytes(8),
+                            StandardCharsets.US_ASCII));
+
+                    time.advance(ONE_NANO);
+                    assertEquals(-1, client.getInputStream().read());
+                    assertEquals(2, joins.started());
+                }
+            } finally {
+                proxy.stop();
+            }
+        }
+    }
+
+    @Test
+    void keepsHealthyIdleConnectionOpenBeyondRelayShutdownDeadline() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineRelayJoin joins = new TimelineRelayJoin(time);
+        try (ServerSocket backendServer = new ServerSocket(0)) {
+            int proxyPort = FreePorts.anyInterfacePort();
+            TestProxy proxy = proxyJoiningOn(joins, backendServer.getLocalPort());
             proxy.start(proxyPort);
 
             try (Socket client = new Socket("127.0.0.1", proxyPort)) {
@@ -113,12 +161,14 @@ class AbstractRedisAuthProxyRelayTest {
                     assertEquals(new String(request, StandardCharsets.US_ASCII),
                             new String(backend.getInputStream().readNBytes(request.length),
                                     StandardCharsets.US_ASCII));
-                    Thread.sleep(2_200);
+                    time.advance(RELAY_JOIN_TIMEOUT.multipliedBy(2).plusMillis(200));
 
                     backend.getOutputStream().write("PONG".getBytes(StandardCharsets.US_ASCII));
                     backend.getOutputStream().flush();
                     assertEquals("PONG", new String(client.getInputStream().readNBytes(4),
                             StandardCharsets.US_ASCII));
+                    assertEquals(0, joins.started(),
+                            "neither direction ended, so the proxy never started its shutdown wait");
                 }
             } finally {
                 proxy.stop();
@@ -143,6 +193,15 @@ class AbstractRedisAuthProxyRelayTest {
         } finally {
             proxy.stop();
         }
+    }
+
+    private static TestProxy proxyJoiningOn(TimelineRelayJoin joins, int backendPort) {
+        return new TestProxy("127.0.0.1", backendPort) {
+            @Override
+            void joinRelay(Thread relay, long timeoutMillis) throws InterruptedException {
+                joins.join(relay, timeoutMillis);
+            }
+        };
     }
 
     private static class TestProxy extends AbstractRedisAuthProxy {

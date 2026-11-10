@@ -29,12 +29,12 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.containsString;
@@ -288,16 +288,11 @@ class RdsSnapshotExportIntegrationTest {
         }
     }
 
-    private static ExportTask awaitTerminal(RdsClient rds, String taskId) throws InterruptedException {
-        Instant deadline = Instant.now().plus(Duration.ofMinutes(3));
-        while (true) {
-            ExportTask task = rds.describeExportTasks(request -> request.exportTaskIdentifier(taskId))
-                    .exportTasks().getFirst();
-            if (List.of("COMPLETE", "FAILED", "CANCELED").contains(task.status()) || Instant.now().isAfter(deadline)) {
-                return task;
-            }
-            Thread.sleep(1_000);
-        }
+    private static ExportTask awaitTerminal(RdsClient rds, String taskId) {
+        return await().atMost(Duration.ofMinutes(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofSeconds(1))
+                .until(() -> rds.describeExportTasks(request -> request.exportTaskIdentifier(taskId))
+                                .exportTasks().getFirst(),
+                        task -> List.of("COMPLETE", "FAILED", "CANCELED").contains(task.status()));
     }
 
     private static RdsClient rdsClient() {

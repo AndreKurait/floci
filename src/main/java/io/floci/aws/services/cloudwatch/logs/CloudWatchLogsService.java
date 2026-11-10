@@ -715,7 +715,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
         getForAccount(streamStore, accountId, streamKey)
                 .orElseThrow(CloudWatchLogsService::logStreamNotFound);
 
-        long now = System.currentTimeMillis();
+        long now = clock.getAsLong();
         long totalBytes = 0;
         Long minTs = null;
         Long maxTs = null;
@@ -1244,6 +1244,11 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
      * families' check-and-write operations and group creation/deletion. Direct constructors must
      * supply this same store rather than silently creating a second quota pool.
      */
+    /** The time this service runs on, in epoch milliseconds; the metric filters stamp theirs with it. */
+    long currentTimeMillis() {
+        return clock.getAsLong();
+    }
+
     StorageBackend<String, MetricFilter> metricFilterStore() {
         return metricFilterStore;
     }

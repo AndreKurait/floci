@@ -30,6 +30,11 @@ public class RedshiftAuthProxy {
 
     private static final Logger LOG = Logger.getLogger(RedshiftAuthProxy.class);
 
+    /** How many times {@link #start} tries to bind the listener before it gives up. */
+    static final int BIND_ATTEMPTS = 40;
+    /** The pause after a bind attempt that found the port still in use. */
+    static final long BIND_RETRY_PAUSE_MILLIS = 25;
+
     private final String clusterKey;
     private final String backendHost;
     private final int backendPort;
@@ -156,14 +161,14 @@ public class RedshiftAuthProxy {
      */
     private ServerSocket bindListener(int proxyPort) throws IOException {
         BindException lastFailure = null;
-        for (int attempt = 0; attempt < 40; attempt++) {
+        for (int attempt = 0; attempt < BIND_ATTEMPTS; attempt++) {
             try {
                 return listenSocket(proxyPort, ListenBacklog.ACCEPT);
             } catch (BindException e) {
                 lastFailure = e;
             }
             try {
-                Thread.sleep(25);
+                pauseBeforeBindRetry(BIND_RETRY_PAUSE_MILLIS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while binding Redshift proxy port " + proxyPort, e);
@@ -178,6 +183,14 @@ public class RedshiftAuthProxy {
      */
     ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
         return ListenBacklog.acceptSocket(proxyPort, backlog);
+    }
+
+    /**
+     * Waits between two bind attempts. A seam so a test can hold the retry window on a
+     * controlled timeline instead of sitting it out.
+     */
+    void pauseBeforeBindRetry(long millis) throws InterruptedException {
+        Thread.sleep(millis);
     }
 
     private static void closeQuietly(ServerSocket s) {

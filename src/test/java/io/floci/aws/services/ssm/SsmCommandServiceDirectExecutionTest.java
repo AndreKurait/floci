@@ -314,10 +314,12 @@ class SsmCommandServiceDirectExecutionTest {
         });
         cancelThread.start();
 
-        // Give cancelCommand every chance to (wrongly) proceed if the lock weren't shared.
-        Thread.sleep(200);
+        // cancelCommand either parks on the monitor the rollup holds or, if the lock weren't
+        // shared, runs to the end.
+        awaitBlockedInOrDone(cancelThread, SsmCommandService.class);
         assertFalse(cancelReturned.get(),
                 "cancelCommand must block while the rollup holds the command's lock, not race past it");
+        assertTrue(isBlockedIn(cancelThread, SsmCommandService.class), "cancelCommand is parked on the command's lock");
 
         releaseRollup.countDown();
         cancelThread.join(5000);
@@ -390,11 +392,12 @@ class SsmCommandServiceDirectExecutionTest {
         });
         listThread.start();
 
-        // Give ListCommands every chance to (wrongly) proceed if the read weren't guarded by the
-        // same lock.
-        Thread.sleep(200);
+        // ListCommands either parks on the monitor the rollup holds or, if the read weren't
+        // guarded by the same lock, runs to the end.
+        awaitBlockedInOrDone(listThread, SsmJsonHandler.class);
         assertFalse(listReturned.get(),
                 "ListCommands must block while the rollup holds the command's lock, not observe a torn read");
+        assertTrue(isBlockedIn(listThread, SsmJsonHandler.class), "ListCommands is parked on the command's lock");
 
         releaseRollup.countDown();
         listThread.join(5000);
@@ -748,14 +751,33 @@ class SsmCommandServiceDirectExecutionTest {
     }
 
     private static String waitForCommandStatus(SsmCommandService service, String commandId, String region) {
-        return await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(20))
+        return await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
                 .until(() -> service.listCommands(commandId, null, region).getFirst().getStatus(),
                         status -> !"InProgress".equals(status));
     }
 
     private static int waitForMessageCount(SsmCommandService service, String instanceId) {
-        return await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(20))
+        return await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
                 .until(() -> service.getMessages(instanceId, "request-id", 30).size(), count -> count > 0);
+    }
+
+    /**
+     * Returns once {@code thread} is blocked entering a synchronized block in {@code code}, or has
+     * ended. The monitor's owner here is a virtual thread, which ThreadMXBean does not report as
+     * a lock owner, so this reads the thread's own state and where it stopped.
+     */
+    private static void awaitBlockedInOrDone(Thread thread, Class<?> code) {
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> !thread.isAlive() || isBlockedIn(thread, code));
+    }
+
+    private static boolean isBlockedIn(Thread thread, Class<?> code) {
+        if (thread.getState() != Thread.State.BLOCKED) {
+            return false;
+        }
+        StackTraceElement[] stack = thread.getStackTrace();
+        return stack.length > 0 && stack[0].getClassName().equals(code.getName())
+                && thread.getState() == Thread.State.BLOCKED;
     }
 
     private static final class InMemoryStorageFactory extends StorageFactory {

@@ -12,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -19,6 +20,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -102,10 +104,8 @@ class OpenSearchServiceTest {
         assertTrue(firstStarting.await(10, TimeUnit.SECONDS), "the first create never started its container");
         CompletableFuture<Domain> second = CompletableFuture.supplyAsync(() -> service.createDomain(
                 "raced-domain", "OpenSearch_2.11", null, null, null, US_EAST_1));
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (secondStarting.getCount() > 0 && !second.isDone() && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> secondStarting.getCount() == 0 || second.isDone());
         releaseFirst.countDown();
 
         first.get(10, TimeUnit.SECONDS);
