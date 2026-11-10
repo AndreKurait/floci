@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigateway.AwsServiceRouter;
 import io.floci.aws.services.apigateway.VtlTemplateEngine;
 import io.floci.aws.services.apigatewayv2.model.Integration;
@@ -64,7 +65,7 @@ class WebSocketIntegrationPermissionTest {
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(mapper);
         service = new WebSocketIntegrationInvoker(lambda, mock(AwsServiceRouter.class), mapper,
                 mock(VtlTemplateEngine.class), new ServiceCallAuthorizer(config, evaluator, providers),
-                new RegionResolver(REGION, OWNER));
+                new RegionResolver(REGION, OWNER), mock(ServiceRoleCallAuthorizer.class));
         when(lambda.invokeTarget(eq(REGION), eq(TARGET), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, null, """
                         {"statusCode":200,"body":"ok"}
