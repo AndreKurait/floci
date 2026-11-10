@@ -718,7 +718,8 @@ Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
 !!! note "Bounding warm containers"
     After an invocation the container stays warm so the next call skips the cold start, and is
     reaped only after `container-idle-timeout-seconds` of inactivity. Each function keeps up to
-    `warm-pool-max-per-function` idle containers, but nothing limits the sum: a stack of many
+    `warm-pool-max-per-function` idle containers across its versions within its account and region,
+    independently of same-named functions owned elsewhere. Without a global cap, nothing limits the sum: a stack of many
     functions that fan out through streams and triggers can accumulate one warm container per
     function touched, and each runtime container holds its own memory. On a Docker Desktop with
     a modest memory allocation that is enough to have Floci OOM-killed. `ephemeral: true` avoids
