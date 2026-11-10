@@ -2,8 +2,10 @@ package io.floci.aws.services.batch;
 
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -19,6 +21,9 @@ class BatchIntegrationTest {
 
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/batch/aws4_request";
+
+    @Inject
+    Clock clock;
 
     @Test
     void submitDescribeAndListImmediateJob() {
@@ -199,7 +204,7 @@ class BatchIntegrationTest {
     }
 
     @Test
-    void listJobsPaginatesNewestFirst() throws Exception {
+    void listJobsPaginatesNewestFirst() {
         String suffix = uniqueSuffix();
         String queueArn = createQueue("batch-page-queue-" + suffix, createComputeEnvironment("batch-page-ce-" + suffix));
         String definitionArn = registerJobDefinition("batch-page-job-" + suffix, "[\"ok\"]", "[]");
@@ -207,7 +212,6 @@ class BatchIntegrationTest {
         String secondName = "batch-page-second-" + suffix;
 
         submit(queueArn, definitionArn, firstName);
-        Thread.sleep(5);
         submit(queueArn, definitionArn, secondName);
 
         String nextToken = givenJson("""
@@ -234,7 +238,7 @@ class BatchIntegrationTest {
     }
 
     @Test
-    void listJobsUsesAwsFilters() throws Exception {
+    void listJobsUsesAwsFilters() {
         String suffix = uniqueSuffix();
         String queueArn = createQueue("batch-dedupe-queue-" + suffix, createComputeEnvironment("batch-dedupe-ce-" + suffix));
         String definitionArn = registerJobDefinition("batch-dedupe-job-" + suffix, "[\"ok\"]", "[]");
@@ -243,9 +247,8 @@ class BatchIntegrationTest {
         String newName = prefix + "-new";
 
         submit(queueArn, definitionArn, oldName);
-        Thread.sleep(5);
-        long createdAfter = System.currentTimeMillis();
-        Thread.sleep(5);
+        // The test clock moves 1 ms on every reading, so this falls strictly between the two submits.
+        long createdAfter = clock.millis();
         submit(queueArn, definitionArn, newName);
         submit(queueArn, definitionArn, "batch-dedupe-other-" + suffix);
 

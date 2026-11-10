@@ -4,7 +4,10 @@ import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.*;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.*;
 
 @QuarkusTest
@@ -176,21 +179,23 @@ class CodeDeployServerIntegrationTest {
                 .extract().jsonPath().getString("deploymentId");
     }
 
+    /** Polls the deployment until it succeeds or fails, for at most 5 s, and returns that status. */
+    private static String awaitFinalStatus(String id) {
+        return await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                .until(() -> given()
+                        .contentType(CT)
+                        .header("X-Amz-Target", "CodeDeploy_20141006.GetDeployment")
+                        .body("{\"deploymentId\":\"" + id + "\"}")
+                        .when().post("/")
+                        .then().statusCode(200)
+                        .extract().jsonPath().getString("deploymentInfo.status"),
+                        reached -> "Succeeded".equals(reached) || "Failed".equals(reached));
+    }
+
     @Test
     @Order(10)
-    void getServerDeploymentCompletesSuccessfully() throws InterruptedException {
-        // Poll until final state (max 5s)
-        String status = "Queued";
-        for (int i = 0; i < 50 && !"Succeeded".equals(status) && !"Failed".equals(status); i++) {
-            Thread.sleep(100);
-            status = given()
-                    .contentType(CT)
-                    .header("X-Amz-Target", "CodeDeploy_20141006.GetDeployment")
-                    .body("{\"deploymentId\":\"" + deploymentId + "\"}")
-                    .when().post("/")
-                    .then().statusCode(200)
-                    .extract().jsonPath().getString("deploymentInfo.status");
-        }
+    void getServerDeploymentCompletesSuccessfully() {
+        String status = awaitFinalStatus(deploymentId);
         Assertions.assertEquals("Succeeded", status, "Server deployment did not reach Succeeded state");
     }
 
@@ -281,22 +286,7 @@ class CodeDeployServerIntegrationTest {
                 .body("deploymentId", notNullValue())
                 .extract().jsonPath().getString("deploymentId");
 
-        String status = "Queued";
-        for (int i = 0; i < 50 && !"Succeeded".equals(status) && !"Failed".equals(status); i++) {
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException(e);
-            }
-            status = given()
-                    .contentType(CT)
-                    .header("X-Amz-Target", "CodeDeploy_20141006.GetDeployment")
-                    .body("{\"deploymentId\":\"" + hookDeploymentId + "\"}")
-                    .when().post("/")
-                    .then().statusCode(200)
-                    .extract().jsonPath().getString("deploymentInfo.status");
-        }
+        String status = awaitFinalStatus(hookDeploymentId);
         Assertions.assertEquals("Failed", status, "Deployment with an unreachable hook script must fail closed");
 
         given()
