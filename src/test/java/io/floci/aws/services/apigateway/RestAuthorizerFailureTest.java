@@ -1,6 +1,7 @@
 package io.floci.aws.services.apigateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
@@ -49,6 +50,9 @@ class RestAuthorizerFailureTest {
         ObjectMapper mapper = new ObjectMapper();
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(mapper);
         direct = mock(ServiceCallAuthorizer.class);
+        CallerCallAuthorizer callers = mock(CallerCallAuthorizer.class);
+        when(callers.evaluateAnonymousResourcePolicy(anyString(), anyString(), nullable(String.class), anyBoolean()))
+                .thenReturn(IamPolicyEvaluator.ResourcePolicyDecision.NEUTRAL);
         ApiGatewayService gateway = mock(ApiGatewayService.class);
         lambda = mock(LambdaService.class);
         Integration integration = new Integration();
@@ -91,7 +95,7 @@ class RestAuthorizerFailureTest {
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
                 new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, cache,
-                new AuthorizerPolicyEvaluator(evaluator), null, direct, null,
+                new AuthorizerPolicyEvaluator(evaluator), null, direct, callers,
                 mock(ServiceRoleCallAuthorizer.class));
     }
 
