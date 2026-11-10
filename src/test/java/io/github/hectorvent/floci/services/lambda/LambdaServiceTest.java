@@ -21,6 +21,8 @@ import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
+import io.github.hectorvent.floci.testing.LockWaits;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -32,6 +34,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -46,7 +49,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
@@ -1541,10 +1543,14 @@ class LambdaServiceTest {
             holder.start();
             assertTrue(acquired.await(2, TimeUnit.SECONDS));
 
-            Future<LambdaFunction> publishFuture = pool.submit(
-                    () -> service.publishVersion(REGION, "lock-race-fn", null));
-            assertThrows(TimeoutException.class,
-                    () -> publishFuture.get(200, TimeUnit.MILLISECONDS),
+            AtomicReference<Thread> publisher = new AtomicReference<>();
+            Future<LambdaFunction> publishFuture = pool.submit(() -> {
+                publisher.set(Thread.currentThread());
+                return service.publishVersion(REGION, "lock-race-fn", null);
+            });
+            // Fails if publishVersion finishes instead of waiting behind the lock's holder.
+            LockWaits.awaitBlockedBehind(publisher, new AtomicReference<>(holder), publishFuture);
+            assertFalse(publishFuture.isDone(),
                     "publishVersion must block while another operation holds this function's lock");
 
             release.countDown();
@@ -2670,13 +2676,10 @@ class LambdaServiceTest {
         return cfg;
     }
 
-    private static void awaitLastUpdateStatus(LambdaService service, LambdaFunction fn, String expected)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (!expected.equals(service.lastUpdateStatus(fn)) && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
-        assertEquals(expected, service.lastUpdateStatus(fn));
+    private static void awaitLastUpdateStatus(LambdaService service, LambdaFunction fn, String expected) {
+        Awaitility.await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals(expected, service.lastUpdateStatus(fn)));
     }
 
     @Test
@@ -2835,9 +2838,14 @@ class LambdaServiceTest {
             holder.start();
             assertTrue(acquired.await(2, TimeUnit.SECONDS));
 
-            Future<LambdaFunction> updateFuture = pool.submit(() -> updater.apply(service, functionName));
-            assertThrows(TimeoutException.class,
-                    () -> updateFuture.get(200, TimeUnit.MILLISECONDS),
+            AtomicReference<Thread> updating = new AtomicReference<>();
+            Future<LambdaFunction> updateFuture = pool.submit(() -> {
+                updating.set(Thread.currentThread());
+                return updater.apply(service, functionName);
+            });
+            // Fails if the updater finishes instead of waiting behind the lock's holder.
+            LockWaits.awaitBlockedBehind(updating, new AtomicReference<>(holder), updateFuture);
+            assertFalse(updateFuture.isDone(),
                     "the updater must block while another operation holds this function's lock");
 
             release.countDown();
