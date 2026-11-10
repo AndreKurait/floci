@@ -6,6 +6,7 @@ import io.floci.aws.core.common.AwsQueryServiceResolver;
 import io.floci.aws.core.common.ProtocolClaim;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.appconfig.AppConfigDataController;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
 import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.route53.Route53Controller;
@@ -674,6 +675,16 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("appconfig".equals(credentialScope) && resourceInfo != null
+                && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            // GetLatestConfiguration uses an internal route to avoid an S3 bucket-name collision.
+            return switch (resourceInfo.getResourceMethod().getName()) {
+                case "startConfigurationSession" -> "appconfig:StartConfigurationSession";
+                case "getLatestConfiguration" -> "appconfig:GetLatestConfiguration";
+                default -> null;
+            };
+        }
         if ("route53".equals(credentialScope) && resourceInfo != null
                 && Route53Controller.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {

@@ -568,8 +568,8 @@ public final class RequestResources {
      */
     private static String withId(String arn, RequestResourceMembers.ArnFormat format, String type,
                                  Map<String, String> filling, StoredResourceArns stored, String region) {
-        if (stored != null && filling.size() == 1) {
-            Optional<String> found = stored.find(type, List.of(filling.values().iterator().next()), region);
+        if (stored != null) {
+            Optional<String> found = stored.findByVariables(type, filling, region);
             if (found.isPresent()) {
                 return found.get();
             }

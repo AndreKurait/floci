@@ -16,6 +16,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -151,6 +152,18 @@ class TagOnCreateTest {
         assertEquals(new Tagging("sqs:TagQueue", List.of(set(Map.of("team", "blue"))), List.of(), false, true), json);
         assertEquals(json, TagOnCreate.of("sqs:CreateQueue",
                 form("Action=CreateQueue&QueueName=q&Tag.1.Key=team&Tag.1.Value=blue")).orElseThrow());
+    }
+
+    @Test
+    void capacityReservationDateChangeQuoteChecksTagsOnItsOwnAction() {
+        Tagging tagging = TagOnCreate.of("ec2:CreateCapacityReservationDateChangeQuote",
+                form("Action=CreateCapacityReservationDateChangeQuote"
+                        + "&TagSpecification.1.ResourceType=capacity-reservation-modification-quote"
+                        + "&TagSpecification.1.Tag.1.Key=team&TagSpecification.1.Tag.1.Value=blue")).orElseThrow();
+        assertTrue(tagging.requestTags());
+        assertEquals(List.of(Map.of("aws:RequestTag/team", List.of("blue"), "aws:TagKeys", List.of("team"))),
+                TagOnCreate.requestTagContexts(tagging));
+        assertEquals("ec2:CreateTags", tagging.action());
     }
 
     /**
