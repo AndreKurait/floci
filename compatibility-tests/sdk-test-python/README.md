@@ -50,6 +50,15 @@ It uses real Python 3.12 Lambda handlers on default and custom event buses to
 check qualified grants, revocation, recovery and `NO_PERMISSIONS` dead letters
 while another SQS target continues receiving events.
 
+`iam/test_eventbridge_lambda_roles.py` checks cross-account targets on both bus
+types. It creates an Organizations member account, uses STS-issued credentials
+for management calls, and checks role trust, qualified identity grants,
+permissions boundaries, SCP denial, target grant revocation and recovery with
+real Lambda handlers. Enable `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`,
+`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true`, and
+`FLOCI_AUTH_VALIDATE_SIGNATURES=true` on the emulator. EventBridge's internal
+service-role identity remains modeled.
+
 ## Legacy DynamoDB client
 
 `legacy/test_dynamodb_20111205.py` exercises the 2011-12-05 API with Boto 2,

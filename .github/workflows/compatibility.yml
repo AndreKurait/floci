@@ -492,6 +492,7 @@ jobs:
             -e FLOCI_HOSTNAME=floci \
             -e FLOCI_AUTH_VALIDATE_SIGNATURES=true \
             -e FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true \
+            -e FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true \
             -e FLOCI_SERVICES_CLOUDFORMATION_ALLOW_STUB_UNSUPPORTED_RESOURCE_TYPES=false \
             floci:test-native
           health=starting
