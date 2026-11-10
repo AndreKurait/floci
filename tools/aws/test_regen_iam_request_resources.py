@@ -245,6 +245,15 @@ def test_a_built_document_validates_matches_botocore_and_names_the_namespaces_it
     assert json.loads(r.render(document)) == document
 
 
+@pytest.mark.parametrize("namespace", ["svc", "other", "hand"])
+def test_validation_rejects_a_namespace_also_declared_not_covered(corrections, tmp_path, namespace):
+    write_models(tmp_path, {"svc": model({"GetThing": {"ThingName": "String"}, "ListThings": {}})})
+    document = r.build(DOCUMENTS, "test", tmp_path, "botocore test")
+    assert r.validate(document) == []
+    document["notCovered"][namespace] = "stale classification after composition"
+    assert any(namespace in problem and "notCovered" in problem for problem in r.validate(document))
+
+
 def test_a_member_holding_an_account_id_gives_the_account_of_the_types_named_by_variables(corrections, tmp_path):
     write_models(tmp_path, {"svc": model({"GetThing": {"ThingName": "String", "registryId": "AccountId"},
                                           "ListThings": {"registryId": "AccountId"}})})
