@@ -22,3 +22,7 @@ Query/Scan table and index defaults and explicit projection policies.
 regions. It checks implicit denial, scoped grants, explicit denial, name-to-ID
 resource resolution, configuration-token authorization without consuming a denied
 token, and `iam:PassRole` with the AppConfig service condition.
+
+The Step Functions/API Gateway resource-policy cases also run here with IAM
+enforcement enabled. They cover signed role grants and anonymous method policies;
+the default IAM-disabled suite does not run these expected-denial cases.

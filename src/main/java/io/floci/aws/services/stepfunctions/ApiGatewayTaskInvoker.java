@@ -107,9 +107,7 @@ public class ApiGatewayTaskInvoker {
                 && api.getEndpointConfiguration().getTypes().contains(EndpointType.PRIVATE)) {
             throw unsupported("private APIs are not supported by this integration");
         }
-        if (api.getPolicy() != null && !api.getPolicy().isBlank()) {
-            throw unsupported("API resource policies are not supported by this integration");
-        }
+        // Shared gateway dispatch applies the method's authorization mode and resource policy.
         String stage = input.path("Stage").asText();
         String path = input.path("Path").asText();
         if (path.startsWith("/")) {
