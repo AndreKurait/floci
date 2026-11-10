@@ -2306,6 +2306,14 @@ public interface EmulatorConfig {
     interface KmsServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * {@code <account-id>=<service principal>} entries: ListGrants and ListRetirableGrants list a grant's
+         * grantee or retiring principal in that account as that AWS service principal, as KMS lists an AWS
+         * service's grantees (GrantListEntry). Grants and the list filters keep the stored principal.
+         * Empty by default.
+         */
+        Optional<List<String>> listedGranteeServicePrincipals();
     }
 
     interface CognitoServiceConfig {
