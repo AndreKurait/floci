@@ -12,19 +12,22 @@ import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
+import io.github.hectorvent.floci.testing.TestTime;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -33,7 +36,9 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -55,8 +60,12 @@ class AslExecutorEcsRunTaskModeTest {
 
     private static final String REGION = "us-east-2";
     private static final String ACCOUNT = "000000000000";
+    private static final Duration ONE_NANOSECOND = Duration.ofNanos(1);
+    /** How often a {@code .sync} wait reads its tasks back, {@code AslExecutor.SYNC_POLL_INTERVAL_MS}. */
+    private static final Duration SYNC_POLL_INTERVAL = Duration.ofMillis(100);
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final TestTime time = TestTime.create();
     private EcsService ecsService;
     private StepFunctionsService sfnService;
     private AslExecutor executor;
@@ -71,8 +80,21 @@ class AslExecutorEcsRunTaskModeTest {
         executor = newExecutor(TimeUnit.NANOSECONDS::sleep);
     }
 
-    @SuppressWarnings("unchecked")
     private AslExecutor newExecutor(AslExecutor.Sleeper sleeper) {
+        return executorBuilder().sleeper(sleeper).build();
+    }
+
+    /** An executor whose {@code .sync} polls and Wait states pause on {@link #time}. */
+    private AslExecutor newTimelineExecutor() {
+        return executorBuilder()
+                .clock(time.clock())
+                .sleeper(time::sleepNanos)
+                .nanoTime(time::nanoTime)
+                .build();
+    }
+
+    @SuppressWarnings("unchecked")
+    private AslExecutorFixture.Builder executorBuilder() {
         // A real handler so parseNetworkConfiguration / parseContainerOverrides actually run.
         EcsJsonHandler ecsJsonHandler = new EcsJsonHandler(ecsService, objectMapper,
                 new HostVolumePolicy(mock(EmulatorConfig.class, RETURNS_DEEP_STUBS)));
@@ -85,9 +107,7 @@ class AslExecutorEcsRunTaskModeTest {
                 .objectMapper(objectMapper)
                 .sfnService(instance)
                 .customResourceLiveness(null)
-                .sleeper(sleeper)
-                .maxWaitSeconds(30)
-                .build();
+                .maxWaitSeconds(30);
     }
 
     @Test
@@ -155,7 +175,7 @@ class AslExecutorEcsRunTaskModeTest {
         launchOneTask();
         when(ecsService.describeTasks(any(), any(), any())).thenReturn(List.of(task("RUNNING")));
 
-        Execution execution = runDefinition("""
+        Execution execution = runUntilTheSyncWaitIsCut(Duration.ofSeconds(1), """
                 {
                   "StartAt": "RunTask",
                   "States": {
@@ -281,7 +301,7 @@ class AslExecutorEcsRunTaskModeTest {
         launchOneTask();
         when(ecsService.describeTasks(any(), any(), any())).thenReturn(List.of(task("RUNNING")));
 
-        Execution execution = runDefinition("""
+        Execution execution = runUntilTheSyncWaitIsCut(Duration.ofSeconds(1), """
                 {
                   "StartAt": "RunTask",
                   "TimeoutSeconds": 1,
@@ -305,20 +325,11 @@ class AslExecutorEcsRunTaskModeTest {
 
     @Test
     void failureInASiblingParallelBranchStopsTheTask() throws Exception {
-        // The sibling's Pause is held until this branch is polling, so the cut lands mid-wait.
-        CountDownLatch polling = new CountDownLatch(1);
-        executor = newExecutor(nanos -> {
-            if (nanos == TimeUnit.SECONDS.toNanos(1)) {
-                polling.await();
-                return;
-            }
-            polling.countDown();
-            TimeUnit.NANOSECONDS.sleep(nanos);
-        });
+        executor = newTimelineExecutor();
         launchOneTask();
         when(ecsService.describeTasks(any(), any(), any())).thenReturn(List.of(task("RUNNING")));
 
-        Execution execution = runDefinition("""
+        CompletableFuture<Execution> running = AslExecutorFixture.start(() -> runDefinition("""
                 {
                   "StartAt": "P",
                   "States": {
@@ -332,8 +343,18 @@ class AslExecutorEcsRunTaskModeTest {
                     ] }
                   }
                 }
-                """, "{}");
+                """, "{}"));
 
+        // Both branches are pausing, the sibling in its Wait and this one between two polls, so the
+        // cut lands mid-wait: the task is left alone until the sibling's Wait is over.
+        time.awaitSleepers(2);
+        time.advance(Duration.ofSeconds(1).minus(ONE_NANOSECOND));
+        assertEquals(2, time.sleepers());
+        assertFalse(running.isDone());
+        verify(ecsService, never()).stopTask(any(), any(), any(), any());
+        time.advance(ONE_NANOSECOND);
+
+        Execution execution = AslExecutorFixture.finished(running);
         assertEquals("FAILED", execution.getStatus());
         assertEquals("Boom", execution.getError());
         // The cut branch stops its task on its own thread, after the Parallel has already failed.
@@ -392,6 +413,28 @@ class AslExecutorEcsRunTaskModeTest {
         }
         task.setContainers(List.of(container));
         return task;
+    }
+
+    /**
+     * Runs a definition whose {@code .sync} wait is cut at {@code bound}. One nanosecond earlier
+     * the wait is still between two polls, having read the task back once per poll interval, and
+     * the task has been left running.
+     */
+    private Execution runUntilTheSyncWaitIsCut(Duration bound, String definition, String input) {
+        executor = newTimelineExecutor();
+        CompletableFuture<Execution> running = AslExecutorFixture.start(() -> runDefinition(definition, input));
+        time.awaitSleepers(1);
+        time.advance(bound.minus(ONE_NANOSECOND));
+        assertEquals(1, time.sleepers());
+        assertFalse(running.isDone());
+        // The poll that would fall on the bound itself is never made: the bound ends the wait.
+        int polls = Math.toIntExact(bound.dividedBy(SYNC_POLL_INTERVAL)) - 1;
+        verify(ecsService, times(polls)).describeTasks(any(), any(), any());
+        verify(ecsService, never()).stopTask(any(), any(), any(), any());
+        time.advance(ONE_NANOSECOND);
+        Execution execution = AslExecutorFixture.finished(running);
+        verify(ecsService, times(polls)).describeTasks(any(), any(), any());
+        return execution;
     }
 
     private Execution run(String resource, String input) {
