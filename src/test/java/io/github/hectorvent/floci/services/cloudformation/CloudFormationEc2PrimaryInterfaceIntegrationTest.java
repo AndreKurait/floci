@@ -10,6 +10,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.Map;
@@ -60,6 +62,69 @@ class CloudFormationEc2PrimaryInterfaceIntegrationTest {
         assertEquals(subnet, instance(instanceId(stack)).getSubnetId());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"", ",\"NetworkInterfaces\":{\"Ref\":\"AWS::NoValue\"}"})
+    void removingThePrimaryInterfaceReplacesTheInstance(String removedInterface) {
+        String subnet = ec2.describeSubnets(REGION, List.of(), Map.of()).get(1).getSubnetId();
+        String stack = create(template(subnet, true));
+        String previous = instanceId(stack);
+
+        cfn("UpdateStack", stack).header("Authorization", AUTH).formParam("TemplateBody", """
+                {"Resources":{"Server":{"Type":"AWS::EC2::Instance","Properties":{
+                  "ImageId":"ami-12345678"%s
+                }}},
+                 "Outputs":{"InstanceId":{"Value":{"Ref":"Server"}}}}
+                """.formatted(removedInterface)).when().post("/").then().statusCode(200);
+
+        assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack, AUTH).status());
+        assertNotEquals(previous, instanceId(stack));
+        assertEquals("terminated", instance(previous).getState().getName());
+    }
+
+    @Test
+    void primaryInterfaceGroupsApplyInTheirVpcAndReplaceOnAParameterChange() {
+        String body = """
+                {"Parameters":{"Group":{"Type":"String","Default":"A"}},
+                 "Conditions":{"UseA":{"Fn::Equals":[{"Ref":"Group"},"A"]}},
+                 "Resources":{
+                   "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.226.0.0/16"}},
+                   "Subnet":{"Type":"AWS::EC2::Subnet","Properties":{
+                     "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.226.1.0/24"}},
+                   "GroupA":{"Type":"AWS::EC2::SecurityGroup","Properties":{
+                     "VpcId":{"Ref":"Vpc"},"GroupDescription":"first primary interface group"}},
+                   "GroupB":{"Type":"AWS::EC2::SecurityGroup","Properties":{
+                     "VpcId":{"Ref":"Vpc"},"GroupDescription":"replacement primary interface group"}},
+                   "Server":{"Type":"AWS::EC2::Instance","Properties":{
+                     "ImageId":"ami-12345678","NetworkInterfaces":[{
+                       "DeviceIndex":0,"SubnetId":{"Ref":"Subnet"},"AssociatePublicIpAddress":false,
+                       "GroupSet":[{"Fn::If":["UseA",{"Ref":"GroupA"},{"Ref":"GroupB"}]}]
+                     }]}}
+                 },
+                 "Outputs":{"InstanceId":{"Value":{"Ref":"Server"}},
+                            "GroupA":{"Value":{"Ref":"GroupA"}},"GroupB":{"Value":{"Ref":"GroupB"}},
+                            "VpcId":{"Value":{"Ref":"Vpc"}}}}
+                """;
+        String stack = create(body);
+        Map<String, String> outputs = outputs(stack);
+        String previous = instanceId(stack);
+        assertEquals(outputs.get("VpcId"), instance(previous).getVpcId());
+        assertEquals(List.of(outputs.get("GroupA")), instance(previous).getSecurityGroups().stream()
+                .map(group -> group.getGroupId()).toList());
+
+        cfn("UpdateStack", stack).header("Authorization", AUTH).formParam("TemplateBody", body)
+                .formParam("Parameters.member.1.ParameterKey", "Group")
+                .formParam("Parameters.member.1.ParameterValue", "B")
+                .when().post("/").then().statusCode(200);
+
+        assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack, AUTH).status());
+        String current = instanceId(stack);
+        assertNotEquals(previous, current);
+        assertEquals(List.of(outputs.get("GroupB")), instance(current).getSecurityGroups().stream()
+                .map(group -> group.getGroupId()).toList());
+        assertEquals(outputs.get("VpcId"), instance(current).getVpcId());
+        assertEquals("terminated", instance(previous).getState().getName());
+    }
+
     @Test
     void mixedSubnetDeclarationFailsWithoutCreatingAnInstance() {
         String subnet = ec2.describeSubnets(REGION, List.of(), Map.of()).getFirst().getSubnetId();
@@ -94,9 +159,13 @@ class CloudFormationEc2PrimaryInterfaceIntegrationTest {
     }
 
     private String instanceId(String stack) {
+        return outputs(stack).get("InstanceId");
+    }
+
+    private Map<String, String> outputs(String stack) {
         String xml = cfn("DescribeStacks", stack).header("Authorization", AUTH)
                 .when().post("/").then().statusCode(200).extract().asString();
-        return XmlParser.extractPairs(xml, "Outputs", "OutputKey", "OutputValue").get("InstanceId");
+        return XmlParser.extractPairs(xml, "Outputs", "OutputKey", "OutputValue");
     }
 
     private Instance instance(String id) {
