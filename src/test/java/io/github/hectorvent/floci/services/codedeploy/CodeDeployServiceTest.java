@@ -466,11 +466,10 @@ class CodeDeployServiceTest {
 
         String deploymentId = createLambdaDeployment("app-hook-late", "group-hook-late", "beforeHook", null);
         time.awaitSleepers(1);
-        time.advance(Duration.ofHours(1).minus(STOP_POLL));
-        service.putLifecycleEventHookExecutionStatus(deploymentId, executionId.get(), "Succeeded");
+        time.advance(Duration.ofHours(1).minusMillis(1));
         assertEquals("InProgress", service.getDeployment(REGION, deploymentId).getStatus());
+        service.putLifecycleEventHookExecutionStatus(deploymentId, executionId.get(), "Succeeded");
 
-        time.advance(STOP_POLL);
         assertEquals("Succeeded", awaitTerminal(deploymentId, Duration.ofSeconds(5)).getStatus());
         assertEquals("Succeeded", lambdaTargetEvent(deploymentId, "BeforeAllowTraffic").get("status"));
     }

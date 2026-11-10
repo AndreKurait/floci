@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.codedeploy.model.Deployment;
 import io.github.hectorvent.floci.services.codedeploy.model.DeploymentGroup;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elb.ElbClassicService;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -27,8 +28,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.awaitility.Awaitility.await;
@@ -56,6 +57,12 @@ class CodeDeployAgentDeploymentTest {
             "s3Location", Map.of("bucket", "bundle", "key", "release.zip", "bundleType", "zip",
                     "version", "version-one", "eTag", "etag-one"));
 
+    private static final Duration START_DEADLINE = Duration.ofMinutes(5);
+    private static final Duration PHASE_LIMIT = Duration.ofHours(1);
+    private static final Duration STOP_POLL = Duration.ofMillis(200);
+
+    private final TestTime time = TestTime.create();
+    private boolean timeline;
     private CodeDeployAgentCommands commands;
     private CodeDeployAgentDeployment runner;
     private DeploymentGroup group;
@@ -247,13 +254,39 @@ class CodeDeployAgentDeploymentTest {
         group.setDeploymentStyle(Map.of("deploymentType", "IN_PLACE", "deploymentOption", "WITH_TRAFFIC_CONTROL"));
         when(traffic.prepare(ACCOUNT, REGION, group)).thenReturn(new CodeDeployClassicTraffic.Plan(
                 ACCOUNT, REGION, "arn:aws:iam::123456789012:role/deploy", List.of("frontend")));
-        runner = runner(Duration.ofSeconds(5), Duration.ofSeconds(5));
+        runner = timeline ? timelineRunner() : runner(Duration.ofSeconds(5), Duration.ofSeconds(5));
+    }
+
+    /** The runner with its production limits, waiting on the test's timeline instead of the system timer. */
+    private void useTimeline() {
+        timeline = true;
+        runner = timelineRunner();
+    }
+
+    private CodeDeployAgentDeployment timelineRunner() {
+        return new CodeDeployAgentDeployment(commands, autoScaling, mock(Ec2Service.class),
+                new RegionResolver(REGION, ACCOUNT), new ObjectMapper(), traffic, START_DEADLINE, PHASE_LIMIT,
+                new TimelineTimer(time));
+    }
+
+    /** Returns once the agent has taken the instance's command, so its worker now waits on the phase limit. */
+    private void awaitPhaseRunning(Running run, String instance) {
+        await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(5))
+                .until(() -> "InProgress".equals(events(run, instance).getLast().get("status")));
     }
 
     @Test
     void aMissingAgentFailsTheStartDeadlineWithoutInventingInstallSuccess() throws Exception {
-        runner = runner(Duration.ofMillis(25), Duration.ofSeconds(5));
+        useTimeline();
         Running run = start(prepare(null));
+        time.awaitSleepers(1);
+
+        time.advance(START_DEADLINE.minusMillis(1));
+        assertFalse(run.finished().isDone());
+        assertEquals("InProgress", run.deployment().getStatus());
+        assertEquals("Pending", events(run, FIRST).getFirst().get("status"));
+
+        time.advance(Duration.ofMillis(1));
         done(run);
         assertEquals("Failed", run.deployment().getStatus());
         Map<String, Object> event = events(run, FIRST).getFirst();
@@ -265,10 +298,21 @@ class CodeDeployAgentDeploymentTest {
 
     @Test
     void anAcknowledgedCommandHasItsOwnCompletionDeadlineAndRejectsLateSuccess() throws Exception {
-        runner = runner(Duration.ofSeconds(5), Duration.ofMillis(25));
+        useTimeline();
         Running run = start(prepare(null));
         String id = pending(FIRST, "ApplicationStop");
+        // Acknowledged four minutes in: the completion limit runs from here, not from the start.
+        time.awaitSleepers(1);
+        time.advance(Duration.ofMinutes(4));
         commands.acknowledge(ACCOUNT, REGION, id);
+        awaitPhaseRunning(run, FIRST);
+        time.awaitSleepers(1);
+
+        time.advance(PHASE_LIMIT.minusMillis(1));
+        assertFalse(run.finished().isDone());
+        assertEquals("InProgress", events(run, FIRST).getFirst().get("status"));
+
+        time.advance(Duration.ofMillis(1));
         done(run);
         assertEquals("Failed", run.deployment().getStatus());
         assertTrue(events(run, FIRST).getFirst().get("diagnostics").toString().contains("did not complete"));
@@ -279,11 +323,15 @@ class CodeDeployAgentDeploymentTest {
     @ValueSource(strings = {"Succeeded", "Failed"})
     void stoppingAnAcknowledgedCommandWaitsForItsCompletionWithoutQueuingAnotherPhase(String completion)
             throws Exception {
+        useTimeline();
         Running run = start(prepare(null));
         String id = pending(FIRST, "ApplicationStop");
         commands.acknowledge(ACCOUNT, REGION, id);
+        awaitPhaseRunning(run, FIRST);
+        time.awaitSleepers(1);
         run.stop().set(true);
-        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        time.advance(PHASE_LIMIT.minusMillis(1));
+        assertFalse(run.finished().isDone());
         assertEquals("InProgress", run.deployment().getStatus());
         assertEquals("InProgress", commands.update(ACCOUNT, REGION, id).get("CommandStatus"));
         commands.complete(ACCOUNT, REGION, id, completion, "{}");
@@ -294,6 +342,27 @@ class CodeDeployAgentDeploymentTest {
         assertTrue(commands.poll(ACCOUNT, REGION, host(FIRST)).isEmpty());
     }
 
+    @Test
+    void aStopIsNoticedAtTheNextStopPollWhileACommandIsQueued() throws Exception {
+        useTimeline();
+        Running run = start(prepare(null));
+        String id = pending(FIRST, "ApplicationStop");
+        time.awaitSleepers(1);
+        time.advance(Duration.ofSeconds(30));
+        run.stop().set(true);
+
+        time.advance(STOP_POLL.minusMillis(1));
+        assertFalse(run.finished().isDone());
+        assertEquals("Pending", events(run, FIRST).getFirst().get("status"));
+
+        time.advance(Duration.ofMillis(1));
+        done(run);
+        assertEquals("Stopped", run.deployment().getStatus());
+        assertEquals("Skipped", events(run, FIRST).getFirst().get("status"));
+        assertEquals("Failed", commands.acknowledge(ACCOUNT, REGION, id).get("CommandStatus"));
+    }
+
+    /** Wiring: the runner as production builds it polls for a stop on the system timer. */
     @Test
     void stopCancelsAQueuedCommandWithoutWaitingForTheStartDeadline() throws Exception {
         Running run = start(prepare(null));
@@ -309,13 +378,18 @@ class CodeDeployAgentDeploymentTest {
     @Test
     void allAtOnceStopWaitsForTheActiveHostAfterCancellingAQueuedPeer() throws Exception {
         members(FIRST, SECOND);
+        useTimeline();
         Running run = start(prepare("CodeDeployDefault.AllAtOnce"));
         String active = pending(FIRST, "ApplicationStop");
         commands.acknowledge(ACCOUNT, REGION, active);
         pending(SECOND, "ApplicationStop");
+        awaitPhaseRunning(run, FIRST);
+        time.awaitSleepers(2);
         run.stop().set(true);
-        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        time.advance(PHASE_LIMIT.minusMillis(1));
+        assertFalse(run.finished().isDone());
         assertEquals("InProgress", run.deployment().getStatus());
+        assertEquals("Skipped", events(run, SECOND).getFirst().get("status"));
         assertTrue(commands.poll(ACCOUNT, REGION, host(SECOND)).isEmpty());
         commands.complete(ACCOUNT, REGION, active, "Succeeded", "{}");
         done(run);
@@ -327,14 +401,19 @@ class CodeDeployAgentDeploymentTest {
     @Test
     void allAtOnceStopWaitsForEveryAcknowledgedCommand() throws Exception {
         members(FIRST, SECOND);
+        useTimeline();
         Running run = start(prepare("CodeDeployDefault.AllAtOnce"));
         String first = pending(FIRST, "ApplicationStop");
         String second = pending(SECOND, "ApplicationStop");
         commands.acknowledge(ACCOUNT, REGION, first);
         commands.acknowledge(ACCOUNT, REGION, second);
+        awaitPhaseRunning(run, FIRST);
+        awaitPhaseRunning(run, SECOND);
+        time.awaitSleepers(2);
         run.stop().set(true);
         commands.complete(ACCOUNT, REGION, first, "Succeeded", "{}");
-        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        time.advance(PHASE_LIMIT.minusMillis(1));
+        assertFalse(run.finished().isDone());
         assertEquals("InProgress", commands.update(ACCOUNT, REGION, second).get("CommandStatus"));
         commands.complete(ACCOUNT, REGION, second, "Succeeded", "{}");
         done(run);
@@ -345,16 +424,25 @@ class CodeDeployAgentDeploymentTest {
 
     @Test
     void allAtOncePermissionFailureWaitsForAnAcknowledgedPeerBeforeReleasingTheGroup() throws Exception {
+        useTimeline();
         useTraffic();
         members(FIRST, SECOND);
+        AtomicReference<BooleanSupplier> groupClosed = new AtomicReference<>(() -> false);
         doAnswer(call -> {
+            groupClosed.set(call.getArgument(4));
             throw new AwsException("IAM_ROLE_PERMISSIONS", "Service role denied traffic change", 403);
         }).when(traffic).change(any(), eq(FIRST), eq(false), any(), any());
         Running run = start(prepare("CodeDeployDefault.AllAtOnce"));
         String active = pending(SECOND, "BeforeBlockTraffic");
         commands.acknowledge(ACCOUNT, REGION, active);
+        awaitPhaseRunning(run, SECOND);
         complete(FIRST, "BeforeBlockTraffic", "Succeeded", "{}");
-        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        // The coordinator has seen the failure and now only waits for the acknowledged peer.
+        await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(5))
+                .until(() -> groupClosed.get().getAsBoolean());
+        time.awaitSleepers(1);
+        time.advance(PHASE_LIMIT.minusMillis(1));
+        assertFalse(run.finished().isDone());
         assertEquals("InProgress", commands.update(ACCOUNT, REGION, active).get("CommandStatus"));
         commands.complete(ACCOUNT, REGION, active, "Succeeded", "{}");
         done(run);
@@ -466,14 +554,19 @@ class CodeDeployAgentDeploymentTest {
     @Test
     void halfAtATimeStopWaitsForActiveCommandsWithoutStartingAnotherHost() throws Exception {
         members(FIRST, SECOND, "i-third", "i-fourth");
+        useTimeline();
         Running run = start(prepare("CodeDeployDefault.HalfAtATime"));
         String first = pending(FIRST, "ApplicationStop");
         String second = pending(SECOND, "ApplicationStop");
         commands.acknowledge(ACCOUNT, REGION, first);
         commands.acknowledge(ACCOUNT, REGION, second);
+        awaitPhaseRunning(run, FIRST);
+        awaitPhaseRunning(run, SECOND);
+        time.awaitSleepers(2);
         run.stop().set(true);
         commands.complete(ACCOUNT, REGION, first, "Succeeded", "{}");
-        assertThrows(TimeoutException.class, () -> run.finished().get(350, TimeUnit.MILLISECONDS));
+        time.advance(PHASE_LIMIT.minusMillis(1));
+        assertFalse(run.finished().isDone());
         assertTrue(commands.poll(ACCOUNT, REGION, host("i-third")).isEmpty());
         commands.complete(ACCOUNT, REGION, second, "Succeeded", "{}");
         done(run);

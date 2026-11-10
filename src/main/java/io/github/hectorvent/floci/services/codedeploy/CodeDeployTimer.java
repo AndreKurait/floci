@@ -28,8 +28,8 @@ interface CodeDeployTimer {
         public boolean awaitDone(Future<?> future, long nanos) throws InterruptedException {
             try {
                 future.get(nanos, TimeUnit.NANOSECONDS);
-            } catch (TimeoutException | ExecutionException | CancellationException outcome) {
-                // The caller reads the outcome from the future itself.
+            } catch (TimeoutException | ExecutionException | CancellationException expected) {
+                // Safe to drop: the caller reads the outcome from the future itself.
             }
             return future.isDone();
         }

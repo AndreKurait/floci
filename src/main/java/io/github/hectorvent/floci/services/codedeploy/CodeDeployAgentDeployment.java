@@ -64,6 +64,7 @@ public class CodeDeployAgentDeployment {
     private final CodeDeployClassicTraffic traffic;
     private final Duration startTimeout;
     private final Duration phaseTimeout;
+    private final CodeDeployTimer timer;
 
     @Inject
     public CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
@@ -76,6 +77,14 @@ public class CodeDeployAgentDeployment {
     CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
                               Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
                                CodeDeployClassicTraffic traffic, Duration startTimeout, Duration phaseTimeout) {
+        this(commands, autoScaling, ec2, regionResolver, mapper, traffic, startTimeout, phaseTimeout,
+                CodeDeployTimer.SYSTEM);
+    }
+
+    CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
+                              Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
+                              CodeDeployClassicTraffic traffic, Duration startTimeout, Duration phaseTimeout,
+                              CodeDeployTimer timer) {
         this.commands = commands;
         this.autoScaling = autoScaling;
         this.ec2 = ec2;
@@ -84,6 +93,7 @@ public class CodeDeployAgentDeployment {
         this.traffic = traffic;
         this.startTimeout = startTimeout;
         this.phaseTimeout = phaseTimeout;
+        this.timer = timer;
     }
 
     /** Resolve account-scoped resources on the request thread before starting any worker. */
@@ -370,8 +380,11 @@ public class CodeDeployAgentDeployment {
                 event.put("startTime", now());
                 event.put("status", "InProgress");
                 // Stop prevents subsequent events; an acknowledged event retains its completion deadline.
-                CodeDeployAgentCommands.Result result = ticket.result().toCompletableFuture()
-                        .get(phaseTimeout.toNanos(), TimeUnit.NANOSECONDS);
+                CompletableFuture<CodeDeployAgentCommands.Result> completion = ticket.result().toCompletableFuture();
+                if (!timer.awaitDone(completion, phaseTimeout.toNanos())) {
+                    throw new TimeoutException();
+                }
+                CodeDeployAgentCommands.Result result = completion.get();
                 if (result.diagnostics() != null) {
                     event.put("diagnostics", diagnostics(result.diagnostics()));
                 }
@@ -423,19 +436,18 @@ public class CodeDeployAgentDeployment {
         }
     }
 
-    private static <T> T await(CompletionStage<T> stage, Duration timeout, BooleanSupplier cancelled)
+    private <T> T await(CompletionStage<T> stage, Duration timeout, BooleanSupplier cancelled)
             throws InterruptedException, ExecutionException, TimeoutException {
         CompletableFuture<T> future = stage.toCompletableFuture();
-        long deadline = System.nanoTime() + timeout.toNanos();
+        long deadline = timer.nanoTime() + timeout.toNanos();
         while (!cancelled.getAsBoolean()) {
-            long remaining = deadline - System.nanoTime();
+            long remaining = deadline - timer.nanoTime();
             if (remaining <= 0) {
                 throw new TimeoutException();
             }
-            try {
-                return future.get(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(200)), TimeUnit.NANOSECONDS);
-            } catch (TimeoutException pending) {
-                // Poll only to observe StopDeployment without changing the native lifecycle deadline.
+            // Poll only to observe StopDeployment without changing the native lifecycle deadline.
+            if (timer.awaitDone(future, Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(200)))) {
+                return future.get();
             }
         }
         throw new CancellationException("Deployment was stopped");
