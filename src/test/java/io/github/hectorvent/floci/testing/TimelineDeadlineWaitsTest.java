@@ -7,6 +7,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -86,6 +87,77 @@ class TimelineDeadlineWaitsTest {
     }
 
     @Test
+    void aLatchWaitReportsWhetherTheLatchOpenedBeforeItsInstant() throws Exception {
+        CountDownLatch opened = new CountDownLatch(1);
+        CountDownLatch never = new CountDownLatch(1);
+        CompletableFuture<Boolean> sawOpened = new CompletableFuture<>();
+        CompletableFuture<Boolean> sawNever = new CompletableFuture<>();
+        Thread first = Thread.ofPlatform().daemon().name("opened-waiter").start(
+                () -> latchWait(opened, sawOpened));
+        Thread second = Thread.ofPlatform().daemon().name("never-waiter").start(
+                () -> latchWait(never, sawNever));
+        waits.awaitWaiting(2);
+
+        opened.countDown();
+        assertTrue(sawOpened.get());
+        first.join();
+
+        time.advance(Duration.ofSeconds(15).minusNanos(1));
+        assertFalse(sawNever.isDone());
+        time.advance(Duration.ofNanos(1));
+        assertFalse(sawNever.get());
+        second.join();
+        assertEquals(0, waits.waiting());
+    }
+
+    @Test
+    void aSpentLatchWaitReportsTheLatchAsItIs() throws Exception {
+        CountDownLatch open = new CountDownLatch(0);
+
+        assertTrue(waits.await(open, 0));
+        assertFalse(waits.await(new CountDownLatch(1), 0));
+        assertEquals(0, time.pendingTasks());
+    }
+
+    @Test
+    void aMonitorWaitReturnsOnANotificationOrAtItsInstantWithTheMonitorHeld() throws Exception {
+        Object monitor = new Object();
+        AtomicInteger returns = new AtomicInteger();
+        AtomicBoolean heldOnReturn = new AtomicBoolean(true);
+        CountDownLatch notified = new CountDownLatch(1);
+        Thread waiter = Thread.ofPlatform().daemon().name("monitor-waiter").start(() -> {
+            try {
+                for (int i = 0; i < 2; i++) {
+                    synchronized (monitor) {
+                        waits.waitOn(monitor, Duration.ofSeconds(15).toNanos());
+                        heldOnReturn.compareAndSet(true, Thread.holdsLock(monitor));
+                        returns.incrementAndGet();
+                        notified.countDown();
+                    }
+                }
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+        });
+        waits.awaitWaiting(1);
+
+        synchronized (monitor) {
+            monitor.notifyAll();
+        }
+        notified.await();
+        waits.awaitWaiting(1);
+        assertEquals(1, returns.get());
+
+        time.advance(Duration.ofSeconds(15).minusNanos(1));
+        assertEquals(1, returns.get());
+        time.advance(Duration.ofNanos(1));
+        waiter.join();
+        assertEquals(2, returns.get());
+        assertTrue(heldOnReturn.get());
+        assertFalse(waiter.isInterrupted());
+    }
+
+    @Test
     void aWaiterQueuedForTheTimelinesLockHasNotSettled() throws Exception {
         // Other threads reading the timeline keep its lock busy, so the waiter often has to queue
         // for it while it puts its next expiry on the timeline. Queued there it looks parked, but
@@ -131,6 +203,14 @@ class TimelineDeadlineWaitsTest {
             for (Thread reader : readers) {
                 reader.join();
             }
+        }
+    }
+
+    private void latchWait(CountDownLatch latch, CompletableFuture<Boolean> seen) {
+        try {
+            seen.complete(waits.await(latch, Duration.ofSeconds(15).toNanos()));
+        } catch (InterruptedException e) {
+            seen.completeExceptionally(e);
         }
     }
 }

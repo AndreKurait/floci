@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.concurrent.DeadlineWaits;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
@@ -60,6 +61,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
     private final int maxPoolSizePerFunction;
     private final int maxIdleTotal;
     private final long drainTimeoutNanos;
+    private final DeadlineWaits waits;
     private final ConcurrentHashMap<String, PoolState> poolStates = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<ContainerHandle, Lease> activeLeases = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<ContainerHandle, String> owned = new ConcurrentHashMap<>();
@@ -97,6 +99,15 @@ public class WarmPool implements ContainerTeardown, Resettable {
     @Inject
     public WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock,
                     ProvisionedConcurrencyPool provisioned) {
+        this(lambdaRuntimeLauncher, config, clock, provisioned, DeadlineWaits.SYSTEM);
+    }
+
+    /**
+     * @param waits the time source of every drain deadline and the bounded waits that honor it; a
+     *              {@code provisioned} pool must measure the deadline it is handed on the same one
+     */
+    WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock,
+             ProvisionedConcurrencyPool provisioned, DeadlineWaits waits) {
         this.lambdaRuntimeLauncher = lambdaRuntimeLauncher;
         this.provisioned = provisioned;
         this.config = config;
@@ -104,6 +115,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         this.maxPoolSizePerFunction = resolveMaxPerFunction(config);
         this.maxIdleTotal = resolveMaxTotal(config);
         this.drainTimeoutNanos = TimeUnit.SECONDS.toNanos(resolveDrainTimeout(config));
+        this.waits = waits;
     }
 
     public WarmPool(LambdaRuntimeLauncher launcher, EmulatorConfig config, Clock clock) {
@@ -119,6 +131,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         this.maxPoolSizePerFunction = DEFAULT_MAX_POOL_SIZE;
         this.maxIdleTotal = 0;
         this.drainTimeoutNanos = TimeUnit.SECONDS.toNanos(15);
+        this.waits = DeadlineWaits.SYSTEM;
     }
 
     static int resolveDrainTimeout(EmulatorConfig config) {
@@ -189,7 +202,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
                 return;
             }
             shutdownState.stopped = true;
-            shutdownState.deadlineNanos = System.nanoTime() + drainTimeoutNanos;
+            shutdownState.deadlineNanos = waits.nanoTime() + drainTimeoutNanos;
             for (String functionName : new ArrayList<>(poolStates.keySet())) {
                 detachFunction(functionName);
             }
@@ -202,7 +215,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             drains.add(() -> provisioned.stopManagedContainers(shutdownState.deadlineNanos));
         }
         drains.add(() -> drainAll(shutdownState, knownHandles));
-        ContainerTeardowns.stopInParallel(drains, Runnable::run, LOG, shutdownState.deadlineNanos);
+        ContainerTeardowns.stopInParallel(drains, Runnable::run, LOG, shutdownState.deadlineNanos, waits);
     }
 
     @PreDestroy
@@ -311,7 +324,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
                 }
             }
             if (rejected) {
-                long now = System.nanoTime();
+                long now = waits.nanoTime();
                 long cleanupDeadline = admission.deadlineNanos > now
                         ? admission.deadlineNanos : now + drainTimeoutNanos;
                 stopInParallel(List.of(handle), cleanupDeadline);
@@ -595,7 +608,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         long deadline;
         synchronized (capLock) {
             deadline = lifecycleState.stopped ? lifecycleState.deadlineNanos
-                    : System.nanoTime() + drainTimeoutNanos;
+                    : waits.nanoTime() + drainTimeoutNanos;
         }
         stopInParallel(handles, deadline);
     }
@@ -609,7 +622,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
                 }
             }
         }
-        ContainerTeardowns.stopInParallel(handles, handle -> stopOwnedHandle(handle, deadline), LOG, deadline);
+        ContainerTeardowns.stopInParallel(handles, handle -> stopOwnedHandle(handle, deadline), LOG, deadline, waits);
     }
 
     private void drainAll(LifecycleState shutdownState, List<ContainerHandle> knownHandles) {
@@ -618,7 +631,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             drains.add(() -> stopOwnedHandle(handle, shutdownState.deadlineNanos));
         }
         drains.add(() -> awaitLaunches(shutdownState));
-        ContainerTeardowns.stopInParallel(drains, Runnable::run, LOG, shutdownState.deadlineNanos);
+        ContainerTeardowns.stopInParallel(drains, Runnable::run, LOG, shutdownState.deadlineNanos, waits);
         if (!owned.isEmpty()) {
             LOG.warnv("Shutdown drain ended with {0} on-demand Lambda environment(s) still owned", owned.size());
         }
@@ -629,8 +642,8 @@ public class WarmPool implements ContainerTeardown, Resettable {
             try {
                 long remaining;
                 while (shutdownState.activeLaunches > 0
-                        && (remaining = shutdownState.deadlineNanos - System.nanoTime()) > 0) {
-                    TimeUnit.NANOSECONDS.timedWait(capLock, remaining);
+                        && (remaining = shutdownState.deadlineNanos - waits.nanoTime()) > 0) {
+                    waits.waitOn(capLock, remaining);
                 }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -711,10 +724,10 @@ public class WarmPool implements ContainerTeardown, Resettable {
             deadline = lifecycleState.deadlineNanos;
         }
         if (shutdown) {
-            long now = System.nanoTime();
+            long now = waits.nanoTime();
             stopInParallel(List.of(handle), deadline > now ? deadline : now + drainTimeoutNanos);
         } else {
-            stopOwnedHandle(handle, System.nanoTime());
+            stopOwnedHandle(handle, waits.nanoTime());
         }
     }
 
@@ -723,7 +736,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         CountDownLatch existing = stoppingHandles.putIfAbsent(handle, completion);
         if (existing != null) {
             try {
-                existing.await(Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+                waits.await(existing, Math.max(0, deadlineNanos - waits.nanoTime()));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
             }
