@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.elbv2.ElbV2ConditionKeys;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
@@ -103,6 +104,7 @@ public class IamConditionContextResolver {
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
     private final Instance<SsmService> ssmService;
+    private final Instance<ElbV2ConditionKeys> elbV2ConditionKeys;
     private final RequestContext requestContext;
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
@@ -124,9 +126,10 @@ public class IamConditionContextResolver {
                                        EmulatorConfig config,
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog,
-                                       Instance<SsmService> ssmService) {
+                                       Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -140,7 +143,7 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -154,7 +157,7 @@ public class IamConditionContextResolver {
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, clock, null);
+                config, currentVertxRequest, serviceCatalog, clock, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -167,7 +170,8 @@ public class IamConditionContextResolver {
                                         EmulatorConfig config,
                                         CurrentVertxRequest currentVertxRequest,
                                         ResolvedServiceCatalog serviceCatalog, Clock clock,
-                                        Instance<SsmService> ssmService) {
+                                        Instance<SsmService> ssmService,
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -175,6 +179,7 @@ public class IamConditionContextResolver {
         this.iamService = iamService;
         this.lambdaWebService = lambdaWebService;
         this.ssmService = ssmService;
+        this.elbV2ConditionKeys = elbV2ConditionKeys;
         this.requestContext = requestContext;
         this.config = config;
         this.currentVertxRequest = currentVertxRequest;
@@ -187,6 +192,7 @@ public class IamConditionContextResolver {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
+            case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
@@ -195,6 +201,11 @@ public class IamConditionContextResolver {
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    private List<Map<String, List<String>>> elbV2Contexts(String action, ContainerRequestContext ctx) {
+        return elbV2ConditionKeys != null && elbV2ConditionKeys.isResolvable()
+                ? elbV2ConditionKeys.get().resourceContexts(action, formParameters(ctx)) : List.of();
     }
 
     /**
@@ -885,6 +896,10 @@ public class IamConditionContextResolver {
      */
     public List<Map<String, List<String>>> resolveRemainingTargets(String credentialScope, String action,
                                                                    ContainerRequestContext ctx) {
+        if ("elasticloadbalancing".equals(credentialScope)) {
+            List<Map<String, List<String>>> contexts = elbV2Contexts(action, ctx);
+            return contexts.size() < 2 ? List.of() : contexts.subList(1, contexts.size());
+        }
         if ("dynamodb".equals(credentialScope)) {
             List<String> modes = singleItemReturnValues(action, bufferedJsonBody(ctx));
             if (modes.size() < 2) {

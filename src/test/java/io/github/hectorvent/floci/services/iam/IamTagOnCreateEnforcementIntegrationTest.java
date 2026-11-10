@@ -27,6 +27,8 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -502,6 +504,120 @@ class IamTagOnCreateEnforcementIntegrationTest {
     private static Response createVpc(User user, String... typesAndTeams) {
         return tagSpecifications(user.query("ec2", "CreateVpc").formParam("CidrBlock", "10.20.0.0/16"), typesAndTeams)
                 .post("/");
+    }
+
+    @Test
+    void elbRequestTagsGuardAllowsTheTaggedCreate() {
+        User user = user("elb-request-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"elasticloadbalancing:CreateTargetGroup\","
+                + "\"Resource\":\"*\",\"Condition\":{\"Null\":{\"aws:RequestTag/team\":\"false\"}}},"
+                + allow("elasticloadbalancing:AddTags"));
+        String name = "triage-elb-" + suffix();
+        user.query("elasticloadbalancing", "CreateTargetGroup").formParam("Version", "2015-12-01")
+                .formParam("Name", name + "-no").formParam("Protocol", "HTTP").formParam("Port", 8080)
+                .formParam("VpcId", "vpc-1").formParam("TargetType", "ip")
+                .post("/").then().statusCode(403);
+        Response created = user.query("elasticloadbalancing", "CreateTargetGroup")
+                .formParam("Version", "2015-12-01").formParam("Name", name).formParam("Protocol", "HTTP")
+                .formParam("Port", 8080).formParam("VpcId", "vpc-1").formParam("TargetType", "ip")
+                .formParam("Tags.member.1.Key", "team").formParam("Tags.member.1.Value", "blue").post("/");
+        deleteElbGroupLater(created);
+    }
+
+    @Test
+    void elbTargetGroupArnScopesRegistration() {
+        String first = createElbGroup();
+        String second = createElbGroup();
+        User user = user("elb-resource-arn");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"elasticloadbalancing:RegisterTargets\","
+                + "\"Resource\":\"" + first + "\"}");
+        user.query("elasticloadbalancing", "RegisterTargets").formParam("Version", "2015-12-01")
+                .formParam("TargetGroupArn", first).formParam("Targets.member.1.Id", "127.0.0.1")
+                .formParam("Targets.member.1.Port", 8080).post("/").then().statusCode(200);
+        user.query("elasticloadbalancing", "RegisterTargets").formParam("Version", "2015-12-01")
+                .formParam("TargetGroupArn", second).formParam("Targets.member.1.Id", "127.0.0.1")
+                .formParam("Targets.member.1.Port", 8080).post("/").then().statusCode(403);
+    }
+
+    @Test
+    void elbResourceTagsAllowTargetDeregistration() {
+        String group = createElbGroup();
+        String storedTag = admin("elasticloadbalancing").formParam("Action", "DescribeTags")
+                .formParam("Version", "2015-12-01").formParam("ResourceArns.member.1", group).post("/")
+                .then().statusCode(200).extract().xmlPath().getString(
+                        "DescribeTagsResponse.DescribeTagsResult.TagDescriptions.member.Tags.member.Value");
+        assertEquals("blue", storedTag);
+        User user = user("elb-resource-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"elasticloadbalancing:DeregisterTargets\","
+                + "\"Resource\":\"" + group + "\"}");
+        user.query("elasticloadbalancing", "DeregisterTargets").formParam("Version", "2015-12-01")
+                .formParam("TargetGroupArn", group).formParam("Targets.member.1.Id", "127.0.0.1")
+                .formParam("Targets.member.1.Port", 8080).post("/").then().statusCode(200);
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"elasticloadbalancing:DeregisterTargets\","
+                + "\"Resource\":\"" + group + "\",\"Condition\":{\"StringEquals\":{"
+                + "\"aws:ResourceTag/team\":\"blue\"}}}");
+        user.query("elasticloadbalancing", "DeregisterTargets").formParam("Version", "2015-12-01")
+                .formParam("TargetGroupArn", group).formParam("Targets.member.1.Id", "127.0.0.1")
+                .formParam("Targets.member.1.Port", 8080).post("/").then().statusCode(200);
+    }
+
+    @Test
+    void elbResourceTagConditionRejectsAChangedTag() {
+        String group = createElbGroup();
+        admin("elasticloadbalancing").formParam("Action", "AddTags").formParam("Version", "2015-12-01")
+                .formParam("ResourceArns.member.1", group).formParam("Tags.member.1.Key", "team")
+                .formParam("Tags.member.1.Value", "red").post("/").then().statusCode(200);
+        User user = user("elb-red-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"elasticloadbalancing:DeregisterTargets\","
+                + "\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"blue\"}}}");
+
+        user.query("elasticloadbalancing", "DeregisterTargets").formParam("Version", "2015-12-01")
+                .formParam("TargetGroupArn", group).formParam("Targets.member.1.Id", "127.0.0.1")
+                .formParam("Targets.member.1.Port", 8080).post("/").then().statusCode(403);
+    }
+
+    @Test
+    void elbTagMutationRequiresEveryResourceTagToMatch() {
+        String blue = createElbGroup();
+        String red = createElbGroup();
+        admin("elasticloadbalancing").formParam("Action", "AddTags").formParam("Version", "2015-12-01")
+                .formParam("ResourceArns.member.1", red).formParam("Tags.member.1.Key", "team")
+                .formParam("Tags.member.1.Value", "red").post("/").then().statusCode(200);
+        User user = user("elb-multiple-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"elasticloadbalancing:AddTags\","
+                + "\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"blue\"}}}");
+        user.query("elasticloadbalancing", "AddTags").formParam("Version", "2015-12-01")
+                .formParam("ResourceArns.member.1", blue).formParam("Tags.member.1.Key", "accepted")
+                .formParam("Tags.member.1.Value", "yes").post("/").then().statusCode(200);
+
+        user.query("elasticloadbalancing", "AddTags").formParam("Version", "2015-12-01")
+                .formParam("ResourceArns.member.1", blue).formParam("ResourceArns.member.2", red)
+                .formParam("Tags.member.1.Key", "rejected").formParam("Tags.member.1.Value", "yes")
+                .post("/").then().statusCode(403);
+        for (String arn : List.of(blue, red)) {
+            List<String> storedKeys = admin("elasticloadbalancing").formParam("Action", "DescribeTags")
+                    .formParam("Version", "2015-12-01").formParam("ResourceArns.member.1", arn)
+                    .post("/").then().statusCode(200).extract().xmlPath().getList(
+                            "DescribeTagsResponse.DescribeTagsResult.TagDescriptions.member.Tags.member.Key",
+                            String.class);
+            assertFalse(storedKeys.contains("rejected"));
+        }
+    }
+
+    private String createElbGroup() {
+        return deleteElbGroupLater(admin("elasticloadbalancing").formParam("Action", "CreateTargetGroup")
+                .formParam("Version", "2015-12-01").formParam("Name", "triage-elb-" + suffix())
+                .formParam("Protocol", "HTTP").formParam("Port", 8080).formParam("VpcId", "vpc-1")
+                .formParam("TargetType", "ip").formParam("Tags.member.1.Key", "team")
+                .formParam("Tags.member.1.Value", "blue").post("/"));
+    }
+
+    private String deleteElbGroupLater(Response created) {
+        String arn = created.then().statusCode(200).extract().xmlPath().getString(
+                "CreateTargetGroupResponse.CreateTargetGroupResult.TargetGroups.member.TargetGroupArn");
+        cleanup.register(() -> admin("elasticloadbalancing").formParam("Action", "DeleteTargetGroup")
+                .formParam("Version", "2015-12-01").formParam("TargetGroupArn", arn).post("/"));
+        return arn;
     }
 
     private static RequestSpecification tagSpecifications(RequestSpecification request, String... typesAndTeams) {
