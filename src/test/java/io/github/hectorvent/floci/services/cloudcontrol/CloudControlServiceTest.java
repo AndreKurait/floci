@@ -11,9 +11,11 @@ import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -381,11 +383,9 @@ class CloudControlServiceTest {
 
     private static void awaitSuccess(CloudControlService service, String accountId, String requestToken)
             throws InterruptedException {
-        CloudControlService.ProgressEvent status = service.requestStatus(accountId, requestToken);
-        for (int i = 0; i < 50 && !"SUCCESS".equals(status.operationStatus()); i++) {
-            Thread.sleep(10);
-            status = service.requestStatus(accountId, requestToken);
-        }
+        CloudControlService.ProgressEvent status = CfnStackWaits.lastStateWithin(Duration.ofMillis(500),
+                () -> service.requestStatus(accountId, requestToken),
+                event -> "SUCCESS".equals(event.operationStatus()));
         assertEquals("SUCCESS", status.operationStatus(),
                 requestToken + " ended " + status.operationStatus() + ": " + status.statusMessage());
     }
