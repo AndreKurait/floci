@@ -301,7 +301,7 @@ class AcmServiceTest {
                 return assertThrows(AwsException.class, () -> service.deleteCertificate(certificate.getArn(), REGION));
             });
             assertTrue(deleting.await(5, TimeUnit.SECONDS));
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
                 ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(waiter.get());
                 assertEquals(Thread.State.BLOCKED, info.getThreadState());
                 assertEquals(holder.get(), info.getLockOwnerId());

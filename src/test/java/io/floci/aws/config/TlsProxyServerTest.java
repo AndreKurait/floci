@@ -16,18 +16,20 @@ import java.net.NetworkInterface;
 import java.net.Socket;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -111,10 +113,15 @@ class TlsProxyServerTest {
     void nonLoopbackHostWithoutConsent_refusesToListen() throws Exception {
         int publicPort = FreePorts.anyInterfacePort();
 
+        // The proxy can only listen through the Vert.x it is handed. One it never touches proves
+        // that no bind was started, now or later, which a wait could only make likely.
+        Vertx untouched = mock(Vertx.class);
+
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> new TlsProxyServer(vertx, configWith(true, publicPort, 0), "0.0.0.0", 4510, 4511));
+                () -> new TlsProxyServer(untouched, configWith(true, publicPort, 0), "0.0.0.0", 4510, 4511));
 
         assertTrue(e.getMessage().contains("FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE"), e.getMessage());
+        verifyNoInteractions(untouched);
         assertFalse(portAccepts(publicPort), "a refused proxy must not listen");
     }
 
@@ -154,7 +161,9 @@ class TlsProxyServerTest {
     @Timeout(20)
     void tlsDisabled_bindsNothing() throws Exception {
         int publicPort = FreePorts.anyInterfacePort();
-        proxy = new TlsProxyServer(vertx, configWith(false, publicPort, 443), "127.0.0.1", 4510, 4511);
+        Vertx untouched = mock(Vertx.class);
+        proxy = new TlsProxyServer(untouched, configWith(false, publicPort, 443), "127.0.0.1", 4510, 4511);
+        verifyNoInteractions(untouched);
         assertFalse(portAccepts(publicPort), "no proxy should listen when TLS is disabled");
     }
 
@@ -187,21 +196,12 @@ class TlsProxyServerTest {
         }
     }
 
-    private void awaitListening(int port) throws Exception {
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            try (Socket s = new Socket("127.0.0.1", port)) {
-                return;
-            } catch (IOException e) {
-                Thread.sleep(50);
-            }
-        }
-        fail("port " + port + " not listening within timeout");
+    private void awaitListening(int port) {
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(10))
+                .until(() -> portAccepts(port));
     }
 
-    private boolean portAccepts(int port) throws Exception {
-        // Give any (unexpected) async bind a brief chance to come up, then probe once.
-        Thread.sleep(500);
+    private boolean portAccepts(int port) {
         try (Socket s = new Socket("127.0.0.1", port)) {
             return true;
         } catch (IOException e) {

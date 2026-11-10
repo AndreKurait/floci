@@ -6,13 +6,16 @@ import io.floci.aws.services.applicationautoscaling.model.StepAdjustment;
 import io.floci.aws.services.applicationautoscaling.model.StepScalingConfiguration;
 import io.floci.aws.services.applicationautoscaling.model.TargetTrackingConfiguration;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
+import io.floci.aws.testing.TestTime;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -29,6 +32,10 @@ class ScalingPolicyAlarmActionHandlerTest {
     private static final String RESOURCE_ID = "service/my-cluster/my-service";
     private static final String POLICY_ARN =
             "arn:aws:autoscaling:us-east-1:000000000000:scalingPolicy:x:resource/ecs/y:policyName/z";
+    /** What a policy that names no cooldown of its own waits between two scaling actions on ECS. */
+    private static final Duration DEFAULT_COOLDOWN = Duration.ofSeconds(300);
+
+    private final TestTime time = TestTime.create();
 
     private final ApplicationAutoScalingService service = mock(ApplicationAutoScalingService.class);
     private final CapacityAdjuster adjuster = mock(CapacityAdjuster.class);
@@ -40,7 +47,7 @@ class ScalingPolicyAlarmActionHandlerTest {
     void setUp() {
         when(adjusters.iterator()).thenAnswer(inv -> List.of(adjuster).iterator());
         when(adjuster.supports("ecs:service:DesiredCount")).thenReturn(true);
-        handler = new ScalingPolicyAlarmActionHandler(service, adjusters);
+        handler = new ScalingPolicyAlarmActionHandler(service, adjusters, time.clock());
     }
 
     private static ScalingPolicy targetTrackingPolicy(double targetValue, Boolean disableScaleIn) {
@@ -152,7 +159,7 @@ class ScalingPolicyAlarmActionHandlerTest {
     void cooldownSuppressesRepeatedScaleIn() {
         ScalingPolicy policy = targetTrackingPolicy(50.0, null);
         policy.getTargetTrackingConfiguration().setScaleInCooldown(300);
-        policy.setLastScaleInTime(System.currentTimeMillis() / 1000.0);
+        policy.setLastScaleInTime(time.now().getEpochSecond());
         stub(policy, target(1, 10), 8);
 
         handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
@@ -166,7 +173,7 @@ class ScalingPolicyAlarmActionHandlerTest {
         policy.getTargetTrackingConfiguration().setScaleOutCooldown(300);
         policy.setLastScaleOutCapacity(10);
         policy.setLastAppliedCapacity(6);
-        policy.setLastScaleOutTime(System.currentTimeMillis() / 1000.0);
+        policy.setLastScaleOutTime(time.now().getEpochSecond());
         stub(policy, target(1, 20), 6);
 
         handler.handle(POLICY_ARN, alarm("GreaterThanThreshold", 50.0), 60.0, REGION);
@@ -209,16 +216,70 @@ class ScalingPolicyAlarmActionHandlerTest {
     void deferredScaleInStillFiresLaterOnceCooldownClears() {
         ScalingPolicy policy = targetTrackingPolicy(50.0, null);
         policy.getTargetTrackingConfiguration().setScaleInCooldown(300);
-        policy.setLastScaleInTime(System.currentTimeMillis() / 1000.0);
+        policy.setLastScaleInTime(time.now().getEpochSecond());
         stub(policy, target(1, 10), 8);
 
         handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
         verify(adjuster, never()).setCapacity(anyString(), anyInt(), anyString());
 
-        policy.setLastScaleInTime(0);
+        time.advance(Duration.ofSeconds(300));
         handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
 
         verify(adjuster).setCapacity(RESOURCE_ID, 4, REGION);
+    }
+
+    @Test
+    void aScaleInWaitsOutTheWholeCooldownTheLastOneStarted() {
+        ScalingPolicy policy = targetTrackingPolicy(50.0, null);
+        policy.getTargetTrackingConfiguration().setScaleInCooldown(300);
+        stub(policy, target(1, 10), 8);
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
+        verify(adjuster).setCapacity(RESOURCE_ID, 4, REGION);
+        assertEquals(time.now().getEpochSecond(), policy.getLastScaleInTime());
+        when(adjuster.getCurrentCapacity(RESOURCE_ID, REGION)).thenReturn(4);
+
+        time.advance(Duration.ofSeconds(299));
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
+        verify(adjuster, times(1)).setCapacity(anyString(), anyInt(), anyString());
+
+        time.advance(Duration.ofSeconds(1));
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
+        verify(adjuster).setCapacity(RESOURCE_ID, 2, REGION);
+        assertEquals(time.now().getEpochSecond(), policy.getLastScaleInTime());
+    }
+
+    @Test
+    void aPolicyNamingNoCooldownWaitsTheDefaultOneBetweenScaleIns() {
+        ScalingPolicy policy = targetTrackingPolicy(50.0, null);
+        policy.setLastScaleInTime(time.now().getEpochSecond());
+        stub(policy, target(1, 10), 8);
+
+        time.advance(DEFAULT_COOLDOWN.minusSeconds(1));
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
+        verify(adjuster, never()).setCapacity(anyString(), anyInt(), anyString());
+
+        time.advance(Duration.ofSeconds(1));
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
+        verify(adjuster).setCapacity(RESOURCE_ID, 4, REGION);
+    }
+
+    @Test
+    void aScaleOutNoLargerThanTheLastWaitsOutTheWholeScaleOutCooldown() {
+        ScalingPolicy policy = targetTrackingPolicy(50.0, null);
+        policy.getTargetTrackingConfiguration().setScaleOutCooldown(300);
+        policy.setLastScaleOutCapacity(10);
+        policy.setLastAppliedCapacity(6);
+        policy.setLastScaleOutTime(time.now().getEpochSecond());
+        stub(policy, target(1, 20), 6);
+
+        time.advance(Duration.ofSeconds(299));
+        handler.handle(POLICY_ARN, alarm("GreaterThanThreshold", 50.0), 60.0, REGION);
+        verify(adjuster, never()).setCapacity(anyString(), anyInt(), anyString());
+
+        time.advance(Duration.ofSeconds(1));
+        handler.handle(POLICY_ARN, alarm("GreaterThanThreshold", 50.0), 60.0, REGION);
+        verify(adjuster).setCapacity(RESOURCE_ID, 8, REGION);
+        assertEquals(time.now().getEpochSecond(), policy.getLastScaleOutTime());
     }
 
     @Test
@@ -333,7 +394,7 @@ class ScalingPolicyAlarmActionHandlerTest {
         ScalingPolicy policy = targetTrackingPolicy(50.0, null);
         policy.getTargetTrackingConfiguration().setScaleOutCooldown(300);
         policy.setLastAppliedCapacity(10);
-        policy.setLastScaleOutTime(System.currentTimeMillis() / 1000.0);
+        policy.setLastScaleOutTime(time.now().getEpochSecond());
         stub(policy, target(1, 20), 3);
 
         handler.handle(POLICY_ARN, alarm("GreaterThanThreshold", 50.0), 80.0, REGION);
