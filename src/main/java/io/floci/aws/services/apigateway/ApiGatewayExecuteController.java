@@ -26,6 +26,7 @@ import io.floci.aws.core.common.AwsPartitions;
 import io.floci.aws.core.common.CookieHeaders;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
 import io.floci.aws.core.common.auth.SigV4AuthorizationHeader;
 import io.floci.aws.services.apigateway.model.ApiGatewayResource;
 import io.floci.aws.services.apigateway.model.ApiKey;
@@ -50,6 +51,7 @@ import io.floci.aws.services.apigatewayv2.websocket.WebSocketConnectionManager;
 import io.floci.aws.services.elbv2.ElbV2Service;
 import io.floci.aws.services.elbv2.model.Listener;
 import io.floci.aws.services.elbv2.model.LoadBalancer;
+import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
@@ -127,6 +129,7 @@ public class ApiGatewayExecuteController {
     private final CognitoUserPoolAuthorizer cognitoAuthorizer;
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final LambdaService lambdaService;
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
@@ -157,11 +160,13 @@ public class ApiGatewayExecuteController {
                                        RequestContext requestContext,
                                        ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
-                                       CloudMapInstanceResolver cloudMapInstanceResolver) {
+                                       CloudMapInstanceResolver cloudMapInstanceResolver,
+                                       ServiceCallAuthorizer serviceCallAuthorizer) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.jsonPathConfiguration = Configuration.builder()
@@ -604,6 +609,11 @@ public class ApiGatewayExecuteController {
                 resource.getId(), stageName, stage, headers, uriInfo, body, requestId,
                 authorizerResult.principalId(), authorizerResult.context(), resolvedApiKey, iamIdentity);
 
+        Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path);
+        if (permissionError != null) {
+            return permissionError;
+        }
+
         try {
             InvokeResult result = lambdaService.invokeTarget(region, functionName, eventJson.getBytes(),
                     InvocationType.RequestResponse);
@@ -622,6 +632,24 @@ public class ApiGatewayExecuteController {
             }
             throw e;
         }
+    }
+
+    private Response lambdaIntegrationPermission(GatewayResponseScope scope, Integration integration,
+                                                  String functionReference, String httpMethod, String path) {
+        if (integration.getCredentials() != null && !integration.getCredentials().isBlank()) {
+            return null;
+        }
+        String functionArn = LambdaArnUtils.functionArn(functionReference, regionResolver.getPartition(),
+                scope.region(), regionResolver.getAccountId());
+        // Lambda's API Gateway guide uses the function's region in a cross-region source ARN.
+        String sourceArn = buildMethodArn(AwsArnUtils.parse(functionArn).region(), scope.apiId(),
+                scope.stageName(), httpMethod, path);
+        if (serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                sourceArn, regionResolver.getAccountId()) == Decision.DENY) {
+            return gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
+                    "Internal server error");
+        }
+        return null;
     }
 
     // ──────────────────────────── HTTP_PROXY ────────────────────────────
@@ -1953,6 +1981,10 @@ public class ApiGatewayExecuteController {
                 if (functionName == null || functionName.isBlank()) {
                     throw new AwsException("InvalidParameterValueException",
                             "Cannot resolve Lambda function name from URI: " + integration.getUri(), 400);
+                }
+                Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path);
+                if (permissionError != null) {
+                    return permissionError;
                 }
                 byte[] payload = transformedBody != null ? transformedBody.getBytes(StandardCharsets.UTF_8) : new byte[0];
                 InvokeResult invokeResult = lambdaService.invokeTarget(region, functionName, payload, InvocationType.RequestResponse);
