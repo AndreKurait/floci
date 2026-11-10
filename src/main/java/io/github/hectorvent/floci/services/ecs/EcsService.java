@@ -282,7 +282,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 execSessions, discoveryRegistrar, cloudWatchMetricsService, Clock.systemUTC());
     }
 
-    /** With the clock for Container Insights samples, task protection deadlines and deployment start times. */
+    /** With the clock every timestamp, task protection deadline and Container Insights sample is read from. */
     EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
                EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
                StorageFactory storageFactory, EcsEventPublisher eventPublisher,
@@ -593,7 +593,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     void awaitServiceStable(EcsServiceModel svc, Duration timeout) {
         String serviceArn = svc.getServiceArn();
         recordLaunchFailure(svc, null, null);
-        Instant waitStarted = Instant.now();
+        Instant waitStarted = clock.instant();
         long deadline = waitTimer.nanoTime() + timeout.toNanos();
         Future<?> pass = null;
         int passes = 0;
@@ -1025,7 +1025,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         td.setPidMode(request.getPidMode());
         td.setIpcMode(request.getIpcMode());
         td.setUnparsed(request.getUnparsed());
-        td.setRegisteredAt(Instant.now());
+        td.setRegisteredAt(clock.instant());
         td.setRegisteredBy(regionResolver.buildArn("iam", region, "root"));
 
         td.setCompatibilities(deriveCompatibilities(request, fargate));
@@ -1505,7 +1505,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     public TaskDefinition deregisterTaskDefinition(String taskDefinitionRef, String region) {
         TaskDefinition td = resolveTaskDefinitionOrThrow(taskDefinitionRef, region);
         td.setStatus(STATUS_INACTIVE);
-        td.setDeregisteredAt(Instant.now());
+        td.setDeregisteredAt(clock.instant());
         storeTaskDefinition(td);
         return td;
     }
@@ -1535,7 +1535,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                         "Task definition " + ref + " must be INACTIVE before deletion.", 400);
             }
             td.setStatus(STATUS_DELETE_IN_PROGRESS);
-            td.setDeleteRequestedAt(Instant.now());
+            td.setDeleteRequestedAt(clock.instant());
             storeTaskDefinition(td);
             deleted.add(td);
         }
@@ -1687,7 +1687,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             task.setDesiredStatus(TaskStatus.RUNNING.name());
             task.setCpu(effectiveCpu(taskDef, request));
             task.setMemory(effectiveMemory(taskDef, request));
-            task.setCreatedAt(Instant.now());
+            task.setCreatedAt(clock.instant());
             task.setContainers(List.of());
             task.setContainerInstanceArn(placedInstanceArn);
             if (placedInstance != null) {
@@ -1722,9 +1722,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                         throw new IllegalStateException(
                                 "the containers a previous run of Floci left on the Docker daemon could not be removed yet");
                     }
-                    task.setPullStartedAt(Instant.now());
+                    task.setPullStartedAt(clock.instant());
                     EcsTaskHandle handle = containerManager.startTask(task, taskDef, containerOverrides, region);
-                    task.setPullStoppedAt(Instant.now());
+                    task.setPullStoppedAt(clock.instant());
                     boolean stopRequested;
                     synchronized (task) {
                         taskHandles.put(taskArn, handle);
@@ -1760,7 +1760,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                             ? e.getMessage()
                             : "Failed to start: " + e.getMessage());
                     task.setStopCode(STOP_CODE_TASK_FAILED_TO_START);
-                    task.setStoppedAt(Instant.now());
+                    task.setStoppedAt(clock.instant());
                     task.bumpVersion();
                     containerManager.releaseTaskNetwork(task, region);
                     if (eventPublisher != null) {
@@ -1811,7 +1811,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                         task.getAttachmentId(), task.getPrivateIpAddress(), null)));
             }
             if (task.isEnableExecuteCommand()) {
-                container.setManagedAgents(List.of(ManagedAgent.executeCommandAgent(Instant.now())));
+                container.setManagedAgents(List.of(ManagedAgent.executeCommandAgent(clock.instant())));
             }
             containers.add(container);
         }
@@ -1823,11 +1823,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      * as ECS can tell. {@code healthStatus} stays UNKNOWN unless a container declares a health
      * check, which is what AWS reports for a task nothing is probing.
      */
-    private static void markTaskRunning(EcsTask task) {
+    private void markTaskRunning(EcsTask task) {
         task.setLastStatus(TaskStatus.RUNNING.name());
-        task.setStartedAt(Instant.now());
+        task.setStartedAt(clock.instant());
         task.setConnectivity(CONNECTIVITY_CONNECTED);
-        task.setConnectivityAt(Instant.now());
+        task.setConnectivityAt(clock.instant());
         task.setHealthStatus(HEALTH_STATUS_UNKNOWN);
         task.bumpVersion();
     }
@@ -2362,8 +2362,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     private void markTaskStopped(EcsTask task, Map<String, Integer> exitCodes, Map<String, Instant> finishedAt,
                                  String region) {
         task.setLastStatus(TaskStatus.STOPPED.name());
-        task.setStoppedAt(Instant.now());
-        task.setExecutionStoppedAt(Instant.now());
+        task.setStoppedAt(clock.instant());
+        task.setExecutionStoppedAt(clock.instant());
         task.bumpVersion();
         containerManager.releaseTaskNetwork(task, region);
         if (task.getContainers() != null) {
@@ -2398,7 +2398,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         }
         task.setDesiredStatus(TaskStatus.STOPPED.name());
         task.setLastStatus(TaskStatus.STOPPING.name());
-        task.setStoppingAt(Instant.now());
+        task.setStoppingAt(clock.instant());
         task.setStoppedReason(reason != null ? reason : "Stopped by user");
         task.setStopCode(stopCode);
         task.bumpVersion();
@@ -3936,7 +3936,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         instance.setStatus(STATUS_ACTIVE);
         instance.setAgentConnected(true);
         instance.setVersion(1);
-        instance.setRegisteredAt(Instant.now());
+        instance.setRegisteredAt(clock.instant());
         instance.setVersionInfo(request.getVersionInfo() != null
                 ? request.getVersionInfo() : DEFAULT_VERSION_INFO);
         instance.setRegisteredResources(request.getTotalResources());
@@ -4460,8 +4460,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     || PLATFORM_VERSION_LATEST.equals(requested) ? DEFAULT_PLATFORM_VERSION : requested);
             ts.setPlatformFamily(platformFamilyOf(taskDef));
         }
-        ts.setCreatedAt(Instant.now());
-        ts.setUpdatedAt(Instant.now());
+        ts.setCreatedAt(clock.instant());
+        ts.setUpdatedAt(clock.instant());
         applyTaskSetScale(ts, svc);
 
         taskSets.put(taskSetArn, ts);
@@ -4501,7 +4501,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         ts.setComputedDesiredCount(
                 (int) Math.ceil(svc.getDesiredCount() * ts.getScaleValue() / 100.0));
         ts.setStabilityStatus(STABILITY_STATUS_STEADY_STATE);
-        ts.setStabilityStatusAt(Instant.now());
+        ts.setStabilityStatusAt(clock.instant());
     }
 
     public TaskSet updateTaskSet(String clusterRef, String serviceRef, String taskSetRef,
@@ -4515,7 +4515,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         }
         ts.setScaleValue(scaleValue);
         ts.setScaleUnit(SCALE_UNIT_PERCENT);
-        ts.setUpdatedAt(Instant.now());
+        ts.setUpdatedAt(clock.instant());
         applyTaskSetScale(ts, svc);
         return ts;
     }
@@ -4536,7 +4536,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                             + "Use the force flag to delete it anyway.", 400);
         }
         ts.setStatus("DRAINING");
-        ts.setUpdatedAt(Instant.now());
+        ts.setUpdatedAt(clock.instant());
         taskSets.remove(ts.getTaskSetArn());
         return ts;
     }
@@ -4603,7 +4603,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 .forEach(ts -> ts.setStatus(ts.getTaskSetArn().equals(primary.getTaskSetArn())
                         ? "PRIMARY" : STATUS_ACTIVE));
 
-        primary.setUpdatedAt(Instant.now());
+        primary.setUpdatedAt(clock.instant());
         return primary;
     }
 
@@ -4841,7 +4841,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 "service-deployment/" + deploymentId);
         String revisionArn = regionResolver.buildArn("ecs", region,
                 "service-revision/" + taskSetId(svc));
-        Instant now = Instant.now();
+        Instant now = clock.instant();
 
         List<String> priorRevisions = serviceRevisions.values().stream()
                 .filter(r -> svc.getServiceArn().equals(r.getServiceArn()))
@@ -4940,7 +4940,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     && STATUS_ACTIVE.equals(svc.getStatus())
                     && runningOnCurrentDeployment(svc) >= svc.getDesiredCount()
                     && !hasProtectedStaleTask(svc)) {
-                Instant now = Instant.now();
+                Instant now = clock.instant();
                 deployment.setStatus(DEPLOYMENT_STATUS_SUCCESSFUL);
                 if (deployment.getAlarmNames() != null) {
                     deployment.setAlarmStatus("MONITORING_COMPLETE");
@@ -5040,7 +5040,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                     return false;
                 }
                 String failedId = deploymentId(svc);
-                Instant now = Instant.now();
+                Instant now = clock.instant();
                 deployment.setStatus(rollback ? DEPLOYMENT_STATUS_ROLLBACK_IN_PROGRESS
                         : DEPLOYMENT_STATUS_STOP_REQUESTED);
                 deployment.setStatusReason(reason);
@@ -5111,7 +5111,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             return false;
         }
         if (DEPLOYMENT_STATUS_STOP_REQUESTED.equals(pending.getStatus())) {
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             synchronized (pending) {
                 if (DEPLOYMENT_STATUS_STOP_REQUESTED.equals(pending.getStatus())) {
                     pending.setStatus(DEPLOYMENT_STATUS_STOPPED);
@@ -5161,7 +5161,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             if (!DEPLOYMENT_STATUS_ROLLBACK_IN_PROGRESS.equals(deployment.getStatus())) {
                 return;
             }
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             deployment.setStatus(successful ? DEPLOYMENT_STATUS_ROLLBACK_SUCCESSFUL
                     : DEPLOYMENT_STATUS_ROLLBACK_FAILED);
             if (detail != null) {
@@ -5482,9 +5482,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
         task.setLastStatus(TaskStatus.STOPPED.name());
         task.setDesiredStatus(TaskStatus.STOPPED.name());
-        task.setStoppingAt(Instant.now());
-        task.setStoppedAt(Instant.now());
-        task.setExecutionStoppedAt(Instant.now());
+        task.setStoppingAt(clock.instant());
+        task.setStoppedAt(clock.instant());
+        task.setExecutionStoppedAt(clock.instant());
         task.setStoppedReason("Essential container in task exited");
         task.setStopCode(STOP_CODE_ESSENTIAL_CONTAINER_EXITED);
         task.bumpVersion();
@@ -6414,7 +6414,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 new SupportedResourceType("ecs:service", "ecs", true));
     }
 
-    private static void addExplorerResource(List<ExplorerResource> out, String arn, String resourceType,
+    private void addExplorerResource(List<ExplorerResource> out, String arn, String resourceType,
                                             Instant createdAt, Map<String, String> tags) {
         if (arn == null) {
             return;
@@ -6422,7 +6422,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
         out.add(new ExplorerResource(arn, resourceType, "ecs",
                 parsed.region(), parsed.accountId(),
-                createdAt != null ? createdAt : Instant.now(),
+                createdAt != null ? createdAt : clock.instant(),
                 tags != null ? tags : Map.of()));
     }
 }
