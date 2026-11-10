@@ -13352,6 +13352,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("InvalidParameterValue",
                         "Both Capacity Reservations must be owned by the calling account.", 400);
             }
+            Instant now = capacityReservationNow();
+            if (source.getCommitmentEndDate() != null && now.isBefore(source.getCommitmentEndDate())
+                    || destination.getCommitmentEndDate() != null && now.isBefore(destination.getCommitmentEndDate())) {
+                throw new AwsException("Unsupported",
+                        "Capacity cannot be moved during a Capacity Reservation commitment period.", 400);
+            }
             if (retry) {
                 return capacityMoveResult(region, requested);
             }

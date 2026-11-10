@@ -1400,6 +1400,9 @@ Capacity moves require different, active reservations in the caller's account an
 with matching instance type, platform, Availability Zone, tenancy, placement group and
 end time. Eligibility (`open` or `targeted`) and tags can differ. Both total and available
 counts are updated, and moving all capacity cancels the empty source reservation.
+Moving capacity is rejected while either reservation has an active commitment period.
+After the period ends, the usual move eligibility checks apply; rejected requests do not
+consume a move token or change either reservation's capacity.
 `DryRun` checks permissions without moving capacity. Case-sensitive `ClientToken` retries
 do not move capacity twice, including after a storage restart. A matching retry requires
 both reservations to remain active; a cancelled reservation returns `Unsupported`.
@@ -1479,8 +1482,8 @@ prevents new admissions; existing membership remains until the instance stops or
 or the reservation is cancelled or expires. Restart checks current sharing authorization.
 Consumed capacity moves retain member ownership and require the recipient to be authorized
 to use the destination. Capacity updates across owners publish in one atomic storage batch.
-Future-dated commitment periods and Capacity Blocks are not modeled.
-The consumed-sharing and inflight compatibility matrix remains incomplete.
+Capacity Blocks are not modeled by the move operation. The consumed-sharing and inflight
+compatibility matrix remains incomplete.
 
 Capacity reservation zone IDs must be among those returned by `DescribeAvailabilityZones`.
 
