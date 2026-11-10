@@ -33,6 +33,11 @@ interface CodeDeployTimer {
             }
             return future.isDone();
         }
+
+        @Override
+        public void waitOn(Object monitor, long nanos) throws InterruptedException {
+            TimeUnit.NANOSECONDS.timedWait(monitor, nanos);
+        }
     };
 
     /** A monotonic reading in nanoseconds, like {@link System#nanoTime()}. */
@@ -42,4 +47,7 @@ interface CodeDeployTimer {
 
     /** Waits up to {@code nanos} for {@code future} to complete in any way; true once it has. */
     boolean awaitDone(Future<?> future, long nanos) throws InterruptedException;
+
+    /** Waits on {@code monitor}, which the caller holds, until it is notified or {@code nanos} pass. */
+    void waitOn(Object monitor, long nanos) throws InterruptedException;
 }

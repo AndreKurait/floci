@@ -5,7 +5,12 @@ import io.github.hectorvent.floci.testing.TestTime;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * A {@link CodeDeployTimer} on a {@link TestTime} timeline. A deployment worker that waits parks until
@@ -16,6 +21,7 @@ final class TimelineTimer implements CodeDeployTimer {
 
     private final TestTime time;
     private final boolean selfAdvancing;
+    private final Semaphore monitorWaits = new Semaphore(0);
 
     TimelineTimer(TestTime time) {
         this(time, false);
@@ -77,5 +83,38 @@ final class TimelineTimer implements CodeDeployTimer {
             }
         }
         return future.isDone();
+    }
+
+    /**
+     * Waits on the monitor with no time limit of its own: a task on the timeline notifies the monitor
+     * when the wait is over, so the waiter wakes only when notified or when the test advances that far.
+     */
+    @Override
+    public void waitOn(Object monitor, long nanos) throws InterruptedException {
+        ScheduledFuture<?> wake = time.scheduler().schedule(() -> {
+            synchronized (monitor) {
+                monitor.notifyAll();
+            }
+        }, nanos, TimeUnit.NANOSECONDS);
+        try {
+            monitorWaits.release();
+            monitor.wait();
+        } finally {
+            wake.cancel(false);
+        }
+    }
+
+    /** Forgets the monitor waits seen so far, so the next {@link #awaitWaitOn} sees only a new one. */
+    void forgetWaits() {
+        monitorWaits.drainPermits();
+    }
+
+    /** Returns once a thread has started a {@link #waitOn} of {@code monitor} and has let go of it. */
+    void awaitWaitOn(Object monitor) throws InterruptedException {
+        assertTrue(monitorWaits.tryAcquire(10, TimeUnit.SECONDS), "a thread waits on the monitor");
+        synchronized (monitor) {
+            // Entering the monitor proves the waiter released it, which only its wait does.
+            monitor.hashCode();
+        }
     }
 }

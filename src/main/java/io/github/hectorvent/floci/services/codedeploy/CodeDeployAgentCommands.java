@@ -16,7 +16,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.TimeUnit;
 
 /** The tenant-scoped command mailbox used by real CodeDeploy agents. */
 @ApplicationScoped
@@ -26,6 +25,7 @@ public class CodeDeployAgentCommands {
     private final CodeDeploySpecificationSigner signer;
     private final long pollWaitNanos;
     private final long redeliveryNanos;
+    private final CodeDeployTimer timer;
     private final Map<DeploymentKey, Session> sessions = new HashMap<>();
     private final Map<GroupKey, Session> reservations = new HashMap<>();
     private final Map<HostKey, Set<Session>> hostSessions = new HashMap<>();
@@ -39,6 +39,11 @@ public class CodeDeployAgentCommands {
 
     CodeDeployAgentCommands(ObjectMapper mapper, CodeDeploySpecificationSigner signer,
                             Duration pollWait, Duration redelivery) {
+        this(mapper, signer, pollWait, redelivery, CodeDeployTimer.SYSTEM);
+    }
+
+    CodeDeployAgentCommands(ObjectMapper mapper, CodeDeploySpecificationSigner signer,
+                            Duration pollWait, Duration redelivery, CodeDeployTimer timer) {
         if (pollWait.isNegative() || redelivery.isNegative()) {
             throw new IllegalArgumentException("Command polling durations cannot be negative");
         }
@@ -46,6 +51,7 @@ public class CodeDeployAgentCommands {
         this.signer = signer;
         this.pollWaitNanos = pollWait.toNanos();
         this.redeliveryNanos = redelivery.toNanos();
+        this.timer = timer;
     }
 
     public synchronized Session open(String account, String region, String executionId, String groupId,
@@ -108,10 +114,10 @@ public class CodeDeployAgentCommands {
     }
 
     public synchronized Map<String, Object> poll(String account, String region, String host) {
-        long deadline = System.nanoTime() + pollWaitNanos;
+        long deadline = timer.nanoTime() + pollWaitNanos;
         HostKey key = new HostKey(account, region, host);
         while (!stopped) {
-            long now = System.nanoTime();
+            long now = timer.nanoTime();
             long remaining = deadline - now;
             for (Session session : hostSessions.getOrDefault(key, Set.of())) {
                 Command command = session.current.get(host);
@@ -134,7 +140,7 @@ public class CodeDeployAgentCommands {
                 break;
             }
             try {
-                TimeUnit.NANOSECONDS.timedWait(this, remaining);
+                timer.waitOn(this, remaining);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 break;
