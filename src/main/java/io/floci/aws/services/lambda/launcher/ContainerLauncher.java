@@ -2,6 +2,7 @@ package io.floci.aws.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.transport.DockerHttpClient;
 import io.floci.aws.config.EmulatorConfig;
@@ -25,6 +26,7 @@ import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.iam.model.SessionCreds;
 import io.floci.aws.services.lambda.LambdaLayerService;
 import io.floci.aws.services.lambda.LambdaLogDestinations;
+import io.floci.aws.services.lambda.launcher.ExtensionShutdownWait.ExtensionExec;
 import io.floci.aws.services.lambda.model.ContainerState;
 import io.floci.aws.services.lambda.model.LambdaFileSystemConfig;
 import io.floci.aws.services.lambda.model.LambdaFunction;
@@ -51,6 +53,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -62,7 +65,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -72,6 +74,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -123,6 +126,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
     private static final DateTimeFormatter LOG_STREAM_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
+    /** How long a stop waits for SHUTDOWN-subscribed extensions, matching AWS's 2000 ms budget. */
+    static final Duration EXTENSION_SHUTDOWN_BUDGET = Duration.ofSeconds(2);
+
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final DockerClient streamingDocker;
@@ -141,6 +147,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     /** When off, each container's exit is watched with its own wait stream (LambdaExitWatcher). */
     private final DockerExitEvents exitEvents;
     private final LambdaContainerReconciler containerReconciler;
+    private final Duration extensionShutdownBudget;
+    private final LongSupplier nanoClock;
     /** The VPC address each VpcConfig function's container holds, returned once it is removed. */
     private final Map<String, VpcLease> vpcLeases = new ConcurrentHashMap<>();
 
@@ -161,6 +169,31 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LambdaExecutionRoleCredentials executionRoleCredentials,
                              Ec2Service ec2Service,
                              DockerExitEvents exitEvents) {
+        this(containerBuilder, lifecycleManager, streamingDocker, controlPlaneHttp, logStreamer, imageResolver,
+                runtimeApiServerFactory, dockerHostResolver, config, regionResolver, ecrRegistryManager,
+                layerService, awsEnv, executionRoleCredentials, ec2Service, exitEvents,
+                EXTENSION_SHUTDOWN_BUDGET, System::nanoTime);
+    }
+
+    /** Lets tests set the extension shutdown budget and the clock that measures it. */
+    ContainerLauncher(ContainerBuilder containerBuilder,
+                      ContainerLifecycleManager lifecycleManager,
+                      DockerClient streamingDocker,
+                      DockerHttpClient controlPlaneHttp,
+                      ContainerLogStreamer logStreamer,
+                      ImageResolver imageResolver,
+                      RuntimeApiServerFactory runtimeApiServerFactory,
+                      DockerHostResolver dockerHostResolver,
+                      EmulatorConfig config,
+                      RegionResolver regionResolver,
+                      EcrRegistryManager ecrRegistryManager,
+                      LambdaLayerService layerService,
+                      LaunchedContainerAwsEnv awsEnv,
+                      LambdaExecutionRoleCredentials executionRoleCredentials,
+                      Ec2Service ec2Service,
+                      DockerExitEvents exitEvents,
+                      Duration extensionShutdownBudget,
+                      LongSupplier nanoClock) {
         this.exitEvents = exitEvents;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -178,6 +211,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.executionRoleCredentials = executionRoleCredentials;
         this.ec2Service = ec2Service;
         this.containerReconciler = new LambdaContainerReconciler(config, lifecycleManager);
+        this.extensionShutdownBudget = extensionShutdownBudget;
+        this.nanoClock = nanoClock;
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
     }
 
@@ -503,7 +538,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // (e.g. aws-lambda-web-adapter) never start without this. Best-effort: an extension
         // launch failure shouldn't fail the whole container launch, since a function with no
         // extensions is the common case and this must be a no-op for it.
-        Map<String, CompletableFuture<Void>> extensionExits = launchExtensions(
+        Map<String, ExtensionExec> extensionExecs = launchExtensions(
                 dockerClient, containerId, fn.getFunctionName(), runtimeApiServer, logDestination, provisioned);
 
         // Init-readiness barrier: the execs above are detached, so without waiting here the caller
@@ -528,7 +563,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 lambdaRegion, "lambda:" + fn.getFunctionName());
         handle.setLogStream(logHandle);
         handle.setLogTailReader(initialization -> InvocationLogTail.captureDocker(dockerClient, handle.getContainerId(), initialization));
-        handle.setExtensionExits(extensionExits);
+        handle.setExtensionExecs(extensionExecs);
 
         return handle;
         } catch (RuntimeException e) {
@@ -669,12 +704,18 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         RuntimeApiServer server = handle.getRuntimeApiServer();
         boolean interrupted = Thread.interrupted();
         try {
-            long shutdownStarted = handle.beginExtensionShutdown(System.nanoTime());
+            long shutdownStarted = handle.beginExtensionShutdown(nanoClock.getAsLong());
+            ExtensionShutdownWait extensionWait = handle.extensionShutdownWait(
+                    execId -> extensionExecExited(handle.getContainerId(), execId));
             server.quiesce();
-            if (!interrupted) {
+            // A cleanup retry after the deadline does not wait again.
+            long remainingNanos = extensionShutdownBudget.toNanos() - (nanoClock.getAsLong() - shutdownStarted);
+            if (!interrupted && remainingNanos > 0) {
                 try {
-                    awaitExtensionShutdown(handle,
-                            TimeUnit.SECONDS.toNanos(2) - (System.nanoTime() - shutdownStarted));
+                    if (!extensionWait.await(remainingNanos)) {
+                        LOG.debugv("Extensions of container {0} outlived their shutdown budget",
+                                handle.getContainerId());
+                    }
                 } catch (InterruptedException e) {
                     interrupted = true;
                 }
@@ -740,12 +781,32 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
     }
 
-    static void awaitExtensionShutdown(ContainerHandle handle, long remainingNanos) throws InterruptedException {
+    /**
+     * Whether the daemon reports an extension's process as gone. Asked only when its output
+     * stream failed. A question the daemon does not answer leaves the process its grace.
+     */
+    private boolean extensionExecExited(String containerId, String execId) {
+        DockerClient dockerClient = lifecycleManager.getDockerClient();
         try {
-            handle.extensionShutdownCompletion().get(Math.max(0, remainingNanos), TimeUnit.NANOSECONDS);
-        } catch (ExecutionException | TimeoutException | CancellationException failure) {
-            LOG.debugv(failure, "Extension shutdown did not complete cleanly for container {0}",
-                    handle.getContainerId());
+            if (Boolean.FALSE.equals(dockerClient.inspectExecCmd(execId).exec().isRunning())) {
+                return true;
+            }
+        } catch (NotFoundException e) {
+            // The daemon forgets an exec once it exited or its container was removed.
+            return true;
+        } catch (RuntimeException e) {
+            LOG.debugv(e, "Could not inspect extension exec {0} of container {1}", execId, containerId);
+        }
+        try {
+            // No process outlives its container, whatever the exec reported.
+            InspectContainerResponse.ContainerState state =
+                    dockerClient.inspectContainerCmd(containerId).exec().getState();
+            return state != null && Boolean.FALSE.equals(state.getRunning());
+        } catch (NotFoundException e) {
+            return true;
+        } catch (RuntimeException e) {
+            LOG.debugv(e, "Could not inspect container {0} for its extension exec {1}", containerId, execId);
+            return false;
         }
     }
 
@@ -1486,7 +1547,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 runtimeApiServer::handleRuntimeProcessExited);
     }
 
-    private Map<String, CompletableFuture<Void>> launchExtensions(DockerClient dockerClient,
+    private Map<String, ExtensionExec> launchExtensions(DockerClient dockerClient,
                                   String containerId, String functionName,
                                   RuntimeApiServer runtimeApiServer, LogDestination logDestination, boolean strict) {
         List<String> extensionNames = listExtensionBinaries(dockerClient, containerId, functionName, strict);
@@ -1494,7 +1555,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // exists when the first one starts polling /extension/event/next — otherwise a
         // fast-starting extension could become ready before there is anything to count it down.
         runtimeApiServer.expectExtensions(extensionNames.size());
-        Map<String, CompletableFuture<Void>> exits = new HashMap<>();
+        Map<String, ExtensionExec> execs = new HashMap<>();
         for (String name : extensionNames) {
             try {
                 String path = EXTENSIONS_DIR + "/" + name;
@@ -1520,9 +1581,15 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                         logDestination.region(),
                         "lambda:" + functionName + ":" + name));
                 // A synchronous connection error may occur after the daemon starts the exec.
-                // Retain its unknown outcome for the bounded shutdown wait.
-                exits.put(name, callback.completion());
-                streamingDocker.execStartCmd(execId).exec(callback);
+                // Keep the entry with a failed stream, so that shutdown asks the daemon
+                // whether the process runs instead of assuming either answer.
+                execs.put(name, new ExtensionExec(execId, callback.completion()));
+                try {
+                    streamingDocker.execStartCmd(execId).exec(callback);
+                } catch (RuntimeException e) {
+                    callback.completion().completeExceptionally(e);
+                    throw e;
+                }
                 LOG.infov("Launched extension {0} for function {1} (container {2})",
                         name, functionName, containerId);
             } catch (Exception e) {
@@ -1533,7 +1600,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                         name, functionName);
             }
         }
-        return exits;
+        return execs;
     }
 
     /**
