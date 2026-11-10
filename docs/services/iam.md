@@ -2712,6 +2712,8 @@ floci populates:
   `logs:CreateLogStream`, `logs:DeleteLogStream`, `logs:TagResource`, `logs:UntagResource`,
   `logs:ListTagsForResource`, `logs:DeleteLogGroup`, `logs:PutRetentionPolicy` and
   `logs:DeleteRetentionPolicy` use the owning log group's tags.
+  EC2 security-group deletion and authorize/revoke ingress/egress requests read the
+  current tags of the group named by `GroupId`, including revocations that also name rule IDs.
 - `s3:ExistingObjectTag/<key>`: the tags already on the target object version, for
   `s3:GetObject`, `s3:GetObjectTagging`, `s3:GetObjectAcl`, `s3:PutObjectAcl`,
   `s3:DeleteObjectTagging`, `s3:PutObjectTagging` and the annotation actions, and for their
