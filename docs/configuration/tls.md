@@ -41,6 +41,16 @@ security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db 
 
 Disabling verification (`--no-verify-ssl`, `verify=False`, `NODE_TLS_REJECT_UNAUTHORIZED=0`) still works but is no longer needed.
 
+For managed Java Lambda runtimes, an explicit Docker bind over
+`/var/lang/lib/security/cacerts` or `/etc/pki/ca-trust/extracted/java/cacerts`,
+including a parent directory, keeps that mounted runtime truststore in control.
+For the default public Java runtime images, Floci does not inject its JVM
+truststore option in that case. Container paths are matched case-sensitively
+on every host OS. Custom Java runtime images retain automatic injection because
+their truststore layout is not established by those standard paths. Supply the roots
+the workload needs in the mounted store; certificate verification stays enabled.
+Container-image Lambda functions retain their existing truststore injection.
+
 ## Configuration
 
 | Environment Variable | Default | Description |
