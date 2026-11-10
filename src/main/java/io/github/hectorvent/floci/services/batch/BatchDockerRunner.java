@@ -327,8 +327,9 @@ public class BatchDockerRunner implements ContainerTeardown {
     }
 
     private Integer waitForExit(String containerId, Duration timeout) throws InterruptedException {
-        long deadline = timeout.isZero() ? Long.MAX_VALUE : timer.currentTimeMillis() + timeout.toMillis();
-        while (timer.currentTimeMillis() <= deadline) {
+        // Measured on the monotonic timer, so setting the host's clock cannot end or extend an attempt.
+        long started = timer.nanoTime();
+        while (timeout.isZero() || timer.nanoTime() - started <= timeout.toNanos()) {
             Integer exitCode = getExitCodeIfStopped(containerId);
             if (exitCode != null) {
                 return exitCode;

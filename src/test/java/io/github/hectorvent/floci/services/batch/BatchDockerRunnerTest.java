@@ -297,6 +297,26 @@ class BatchDockerRunnerTest {
         assertEquals(limit.toEpochMilli(), result.stoppedAt());
     }
 
+    @Test
+    void steppingTheWallClockDuringAnAttemptDoesNotShortenItsTimeout() {
+        TestTime time = TestTime.create();
+        Instant started = time.now();
+        TimelineRunTimer timer = new TimelineRunTimer(time);
+        BatchDockerRunner runner = timedRunner(timer, () -> {
+            if (!time.now().isBefore(started.plusSeconds(1))) {
+                // The host's clock is set an hour ahead one second into the attempt.
+                timer.wallClockAhead = Duration.ofHours(1);
+            }
+            return time.now().isBefore(started.plusSeconds(30));
+        });
+
+        BatchRunResult result = runner.run(jobWithTimeout(60), 1);
+
+        assertFalse(result.timedOut());
+        assertEquals(0, result.exitCode());
+        assertEquals(started.plusSeconds(30), time.now());
+    }
+
     /** A runner on {@code timer} whose one container is running for as long as {@code running} says. */
     private BatchDockerRunner timedRunner(BatchDockerRunner.RunTimer timer, BooleanSupplier running) {
         EmulatorConfig config = config(Optional.empty());
