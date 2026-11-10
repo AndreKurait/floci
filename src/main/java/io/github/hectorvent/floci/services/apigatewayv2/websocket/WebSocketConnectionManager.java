@@ -3,8 +3,10 @@ package io.github.hectorvent.floci.services.apigatewayv2.websocket;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.vertx.core.http.ServerWebSocket;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -27,6 +29,12 @@ public class WebSocketConnectionManager implements Resettable {
      * the management API.
      */
     private final Set<String> serverInitiatedCloses = ConcurrentHashMap.newKeySet();
+    private final Clock clock;
+
+    @Inject
+    public WebSocketConnectionManager(Clock clock) {
+        this.clock = clock;
+    }
 
     /**
      * Register a new WebSocket connection.
@@ -117,7 +125,7 @@ public class WebSocketConnectionManager implements Resettable {
     public void updateLastActiveAt(String connectionId) {
         ConnectionInfo info = connections.get(connectionId);
         if (info != null) {
-            info.setLastActiveAt(System.currentTimeMillis());
+            info.setLastActiveAt(clock.millis());
         }
     }
 
