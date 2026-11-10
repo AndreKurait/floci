@@ -138,6 +138,7 @@ public class ResolvedServiceCatalog {
                     "iot-jobs-data", "iot",
                     "monitoring", "cloudwatch",
                     "awsssoportal", "sso",
+                    "appconfigdata", "appconfig",
                     "eventsv2", "events",
                     "payment-cryptography-data", "payment-cryptography");
 

@@ -343,6 +343,19 @@
       "StartPolicyGeneration",
       "ValidatePolicy"
     ],
+    "appconfig": [
+      "CreateApplication",
+      "CreateDeploymentStrategy",
+      "CreateExtension",
+      "CreateExtensionAssociation",
+      "GetAccountSettings",
+      "ListApplications",
+      "ListDeploymentStrategies",
+      "ListExperimentDefinitions",
+      "ListExtensionAssociations",
+      "ListExtensions",
+      "UpdateAccountSettings"
+    ],
     "dsql": [
       "InjectError",
       "ListClusters"
