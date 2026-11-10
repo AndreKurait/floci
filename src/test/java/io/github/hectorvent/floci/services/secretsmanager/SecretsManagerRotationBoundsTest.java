@@ -9,11 +9,16 @@ import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -31,10 +36,13 @@ class SecretsManagerRotationBoundsTest {
         AtomicInteger concurrentInvocations = new AtomicInteger();
         AtomicInteger peakConcurrentInvocations = new AtomicInteger();
         CountDownLatch release = new CountDownLatch(1);
+        Set<Thread> invokers = ConcurrentHashMap.newKeySet();
+        Set<Thread> alreadyRunning = Thread.getAllStackTraces().keySet();
 
         Mockito.when(mockLambda.invoke(Mockito.anyString(), Mockito.anyString(),
                         Mockito.any(byte[].class), Mockito.any()))
                 .thenAnswer(invocation -> {
+                    invokers.add(Thread.currentThread());
                     int inFlight = concurrentInvocations.incrementAndGet();
                     peakConcurrentInvocations.updateAndGet(peak -> Math.max(peak, inFlight));
                     try {
@@ -57,26 +65,23 @@ class SecretsManagerRotationBoundsTest {
             svc.rotateSecret(name, null, LAMBDA_ARN, null, true, REGION);
         }
 
-        // Let the pool ramp up to its cap and stay there; a run of unchanged readings means every
-        // task that is ever going to start running concurrently already has.
-        long deadline = System.currentTimeMillis() + 5000;
-        int lastSeen = -1;
-        int stableReadings = 0;
-        while (System.currentTimeMillis() < deadline && stableReadings < 5) {
-            int now = peakConcurrentInvocations.get();
-            if (now == lastSeen) {
-                stableReadings++;
-            } else {
-                stableReadings = 0;
-                lastSeen = now;
-            }
-            Thread.sleep(20);
-        }
+        // An executor starts its threads as work is handed to it, so every rotation thread this
+        // service will ever have exists by now. Once each of them is held inside its first Lambda
+        // call, no thread is left that could raise the peak.
+        List<Thread> rotationThreads = Thread.getAllStackTraces().keySet().stream()
+                .filter(thread -> thread.getName().matches("secretsmanager-rotation-\\d+")
+                        && !alreadyRunning.contains(thread))
+                .toList();
+        assertFalse(rotationThreads.isEmpty(), "rotations must run on the service's named rotation threads");
+        await("every rotation thread held in its Lambda call").atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> concurrentInvocations.get() >= rotationThreads.size());
 
+        int peak = peakConcurrentInvocations.get();
         release.countDown();
         svc.shutdown();
 
-        int peak = peakConcurrentInvocations.get();
+        assertTrue(rotationThreads.containsAll(invokers), "every rotation must run on a rotation thread");
         assertTrue(peak <= SecretsManagerService.ROTATION_EXECUTOR_POOL_SIZE,
                 "rotation ran " + peak + " secrets concurrently out of " + secretCount
                         + " submitted; the rotation executor must be bounded by its pool size of "

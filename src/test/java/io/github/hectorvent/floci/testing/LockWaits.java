@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.testing;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
+import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -38,6 +39,32 @@ public final class LockWaits {
     public static void awaitBlockedBehind(AtomicReference<Thread> waiter, AtomicReference<Thread> holder,
                                           Future<?> task) {
         awaitBlockedBehind(waiter::get, holder::get, task::isDone);
+    }
+
+    /**
+     * Returns the thread that has stopped inside {@code owner}'s {@code method} to wait: blocked on a
+     * monitor, in {@code Object.wait} or parked, with that method on its stack. For a caller that must
+     * hold back until others are done, this shows it is holding back there, where a fixed wait only
+     * showed it had not returned yet. Sees platform threads only. Fails after ten seconds.
+     */
+    public static Thread awaitWaitingIn(Class<?> owner, String method) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() - deadline < 0) {
+            for (Map.Entry<Thread, StackTraceElement[]> entry : Thread.getAllStackTraces().entrySet()) {
+                Thread.State state = entry.getKey().getState();
+                if (state != Thread.State.BLOCKED && state != Thread.State.WAITING
+                        && state != Thread.State.TIMED_WAITING) {
+                    continue;
+                }
+                for (StackTraceElement frame : entry.getValue()) {
+                    if (frame.getClassName().equals(owner.getName()) && frame.getMethodName().equals(method)) {
+                        return entry.getKey();
+                    }
+                }
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+        }
+        return fail("no thread ever waited in " + owner.getSimpleName() + "." + method);
     }
 
     private static void awaitBlockedBehind(Supplier<Thread> waiter, Supplier<Thread> holder,
