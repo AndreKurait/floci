@@ -10,19 +10,25 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -366,5 +372,234 @@ class TestTimeTest {
         AssertionError error = assertThrows(AssertionError.class, () -> time.awaitSleepers(1));
 
         assertTrue(error.getMessage().contains("expected 1 sleeping thread(s)"), error.getMessage());
+    }
+
+    @Test
+    void aTimedGetTimesOutExactlyWhenItsTimeoutHasPassed() throws Exception {
+        CompletableFuture<String> never = new CompletableFuture<>();
+        AtomicReference<Object> outcome = new AtomicReference<>();
+        AtomicBoolean interruptLeftBehind = new AtomicBoolean();
+        Thread waiter = Thread.ofPlatform().name("waiter").start(() -> {
+            try {
+                outcome.set(time.get(never, Duration.ofMinutes(5)));
+            } catch (TimeoutException | InterruptedException | ExecutionException e) {
+                outcome.set(e);
+            }
+            interruptLeftBehind.set(Thread.currentThread().isInterrupted());
+        });
+        time.awaitSleepers(1);
+
+        time.advance(Duration.ofMinutes(5).minusNanos(1));
+        assertNull(outcome.get());
+        assertEquals(1, time.sleepers());
+
+        time.advance(Duration.ofNanos(1));
+        assertInstanceOf(TimeoutException.class, outcome.get());
+        assertEquals(0, time.sleepers());
+        waiter.join();
+        assertFalse(interruptLeftBehind.get());
+    }
+
+    @Test
+    void aTimedGetReturnsWhatArrivesBeforeItsDeadline() throws Exception {
+        CompletableFuture<String> answer = new CompletableFuture<>();
+        CompletableFuture<String> failure = new CompletableFuture<>();
+        AtomicReference<Object> answered = new AtomicReference<>();
+        AtomicReference<Object> failed = new AtomicReference<>();
+        Thread first = Thread.ofVirtual().name("first").start(() -> answered.set(timedGet(answer)));
+        Thread second = Thread.ofPlatform().name("second").start(() -> failed.set(timedGet(failure)));
+        time.awaitSleepers(2);
+        time.advance(Duration.ofMinutes(5).minusNanos(1));
+
+        answer.complete("signalled");
+        failure.completeExceptionally(new IllegalStateException("boom"));
+        first.join();
+        second.join();
+
+        assertEquals("signalled", answered.get());
+        assertInstanceOf(IllegalStateException.class, ((ExecutionException) failed.get()).getCause());
+        assertEquals(0, time.sleepers());
+        time.advance(Duration.ofMinutes(1));
+        assertEquals("signalled", answered.get());
+    }
+
+    @Test
+    void aTimedPollTakesOneTurnPerTimeoutHoweverFarTheTestJumps() throws Exception {
+        LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<>();
+        List<String> polled = new CopyOnWriteArrayList<>();
+        Thread poller = Thread.ofVirtual().name("poller").start(() -> {
+            try {
+                for (int turn = 0; turn < 4; turn++) {
+                    polled.add(time.poll(queue, Duration.ofSeconds(20)) + " at " + time.now());
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        time.awaitSleepers(1);
+
+        time.advance(Duration.ofSeconds(50));
+        assertEquals(List.of("null at " + START.plusSeconds(20), "null at " + START.plusSeconds(40)), polled);
+
+        queue.add("message");
+        queue.add("another");
+        poller.join();
+        assertEquals(List.of("message at " + START.plusSeconds(50), "another at " + START.plusSeconds(50)),
+                polled.subList(2, 4));
+        assertEquals(0, time.sleepers());
+    }
+
+    @Test
+    void anyBlockingCallCanBeBoundedOnTheTimeline() throws Exception {
+        Object monitor = new Object();
+        CountDownLatch latch = new CountDownLatch(1);
+        List<String> order = new CopyOnWriteArrayList<>();
+        Thread onMonitor = Thread.ofPlatform().name("on-monitor").start(() -> {
+            synchronized (monitor) {
+                try {
+                    time.within(Duration.ofSeconds(30), () -> {
+                        monitor.wait();
+                        return null;
+                    });
+                    order.add("notified");
+                } catch (TimeoutException e) {
+                    order.add("monitor timed out at " + time.now());
+                } catch (InterruptedException e) {
+                    order.add("interrupted");
+                }
+            }
+        });
+        Thread onLatch = Thread.ofPlatform().name("on-latch").start(() -> {
+            try {
+                time.within(Duration.ofSeconds(10), () -> {
+                    latch.await();
+                    return null;
+                });
+                order.add("released");
+            } catch (TimeoutException e) {
+                order.add("latch timed out at " + time.now());
+            } catch (InterruptedException e) {
+                order.add("interrupted");
+            }
+        });
+        time.awaitSleepers(2);
+
+        time.advance(Duration.ofMinutes(1));
+
+        onMonitor.join();
+        onLatch.join();
+        assertEquals(List.of("latch timed out at " + START.plusSeconds(10),
+                "monitor timed out at " + START.plusSeconds(30)), order);
+    }
+
+    @Test
+    void aThreadInterruptedInATimedWaitSeesTheInterruptNotATimeout() throws Exception {
+        AtomicReference<Object> outcome = new AtomicReference<>();
+        Thread waiter = Thread.ofPlatform().name("waiter").start(
+                () -> outcome.set(timedGet(new CompletableFuture<>())));
+        time.awaitSleepers(1);
+
+        waiter.interrupt();
+        waiter.join();
+
+        assertInstanceOf(InterruptedException.class, outcome.get());
+        assertEquals(0, time.sleepers());
+        time.advance(Duration.ofMinutes(10));
+    }
+
+    @Test
+    void aTimedWaitWithNoTimeLeftNeverBlocks() throws Exception {
+        CompletableFuture<String> pending = new CompletableFuture<>();
+        LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<>(List.of("ready"));
+
+        assertThrows(TimeoutException.class, () -> time.get(pending, Duration.ZERO));
+        assertThrows(TimeoutException.class, () -> time.within(Duration.ofSeconds(-1), () -> pending.get()));
+        assertEquals("done", time.get(CompletableFuture.completedFuture("done"), Duration.ZERO));
+        assertEquals("ready", time.poll(queue, Duration.ZERO));
+        assertNull(time.poll(queue, Duration.ZERO));
+        assertEquals(START, time.now());
+    }
+
+    @Test
+    void aTimedGetOnTheTestThreadCanPassByItself() throws Exception {
+        CompletableFuture<String> response = new CompletableFuture<>();
+        AtomicInteger ticks = new AtomicInteger();
+        time.scheduler().scheduleAtFixedRate(ticks::incrementAndGet, 1, 1, TimeUnit.SECONDS);
+        time.scheduler().schedule(() -> response.complete("late answer"), 3, TimeUnit.SECONDS);
+
+        assertEquals("late answer", time.getAdvancing(response, Duration.ofSeconds(10)));
+        assertEquals(START.plusSeconds(3), time.now());
+        assertEquals(3, ticks.get());
+
+        assertThrows(TimeoutException.class,
+                () -> time.getAdvancing(new CompletableFuture<>(), Duration.ofSeconds(10)));
+        assertEquals(START.plusSeconds(13), time.now());
+        assertEquals(13, ticks.get());
+    }
+
+    @Test
+    void aTimedGetInsideATaskMovesTheTimelineItself() {
+        CompletableFuture<String> response = new CompletableFuture<>();
+        List<String> order = new ArrayList<>();
+        time.scheduler().schedule(() -> {
+            try {
+                order.add(time.get(response, Duration.ofSeconds(30)) + " at " + time.now());
+            } catch (InterruptedException | ExecutionException | TimeoutException e) {
+                order.add(e.toString());
+            }
+        }, 1, TimeUnit.SECONDS);
+        time.scheduler().schedule(() -> response.complete("answer"), 5, TimeUnit.SECONDS);
+
+        time.advance(Duration.ofSeconds(1));
+
+        assertEquals(List.of("answer at " + START.plusSeconds(5)), order);
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> {
+            Future<?> task = time.scheduler().submit(() -> time.within(Duration.ofSeconds(1), () -> response.get()));
+            time.runDue();
+            try {
+                task.get();
+            } catch (ExecutionException e) {
+                throw (RuntimeException) e.getCause();
+            }
+        });
+        assertTrue(refused.getMessage().contains("would stop the timeline"), refused.getMessage());
+    }
+
+    @Test
+    void advanceUntilStopsAtTheInstantTheConditionFirstHolds() throws Exception {
+        AtomicInteger polls = new AtomicInteger();
+        Thread poller = Thread.ofVirtual().name("poller").start(() -> {
+            try {
+                while (true) {
+                    time.sleepMillis(250);
+                    polls.incrementAndGet();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        time.awaitSleepers(1);
+
+        assertTrue(time.advanceUntil(() -> polls.get() == 7, Duration.ofMinutes(5)));
+        assertEquals(START.plusMillis(1750), time.now());
+
+        assertFalse(time.advanceUntil(() -> polls.get() == 12, Duration.ofSeconds(1)));
+        assertEquals(START.plusMillis(2750), time.now());
+        assertEquals(11, polls.get());
+
+        assertTrue(time.advanceUntil(() -> true, Duration.ofHours(1)));
+        assertEquals(START.plusMillis(2750), time.now());
+        assertThrows(IllegalArgumentException.class, () -> time.advanceUntil(() -> true, Duration.ofNanos(-1)));
+        poller.interrupt();
+        poller.join();
+    }
+
+    /** What a five-minute timed get of {@code future} ends with: its value, or what it threw. */
+    private Object timedGet(CompletableFuture<String> future) {
+        try {
+            return time.get(future, Duration.ofMinutes(5));
+        } catch (TimeoutException | InterruptedException | ExecutionException e) {
+            return e;
+        }
     }
 }
