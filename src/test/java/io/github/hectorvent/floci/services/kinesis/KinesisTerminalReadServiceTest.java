@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisShard;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisStream;
+import io.github.hectorvent.floci.testing.LockWaits;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -18,7 +19,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.doAnswer;
@@ -148,8 +149,11 @@ class KinesisTerminalReadServiceTest {
         put("first");
         CountDownLatch captured = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Thread> reader = new AtomicReference<>();
+        AtomicReference<Thread> writer = new AtomicReference<>();
         doAnswer(invocation -> {
             KinesisShard.RecordsSnapshot snapshot = (KinesisShard.RecordsSnapshot) invocation.callRealMethod();
+            reader.set(Thread.currentThread());
             captured.countDown();
             assertTrue(release.await(5, TimeUnit.SECONDS));
             return snapshot;
@@ -161,12 +165,15 @@ class KinesisTerminalReadServiceTest {
                 assertTrue(captured.await(5, TimeUnit.SECONDS));
                 CountDownLatch writing = new CountDownLatch(1);
                 Future<?> mutation = pool.submit(() -> {
+                    writer.set(Thread.currentThread());
                     writing.countDown();
                     service.putRecordForAccount(ACCOUNT, "s", new byte[]{2}, "pk", REGION);
                     split();
                 });
                 assertTrue(writing.await(5, TimeUnit.SECONDS));
-                assertThrows(TimeoutException.class, () -> mutation.get(150, TimeUnit.MILLISECONDS));
+                // The append waits for the stream monitor the parked read holds, so it cannot finish.
+                LockWaits.awaitBlockedBehind(writer, reader, mutation);
+                assertFalse(mutation.isDone());
                 release.countDown();
                 Map<String, Object> open = reading.get(5, TimeUnit.SECONDS);
                 assertNotNull(open.get("NextShardIterator"));
