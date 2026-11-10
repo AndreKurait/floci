@@ -378,7 +378,7 @@ jobs:
           # sdk-test-java's HTTP Task regression calls a MOCK API on http://floci:4566; every
           # other leg keeps the default rejection of plaintext http:invoke endpoints.
           docker run -d --name floci --network compat-net \
-            -p 4566:4566 \
+            -p 127.0.0.1:4566:4566 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --group-add "$DOCKER_GID" \
             -e FLOCI_BASE_URL=http://floci:4566 \
@@ -388,6 +388,7 @@ jobs:
             -e FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED=true \
             -e FLOCI_TLS_ENABLED=true \
             -e FLOCI_SERVICES_STEPFUNCTIONS_ALLOW_PLAINTEXT_HTTP=${{ matrix.test == 'sdk-test-java' }} \
+            -e FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=${{ matrix.test == 'sdk-test-java' }} \
             -e FLOCI_SERVICES_EC2_MOCK=true \
             -e FLOCI_SERVICES_REDSHIFT_ENDPOINT_HOST=floci \
             -e FLOCI_SERVICES_RDS_ENDPOINT_HOST=floci \
@@ -576,7 +577,7 @@ jobs:
           docker network create compat-net
           cat > start-floci.sh <<'SH'
           docker run -d --name floci --network compat-net \
-            -p 4566:4566 \
+            -p 127.0.0.1:4566:4566 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
             -e FLOCI_BASE_URL=http://floci:4566 \

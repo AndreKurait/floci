@@ -167,3 +167,26 @@ docker run --rm -e FLOCI_ENDPOINT=http://host.docker.internal:4566 floci-sdk-pyt
 ## Exit Codes
 
 All test runners exit `0` on full pass and non-zero if any test fails — suitable for CI pipelines.
+
+## HTTP API JWT fixture
+
+The Java HTTP API execution test serves a local OIDC discovery document and JWKS
+endpoint and signs its tokens with an ephemeral RSA key. Run Floci with
+`FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=true` for this suite so it can fetch the
+fixture on the test client's private address. The compatibility workflow enables
+this only for the Java SDK job. Normal Floci configurations keep private JWT
+issuer targets disabled. The client and Floci must be able to reach each other,
+as they can on the workflow's shared container network.
+
+The fixture verifies a valid signature through an HTTP proxy integration even
+when Lambda dispatch is unavailable. Missing tokens, wrong audiences and a
+different signing key must fail. The positive case also requires a real JWKS
+fetch. Setup and signature verification failures fail the suite.
+
+The issuer binds the client's specific interface used to reach Floci, which is
+loopback when both processes run on the same host. When testing a containerized
+Floci from the host, use `FLOCI_TEST_JWT_ISSUER_BIND_ADDRESS` to choose a specific
+local interface reachable from that container, and `FLOCI_TEST_JWT_ISSUER_HOST`
+to override the hostname Floci should use for callbacks. Wildcard binds are
+rejected. Keep the fixture on a private test network, and enable the private-JWT
+flag only on that test Floci instance, including when using a local launcher.
