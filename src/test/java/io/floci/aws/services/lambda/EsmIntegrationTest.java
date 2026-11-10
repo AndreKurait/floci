@@ -1373,7 +1373,7 @@ class EsmIntegrationTest {
                         String lastBody = getQueueAttributesBody(MULTI_ACCOUNT_QUEUE_URL, sqsAuth);
                         assertTrue(parseNotVisible(lastBody) > 0,
                                 "ESM poller never claimed the message under account " + NON_DEFAULT_ACCOUNT
-                                        + " (ApproximateNumberOfMessagesNotVisible stayed 0) — "
+                                        + " (ApproximateNumberOfMessagesNotVisible stayed 0): "
                                         + "account-aware queue lookup in doReceiveMessage is broken. "
                                         + "Last GetQueueAttributes body: " + lastBody);
                     });
