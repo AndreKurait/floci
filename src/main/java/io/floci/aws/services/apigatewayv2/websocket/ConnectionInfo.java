@@ -1,6 +1,8 @@
 package io.floci.aws.services.apigatewayv2.websocket;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.floci.aws.services.apigateway.ExecuteApiSigV4Authorizer.CallerIdentity;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 @RegisterForReflection
@@ -14,6 +16,11 @@ public class ConnectionInfo {
     private long lastActiveAt;
     private String sourceIp;
     private String userAgent;
+    @JsonIgnore
+    private CallerIdentity callerIdentity;
+
+    CallerIdentity callerIdentity() { return callerIdentity; }
+    void callerIdentity(CallerIdentity identity) { this.callerIdentity = identity; }
 
     public ConnectionInfo() {}
 
