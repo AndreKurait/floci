@@ -110,6 +110,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1542,13 +1543,9 @@ class IotMqttBrokerServiceTest {
             releaseFirst.countDown();
         }
 
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (queuedRan.get() < queued) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("only " + queuedRan.get() + " of " + queued + " queued evaluations ran");
-            }
-            Thread.sleep(10);
-        }
+        await("all " + queued + " queued evaluations to run").atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> queuedRan.get() >= queued);
         assertFalse(beyondBoundRan.get(), "the evaluation beyond the bound was skipped");
 
         broker.evaluateRulesOnWorker(topic, afterDrainRan::countDown);
@@ -1860,16 +1857,9 @@ class IotMqttBrokerServiceTest {
     }
 
     private List<JsonNode> awaitPresence(String eventType, String clientId, int count) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 10_000;
-        List<JsonNode> events = presence(eventType, clientId);
-        while (events.size() < count) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("expected " + count + " " + eventType + " events for " + clientId + ", got " + events);
-            }
-            Thread.sleep(10);
-            events = presence(eventType, clientId);
-        }
-        return events;
+        return await(count + " " + eventType + " events for " + clientId).atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> presence(eventType, clientId), events -> events.size() >= count);
     }
 
     /**
@@ -1884,13 +1874,9 @@ class IotMqttBrokerServiceTest {
     }
 
     private static void awaitDisconnected(MqttClient client) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (client.isConnected()) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("client " + client.getClientId() + " is still connected");
-            }
-            Thread.sleep(10);
-        }
+        await("client " + client.getClientId() + " to be disconnected").atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !client.isConnected());
     }
 
     private static MqttSubscribeMessage subscribeMessage(String topicFilter) {
@@ -2125,18 +2111,9 @@ class IotMqttBrokerServiceTest {
 
     /** Vert.x resolves close() a moment before the OS releases the port; poll like the lazy-start test. */
     private static void awaitClosed(int port) {
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (accepts(port)) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("port " + port + " still accepts connections");
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("interrupted while waiting for port " + port + " to close", e);
-            }
-        }
+        await("port " + port + " to stop accepting connections").atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                .until(() -> !accepts(port));
     }
 
     /** A client key manager with no certificate that records whether the server asked for one. */

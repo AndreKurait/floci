@@ -8,6 +8,7 @@ import io.floci.aws.services.kinesis.model.KinesisConsumer;
 import io.floci.aws.services.kinesis.model.KinesisRecord;
 import io.floci.aws.services.kinesis.model.KinesisShard;
 import io.floci.aws.services.kinesis.model.KinesisStream;
+import io.floci.aws.testing.LockWaits;
 import io.floci.aws.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
@@ -40,7 +41,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -911,10 +911,12 @@ class KinesisServiceTest {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicBoolean firstIn = new AtomicBoolean(true);
+        AtomicReference<Thread> t1Thread = new AtomicReference<>();
         // Only the first producer to enter the critical section parks; it holds the stream lock
         // until released, so any second producer on the same stream must block behind it.
         kinesisService.putRecordAppendHook = () -> {
             if (firstIn.compareAndSet(true, false)) {
+                t1Thread.set(Thread.currentThread());
                 entered.countDown();
                 try {
                     release.await();
@@ -947,27 +949,13 @@ class KinesisServiceTest {
                     "T2 must be scheduled and reach the putRecord call");
 
             // Deterministic barrier: T2 must actually reach and block on the stream monitor while
-            // T1 holds it. Spin until its thread is BLOCKED (entering the synchronized section);
-            // if the lock were gone T2 would run to completion instead and never park here.
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            boolean blockedOnMonitor = false;
-            while (System.nanoTime() < deadline) {
-                Thread th = t2Thread.get();
-                if (th != null && th.getState() == Thread.State.BLOCKED) {
-                    blockedOnMonitor = true;
-                    break;
-                }
-                if (t2.isDone()) {
-                    break;
-                }
-                Thread.sleep(5);
-            }
-            assertTrue(blockedOnMonitor,
+            // T1 holds it. If the lock were gone T2 would run to completion instead, which fails here.
+            LockWaits.awaitBlockedBehind(t2Thread, t1Thread, t2);
+            assertEquals(Thread.State.BLOCKED, t2Thread.get().getState(),
                     "T2 must block entering the append critical section while T1 holds the stream lock");
 
-            // Mutual exclusion: T2 cannot complete while T1 holds the lock.
-            assertThrows(TimeoutException.class, () -> t2.get(500, TimeUnit.MILLISECONDS),
-                    "a second producer must block while the first holds the stream lock");
+            // Mutual exclusion: T2 waits for the monitor T1 holds until released, so it cannot complete.
+            assertFalse(t2.isDone(), "a second producer must block while the first holds the stream lock");
 
             release.countDown();
             t1.get(2, TimeUnit.SECONDS);
@@ -999,8 +987,11 @@ class KinesisServiceTest {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicBoolean firstIn = new AtomicBoolean(true);
+        AtomicReference<Thread> producerThread = new AtomicReference<>();
+        AtomicReference<Thread> deleterThread = new AtomicReference<>();
         kinesisService.putRecordAppendHook = () -> {
             if (firstIn.compareAndSet(true, false)) {
+                producerThread.set(Thread.currentThread());
                 entered.countDown();
                 try {
                     release.await();
@@ -1018,10 +1009,12 @@ class KinesisServiceTest {
 
             // The deleter shares the stream monitor the parked producer holds, so it must block.
             Future<?> deleter = pool.submit(() -> {
+                deleterThread.set(Thread.currentThread());
                 kinesisService.deleteStream("res", REGION);
                 return null;
             });
-            assertThrows(TimeoutException.class, () -> deleter.get(500, TimeUnit.MILLISECONDS),
+            LockWaits.awaitBlockedBehind(deleterThread, producerThread, deleter);
+            assertFalse(deleter.isDone(),
                     "deleteStream must block behind the in-flight append, not delete concurrently");
 
             release.countDown();
@@ -1131,6 +1124,8 @@ class KinesisServiceTest {
         final CountDownLatch parked = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
 
+        final AtomicReference<Thread> parkedThread = new AtomicReference<>();
+
         void arm() {
             armed.set(true);
         }
@@ -1138,6 +1133,7 @@ class KinesisServiceTest {
         @Override
         public Optional<KinesisStream> get(String key) {
             if (armed.compareAndSet(true, false)) {
+                parkedThread.set(Thread.currentThread());
                 parked.countDown();
                 try {
                     release.await();
@@ -1222,23 +1218,6 @@ class KinesisServiceTest {
                         s -> s.updateMaxRecordSize(META_STREAM, 2048, REGION)));
     }
 
-    /** Spins until {@code thread} is BLOCKED entering a monitor, or {@code task} completes. */
-    private static boolean awaitBlockedOnMonitor(AtomicReference<Thread> thread, Future<?> task)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-        while (System.nanoTime() < deadline) {
-            Thread t = thread.get();
-            if (t != null && t.getState() == Thread.State.BLOCKED) {
-                return true;
-            }
-            if (task.isDone()) {
-                return false;
-            }
-            Thread.sleep(5);
-        }
-        return false;
-    }
-
     /**
      * A metadata write that overlaps a deleteStream must not resurrect the stream.
      *
@@ -1282,10 +1261,12 @@ class KinesisServiceTest {
             });
             assertTrue(deleterStarted.await(2, TimeUnit.SECONDS),
                     "the deleter must be scheduled and reach the deleteStream call");
-            assertTrue(awaitBlockedOnMonitor(deleterThread, deleter),
-                    () -> "deleteStream must block on the stream monitor while " + label
-                            + " holds it, which is what proves the resolve happens inside the lock");
-            assertThrows(TimeoutException.class, () -> deleter.get(500, TimeUnit.MILLISECONDS),
+            // deleteStream must block on the stream monitor while the writer holds it, which is what
+            // proves the resolve happens inside the lock; an unserialized delete finishes and fails here.
+            LockWaits.awaitBlockedBehind(deleterThread, store.parkedThread, deleter);
+            assertEquals(Thread.State.BLOCKED, deleterThread.get().getState(),
+                    () -> "deleteStream must block on the stream monitor while " + label + " holds it");
+            assertFalse(deleter.isDone(),
                     () -> "deleteStream must not complete while " + label + " holds the stream monitor");
 
             store.release.countDown();

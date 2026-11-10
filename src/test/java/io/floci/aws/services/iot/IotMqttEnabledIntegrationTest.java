@@ -49,6 +49,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -844,30 +845,23 @@ class IotMqttEnabledIntegrationTest {
     }
 
     /** The first non-empty receive on the queue within two seconds. */
-    private List<String> awaitMessages(String queueUrl) throws InterruptedException {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(2));
-        while (Instant.now().isBefore(deadline)) {
-            List<String> received = receiveMessages(queueUrl);
-            if (!received.isEmpty()) {
-                return received;
-            }
-            Thread.sleep(25);
-        }
-        throw new AssertionError("No message arrived on " + queueUrl);
+    private List<String> awaitMessages(String queueUrl) {
+        return await("a message on " + queueUrl).atMost(Duration.ofSeconds(2))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                .until(() -> receiveMessages(queueUrl), received -> !received.isEmpty());
     }
 
     /** Receives until {@code count} messages arrived or ten seconds passed, then once more, so a surplus one shows too. */
     private List<JsonNode> awaitMessages(String queueUrl, int count) throws Exception {
         List<JsonNode> messages = new ArrayList<>();
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(10));
-        while (messages.size() < count && Instant.now().isBefore(deadline)) {
-            for (String body : receiveMessages(queueUrl)) {
-                messages.add(OBJECT_MAPPER.readTree(body));
-            }
-            if (messages.size() < count) {
-                Thread.sleep(50);
-            }
-        }
+        await(count + " messages on " + queueUrl).atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                .until(() -> {
+                    for (String body : receiveMessages(queueUrl)) {
+                        messages.add(OBJECT_MAPPER.readTree(body));
+                    }
+                    return messages.size() >= count;
+                });
         for (String body : receiveMessages(queueUrl)) {
             messages.add(OBJECT_MAPPER.readTree(body));
         }
@@ -950,17 +944,11 @@ class IotMqttEnabledIntegrationTest {
         return OBJECT_MAPPER.readTree(payload);
     }
 
-    private void awaitPublishedEvent(String topic, byte[] payload) throws InterruptedException {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(2));
-        while (Instant.now().isBefore(deadline)) {
-            boolean found = eventRecorder.recentEvents().stream()
-                    .anyMatch(event -> topic.equals(event.topic()) && Arrays.equals(payload, event.payload()));
-            if (found) {
-                return;
-            }
-            Thread.sleep(25);
-        }
-        throw new AssertionError("MQTT publish event was not recorded");
+    private void awaitPublishedEvent(String topic, byte[] payload) {
+        await("the recorded MQTT publish event on " + topic).atMost(Duration.ofSeconds(2))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                .until(() -> eventRecorder.recentEvents().stream()
+                        .anyMatch(event -> topic.equals(event.topic()) && Arrays.equals(payload, event.payload())));
     }
 
     /** An MQTT 3.1.1 CONNECT over a plain socket, so the test decides exactly which packets follow it. */
@@ -1049,15 +1037,10 @@ class IotMqttEnabledIntegrationTest {
                     .orElseThrow(() -> new AssertionError("No MQTT publish received"));
         }
 
-        void awaitDisconnected() throws InterruptedException {
-            Instant deadline = Instant.now().plus(Duration.ofSeconds(2));
-            while (Instant.now().isBefore(deadline)) {
-                if (!client.isConnected()) {
-                    return;
-                }
-                Thread.sleep(25);
-            }
-            throw new AssertionError("MQTT connection stayed open");
+        void awaitDisconnected() {
+            await("the MQTT connection to close").atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                    .until(() -> !client.isConnected());
         }
 
         /** Drops the TCP connection without sending DISCONNECT, as a crashed device would. */

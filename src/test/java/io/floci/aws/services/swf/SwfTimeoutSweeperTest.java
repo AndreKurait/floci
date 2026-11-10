@@ -3,15 +3,23 @@ package io.floci.aws.services.swf;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.EmulatorConfig.ServicesConfig;
 import io.floci.aws.config.EmulatorConfig.SwfServiceConfig;
+import io.floci.aws.testing.TestTime;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
 import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 /**
  * The sweep interval reaches {@code scheduleWithFixedDelay}, which rejects a non-positive
@@ -36,6 +44,75 @@ class SwfTimeoutSweeperTest {
         SwfTimeoutSweeper sweeper = new SwfTimeoutSweeper(null, configWithInterval(30L));
         assertDoesNotThrow(() -> sweeper.onStart(new StartupEvent()));
         sweeper.onStop(new ShutdownEvent());
+    }
+
+    @Test
+    void configuredSecondsIntervalIsTheSweepPeriod() {
+        TestTime time = TestTime.create();
+        SwfService service = mock(SwfService.class);
+        new SwfTimeoutSweeper(service, configWithInterval(30L), time.scheduler()).onStart(new StartupEvent());
+
+        time.advance(Duration.ofSeconds(30).minusMillis(1));
+        verify(service, never()).sweep();
+        time.advance(Duration.ofMillis(1));
+        verify(service, times(1)).sweep();
+        time.advance(Duration.ofSeconds(30));
+        verify(service, times(2)).sweep();
+    }
+
+    @Test
+    void nonPositiveConfiguredInterval_fallsBackToTheDefaultPeriod() {
+        for (long interval : new long[] {0L, -1L, Long.MIN_VALUE}) {
+            TestTime time = TestTime.create();
+            SwfService service = mock(SwfService.class);
+            new SwfTimeoutSweeper(service, configWithInterval(interval), time.scheduler())
+                    .onStart(new StartupEvent());
+
+            time.advance(Duration.ofSeconds(SwfTimeoutSweeper.DEFAULT_TICK_INTERVAL_SECONDS).minusMillis(1));
+            verify(service, never()).sweep();
+            time.advance(Duration.ofMillis(1));
+            verify(service, times(1)).sweep();
+        }
+    }
+
+    @Test
+    void aFailedSweepDoesNotStopTheOnesAfterIt() {
+        TestTime time = TestTime.create();
+        SwfService service = mock(SwfService.class);
+        doThrow(new IllegalStateException("storage is briefly unavailable")).doNothing().when(service).sweep();
+        new SwfTimeoutSweeper(service, configWithInterval(1L), time.scheduler()).onStart(new StartupEvent());
+
+        time.advance(Duration.ofSeconds(1));
+        verify(service, times(1)).sweep();
+        time.advance(Duration.ofSeconds(1));
+        verify(service, times(2)).sweep();
+    }
+
+    @Test
+    void aDisabledSweeperNeverSweeps() {
+        TestTime time = TestTime.create();
+        SwfService service = mock(SwfService.class);
+        EmulatorConfig config = configWithInterval(1L);
+        SwfServiceConfig swf = config.services().swf();
+        doReturn(false).when(swf).timeoutSweepEnabled();
+        new SwfTimeoutSweeper(service, config, time.scheduler()).onStart(new StartupEvent());
+
+        time.advance(Duration.ofHours(1));
+
+        verify(service, never()).sweep();
+    }
+
+    /** The sweeper's own thread in real time; the cases above cover when it sweeps. */
+    @Test
+    void theSweepersOwnThreadSweepsAtTheConfiguredInterval() {
+        SwfService service = mock(SwfService.class);
+        SwfTimeoutSweeper sweeper = new SwfTimeoutSweeper(service, configWithInterval(1L));
+        try {
+            sweeper.onStart(new StartupEvent());
+            verify(service, timeout(5000)).sweep();
+        } finally {
+            sweeper.onStop(new ShutdownEvent());
+        }
     }
 
     @Test

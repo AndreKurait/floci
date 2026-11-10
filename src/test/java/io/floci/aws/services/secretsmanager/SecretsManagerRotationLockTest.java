@@ -9,12 +9,15 @@ import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.secretsmanager.model.Secret;
 import io.floci.aws.services.secretsmanager.model.SecretVersion;
+import io.floci.aws.testing.ThreadStates;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
+import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -241,18 +244,9 @@ class SecretsManagerRotationLockTest {
         }
 
         /** Waits for the thread to sit on a monitor rather than for a fixed interval to pass. */
-        boolean awaitBlocked() throws InterruptedException {
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (System.nanoTime() < deadline) {
-                if (thread.getState() == Thread.State.BLOCKED) {
-                    return true;
-                }
-                if (!thread.isAlive()) {
-                    return false;
-                }
-                Thread.sleep(5);
-            }
-            return false;
+        boolean awaitBlocked() {
+            return ThreadStates.awaitState(thread, EnumSet.of(Thread.State.BLOCKED, Thread.State.TERMINATED),
+                    Duration.ofSeconds(5), thread.getName()) == Thread.State.BLOCKED;
         }
 
         void awaitTermination() throws InterruptedException {

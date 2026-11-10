@@ -64,17 +64,26 @@ public class KinesisAnalyticsV2Service {
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
     private final FlinkContainerManager containerManager;
-    private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService poller;
 
     @Inject
     public KinesisAnalyticsV2Service(StorageFactory storageFactory, EmulatorConfig config,
                                      RegionResolver regionResolver,
                                      FlinkContainerManager containerManager) {
+        this(storageFactory, config, regionResolver, containerManager,
+                Executors.newSingleThreadScheduledExecutor());
+    }
+
+    /** Package-private so tests can run the readiness poller on a scheduler they control. */
+    KinesisAnalyticsV2Service(StorageFactory storageFactory, EmulatorConfig config,
+                              RegionResolver regionResolver,
+                              FlinkContainerManager containerManager, ScheduledExecutorService poller) {
         this.storage = storageFactory.create("kinesisanalytics", "kinesisanalytics-applications.json",
                 new TypeReference<Map<String, FlinkApplication>>() {});
         this.config = config;
         this.regionResolver = regionResolver;
         this.containerManager = containerManager;
+        this.poller = poller;
     }
 
     @PostConstruct

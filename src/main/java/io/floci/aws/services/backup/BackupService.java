@@ -30,6 +30,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
@@ -78,15 +79,26 @@ public class BackupService {
         return vaultLocks.computeIfAbsent(vaultKey, k -> new Object());
     }
 
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "backup-job-scheduler");
-        t.setDaemon(true);
-        return t;
-    });
+    private final Clock clock;
+    private final ScheduledExecutorService scheduler;
 
     @Inject
     public BackupService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
                          ObjectMapper objectMapper, SnsService snsService) {
+        this(storageFactory, config, regionResolver, objectMapper, snsService, Clock.systemUTC(),
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "backup-job-scheduler");
+                    t.setDaemon(true);
+                    return t;
+                }));
+    }
+
+    /** For tests that decide when a job's delays elapse: the clock and the scheduler the jobs run on. */
+    BackupService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
+                  ObjectMapper objectMapper, SnsService snsService, Clock clock,
+                  ScheduledExecutorService scheduler) {
+        this.clock = clock;
+        this.scheduler = scheduler;
         this.vaultStore     = storageFactory.create("backup", "backup-vaults.json",     new TypeReference<>() {});
         this.planStore      = storageFactory.create("backup", "backup-plans.json",      new TypeReference<>() {});
         this.selectionStore = storageFactory.create("backup", "backup-selections.json", new TypeReference<>() {});
@@ -122,7 +134,7 @@ public class BackupService {
     }
 
     private void scheduleJob(String jobId, BackupJob job, String accountId, String region) {
-        long now = Instant.now().getEpochSecond();
+        long now = clock.instant().getEpochSecond();
         if ("CREATED".equals(job.getState()) && job.getStartBy() != null && job.getStartBy() < now) {
             scheduler.execute(() -> RequestScopes.runAs(accountId, region, () -> {
                 synchronized (lockFor(jobLockKey(jobId))) {
@@ -130,7 +142,7 @@ public class BackupService {
                         if ("CREATED".equals(current.getState())) {
                             current.setState("EXPIRED");
                             current.setStatusMessage("The job did not start before its start window expired");
-                            current.setCompletionDate(Instant.now().getEpochSecond());
+                            current.setCompletionDate(clock.instant().getEpochSecond());
                             jobStore.put(jobId, current);
                         }
                     });
@@ -218,7 +230,7 @@ public class BackupService {
             vault.setBackupVaultName(vaultName);
             vault.setBackupVaultArn(regionResolver.buildArn("backup", region, "backup-vault:" + vaultName));
             vault.setEncryptionKeyArn(encryptionKeyArn);
-            long now = Instant.now().getEpochSecond();
+            long now = clock.instant().getEpochSecond();
             vault.setCreationDate(now);
             // Only an air-gapped vault arrives here locked. AWS creates it with a compliance-mode
             // lock whose LockDate is the creation date, so the lock is immutable from the start;
@@ -516,7 +528,7 @@ public class BackupService {
         vault.setMinRetentionDays(minRetentionDays);
         vault.setMaxRetentionDays(maxRetentionDays);
         vault.setLockDate(changeableForDays == null ? null
-                : Instant.now().plus(changeableForDays, ChronoUnit.DAYS).getEpochSecond());
+                : clock.instant().plus(changeableForDays, ChronoUnit.DAYS).getEpochSecond());
         vaultStore.put(vaultKey(region, vaultName), vault);
         LOG.infov("Locked backup vault {0} in {1} ({2})", vaultName, region,
                 changeableForDays == null
@@ -631,9 +643,9 @@ public class BackupService {
      * LockDate must answer TRUE here -- the inverse of this is the defect that made a
      * governance lock permanent.
      */
-    private static boolean lockIsStillChangeable(BackupVault vault) {
+    private boolean lockIsStillChangeable(BackupVault vault) {
         Long lockDate = vault.getLockDate();
-        return lockDate == null || Instant.now().getEpochSecond() < lockDate;
+        return lockDate == null || clock.instant().getEpochSecond() < lockDate;
     }
 
     // ── Plan ───────────────────────────────────────────────────────────────────
@@ -651,7 +663,7 @@ public class BackupService {
         plan.setBackupPlanArn(regionResolver.buildArn("backup", region, "backup-plan:" + planId));
         plan.setBackupPlanName(planName);
         plan.setTags(tags);
-        plan.setCreationDate(Instant.now().getEpochSecond());
+        plan.setCreationDate(clock.instant().getEpochSecond());
         plan.setVersionId(shortId());
         assignRuleIds(rules);
         plan.setRules(rules);
@@ -690,7 +702,7 @@ public class BackupService {
                         "Backup plan has active selections and cannot be deleted", 400);
             }
             BackupPlan deleted = objectMapper.convertValue(plan, BackupPlan.class);
-            deleted.setDeletionDate(Instant.now().getEpochSecond());
+            deleted.setDeletionDate(clock.instant().getEpochSecond());
             planStore.put(planId, deleted);
             return deleted;
         }
@@ -728,7 +740,7 @@ public class BackupService {
             selection.setIamRoleArn(iamRoleArn);
             selection.setResources(resources);
             selection.setNotResources(notResources);
-            selection.setCreationDate(Instant.now().getEpochSecond());
+            selection.setCreationDate(clock.instant().getEpochSecond());
             selection.setCreatorRequestId(creatorRequestId);
             selectionStore.put(selectionId, selection);
             return selection;
@@ -763,7 +775,7 @@ public class BackupService {
         requireLifecycleWithinLock(vault, lifecycle);
 
         String jobId = UUID.randomUUID().toString();
-        long now = Instant.now().getEpochSecond();
+        long now = clock.instant().getEpochSecond();
 
         BackupJob job = new BackupJob();
         job.setBackupJobId(jobId);
@@ -859,7 +871,7 @@ public class BackupService {
             RecoveryPoint rp = describeRecoveryPoint(vaultName, recoveryPointArn, region);
             if (vault.isLocked() && vault.getMinRetentionDays() != null) {
                 long ageDays = ChronoUnit.DAYS.between(
-                        Instant.ofEpochSecond(rp.getCreationDate()), Instant.now());
+                        Instant.ofEpochSecond(rp.getCreationDate()), clock.instant());
                 if (ageDays < vault.getMinRetentionDays()) {
                     throw new AwsException("InvalidRequestException",
                             "Recovery point is protected by a vault lock until its minimum retention of "
@@ -919,7 +931,7 @@ public class BackupService {
     private void completeJobLocked(String jobId, String vaultName, String region) {
         jobStore.get(jobId).ifPresent(job -> {
             if ("RUNNING".equals(job.getState())) {
-                long now = Instant.now().getEpochSecond();
+                long now = clock.instant().getEpochSecond();
                 // The recovery point belongs to the vault the job started in, not to whatever
                 // vault holds the name now. A vault deleted mid-job (allowed: it held no recovery
                 // point yet) and recreated unlocked would otherwise receive a recovery point its
@@ -1012,7 +1024,7 @@ public class BackupService {
             jobStore.get(jobId).ifPresent(job -> {
                 if ("ABORTING".equals(job.getState())) {
                     job.setState("ABORTED");
-                    job.setCompletionDate(Instant.now().getEpochSecond());
+                    job.setCompletionDate(clock.instant().getEpochSecond());
                     jobStore.put(jobId, job);
                 }
             });

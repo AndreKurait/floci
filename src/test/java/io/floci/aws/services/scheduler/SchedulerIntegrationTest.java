@@ -8,9 +8,12 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
 
@@ -236,12 +239,17 @@ class SchedulerIntegrationTest {
 
     @Test
     @Order(14)
-    void tagResourceAddsTags() throws InterruptedException {
-        // createScheduleGroup uses one Instant.now() for both CreationDate and
-        // LastModificationDate (so they are byte-identical at creation). Sleep here so the
-        // tagScheduleGroup Instant.now() below is guaranteed to be strictly later, even on
-        // a system whose clock granularity collides with the test class's startup speed.
-        Thread.sleep(2);
+    void tagResourceAddsTags() {
+        // createScheduleGroup reads the clock once for both CreationDate and
+        // LastModificationDate (so they are byte-identical at creation). Tag only once the
+        // wall clock reads later than that stamp, so the tagScheduleGroup reading below is
+        // strictly later whatever the clock's granularity.
+        double created = taggedGroup().get("CreationDate").asDouble();
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> {
+                    Instant now = Instant.now();
+                    return now.getEpochSecond() + now.getNano() / 1_000_000_000.0 > created;
+                });
 
         given()
             .contentType("application/json")
@@ -272,6 +280,13 @@ class SchedulerIntegrationTest {
         // so a regression in this AWS-visible field is caught. Parse via Jackson directly
         // because RestAssured coerces sub-second epoch doubles to Float and loses the
         // sub-second delta the test relies on.
+        JsonNode tree = taggedGroup();
+        double creation = tree.get("CreationDate").asDouble();
+        double lastMod = tree.get("LastModificationDate").asDouble();
+        assertThat(lastMod, greaterThan(creation));
+    }
+
+    private static JsonNode taggedGroup() {
         String body = given()
         .when()
             .get("/schedule-groups/tagged-group")
@@ -279,10 +294,7 @@ class SchedulerIntegrationTest {
             .statusCode(200)
             .extract().asString();
         try {
-            JsonNode tree = new ObjectMapper().readTree(body);
-            double creation = tree.get("CreationDate").asDouble();
-            double lastMod = tree.get("LastModificationDate").asDouble();
-            assertThat(lastMod, greaterThan(creation));
+            return new ObjectMapper().readTree(body);
         } catch (Exception e) {
             throw new AssertionError("Failed to parse schedule-group response: " + body, e);
         }

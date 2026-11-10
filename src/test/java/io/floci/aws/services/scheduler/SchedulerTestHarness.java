@@ -169,7 +169,8 @@ final class SchedulerTestHarness {
     Response waitForTerminalExecution(String executionArn) {
         await()
                 .atMost(Duration.ofSeconds(10))
-                .pollInterval(Duration.ofMillis(100))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
                 .until(() -> !"RUNNING".equals(describeExecution(executionArn).jsonPath().getString("status")));
         return describeExecution(executionArn);
     }

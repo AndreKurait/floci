@@ -6,7 +6,10 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.lambda.LambdaService;
+import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.secretsmanager.model.Secret;
+import io.floci.aws.testing.TestTime;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -18,20 +21,23 @@ import java.util.List;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 
 /**
  * Covers the background sweep that makes a rotation schedule actually fire. Rotation itself runs
  * asynchronously, so these assert on the scheduling state the sweep drives - which secret is due
- * and where its next rotation lands - rather than on the rotation's outcome.
+ * and where its next rotation lands - rather than on the rotation's outcome. The service and the
+ * sweep share one controlled timeline, so a schedule lands on an exact instant and the sweep fires
+ * on the tick that reaches it.
  */
 class SecretRotationSchedulerTest {
 
@@ -39,6 +45,10 @@ class SecretRotationSchedulerTest {
     private static final String LAMBDA_ARN = "arn:aws:lambda:us-east-1:000000000000:function:rotate";
     private static final String TOKEN = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
 
+    /** The shipped {@code rotation-tick-seconds}. */
+    private static final Duration TICK = Duration.ofSeconds(60);
+
+    private final TestTime time = TestTime.create();
     private final LambdaService lambda = mock(LambdaService.class);
     private SecretsManagerService service;
     private SecretRotationScheduler scheduler;
@@ -46,8 +56,26 @@ class SecretRotationSchedulerTest {
     @BeforeEach
     void setUp() {
         service = new SecretsManagerService(new InMemoryStorage<>(), 30,
-                new RegionResolver(REGION, "000000000000"), lambda, new ObjectMapper());
+                new RegionResolver(REGION, "000000000000"), lambda, new ObjectMapper(), null, List.of(),
+                time.clock());
         scheduler = new SecretRotationScheduler(service);
+    }
+
+    @AfterEach
+    void tearDown() {
+        service.shutdown();
+    }
+
+    /** The sweep as it runs in production, except that its executor and clock are the test's. */
+    private SecretRotationScheduler startSweep(boolean enabled) {
+        SecretRotationScheduler sweep = new SecretRotationScheduler(service, TICK.toSeconds(), enabled,
+                time.scheduler(), time.clock());
+        sweep.onStart(null);
+        return sweep;
+    }
+
+    private Instant nextRotation(String name) {
+        return service.describeSecret(name, REGION).getNextRotationDate();
     }
 
     private void enableRotation(String name, Secret.RotationRules rules) {
@@ -73,47 +101,41 @@ class SecretRotationSchedulerTest {
 
     @Test
     void enablingRotationWithAutomaticallyAfterDaysSchedulesThatManyDaysOut() {
-        Instant before = Instant.now();
         enableRotation("daily", new Secret.RotationRules(14, null, null));
 
-        Instant next = service.describeSecret("daily", REGION).getNextRotationDate();
-        assertNotNull(next, "enabling rotation must schedule the next one");
-        assertTrue(next.isAfter(before.plus(13, ChronoUnit.DAYS)));
-        assertTrue(next.isBefore(before.plus(15, ChronoUnit.DAYS)));
+        assertEquals(time.now().plus(14, ChronoUnit.DAYS), nextRotation("daily"),
+                "enabling rotation must schedule the next one");
     }
 
     @Test
     void enablingRotationWithARateExpressionSchedulesThatInterval() {
-        Instant before = Instant.now();
         enableRotation("rated", new Secret.RotationRules(null, null, "rate(10 days)"));
 
-        Instant next = service.describeSecret("rated", REGION).getNextRotationDate();
-        assertNotNull(next);
-        assertTrue(next.isAfter(before.plus(9, ChronoUnit.DAYS)));
-        assertTrue(next.isBefore(before.plus(11, ChronoUnit.DAYS)));
+        assertEquals(time.now().plus(10, ChronoUnit.DAYS), nextRotation("rated"));
     }
 
     @Test
     void enablingRotationWithAnHourlyRateSchedulesInHours() {
-        Instant before = Instant.now();
         enableRotation("hourly", new Secret.RotationRules(null, null, "rate(12 hours)"));
 
-        Instant next = service.describeSecret("hourly", REGION).getNextRotationDate();
-        assertNotNull(next);
-        assertTrue(next.isAfter(before.plus(11, ChronoUnit.HOURS)));
-        assertTrue(next.isBefore(before.plus(13, ChronoUnit.HOURS)));
+        assertEquals(time.now().plus(12, ChronoUnit.HOURS), nextRotation("hourly"));
     }
 
     @Test
     void enablingRotationWithACronExpressionSchedulesTheNextMatchingTime() {
-        // Every day at 16:00 UTC; the next fire is always within a day.
-        Instant before = Instant.now();
+        // Every day at 16:00 UTC, enabled at midnight and again one second before the hour.
+        time.advanceTo(Instant.parse("2026-03-10T00:00:00Z"));
         enableRotation("crony", new Secret.RotationRules(null, null, "cron(0 16 * * ? *)"));
+        assertEquals(Instant.parse("2026-03-10T16:00:00Z"), nextRotation("crony"));
 
-        Instant next = service.describeSecret("crony", REGION).getNextRotationDate();
-        assertNotNull(next);
-        assertTrue(next.isAfter(before));
-        assertTrue(next.isBefore(before.plus(25, ChronoUnit.HOURS)));
+        time.advanceTo(Instant.parse("2026-03-10T15:59:59Z"));
+        enableRotation("crony-late", new Secret.RotationRules(null, null, "cron(0 16 * * ? *)"));
+        assertEquals(Instant.parse("2026-03-10T16:00:00Z"), nextRotation("crony-late"));
+
+        // At the hour itself the next fire is tomorrow's.
+        time.advanceTo(Instant.parse("2026-03-10T16:00:00Z"));
+        enableRotation("crony-on-the-hour", new Secret.RotationRules(null, null, "cron(0 16 * * ? *)"));
+        assertEquals(Instant.parse("2026-03-11T16:00:00Z"), nextRotation("crony-on-the-hour"));
     }
 
     @Test
@@ -139,7 +161,7 @@ class SecretRotationSchedulerTest {
     /** Drags the schedule into the past so the next tick sees the secret as due. */
     private void makeDue(String name) {
         Secret secret = service.describeSecret(name, REGION);
-        secret.setNextRotationDate(Instant.now().minus(1, ChronoUnit.MINUTES));
+        secret.setNextRotationDate(time.now().minus(1, ChronoUnit.MINUTES));
     }
 
     @Test
@@ -147,10 +169,10 @@ class SecretRotationSchedulerTest {
         enableRotation("due", new Secret.RotationRules(14, null, null));
         makeDue("due");
 
-        scheduler.tick(Instant.now());
+        scheduler.tick(time.now());
 
-        Instant next = service.describeSecret("due", REGION).getNextRotationDate();
-        assertTrue(next.isAfter(Instant.now()), "a fired rotation must reschedule into the future");
+        assertEquals(time.now().plus(14, ChronoUnit.DAYS), nextRotation("due"),
+                "a fired rotation must reschedule a full interval ahead");
     }
 
     @Test
@@ -158,7 +180,7 @@ class SecretRotationSchedulerTest {
         enableRotation("not-due", new Secret.RotationRules(14, null, null));
         Instant before = service.describeSecret("not-due", REGION).getNextRotationDate();
 
-        scheduler.tick(Instant.now());
+        scheduler.tick(time.now());
 
         assertEquals(before, service.describeSecret("not-due", REGION).getNextRotationDate());
     }
@@ -167,7 +189,7 @@ class SecretRotationSchedulerTest {
     void tickIgnoresSecretsWithRotationTurnedOff() {
         service.createSecret("plain", "v1", null, null, null, null, REGION);
 
-        scheduler.tick(Instant.now());
+        scheduler.tick(time.now());
 
         assertNull(service.describeSecret("plain", REGION).getNextRotationDate());
     }
@@ -180,7 +202,7 @@ class SecretRotationSchedulerTest {
         makeDue("rds!db-1");
         Instant due = service.describeSecret("rds!db-1", REGION).getNextRotationDate();
 
-        scheduler.tick(Instant.now());
+        scheduler.tick(time.now());
 
         assertEquals(due, service.describeSecret("rds!db-1", REGION).getNextRotationDate());
     }
@@ -192,10 +214,10 @@ class SecretRotationSchedulerTest {
                 List.of(new SecretsManagerService.ReplicaRegion("eu-west-1", null)), false, REGION);
 
         Secret replica = service.describeSecret("replicated", "eu-west-1");
-        replica.setNextRotationDate(Instant.now().minus(1, ChronoUnit.MINUTES));
+        replica.setNextRotationDate(time.now().minus(1, ChronoUnit.MINUTES));
 
         // The replica is due on paper, but rotating it would write to a read-only copy.
-        scheduler.tick(Instant.now());
+        scheduler.tick(time.now());
 
         assertTrue(service.describeSecret("replicated", "eu-west-1").isReplica());
     }
@@ -207,7 +229,7 @@ class SecretRotationSchedulerTest {
         service.deleteSecret("doomed", 7, false, REGION);
         Instant due = service.describeSecret("doomed", REGION).getNextRotationDate();
 
-        scheduler.tick(Instant.now());
+        scheduler.tick(time.now());
 
         assertEquals(due, service.describeSecret("doomed", REGION).getNextRotationDate());
     }
@@ -222,7 +244,8 @@ class SecretRotationSchedulerTest {
                 AccountAwareStorageBackend.inMemory("000000000000");
         LambdaService foreignLambda = mock(LambdaService.class);
         SecretsManagerService accountAware = new SecretsManagerService(store, 30,
-                new RegionResolver(REGION, "000000000000"), foreignLambda, new ObjectMapper());
+                new RegionResolver(REGION, "000000000000"), foreignLambda, new ObjectMapper(),
+                null, List.of(), time.clock());
         SecretRotationScheduler sweep = new SecretRotationScheduler(accountAware);
 
         accountAware.createSecret("foreign", "v1", null, null, null, null, REGION);
@@ -233,14 +256,14 @@ class SecretRotationSchedulerTest {
         // Re-home the secret into the other account, ARN included, and clear the default copy.
         Secret secret = accountAware.describeSecret("foreign", REGION);
         secret.setArn(secret.getArn().replace("000000000000", foreignAccount));
-        secret.setNextRotationDate(Instant.now().minus(1, ChronoUnit.MINUTES));
+        secret.setNextRotationDate(time.now().minus(1, ChronoUnit.MINUTES));
         store.putForAccount(foreignAccount, REGION + "::foreign", secret);
         store.deleteForAccount("000000000000", REGION + "::foreign");
 
-        sweep.tick(Instant.now());
+        sweep.tick(time.now());
 
         Secret afterSweep = store.getForAccount(foreignAccount, REGION + "::foreign").orElseThrow();
-        assertTrue(afterSweep.getNextRotationDate().isAfter(Instant.now()),
+        assertEquals(time.now().plus(14, ChronoUnit.DAYS), afterSweep.getNextRotationDate(),
                 "a secret in another account must still be rotated");
         assertTrue(store.getForAccount("000000000000", REGION + "::foreign").isEmpty(),
                 "rotating it must not leave a phantom copy in the default account");
@@ -257,8 +280,91 @@ class SecretRotationSchedulerTest {
         enableRotation("healthy", new Secret.RotationRules(14, null, null));
         makeDue("healthy");
 
-        scheduler.tick(Instant.now());
+        scheduler.tick(time.now());
 
-        assertTrue(service.describeSecret("healthy", REGION).getNextRotationDate().isAfter(Instant.now()));
+        assertEquals(time.now().plus(14, ChronoUnit.DAYS), nextRotation("healthy"));
+    }
+
+    // ─── The sweep on its schedule ─────────────────────────────────────────────
+
+    @Test
+    void theSweepRotatesOnTheTickThatReachesTheSchedule() {
+        startSweep(true);
+        enableRotation("fortnightly", new Secret.RotationRules(14, null, null));
+        Instant due = time.now().plus(14, ChronoUnit.DAYS);
+
+        time.advance(Duration.ofDays(14).minusSeconds(1));
+        assertEquals(due, nextRotation("fortnightly"), "one second early, every tick so far left it alone");
+
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(due.plus(14, ChronoUnit.DAYS), nextRotation("fortnightly"),
+                "the tick at the scheduled instant rotates and reschedules a full interval ahead");
+        verify(lambda, timeout(5000)).invoke(eq(REGION), eq(LAMBDA_ARN),
+                argThat(payload -> new String(payload, StandardCharsets.UTF_8).contains("\"Step\":\"createSecret\"")),
+                eq(InvocationType.RequestResponse));
+    }
+
+    @Test
+    void aScheduleBetweenTwoTicksWaitsForTheLaterOne() {
+        startSweep(true);
+        time.advance(Duration.ofSeconds(30));
+        enableRotation("off-beat", new Secret.RotationRules(null, null, "rate(4 hours)"));
+        Instant due = time.now().plus(4, ChronoUnit.HOURS);
+
+        // Due half a minute after the tick at four hours; the next tick is a full minute after it.
+        time.advance(Duration.ofHours(4).plusSeconds(29));
+        assertEquals(due, nextRotation("off-beat"), "no tick falls between the schedule and the next minute");
+
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(time.now().plus(4, ChronoUnit.HOURS), nextRotation("off-beat"),
+                "the interval restarts from the tick that fired the rotation");
+    }
+
+    @Test
+    void aSweepDisabledByConfigurationNeverRotates() {
+        startSweep(false);
+        enableRotation("idle", new Secret.RotationRules(14, null, null));
+        Instant due = nextRotation("idle");
+
+        time.advance(Duration.ofDays(15));
+
+        assertEquals(due, nextRotation("idle"));
+    }
+
+    @Test
+    void aSweepThatFailsStillRunsOnTheNextTick() {
+        SecretsManagerService failing = new SecretsManagerService(new InMemoryStorage<>(), 30,
+                new RegionResolver(REGION, "000000000000"), lambda, new ObjectMapper(), null, List.of(),
+                time.clock()) {
+            private boolean failed;
+
+            @Override
+            public List<RegionalSecret> listAllSecrets() {
+                if (!failed) {
+                    failed = true;
+                    throw new IllegalStateException("storage is briefly unavailable");
+                }
+                return super.listAllSecrets();
+            }
+        };
+        try {
+            failing.createSecret("survivor", "v1", null, null, null, null, REGION);
+            failing.rotateSecret("survivor", TOKEN, LAMBDA_ARN,
+                    new Secret.RotationRules(null, null, "rate(4 hours)"), false, REGION);
+            failing.describeSecret("survivor", REGION).setNextRotationDate(time.now());
+            new SecretRotationScheduler(failing, TICK.toSeconds(), true, time.scheduler(), time.clock())
+                    .onStart(null);
+
+            time.advance(TICK);
+            assertEquals(time.now().minus(TICK), failing.describeSecret("survivor", REGION).getNextRotationDate(),
+                    "the first sweep failed before it reached the secret");
+
+            time.advance(TICK);
+            assertEquals(time.now().plus(4, ChronoUnit.HOURS),
+                    failing.describeSecret("survivor", REGION).getNextRotationDate(),
+                    "a failed sweep must not cancel the ones after it");
+        } finally {
+            failing.shutdown();
+        }
     }
 }
