@@ -263,6 +263,8 @@ public class Ec2QueryHandler {
                 case "RegisterImage" -> handleRegisterImage(params, region);
                 case "DeregisterImage" -> handleDeregisterImage(params, region);
                 case "CopyImage" -> handleCopyImage(params, region);
+                case "CreateSnapshot" -> handleCreateSnapshot(params, region);
+                case "DeleteSnapshot" -> handleDeleteSnapshot(params, region);
                 case "DescribeSnapshots" -> handleDescribeSnapshots(params, region);
                 // Tags
                 case "CreateTags" -> handleCreateTags(params, region);
@@ -4165,6 +4167,28 @@ public class Ec2QueryHandler {
                 .elem("imageId", image.getImageId())
                 .end("CopyImageResponse");
         return xmlResponse(xml.build());
+    }
+
+    private Response handleCreateSnapshot(MultivaluedMap<String, String> p, String region) {
+        String location = p.getFirst("Location");
+        if (p.getFirst("OutpostArn") != null || location != null && !"regional".equals(location)) {
+            throw new AwsException("UnsupportedOperation",
+                    "CreateSnapshot supports regional snapshots without an OutpostArn.", 400);
+        }
+        Snapshot snapshot = service.createSnapshot(region, p.getFirst("VolumeId"),
+                p.getFirst("Description"), parseTagsForResource(p, "snapshot", Set.of("snapshot")),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return xmlResponse(new XmlBuilder()
+                .start("CreateSnapshotResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .raw(snapshotXml(snapshot))
+                .end("CreateSnapshotResponse")
+                .build());
+    }
+
+    private Response handleDeleteSnapshot(MultivaluedMap<String, String> p, String region) {
+        service.deleteSnapshot(region, p.getFirst("SnapshotId"), Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("DeleteSnapshot");
     }
 
     private Response handleDescribeSnapshots(MultivaluedMap<String, String> p, String region) {

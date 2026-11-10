@@ -9459,6 +9459,80 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    public Snapshot createSnapshot(String region, String volumeId, String description,
+                                   List<Tag> snapshotTags, boolean dryRun) {
+        if (volumeId == null || volumeId.isBlank()) {
+            throw new AwsException("MissingParameter", "The parameter VolumeId is missing", 400);
+        }
+        if (!volumeId.matches("vol-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException("InvalidVolumeID.Malformed",
+                    "Invalid id: '" + volumeId + "' (expecting 'vol-...')", 400);
+        }
+        return withVolumeLock(volumeId, () -> {
+            Volume volume = getRequiredVolume(region, volumeId);
+            if (!"available".equals(volume.getState()) && !"in-use".equals(volume.getState())) {
+                throw new AwsException("IncorrectState",
+                        "The volume '" + volumeId + "' is not available or in-use.", 400);
+            }
+            if (dryRun) {
+                throw new AwsException("DryRunOperation",
+                        "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+
+            Snapshot snapshot = new Snapshot();
+            snapshot.setSnapshotId("snap-" + randomHex(17));
+            snapshot.setVolumeId(volumeId);
+            snapshot.setVolumeSize(volume.getSize());
+            snapshot.setOwnerId(callerAccountId());
+            snapshot.setRegion(region);
+            snapshot.setEncrypted(volume.isEncrypted());
+            snapshot.setDescription(description == null ? "" : description);
+            snapshot.setStartTime(Instant.now());
+            snapshot.setState("completed");
+            snapshot.setProgress("100%");
+            if (snapshotTags != null) {
+                for (Tag tag : snapshotTags) {
+                    snapshot.getTags().add(new Tag(tag.getKey(), tag.getValue()));
+                }
+            }
+            snapshots.put(key(region, snapshot.getSnapshotId()), snapshot);
+            putTags(region, snapshot.getSnapshotId(), new ArrayList<>(snapshot.getTags()));
+            return snapshot;
+        });
+    }
+
+    public void deleteSnapshot(String region, String snapshotId, boolean dryRun) {
+        if (snapshotId == null || snapshotId.isBlank()) {
+            throw new AwsException("MissingParameter", "The parameter SnapshotId is missing.", 400);
+        }
+        if (!snapshotId.matches("snap-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException("InvalidSnapshotID.Malformed", "Invalid snapshot id: " + snapshotId, 400);
+        }
+        synchronized (imageRegistryLock) {
+            if (snapshots.get(key(region, snapshotId)).isEmpty()) {
+                throw new AwsException("InvalidSnapshot.NotFound",
+                        "The snapshot '" + snapshotId + "' does not exist.", 400);
+            }
+            if (registeredImages.scan(k -> true).stream()
+                    .filter(image -> region.equals(image.getRegion()))
+                    .filter(image -> !DEREGISTERED_STATE.equals(image.getState()))
+                    .anyMatch(image -> image.getBlockDeviceMappings().stream()
+                            .filter(mapping -> Objects.equals(image.getRootDeviceName(), mapping.getDeviceName()))
+                            .map(BlockDeviceMapping::getEbs)
+                            .filter(Objects::nonNull)
+                            .anyMatch(ebs -> snapshotId.equals(ebs.getSnapshotId())))) {
+                throw new AwsException("InvalidSnapshot.InUse",
+                        "The snapshot '" + snapshotId + "' is used by a registered image.", 400);
+            }
+            if (dryRun) {
+                throw new AwsException("DryRunOperation",
+                        "Request would have succeeded, but DryRun flag is set.", 412);
+            }
+            snapshots.delete(key(region, snapshotId));
+            removeTags(region, snapshotId);
+        }
+    }
+
     public List<Snapshot> describeSnapshots(String region, List<String> snapshotIds,
                                             List<String> ownerIds, Map<String, List<String>> filters) {
         return describeSnapshots(region, snapshotIds, ownerIds, filterList(filters));
@@ -10193,6 +10267,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private boolean matchesSnapshotFilter(Snapshot snapshot, String name, List<String> values) {
+        if (name != null && (name.startsWith("tag:") || "tag-key".equals(name))) {
+            return matchesTagFilter(snapshot.getTags(), name, values, Ec2Service::matchesFilterValue);
+        }
         return switch (name) {
             case "description" -> matchesFilterValue(values, snapshot.getDescription());
             case "owner-id" -> matchesFilterValue(values, snapshot.getOwnerId());
