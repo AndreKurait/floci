@@ -2396,6 +2396,23 @@ class IamEnforcementFilterTest {
         assertTrue(body.contains("User is not authorized to perform: dynamodb:PutItem"), body);
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "AWS_JSON_1_0, 400",
+            "AWS_JSON_1_1, 400",
+            "REST, 403"
+    })
+    void ssmDenialUsesTheSharedJsonProtocolStatus(WireProtocol protocol, int status) {
+        Response response = IamEnforcementFilter.accessDeniedResponse(
+                "ssm:GetParameter", "ssm", MediaType.APPLICATION_JSON_TYPE, null, protocol);
+
+        assertEquals(status, response.getStatus());
+        assertEquals(MediaType.APPLICATION_JSON_TYPE, response.getMediaType());
+        String body = entityString(response);
+        assertTrue(body.contains("\"__type\":\"AccessDeniedException\""), body);
+        assertTrue(body.contains("User is not authorized to perform: ssm:GetParameter"), body);
+    }
+
     @Test
     void restJsonProtocolGetsJsonErrorResponse() {
         // Lambda / API Gateway — REST-JSON.
