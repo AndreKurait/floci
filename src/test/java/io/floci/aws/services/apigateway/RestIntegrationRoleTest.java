@@ -2,6 +2,7 @@ package io.floci.aws.services.apigateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
@@ -113,9 +114,12 @@ class RestIntegrationRoleTest {
         when(uri.getRequestUri()).thenReturn(URI.create("http://localhost/execute-api/api/prod/"));
         when(lambda.invokeTarget(anyString(), anyString(), any(byte[].class), any())).thenReturn(
                 new InvokeResult(200, null, "{\"statusCode\":200,\"body\":\"ok\"}".getBytes(StandardCharsets.UTF_8), null, "request"));
+        CallerCallAuthorizer callers = mock(CallerCallAuthorizer.class);
+        when(callers.authorizeAnonymousResource(anyString(), anyString(), any(), anyBoolean()))
+                .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
-                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, null, null, null, direct, null, roles);
+                new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, null, null, null, direct, callers, roles);
     }
 
     @ParameterizedTest
