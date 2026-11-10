@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.LambdaLogDestinations;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
+import io.github.hectorvent.floci.services.lambda.model.InvocationTimer;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.LambdaLayerVersion;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
@@ -887,15 +888,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     }
 
     static int shutdownTimeout(ContainerHandle handle, boolean hasExtensions) {
+        return shutdownTimeout(handle, hasExtensions, InvocationTimer.SYSTEM);
+    }
+
+    static int shutdownTimeout(ContainerHandle handle, boolean hasExtensions, InvocationTimer timer) {
         if (!hasExtensions) {
             return 1;
         }
         if (handle.extensionExit().isDone()) {
             return 2;
         }
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        long deadline = timer.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         try {
-            handle.extensionExit().get(2, TimeUnit.SECONDS);
+            timer.await(handle.extensionExit(), TimeUnit.SECONDS.toMillis(2));
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             return 0;
@@ -903,7 +908,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             LOG.debugv(failure, "Extension shutdown did not complete cleanly for container {0}",
                     handle.getContainerId());
         }
-        long remaining = Math.max(0, deadline - System.nanoTime());
+        long remaining = Math.max(0, deadline - timer.nanoTime());
         // Docker accepts whole seconds. Rounding down keeps the total within the
         // extension budget rather than adding another grace period after it expires.
         return (int) TimeUnit.NANOSECONDS.toSeconds(remaining);

@@ -34,6 +34,7 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import org.jboss.logging.Logger;
 
 import java.net.URI;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -73,6 +74,7 @@ public class WebSocketHandler {
     private final CallerCallAuthorizer callerCallAuthorizer;
     private final EmulatorConfig config;
     private final Vertx vertx;
+    private final Clock clock;
 
     @Inject
     public WebSocketHandler(ApiGatewayV2Service apiGatewayV2Service,
@@ -85,7 +87,8 @@ public class WebSocketHandler {
                             EmulatorConfig config,
                             ObjectMapper objectMapper,
                             Vertx vertx, ExecuteApiSigV4Authorizer sigV4Authorizer,
-                            CallerCallAuthorizer callerCallAuthorizer) {
+                            CallerCallAuthorizer callerCallAuthorizer,
+                            Clock clock) {
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.connectionManager = connectionManager;
         this.routeSelectionEvaluator = routeSelectionEvaluator;
@@ -99,6 +102,7 @@ public class WebSocketHandler {
         this.sigV4Authorizer = sigV4Authorizer;
         this.callerCallAuthorizer = callerCallAuthorizer;
         this.config = config;
+        this.clock = clock;
     }
 
     /**
@@ -242,7 +246,7 @@ public class WebSocketHandler {
 
         // Generate a unique connectionId (AWS format: base64-encoded random bytes, ~10-14 chars)
         String connectionId = generateConnectionId();
-        long connectedAt = System.currentTimeMillis();
+        long connectedAt = clock.millis();
 
         // Extract source IP and user agent from the upgrade request
         String sourceIp = ctx.request().remoteAddress() != null
@@ -491,7 +495,7 @@ public class WebSocketHandler {
                 return;
             }
 
-            long now = System.currentTimeMillis();
+            long now = clock.millis();
 
             // Check max connection duration (2 hours)
             if (now - connectedAt > MAX_CONNECTION_DURATION_MS) {
@@ -623,7 +627,7 @@ public class WebSocketHandler {
 
         // Get connection info for connectedAt, sourceIp, userAgent
         ConnectionInfo connectionInfo = connectionManager.getConnectionInfo(connectionId);
-        long connectedAt = connectionInfo != null ? connectionInfo.getConnectedAt() : System.currentTimeMillis();
+        long connectedAt = connectionInfo != null ? connectionInfo.getConnectedAt() : clock.millis();
         String sourceIp = connectionInfo != null ? connectionInfo.getSourceIp() : "127.0.0.1";
         String userAgent = connectionInfo != null ? connectionInfo.getUserAgent() : "";
 
@@ -695,7 +699,7 @@ public class WebSocketHandler {
 
         // Retrieve connection info BEFORE unregistering so we have connectedAt, sourceIp, userAgent
         ConnectionInfo connectionInfo = connectionManager.getConnectionInfo(connectionId);
-        long connectedAt = connectionInfo != null ? connectionInfo.getConnectedAt() : System.currentTimeMillis();
+        long connectedAt = connectionInfo != null ? connectionInfo.getConnectedAt() : clock.millis();
         String sourceIp = connectionInfo != null ? connectionInfo.getSourceIp() : "127.0.0.1";
         String userAgent = connectionInfo != null ? connectionInfo.getUserAgent() : "";
 

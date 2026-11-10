@@ -2,10 +2,13 @@ package io.github.hectorvent.floci.services.lambda.launcher;
 
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
+import io.github.hectorvent.floci.services.lambda.TimelineInvocationTimer;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
@@ -14,6 +17,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ExtensionLogCallbackTest {
+    private static final Duration EXTENSION_GRACE = Duration.ofSeconds(2);
 
     @Test
     void completionFollowsFinalLogDelivery() throws Exception {
@@ -66,13 +70,52 @@ class ExtensionLogCallbackTest {
 
     @Test
     void unresponsiveExtensionCannotAddAnotherStopGracePeriod() {
+        TestTime time = TestTime.create();
         ContainerHandle handle = new ContainerHandle("id", "fn", null, null);
         handle.setExtensionExit(new CompletableFuture<>());
-        long start = System.nanoTime();
 
-        assertEquals(0, ContainerLauncher.shutdownTimeout(handle, true));
+        assertEquals(0, ContainerLauncher.shutdownTimeout(handle, true, new TimelineInvocationTimer(time)));
 
-        assertTrue(System.nanoTime() - start >= TimeUnit.SECONDS.toNanos(2));
+        assertEquals(TestTime.DEFAULT_START.plus(EXTENSION_GRACE), time.now());
         assertFalse(handle.extensionExit().isDone(), "A shutdown timeout must not fabricate extension completion");
+    }
+
+    @Test
+    void extensionExitingDuringTheGraceLeavesTheWholeSecondsThatRemain() {
+        TestTime time = TestTime.create();
+        ContainerHandle handle = new ContainerHandle("id", "fn", null, null);
+        CompletableFuture<Void> exit = new CompletableFuture<>();
+        handle.setExtensionExit(exit);
+        time.scheduler().schedule(() -> exit.complete(null), 1000, TimeUnit.MILLISECONDS);
+
+        assertEquals(1, ContainerLauncher.shutdownTimeout(handle, true, new TimelineInvocationTimer(time)));
+
+        assertEquals(TestTime.DEFAULT_START.plusMillis(1000), time.now());
+    }
+
+    @Test
+    void extensionExitingPastAWholeSecondOfTheGraceLeavesNoStopTimeout() {
+        TestTime time = TestTime.create();
+        ContainerHandle handle = new ContainerHandle("id", "fn", null, null);
+        CompletableFuture<Void> exit = new CompletableFuture<>();
+        handle.setExtensionExit(exit);
+        time.scheduler().schedule(() -> exit.complete(null), 1001, TimeUnit.MILLISECONDS);
+
+        assertEquals(0, ContainerLauncher.shutdownTimeout(handle, true, new TimelineInvocationTimer(time)));
+
+        assertEquals(TestTime.DEFAULT_START.plusMillis(1001), time.now());
+    }
+
+    @Test
+    void interruptedWaitForAnExtensionReturnsWithoutAStopTimeout() {
+        // Real-time wiring of the system wait: an interrupt ends it at once, so nothing is waited out
+        ContainerHandle handle = new ContainerHandle("id", "fn", null, null);
+        handle.setExtensionExit(new CompletableFuture<>());
+        Thread.currentThread().interrupt();
+        try {
+            assertEquals(0, ContainerLauncher.shutdownTimeout(handle, true));
+        } finally {
+            assertTrue(Thread.interrupted(), "the interrupt must be restored for the caller");
+        }
     }
 }

@@ -164,6 +164,7 @@ public class Ec2ContainerManager {
     static int containerBridgeIpAttempts = 30;
     static long containerBridgeIpPollMillis = 500;
 
+    private final Ec2ContainerPause pause;
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final ContainerLogStreamer logStreamer;
@@ -395,6 +396,32 @@ public class Ec2ContainerManager {
                         ExecutorService executor,
                         ExecutorService serviceNetworkRetryExecutor,
                         Duration userDataExecutionTimeout) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver, dockerClient,
+                portAllocator, config, metadataServer, portForwardManager, regionResolver,
+                containerNetworkReachability, vpcNetworkManager, reachableEndpoint, instanceTypeCatalog,
+                executor, serviceNetworkRetryExecutor, userDataExecutionTimeout, Ec2ContainerPause.THREAD_SLEEP);
+    }
+
+    Ec2ContainerManager(ContainerBuilder containerBuilder,
+                        ContainerLifecycleManager lifecycleManager,
+                        ContainerLogStreamer logStreamer,
+                        ContainerDetector containerDetector,
+                        DockerHostResolver dockerHostResolver,
+                        DockerClient dockerClient,
+                        PortAllocator portAllocator,
+                        EmulatorConfig config,
+                        Ec2MetadataServer metadataServer,
+                        Ec2PortForwardManager portForwardManager,
+                        RegionResolver regionResolver,
+                        ContainerNetworkReachability containerNetworkReachability,
+                        VpcNetworkManager vpcNetworkManager,
+                        ContainerReachableEndpoint reachableEndpoint,
+                        Ec2InstanceTypeCatalog instanceTypeCatalog,
+                        ExecutorService executor,
+                        ExecutorService serviceNetworkRetryExecutor,
+                        Duration userDataExecutionTimeout,
+                        Ec2ContainerPause pause) {
+        this.pause = pause;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -446,11 +473,11 @@ public class Ec2ContainerManager {
      * Its own virtual threads, never {@link #createLaunchExecutor}'s: that pool blocks a full queue's
      * submitters, and a launch worker waiting on it for a retry could stall them all.
      */
-    private static ExecutorService createServiceNetworkRetryExecutor() {
+    static ExecutorService createServiceNetworkRetryExecutor() {
         return Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("ec2-service-network-retry-", 0).factory());
     }
 
-    private static ExecutorService createLaunchExecutor() {
+    static ExecutorService createLaunchExecutor() {
         return new ThreadPoolExecutor(
                 LAUNCH_CORE_THREADS,
                 LAUNCH_MAX_THREADS,
@@ -583,7 +610,7 @@ public class Ec2ContainerManager {
                     }
                     running = lifecycleManager.isContainerRunning(containerId);
                     if (!running) {
-                        Thread.sleep(500);
+                        pause.pause(500);
                     }
                 }
 
@@ -1404,7 +1431,7 @@ public class Ec2ContainerManager {
                 for (int i = 0; i < 20 && !running; i++) {
                     running = lifecycleManager.isContainerRunning(containerId);
                     if (!running) {
-                        Thread.sleep(500);
+                        pause.pause(500);
                     }
                 }
                 setUpMetadataEndpoint = refreshStartedContainerAddresses(instance, containerId, namespace);
@@ -2146,7 +2173,7 @@ public class Ec2ContainerManager {
                     }
                     try {
                         // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.
-                        Thread.sleep(500);
+                        pause.pause(500);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                     }
@@ -2598,7 +2625,7 @@ public class Ec2ContainerManager {
             if (containerIp != null && !containerIp.isBlank()) {
                 return containerIp;
             }
-            Thread.sleep(containerBridgeIpPollMillis);
+            pause.pause(containerBridgeIpPollMillis);
         }
         LOG.warnv("Timed out waiting for EC2 instance {0} container {1} bridge IP", instanceId, containerId);
         return null;

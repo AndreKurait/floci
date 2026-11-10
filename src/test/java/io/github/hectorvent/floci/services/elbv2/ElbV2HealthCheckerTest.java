@@ -1,10 +1,12 @@
 package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
+import io.github.hectorvent.floci.testing.TestTime;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
@@ -21,12 +23,14 @@ import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -38,15 +42,18 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
-import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ElbV2HealthCheckerTest {
+    private static final Duration REGISTRATION_PROBE_DELAY = Duration.ofMillis(1);
+    private static final Duration TICK = Duration.ofMillis(1);
 
     private final Vertx vertx = Vertx.vertx();
     private final List<ElbV2HealthChecker> checkers = new ArrayList<>();
+    private final TestTime time = TestTime.create();
+    private final List<Long> periods = new CopyOnWriteArrayList<>();
 
     @Test
     void unavailableAlbNamespaceCannotProduceAHealthyDirectProbe() throws Exception {
@@ -327,33 +334,40 @@ class ElbV2HealthCheckerTest {
                 .toCompletableFuture()
                 .get(2, TimeUnit.SECONDS);
         try {
-            ElbV2HealthChecker checker = healthChecker();
+            ElbV2HealthChecker checker = timedHealthChecker();
             TargetGroup targetGroup = targetGroup(server.actualPort(), "200", 2, 1);
             TargetDescription target = target("127.0.0.1", server.actualPort());
+            Duration interval = Duration.ofSeconds(1);
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals(
-                    "unhealthy",
-                    checker.getHealth(targetGroup.getTargetGroupArn(), target.getId(), target.getPort()).state()));
+            time.advance(REGISTRATION_PROBE_DELAY);
+            awaitCompletedProbes(checker, 1);
+            assertEquals("unhealthy",
+                    checker.getHealth(targetGroup.getTargetGroupArn(), target.getId(), target.getPort()).state());
 
             statusCode.set(200);
             targetGroup.setHealthCheckIntervalSeconds(1);
             checker.startMonitoring(targetGroup);
-            await().atMost(Duration.ofSeconds(2)).until(() -> requestCount.get() >= 2);
+            time.advance(interval.minus(TICK));
+            assertEquals(1, requestCount.get(), "No probe is due before the interval has passed");
+            time.advance(TICK);
+            awaitCompletedProbes(checker, 2);
 
-            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
-                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("unhealthy", health.state());
-                assertEquals("Target.ResponseCodeMismatch", health.reason());
-            });
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
-                        targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("healthy", health.state());
-                assertNull(health.reason());
-                assertNull(health.description());
-            });
+            // One success is short of the threshold of two
+            ElbV2HealthChecker.TargetHealthStatus recovering = checker.getHealth(
+                    targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+            assertEquals("unhealthy", recovering.state());
+            assertEquals("Target.ResponseCodeMismatch", recovering.reason());
+            assertEquals(2, requestCount.get());
+
+            time.advance(interval);
+            awaitCompletedProbes(checker, 3);
+            ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                    targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+            assertEquals("healthy", health.state());
+            assertNull(health.reason());
+            assertNull(health.description());
+            assertEquals(3, requestCount.get());
         } finally {
             close(server);
         }
@@ -402,27 +416,43 @@ class ElbV2HealthCheckerTest {
             }
         }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         try {
+            Duration ceiling = Duration.ofMillis(20);
             EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-            when(config.services().elbv2().maxHealthCheckIntervalMillis()).thenReturn(20L);
-            ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class));
-            checkers.add(checker);
+            when(config.services().elbv2().maxHealthCheckIntervalMillis()).thenReturn(ceiling.toMillis());
+            ElbV2HealthChecker checker = timedHealthChecker(config);
             TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
             group.setHealthCheckIntervalSeconds(30);
             TargetDescription target = target("127.0.0.1", server.actualPort());
 
             checker.startMonitoring(group);
+            assertEquals(List.of(ceiling.toMillis()), periods);
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-            HttpServerResponse first = firstSuccess.get(2, TimeUnit.SECONDS);
+            time.advance(REGISTRATION_PROBE_DELAY);
+            awaitCompletedProbes(checker, 1);
             assertEquals("unhealthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
-            await().during(Duration.ofMillis(100)).atMost(Duration.ofSeconds(1))
-                    .untilAsserted(() -> assertEquals(2, requests.get()));
-            first.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
 
+            // The first tick comes 1 ms short of a full interval after the registration probe
+            time.advance(ceiling.minus(REGISTRATION_PROBE_DELAY));
+            assertEquals(1, requests.get());
+            assertEquals(0, checker.probeSnapshot().keys());
+            time.advance(ceiling);
+            HttpServerResponse first = firstSuccess.get(2, TimeUnit.SECONDS);
+            // Every further tick finds the unanswered probe still in flight and starts nothing
+            for (int tick = 0; tick < 5; tick++) {
+                time.advance(ceiling);
+            }
+            assertEquals(2, requests.get());
+            assertEquals(1, checker.probeSnapshot().keys());
+            first.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            awaitCompletedProbes(checker, 2);
+            assertEquals("unhealthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+
+            time.advance(ceiling);
             HttpServerResponse second = secondSuccess.get(2, TimeUnit.SECONDS);
             assertEquals("unhealthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
             second.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals(
-                    "healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            awaitCompletedProbes(checker, 3);
+            assertEquals("healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
             assertEquals(30, group.getHealthCheckIntervalSeconds());
             assertEquals(2, group.getHealthyThresholdCount());
         } finally {
@@ -519,8 +549,12 @@ class ElbV2HealthCheckerTest {
             }
             checker.addTargets(group.getTargetGroupArn(), targets, group);
             await().atMost(Duration.ofSeconds(3)).until(() -> requests.size() == 32);
-            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1))
-                    .untilAsserted(() -> assertEquals(32, requests.size()));
+            // All 33 probes are queued, and the 33rd cannot start while the 32 slots are held
+            KeyedWorkQueue.Snapshot blocked = checker.probeSnapshot();
+            assertEquals(33, blocked.keys());
+            assertEquals(32, blocked.active());
+            assertEquals(0, blocked.completed());
+            assertEquals(32, requests.size());
             for (HttpServerResponse response : List.copyOf(requests)) {
                 response.end();
             }
@@ -590,12 +624,13 @@ class ElbV2HealthCheckerTest {
         HttpServer server = vertx.createHttpServer().requestHandler(request -> requests.add(request.response()))
                 .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         try {
-            ElbV2HealthChecker checker = healthChecker();
+            ElbV2HealthChecker checker = timedHealthChecker();
             TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
             group.setHealthCheckTimeoutSeconds(10);
             TargetDescription target = target("127.0.0.1", server.actualPort());
             checker.startMonitoring(group);
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            time.advance(REGISTRATION_PROBE_DELAY);
             await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 1);
             for (int registration = 0; registration < 40; registration++) {
                 switch (removal) {
@@ -606,14 +641,20 @@ class ElbV2HealthCheckerTest {
                 }
                 checker.startMonitoring(group);
                 checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+                time.advance(REGISTRATION_PROBE_DELAY);
             }
-            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1))
-                    .untilAsserted(() -> assertEquals(1, requests.size()));
+            // Every registration's own probe came due, and none could start beside the unanswered one
+            KeyedWorkQueue.Snapshot beforeAnswer = checker.probeSnapshot();
+            assertEquals(1, beforeAnswer.keys());
+            assertEquals(1, beforeAnswer.active());
+            assertEquals(0, beforeAnswer.completed());
+            assertEquals(1, requests.size());
             requests.getFirst().end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
             await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 2);
-            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> assertEquals(
-                    "Elb.RegistrationInProgress",
-                    checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason()));
+            // The late probe has finished, so its result had its chance to reach the new registration
+            await().atMost(Duration.ofSeconds(5)).until(() -> checker.probeSnapshot().completed() == 1);
+            assertEquals("Elb.RegistrationInProgress",
+                    checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
             requests.get(1).setStatusCode(503).end();
             await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("unhealthy",
                     checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
@@ -630,19 +671,23 @@ class ElbV2HealthCheckerTest {
             request.response().end();
         }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         try {
-            ElbV2HealthChecker checker = healthChecker();
+            ElbV2HealthChecker checker = timedHealthChecker();
             TargetGroup group = targetGroup(server.actualPort(), "200", 3, 1);
             group.setProtocol("TCP");
             TargetDescription target = target("127.0.0.1", server.actualPort());
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-            await().atMost(Duration.ofSeconds(2)).until(() -> requests.get() == 1);
+            time.advance(REGISTRATION_PROBE_DELAY);
+            awaitCompletedProbes(checker, 1);
             for (int i = 0; i < 100; i++) {
                 checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
             }
-            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
-                assertEquals(1, requests.get());
-                assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
-            });
+            // A repeated registration schedules no probe at all
+            assertEquals(0, time.pendingTasks());
+            KeyedWorkQueue.Snapshot settled = checker.probeSnapshot();
+            assertEquals(0, settled.keys());
+            assertEquals(1, settled.completed());
+            assertEquals(1, requests.get());
+            assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
         } finally {
             close(server);
         }
@@ -652,18 +697,28 @@ class ElbV2HealthCheckerTest {
     void changingIntervalPreservesCountersAndReplacesTheOldTimer() throws Exception {
         HttpServer server = startServer(200);
         try {
-            ElbV2HealthChecker checker = healthChecker();
+            ElbV2HealthChecker checker = timedHealthChecker();
             TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
             group.setProtocol("TCP");
             group.setHealthCheckIntervalSeconds(30);
             checker.startMonitoring(group);
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("Elb.InitialHealthChecking",
-                    checker.getHealth(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()).reason()));
+            time.advance(REGISTRATION_PROBE_DELAY);
+            awaitCompletedProbes(checker, 1);
+            assertEquals("Elb.InitialHealthChecking",
+                    checker.getHealth(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()).reason());
             group.setHealthCheckIntervalSeconds(1);
             checker.startMonitoring(group);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
-                    checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort())));
+            assertEquals(List.of(30_000L, 1_000L), periods);
+            assertEquals(1, time.pendingTasks(), "The 30-second timer is replaced, not kept beside the new one");
+
+            time.advance(Duration.ofSeconds(1).minus(TICK));
+            assertEquals(1, checker.probeSnapshot().completed());
+            assertEquals(0, checker.probeSnapshot().keys());
+            time.advance(TICK);
+            awaitCompletedProbes(checker, 2);
+            // The success counted before the change still counts toward the threshold of two
+            assertEquals("healthy", checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()));
         } finally {
             close(server);
         }
@@ -675,17 +730,18 @@ class ElbV2HealthCheckerTest {
         HttpServer server = vertx.createHttpServer().requestHandler(request -> requestArrived.complete(request.response()))
                 .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         try {
-            ElbV2HealthChecker checker = healthChecker();
+            ElbV2HealthChecker checker = timedHealthChecker();
             TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
             checker.startMonitoring(group);
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
+            time.advance(REGISTRATION_PROBE_DELAY);
             HttpServerResponse response = requestArrived.get(2, TimeUnit.SECONDS);
             group.setMatcher("503");
             checker.startMonitoring(group);
             response.end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
-            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> assertEquals(
-                    "Elb.RegistrationInProgress",
-                    checker.getHealth(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()).reason()));
+            awaitCompletedProbes(checker, 1);
+            assertEquals("Elb.RegistrationInProgress",
+                    checker.getHealth(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()).reason());
         } finally {
             close(server);
         }
@@ -696,30 +752,32 @@ class ElbV2HealthCheckerTest {
     void initialAdmissionRespectsTargetGroupKind(String protocol, int requiredSuccesses) throws Exception {
         HttpServer server = startServer(200);
         try {
-            ElbV2HealthChecker checker = healthChecker();
+            ElbV2HealthChecker checker = timedHealthChecker();
             TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
             group.setProtocol("LAMBDA".equals(protocol) ? null : protocol);
             group.setTargetType("LAMBDA".equals(protocol) ? "lambda" : "ip");
             group.setHealthCheckProtocol("HTTP");
             TargetDescription target = target("127.0.0.1", server.actualPort());
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            time.advance(REGISTRATION_PROBE_DELAY);
+            awaitCompletedProbes(checker, 1);
 
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus first = checker.getHealth(
-                        group.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals(requiredSuccesses == 1 ? "healthy" : "initial", first.state());
-                assertEquals(requiredSuccesses == 1 ? null : "Elb.InitialHealthChecking", first.reason());
-                assertEquals(requiredSuccesses == 1 ? null : "Initial health checks in progress", first.description());
-            });
+            ElbV2HealthChecker.TargetHealthStatus first = checker.getHealth(
+                    group.getTargetGroupArn(), target.getId(), target.getPort());
+            assertEquals(requiredSuccesses == 1 ? "healthy" : "initial", first.state());
+            assertEquals(requiredSuccesses == 1 ? null : "Elb.InitialHealthChecking", first.reason());
+            assertEquals(requiredSuccesses == 1 ? null : "Initial health checks in progress", first.description());
+
             group.setHealthCheckIntervalSeconds(1);
             checker.startMonitoring(group);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                ElbV2HealthChecker.TargetHealthStatus healthy = checker.getHealth(
-                        group.getTargetGroupArn(), target.getId(), target.getPort());
-                assertEquals("healthy", healthy.state());
-                assertNull(healthy.reason());
-                assertNull(healthy.description());
-            });
+            time.advance(Duration.ofSeconds(1));
+            // Lambda target groups are not monitored periodically, so only the registration probe ran
+            awaitCompletedProbes(checker, "LAMBDA".equals(protocol) ? 1 : 2);
+            ElbV2HealthChecker.TargetHealthStatus healthy = checker.getHealth(
+                    group.getTargetGroupArn(), target.getId(), target.getPort());
+            assertEquals("healthy", healthy.state());
+            assertNull(healthy.reason());
+            assertNull(healthy.description());
         } finally {
             close(server);
         }
@@ -733,55 +791,39 @@ class ElbV2HealthCheckerTest {
             request.response().end();
         }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         try {
-            Vertx scheduled = mock(Vertx.class);
-            AtomicLong clock = new AtomicLong(TimeUnit.SECONDS.toNanos(1));
-            AtomicReference<Handler<Long>> periodic = new AtomicReference<>();
-            doAnswer(invocation -> {
-                Handler<Long> callback = invocation.getArgument(1);
-                callback.handle(1L);
-                return 1L;
-            }).when(scheduled).setTimer(anyLong(), any());
-            doAnswer(invocation -> {
-                assertEquals(5000L, invocation.<Long>getArgument(0));
-                periodic.set(invocation.getArgument(1));
-                return 2L;
-            }).when(scheduled).setPeriodic(anyLong(), any());
-            EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-            when(config.services().elbv2().mock()).thenReturn(false);
-            ElbV2HealthChecker checker = new ElbV2HealthChecker(
-                    scheduled, config, mock(Ec2Service.class), clock::get);
-            checkers.add(checker);
+            ElbV2HealthChecker checker = timedHealthChecker();
             TargetGroup group = targetGroup(server.actualPort(), "200", 3, 1);
             group.setProtocol("TCP");
             group.setHealthCheckIntervalSeconds(5);
             TargetDescription target = target("127.0.0.1", server.actualPort());
+            Duration interval = Duration.ofSeconds(5);
 
             checker.startMonitoring(group);
+            assertEquals(List.of(interval.toMillis()), periods);
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
-                assertEquals("Elb.InitialHealthChecking",
-                        checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
-            });
-            clock.set(TimeUnit.SECONDS.toNanos(5));
-            periodic.get().handle(2L);
-            await().during(Duration.ofMillis(100)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
-                assertEquals(1, requests.get());
-                assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
-            });
-            clock.set(TimeUnit.SECONDS.toNanos(10) + 1);
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                periodic.get().handle(2L);
-                assertEquals(2, requests.get());
-            });
-            clock.set(TimeUnit.SECONDS.toNanos(15));
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
-                periodic.get().handle(2L);
-                assertEquals(3, requests.get());
-                assertEquals("healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
-            });
+            time.advance(REGISTRATION_PROBE_DELAY);
+            awaitCompletedProbes(checker, 1);
+            assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+            assertEquals("Elb.InitialHealthChecking",
+                    checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
+
+            // The first tick comes 1 ms short of a full interval after the registration probe
+            time.advance(interval.minus(REGISTRATION_PROBE_DELAY));
+            assertEquals(0, checker.probeSnapshot().keys());
+            assertEquals(1, requests.get());
+            assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+
+            time.advance(interval);
+            awaitCompletedProbes(checker, 2);
+            assertEquals(2, requests.get());
+            assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+
+            time.advance(interval);
+            awaitCompletedProbes(checker, 3);
+            assertEquals(3, requests.get());
+            assertEquals("healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
             checker.stopMonitoring(group.getTargetGroupArn());
-            verify(scheduled).cancelTimer(2L);
+            assertEquals(0, time.pendingTasks());
             assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
         } finally {
             close(server);
@@ -822,10 +864,10 @@ class ElbV2HealthCheckerTest {
             releaseLookup.complete(null);
             await().atMost(Duration.ofSeconds(2)).until(() -> requests.get() == 1);
             if (changeProtocol) {
-                await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() ->
-                        assertEquals("initial", checker.getState(
-                                group.getTargetGroupArn(), target.getId(), target.getPort()),
-                                "A result for the previous settings must not change current health"));
+                awaitCompletedProbes(checker, 1);
+                assertEquals("initial", checker.getState(
+                        group.getTargetGroupArn(), target.getId(), target.getPort()),
+                        "A result for the previous settings must not change current health");
             } else {
                 await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
                         assertEquals("healthy", checker.getState(
@@ -843,6 +885,51 @@ class ElbV2HealthCheckerTest {
         ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class));
         checkers.add(checker);
         return checker;
+    }
+
+    private ElbV2HealthChecker timedHealthChecker() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().elbv2().mock()).thenReturn(false);
+        return timedHealthChecker(config);
+    }
+
+    /** A checker whose Vert.x timers and interval clock are the controlled timeline; probes do real I/O. */
+    private ElbV2HealthChecker timedHealthChecker(EmulatorConfig config) {
+        Vertx timers = mock(Vertx.class);
+        AtomicLong ids = new AtomicLong();
+        Map<Long, ScheduledFuture<?>> scheduled = new ConcurrentHashMap<>();
+        when(timers.setPeriodic(anyLong(), any())).thenAnswer(invocation -> {
+            long period = invocation.getArgument(0);
+            Handler<Long> handler = invocation.getArgument(1);
+            long id = ids.incrementAndGet();
+            periods.add(period);
+            scheduled.put(id, time.scheduler().scheduleAtFixedRate(() -> handler.handle(id),
+                    period, period, TimeUnit.MILLISECONDS));
+            return id;
+        });
+        when(timers.setTimer(anyLong(), any())).thenAnswer(invocation -> {
+            long delay = invocation.getArgument(0);
+            Handler<Long> handler = invocation.getArgument(1);
+            long id = ids.incrementAndGet();
+            scheduled.put(id, time.scheduler().schedule(() -> handler.handle(id), delay, TimeUnit.MILLISECONDS));
+            return id;
+        });
+        when(timers.cancelTimer(anyLong())).thenAnswer(invocation -> {
+            ScheduledFuture<?> timer = scheduled.remove(invocation.<Long>getArgument(0));
+            return timer != null && timer.cancel(false);
+        });
+        ElbV2HealthChecker checker = new ElbV2HealthChecker(timers, config, mock(Ec2Service.class), time::nanoTime);
+        checkers.add(checker);
+        return checker;
+    }
+
+    /** Waits for real probe I/O; a probe counts as completed once its result was published or dropped. */
+    private static void awaitCompletedProbes(ElbV2HealthChecker checker, long completed) {
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(2))
+                .until(() -> checker.probeSnapshot().completed() >= completed);
+        KeyedWorkQueue.Snapshot snapshot = checker.probeSnapshot();
+        assertEquals(completed, snapshot.completed());
+        assertEquals(0, snapshot.keys(), "No further probe may be queued or running");
     }
 
     private HttpServer startServer(int statusCode) throws Exception {

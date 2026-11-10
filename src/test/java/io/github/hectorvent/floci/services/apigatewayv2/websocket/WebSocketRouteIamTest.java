@@ -19,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Clock;
 import java.util.List;
 import java.util.Optional;
 
@@ -69,7 +70,7 @@ class WebSocketRouteIamTest {
         when(iam.resolveCallerArns(KEY)).thenReturn(Optional.of(new IamService.CallerArns(USER, USER)));
         CallerCallAuthorizer callers = new CallerCallAuthorizer(config, iam, evaluator, providers, scpInstance);
         controller = new WebSocketHandler(null, null, null, null, null, null,
-                new RegionResolver("us-east-1", OWNER), config, mapper, null, null, callers);
+                new RegionResolver("us-east-1", OWNER), config, mapper, null, null, callers, Clock.systemUTC());
     }
 
     @ParameterizedTest

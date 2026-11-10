@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.apigateway;
 
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -15,6 +16,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class VtlExecutionGuardTest {
 
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
+
+    private final TestTime time = TestTime.create();
+
     @AfterEach
     void clearAnyLeftoverDeadline() {
         // Guard against a failed assertion mid-test leaking a deadline into later tests on the
@@ -28,35 +33,46 @@ class VtlExecutionGuardTest {
     }
 
     @Test
-    void checkDeadline_beforeDeadlinePasses_doesNothing() throws InterruptedException {
-        VtlExecutionGuard.begin(Duration.ofSeconds(30));
+    void checkDeadline_beforeDeadlinePasses_doesNothing() {
+        VtlExecutionGuard.begin(TIMEOUT);
         assertDoesNotThrow(VtlExecutionGuard::checkDeadline);
     }
 
     @Test
-    void checkDeadline_afterDeadlinePasses_throws() throws InterruptedException {
-        VtlExecutionGuard.begin(Duration.ofMillis(1));
-        Thread.sleep(20);
+    void checkDeadline_untilTheDeadlineItself_doesNothing() {
+        VtlExecutionGuard.begin(TIMEOUT, time.clock());
+        time.advance(TIMEOUT);
+        assertDoesNotThrow(VtlExecutionGuard::checkDeadline);
+    }
+
+    @Test
+    void checkDeadline_afterDeadlinePasses_throws() {
+        VtlExecutionGuard.begin(TIMEOUT, time.clock());
+        time.advance(TIMEOUT.plusMillis(1));
         VtlLimitExceededException ex =
                 assertThrows(VtlLimitExceededException.class, VtlExecutionGuard::checkDeadline);
         assertNotNullMessage(ex);
     }
 
     @Test
-    void end_clearsDeadline_soCheckDeadlineNoLongerThrows() throws InterruptedException {
-        VtlExecutionGuard.begin(Duration.ofMillis(1));
-        Thread.sleep(20);
+    void end_clearsDeadline_soCheckDeadlineNoLongerThrows() {
+        VtlExecutionGuard.begin(TIMEOUT, time.clock());
+        time.advance(TIMEOUT.plusMillis(1));
         VtlExecutionGuard.end();
         assertDoesNotThrow(VtlExecutionGuard::checkDeadline);
     }
 
     @Test
-    void begin_replacesAnyPreviousDeadline() throws InterruptedException {
-        VtlExecutionGuard.begin(Duration.ofMillis(1));
-        Thread.sleep(20);
+    void begin_replacesAnyPreviousDeadline() {
+        VtlExecutionGuard.begin(TIMEOUT, time.clock());
+        time.advance(TIMEOUT.plusMillis(1));
         // A fresh begin() must reset the deadline, not extend the expired one.
-        VtlExecutionGuard.begin(Duration.ofSeconds(30));
+        VtlExecutionGuard.begin(TIMEOUT, time.clock());
         assertDoesNotThrow(VtlExecutionGuard::checkDeadline);
+        time.advance(TIMEOUT);
+        assertDoesNotThrow(VtlExecutionGuard::checkDeadline);
+        time.advance(Duration.ofMillis(1));
+        assertThrows(VtlLimitExceededException.class, VtlExecutionGuard::checkDeadline);
     }
 
     private static void assertNotNullMessage(VtlLimitExceededException ex) {

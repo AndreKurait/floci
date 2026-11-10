@@ -28,6 +28,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.lang.reflect.Method;
 import java.net.URI;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -63,7 +64,8 @@ class WebSocketHandlerFailureTest {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.hostname()).thenReturn(Optional.of("localhost"));
         handler = new WebSocketHandler(apiService, connections, selection, events, invoker,
-                authorizer, mock(RegionResolver.class), config, mapper, vertx, sigV4, mock(CallerCallAuthorizer.class));
+                authorizer, mock(RegionResolver.class), config, mapper, vertx, sigV4, mock(CallerCallAuthorizer.class),
+                Clock.systemUTC());
         when(vertx.executeBlocking(any(Callable.class))).thenAnswer(invocation -> {
             Callable<Object> task = invocation.getArgument(0);
             Promise<Object> completion = Promise.promise();
