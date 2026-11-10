@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.lambda.runtime;
 
+import io.github.hectorvent.floci.services.lambda.TimelineInvocationTimer;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.PendingInvocation;
+import io.github.hectorvent.floci.testing.TestTime;
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
@@ -179,14 +181,16 @@ class RuntimeApiServerTest {
     @Test
     @Timeout(10)
     void nextEndpoint_startsDeadlineWhenInvocationIsDispatched() throws Exception {
-        long queuedDeadline = System.currentTimeMillis() + 1_000;
+        TestTime time = TestTime.create();
+        Duration handlerTimeout = Duration.ofSeconds(1);
         PendingInvocation invocation = new PendingInvocation(
-                "req-deadline", "{}".getBytes(), queuedDeadline,
+                "req-deadline", "{}".getBytes(), time.currentTimeMillis() + handlerTimeout.toMillis(),
                 "arn:aws:lambda:us-east-1:000000000000:function:test",
-                new CompletableFuture<>());
+                new CompletableFuture<>(), new TimelineInvocationTimer(time));
         server.enqueue(invocation);
 
-        Thread.sleep(300);
+        // The invocation waits in the queue before a runtime asks for it
+        time.advance(Duration.ofMillis(300));
         HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port
                                 + "/2018-06-01/runtime/invocation/next"))
@@ -195,7 +199,7 @@ class RuntimeApiServerTest {
 
         long advertisedDeadline = Long.parseLong(response.headers()
                 .firstValue("Lambda-Runtime-Deadline-Ms").orElseThrow());
-        assertTrue(advertisedDeadline >= queuedDeadline + 200,
+        assertEquals(time.currentTimeMillis() + handlerTimeout.toMillis(), advertisedDeadline,
                 "queueing and cold-start time must not consume the handler timeout");
     }
 
@@ -748,8 +752,11 @@ class RuntimeApiServerTest {
         }
         quiesceDone.get(5, TimeUnit.SECONDS);
 
+        // Closing the server ends the parked request, so what the poller received over the whole
+        // life of its connection is known without waiting to see whether something still arrives
+        server.close().get(5, TimeUnit.SECONDS);
         try {
-            HttpResponse<String> response = parkedResponse.get(2, TimeUnit.SECONDS);
+            HttpResponse<String> response = parkedResponse.get(5, TimeUnit.SECONDS);
             assertFalse(response.statusCode() == 200
                     && "req-latch-enqueue".equals(response.headers()
                             .firstValue("Lambda-Runtime-Aws-Request-Id").orElse("")),
@@ -757,7 +764,7 @@ class RuntimeApiServerTest {
                             + "would cause silent discard of /response. Got "
                             + response.statusCode());
         } catch (Exception expected) {
-            // socket close from tearDown — expected shape.
+            // the closed server dropped the parked connection, which is the expected shape
         }
         InvokeResult result = invocation.getResultFuture().get(2, TimeUnit.SECONDS);
         assertEquals("Unhandled", result.getFunctionError());
@@ -824,8 +831,11 @@ class RuntimeApiServerTest {
         }
         quiesceDone.get(5, TimeUnit.SECONDS);
 
+        // Closing the server ends the parked request, so what the poller received over the whole
+        // life of its connection is known without waiting to see whether something still arrives
+        server.close().get(5, TimeUnit.SECONDS);
         try {
-            HttpResponse<String> response = nextResponse.get(2, TimeUnit.SECONDS);
+            HttpResponse<String> response = nextResponse.get(5, TimeUnit.SECONDS);
             assertFalse(response.statusCode() == 200
                     && "req-latch-nextpath".equals(response.headers()
                             .firstValue("Lambda-Runtime-Aws-Request-Id").orElse("")),
@@ -833,7 +843,7 @@ class RuntimeApiServerTest {
                             + "would cause silent discard of /response. Got "
                             + response.statusCode());
         } catch (Exception expected) {
-            // socket close from tearDown — expected shape.
+            // the closed server dropped the parked connection, which is the expected shape
         }
         InvokeResult result = invocation.getResultFuture().get(2, TimeUnit.SECONDS);
         assertEquals("Unhandled", result.getFunctionError());
@@ -1721,7 +1731,9 @@ class RuntimeApiServerTest {
 
         String first = registerExtension("first-extension", "INVOKE");
         String second = registerExtension("second-extension", "INVOKE");
-        Thread.sleep(200);
+        // Both registrations have been answered and neither extension has polled: a wait that
+        // cannot block reports the barrier as closed, so the waiter above cannot have got through
+        assertFalse(server.awaitExtensionsReady(0), "registering alone must not open the barrier");
         assertFalse(awaited.isDone(), "registering alone must not open the barrier");
 
         pollExtensionEventNext(first);
@@ -1753,7 +1765,10 @@ class RuntimeApiServerTest {
             }
         });
 
-        Thread.sleep(700);
+        // The registration has been answered and the extension has not polled: a wait that
+        // cannot block reports the barrier as closed, so the waiter above cannot have got through
+        assertFalse(server.awaitExtensionsReady(0),
+                "a registered-but-not-yet-polling extension must keep the barrier closed");
         assertFalse(awaited.isDone(),
                 "a registered-but-not-yet-polling extension must keep the barrier closed");
 

@@ -17,11 +17,11 @@ import java.util.concurrent.TimeoutException;
  * timeline itself, task by task, until the future it waits for completes or its timeout has passed:
  * the test thread is the one waiting, so nobody else could.
  */
-final class TimelineInvocationTimer implements InvocationTimer {
+public final class TimelineInvocationTimer implements InvocationTimer {
 
     private final TestTime time;
 
-    TimelineInvocationTimer(TestTime time) {
+    public TimelineInvocationTimer(TestTime time) {
         this.time = time;
     }
 
