@@ -90,7 +90,7 @@ class RestAuthorizerFailureTest {
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver("us-east-1", OWNER), mapper, null, null, null, null, null,
                 new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, cache,
-                new AuthorizerPolicyEvaluator(evaluator), null, direct);
+                new AuthorizerPolicyEvaluator(evaluator), null, direct, null);
     }
 
     @ParameterizedTest
