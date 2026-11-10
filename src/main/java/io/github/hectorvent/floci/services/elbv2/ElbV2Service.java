@@ -715,6 +715,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                           String matcher, String ipAddressType,
                                           Map<String, String> initialTags) {
         validateHealthCheckTimeout(healthCheckTimeout);
+        validateHealthCheckInterval(healthCheckInterval);
         String effectiveProtocol = protocol != null ? protocol : "HTTP";
         String effectiveHealthProtocol = healthCheckProtocol != null ? healthCheckProtocol
                 : defaultHealthCheckProtocol(effectiveProtocol, targetType);
@@ -818,6 +819,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                    Integer healthCheckTimeout, Integer healthyThreshold,
                                    Integer unhealthyThreshold, String matcher) {
         validateHealthCheckTimeout(healthCheckTimeout);
+        validateHealthCheckInterval(healthCheckInterval);
         TargetGroup tg = requireTargetGroup(region, arn);
         validateHealthCheckPort(healthCheckPort);
         if (healthCheckProtocol != null) {
@@ -859,6 +861,15 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             String supported = applicationTarget ? "HTTP, HTTPS" : "HTTP, HTTPS, TCP";
             throw new AwsException("ValidationError", "Health check protocol '" + healthProtocol
                     + "' must be one of '" + supported + "'", 400);
+        }
+    }
+
+    private static void validateHealthCheckInterval(Integer interval) {
+        if (interval != null && (interval < 5 || interval > 300)) {
+            String constraint = interval < 5 ? "greater than or equal to 5" : "less than or equal to 300";
+            throw new AwsException("ValidationError", "1 validation error detected: Value '" + interval
+                    + "' at 'healthCheckIntervalSeconds' failed to satisfy constraint: Member must have value "
+                    + constraint, 400);
         }
     }
 

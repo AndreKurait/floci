@@ -201,7 +201,11 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   by the API. Real HTTP probes, their timeouts, healthy and unhealthy thresholds,
   and the bounded probe queue still apply; one target never has overlapping probes.
   This deliberately accelerates local health transitions and does not reproduce
-  AWS wall-clock timing. Negative values are rejected during startup.
+  AWS wall-clock timing. Negative values are rejected during startup. Registration
+  probes start a target's cadence; an earlier group timer tick does not advance its
+  health threshold. Probe ownership survives deregistration until the worker exits.
+- `CreateTargetGroup` and `ModifyTargetGroup` validate `HealthCheckIntervalSeconds`
+  against the AWS range of 5 to 300 before changing stored settings or active timers.
 - Each `CreateListener` automatically creates an immutable default rule (`priority=default`, `isDefault=true`). This rule cannot be deleted; use `ModifyListener` to change its action.
 - Rule priorities are unique per listener: `CreateRule` and `SetRulePriorities` only reject a priority held by another rule on the same listener. `SetRulePriorities` is atomic: all priority assignments are validated before any change is committed.
 - `DeleteTargetGroup` is rejected with `ResourceInUse` while the target group is referenced by any listener or rule.

@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.quarkus.runtime.Startup;
 import io.vertx.core.Vertx;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -27,11 +28,16 @@ import java.net.URL;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
+@Startup
 @ApplicationScoped
 public class ElbV2HealthChecker implements Resettable {
 
@@ -43,7 +49,9 @@ public class ElbV2HealthChecker implements Resettable {
     private final Ec2Service ec2Service;
     private final ElbV2VpcNetworkManager vpcNetworks;
     private final long maxHealthCheckIntervalMillis;
+    private final LongSupplier nanoTime;
     private final SSLSocketFactory backendTls = backendTls();
+    private final Set<ProbeIdentity> activeProbes = new HashSet<>();
 
     // tgArn → (targetKey → TargetState)
     private final Map<String, Map<String, TargetState>> states = new ConcurrentHashMap<>();
@@ -53,16 +61,26 @@ public class ElbV2HealthChecker implements Resettable {
             "elb-health-probe", MAX_CONCURRENT_PROBES, 4096, this::runProbe);
 
     public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
-        this(vertx, config, ec2Service, null);
+        this(vertx, config, ec2Service, null, System::nanoTime);
     }
 
     @Inject
     public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
                              ElbV2VpcNetworkManager vpcNetworks) {
+        this(vertx, config, ec2Service, vpcNetworks, System::nanoTime);
+    }
+
+    ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service, LongSupplier nanoTime) {
+        this(vertx, config, ec2Service, null, nanoTime);
+    }
+
+    private ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
+                               ElbV2VpcNetworkManager vpcNetworks, LongSupplier nanoTime) {
         this.vertx = vertx;
         this.config = config;
         this.ec2Service = ec2Service;
         this.vpcNetworks = vpcNetworks;
+        this.nanoTime = nanoTime;
         maxHealthCheckIntervalMillis = config.services().elbv2().maxHealthCheckIntervalMillis();
         if (maxHealthCheckIntervalMillis < 0) {
             throw new IllegalArgumentException(
@@ -85,12 +103,8 @@ public class ElbV2HealthChecker implements Resettable {
             return;
         }
         String tgArn = tg.getTargetGroupArn();
-        states.computeIfAbsent(tgArn, k -> new ConcurrentHashMap<>());
-        long intervalMs = (tg.getHealthCheckIntervalSeconds() != null
-                ? tg.getHealthCheckIntervalSeconds() : 30) * 1000L;
-        if (maxHealthCheckIntervalMillis > 0) {
-            intervalMs = Math.min(intervalMs, maxHealthCheckIntervalMillis);
-        }
+        long intervalMs = effectiveIntervalMillis(tg);
+        Map<String, TargetState> targets = states.computeIfAbsent(tgArn, k -> new ConcurrentHashMap<>());
         ProbeSettings settings = ProbeSettings.of(tg);
         Monitoring previous = timers.get(tgArn);
         if (previous != null && previous.intervalMillis() == intervalMs
@@ -101,12 +115,22 @@ public class ElbV2HealthChecker implements Resettable {
         if (previous != null && previous.intervalMillis() == intervalMs) {
             timerId = previous.timerId();
         } else {
+            timerId = vertx.setPeriodic(intervalMs, id -> probeAll(tgArn, id));
             if (previous != null) {
                 vertx.cancelTimer(previous.timerId());
             }
-            timerId = vertx.setPeriodic(intervalMs, id -> probeAll(tgArn, id));
+            targets.values().forEach(state -> state.hasProbeDeadline = false);
         }
         timers.put(tgArn, new Monitoring(timerId, intervalMs, tg, settings));
+    }
+
+    private long effectiveIntervalMillis(TargetGroup group) {
+        long interval = (group.getHealthCheckIntervalSeconds() != null
+                ? group.getHealthCheckIntervalSeconds() : 30) * 1000L;
+        if (interval <= 0) {
+            throw new IllegalArgumentException("The target group health-check interval must be positive");
+        }
+        return maxHealthCheckIntervalMillis > 0 ? Math.min(interval, maxHealthCheckIntervalMillis) : interval;
     }
 
     public synchronized void stopMonitoring(String tgArn) {
@@ -143,7 +167,7 @@ public class ElbV2HealthChecker implements Resettable {
             }
         }
         if (!registered.isEmpty() && Boolean.TRUE.equals(tg.getHealthCheckEnabled())) {
-            vertx.setTimer(1, ignored -> probeTargets(tgArn, tg, registered));
+            vertx.setTimer(1, ignored -> probeTargets(tgArn, tg, registered, true));
         }
     }
 
@@ -183,18 +207,19 @@ public class ElbV2HealthChecker implements Resettable {
         Monitoring monitoring = timers.get(tgArn);
         Map<String, TargetState> targets = states.get(tgArn);
         if (monitoring != null && monitoring.timerId() == timerId && targets != null) {
-            probeTargets(tgArn, monitoring.group(), targets);
+            probeTargets(tgArn, monitoring.group(), targets, true);
         }
     }
 
     synchronized void probeAll(String tgArn, TargetGroup group) {
         Map<String, TargetState> targets = states.get(tgArn);
         if (targets != null) {
-            probeTargets(tgArn, group, targets);
+            probeTargets(tgArn, group, targets, false);
         }
     }
 
-    private synchronized void probeTargets(String tgArn, TargetGroup tg, Map<String, TargetState> selected) {
+    private synchronized void probeTargets(String tgArn, TargetGroup tg, Map<String, TargetState> selected,
+                                           boolean respectInterval) {
         Map<String, TargetState> targets = states.get(tgArn);
         if (targets == null || !Boolean.TRUE.equals(tg.getHealthCheckEnabled())) {
             return;
@@ -202,7 +227,11 @@ public class ElbV2HealthChecker implements Resettable {
         for (Map.Entry<String, TargetState> entry : selected.entrySet()) {
             String key = entry.getKey();
             TargetState state = entry.getValue();
-            if (targets.get(key) != state || state.inFlight || state.workerRunning) {
+            if (targets.get(key) != state || state.inFlight || state.workerRunning
+                    || activeProbes.contains(new ProbeIdentity(tgArn, key))) {
+                continue;
+            }
+            if (respectInterval && state.hasProbeDeadline && nanoTime.getAsLong() - state.nextProbeNanos < 0) {
                 continue;
             }
             // Split at the last colon so IPv6 literals remain intact.
@@ -230,12 +259,25 @@ public class ElbV2HealthChecker implements Resettable {
 
     private void runProbe(ProbeWork work) {
         TargetState state = work.state();
+        ProbeIdentity identity = new ProbeIdentity(work.groupArn(), work.key());
         try {
             synchronized (this) {
-                if (!current(work) || !probeSlots.tryAcquire()) {
+                if (!current(work) || activeProbes.contains(identity)) {
                     return;
                 }
+                long interval = TimeUnit.MILLISECONDS.toNanos(work.monitoring() != null
+                        ? work.monitoring().intervalMillis() : effectiveIntervalMillis(work.group()));
+                if (!probeSlots.tryAcquire()) {
+                    return;
+                }
+                activeProbes.add(identity);
                 state.workerRunning = true;
+                long now = nanoTime.getAsLong();
+                // Retain the cadence across worker jitter instead of delaying every following timer tick.
+                state.nextProbeNanos = state.hasProbeDeadline
+                        ? state.nextProbeNanos + Math.max(1, (now - state.nextProbeNanos) / interval + 1) * interval
+                        : now + interval;
+                state.hasProbeDeadline = true;
             }
             int statusCode = 0;
             Exception failure = null;
@@ -248,7 +290,15 @@ public class ElbV2HealthChecker implements Resettable {
                 }, () -> {
                     synchronized (this) {
                         state.workerRunning = false;
+                        activeProbes.remove(identity);
                         probeSlots.release();
+                        Map<String, TargetState> targets = states.get(work.groupArn());
+                        TargetState replacement = targets != null ? targets.get(work.key()) : null;
+                        Monitoring monitoring = timers.get(work.groupArn());
+                        if (replacement != null && replacement != state && monitoring != null) {
+                            probeTargets(work.groupArn(), monitoring.group(),
+                                    Map.of(work.key(), replacement), true);
+                        }
                     }
                 });
             } catch (IOException | RuntimeException error) {
@@ -298,6 +348,8 @@ public class ElbV2HealthChecker implements Resettable {
     }
 
     private record Monitoring(long timerId, long intervalMillis, TargetGroup group, ProbeSettings settings) {}
+
+    private record ProbeIdentity(String groupArn, String targetKey) {}
 
     private record ProbeWork(String groupArn, String key, String targetId, int port, TargetGroup group,
                              TargetState state, Monitoring monitoring, ProbeSettings settings) {}
@@ -430,6 +482,8 @@ public class ElbV2HealthChecker implements Resettable {
     private static class TargetState {
         boolean inFlight;
         boolean workerRunning;
+        boolean hasProbeDeadline;
+        long nextProbeNanos;
         volatile TargetHealthStatus health = TargetHealthStatus.registrationInProgress();
         int consecutiveSuccesses;
         int consecutiveFailures;
