@@ -7158,8 +7158,11 @@ public class S3Service implements Resettable, ResourceProvider {
             if (tn.events().stream().anyMatch(p -> matchesEvent(p, eventName)) && tn.matchesKey(key)) {
                 try {
                     String eventJson = notificationEventJson(event, tn.id());
-                    snsService.publish(tn.topicArn(), null, eventJson, "Amazon S3 Notification",
-                            extractRegionFromArn(tn.topicArn()));
+                    String sourceAccount = resolveBucketEntry(bucketName).orElseThrow().account();
+                    String sourceArn = AwsArnUtils.Arn.global(bucketPartition(bucketName), "s3", "", bucketName)
+                            .toString();
+                    snsService.publishFromService("s3", tn.topicArn(), eventJson, "Amazon S3 Notification",
+                            sourceArn, sourceAccount, extractRegionFromArn(tn.topicArn()));
                     LOG.debugv("Fired S3 event {0} to SNS {1}", eventName, tn.topicArn());
                 } catch (Exception e) {
                     LOG.warnv("Failed to deliver S3 event to SNS {0}: {1}", tn.topicArn(), e.getMessage());

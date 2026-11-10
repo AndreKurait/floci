@@ -1085,6 +1085,16 @@ public class SnsService implements Resettable, ResourceProvider {
         return publish(topicArn, targetArn, null, message, subject, null, null, null, region);
     }
 
+    /** Publishes a service notification only when the topic permits its source resource. */
+    public String publishFromService(String service, String topicArn, String message, String subject,
+                                     String sourceArn, String sourceAccount, String region) {
+        if (serviceCallAuthorizer != null && serviceCallAuthorizer.authorize(
+                service, "sns:Publish", topicArn, sourceArn, sourceAccount) != Decision.ALLOW) {
+            throw new AwsException("AuthorizationError", "The service cannot publish to the topic", 403);
+        }
+        return publish(topicArn, null, message, subject, region);
+    }
+
     public String publish(String topicArn, String targetArn, String phoneNumber, String message,
                           String subject, Map<String, MessageAttributeValue> messageAttributes, String region) {
         return publish(topicArn, targetArn, phoneNumber, message, subject, messageAttributes, null, null, region);
@@ -1184,7 +1194,7 @@ public class SnsService implements Resettable, ResourceProvider {
                 MESSAGE_TIMESTAMP.format(Instant.now()), signatureVersion(topic), new HashMap<>());
         JsonNode parsedBody = null;
         boolean bodyParseAttempted = false;
-        for (Subscription sub : subscriptionsByTopic(effectiveArn, region)) {
+        for (Subscription sub : subscriptionsForDelivery(effectiveArn, region)) {
             if ("true".equals(sub.getAttributes().get("PendingConfirmation"))) {
                 LOG.debugv("Skipping delivery to pending subscription {0}", sub.getSubscriptionArn());
                 continue;
@@ -1645,7 +1655,7 @@ public class SnsService implements Resettable, ResourceProvider {
         List<String[]> failed = new ArrayList<>();
         String timestamp = MESSAGE_TIMESTAMP.format(Instant.now());
         String version = signatureVersion(topic);
-        List<Subscription> subscriptions = subscriptionsByTopic(topicArn, region);
+        List<Subscription> subscriptions = subscriptionsForDelivery(topicArn, region);
         for (Map<String, Object> entry : entries) {
             String id = (String) entry.get("Id");
             String message = (String) entry.get("Message");
@@ -2578,6 +2588,17 @@ public class SnsService implements Resettable, ResourceProvider {
             }
         }
         return result;
+    }
+
+    private List<Subscription> subscriptionsForDelivery(String topicArn, String region) {
+        if (subscriptionStore instanceof AccountAwareStorageBackend<Subscription> aware) {
+            String prefix = "sub::" + region + "::";
+            return aware.scanAllAccountEntries(key -> key.startsWith(prefix)).stream()
+                    .map(AccountAwareStorageBackend.AccountEntry::value)
+                    .filter(subscription -> topicArn.equals(subscription.getTopicArn()))
+                    .toList();
+        }
+        return subscriptionsByTopic(topicArn, region);
     }
 
     /** What every subscriber of one published message shares. AWS stamps and signs a publish once. */
