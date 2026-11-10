@@ -1059,6 +1059,15 @@ public class Ec2QueryHandler {
             }
         }
 
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            Ec2Service.validateNewResourceTags(launchTemplateData.tagsForResource("network-interface"));
+            Map<String, Tag> primaryInterfaceTags = new LinkedHashMap<>();
+            launchTemplateData.tagsForResource("network-interface")
+                    .forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            networkInterfaceTags.forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            Ec2Service.validateNewResourceTags(new ArrayList<>(primaryInterfaceTags.values()));
+        }
+
         String availabilityZone = runInstancesAvailabilityZone(p, region, launchTemplateData);
         Reservation res = attempt == null ? service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
@@ -1073,6 +1082,20 @@ public class Ec2QueryHandler {
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification,
                 networkInterfaceDeleteOnTermination, attempt);
+
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            List<Tag> templateInterfaceTags = launchTemplateData.tagsForResource("network-interface");
+            if (!templateInterfaceTags.isEmpty()) {
+                List<String> primaryIds = res.getInstances().stream()
+                        .flatMap(instance -> instance.getNetworkInterfaces().stream())
+                        .filter(networkInterface -> networkInterface.getDeviceIndex() == 0)
+                        .map(InstanceNetworkInterface::getNetworkInterfaceId)
+                        .toList();
+                if (!primaryIds.isEmpty()) {
+                    service.tagRunInstancesInterfaces(region, primaryIds, templateInterfaceTags, attempt);
+                }
+            }
+        }
 
         // The request's EbsOptimized wins over a launch template's. Applied after the launch, on this
         // API path only: CloudFormation, Auto Scaling and Fleet launches still read false. Passing it

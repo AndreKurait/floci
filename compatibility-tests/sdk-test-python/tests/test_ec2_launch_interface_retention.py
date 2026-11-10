@@ -135,6 +135,21 @@ def test_primary_interface_retention(ec2_client, via_template, supplied_interfac
             assert reused["NetworkInterfaces"][0]["NetworkInterfaceId"] == eni_id
             assert interfaces()[0]["Attachment"]["InstanceId"] == reused["InstanceId"]
             assert interfaces()[0]["Attachment"]["DeleteOnTermination"] is False
+            carried = ec2.describe_addresses(AllocationIds=[allocation])["Addresses"][0]
+            assert carried["InstanceId"] == reused["InstanceId"]
+            assert carried["AssociationId"] == association
+            assert carried["NetworkInterfaceId"] == eni_id
+            assert ec2.describe_addresses(AllocationIds=[allocation], Filters=[{
+                "Name": "instance-id", "Values": [reused["InstanceId"]],
+            }])["Addresses"] == [carried]
+            assert not ec2.describe_addresses(AllocationIds=[allocation], Filters=[{
+                "Name": "instance-id", "Values": [instance_id],
+            }])["Addresses"]
+            with pytest.raises(ClientError):
+                ec2.run_instances(
+                    ImageId=image, InstanceType="t3.nano", MinCount=1, MaxCount=1,
+                    NetworkInterfaces=[{"DeviceIndex": 0, "NetworkInterfaceId": eni_id}])
+            assert ec2.describe_addresses(AllocationIds=[allocation])["Addresses"] == [carried]
 
 
 @pytest.mark.parametrize("delete", [False, True])
@@ -167,3 +182,108 @@ def test_request_interface_replaces_template_retention(ec2_client, delete):
         retained = ec2.describe_network_interfaces(
             Filters=[{"Name": "network-interface-id", "Values": [eni_id]}])["NetworkInterfaces"]
         assert bool(retained) != delete
+
+
+@pytest.mark.parametrize("supplied_interface", [False, True])
+@pytest.mark.parametrize("request_override", [False, True])
+def test_template_primary_interface_tags(ec2_client, supplied_interface, request_override):
+    ec2 = ec2_client
+    name = "template-interface-tags-" + uuid.uuid4().hex
+    with ExitStack() as cleanup:
+        vpc = ec2.create_vpc(CidrBlock="10.239.0.0/24")["Vpc"]["VpcId"]
+        cleanup.callback(ec2.delete_vpc, VpcId=vpc)
+        subnet = ec2.create_subnet(VpcId=vpc, CidrBlock="10.239.0.0/26")["Subnet"]["SubnetId"]
+        cleanup.callback(ec2.delete_subnet, SubnetId=subnet)
+        image = ec2.register_image(Name=name, Architecture="x86_64", RootDeviceName="/dev/sda1")["ImageId"]
+        cleanup.callback(ec2.deregister_image, ImageId=image)
+        interface_ids = []
+        cleanup.callback(_delete_interfaces, ec2, interface_ids)
+        network = {"DeviceIndex": 0, "DeleteOnTermination": False}
+        if supplied_interface:
+            interface_id = ec2.create_network_interface(SubnetId=subnet)["NetworkInterface"]["NetworkInterfaceId"]
+            interface_ids.append(interface_id)
+            network["NetworkInterfaceId"] = interface_id
+            ec2.create_tags(Resources=[interface_id], Tags=[{"Key": "existing", "Value": "preserved"}])
+        else:
+            network["SubnetId"] = subnet
+        template = ec2.create_launch_template(LaunchTemplateName=name, LaunchTemplateData={
+            "ImageId": image, "InstanceType": "t3.nano", "NetworkInterfaces": [network],
+            "TagSpecifications": [
+                {"ResourceType": "network-interface", "Tags": [
+                    {"Key": "template-only", "Value": "interface"}, {"Key": "shared", "Value": "template"}]},
+                {"ResourceType": "instance", "Tags": [{"Key": "instance-only", "Value": "instance"}]}]
+        })["LaunchTemplate"]["LaunchTemplateId"]
+        cleanup.callback(ec2.delete_launch_template, LaunchTemplateId=template)
+        launch = {"LaunchTemplate": {"LaunchTemplateId": template}, "MinCount": 1, "MaxCount": 1}
+        if request_override:
+            launch["TagSpecifications"] = [{"ResourceType": "network-interface", "Tags": [
+                {"Key": "shared", "Value": "request"}, {"Key": "request-only", "Value": "interface"}]}]
+        instance = ec2.run_instances(**launch)["Instances"][0]
+        cleanup.callback(_terminate, ec2, instance["InstanceId"])
+        interface_id = instance["NetworkInterfaces"][0]["NetworkInterfaceId"]
+        if interface_id not in interface_ids:
+            interface_ids.append(interface_id)
+        expected = {"existing": "preserved"} if supplied_interface else {
+            "template-only": "interface", "shared": "template"}
+        if request_override:
+            expected.update({"shared": "request", "request-only": "interface"})
+        def assert_tags():
+            interface = ec2.describe_network_interfaces(NetworkInterfaceIds=[interface_id])["NetworkInterfaces"][0]
+            assert {t["Key"]: t["Value"] for t in interface.get("TagSet", [])} == expected
+            tags = ec2.describe_tags(Filters=[{"Name": "resource-id", "Values": [interface_id]}])["Tags"]
+            assert {t["Key"]: t["Value"] for t in tags} == expected
+        assert_tags()
+        _terminate(ec2, instance["InstanceId"])
+        assert_tags()
+
+
+@pytest.mark.parametrize("retain_primary", [False, True])
+def test_instance_group_update_preserves_secondary_interface_groups(ec2_client, retain_primary):
+    ec2 = ec2_client
+    name = "interface-group-isolation-" + uuid.uuid4().hex
+    with ExitStack() as cleanup:
+        vpc = ec2.create_vpc(CidrBlock="10.237.0.0/24")["Vpc"]["VpcId"]
+        cleanup.callback(ec2.delete_vpc, VpcId=vpc)
+        groups = []
+        for suffix in ("primary", "secondary", "replacement"):
+            group = ec2.create_security_group(
+                GroupName=name + "-" + suffix, Description=suffix, VpcId=vpc)["GroupId"]
+            groups.append(group)
+            cleanup.callback(ec2.delete_security_group, GroupId=group)
+        subnet = ec2.create_subnet(VpcId=vpc, CidrBlock="10.237.0.0/26")["Subnet"]["SubnetId"]
+        cleanup.callback(ec2.delete_subnet, SubnetId=subnet)
+        image = ec2.register_image(
+            Name=name, Architecture="x86_64", RootDeviceName="/dev/sda1")["ImageId"]
+        cleanup.callback(ec2.deregister_image, ImageId=image)
+        interfaces = []
+        cleanup.callback(_delete_interfaces, ec2, interfaces)
+        secondary = ec2.create_network_interface(SubnetId=subnet, Groups=[groups[1]])["NetworkInterface"]
+        secondary_id = secondary["NetworkInterfaceId"]
+        interfaces.append(secondary_id)
+        instance = ec2.run_instances(
+            ImageId=image, InstanceType="t3.nano", MinCount=1, MaxCount=1,
+            NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": subnet, "Groups": [groups[0]],
+                                "DeleteOnTermination": not retain_primary}])["Instances"][0]
+        instance_id = instance["InstanceId"]
+        primary_id = instance["NetworkInterfaces"][0]["NetworkInterfaceId"]
+        interfaces.append(primary_id)
+        cleanup.callback(_terminate, ec2, instance_id)
+        ec2.get_waiter("instance_running").wait(
+            InstanceIds=[instance_id], WaiterConfig={"Delay": 1, "MaxAttempts": 30})
+        ec2.attach_network_interface(NetworkInterfaceId=secondary_id, InstanceId=instance_id, DeviceIndex=1)
+        ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[groups[2]])
+        expected = {primary_id: [groups[2]], secondary_id: [groups[1]]}
+        described = ec2.describe_network_interfaces(NetworkInterfaceIds=interfaces)["NetworkInterfaces"]
+        assert {eni["NetworkInterfaceId"]: [g["GroupId"] for g in eni["Groups"]]
+                for eni in described} == expected
+        attached = _instances(ec2)[instance_id]["NetworkInterfaces"]
+        assert {eni["NetworkInterfaceId"]: [g["GroupId"] for g in eni["Groups"]]
+                for eni in attached} == expected
+        _terminate(ec2, instance_id)
+        retained = ec2.describe_network_interfaces(
+            Filters=[{"Name": "network-interface-id", "Values": interfaces}])["NetworkInterfaces"]
+        if not retain_primary:
+            del expected[primary_id]
+        assert {eni["NetworkInterfaceId"]: [g["GroupId"] for g in eni["Groups"]]
+                for eni in retained} == expected
+        assert all(eni["Status"] == "available" and not eni.get("Attachment") for eni in retained)

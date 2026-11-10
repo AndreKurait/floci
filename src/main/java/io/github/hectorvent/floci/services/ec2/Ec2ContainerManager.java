@@ -1407,34 +1407,7 @@ public class Ec2ContainerManager {
                         Thread.sleep(500);
                     }
                 }
-                String instanceId = instance.getInstanceId();
-                // A protected workload shares the helper's namespace, so it has no Docker network
-                // attachment of its own to rediscover: the helper keeps its private address
-                // across the workload's stop/start, exactly as launch used it.
-                String containerIp = namespace == null
-                        ? waitForContainerBridgeIp(containerId, instanceId)
-                        : namespace.privateAddress();
-                if (containerIp != null && !containerIp.isBlank()) {
-                    instance.setContainerBridgeIp(containerIp);
-                    refreshServiceNetworkIp(instance);
-                    if (namespace == null) {
-                        exposeReachablePrivateAddress(instance, containerIp,
-                                config.services().ec2().awsFaithfulPrivateIp());
-                    }
-                    // Docker hands out a new bridge IP on restart, so the previously reported
-                    // public address can now point at another container entirely. An address the
-                    // stop left in place is an Elastic IP's; a released automatic one is replaced
-                    // only when the shared rule allows it.
-                    if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
-                        exposeReachablePublicAddress(instance);
-                    }
-                    if (namespace == null) {
-                        metadataServer.registerContainer(containerIp, instanceId, instance);
-                        refreshImdsSourceRegistration(instance, containerId, containerIp);
-                        refreshMetadataAddresses(instance, containerId);
-                    }
-                    setUpMetadataEndpoint = namespace == null;
-                }
+                setUpMetadataEndpoint = refreshStartedContainerAddresses(instance, containerId, namespace);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 instance.compareAndSetState(pending, InstanceState.stopped());
@@ -1460,6 +1433,44 @@ public class Ec2ContainerManager {
                 setUpMetadataEndpointWhileRunning(instance, containerId, running);
             }
         }));
+    }
+
+    /**
+     * Re-reads the addresses a started or restarted container answers on and publishes them to
+     * the instance and its IMDS registration. Returns whether the workload's own link-local
+     * metadata endpoint still has to be set up, which is the case only without a helper namespace.
+     */
+    private boolean refreshStartedContainerAddresses(Instance instance, String containerId,
+                                                     ProtectedNamespace namespace) throws InterruptedException {
+        String instanceId = instance.getInstanceId();
+        // A protected workload shares the helper's namespace, so it has no Docker network
+        // attachment of its own to rediscover: the helper keeps its private address
+        // across the workload's stop/start, exactly as launch used it.
+        String containerIp = namespace == null
+                ? waitForContainerBridgeIp(containerId, instanceId)
+                : namespace.privateAddress();
+        if (containerIp == null || containerIp.isBlank()) {
+            return false;
+        }
+        instance.setContainerBridgeIp(containerIp);
+        refreshServiceNetworkIp(instance);
+        if (namespace == null) {
+            exposeReachablePrivateAddress(instance, containerIp,
+                    config.services().ec2().awsFaithfulPrivateIp());
+        }
+        // Docker hands out a new bridge IP on restart, so the previously reported
+        // public address can now point at another container entirely. An address the
+        // stop left in place is an Elastic IP's; a released automatic one is replaced
+        // only when the shared rule allows it.
+        if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
+            exposeReachablePublicAddress(instance);
+        }
+        if (namespace == null) {
+            metadataServer.registerContainer(containerIp, instanceId, instance);
+            refreshImdsSourceRegistration(instance, containerId, containerIp);
+            refreshMetadataAddresses(instance, containerId);
+        }
+        return namespace == null;
     }
 
     /**
@@ -1937,10 +1948,12 @@ public class Ec2ContainerManager {
         instance.setPrivateIpAddress(privateIp);
         instance.setPrivateDnsName(privateDnsName);
         if (instance.getNetworkInterfaces() != null) {
-            instance.getNetworkInterfaces().forEach(networkInterface -> {
-                networkInterface.setPrivateIpAddress(privateIp);
-                networkInterface.setPrivateDnsName(privateDnsName);
-            });
+            instance.getNetworkInterfaces().stream()
+                    .filter(networkInterface -> networkInterface.getDeviceIndex() == 0)
+                    .forEach(networkInterface -> {
+                        networkInterface.setPrivateIpAddress(privateIp);
+                        networkInterface.setPrivateDnsName(privateDnsName);
+                    });
         }
     }
 
@@ -2180,6 +2193,14 @@ public class Ec2ContainerManager {
      * Reboots an instance via docker restart.
      */
     public void reboot(Instance instance) {
+        reboot(instance, null);
+    }
+
+    /**
+     * Reboots as {@link #reboot(Instance)} does, then re-reads the container's addresses and runs
+     * {@code postReboot}, so the caller publishes them only after Docker restarted the container.
+     */
+    public void reboot(Instance instance, Runnable postReboot) {
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
             return;
@@ -2194,7 +2215,14 @@ public class Ec2ContainerManager {
                 dockerClient.restartContainerCmd(containerId).exec();
                 guestReboots.forget(instance);
                 releaseNativeGuest(instance, containerId);
+                refreshStartedContainerAddresses(instance, containerId, protectedNamespace(instance));
+                if (postReboot != null) {
+                    postReboot.run();
+                }
                 LOG.infov("Rebooted EC2 container {0}", containerId);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.debugv(e, "Interrupted address refresh after rebooting EC2 container {0}", containerId);
             } catch (Exception e) {
                 LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());
             }
