@@ -268,6 +268,7 @@ class ApiGatewayPassRoleIntegrationTest {
             String api = f.v2.createApi(b -> b.name(f.name).protocolType("HTTP").target(target)
                     .credentialsArn(f.role)).apiId();
             assertEquals(target, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().integrationUri());
+            assertEquals(f.role, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().credentialsArn());
             assertEquals(1, f.v2.getRoutes(b -> b.apiId(api)).items().size());
             assertEquals(1, f.v2.getStages(b -> b.apiId(api)).items().size());
             f.policy(null);
