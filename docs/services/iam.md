@@ -3117,3 +3117,9 @@ aws iam create-access-key --user-name alice --endpoint-url $AWS_ENDPOINT_URL
 # List roles
 aws iam list-roles --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+REST API OpenAPI and Swagger imports require `iam:PassRole` for every assigned
+integration role before creating, merging or overwriting resources. The service
+parser resolves AWS variables and ANY-method operations. Unused extensions,
+ignored integration types and caller credentials pass no role. Authorizer and
+HTTP API import checks remain separate follow-ups.
