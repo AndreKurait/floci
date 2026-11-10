@@ -1182,5 +1182,17 @@ owner, the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exa
 qualified Lambda target. Missing permission returns an authorizer configuration
 error before invoking Lambda. Cached authorizer results do not invoke Lambda; a
 cache miss or stage cache flush makes the next invocation check permission again.
+Configured REST Lambda authorizer roles are checked when IAM enforcement is enabled.
+The role must belong to the API owner, trust API Gateway, and permit invocation of
+the qualified target through identity/resource policies, permissions boundaries
+and SCPs. Cached authorizer results do not invoke Lambda; the next invocation after
+cache expiry or flush checks current permissions. Missing credentials continue to
+use Lambda resource-based permissions.
+
+This local role evaluation does not issue STS credentials or establish all
+service-specific trust condition keys. Integration caller-passthrough credentials
+are not an authorizer credential mode. HTTP/WebSocket role enforcement and live
+AWS or native-image parity remain outside this support.
+
 
 When IAM enforcement is enabled, REST methods using `NONE` require an explicit anonymous grant from an attached resource policy. Cognito user-pool methods authenticate the token first, then require that resource-policy grant. Missing policies retain existing access; an explicit deny or an attached policy without a matching allow rejects the request before backend dispatch. Source-IP conditions use the connection address. Anonymous policy context omits `aws:PrincipalIsAWSService`, while signed AWS credentials retain their existing context. These checks use the current stored policy. CUSTOM authorizer/resource-policy combination, complete inbound condition context and deployment-snapshot activation remain separate work.
