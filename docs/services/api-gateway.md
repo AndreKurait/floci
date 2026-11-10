@@ -1216,3 +1216,10 @@ bare `*` is not the documented AWS sentinel. This check is distinct from `execut
 route authorization. Issued session identities are read from IAM, not synthesized; full forwarded
 request condition context, other service integrations and HTTP/WebSocket caller modes remain
 outside this implementation.
+
+HTTP API import and reimport check `iam:PassRole` for assigned AWS integration and REQUEST
+Lambda authorizer execution roles when IAM enforcement is enabled. The check uses the same
+normalized OpenAPI plan as the importer, including YAML and ANY-method operations, before
+creating or replacing API resources. Caller credentials, omitted or null credentials, HTTP
+integration credentials and JWT authorizer fields do not pass an execution role. This check
+does not add OpenAPI reference resolution or AWS-variable substitution beyond the existing importer.
