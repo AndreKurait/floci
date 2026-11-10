@@ -8,10 +8,13 @@ import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @QuarkusTest
@@ -69,6 +72,37 @@ class AlarmEvaluatorAccountIntegrationTest {
             for (String account : accounts) {
                 RequestScopes.runAs(account, REGION, () -> metrics.deleteAlarms(List.of(NAME), REGION));
             }
+        }
+    }
+
+    /**
+     * Real-time wiring: nothing here calls the evaluator, so only the tick the container started on
+     * the real executor, at its configured ten-second period, can move the alarm. The timing rules
+     * themselves are asserted on a controlled timeline in {@link AlarmEvaluatorTimingTest}.
+     */
+    @Test
+    void theScheduledTickEvaluatesAnAlarmNobodyAskedItToEvaluate() {
+        String account = "555555555555";
+        try {
+            RequestScopes.runAs(account, REGION, () -> {
+                MetricAlarm alarm = new MetricAlarm();
+                alarm.setAlarmName(NAME);
+                alarm.setNamespace(NAMESPACE);
+                alarm.setMetricName("Scheduled");
+                alarm.setStatistic("Average");
+                alarm.setPeriod(60);
+                alarm.setEvaluationPeriods(1);
+                alarm.setThreshold(50);
+                alarm.setComparisonOperator("GreaterThanThreshold");
+                metrics.putMetricAlarm(alarm, REGION);
+                metrics.putMetricData(NAMESPACE, List.of(MetricDatum.of("Scheduled", "Percent", 90, List.of(),
+                        Instant.now().getEpochSecond() - 60)), REGION);
+            });
+
+            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(50))
+                    .until(() -> state(account), equalTo("ALARM"));
+        } finally {
+            RequestScopes.runAs(account, REGION, () -> metrics.deleteAlarms(List.of(NAME), REGION));
         }
     }
 
