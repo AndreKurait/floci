@@ -1,10 +1,13 @@
 package io.github.hectorvent.floci.services.elbv2;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.Pem;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.RealElbV2DataPlaneProfile;
+import io.github.hectorvent.floci.testing.TestAccounts;
 import io.github.hectorvent.floci.testutil.LogCapture;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -20,9 +23,12 @@ import io.vertx.core.net.PemKeyCertOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
@@ -75,6 +81,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestProfile(RealElbV2DataPlaneProfile.class)
 class ElbV2TcpDataPlaneIntegrationTest {
 
+    private static final String NON_DEFAULT_ACCOUNT = "111122223333";
+
     @Inject
     Vertx vertx;
 
@@ -97,9 +105,11 @@ class ElbV2TcpDataPlaneIntegrationTest {
     private String targetGroupArn;
     private String listenerArn;
     private int listenerPort;
+    private boolean nonDefaultAccount;
 
     @BeforeEach
-    void createTcpListenerWithHealthyTarget() throws Exception {
+    void createTcpListenerWithHealthyTarget(TestInfo testInfo) throws Exception {
+        nonDefaultAccount = testInfo.getTags().contains("nondefault-account");
         backend = vertx.createNetServer()
                 .connectHandler(socket -> socket.handler(socket::write))
                 .listen(0, "127.0.0.1")
@@ -111,7 +121,8 @@ class ElbV2TcpDataPlaneIntegrationTest {
         client = ElasticLoadBalancingV2Client.builder()
                 .endpointOverride(endpoint)
                 .region(Region.US_EAST_1)
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(
+                        nonDefaultAccount ? NON_DEFAULT_ACCOUNT : "test", "test")))
                 .httpClientBuilder(UrlConnectionHttpClient.builder())
                 .build();
 
@@ -168,7 +179,15 @@ class ElbV2TcpDataPlaneIntegrationTest {
                             || "Elb.InitialHealthChecking".equals(description.targetHealth().reasonAsString())));
         });
         // Keep the real network probes and threshold, without waiting for the periodic timer.
-        healthChecker.probeAll(targetGroupArn, service.getTargetGroup("us-east-1", targetGroupArn));
+        probeNow();
+    }
+
+    /** Probes outside the periodic cadence, reading the group in the account that owns it. */
+    private void probeNow() {
+        healthChecker.probeAll(targetGroupArn, nonDefaultAccount
+                ? RequestScopes.callAs(NON_DEFAULT_ACCOUNT, "us-east-1",
+                        () -> service.getTargetGroup("us-east-1", targetGroupArn))
+                : service.getTargetGroup("us-east-1", targetGroupArn));
     }
 
     @AfterEach
@@ -208,6 +227,43 @@ class ElbV2TcpDataPlaneIntegrationTest {
 
     @Test
     void tcpListenerRelaysBinaryBytesWithoutInterpretingHttp() throws Exception {
+        assertBinaryRelay();
+    }
+
+    @Tag("nondefault-account")
+    @Test
+    void tcpListenerRelaysBinaryBytesForItsNondefaultOwner() throws Exception {
+        assertBinaryRelay();
+    }
+
+    @Tag("nondefault-account")
+    @Test
+    void runtimeReinitializationRestoresTheNondefaultOwnersListenerAndHealthChecks() throws Exception {
+        assertBinaryRelay();
+        assertTrue(dataPlane.removeListener(listenerArn, listenerPort, () -> true));
+        healthChecker.stopMonitoring(targetGroupArn);
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertThrows(ConnectException.class, () -> connect(listenerPort).close()));
+
+        service.initializeStorage();
+        service.restorePersistedRuntime();
+
+        // Restored monitoring owns the target again; probe it now instead of waiting for the timer.
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            probeNow();
+            assertEquals(TargetHealthStateEnum.HEALTHY,
+                    client.describeTargetHealth(request -> request.targetGroupArn(targetGroupArn))
+                            .targetHealthDescriptions().getFirst().targetHealth().state());
+        });
+        await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class).untilAsserted(() -> {
+            try (Socket socket = connect(listenerPort)) {
+                assertEquals(listenerPort, socket.getPort());
+            }
+        });
+        assertBinaryRelay();
+    }
+
+    private void assertBinaryRelay() throws Exception {
         // PostgreSQL SSLRequest: valid TCP payload, not an HTTP request.
         byte[] payload = {0, 0, 0, 8, 4, (byte) 0xd2, 0x16, 0x2f};
         try (Socket direct = connect(backend.actualPort())) {
@@ -496,6 +552,57 @@ class ElbV2TcpDataPlaneIntegrationTest {
         client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
                 .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("120").build()));
         assertEquals(120_000L, dataPlane.tcpIdleTimeoutMillis(listenerArn, "us-east-1"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"eu-west-1", "cn-north-1"})
+    void unsignedTcpConnectionsUseTheListenerOwnersTargetsAndTimeout(String region) throws Exception {
+        String owner = TestAccounts.randomId();
+        try (ElasticLoadBalancingV2Client member = ElasticLoadBalancingV2Client.builder()
+                .endpointOverride(endpoint).region(Region.of(region))
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(owner, "test")))
+                .httpClientBuilder(UrlConnectionHttpClient.builder()).build()) {
+            String balancer = member.createLoadBalancer(request -> request.name("member-tcp")
+                    .type(LoadBalancerTypeEnum.NETWORK).subnets(Ec2Service.defaultSubnetId(region, "a")))
+                    .loadBalancers().getFirst().loadBalancerArn();
+            String group = null;
+            try {
+                group = member.createTargetGroup(request -> request.name("member-tcp-target")
+                        .protocol(ProtocolEnum.TCP).port(backend.actualPort()).targetType(TargetTypeEnum.IP)
+                        .vpcId(Ec2Service.defaultVpcId(region))).targetGroups().getFirst().targetGroupArn();
+                String targetGroup = group;
+                member.registerTargets(request -> request.targetGroupArn(targetGroup)
+                        .targets(TargetDescription.builder().id("127.0.0.1").port(backend.actualPort()).build()));
+                int port;
+                try (ServerSocket reservation = new ServerSocket(0)) {
+                    port = reservation.getLocalPort();
+                }
+                String listener = member.createListener(request -> request.loadBalancerArn(balancer)
+                        .protocol(ProtocolEnum.TCP).port(port).defaultActions(Action.builder()
+                                .type(ActionTypeEnum.FORWARD).targetGroupArn(targetGroup).build()))
+                        .listeners().getFirst().listenerArn();
+                assertEquals(owner, AwsArnUtils.parse(listener).accountId());
+                assertEquals(region, AwsArnUtils.parse(listener).region());
+                member.modifyListenerAttributes(request -> request.listenerArn(listener)
+                        .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("120").build()));
+                await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class).untilAsserted(() -> {
+                    try (Socket socket = connect(port)) {
+                        assertEcho(socket, new byte[]{0, 1, 2, 3, (byte) 255});
+                    }
+                });
+                // This is the same lookup the asynchronous connect callback makes outside a request scope.
+                assertEquals(120_000L, dataPlane.tcpIdleTimeoutMillis(listener, region));
+            } finally {
+                String targetGroup = group;
+                assertAll("Remove the member account's listener, load balancer and target group",
+                        () -> member.deleteLoadBalancer(request -> request.loadBalancerArn(balancer)),
+                        () -> {
+                            if (targetGroup != null) {
+                                member.deleteTargetGroup(request -> request.targetGroupArn(targetGroup));
+                            }
+                        });
+            }
+        }
     }
 
     private void replaceBackend(NetServerOptions options, Handler<NetSocket> handler) throws Exception {

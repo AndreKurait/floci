@@ -335,6 +335,9 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
     private void compact(boolean reportFailure) {
         compactionLock.writeLock().lock();
         try {
+            if (reportFailure && walFailure != null) {
+                throw new IllegalStateException("WAL recovery is required after an uncertain write", walFailure);
+            }
             if (!dirty || walFailure != null) {
                 return;
             }

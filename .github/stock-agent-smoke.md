@@ -10,6 +10,12 @@ guest through EC2. An instance role supplies credentials through IMDSv2. The
 agent uses ordinary AWS endpoint names, verified TLS and its unchanged
 `aws:softwareInventory` plugin.
 
+The script starts the Floci image with its original entrypoint, command, and
+health check. A separate pinned AWS CLI container makes signed setup and
+verification calls with local test credentials and the generated CA, so the
+Floci image does not need to contain AWS CLI. The Docker endpoint is read from
+the active Docker context and must be a local socket.
+
 Success requires the agent to register, discover a tag-targeted State Manager
 association, execute it, report success, and publish inventory containing its
 installed agent package. The driver never registers a managed node or submits
@@ -23,6 +29,12 @@ python3 .github/scripts/smoke-ssm-agent.py \
   ghcr.io/andrekurait/floci@sha256:IMAGE_DIGEST \
   ghcr.io/andrekurait/floci@sha256:HELPER_DIGEST \
   --output /tmp/stock-agent-result
+```
+
+Fast fixture checks, which need no Floci image:
+
+```sh
+python3 -B -m unittest discover -s .github/scripts -p test_smoke_ssm_agent.py
 ```
 
 The server uses an owned Docker network and its standard image launcher.

@@ -70,7 +70,8 @@ class ElbV2SharedHttpsPortTest {
         Listener listener = listener(443);
         LoadBalancer loadBalancer = new LoadBalancer();
         loadBalancer.setDnsName("alb.example.test");
-        when(plane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn())).thenReturn(loadBalancer);
+        when(plane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn())).thenReturn(loadBalancer);
         GeneratedCertificate certificate = new CertificateGenerator().generateSelfSignedCertificate(
                 "service.example.test", List.of(), KeyAlgorithm.RSA_2048);
         when(plane.certificateResolver.publishedMaterial(
@@ -135,7 +136,9 @@ class ElbV2SharedHttpsPortTest {
                     .requestHandler(request -> request.response().end("api-control"))
                     .listen().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             try (TlsProxyFixture proxy = new TlsProxyFixture(vertx, config, api.actualPort(), api.actualPort())) {
-                assertTrue(request(trust, sharedPort, "callbacks.example.test", apiCertificate).contains("api-control"));
+                ElbV2TlsReadiness.await(Duration.ofSeconds(5), () ->
+                        assertTrue(request(trust, sharedPort, "callbacks.example.test", apiCertificate)
+                                .contains("api-control")));
                 plane.vertx = vertx;
                 plane.config = config;
                 plane.tlsProxyServer = proxy.server();
@@ -144,7 +147,8 @@ class ElbV2SharedHttpsPortTest {
                 Listener listener = listener(sharedPort);
                 LoadBalancer loadBalancer = new LoadBalancer();
                 loadBalancer.setDnsName("alb.example.test");
-                when(plane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+                when(plane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                         .thenReturn(loadBalancer);
                 when(plane.certificateResolver.publishedMaterial(
                         listener.getListenerArn(), "us-west-2", listener.getCertificates().getFirst()))

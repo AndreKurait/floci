@@ -25,10 +25,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -42,6 +44,7 @@ import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -341,6 +344,196 @@ class SecurityGroupFirewallManagerTest {
         verify(lifecycle).removeIfExistsStrict("helper-a");
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void capturedCleanupPreservesAReplacementRegistration(boolean reuseHelper) {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(mock(DockerClient.class, RETURNS_DEEP_STUBS), lifecycle);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        Runnable cleanup = manager.captureUnregister("eni-a");
+        registerOrigin(manager, "eni-a", reuseHelper ? "helper-a" : "helper-b", "172.18.0.3", "vpc-b");
+
+        cleanup.run();
+        cleanup.run();
+
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-b")),
+                manager.vpcForClient("172.18.0.3"));
+        verify(lifecycle, times(reuseHelper ? 0 : 1)).removeIfExistsStrict("helper-a");
+        verify(lifecycle, never()).removeIfExistsStrict("helper-b");
+    }
+
+    @Test
+    void strictRemovalIncludesRetiredHelpersAndRetainsFailedCleanup() {
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(dockerClient, lifecycle);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        manager.retireDnsOrigins();
+        doThrow(new IllegalStateException("removal failed")).doNothing()
+                .when(lifecycle).removeIfExistsStrict("helper-a");
+
+        assertThrows(IllegalStateException.class, () -> manager.removeNamespaceStrict("eni-a"));
+        manager.removeNamespaceStrict("eni-a");
+        manager.removeNamespaceStrict("eni-a");
+
+        verify(lifecycle, times(2)).removeIfExistsStrict("helper-a");
+    }
+
+    @Test
+    void observerRetriesCleanupAfterOwningServiceUnregisterFails() {
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(dockerClient, lifecycle);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        doThrow(new IllegalStateException("removal failed")).doNothing()
+                .when(lifecycle).removeIfExistsStrict("helper-a");
+
+        assertThrows(IllegalStateException.class, () -> manager.unregister("eni-a"));
+        manager.retireDnsOrigins();
+        manager.retireDnsOrigins();
+
+        verify(lifecycle, times(2)).removeIfExistsStrict("helper-a");
+    }
+
+    @Test
+    void observerRetainsOldHelperWhenReplacementWinsTheMonitor() throws Exception {
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(dockerClient, lifecycle);
+        registerOrigin(manager, "eni-a", "helper-old", "172.18.0.2", "vpc-a");
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> retirement;
+            synchronized (manager) {
+                retirement = executor.submit(manager::retireDnsOrigins);
+                await().atMost(2, TimeUnit.SECONDS).until(() -> manager.vpcForClient("172.18.0.2").isEmpty());
+                registerOrigin(manager, "eni-a", "helper-new", "172.18.0.3", "vpc-a");
+            }
+            retirement.get(2, TimeUnit.SECONDS);
+        }
+        manager.unregister("eni-a");
+
+        verify(lifecycle).removeIfExistsStrict("helper-old");
+        verify(lifecycle).removeIfExistsStrict("helper-new");
+    }
+
+    @Test
+    void unregisterQuarantinesDepartingHelperBeforePeerFailure() {
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(dockerClient, lifecycle);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        doAnswer(ignored -> {
+            verify(dockerClient).copyArchiveToContainerCmd("helper-a");
+            throw new IllegalStateException("peer failure");
+        }).when(manager).reconcileAll();
+
+        assertThrows(IllegalStateException.class, () -> manager.unregister("eni-a"));
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+    }
+
+    @Test
+    void replacementRetainsOldHelperWithoutObserverInterleaving() {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(mock(DockerClient.class, RETURNS_DEEP_STUBS), lifecycle);
+        registerOrigin(manager, "eni-a", "helper-old", "172.18.0.2", "vpc-a");
+        registerOrigin(manager, "eni-a", "helper-new", "172.18.0.3", "vpc-a");
+
+        manager.unregister("eni-a");
+
+        verify(lifecycle).removeIfExistsStrict("helper-old");
+        verify(lifecycle).removeIfExistsStrict("helper-new");
+    }
+
+    @Test
+    void observerRetriesRequestedRemovalDespitePeerPolicyFailure() {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(mock(DockerClient.class, RETURNS_DEEP_STUBS), lifecycle);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        doThrow(new IllegalStateException("peer failure")).when(manager).reconcileAll();
+        assertThrows(IllegalStateException.class, () -> manager.unregister("eni-a"));
+
+        assertThrows(IllegalStateException.class, manager::retireDnsOrigins);
+
+        verify(lifecycle).removeIfExistsStrict("helper-a");
+    }
+
+    @Test
+    void removalRejectsHelperReadmissionWithoutBlockingAnotherNamespace() throws Exception {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(mock(DockerClient.class, RETURNS_DEEP_STUBS), lifecycle);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        CountDownLatch removing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(ignored -> {
+            removing.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("helper-a");
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> removal = executor.submit(() -> manager.unregister("eni-a"));
+            try {
+                assertTrue(removing.await(5, TimeUnit.SECONDS));
+                executor.submit(() -> registerOrigin(manager, "eni-b", "helper-b", "172.18.0.3", "vpc-b"))
+                        .get(2, TimeUnit.SECONDS);
+                executor.submit(() -> assertThrows(IllegalStateException.class,
+                        () -> registerOrigin(manager, "eni-c", "helper-a", "172.18.0.4", "vpc-c")))
+                        .get(2, TimeUnit.SECONDS);
+                assertTrue(manager.vpcForClient("172.18.0.4").isEmpty());
+            } finally {
+                release.countDown();
+                removal.get(5, TimeUnit.SECONDS);
+            }
+        }
+        verify(lifecycle).removeIfExistsStrict("helper-a");
+        assertTrue(manager.vpcForClient("172.18.0.3").isPresent());
+    }
+
+    @Test
+    void concurrentStrictRemovalWaitsForTheExistingCleanup() throws Exception {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager manager = cleanupManager(mock(DockerClient.class, RETURNS_DEEP_STUBS), lifecycle);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        CountDownLatch removing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch secondCaller = new CountDownLatch(1);
+        doAnswer(ignored -> {
+            removing.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("helper-a");
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> first = executor.submit(() -> manager.removeNamespaceStrict("eni-a"));
+            Future<?> second = null;
+            try {
+                assertTrue(removing.await(5, TimeUnit.SECONDS));
+                second = executor.submit(() -> {
+                    secondCaller.countDown();
+                    manager.removeNamespaceStrict("eni-a");
+                });
+                assertTrue(secondCaller.await(5, TimeUnit.SECONDS));
+                Future<?> waiting = second;
+                assertThrows(TimeoutException.class, () -> waiting.get(100, TimeUnit.MILLISECONDS));
+            } finally {
+                release.countDown();
+                first.get(5, TimeUnit.SECONDS);
+                if (second != null) {
+                    second.get(5, TimeUnit.SECONDS);
+                }
+            }
+        }
+        verify(lifecycle).removeIfExistsStrict("helper-a");
+    }
+
+    private static SecurityGroupFirewallManager cleanupManager(DockerClient dockerClient,
+                                                               ContainerLifecycleManager lifecycle) {
+        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(dockerClient,
+                mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
+                mock(EmbeddedDnsServer.class)));
+        doNothing().when(manager).reconcileAll();
+        doNothing().when(manager).admit(anyString(), anyBoolean());
+        return manager;
+    }
+
     @Test
     void emptyDnsRegistryDoesNotQueryDocker() {
         DockerClient dockerClient = mock(DockerClient.class);
@@ -403,6 +596,65 @@ class SecurityGroupFirewallManagerTest {
                 replacement.vpcId(), "eni-replacement", "10.0.1.10", "172.18.0.2", Set.of(), List.of()),
                 "helper-replacement", Map.of());
         assertEquals(Optional.of(replacement), origins.vpcForClient("172.18.0.2"));
+    }
+
+    @Test
+    void failedRegistrationRestoresThePreviousDnsScope() {
+        SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class));
+        doNothing().when(manager).refreshPeers();
+        registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.2", "vpc-a");
+        doThrow(new IllegalStateException("admission failed")).when(manager).admit(anyString(), anyBoolean());
+
+        assertThrows(IllegalStateException.class,
+                () -> registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.3", "vpc-b"));
+
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a")),
+                manager.vpcForClient("172.18.0.2"));
+        assertTrue(manager.vpcForClient("172.18.0.3").isEmpty());
+    }
+
+    @Test
+    void reconciliationRemovesOriginsOfStoppedHelpers() {
+        SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class, RETURNS_DEEP_STUBS));
+        registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.2", "vpc-a");
+        doCallRealMethod().when(manager).reconcileAll();
+
+        manager.reconcileAll();
+
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+    }
+
+    @Test
+    void pendingReplacementDoesNotExposeUncommittedDnsOrigin() throws Exception {
+        SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class));
+        registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.2", "vpc-a");
+        CountDownLatch admitting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            admitting.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return null;
+        }).when(manager).admit(anyString(), anyBoolean());
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> replacement = executor.submit(
+                    () -> registerOrigin(manager, "eni-0", "helper-eni-0", "172.18.0.3", "vpc-b"));
+            try {
+                assertTrue(admitting.await(5, TimeUnit.SECONDS));
+                Future<?> lookup = executor.submit(() -> {
+                    assertTrue(manager.vpcForClient("172.18.0.3").isEmpty());
+                    assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc(
+                                    "111111111111", "us-east-1", "vpc-a")),
+                            manager.vpcForClient("172.18.0.2"));
+                });
+                lookup.get(1, TimeUnit.SECONDS);
+            } finally {
+                release.countDown();
+                replacement.get(5, TimeUnit.SECONDS);
+            }
+        }
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-b")),
+                manager.vpcForClient("172.18.0.3"));
     }
 
     @Test

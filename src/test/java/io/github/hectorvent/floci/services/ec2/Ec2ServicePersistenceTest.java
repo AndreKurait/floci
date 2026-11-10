@@ -288,6 +288,60 @@ class Ec2ServicePersistenceTest {
         assertEquals("stopped", persistedInstance(dir, launch.instance()).getState().getName());
     }
 
+    @Test
+    void retainedInterfaceAddressInstanceSurvivesRestart(@TempDir Path dir) {
+        Ec2Service service = newMockModeService(dir);
+        String subnet = service.createSubnet(REGION, service.createVpc(REGION, "10.235.0.0/24", false).getVpcId(),
+                "10.235.0.0/24", REGION + "a").getSubnetId();
+        String networkInterface = service.createNetworkInterface(REGION, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        Instance first = service.runInstances(REGION, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, networkInterface, 0).getInstances().getFirst();
+        Address address = service.allocateAddress(REGION);
+        service.associateAddress(REGION, address.getAllocationId(), first.getInstanceId());
+        String association = address.getAssociationId();
+        service.terminateInstances(REGION, List.of(first.getInstanceId()));
+        assertNull(newMockModeService(dir).describeAddresses(REGION, List.of(address.getAllocationId()), Map.of())
+                .getFirst().getInstanceId());
+        Instance second = service.runInstances(REGION, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, networkInterface, 0).getInstances().getFirst();
+
+        Ec2Service restarted = newMockModeService(dir);
+        Address restored = restarted.describeAddresses(REGION, List.of(address.getAllocationId()), Map.of())
+                .getFirst();
+        assertEquals(second.getInstanceId(), restored.getInstanceId());
+        assertEquals(association, restored.getAssociationId());
+        assertEquals(networkInterface, restored.getNetworkInterfaceId());
+        assertTrue(restarted.describeAddresses(REGION, List.of(address.getAllocationId()),
+                Map.of("instance-id", List.of(first.getInstanceId()))).isEmpty());
+    }
+
+    @Test
+    void deadHostAddressReconciliationSurvivesRestart(@TempDir Path dir) throws IOException {
+        Ec2Service service = newMockModeService(dir);
+        String subnet = service.createSubnet(REGION, service.createVpc(REGION, "10.232.0.0/24", false).getVpcId(),
+                "10.232.0.0/24", REGION + "a").getSubnetId();
+        String networkInterface = service.createNetworkInterface(REGION, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        Instance host = service.runInstances(REGION, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, networkInterface, 0).getInstances().getFirst();
+        Address address = service.allocateAddress(REGION);
+        service.associateAddress(REGION, address.getAllocationId(), host.getInstanceId());
+        String association = address.getAssociationId();
+        // Reconcile the asynchronous terminal state, then reopen the persisted address store.
+        host.setState(InstanceState.terminated());
+        assertNull(service.describeNetworkInterfaces(REGION, List.of(networkInterface), Map.of(), 0, null)
+                .networkInterfaces().getFirst().getAttachment());
+        Address persisted = newMockModeService(dir).describeAddresses(REGION, List.of(address.getAllocationId()), Map.of())
+                .getFirst();
+        assertNull(persisted.getInstanceId());
+        assertEquals(association, persisted.getAssociationId());
+        assertEquals(networkInterface, persisted.getNetworkInterfaceId());
+    }
+
     private PendingContainerLaunch pendingContainerLaunch(Path dir) {
         Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
         AtomicReference<Runnable> completion = new AtomicReference<>();
@@ -1288,15 +1342,27 @@ class Ec2ServicePersistenceTest {
         return newService(dir, containers, instances, mock(Ec2PortForwardManager.class));
     }
 
+    /** Mock mode with a container manager present, for paths that ask it for a reachable address. */
+    private Ec2Service newMockModeService(Path dir) {
+        return newService(dir, mock(Ec2ContainerManager.class),
+                load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {}),
+                mock(Ec2PortForwardManager.class), true);
+    }
+
     private Ec2Service newService(Path dir, Ec2ContainerManager containers, StorageBackend<String, Instance> instances,
                                  Ec2PortForwardManager ports) {
+        return newService(dir, containers, instances, ports, containers == null);
+    }
+
+    private Ec2Service newService(Path dir, Ec2ContainerManager containers, StorageBackend<String, Instance> instances,
+                                 Ec2PortForwardManager ports, boolean mockMode) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
-        when(ec2.mock()).thenReturn(containers == null);
+        when(ec2.mock()).thenReturn(mockMode);
         when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
         Ec2ImageCatalog imageCatalog = new Ec2ImageCatalog();
         return new Ec2Service(config, containers, ports,

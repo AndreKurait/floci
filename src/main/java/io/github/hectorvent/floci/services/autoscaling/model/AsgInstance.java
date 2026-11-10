@@ -28,6 +28,8 @@ public class AsgInstance {
     // into or out of standby; null otherwise, and for members stored before standby was supported.
     private String standbyActivityId;
     private String terminationActivityId;
+    // An attached instance stays Pending until its load-balancer registration succeeds.
+    private boolean pendingAttachment;
     private Map<String, LaunchLifecycleAction> launchLifecycleActions = new LinkedHashMap<>();
 
     public AsgInstance() {}
@@ -70,6 +72,9 @@ public class AsgInstance {
 
     public String getTerminationActivityId() { return terminationActivityId; }
     public void setTerminationActivityId(String v) { this.terminationActivityId = v; }
+
+    public boolean isPendingAttachment() { return pendingAttachment; }
+    public void setPendingAttachment(boolean v) { this.pendingAttachment = v; }
 
     public Map<String, LaunchLifecycleAction> getLaunchLifecycleActions() { return launchLifecycleActions; }
     public void setLaunchLifecycleActions(Map<String, LaunchLifecycleAction> v) {

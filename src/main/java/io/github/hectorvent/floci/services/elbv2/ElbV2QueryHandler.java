@@ -245,12 +245,14 @@ public class ElbV2QueryHandler {
         if (arns == null || arns.size() != 1) {
             throw new AwsException("ValidationError", "Exactly one LoadBalancerArn must be specified.", 400);
         }
-        String status = service.describeProvisionedCapacity(region, arns.get(0));
+        ElbV2Service.ProvisionedCapacity capacity = service.describeProvisionedCapacity(region, arns.get(0));
         String xml = new XmlBuilder()
                 .start("DescribeProvisionedCapacityResponse", AwsNamespaces.ELB_V2)
                 .start("DescribeProvisionedCapacityResult")
                   .start("ProvisionedCapacity")
-                    .elem("Status", status)
+                    .elem("MinimumLBCapacityUnits", capacity.minimumLBCapacityUnits())
+                    .elem("Status", capacity.status())
+                    .elem("DecreasesRemaining", capacity.decreasesRemaining())
                   .end("ProvisionedCapacity")
                 .end("DescribeProvisionedCapacityResult")
                 .raw(AwsQueryResponse.responseMetadata())

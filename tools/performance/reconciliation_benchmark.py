@@ -37,15 +37,25 @@ def until(predicate, timeout=90):
 
 
 def asg_sample(endpoint):
-    asg = client("autoscaling", endpoint)
-    ec2 = client("ec2", endpoint)
     name = "wake-bench-" + uuid.uuid4().hex[:12]
     instance_ids = []
-    try:
+    with contextlib.ExitStack() as cleanup:
+        asg = cleanup.enter_context(contextlib.closing(client("autoscaling", endpoint)))
+        ec2 = cleanup.enter_context(contextlib.closing(client("ec2", endpoint)))
         asg.create_launch_configuration(LaunchConfigurationName=name, ImageId="ami-amazonlinux2023",
                                         InstanceType="t3.micro")
+        cleanup.callback(asg.delete_launch_configuration, LaunchConfigurationName=name)
         asg.create_auto_scaling_group(AutoScalingGroupName=name, LaunchConfigurationName=name,
                                       MinSize=0, MaxSize=1, DesiredCapacity=0, AvailabilityZones=["us-east-1a"])
+
+        def await_termination():
+            if instance_ids:
+                until(lambda: all(i["State"]["Name"] == "terminated"
+                                  for reservation in ec2.describe_instances(InstanceIds=instance_ids)["Reservations"]
+                                  for i in reservation["Instances"]))
+
+        cleanup.callback(await_termination)
+        cleanup.callback(asg.delete_auto_scaling_group, AutoScalingGroupName=name, ForceDelete=True)
         start = time.monotonic()
         asg.set_desired_capacity(AutoScalingGroupName=name, DesiredCapacity=1)
         api_seconds = time.monotonic() - start
@@ -58,56 +68,43 @@ def asg_sample(endpoint):
 
         until(completed)
         return {"api_seconds": api_seconds, "in_service_seconds": time.monotonic() - start}
-    finally:
-        asg.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
-        asg.delete_launch_configuration(LaunchConfigurationName=name)
-        if instance_ids:
-            until(lambda: all(i["State"]["Name"] == "terminated"
-                              for r in ec2.describe_instances(InstanceIds=instance_ids)["Reservations"]
-                              for i in r["Instances"]))
 
 
 @contextlib.contextmanager
 def targets(count, delay):
     servers = []
-    threads = []
-    for index in range(count):
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                time.sleep(delay)
-                self.send_response(200)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                with self.server.result_lock:
-                    self.server.first_completed = self.server.first_completed or time.monotonic()
-                    self.server.requests += 1
+    with contextlib.ExitStack() as cleanup:
+        for index in range(count):
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    time.sleep(delay)
+                    self.send_response(200)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    with self.server.result_lock:
+                        self.server.first_completed = self.server.first_completed or time.monotonic()
+                        self.server.requests += 1
 
-            def log_message(self, *_):
-                pass
+                def log_message(self, *_):
+                    pass
 
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        server.daemon_threads = True
-        server.result_lock = threading.Lock()
-        server.first_completed = None
-        server.requests = 0
-        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
-        thread.start()
-        servers.append(server)
-        threads.append(thread)
-    try:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            cleanup.callback(server.server_close)
+            server.daemon_threads = True
+            server.result_lock = threading.Lock()
+            server.first_completed = None
+            server.requests = 0
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            servers.append(server)
+            cleanup.callback(thread.join, 2)
+            cleanup.callback(server.shutdown)
         yield servers
-    finally:
-        for server in servers:
-            server.shutdown()
-            server.server_close()
-        for thread in threads:
-            thread.join(2)
 
 
 def health_sample(endpoint, count, delay):
-    elb = client("elbv2", endpoint)
     name = "health-bench-" + uuid.uuid4().hex[:12]
-    with targets(count, delay) as servers:
+    with contextlib.closing(client("elbv2", endpoint)) as elb, targets(count, delay) as servers:
         group = elb.create_target_group(Name=name, Protocol="HTTP", Port=80, VpcId="vpc-benchmark",
                                         TargetType="ip", HealthCheckEnabled=True, HealthCheckIntervalSeconds=5,
                                         HealthCheckTimeoutSeconds=2, HealthyThresholdCount=2,
@@ -151,8 +148,10 @@ def main():
               "scope": "warm JVM; mock EC2 ASG coordination; real loopback HTTP probes; not a fleet lifecycle",
               "host_load_start": os.getloadavg(), "asg": [], "health": []}
     # Warm protocol parsing and SDK transport without creating workloads.
-    client("autoscaling", args.endpoint).describe_auto_scaling_groups()
-    client("elbv2", args.endpoint).describe_target_groups()
+    with contextlib.closing(client("autoscaling", args.endpoint)) as asg:
+        asg.describe_auto_scaling_groups()
+    with contextlib.closing(client("elbv2", args.endpoint)) as elb:
+        elb.describe_target_groups()
     for index in range(args.runs):
         for kind, sample in [("asg", lambda: asg_sample(args.endpoint)),
                              ("health", lambda: health_sample(args.endpoint, args.targets, args.delay))]:

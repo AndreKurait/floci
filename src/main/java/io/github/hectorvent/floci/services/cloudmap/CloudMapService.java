@@ -495,6 +495,27 @@ public class CloudMapService {
         return resolveDnsNameIfOwned(queryName, type, dnsNamespacesByLongestName());
     }
 
+    public Optional<DnsAnswer> resolvePublicDnsNameIfOwned(String queryName, int type, ClientVpc origin) {
+        if (route53Service.isCoveredByPrivateZone(queryName, origin)) {
+            return Optional.empty();
+        }
+        String recordType = switch (type) {
+            case 1 -> "A";
+            case 28 -> "AAAA";
+            case 33 -> "SRV";
+            default -> null;
+        };
+        Optional<String> zone = route53Service.publicDnsRegistrationZoneId(queryName, recordType);
+        if (zone.isEmpty()) {
+            return Optional.empty();
+        }
+        List<Namespace> namespaces = dnsNamespacesByLongestName().stream()
+                .filter(namespace -> "DNS_PUBLIC".equals(namespace.getType())
+                        && zone.orElseThrow().equals(namespace.getHostedZoneId()))
+                .toList();
+        return resolveDnsNameIfOwned(queryName, type, namespaces);
+    }
+
     public Optional<DnsAnswer> resolveDnsNameIfOwned(String queryName, int type, ClientVpc origin) {
         Set<String> privateZones = route53Service.privateDnsZoneIds(queryName, origin);
         List<Namespace> visible = dnsNamespacesByLongestName().stream()

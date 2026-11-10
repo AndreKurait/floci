@@ -427,22 +427,15 @@ requests use the account and region in their credential scope.
 
 Use `Version=2010-08-01` for current GET operations. Omitting the version selects the
 legacy `2009-05-15` API, which supports only `ListMetrics` and `GetMetricStatistics`.
-An invalid version or action returns HTTP 404 `InvalidAction`; an absent action returns
+`Version=2013-01-16` supports `ListMetrics`, `GetMetricStatistics` and `DescribeAlarms`
+over GET and POST, using the requested version's XML namespace and the shared input
+members listed below, with the same storage, account/region scope and IAM checks as the
+current API. Unimplemented legacy operations such as `PutMetricAlarm`, `DeleteAlarms` and
+`GetMetricData`, other input members and alarm listings containing metric-math definitions
+return HTTP 400 `UnsupportedOperation` rather than running the current operation.
+An invalid version or action, including an action outside the 2013 model such as metric
+streams and resource tags, returns HTTP 404 `InvalidAction`; an absent action returns
 HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
-
-Query clients using `Version=2013-01-16` route the common modeled operations through the
-same handlers as the current API, for both GET and POST. Implemented common operations
-include `ListMetrics`, `GetMetricStatistics`, `PutMetricAlarm`, `DescribeAlarms`,
-`DescribeAlarmHistory` and `DeleteAlarms`, with the same storage, account/region scope
-and IAM checks. Successful responses use the requested 2013 XML namespace.
-
-This is not complete legacy-version compatibility. Its `GetMetricData` input uses
-`Defaults` and `Metrics` instead of the current `MetricDataQueries` shape, so legacy
-JSON and Query requests return `UnsupportedOperation` rather than running the modern
-operation. The 2013 Query route rejects operations outside that version's model,
-including metric streams and resource tags. Unknown Query versions or operation
-names remain invalid. The console JSON target has the narrower operation and member
-rules described below.
 
 JSON `PutMetricData` accepts a gzip-compressed body (`Content-Encoding: gzip`), which the AWS
 CLI, boto3 and the other SDKs that call CloudWatch over JSON send by default for any body of
@@ -462,9 +455,12 @@ four operations on the same metrics and alarms, with these request members: `Lis
 (`Namespace`, `MetricName`, `Dimensions`, `NextToken`), `DescribeAlarms` (`AlarmNames`,
 `AlarmNamePrefix`, `MaxRecords`, `NextToken`), `GetMetricStatistics` (`Namespace`, `MetricName`,
 `Dimensions`, `StartTime`, `EndTime`, `Period`, `Statistics`, `Unit`) and `DeleteAlarms`
-(`AlarmNames`). Every result comes back at once, so `MaxRecords` and `NextToken` change nothing.
-It returns HTTP 400 `UnsupportedOperation` for every other operation, such as the console's
-`GetMetricData` with `Defaults` and `Metrics`; for a request that sets any other member, such as
+(`AlarmNames`). `ListMetrics` supports `NextToken`; `DescribeAlarms` returns every result
+at once, so its `MaxRecords` and `NextToken` change nothing.
+Unknown legacy operation names return HTTP 404 `UnknownOperationException` before
+body parsing. Recognized operations outside the supported set return HTTP 400
+`UnsupportedOperation`, including the console's `GetMetricData` with `Defaults` and
+`Metrics`. Supported operations also return that error for a request that sets any other member, such as
 `StateValue`, `ExtendedStatistics` or the console's `CountOnlyRequest`, to a value other than
 `false` or `null`; and for a `DescribeAlarms` answer that would list an alarm defined with
 `Metrics`, whose items the console's API shapes differently. Such an alarm makes every listing

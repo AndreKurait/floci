@@ -752,11 +752,17 @@ public class ElbV2DataPlane {
             return;
         }
         RoutedListener listener = routing.listeners().values().iterator().next();
+        RequestScopes.runAs(AwsArnUtils.parse(listener.arn()).accountId(), listener.region(),
+                () -> dispatchTcpConnection(socket, listener));
+    }
+
+    private void dispatchTcpConnection(NetSocket socket, RoutedListener listener) {
         Action action = listener.chain().stream().map(rule -> rule.action)
                 .filter(candidate -> candidate != null && "forward".equals(candidate.getType()))
                 .findFirst().orElse(null);
         String tgArn = action == null ? null : resolveTgArn(action);
-        TargetGroup tg = tgArn == null ? null : elbV2Service.getTargetGroup(listener.region(), tgArn);
+        TargetGroup tg = tgArn == null ? null
+                : elbV2Service.getTargetGroupForListener(listener.region(), listener.arn(), tgArn);
         if (tg == null || "lambda".equals(tg.getTargetType())) {
             socket.close();
             return;
@@ -865,7 +871,8 @@ public class ElbV2DataPlane {
     }
 
     private ListenerBinding binding(Listener listener, String region) {
-        LoadBalancer loadBalancer = elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn());
+        LoadBalancer loadBalancer = elbV2Service.getLoadBalancerForListener(
+                region, listener.getListenerArn(), listener.getLoadBalancerArn());
         String host = loadBalancer != null ? normalizeHost(loadBalancer.getDnsName()) : listener.getLoadBalancerArn();
         boolean secure = "HTTPS".equalsIgnoreCase(listener.getProtocol());
         Set<String> hosts = new LinkedHashSet<>();
@@ -1072,7 +1079,7 @@ public class ElbV2DataPlane {
     }
 
     private record RoutedListener(String arn, String region, String canonicalHostedZoneId,
-                                  List<CompiledRule> chain, Set<String> certificateHosts) {}
+                                  List<CompiledRule> chain, Set<String> certificateHosts, boolean http) {}
 
     private record RoutingView(Map<String, String> hosts, Map<String, RoutedListener> listeners) {}
 
@@ -1086,7 +1093,7 @@ public class ElbV2DataPlane {
             String region = listenerRegions.get(arn);
             if (binding != null && binding.port() == port && chain != null && region != null) {
                 routes.put(arn, new RoutedListener(arn, region, binding.canonicalHostedZoneId(),
-                        chain.get(), binding.certificateHosts()));
+                        chain.get(), binding.certificateHosts(), !binding.secure() && !binding.tcp()));
             }
         }
         state.routing = new RoutingView(Map.copyOf(hosts), Map.copyOf(routes));
@@ -1141,16 +1148,20 @@ public class ElbV2DataPlane {
             context.next();
             return;
         }
-        int port = authority.getPort() > 0 ? authority.getPort() : context.request().isSSL() ? 443 : 80;
+        int port = authority.getPort() != -1 ? authority.getPort() : context.request().isSSL() ? 443 : 80;
         PortState state = portStates.get(port);
         RoutingView routing = state == null ? null : state.routing;
         String host = normalizeHost(authority.getHost());
         RoutedListener listener = null;
         if (routing != null) {
             String direct = routing.hosts().get(host);
+            if (direct == null && RequestHost.isEmulatorHost(host, config)) {
+                context.next();
+                return;
+            }
             listener = direct == null ? resolveAlias(routing, publicAlias(host)) : routing.listeners().get(direct);
         }
-        if (listener == null) {
+        if (listener == null || !listener.http()) {
             context.next();
             return;
         }
@@ -1162,7 +1173,7 @@ public class ElbV2DataPlane {
     }
 
     private RoutedListener resolveAlias(RoutingView routing, Route53Service.PublicAlias alias) {
-        if (alias == null) {
+        if (alias == null || alias.dnsName() == null) {
             return null;
         }
         String target = normalizeHost(alias.dnsName());
@@ -1250,7 +1261,7 @@ public class ElbV2DataPlane {
             req.response().setStatusCode(502).end("No target group");
             return;
         }
-        TargetGroup tg = elbV2Service.getTargetGroup(region, tgArn);
+        TargetGroup tg = elbV2Service.getTargetGroupForListener(region, listenerArn, tgArn);
         if (tg == null) {
             req.response().setStatusCode(502).end("Target group not found");
             return;
@@ -1320,7 +1331,7 @@ public class ElbV2DataPlane {
         if (binding == null) {
             return null;
         }
-        LoadBalancer loadBalancer = elbV2Service.getLoadBalancer(region, binding.loadBalancerArn());
+        LoadBalancer loadBalancer = elbV2Service.getLoadBalancerForListener(region, listenerArn, binding.loadBalancerArn());
         if (loadBalancer == null || loadBalancer.getAttributes() == null) {
             return null;
         }
@@ -1345,7 +1356,7 @@ public class ElbV2DataPlane {
     }
 
     private String listenerAttribute(String listenerArn, String region, String key) {
-        Listener listener = elbV2Service.getListener(region, listenerArn);
+        Listener listener = elbV2Service.getDataPlaneListener(region, listenerArn);
         if (listener == null || listener.getAttributes() == null) {
             return null;
         }
@@ -1353,8 +1364,9 @@ public class ElbV2DataPlane {
     }
 
     long tcpIdleTimeoutMillis(String listenerArn, String region) {
-        return parseTimeoutMillis(listenerAttribute(listenerArn, region, TCP_IDLE_TIMEOUT_ATTRIBUTE),
-                TCP_IDLE_TIMEOUT_ATTRIBUTE, TCP_IDLE_TIMEOUT_SECONDS);
+        return RequestScopes.callAs(AwsArnUtils.parse(listenerArn).accountId(), region,
+                () -> parseTimeoutMillis(listenerAttribute(listenerArn, region, TCP_IDLE_TIMEOUT_ATTRIBUTE),
+                        TCP_IDLE_TIMEOUT_ATTRIBUTE, TCP_IDLE_TIMEOUT_SECONDS));
     }
 
     /** Healthy targets, falling back to all registered ones; null when none are registered at all. */
@@ -1978,11 +1990,7 @@ public class ElbV2DataPlane {
                     List<String> patterns = condition.getHostHeaderValues().isEmpty()
                             ? condition.getValues()
                             : condition.getHostHeaderValues();
-                    String host = req.host();
-                    if (host != null && host.contains(":")) {
-                        host = host.substring(0, host.indexOf(':'));
-                    }
-                    String effectiveHost = host;
+                    String effectiveHost = normalizeHost(req.host());
                     yield patterns.stream().anyMatch(p -> globMatches(p, effectiveHost));
                 }
                 case "path-pattern" -> {

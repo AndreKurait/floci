@@ -54,12 +54,38 @@ class IamPrincipalTagsServiceTest {
         IamRole role = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
         iam.tagRole("Worker", Map.of("department", "engineering"));
         iam.registerSession("ASIASESSION", "secret", "token", role.getArn(), NOW.plusSeconds(3600), null,
-                ACCOUNT, "worker", "AROAID:worker");
+                ACCOUNT, "worker", role.getRoleId() + ":worker");
         assertEquals(List.of("engineering"), context("ASIASESSION").get("aws:PrincipalTag/department"));
         assertEquals(List.of(role.getArn()), context("ASIASESSION").get("aws:PrincipalArn"));
         assertEquals(List.of(NOW.toString()), context("ASIASESSION").get("aws:TokenIssueTime"));
         iam.untagRole("Worker", List.of("department"));
         assertFalse(context("ASIASESSION").containsKey("aws:PrincipalTag/department"));
+    }
+
+    @Test
+    void recreatedRoleDoesNotSupplyTagsToTheOriginalSession() {
+        IamRole original = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        iam.tagRole("Worker", Map.of("department", "engineering"));
+        iam.registerSession("ASIAOLD", "secret", "token", original.getArn(), NOW.plusSeconds(3600), null,
+                ACCOUNT, "worker", original.getRoleId() + ":worker");
+        assertEquals(List.of("engineering"), context("ASIAOLD").get("aws:PrincipalTag/department"));
+        iam.deleteRole("Worker");
+        IamRole replacement = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        assertEquals(original.getArn(), replacement.getArn());
+        assertNotEquals(original.getRoleId(), replacement.getRoleId());
+        iam.tagRole("Worker", Map.of("department", "security"));
+        assertFalse(context("ASIAOLD").containsKey("aws:PrincipalTag/department"));
+        iam.registerSession("ASIANEW", "secret", "token", replacement.getArn(), NOW.plusSeconds(3600), null,
+                ACCOUNT, "replacement", replacement.getRoleId() + ":replacement");
+        assertEquals(List.of("security"), context("ASIANEW").get("aws:PrincipalTag/department"));
+    }
+
+    @Test
+    void aSessionWithoutRecordedRoleIdentityDoesNotSupplyTags() {
+        IamRole role = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        iam.tagRole("Worker", Map.of("department", "engineering"));
+        iam.registerSession("ASIALEGACY", role.getArn(), NOW.plusSeconds(3600));
+        assertFalse(context("ASIALEGACY").containsKey("aws:PrincipalTag/department"));
     }
 
     @Test
@@ -78,13 +104,35 @@ class IamPrincipalTagsServiceTest {
     }
 
     @Test
-    void rootAndFederatedUserDoNotInheritIssuerTags() {
+    void federatedUserKeepsIssuerTagsWithoutBecomingTheIssuer() {
         iam.createUser("alice", "/");
         String key = iam.createAccessKey("alice").getAccessKeyId();
         iam.tagUser("alice", Map.of("department", "engineering"));
-        iam.registerIssuedSession("ASIAFED", "secret", "token", "arn:aws:sts::" + ACCOUNT + ":federated-user/fed",
+        String federatedArn = "arn:aws:sts::" + ACCOUNT + ":federated-user/fed";
+        iam.registerIssuedSession("ASIAFED", "secret", "token", federatedArn,
                 NOW.plusSeconds(3600), null, ACCOUNT, key);
+        IamService.CallerArns before = iam.resolveCallerArns("ASIAFED").orElseThrow();
+        assertEquals(List.of("engineering"), context(before).get("aws:PrincipalTag/department"));
+        assertEquals(List.of(federatedArn), context(before).get("aws:PrincipalArn"));
+        assertEquals(List.of("FederatedUser"), context(before).get("aws:PrincipalType"));
+        assertEquals(List.of(ACCOUNT + ":fed"), context(before).get("aws:userid"));
+        assertEquals(List.of(NOW.toString()), context(before).get("aws:TokenIssueTime"));
+        assertFalse(context(before).containsKey("aws:username"));
+        iam.tagUser("alice", Map.of("department", "security"));
+        assertEquals(List.of("security"), context("ASIAFED").get("aws:PrincipalTag/department"));
+        assertEquals(List.of("engineering"), context(before).get("aws:PrincipalTag/department"));
+        iam.untagUser("alice", List.of("department"));
         assertFalse(context("ASIAFED").containsKey("aws:PrincipalTag/department"));
+    }
+
+    @Test
+    void rootAndRootIssuedFederationDoNotAcquireUserTags() {
+        iam.createUser("alice", "/");
+        iam.tagUser("alice", Map.of("department", "engineering"));
+        iam.registerIssuedSession("ASIAROOTFED", "secret", "token",
+                "arn:aws:sts::" + ACCOUNT + ":federated-user/root",
+                NOW.plusSeconds(3600), null, ACCOUNT, "test");
+        assertTrue(iam.resolveCallerArns("ASIAROOTFED").orElseThrow().principalTags().isEmpty());
         assertTrue(IamService.CallerArns.accountRoot("arn:aws:iam::" + ACCOUNT + ":root", ACCOUNT).principalTags().isEmpty());
     }
 

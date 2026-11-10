@@ -5989,7 +5989,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             String federatedArn = session.getRoleArn();
             return Optional.of(new CallerArns(federatedArn, federatedArn,
                     CallerArns.TYPE_FEDERATED_USER,
-                    sessionUserId(session).orElse(null), null));
+                    sessionUserId(session).orElse(null), null)
+                    .withPrincipalTags(issuingUser(session).map(IamUser::getTags).orElse(Map.of())));
         }
         String roleArn = session.getRoleArn();
         if (roleArn == null) {
@@ -6029,8 +6030,19 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 sessionUserId(session).orElse(null), null,
                 role != null && role.getPermissionsBoundaryArn() != null)
                 .withPrincipalTags(StsSessionTags.effective(
-                        role == null || !roleArnMatches(roleArn, role) ? Map.of() : role.getTags(),
+                        sessionRoleMatches(session, role) ? role.getTags() : Map.of(),
                         session.getSessionTags())));
+    }
+
+    private static boolean sessionRoleMatches(SessionCredential session, IamRole role) {
+        if (role == null || role.getRoleId() == null || !roleArnMatches(session.getRoleArn(), role)) {
+            return false;
+        }
+        String assumedRoleId = session.getAssumedRoleId();
+        if (assumedRoleId != null) {
+            return assumedRoleId.startsWith(role.getRoleId() + ":");
+        }
+        return role.getRoleId().equals(session.getEc2RoleId());
     }
 
     /**

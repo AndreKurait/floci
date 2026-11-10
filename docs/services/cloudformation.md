@@ -18,13 +18,15 @@ both value types in the [Mappings syntax](https://docs.aws.amazon.com/AWSCloudFo
 ## EC2 instance network placement
 
 `AWS::EC2::Instance` uses the resolved `NetworkInterfaces` entry with `DeviceIndex`
-`0` for its subnet and launch-time `AssociatePublicIpAddress` setting. Changing
-that subnet replaces the instance. As specified by the
+`0` for its subnet, `GroupSet` security groups and launch-time
+`AssociatePublicIpAddress` setting. Changing or removing the resolved primary
+interface replaces the instance, including changes supplied through parameters.
+The prior declaration is restored on rollback. As specified by the
 [CloudFormation instance contract](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ec2-instance.html#cfn-ec2-instance-subnetid),
-declare `SubnetId` inside the interface when using `NetworkInterfaces`; combining
-interfaces with an instance-level `SubnetId` is rejected. Existing ENI attachment,
-secondary-interface provisioning and replacement for other interface settings
-remain outside this implementation.
+declare the subnet and security groups inside the interface when using
+`NetworkInterfaces`; combining interfaces with instance-level `SubnetId`,
+`SecurityGroupIds` or `SecurityGroups` is rejected. Existing ENI attachment and
+secondary-interface provisioning remain outside this implementation.
 
 ## EC2 security group rule updates
 
@@ -42,6 +44,14 @@ cleanup removes that parameter and the key. Imported public keys create no priva
 parameter. `Ref`, `KeyPairId`, and `KeyFingerprint` report the backing EC2 identity.
 Failed follow-up writes keep created keys and parameters tracked for cleanup retries;
 parameters that already existed remain outside the stack's ownership.
+
+Stack deletion, replacement cleanup and rollback use the recorded `KeyPairId`. A key created
+outside the stack under a reused name remains untouched. Generated keys lose only their owned
+`/ec2/keypair/{KeyPairId}` parameter; imported keys do not own a private-key parameter.
+Pending cleanup preserves the key identity and parameter ownership across retries and reloads.
+Exhausting one cleanup entry does not discard another entry that still has attempts remaining.
+Cloud Control and legacy records without a key ID retain name-based deletion.
+
 Generated Ed25519 keys and PPK output are currently rejected before any resource is
 created. The CloudFormation strict unsupported-resource policy remains enabled by
 callers that require it.

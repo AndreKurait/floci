@@ -90,6 +90,10 @@ receivers, including internal redrive delivery and visibility changes. A notific
 between an empty scan and parking is retained. Nonempty queues retain periodic
 checks for visibility and retention expiry. Deletion, reset and shutdown wake old
 receivers; they cannot claim messages from a replacement queue.
+Reset also fences message-store writes across queue generations. An old write
+that finishes after reset cannot overwrite a replacement queue's persisted messages.
+Queue creation retains the message queue already opened by a concurrent receive or send
+after metadata becomes visible, preserving waiting receivers and their messages.
 
 `MaxNumberOfMessages` defaults to 1 and must be an integer from 1 to 10.
 Out-of-range, malformed, and overflowing values return `InvalidParameterValue`

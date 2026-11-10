@@ -853,14 +853,11 @@ public class Ec2QueryHandler {
     }
 
     private Ec2RunInstancesReplay.Scope runInstancesScope(MultivaluedMap<String, String> p, String region) {
-        String zone = p.getFirst("Placement.AvailabilityZone");
         String subnet = firstNonBlank(p.getFirst("SubnetId"), p.getFirst("NetworkInterface.1.SubnetId"));
         String eni = p.getFirst("NetworkInterface.1.NetworkInterfaceId");
         LaunchTemplateData template = resolveRunInstancesLaunchTemplateData(p, region, false);
+        String zone = runInstancesAvailabilityZone(p, region, template);
         if (template != null) {
-            if (template.getPlacement() != null) {
-                zone = firstNonBlank(zone, template.getPlacement().getAvailabilityZone());
-            }
             if (!anyParamStartsWith(p, "NetworkInterface.")) {
                 LaunchTemplateData.NetworkInterface primary = template.primaryNetworkInterface();
                 if (primary != null) {
@@ -870,6 +867,29 @@ public class Ec2QueryHandler {
             }
         }
         return service.runInstancesScope(region, subnet, eni, zone, p.getFirst("Placement.HostId"));
+    }
+
+    /**
+     * The zone a launch is placed in, named by the request or, when the request names neither a
+     * zone nor a zone ID, by the launch template. Request placement replaces template placement
+     * as a whole, so a request zone ID is not combined with a template zone name.
+     */
+    private String runInstancesAvailabilityZone(MultivaluedMap<String, String> p, String region,
+                                               LaunchTemplateData template) {
+        String zone = p.getFirst("Placement.AvailabilityZone");
+        String zoneId = p.getFirst("Placement.AvailabilityZoneId");
+        if (firstNonBlank(zone, zoneId) == null && template != null && template.getPlacement() != null) {
+            zone = template.getPlacement().getAvailabilityZone();
+            zoneId = template.getPlacement().getAvailabilityZoneId();
+        }
+        if (isSet(zoneId)) {
+            if (isSet(zone)) {
+                throw new AwsException("InvalidParameterCombination",
+                        "You cannot specify both AvailabilityZone and AvailabilityZoneId", 400);
+            }
+            return Ec2Service.zoneNameForZoneId(region, zoneId);
+        }
+        return zone;
     }
 
     private Reservation launchRunInstances(MultivaluedMap<String, String> p, String region,
@@ -883,7 +903,6 @@ public class Ec2QueryHandler {
         }
         String keyName = p.getFirst("KeyName");
         String subnetId = p.getFirst("SubnetId");
-        String availabilityZone = p.getFirst("Placement.AvailabilityZone");
         // The launch-time public-IP override arrives either on the primary
         // network interface spec (the shape Terraform's
         // associate_public_ip_address sends) or as the legacy top-level
@@ -967,10 +986,6 @@ public class Ec2QueryHandler {
                     "Network interfaces and an instance-level private IP address may not be specified on the same request", 400);
         }
         if (launchTemplateData != null) {
-            if (launchTemplateData.getPlacement() != null) {
-                availabilityZone = firstNonBlank(availabilityZone,
-                        launchTemplateData.getPlacement().getAvailabilityZone());
-            }
             if (marketType == null && launchTemplateData.getInstanceMarketOptions() != null) {
                 marketType = launchTemplateData.getInstanceMarketOptions().getMarketType();
             }
@@ -1044,6 +1059,16 @@ public class Ec2QueryHandler {
             }
         }
 
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            Ec2Service.validateNewResourceTags(launchTemplateData.tagsForResource("network-interface"));
+            Map<String, Tag> primaryInterfaceTags = new LinkedHashMap<>();
+            launchTemplateData.tagsForResource("network-interface")
+                    .forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            networkInterfaceTags.forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            Ec2Service.validateNewResourceTags(new ArrayList<>(primaryInterfaceTags.values()));
+        }
+
+        String availabilityZone = runInstancesAvailabilityZone(p, region, launchTemplateData);
         Reservation res = attempt == null ? service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
@@ -1057,6 +1082,20 @@ public class Ec2QueryHandler {
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification,
                 networkInterfaceDeleteOnTermination, attempt);
+
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            List<Tag> templateInterfaceTags = launchTemplateData.tagsForResource("network-interface");
+            if (!templateInterfaceTags.isEmpty()) {
+                List<String> primaryIds = res.getInstances().stream()
+                        .flatMap(instance -> instance.getNetworkInterfaces().stream())
+                        .filter(networkInterface -> networkInterface.getDeviceIndex() == 0)
+                        .map(InstanceNetworkInterface::getNetworkInterfaceId)
+                        .toList();
+                if (!primaryIds.isEmpty()) {
+                    service.tagRunInstancesInterfaces(region, primaryIds, templateInterfaceTags, attempt);
+                }
+            }
+        }
 
         // The request's EbsOptimized wins over a launch template's. Applied after the launch, on this
         // API path only: CloudFormation, Auto Scaling and Fleet launches still read false. Passing it
@@ -4383,20 +4422,8 @@ public class Ec2QueryHandler {
             throw new AwsException("UnsupportedOperation",
                     "CreateSnapshot supports regional snapshots without an OutpostArn.", 400);
         }
-        for (String prefix : new String[] {"TagSpecification", "TagSpecifications"}) {
-            for (int i = 1; ; i++) {
-                String resourceType = p.getFirst(prefix + "." + i + ".ResourceType");
-                if (resourceType == null) {
-                    break;
-                }
-                if (!"snapshot".equals(resourceType)) {
-                    throw new AwsException("InvalidParameterValue",
-                            "CreateSnapshot supports tags for the snapshot resource type only.", 400);
-                }
-            }
-        }
         Snapshot snapshot = service.createSnapshot(region, p.getFirst("VolumeId"),
-                p.getFirst("Description"), parseTagsForResource(p, "snapshot"),
+                p.getFirst("Description"), parseTagsForResource(p, "snapshot", Set.of("snapshot")),
                 Boolean.parseBoolean(p.getFirst("DryRun")));
         return xmlResponse(new XmlBuilder()
                 .start("CreateSnapshotResponse", AwsNamespaces.EC2)

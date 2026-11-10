@@ -14,6 +14,7 @@ import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.response.Response;
 import io.vertx.core.http.ServerWebSocket;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
@@ -36,6 +37,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.*;
@@ -45,6 +47,8 @@ import static org.mockito.Mockito.*;
 @TestProfile(SignedIamEnforcementProfile.class)
 class ManageConnectionsIamIntegrationTest {
     private static final String OWNER = "000000000000";
+    Supplier<String> roleNames = () -> "connections-role-" + UUID.randomUUID();
+
     @InjectSpy
     WebSocketConnectionManager connections;
     @TestHTTPResource("/")
@@ -97,14 +101,14 @@ class ManageConnectionsIamIntegrationTest {
     @Test
     void issuedStsSessionUsesFullRolePathSessionPolicyTokenAndCurrentRoleGrant() throws Exception {
         Fixture f = fixture();
-        String name = "connections-role-" + UUID.randomUUID();
-        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        String name = roleNames.get();
         String role = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name, "Path", "/service-role/",
                 "AssumeRolePolicyDocument", "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::" + OWNER
                         + ":root\"},\"Action\":\"sts:AssumeRole\"}}")).then().statusCode(200).extract().xmlPath()
                 .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
-        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "manage")));
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
         rolePolicy(name, policy(f.arn()));
+        cleanup.register(() -> cleanupIam("DeleteRolePolicy", Map.of("RoleName", name, "PolicyName", "manage")));
         AwsSessionCredentials allowed = assume(role, null);
         try (ApiGatewayManagementApiClient restricted = client(f, assume(role, policy(f.arn()).replace("Allow", "Deny")));
              ApiGatewayManagementApiClient missingToken = client(f, AwsBasicCredentials.create(allowed.accessKeyId(), allowed.secretAccessKey()));
@@ -202,6 +206,42 @@ class ManageConnectionsIamIntegrationTest {
                 socket.abort();
             }
         }
+    }
+
+    @Test
+    void rejectedRoleCreationPreservesPreexistingRole() throws Exception {
+        String name = "connections-existing-" + UUID.randomUUID();
+        SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", name,
+                "AssumeRolePolicyDocument", "{\"Statement\":[]}")).then().statusCode(200);
+        cleanup.register(() -> cleanupIam("DeleteRole", Map.of("RoleName", name)));
+        ManageConnectionsIamIntegrationTest fixture = nestedFixture(name);
+        try {
+            assertThrows(AssertionError.class,
+                    fixture::issuedStsSessionUsesFullRolePathSessionPolicyTokenAndCurrentRoleGrant);
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(200);
+    }
+
+    @Test
+    void successfulRoleScenarioRemovesOwnedRoleAndPolicy() throws Exception {
+        String name = "connections-owned-" + UUID.randomUUID();
+        ManageConnectionsIamIntegrationTest fixture = nestedFixture(name);
+        try {
+            fixture.issuedStsSessionUsesFullRolePathSessionPolicyTokenAndCurrentRoleGrant();
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        SignedIamUsers.iam(endpoint, "GetRole", Map.of("RoleName", name)).then().statusCode(404);
+    }
+
+    private ManageConnectionsIamIntegrationTest nestedFixture(String name) {
+        ManageConnectionsIamIntegrationTest fixture = new ManageConnectionsIamIntegrationTest();
+        fixture.endpoint = endpoint;
+        fixture.connections = connections;
+        fixture.roleNames = () -> name;
+        return fixture;
     }
 
     private void cleanupIam(String action, Map<String, String> parameters) {

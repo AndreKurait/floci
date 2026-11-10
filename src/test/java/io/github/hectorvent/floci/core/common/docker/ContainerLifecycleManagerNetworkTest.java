@@ -321,8 +321,9 @@ class ContainerLifecycleManagerNetworkTest {
         assertTrue(failure.getMessage().contains("no reachable address"));
     }
 
-    @Test
-    void resolveEndpointPrefersTheServiceNetworkOverTheDefaultBridge() {
+    @ParameterizedTest
+    @ValueSource(strings = {"floci-net", "network-id"})
+    void resolveEndpointPrefersTheServiceNetworkOverTheDefaultBridge(String preferredNetwork) {
         when(containerDetector.isRunningInContainer()).thenReturn(true);
         InspectContainerResponse inspect = inspectOf("container-id");
         NetworkSettings networks = mock(NetworkSettings.class);
@@ -331,11 +332,12 @@ class ContainerLifecycleManagerNetworkTest {
         // Docker lists a container's networks by name, so the default bridge usually comes first.
         Map<String, ContainerNetwork> attached = new LinkedHashMap<>();
         attached.put("bridge", new ContainerNetwork().withIpv4Address("172.17.0.4"));
-        attached.put("floci-net", new ContainerNetwork().withIpv4Address("172.20.0.4"));
+        attached.put("floci-net", new ContainerNetwork().withIpv4Address("172.20.0.4").withNetworkID("network-id"));
         when(networks.getNetworks()).thenReturn(attached);
 
         assertEquals(new EndpointInfo("172.20.0.4", 9644),
-                manager().resolveEndpoint("container-id", 9644, "floci-net"));
+                manager().resolveEndpoint("container-id", 9644, preferredNetwork));
+        assertEquals("172.20.0.4", manager().resolveContainerNetworkIp("container-id", preferredNetwork));
     }
 
     @Test

@@ -87,7 +87,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         private final Map<String, Long> epochByEnvironment = new HashMap<>();
     }
 
-    private record Lease(PoolState poolState, long epoch, String environmentKey) {
+    private record Lease(PoolState poolState, long epoch, String environmentKey, String functionScope) {
     }
 
     private record IdleEntry(PoolState poolState, String environmentKey,
@@ -245,6 +245,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
         PoolState poolState = null;
         long leaseEpoch = 0;
         String environmentKey = executionEnvironmentKey(fn);
+        String functionScope = ephemeral ? null : functionScope(fn);
 
         if (!ephemeral) {
             synchronized (capLock) {
@@ -303,7 +304,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             synchronized (capLock) {
                 rejected = admission.stopped || admission != lifecycleState;
                 if (!rejected && !ephemeral) {
-                    activeLeases.put(handle, new Lease(poolState, leaseEpoch, environmentKey));
+                    activeLeases.put(handle, new Lease(poolState, leaseEpoch, environmentKey, functionScope));
                 }
                 if (!rejected) {
                     handle.setState(ContainerState.BUSY);
@@ -382,7 +383,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
             synchronized (lease.poolState()) {
                 stale = lifecycleState.stopped || lease.epoch() != lease.poolState().epochByEnvironment
                         .getOrDefault(lease.environmentKey(), 0L);
-                returned = !stale && idleSize(lease.poolState()) < maxPoolSizePerFunction;
+                returned = !stale && idleSize(lease.poolState(), lease.functionScope()) < maxPoolSizePerFunction;
                 if (returned) {
                     if (maxIdleTotal > 0) {
                         evicted = evictIdleBeyond(maxIdleTotal - 1);
@@ -534,16 +535,22 @@ public class WarmPool implements ContainerTeardown, Resettable {
 
     /** Deletes only the named account/region's environments, across all its versions. */
     public void drainFunction(LambdaFunction fn) {
+        String scope = functionScope(fn);
+        drainFunction(fn.getFunctionName(), key -> matchesFunctionScope(key, scope));
+    }
+
+    private static String functionScope(LambdaFunction fn) {
         String arn = fn.getFunctionArn();
-        String scope = fn.getFunctionName();
         if (arn != null && !arn.isBlank()) {
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
-            scope = new AwsArnUtils.Arn(parsed.partition(), "lambda", parsed.region(), parsed.accountId(),
+            return new AwsArnUtils.Arn(parsed.partition(), "lambda", parsed.region(), parsed.accountId(),
                     "function:" + fn.getFunctionName()).toString();
         }
-        String functionScope = scope;
-        drainFunction(fn.getFunctionName(), key ->
-                key.equals(functionScope) || key.startsWith(functionScope + ":"));
+        return fn.getFunctionName();
+    }
+
+    private static boolean matchesFunctionScope(String environmentKey, String scope) {
+        return environmentKey.equals(scope) || environmentKey.startsWith(scope + ":");
     }
 
     private void drainFunction(String functionName, Predicate<String> matches) {
@@ -686,10 +693,12 @@ public class WarmPool implements ContainerTeardown, Resettable {
         return fn.getFunctionName() + ":" + fn.getVersion();
     }
 
-    private static int idleSize(PoolState poolState) {
+    private static int idleSize(PoolState poolState, String scope) {
         int size = 0;
-        for (ArrayDeque<ContainerHandle> idle : poolState.idleByEnvironment.values()) {
-            size += idle.size();
+        for (Map.Entry<String, ArrayDeque<ContainerHandle>> idle : poolState.idleByEnvironment.entrySet()) {
+            if (matchesFunctionScope(idle.getKey(), scope)) {
+                size += idle.getValue().size();
+            }
         }
         return size;
     }

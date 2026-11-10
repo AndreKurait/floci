@@ -28,6 +28,16 @@ public class CloudMapDnsRecordSource implements DnsRecordSource {
     }
 
     @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
+        return resolveAuthoritative(name, type, null);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type, ClientVpc origin) {
+        return cloudMapService.resolvePublicDnsNameIfOwned(name, type, origin);
+    }
+
+    @Override
     public Optional<DnsAnswer> resolveIpv4(String name) {
         return resolve(name, 1, null);
     }

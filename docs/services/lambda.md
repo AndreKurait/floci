@@ -570,7 +570,9 @@ these allocations without counting provisioned capacity twice when a function ha
 reservation. Cold spillover still consumes ordinary unreserved permits. Automatic scaling
 and weighted-alias allocation remain unsupported. Provisioned runtimes receive
 their numeric `AWS_LAMBDA_FUNCTION_VERSION` and
-`AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`.
+`AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`. For both provisioned and ordinary
+invocations, `context.invoked_function_arn` retains the requested qualifier, including an
+alias name, without changing the executed function version.
 
 Configuration replacement and deletion remain committed if environment removal fails.
 Failed removals retain ownership and are retried while Floci is running; they continue
@@ -718,7 +720,8 @@ Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
 !!! note "Bounding warm containers"
     After an invocation the container stays warm so the next call skips the cold start, and is
     reaped only after `container-idle-timeout-seconds` of inactivity. Each function keeps up to
-    `warm-pool-max-per-function` idle containers, but nothing limits the sum: a stack of many
+    `warm-pool-max-per-function` idle containers across its versions within its account and region,
+    independently of same-named functions owned elsewhere. Without a global cap, nothing limits the sum: a stack of many
     functions that fan out through streams and triggers can accumulate one warm container per
     function touched, and each runtime container holds its own memory. On a Docker Desktop with
     a modest memory allocation that is enough to have Floci OOM-killed. `ephemeral: true` avoids
@@ -1150,6 +1153,19 @@ FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud
 # Multiple suffixes
 FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud,localhost.example.internal
 ```
+
+On an internal Docker bridge, Docker's embedded resolver does not forward external
+queries. When a Lambda has configured DNS servers, Floci supplies a read-only
+resolver file before the runtime starts. Docker's resolver remains first for
+container aliases; configured servers handle queries Docker cannot forward.
+The runtime retains its image
+user, entrypoint, and filesystem permissions. A small, labelled Docker volume
+holds the file and is removed when the Lambda execution environment is removed.
+Preparation uses Docker APIs, including with a remote daemon; no helper process
+runs and no additional image is needed. Explicit resolver mounts and containers
+sharing another container's network namespace keep their existing DNS setup.
+Failed helper or resolver-volume removal remains queued for the existing cleanup
+sweep. Retrying cleanup does not release the Runtime API port a second time.
 
 ### Real AWS Credentials
 

@@ -30,13 +30,15 @@ Trust and target-policy evaluation use the same server-clock instant for
 `aws:CurrentTime` and `aws:EpochTime`. Time-conditioned grants and denies are
 reevaluated on each invocation; this request time is not `aws:TokenIssueTime`.
 
-Role trust evaluation does not synthesize API Gateway source condition keys:
-service-specific source context and actual issued STS session identities are not
-modeled here. The role principal is evaluated without issuing session credentials.
-Caller-passthrough credentials retain their existing behavior and remain outside
-this role check. HTTP/WebSocket integrations and Lambda authorizers are separate
-permission paths.
-IAM enforcement disabled retains the existing permissive behavior.
+After trust succeeds, each evaluation resolves a temporary local role credential
+through IAM. Its session identity supplies `aws:userid` and its recorded issuance
+time supplies `aws:TokenIssueTime`. The authorization credential is revoked after
+evaluation; the Lambda workload retains its own execution-role credentials.
+
+Role checks do not synthesize service-specific trust `SourceArn` or `SourceAccount`
+conditions. Caller-passthrough credentials, HTTP/WebSocket integrations and Lambda
+authorizers remain separate paths. IAM enforcement disabled retains the existing
+permissive behavior.
 
 
 ## JWT issuer network policy
@@ -1177,8 +1179,8 @@ use Lambda resource-based permissions.
 
 This local role evaluation does not issue STS credentials or establish all
 service-specific trust condition keys. Integration caller-passthrough credentials
-are not an authorizer credential mode. HTTP/WebSocket role enforcement and live
-AWS or native-image parity remain outside this support.
+are not an authorizer credential mode. Live AWS or native-image parity remains
+outside this support.
 
 WebSocket REQUEST authorizers without `authorizerCredentialsArn` check the Lambda
 resource policy when IAM enforcement is enabled. The check uses the API account,
@@ -1214,7 +1216,7 @@ assumed for this mode, and an anonymous or invalid signature cannot supply a cal
 The API owner still determines the integration configuration; the caller can belong to a different
 account. Cached responses do not invoke Lambda again.
 
-The local `test` credential has no IAM policy context and is refused in enforced caller mode.
+The verified local `test` credential represents account root and still obeys resource-policy and SCP denials.
 IAM-disabled behavior and the historical bare `*` credential spelling retain their local bypass;
 bare `*` is not the documented AWS sentinel. This check is distinct from `execute-api:Invoke`
 route authorization. Issued session identities are read from IAM, not synthesized; full forwarded
@@ -1280,8 +1282,7 @@ Caller policy evaluation supplies `aws:CurrentTime` and `aws:EpochTime` from the
 server clock. The same instant is used for caller session expiry and time-based
 identity, session, boundary, SCP and resource-policy conditions. REST anonymous
 and custom-authorizer resource-policy checks also receive these time keys.
-These values do not come from client-supplied date headers. This does not add
-other global condition keys or issue STS sessions for service execution roles.
+These values do not come from client-supplied date headers.
 
 REST resource-policy evaluation for callers without verified AWS credentials leaves
 `aws:PrincipalIsAWSService` absent. `Bool` matching `false` does not match an
@@ -1297,3 +1298,44 @@ an individual connection ID. Identity policies, session policies, permissions
 boundaries and SCPs use the shared caller evaluator. Policy changes apply to
 every request, and a permitted endpoint cannot access another API or stage's
 connection. IAM-disabled local connection management remains unsigned.
+
+Policy denial returns 403 `ForbiddenException` before connection lookup; an
+authorized request for another API's, stage's or region's connection returns 410.
+POST retains its 128 KiB payload limit after authorization, including when the
+connection is absent.
+
+### CloudFormation V2 authorizer update rollback
+
+CloudFormation in-place updates to standalone V2 authorizers snapshot their complete
+configuration before mutation. Failure during the update or in a later stack
+resource restores the previous authorizer ID, credentials and settings. Failed
+restoration keeps the snapshot for rollback retry; successful stack updates clear
+it. Deployment activation, concurrent transaction isolation and process-crash
+recovery remain outside this rollback support.
+
+### CloudFormation V2 child replacement
+
+CloudFormation replaces standalone V2 authorizers, integrations, routes, stages and
+deployments when their `ApiId` changes. Replacement cleanup tracks the owning API
+alongside each child ID, including stages with the same name on different APIs.
+`Ref` continues to return the child ID or stage name. A later stack failure restores
+the previous child; `UpdateReplacePolicy: Retain` keeps a displaced child. Stage
+name changes also replace the stage. Cleanup uses the recorded `ApiId`.
+
+Older persisted children without `ApiId` recover ownership from the previous stack
+template, saved parameters and resource identities before update or deletion.
+Recovered metadata is saved before a child changes, and failed updates retain the
+previous stack tags. Policy-retained resources and resources explicitly retained by
+`DeleteStack` need no ownership recovery. Unresolved historical ownership fails
+without scanning other APIs or guessing from live exports, dynamic references or
+current SSM values. Stored-record reload support does not establish process-crash
+atomicity.
+
+CloudFormation replaces an `AWS::ApiGatewayV2::Api` when `ProtocolType` changes.
+Referenced children move to the new API through their recorded parent identities.
+The old API remains available until the update commits, and
+`UpdateReplacePolicy: Retain` preserves it. Rollback restores the old API identity
+and Body ownership metadata, deleting the replacement through the shared retryable
+cleanup lifecycle. Ordinary API name updates remain in place. These lifecycle
+checks use local SDK and service tests; they do not establish deployment activation
+or live AWS parity.

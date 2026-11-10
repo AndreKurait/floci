@@ -74,7 +74,7 @@ class ServiceRoleCallAuthorizerTest {
                     AwsArnUtils.Arn.global(parsed.partition(), "sts", parsed.accountId(),
                             "assumed-role/events/" + sessionName).toString(), arn,
                     IamService.CallerArns.TYPE_ASSUMED_ROLE, invocation.getArgument(8), null,
-                    role.getPermissionsBoundaryArn() != null));
+                    role.getPermissionsBoundaryArn() != null).withTokenIssueTime(NOW).withPrincipalTags(role.getTags()));
             return null;
         }).when(iam).registerSessionForAccount(anyString(), anyString(), anyString(), anyString(),
                 anyString(), any(Instant.class), isNull(), anyString(), nullable(String.class));
@@ -164,10 +164,13 @@ class ServiceRoleCallAuthorizerTest {
 
 
     @ParameterizedTest
-    @ValueSource(strings = {"allow", "deny", "provider-failure", "resolution-failure", "registration-failure"})
+    @ValueSource(strings = {"allow", "deny", "principal-missing", "context-missing",
+            "provider-failure", "resolution-failure", "registration-failure"})
     void issuedCredentialIsRevokedAfterEveryEvaluationOutcome(String outcome) {
         switch (outcome) {
             case "deny" -> when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(DENY)));
+            case "principal-missing" -> when(iam.resolveCallerArns(anyString())).thenReturn(Optional.empty());
+            case "context-missing" -> when(iam.resolveCallerContext(anyString(), any(Instant.class))).thenReturn(null);
             case "provider-failure" -> when(scps.effectiveScpLevels(ACCOUNT)).thenThrow(new IllegalStateException("provider"));
             case "resolution-failure" -> when(iam.resolveCallerContext(anyString(), any(Instant.class)))
                     .thenThrow(new IllegalStateException("resolution"));
@@ -326,12 +329,12 @@ class ServiceRoleCallAuthorizerTest {
     }
 
     @Test
-    void requestTimeDoesNotInventSessionIssuanceOrServiceSourceContext() {
+    void issuedSessionCarriesTokenTimeWithoutServiceSourceContext() {
         String policy = """
                 {"Statement":{"Effect":"Allow","Action":"*","Resource":"*","Condition":{
-                "DateEquals":{"aws:CurrentTime":"%s"},
-                "Null":{"aws:TokenIssueTime":"true","aws:SourceArn":"true","aws:SourceAccount":"true"}}}}
-                """.formatted(NOW);
+                "DateEquals":{"aws:CurrentTime":"%s","aws:TokenIssueTime":"%s"},
+                "Null":{"aws:SourceArn":"true","aws:SourceAccount":"true"}}}}
+                """.formatted(NOW, NOW);
         when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of(policy)));
         assertEquals(Decision.ALLOW, decide(FUNCTION));
     }
@@ -400,8 +403,21 @@ class ServiceRoleCallAuthorizerTest {
     void absentAttachedTagsDoNotInventSessionTags() {
         when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of("""
                 {"Statement":{"Effect":"Allow","Action":"*","Resource":"*",
-                "Condition":{"Null":{"aws:PrincipalTag/team":"true","aws:TokenIssueTime":"true"}}}}""")));
+                "Condition":{"Null":{"aws:PrincipalTag/team":"true","aws:TokenIssueTime":"false"}}}}""")));
         assertEquals(Decision.ALLOW, decide(FUNCTION));
+    }
+
+    @Test
+    void resolvedSessionWithoutTagsCannotBorrowRawRoleTags() {
+        role.setTags(Map.of("team", "orders"));
+        when(iam.resolveCallerArns(anyString())).thenAnswer(invocation ->
+                Optional.ofNullable(sessions.get(invocation.getArgument(0)))
+                        .map(principal -> principal.withPrincipalTags(Map.of())));
+        when(iam.resolvePrincipalContext(ROLE)).thenReturn(CallerContext.of(List.of("""
+                {"Statement":{"Effect":"Allow","Action":"*","Resource":"*",
+                "Condition":{"StringEquals":{"aws:PrincipalTag/team":"orders"}}}}""")));
+        assertEquals(Decision.DENY, decide(FUNCTION));
+        assertTrue(sessions.isEmpty());
     }
 
     private Decision timeDecision(String service, String target) {

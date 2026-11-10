@@ -148,6 +148,10 @@ public class AwsJsonController {
 
         String serviceKey = targetMatch.descriptor().externalKey();
         String action = targetMatch.action();
+        if ("monitoring".equals(serviceKey) && targetMatch.jsonOnly()
+                && !QueryServiceModels.legacyCloudWatchOperations().contains(action)) {
+            return JsonErrorResponseUtils.createUnknownOperationErrorResponse(target);
+        }
         LOG.debugv("{0} JSON action: {1}", serviceKey, action);
 
         JsonNode request;

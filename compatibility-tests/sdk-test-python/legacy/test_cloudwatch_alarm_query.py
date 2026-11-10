@@ -61,6 +61,8 @@ def test_alarm_query_lifecycle_preserves_scope_and_unselected_alarms(
 ):
     prefix, selected, created, other = alarms
     client = alarm_client(aws_config, version)
+    # Version 2013-01-16 serves only the shared reads; its writes go through the current version.
+    writer = client if version == "2010-08-01" else alarm_client(aws_config, "2010-08-01")
     observed = client.describe_alarms(alarm_name_prefix=prefix)
     assert sorted(alarm.name for alarm in observed) == selected
     assert not observed.next_token
@@ -77,7 +79,7 @@ def test_alarm_query_lifecycle_preserves_scope_and_unselected_alarms(
         comparison=">",
     )
     alarm.actions_enabled = False
-    assert client.create_alarm(alarm) is True
+    assert writer.create_alarm(alarm) is True
     assert sorted(alarm.name for alarm in client.describe_alarms(alarm_name_prefix=prefix)) == selected + [created]
     assert cloudwatch_client.describe_alarms(AlarmNames=[created])["MetricAlarms"][0]["Threshold"] == 7
 
@@ -87,7 +89,7 @@ def test_alarm_query_lifecycle_preserves_scope_and_unselected_alarms(
     assert list(alarm_client(aws_config, version, access_key="999988887777")
                 .describe_alarms(alarm_name_prefix=prefix)) == []
 
-    assert client.delete_alarms(selected + [created]) is True
+    assert writer.delete_alarms(selected + [created]) is True
     assert list(client.describe_alarms(alarm_name_prefix=prefix)) == []
     assert cloudwatch_client.describe_alarms(AlarmNamePrefix=prefix)["MetricAlarms"] == []
     assert [alarm["AlarmName"] for alarm in cloudwatch_client.describe_alarms(AlarmNames=[other])["MetricAlarms"]] == [other]

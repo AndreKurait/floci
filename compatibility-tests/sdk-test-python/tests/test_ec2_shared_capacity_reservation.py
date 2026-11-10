@@ -186,3 +186,26 @@ def test_accepting_open_share_adopts_existing_recipient_instance(shared):
     assert describe(owner, capacity_id)["AvailableInstanceCount"] == 0
     current = recipient.describe_instances(InstanceIds=instances)["Reservations"][0]["Instances"][0]
     assert current["CapacityReservationId"] == capacity_id
+
+
+def test_owned_open_reservation_does_not_double_count_a_shared_member(shared):
+    owner, recipient, _, recipient_ram, capacity, share, instances = shared
+    capacity_id = capacity["CapacityReservationId"]
+    owner.modify_capacity_reservation(CapacityReservationId=capacity_id, InstanceMatchCriteria="open")
+    accept(recipient_ram, share)
+    instance = recipient.run_instances(
+        ImageId="ami-test", InstanceType="t3.micro", MinCount=1, MaxCount=1,
+        Placement={"AvailabilityZone": "us-east-1a"},
+        CapacityReservationSpecification={"CapacityReservationPreference": "capacity-reservations-only"},
+    )["Instances"][0]
+    instances.append(instance["InstanceId"])
+    assert instance["CapacityReservationId"] == capacity_id
+    owned = recipient.create_capacity_reservation(
+        InstanceType="t3.micro", InstancePlatform="Linux/UNIX", InstanceCount=1,
+        AvailabilityZone="us-east-1a", InstanceMatchCriteria="open",
+    )["CapacityReservation"]
+    try:
+        assert owned["AvailableInstanceCount"] == 1
+        assert describe(owner, capacity_id)["AvailableInstanceCount"] == 0
+    finally:
+        recipient.cancel_capacity_reservation(CapacityReservationId=owned["CapacityReservationId"])

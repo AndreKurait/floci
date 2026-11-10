@@ -986,6 +986,64 @@ class ContainerLauncherTest {
         assertTrue(captureRealContainerSpec().init(), "Custom images also need signal forwarding and reaping");
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "/var/lang/lib/security/cacerts, false",
+            "/var/lang/lib/security, false",
+            "/etc/pki/ca-trust/extracted/java/cacerts, false",
+            "/etc/pki/ca-trust/extracted/java, false",
+            "/var/lang/lib/security/cacerts.backup, true",
+            "/VAR/lang/lib/security, true",
+            "/var/lang/lib/../lib/security, false",
+            "/var/lang//lib/security/, false",
+            "/var/lang/lib/security/../other, true",
+            "/opt/cacerts, true"
+    })
+    void launchFunction_keepsAnExplicitlyMountedRuntimeTrustStore(String destination, boolean injectStore)
+            throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("code"));
+        when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
+                "--volume /host/trust:" + destination + ":ro"));
+        when(imageResolver.resolve(eq("java21"), any())).thenReturn("public.ecr.aws/lambda/java:21");
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("mounted-trust");
+        fn.setRuntime("java21");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setEnvironment(Map.of("JAVA_TOOL_OPTIONS", "-Dapplication.option=kept"));
+
+        launcher.launch(fn);
+
+        ContainerSpec spec = captureRealContainerSpec();
+        assertEquals(injectStore, spec.javaTrustStore());
+        assertTrue(spec.env().contains("JAVA_TOOL_OPTIONS=-Dapplication.option=kept"));
+        assertTrue(spec.binds().stream().anyMatch(bind -> bind.getVolume().getPath().equals(destination)
+                && bind.getAccessMode() == AccessMode.ro));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void launchFunction_keepsAutomaticTrustForCustomJavaRuntimeImages(boolean platformOverride) throws Exception {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        when(lambda.dockerFlags()).thenReturn(Optional.of(
+                "--platform linux/arm64 --volume /host/trust:/var/lang/lib/security/cacerts:ro"));
+        when(lambda.runtimeImages()).thenReturn(Map.of(
+                platformOverride ? "java21.linux.arm64" : "java21", "registry.example/custom-java:21"));
+        launcher = newLauncher(new ImageResolver(config));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("custom-java-mounted-trust");
+        fn.setRuntime("java21");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(Files.createDirectory(tempDir.resolve("custom-java-code")).toString());
+
+        launcher.launch(fn);
+
+        ArgumentCaptor<ContainerSpec> captured = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycleManager).create(captured.capture(), eq("linux/arm64"));
+        assertEquals("registry.example/custom-java:21", captured.getValue().image());
+        assertTrue(captured.getValue().javaTrustStore());
+    }
+
     @Test
     void launchFunction_createsWithoutBindMountsOrVolume_forSmallCode() throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("code"));
@@ -1126,6 +1184,11 @@ class ContainerLauncherTest {
 
     @Test
     void launchFunction_appliesConfiguredDockerFlagsToRealContainer() throws Exception {
+        InspectNetworkCmd inspectNetwork = mock(InspectNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.inspectNetworkCmd()).thenReturn(inspectNetwork);
+        Network network = mock(Network.class);
+        when(network.getInternal()).thenReturn(false);
+        when(inspectNetwork.exec()).thenReturn(network);
         lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.9");
         when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
@@ -1898,6 +1961,29 @@ class ContainerLauncherTest {
         assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_SESSION_TOKEN=")),
                 "AWS_SESSION_TOKEN should not be injected when awsConfigPath is set");
         verify(executionRoleCredentials, never()).forFunction(any());
+    }
+
+    @Test
+    void resolverRemovalFailureDoesNotLeakRuntimeApiPort() {
+        ContainerHandle handle = launcher.launch(imageFunction());
+        handle.setDnsResolverVolume("owned-resolver");
+        doThrow(new IllegalStateException("volume removal failed"))
+                .when(lifecycleManager).removeVolumeStrict("owned-resolver");
+
+        assertThrows(IllegalStateException.class, () -> launcher.stop(handle));
+
+        InOrder order = inOrder(lifecycleManager, runtimeApiServer, runtimeApiServerFactory);
+        order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
+        order.verify(runtimeApiServer).close();
+        order.verify(runtimeApiServerFactory).release(runtimeApiServer);
+        order.verify(lifecycleManager).removeVolumeStrict("owned-resolver");
+        doNothing().when(lifecycleManager).removeVolumeStrict("owned-resolver");
+        launcher.stop(handle);
+        launcher.stop(handle);
+        verify(runtimeApiServerFactory, times(1)).release(runtimeApiServer);
+        verify(runtimeApiServer, times(1)).close();
+        verify(lifecycleManager, times(2)).removeVolumeStrict("owned-resolver");
+        assertNull(handle.getDnsResolverVolume());
     }
 
     @Test

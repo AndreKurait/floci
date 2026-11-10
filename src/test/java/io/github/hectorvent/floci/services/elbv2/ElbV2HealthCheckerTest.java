@@ -10,12 +10,14 @@ import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.net.NetServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +25,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
@@ -112,6 +115,45 @@ class ElbV2HealthCheckerTest {
                 isolated.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             }
         }
+    }
+
+    @Test
+    void tcpProbeConnectsWithoutSendingHttpOrApplyingTheHttpMatcher() throws Exception {
+        CompletableFuture<Integer> received = new CompletableFuture<>();
+        AtomicInteger bytes = new AtomicInteger();
+        NetServer server = vertx.createNetServer().connectHandler(socket -> socket
+                .handler(buffer -> bytes.addAndGet(buffer.length()))
+                .closeHandler(ignored -> received.complete(bytes.get())))
+                .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        ElbV2HealthChecker checker = healthChecker();
+        try {
+            TargetGroup group = targetGroup(server.actualPort(), "404", 1, 1);
+            group.setProtocol("TCP");
+            group.setHealthCheckProtocol("TCP");
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            assertEquals(0, received.get(2, TimeUnit.SECONDS), "A TCP health check must send no HTTP payload");
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+        } finally {
+            server.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void tcpProbeRejectsAClosedPort() throws Exception {
+        int port;
+        try (ServerSocket listener = new ServerSocket(0)) {
+            port = listener.getLocalPort();
+        }
+        ElbV2HealthChecker checker = healthChecker();
+        TargetGroup group = targetGroup(port, "200", 1, 1);
+        group.setProtocol("TCP");
+        group.setHealthCheckProtocol("TCP");
+        TargetDescription target = target("127.0.0.1", port);
+        checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+        await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("unhealthy",
+                checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
     }
 
     @Test
@@ -555,16 +597,20 @@ class ElbV2HealthCheckerTest {
             checker.startMonitoring(group);
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
             await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 1);
-            switch (removal) {
-                case "deregister" -> checker.removeTargets(group.getTargetGroupArn(), List.of(target), group);
-                case "stop" -> checker.stopMonitoring(group.getTargetGroupArn());
-                case "reset" -> checker.clear();
-                default -> throw new AssertionError(removal);
+            for (int registration = 0; registration < 40; registration++) {
+                switch (removal) {
+                    case "deregister" -> checker.removeTargets(group.getTargetGroupArn(), List.of(target), group);
+                    case "stop" -> checker.stopMonitoring(group.getTargetGroupArn());
+                    case "reset" -> checker.clear();
+                    default -> throw new AssertionError(removal);
+                }
+                checker.startMonitoring(group);
+                checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
             }
-            checker.startMonitoring(group);
-            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-            await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 2);
+            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1))
+                    .untilAsserted(() -> assertEquals(1, requests.size()));
             requests.getFirst().end().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            await().atMost(Duration.ofSeconds(2)).until(() -> requests.size() == 2);
             await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> assertEquals(
                     "Elb.RegistrationInProgress",
                     checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason()));
@@ -680,43 +726,64 @@ class ElbV2HealthCheckerTest {
     }
 
     @Test
-    @SuppressWarnings("unchecked")
     void periodicProbeRetainsIntervalAndNetworkAdmissionThreshold() throws Exception {
-        HttpServer server = startServer(200);
-        Vertx scheduled = mock(Vertx.class);
-        AtomicReference<Handler<Long>> periodic = new AtomicReference<>();
-        doAnswer(invocation -> {
-            Handler<Long> callback = invocation.getArgument(1);
-            callback.handle(1L);
-            return 1L;
-        }).when(scheduled).setTimer(anyLong(), any());
-        doAnswer(invocation -> {
-            assertEquals(5000L, invocation.<Long>getArgument(0));
-            periodic.set(invocation.getArgument(1));
-            return 2L;
-        }).when(scheduled).setPeriodic(anyLong(), any());
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(config.services().elbv2().mock()).thenReturn(false);
-        ElbV2HealthChecker checker = new ElbV2HealthChecker(scheduled, config, mock(Ec2Service.class));
-        TargetGroup group = targetGroup(server.actualPort(), "200", 2, 1);
-        group.setProtocol("TCP");
-        group.setHealthCheckIntervalSeconds(5);
-        TargetDescription target = target("127.0.0.1", server.actualPort());
-
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer server = vertx.createHttpServer().requestHandler(request -> {
+            requests.incrementAndGet();
+            request.response().end();
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         try {
+            Vertx scheduled = mock(Vertx.class);
+            AtomicLong clock = new AtomicLong(TimeUnit.SECONDS.toNanos(1));
+            AtomicReference<Handler<Long>> periodic = new AtomicReference<>();
+            doAnswer(invocation -> {
+                Handler<Long> callback = invocation.getArgument(1);
+                callback.handle(1L);
+                return 1L;
+            }).when(scheduled).setTimer(anyLong(), any());
+            doAnswer(invocation -> {
+                assertEquals(5000L, invocation.<Long>getArgument(0));
+                periodic.set(invocation.getArgument(1));
+                return 2L;
+            }).when(scheduled).setPeriodic(anyLong(), any());
+            EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+            when(config.services().elbv2().mock()).thenReturn(false);
+            ElbV2HealthChecker checker = new ElbV2HealthChecker(
+                    scheduled, config, mock(Ec2Service.class), clock::get);
+            checkers.add(checker);
+            TargetGroup group = targetGroup(server.actualPort(), "200", 3, 1);
+            group.setProtocol("TCP");
+            group.setHealthCheckIntervalSeconds(5);
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+
             checker.startMonitoring(group);
             checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
-            assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertEquals("Elb.InitialHealthChecking",
-                    checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason()));
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
+                assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+                assertEquals("Elb.InitialHealthChecking",
+                        checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
+            });
+            clock.set(TimeUnit.SECONDS.toNanos(5));
             periodic.get().handle(2L);
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
-                    assertEquals("healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort())));
+            await().during(Duration.ofMillis(100)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
+                assertEquals(1, requests.get());
+                assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+            });
+            clock.set(TimeUnit.SECONDS.toNanos(10) + 1);
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
+                periodic.get().handle(2L);
+                assertEquals(2, requests.get());
+            });
+            clock.set(TimeUnit.SECONDS.toNanos(15));
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
+                periodic.get().handle(2L);
+                assertEquals(3, requests.get());
+                assertEquals("healthy", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
+            });
             checker.stopMonitoring(group.getTargetGroupArn());
             verify(scheduled).cancelTimer(2L);
             assertEquals("initial", checker.getState(group.getTargetGroupArn(), target.getId(), target.getPort()));
         } finally {
-            checker.stopMonitoring(group.getTargetGroupArn());
             close(server);
         }
     }

@@ -176,6 +176,19 @@ public final class ContainerCaBundle {
         return Files.isReadable(trustStore) ? Optional.of(trustStore) : Optional.empty();
     }
 
+    /** Trust the configured HTTPS certificate chain and certificates issued by the local CA. */
+    public static String endpointTrustPem(EmulatorConfig config, String localCa)
+            throws IOException, GeneralSecurityException {
+        if (!config.tls().enabled() || config.tls().keyPath().filter(path -> !path.isBlank()).isEmpty()) {
+            return localCa;
+        }
+        Optional<String> certificate = config.tls().certPath().filter(path -> !path.isBlank());
+        if (certificate.isEmpty()) {
+            return localCa;
+        }
+        return certificatePem(Files.readString(Path.of(certificate.get()))) + localCa;
+    }
+
     /**
      * The certificate blocks of a PEM text, re-encoded one after the other; a private key or any
      * other PEM object in the text is dropped. What Floci hands out from a user-provided certificate

@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.CapacityReservationSpecification;
@@ -89,7 +90,7 @@ public class AutoScalingReconciler {
     private final SsmCommandService ssmCommandService;
     private final ScheduledExecutorService scheduler;
     private final KeyedWorkQueue<AutoScalingGroupChanged> changes;
-    private int repairCursor;
+    private String repairCursor;
     private final ExecutorService launchWaiters = Executors.newVirtualThreadPerTaskExecutor();
     private final Set<PendingLaunch> pendingLaunches = ConcurrentHashMap.newKeySet();
 
@@ -147,36 +148,27 @@ public class AutoScalingReconciler {
         changes.submit(change);
     }
 
-    private void requestAll() {
-        List<AutoScalingGroupChanged> groups = new ArrayList<>();
+    void requestAll() {
         try {
-            for (String accountId : asgService.autoScalingGroupAccountIds()) {
-                try {
-                    RequestScopes.runAs(accountId, () -> {
-                        for (AutoScalingGroup group : asgService.describeAutoScalingGroups(null, null)) {
-                            groups.add(new AutoScalingGroupChanged(accountId,
-                                    group.getRegion(), group.getAutoScalingGroupName()));
-                        }
-                    });
-                } catch (RuntimeException failure) {
-                    LOG.warnv(failure, "Could not enumerate Auto Scaling repair for account {0}", accountId);
-                }
-            }
-            groups.sort(Comparator.comparing(AutoScalingGroupChanged::accountId)
-                    .thenComparing(AutoScalingGroupChanged::region).thenComparing(AutoScalingGroupChanged::name));
-            if (groups.isEmpty()) {
+            Map<String, AccountAwareStorageBackend.AccountEntry<AutoScalingGroup>> page =
+                    asgService.repairInventoryPage(repairCursor, MAX_PENDING_CHANGES);
+            if (page.isEmpty()) {
+                repairCursor = null;
                 return;
             }
-            int start = Math.floorMod(repairCursor, groups.size());
-            for (int offset = 0; offset < groups.size(); offset++) {
-                int index = (start + offset) % groups.size();
-                if (!changes.submit(groups.get(index))) {
-                    // Resume at the rejected resource so a large inventory does not starve its tail.
-                    repairCursor = index;
-                    return;
+            for (Map.Entry<String, AccountAwareStorageBackend.AccountEntry<AutoScalingGroup>> row : page.entrySet()) {
+                AccountAwareStorageBackend.AccountEntry<AutoScalingGroup> entry = row.getValue();
+                AutoScalingGroup group = entry.value();
+                if (group != null && group.getRegion() != null && group.getAutoScalingGroupName() != null) {
+                    AutoScalingGroupChanged change = new AutoScalingGroupChanged(entry.accountId(),
+                            group.getRegion(), group.getAutoScalingGroupName());
+                    if (!changes.submit(change)) {
+                        // Keep the rejected row after the cursor so the next sweep retries it.
+                        return;
+                    }
                 }
+                repairCursor = row.getKey();
             }
-            repairCursor = 0;
         } catch (RuntimeException failure) {
             LOG.warnv(failure, "Could not schedule Auto Scaling repair; the next sweep will retry");
         }
@@ -382,7 +374,9 @@ public class AutoScalingReconciler {
                 }
                 if ("running".equals(ec2State)) {
                     boolean returningFromStandby = asgInst.getStandbyActivityId() != null;
-                    if (!returningFromStandby && "Pending".equals(asgInst.getLifecycleState())
+                    // An attached instance was not launched by the group, so it only waits for registration.
+                    if (!returningFromStandby && !asgInst.isPendingAttachment()
+                            && "Pending".equals(asgInst.getLifecycleState())
                             && asgService.beginLaunchLifecycleActions(asg, asgInst, Instant.now())) {
                         changed = true;
                         continue;
@@ -390,7 +384,12 @@ public class AutoScalingReconciler {
                     registerWithTargetGroups(asg, asgInst, returningFromStandby);
                     registerWithClassicLoadBalancers(asg, asgInst, returningFromStandby);
                     asgInst.setLifecycleState("InService");
-                    if (returningFromStandby) {
+                    if (asgInst.isPendingAttachment()) {
+                        asgInst.setPendingAttachment(false);
+                        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                                "Attaching an EC2 instance: " + asgInst.getInstanceId(),
+                                "An instance was attached to the Auto Scaling group.", "Successful");
+                    } else if (returningFromStandby) {
                         asgService.completeStandbyActivity(asgInst, "Successful", null);
                     } else {
                         asgInst.setHealthStatus("Healthy");
@@ -1122,8 +1121,8 @@ public class AutoScalingReconciler {
             } catch (Exception e) {
                 LOG.warnv(e, "ASG {0}: could not register {1} with Classic ELB {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), lbName, e.getMessage());
-                if (returningFromStandby && !(e instanceof AwsException aws
-                        && "LoadBalancerNotFound".equals(aws.getErrorCode()))) {
+                if (asgInst.isPendingAttachment() || (returningFromStandby && !(e instanceof AwsException aws
+                        && "LoadBalancerNotFound".equals(aws.getErrorCode())))) {
                     throw e;
                 }
             }
@@ -1142,8 +1141,8 @@ public class AutoScalingReconciler {
             } catch (Exception e) {
                 LOG.warnv(e, "ASG {0}: could not register {1} with TG {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), tgArn, e.getMessage());
-                if (returningFromStandby && !(e instanceof AwsException aws
-                        && "TargetGroupNotFound".equals(aws.getErrorCode()))) {
+                if (asgInst.isPendingAttachment() || (returningFromStandby && !(e instanceof AwsException aws
+                        && "TargetGroupNotFound".equals(aws.getErrorCode())))) {
                     throw e;
                 }
             }

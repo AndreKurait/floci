@@ -16,6 +16,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,7 +31,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
 class Ec2CapacityReservationMoveServiceTest {
@@ -63,6 +66,45 @@ class Ec2CapacityReservationMoveServiceTest {
         assertCounts(source, 0, 0);
         assertEquals("cancelled", describe(source).getState());
         assertCounts(destination, 4, 4);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void commitmentBlocksEitherSideWithoutConsumingMoveToken(boolean futureSource) {
+        service = spy(service);
+        Instant now = Instant.parse("2026-10-01T00:00:00Z");
+        Instant start = now.plus(Duration.ofDays(7));
+        Instant commitmentEnd = start.plusSeconds(3600);
+        doReturn(now).when(service).capacityReservationNow();
+        CapacityReservation future = service.createCapacityReservation(REGION, "t3.micro", "Linux/UNIX",
+                REGION + "a", null, 16, null, null, null, null, null, "targeted", null, null,
+                start, 3600L, "incremental", "future-reservation");
+        CapacityReservation immediate = create(service, 3);
+        CapacityReservation source = futureSource ? future : immediate;
+        CapacityReservation destination = futureSource ? immediate : future;
+        int sourceCount = futureSource ? 16 : 3;
+        int destinationCount = futureSource ? 3 : 16;
+
+        doReturn(start).when(service).capacityReservationNow();
+        assertEquals("active", describe(future).getState());
+        assertError("Unsupported", () -> move(source, destination, 1, "after-commitment"));
+        assertCounts(source, sourceCount, sourceCount);
+        assertCounts(destination, destinationCount, destinationCount);
+        assertTrue(describe(source).getCompletedMoves().isEmpty());
+        doReturn(commitmentEnd.minusSeconds(1)).when(service).capacityReservationNow();
+        assertError("Unsupported", () -> move(source, destination, 1, "after-commitment"));
+
+        doReturn(commitmentEnd).when(service).capacityReservationNow();
+        Ec2Service.CapacityReservationMoveResult moved = move(source, destination, 1, "after-commitment");
+        assertCounts(source, sourceCount - 1, sourceCount - 1);
+        assertCounts(destination, destinationCount + 1, destinationCount + 1);
+        CapacityReservation retained = futureSource ? moved.source() : moved.destination();
+        assertEquals(start, retained.getStartDate());
+        assertEquals(commitmentEnd, retained.getCommitmentEndDate());
+        assertEquals(16, retained.getCommittedInstanceCount());
+        move(source, destination, 1, "after-commitment");
+        assertCounts(source, sourceCount - 1, sourceCount - 1);
+        assertCounts(destination, destinationCount + 1, destinationCount + 1);
     }
 
     @Test

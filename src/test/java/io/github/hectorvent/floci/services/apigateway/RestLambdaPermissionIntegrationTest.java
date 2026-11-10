@@ -13,6 +13,8 @@ import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -31,14 +33,17 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -50,6 +55,10 @@ class RestLambdaPermissionIntegrationTest {
     private static final String FOREIGN = "343434343434";
     private static final String CALLER = "565656565656";
     private static final String REGION = "us-east-1";
+
+    private Supplier<String> userNames = () -> "rest-caller-permission-" + UUID.randomUUID().toString().substring(0, 8);
+
+    private Supplier<String> roleNames = () -> "rest-caller-role-" + UUID.randomUUID().toString().substring(0, 8);
 
     @InjectSpy
     LambdaService lambda;
@@ -170,10 +179,10 @@ class RestLambdaPermissionIntegrationTest {
     void verifiedCallerPoliciesControlQualifiedLambda(String type, String callerAccount, String targetOwner,
                                                       String targetRegion) throws Exception {
         Fixture fixture = fixture(type, targetOwner, targetRegion, "arn:aws:iam::*:user/*");
-        String user = "rest-caller-permission-" + UUID.randomUUID().toString().substring(0, 8);
-        cleanup.register(() -> callerIam(callerAccount, "DeleteUser", Map.of("UserName", user)));
+        String user = userNames.get();
         String principal = callerIam(callerAccount, "CreateUser", Map.of("UserName", user))
                 .xmlPath().getString("CreateUserResponse.CreateUserResult.User.Arn");
+        cleanup.register(() -> callerIam(callerAccount, "DeleteUser", Map.of("UserName", user)));
         Response created = callerIam(callerAccount, "CreateAccessKey", Map.of("UserName", user));
         CallerKey key = new CallerKey(created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId"),
                 created.xmlPath().getString("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.SecretAccessKey"), null);
@@ -204,13 +213,13 @@ class RestLambdaPermissionIntegrationTest {
     @CsvSource({"AWS_PROXY", "AWS"})
     void issuedSessionTokenAndSessionPolicyRemainEffective(String type) throws Exception {
         Fixture fixture = fixture(type, OWNER, REGION, "arn:aws:iam::*:user/*");
-        String name = "rest-caller-role-" + UUID.randomUUID().toString().substring(0, 8);
+        String name = roleNames.get();
         String trust = """
                 {"Statement":{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
                 "Action":"sts:AssumeRole"}}""".formatted(OWNER);
-        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
         String role = callerIam(OWNER, "CreateRole", Map.of("RoleName", name, "Path", "/caller-path/",
                 "AssumeRolePolicyDocument", trust)).xmlPath().getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
         String policy = """
                 {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
                 .formatted(fixture.arn());
@@ -228,6 +237,79 @@ class RestLambdaPermissionIntegrationTest {
                 "PolicyDocument", policy.replace("Allow", "Deny")));
         signedInvoke(fixture, allowed, allowed.secretAccessKey(), 500);
         verifyInvocations(fixture, 2);
+    }
+
+    @Test
+    void rejectedSessionRoleCreationPreservesPreexistingRole() throws Exception {
+        String name = "rest-existing-" + UUID.randomUUID();
+        iam("CreateRole", Map.of("RoleName", name, "AssumeRolePolicyDocument", "{\"Statement\":[]}"));
+        cleanup.register(() -> iam("DeleteRole", Map.of("RoleName", name)));
+        RestLambdaPermissionIntegrationTest fixture = nestedFixture(name);
+        try {
+            assertThrows(AssertionError.class, () -> fixture.issuedSessionTokenAndSessionPolicyRemainEffective("AWS_PROXY"));
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        iam("GetRole", Map.of("RoleName", name));
+    }
+
+    @Test
+    void successfulSessionScenarioRemovesOwnedRoleAndPolicy() throws Exception {
+        String name = "rest-owned-" + UUID.randomUUID();
+        RestLambdaPermissionIntegrationTest fixture = nestedFixture(name);
+        try {
+            fixture.issuedSessionTokenAndSessionPolicyRemainEffective("AWS_PROXY");
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        given().header("Authorization", EnforcementFixtures.auth(OWNER, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "GetRole")
+                .formParam("RoleName", name).post("/").then().statusCode(404);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"AWS_PROXY,121212121212,121212121212,us-east-1", "AWS,121212121212,121212121212,us-east-1",
+            "AWS_PROXY,565656565656,343434343434,eu-west-1", "AWS,565656565656,343434343434,eu-west-1"})
+    void rejectedCallerCreationPreservesPreexistingUser(String type, String callerAccount, String targetOwner,
+                                                       String targetRegion) throws Exception {
+        String name = "rest-existing-user-" + UUID.randomUUID();
+        callerIam(callerAccount, "CreateUser", Map.of("UserName", name));
+        cleanup.register(() -> callerIam(callerAccount, "DeleteUser", Map.of("UserName", name)));
+        RestLambdaPermissionIntegrationTest fixture = nestedFixture("unused-role");
+        fixture.userNames = () -> name;
+        try {
+            assertThrows(AssertionError.class, () -> fixture.verifiedCallerPoliciesControlQualifiedLambda(
+                    type, callerAccount, targetOwner, targetRegion));
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        callerIam(callerAccount, "GetUser", Map.of("UserName", name));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"AWS_PROXY,121212121212,121212121212,us-east-1", "AWS,121212121212,121212121212,us-east-1",
+            "AWS_PROXY,565656565656,343434343434,eu-west-1", "AWS,565656565656,343434343434,eu-west-1"})
+    void successfulCallerScenarioRemovesOwnedUserKeyAndPolicy(String type, String callerAccount, String targetOwner,
+                                                              String targetRegion) throws Exception {
+        String name = "rest-owned-user-" + UUID.randomUUID();
+        RestLambdaPermissionIntegrationTest fixture = nestedFixture("unused-role");
+        fixture.userNames = () -> name;
+        try {
+            fixture.verifiedCallerPoliciesControlQualifiedLambda(type, callerAccount, targetOwner, targetRegion);
+        } finally {
+            fixture.cleanup.afterEach(mock(ExtensionContext.class));
+        }
+        given().header("Authorization", EnforcementFixtures.auth(callerAccount, "iam"))
+                .contentType("application/x-www-form-urlencoded").formParam("Action", "GetUser")
+                .formParam("UserName", name).post("/").then().statusCode(404);
+    }
+
+    private RestLambdaPermissionIntegrationTest nestedFixture(String name) {
+        RestLambdaPermissionIntegrationTest fixture = new RestLambdaPermissionIntegrationTest();
+        fixture.baseUri = baseUri;
+        fixture.lambda = lambda;
+        fixture.roleNames = () -> name;
+        return fixture;
     }
 
     private static CallerKey assume(String role, String policy) {

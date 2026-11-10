@@ -71,7 +71,9 @@ An explicitly supplied network interface must still exist: a deleted interface r
 `InvalidNetworkInterfaceID.NotFound` before exact replay or parameter mismatch.
 `DryRun` retains its validation behavior and does not consume a token.
 
-A subnet or explicit availability zone scopes the token to that zone. A request without either
+A subnet or explicit availability zone, supplied by name or ID, scopes the token to that zone.
+Request placement overrides launch-template placement for both launch and replay.
+A request without either
 binds to its selected zone; an explicit request for that zone uses the same outcome and must
 match the original parameters. Other zones are independent. Request matching retains original
 parameter presence, including omitted versus explicit `Monitoring.Enabled=false` and
@@ -83,6 +85,8 @@ The journal and generated resource ownership use the EC2 storage backend. Persis
 and WAL modes persist allocation intent before resource publication and flush launch resources
 before acknowledging a completed outcome. Interrupted attempts reclaim their owned resources
 before retry; cleanup failures retain that ownership for retry or service startup recovery.
+This includes a generated primary interface requested to survive normal instance termination.
+Compensation preserves supplied interfaces and generated interfaces subsequently attached to another instance.
 Startup logs failed recovery attempts and continues recovering other pending requests and zones.
 Memory mode remains volatile. This is request replay, separate from Capacity Reservation
 membership recovery. Tokens and protected instance tombstones currently have no automatic
@@ -524,6 +528,13 @@ the sole nameserver before starting workloads. Workloads inherit that resolver
 file, so ordinary DNS works on an internal Docker network without an external
 gateway. Floci handles recursive lookups and the workload VPC's Resolver rules.
 The existing DNS packet exception still permits only port 53 at that resolver.
+
+Protected namespaces also route IPv4 DNS requests to `169.254.169.253` through
+that same configured resolver. UDP and TCP port 53 retain the namespace's
+registered VPC identity, including on internal Docker networks without a default
+route. This DNS route is installed before workload startup and removed with the
+owned namespace. It does not attach workloads to the host metadata network or
+grant access to other ports, EC2 instance metadata, or arbitrary upstream DNS.
 
 Rule and prefix-list updates refresh protected workloads in the caller's account and region.
 Workloads in other accounts keep their own groups and prefix-list entries.
@@ -1393,6 +1404,9 @@ Capacity moves require different, active reservations in the caller's account an
 with matching instance type, platform, Availability Zone, tenancy, placement group and
 end time. Eligibility (`open` or `targeted`) and tags can differ. Both total and available
 counts are updated, and moving all capacity cancels the empty source reservation.
+Moving capacity is rejected while either reservation has an active commitment period.
+After the period ends, the usual move eligibility checks apply; rejected requests do not
+consume a move token or change either reservation's capacity.
 `DryRun` checks permissions without moving capacity. Case-sensitive `ClientToken` retries
 do not move capacity twice, including after a storage restart. A matching retry requires
 both reservations to remain active; a cancelled reservation returns `Unsupported`.
@@ -1472,8 +1486,8 @@ prevents new admissions; existing membership remains until the instance stops or
 or the reservation is cancelled or expires. Restart checks current sharing authorization.
 Consumed capacity moves retain member ownership and require the recipient to be authorized
 to use the destination. Capacity updates across owners publish in one atomic storage batch.
-Future-dated commitment periods and Capacity Blocks are not modeled.
-The consumed-sharing and inflight compatibility matrix remains incomplete.
+Capacity Blocks are not modeled by the move operation. The consumed-sharing and inflight
+compatibility matrix remains incomplete.
 
 Capacity reservation zone IDs must be among those returned by `DescribeAvailabilityZones`.
 
@@ -1627,6 +1641,13 @@ These members of `RequestLaunchTemplateData` are stored and read back unchanged 
 `InstanceRequirementsRequest`, including the nested `BaselinePerformanceFactors.Cpu.References`.
 Within `NetworkInterfaces`, `ConnectionTrackingSpecification` is stored and read back with all
 three of its timeout members.
+
+`RunInstances` accepts either `Placement.AvailabilityZone` or `Placement.AvailabilityZoneId`.
+The request's selector takes precedence over either selector in the selected launch template;
+when neither is requested, the template supplies the zone. Zone IDs must be published by
+`DescribeAvailabilityZones`, and specifying both selectors is rejected. An explicit subnet or
+existing primary network interface must belong to the selected zone; invalid or contradictory
+placement is rejected before launch, including dry runs.
 
 At launch, `RunInstances` and `CreateFleet` apply the template's `BlockDeviceMappings` under the
 request's, field by field: a request entry for a `DeviceName` the template maps, spelled `xvdf` or
@@ -1802,7 +1823,16 @@ Setting it to `true` for an existing interface is rejected before launch.
 Both instance and interface descriptions report the selected value. Stopping an instance
 keeps the attachment; termination deletes an interface marked for deletion and returns
 a retained interface to `available`, preserving its private address, groups, tags, and
-Elastic IP association. A retained interface can be reused by a later launch.
+Elastic IP association. A retained interface can be reused by a later launch. In container mode,
+launch, start, and metadata restoration also synchronize its primary private address and
+DNS name with the attached instance interface. AWS-faithful private-address mode keeps the
+allocated address. Secondary private-address entries, tags, groups, and attachment identity
+are preserved.
+
+Launch-template `network-interface` tags apply to the primary interface created by
+the launch. Request tags override matching template keys. Template interface tags
+do not retag a supplied interface or propagate to secondary interfaces. Tags stay
+visible through `DescribeTags` and `DescribeNetworkInterfaces` after retention.
 
 `ModifyNetworkInterfaceAttribute` is not implemented: no example in the corpus that needed `CreateNetworkInterface` was found to need it. A route table's `CreateRoute` with a `NetworkInterfaceId` target is accepted but not recorded, since `Route` does not yet model an ENI target; a subsequent `plan` against such a route may show drift.
 
@@ -2054,6 +2084,11 @@ Each VPC is backed by a real Docker network, created lazily when the first insta
 launches. An instance's reported private IP is then an address its container actually holds, drawn
 from the subnet CIDR the caller declared, not a plausible-looking number. Instances in the same
 VPC reach each other at those addresses; instances in different VPCs sit on different bridges.
+
+If a Docker network-attach request fails, Floci checks the guest's actual endpoint on the
+requested VPC network. A confirmed match at the requested private address recovers a lost
+response. An absent or different endpoint, or an unsuccessful inspection, fails the launch
+through normal instance cleanup. It does not silently start the guest on its bridge alone.
 
 `CreateVpc` and `CreateSubnet` record declarations without contacting Docker. CIDR collision
 checks and fallback address planning run when a consumer first needs an effective address or

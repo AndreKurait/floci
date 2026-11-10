@@ -7,6 +7,8 @@ import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.command.CreateNetworkCmd;
 import com.github.dockerjava.api.command.CreateNetworkResponse;
 import com.github.dockerjava.api.command.DisconnectFromNetworkCmd;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectNetworkCmd;
 import com.github.dockerjava.api.command.ListNetworksCmd;
 import com.github.dockerjava.api.command.RemoveNetworkCmd;
@@ -41,6 +43,7 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -807,6 +810,70 @@ class VpcNetworkManagerTest {
         assertEquals(-1, flociEndpoint.required("GwPriority").intValue());
         assertFalse(guestEndpoint.has("GwPriority"), "guest routing retains Docker's default priority");
         assertEquals(address, guestEndpoint.path("IPAMConfig").path("IPv4Address").asText());
+    }
+
+    @Test
+    void lostAttachResponseAcceptsTheConfirmedPrivateEndpoint() {
+        String address = prepareUncertainAttach();
+        InspectContainerResponse inspection = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        ContainerNetwork endpoint = observedEndpoint(address);
+        String networkName = manager.networkName(REGION, "vpc-1");
+        when(inspection.getNetworkSettings().getNetworks()).thenReturn(Map.of(
+                networkName, endpoint));
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("instance-1")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(inspection);
+
+        assertEquals(Optional.of(manager.networkName(REGION, "vpc-1")),
+                manager.attach(REGION, "vpc-1", "subnet-a", "instance-1", address));
+        verify(docker.connectToNetworkCmd(), times(1)).exec();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "10.0.1.99"})
+    void failedAttachCannotFallBackToAnUnconnectedOrDifferentAddress(String observedAddress) {
+        String address = prepareUncertainAttach();
+        InspectContainerResponse inspection = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        Map<String, ContainerNetwork> endpoints = observedAddress.isEmpty()
+                ? Map.of()
+                : Map.of(manager.networkName(REGION, "vpc-1"),
+                        observedEndpoint(observedAddress));
+        when(inspection.getNetworkSettings().getNetworks()).thenReturn(endpoints);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("instance-1")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(inspection);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.attach(REGION, "vpc-1", "subnet-a", "instance-1", address));
+        assertEquals("response lost", failure.getCause().getMessage());
+    }
+
+    @Test
+    void failedAttachAndInspectionPreserveBothFailures() {
+        String address = prepareUncertainAttach();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("instance-1")).thenReturn(inspect);
+        IllegalStateException inspectFailure = new IllegalStateException("daemon unavailable");
+        when(inspect.exec()).thenThrow(inspectFailure);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.attach(REGION, "vpc-1", "subnet-a", "instance-1", address));
+        assertEquals("response lost", failure.getCause().getMessage());
+        assertSame(inspectFailure, failure.getCause().getSuppressed()[0]);
+    }
+
+    private String prepareUncertainAttach() {
+        manager.declareVpc(REGION, "vpc-1", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-1", "subnet-a", "10.0.1.0/24");
+        ConnectToNetworkCmd connect = docker.connectToNetworkCmd();
+        doThrow(new IllegalStateException("response lost")).when(connect).exec();
+        return manager.allocatePrivateIp(REGION, "subnet-a").orElseThrow();
+    }
+
+    private ContainerNetwork observedEndpoint(String address) {
+        ContainerNetwork endpoint = mock(ContainerNetwork.class);
+        when(endpoint.getIpAddress()).thenReturn(address);
+        return endpoint;
     }
 
     @Test

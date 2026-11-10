@@ -183,8 +183,6 @@ public class ServiceRoleCallAuthorizer {
         principalContext.put("aws:CurrentTime", List.of(now.toString()));
         principalContext.put("aws:EpochTime", List.of(Long.toString(now.getEpochSecond())));
         principal.putPrincipalKeys(principalContext);
-        Map.copyOf(role.getTags()).forEach((key, value) ->
-                principalContext.put("aws:PrincipalTag/" + key, List.of(value)));
         Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
                 principalContext, resourceArn, region, roleId.accountId(), owner);
         ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,

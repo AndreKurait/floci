@@ -41,6 +41,16 @@ security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db 
 
 Disabling verification (`--no-verify-ssl`, `verify=False`, `NODE_TLS_REJECT_UNAUTHORIZED=0`) still works but is no longer needed.
 
+For managed Java Lambda runtimes, an explicit Docker bind over
+`/var/lang/lib/security/cacerts` or `/etc/pki/ca-trust/extracted/java/cacerts`,
+including a parent directory, keeps that mounted runtime truststore in control.
+For the default public Java runtime images, Floci does not inject its JVM
+truststore option in that case. Container paths are matched case-sensitively
+on every host OS. Custom Java runtime images retain automatic injection because
+their truststore layout is not established by those standard paths. Supply the roots
+the workload needs in the mounted store; certificate verification stays enabled.
+Container-image Lambda functions retain their existing truststore injection.
+
 ## Configuration
 
 | Environment Variable | Default | Description |
@@ -63,7 +73,9 @@ With TLS enabled, the proxy that accepts HTTP and HTTPS on Floci's ports listens
 
 The proxy preserves the original client address and port for both protocols using
 a PROXY protocol preface on its connection to Quarkus. The internal HTTP and HTTPS
-listeners remain on loopback and require that preface. Clients should use the
+listeners remain on loopback and require that preface. Their loopback address,
+internal ports, and PROXY protocol setting take precedence over system-property
+overrides; the public proxy still uses the configured host. Clients should use the
 public Floci port. Client-supplied `Forwarded` and `X-Forwarded-For` headers remain
 subject to the configured forwarding policy; the TCP proxy does not use them to
 choose the client's address.

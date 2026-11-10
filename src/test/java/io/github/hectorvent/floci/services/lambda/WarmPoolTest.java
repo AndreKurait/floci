@@ -1353,6 +1353,72 @@ class WarmPoolTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"222222222222,us-east-1", "111111111111,eu-west-1"})
+    void recreatedOwnerRetainsIdleWorkerWhenOtherOwnerIsAtItsCap(String account, String region) {
+        WarmPool pool = buildPool(Optional.of(1), 0);
+        pool.init();
+        LambdaFunction owner = scopedFunction("111111111111", "us-east-1", "$LATEST");
+        LambdaFunction other = scopedFunction(account, region, "$LATEST");
+        ContainerHandle original = new ContainerHandle("original", "shared", null, ContainerState.WARM);
+        ContainerHandle foreign = new ContainerHandle("foreign", "shared", null, ContainerState.WARM);
+        ContainerHandle recreated = new ContainerHandle("recreated", "shared", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(original, foreign, recreated);
+        when(containerLauncher.isAlive(any())).thenReturn(true);
+        try {
+            pool.release(pool.acquire(owner));
+            pool.drainFunction(owner);
+            pool.release(pool.acquire(other));
+            pool.release(pool.acquire(owner));
+
+            verify(containerLauncher).stop(original);
+            verify(containerLauncher, never()).stop(foreign);
+            verify(containerLauncher, never()).stop(recreated);
+            assertSame(foreign, pool.acquire(other));
+            assertSame(recreated, pool.acquire(owner));
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void ownedVersionsStillShareIdleCap() {
+        WarmPool pool = buildPool(Optional.of(1), 0);
+        pool.init();
+        LambdaFunction latest = scopedFunction("111111111111", "us-east-1", "$LATEST");
+        LambdaFunction version = scopedFunction("111111111111", "us-east-1", "1");
+        ContainerHandle first = new ContainerHandle("latest", "shared", null, ContainerState.WARM);
+        ContainerHandle second = new ContainerHandle("version", "shared", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(first, second);
+        try {
+            pool.release(pool.acquire(latest));
+            pool.release(pool.acquire(version));
+            verify(containerLauncher, never()).stop(first);
+            verify(containerLauncher).stop(second);
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void globalIdleCapStillEvictsAcrossFunctionOwners() {
+        WarmPool pool = buildPool(Optional.of(1), 1);
+        pool.init();
+        LambdaFunction owner = scopedFunction("111111111111", "us-east-1", "$LATEST");
+        LambdaFunction other = scopedFunction("222222222222", "us-east-1", "$LATEST");
+        ContainerHandle first = new ContainerHandle("owner", "shared", null, ContainerState.WARM);
+        ContainerHandle second = new ContainerHandle("other", "shared", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(first, second);
+        try {
+            pool.release(pool.acquire(owner));
+            pool.release(pool.acquire(other));
+            verify(containerLauncher).stop(first);
+            verify(containerLauncher, never()).stop(second);
+        } finally {
+            pool.shutdown();
+        }
+    }
+
     private static LambdaFunction scopedFunction(String account, String region, String version) {
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("shared");

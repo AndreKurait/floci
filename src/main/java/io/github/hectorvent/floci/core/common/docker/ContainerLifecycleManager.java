@@ -1796,10 +1796,16 @@ public class ContainerLifecycleManager {
         if (networks != null) {
             // Prefer the configured network so that when the container is on both
             // bridge (default) and the service network, we return the right IP.
-            if (preferredNetwork != null && networks.containsKey(preferredNetwork)) {
-                String ip = networks.get(preferredNetwork).getIpAddress();
-                if (ip != null && !ip.isBlank()) {
-                    return ip;
+            if (preferredNetwork != null) {
+                for (Map.Entry<String, ContainerNetwork> entry : networks.entrySet()) {
+                    ContainerNetwork network = entry.getValue();
+                    if (network != null && (preferredNetwork.equals(entry.getKey())
+                            || preferredNetwork.equals(network.getNetworkID()))) {
+                        String ip = network.getIpAddress();
+                        if (ip != null && !ip.isBlank()) {
+                            return ip;
+                        }
+                    }
                 }
             }
             // Fall back to any network

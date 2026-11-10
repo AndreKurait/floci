@@ -15,6 +15,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -276,6 +278,52 @@ class LambdaExecutorServiceTest {
         executor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse, 0, null, clientContext);
 
         assertEquals(clientContext, seen.get());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "RequestResponse, 1, live, live, false",
+            "Event, 1, live, live, false",
+            "RequestResponse, 1, live, live, true",
+            "Event, 1, live, live, true",
+            "RequestResponse, 1, 1, 1, false",
+            "Event, 1, 1, 1, false",
+            "RequestResponse, $LATEST, $LATEST, $LATEST, false",
+            "Event, $LATEST, $LATEST, $LATEST, false",
+            "RequestResponse, $LATEST, , '', false",
+            "Event, $LATEST, , '', false"
+    })
+    void runtimeReceivesTheInvokedQualifierInsteadOfTheResolvedVersion(
+            InvocationType type, String version, String qualifier, String expectedQualifier,
+            boolean provisioned) throws Exception {
+        String baseArn = fn.getFunctionArn();
+        fn.setVersion(version);
+        if (!"$LATEST".equals(version)) {
+            fn.setFunctionArn(baseArn + ":" + version);
+        }
+        RuntimeApiServer runtime = mock(RuntimeApiServer.class);
+        ContainerHandle handle = new ContainerHandle("cid-context", "test-fn", runtime, ContainerState.WARM);
+        when(warmPool.acquire(fn)).thenReturn(handle);
+        if (provisioned) {
+            when(warmPool.acquireProvisioned(fn, qualifier)).thenReturn(handle);
+            when(concurrencyLimiter.acquireProvisioned(fn)).thenReturn(() -> {});
+        }
+        CompletableFuture<String> observedArn = new CompletableFuture<>();
+        doAnswer(call -> {
+            PendingInvocation invocation = call.getArgument(0);
+            observedArn.complete(invocation.getFunctionArn());
+            invocation.getResultFuture().complete(
+                    new InvokeResult(200, null, "{}".getBytes(), null, invocation.getRequestId()));
+            return invocation.getResultFuture();
+        }).when(runtime).enqueue(any(PendingInvocation.class));
+
+        InvokeResult result = executor.invoke(fn, "{}".getBytes(), type, 0, qualifier);
+
+        assertEquals(type == InvocationType.Event ? 202 : 200, result.getStatusCode());
+        String expectedArn = expectedQualifier.isEmpty() ? baseArn : baseArn + ":" + expectedQualifier;
+        assertEquals(expectedArn, observedArn.get(5, TimeUnit.SECONDS));
+        assertEquals(version, fn.getVersion());
+        verify(warmPool, timeout(5000)).release(handle);
     }
 
     @Test

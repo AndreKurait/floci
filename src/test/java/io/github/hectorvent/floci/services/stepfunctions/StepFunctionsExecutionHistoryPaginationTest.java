@@ -135,6 +135,14 @@ class StepFunctionsExecutionHistoryPaginationTest {
         assertError("ValidationException", request().put("maxResults", size));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "\"false\"", "{}", "[]"})
+    void nonBooleanExecutionDataProjectionIsRejected(String value) throws Exception {
+        ObjectNode request = request();
+        request.set("includeExecutionData", mapper.readTree(value));
+        assertError("ValidationException", request);
+    }
+
     private ObjectNode request() {
         return mapper.createObjectNode().put("executionArn", ARN);
     }

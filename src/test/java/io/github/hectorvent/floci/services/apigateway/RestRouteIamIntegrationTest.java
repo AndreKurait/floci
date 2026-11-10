@@ -24,6 +24,8 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
+import software.amazon.awssdk.services.sts.StsClient;
+import software.amazon.awssdk.services.sts.model.Credentials;
 
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -70,6 +72,35 @@ class RestRouteIamIntegrationTest {
                     patch.op("replace").path("/policy").value(deny)));
             invoke(fixture, key, 403);
             assertEquals(1, fixture.hits().get());
+        }
+    }
+
+    @Test
+    void federatedUserRechecksIssuerTagsAlongsideItsSessionPolicy() throws Exception {
+        Fixture fixture = fixture("GET");
+        String issuerPolicy = "{\"Statement\":{\"Effect\":\"Allow\","
+                + "\"Action\":[\"execute-api:Invoke\",\"sts:GetFederationToken\"],\"Resource\":\"*\"}}";
+        String sessionPolicy = conditionedPolicy(fixture.arn(),
+                "\"StringEquals\":{\"aws:PrincipalTag/department\":\"engineering\"}");
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "rest-fed-tags-", "invoke", issuerPolicy);
+             StsClient sts = StsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                     .credentialsProvider(StaticCredentialsProvider.create(
+                             AwsBasicCredentials.create(user.accessKeyId(), user.secretAccessKey()))).build()) {
+            Credentials session = sts.getFederationToken(request -> request.name("principal-tags")
+                    .policy(sessionPolicy)).credentials();
+            try {
+                Key key = new Key(session.accessKeyId(), session.secretAccessKey(), session.sessionToken());
+                invoke(fixture, key, 403);
+                SignedIamUsers.iam(endpoint, "TagUser", Map.of("UserName", user.name(),
+                        "Tags.member.1.Key", "department", "Tags.member.1.Value", "engineering")).then().statusCode(200);
+                invoke(fixture, key, 200);
+                SignedIamUsers.iam(endpoint, "UntagUser", Map.of("UserName", user.name(),
+                        "TagKeys.member.1", "department")).then().statusCode(200);
+                invoke(fixture, key, 403);
+                assertEquals(1, fixture.hits().get());
+            } finally {
+                iam.unregisterSession(OWNER, session.accessKeyId());
+            }
         }
     }
 

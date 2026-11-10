@@ -83,6 +83,45 @@ class Ec2InstanceCfnProvisionerTest {
                 eq(false), isNull());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"true", "null"})
+    void primaryInterfacePublicIpIsForwardedWhenTrueOrOmitted(String publicIp) throws Exception {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        stubLaunch(instance);
+        String publicIpProperty = "null".equals(publicIp) ? "" : ",\"AssociatePublicIpAddress\":true";
+
+        provisioner.provision(resource("Server"), props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-primary"%s}
+                ]}
+                """.formatted(publicIpProperty)), ctx());
+
+        ArgumentCaptor<Boolean> publicIpArgument = ArgumentCaptor.forClass(Boolean.class);
+        verify(ec2).runInstances(eq("us-east-1"), eq("ami-1"), eq("t3.micro"), eq(1), eq(1), isNull(),
+                anyList(), eq("subnet-primary"), isNull(), anyList(), isNull(), isNull(),
+                publicIpArgument.capture(), isNull(), eq(0), isNull(), isNull(), isNull(), isNull(),
+                eq(false), isNull(), isNull(), isNull(), eq(false), isNull());
+        assertEquals("null".equals(publicIp) ? null : Boolean.TRUE, publicIpArgument.getValue());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{}", "{\"DeviceIndex\":null}", "\"scalar\"", "null", "[]"})
+    void everyInterfaceIsValidatedAfterAValidPrimary(String invalidInterface) throws Exception {
+        StackResource resource = resource("Server");
+        resource.getAttributes().put("existing", "preserved");
+
+        assertThrows(AwsException.class, () -> provisioner.provision(resource, props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-primary"},%s
+                ]}
+                """.formatted(invalidInterface)), ctx()));
+
+        assertEquals(Map.of("existing", "preserved"), resource.getAttributes());
+        assertNull(resource.getPhysicalId());
+        verifyNoInteractions(ec2);
+    }
+
     @Test
     void changingThePrimaryInterfaceSubnetReplacesTheInstance() throws Exception {
         Instance previous = reusable("i-before");
@@ -103,6 +142,76 @@ class Ec2InstanceCfnProvisionerTest {
         assertEquals("i-after", resource.getPhysicalId());
         assertTrue(provisioner.hasReplacementUpdate(resource));
         assertEquals("i-before", provisioner.updateCleanupPhysicalId(resource));
+    }
+
+    @Test
+    void primaryInterfaceGroupsArePassedToTheLaunch() throws Exception {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        stubLaunch(instance);
+
+        provisioner.provision(resource("Server"), props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-1","GroupSet":["sg-primary"]}
+                ]}
+                """), ctx());
+
+        verify(ec2).runInstances(eq("us-east-1"), eq("ami-1"), eq("t3.micro"), eq(1), eq(1), isNull(),
+                eq(List.of("sg-primary")), eq("subnet-1"), isNull(), anyList(), isNull(), isNull(),
+                isNull(), isNull(), eq(0), isNull(), isNull(), isNull(), isNull(),
+                eq(false), isNull(), isNull(), isNull(), eq(false), isNull());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SecurityGroupIds", "SecurityGroups"})
+    void instanceGroupsCannotOverrideThePrimaryInterface(String property) throws Exception {
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(resource("Server"),
+                props("""
+                        {"ImageId":"ami-1","%s":["sg-override"],"NetworkInterfaces":[
+                          {"DeviceIndex":0,"SubnetId":"subnet-1","GroupSet":["sg-primary"]}
+                        ]}
+                        """.formatted(property)), ctx()));
+
+        assertEquals("InvalidParameterCombination", error.getErrorCode());
+        verifyNoInteractions(ec2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"{}", "\"sg-primary\""})
+    void primaryInterfaceGroupSetMustBeAList(String groups) throws Exception {
+        assertThrows(AwsException.class, () -> provisioner.provision(resource("Server"), props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-1","GroupSet":%s}
+                ]}
+                """.formatted(groups)), ctx()));
+
+        verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void rollingBackPrimaryInterfaceRemovalRestoresItsDeclaration() throws Exception {
+        Instance previous = reusable("i-before");
+        previous.setSubnetId("subnet-before");
+        stubLaunch(previous);
+        StackResource resource = resource("Server");
+        provisioner.provision(resource, props("""
+                {"ImageId":"ami-1","NetworkInterfaces":[
+                  {"DeviceIndex":0,"SubnetId":"subnet-before"}
+                ]}
+                """), ctx());
+        Map<String, String> declared = declarations(resource);
+        Instance replacement = new Instance();
+        replacement.setInstanceId("i-after");
+        replacement.setState(InstanceState.terminated());
+        stubLaunch(replacement);
+
+        provisioner.provision(resource, props("{\"ImageId\":\"ami-1\"}"), ctx("i-before"));
+
+        assertEquals("i-after", resource.getPhysicalId());
+        assertTrue(provisioner.hasReplacementUpdate(resource));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertEquals("i-before", resource.getPhysicalId());
+        assertEquals(declared, declarations(resource));
     }
 
     @ParameterizedTest

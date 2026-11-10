@@ -593,10 +593,22 @@ public class VpcNetworkManager {
                 throw new IllegalStateException("Cannot attach the protected namespace to native VPC "
                         + vpc.vpcId + " at " + address + ": " + e.getMessage(), e);
             }
-            LOG.warnv("Could not attach container {0} to VPC network {1} at {2}: {3}. The instance keeps "
-                            + "its bridge address and its reported private IP will not be reachable.",
-                    containerId, networkName, address, e.getMessage());
-            return Optional.empty();
+            // A lost response can follow a successful attach. Read the endpoint before failing launch.
+            try {
+                InspectContainerResponse inspection = dockerClient.inspectContainerCmd(containerId).exec();
+                Map<String, ContainerNetwork> networks = inspection.getNetworkSettings() == null
+                        ? null : inspection.getNetworkSettings().getNetworks();
+                ContainerNetwork endpoint = networks == null ? null : networks.get(networkName);
+                if (endpoint != null && address.equals(endpoint.getIpAddress())) {
+                    LOG.infov("Confirmed container {0} on VPC network {1} at {2} after an attach error",
+                            containerId, networkName, address);
+                    return Optional.of(networkName);
+                }
+            } catch (Exception inspectionFailure) {
+                e.addSuppressed(inspectionFailure);
+            }
+            throw new IllegalStateException("Cannot confirm container " + containerId
+                    + " on VPC network " + networkName + " at " + address, e);
         }
     }
 

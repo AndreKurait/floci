@@ -1,11 +1,15 @@
 package io.github.hectorvent.floci.services.eks;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.core.command.CopyArchiveToContainerCmdImpl;
+import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
+import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -14,6 +18,8 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.C
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.services.acm.CertificateGenerator;
+import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
@@ -27,6 +33,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
+
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -34,7 +45,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.security.KeyStore;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -47,6 +64,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -67,6 +85,8 @@ class EksClusterManagerArchiveRetryTest {
 
     private final List<ArchiveUpload> uploads = new ArrayList<>();
     private Function<ArchiveUpload, RuntimeException> failure = upload -> null;
+    private EmulatorConfig.TlsConfig tls;
+    private FlociCertificateAuthority certificateAuthority;
     private EmulatorConfig.EksServiceConfig eks;
     private ContainerLifecycleManager lifecycleManager;
     private EksOidcService oidcService;
@@ -77,7 +97,7 @@ class EksClusterManagerArchiveRetryTest {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         eks = mock(EmulatorConfig.EksServiceConfig.class);
-        EmulatorConfig.TlsConfig tls = mock(EmulatorConfig.TlsConfig.class);
+        tls = mock(EmulatorConfig.TlsConfig.class);
         when(config.services()).thenReturn(services);
         when(services.eks()).thenReturn(eks);
         when(config.tls()).thenReturn(tls);
@@ -119,7 +139,7 @@ class EksClusterManagerArchiveRetryTest {
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
         when(regionResolver.getDefaultRegion()).thenReturn("us-east-1");
-        FlociCertificateAuthority certificateAuthority = inlineMock(FlociCertificateAuthority.class);
+        certificateAuthority = inlineMock(FlociCertificateAuthority.class);
         when(certificateAuthority.caPem()).thenReturn(CA_PEM);
         oidcService = mock(EksOidcService.class);
 
@@ -127,6 +147,84 @@ class EksClusterManagerArchiveRetryTest {
                 mock(ContainerDetector.class), mock(PortAllocator.class), dockerHostResolver,
                 mock(EcrRegistryManager.class), config, regionResolver, null, oidcService, certificateAuthority,
                 null, null, 0L);
+    }
+
+    @Test
+    void configuredCertificateBundleTrustsTheServerAndKeepsTheLocalCa() throws Exception {
+        FlociCertificateAuthority local = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("local"));
+        FlociCertificateAuthority configured = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("configured"));
+        CertificateGenerator.GeneratedCertificate leaf = configured.issueServerCertificate("localhost",
+                List.of("localhost"), KeyAlgorithm.RSA_2048, null);
+        Path chain = Files.writeString(tempDir.resolve("chain.pem"),
+                leaf.certificatePem() + leaf.privateKeyPem() + configured.caPem());
+        when(tls.certPath()).thenReturn(Optional.of(chain.toString()));
+        when(tls.keyPath()).thenReturn(Optional.of(tempDir.resolve("server.key").toString()));
+        when(certificateAuthority.caPem()).thenReturn(local.caPem());
+
+        manager.registerPodIdentityWebhook(CONTAINER_ID, cluster());
+
+        assertEquals(1, uploads.size());
+        String actual = uploadedCa(uploads.getFirst());
+        assertFalse(actual.contains("PRIVATE KEY"));
+        assertEquals(ContainerCaBundle.certificatePem(leaf.certificatePem() + configured.caPem()) + local.caPem(), actual);
+        X509Certificate[] serverChain = {Pem.parseCertificate(leaf.certificatePem()), configured.certificate()};
+        X509TrustManager trust = trustManager(actual);
+        assertDoesNotThrow(() -> trust.checkServerTrusted(serverChain, "RSA"));
+        CertificateGenerator.GeneratedCertificate localLeaf = local.issueServerCertificate("localhost",
+                List.of("localhost"), KeyAlgorithm.RSA_2048, null);
+        X509Certificate[] localChain = {Pem.parseCertificate(localLeaf.certificatePem()), local.certificate()};
+        assertDoesNotThrow(() -> trust.checkServerTrusted(localChain, "RSA"));
+        X509TrustManager oldTrust = trustManager(local.caPem());
+        assertThrows(CertificateException.class, () -> oldTrust.checkServerTrusted(serverChain, "RSA"));
+    }
+
+    @Test
+    void adoptingASurvivingClusterRefreshesItsWebhookTrust() throws Exception {
+        Cluster cluster = cluster();
+        cluster.setNodeInstanceType("m5.large");
+        cluster.setDockerName("floci-aws-eks-demo");
+        manager.registerPodIdentityWebhook(CONTAINER_ID, cluster);
+        FlociCertificateAuthority configured = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("configured"));
+        when(tls.certPath()).thenReturn(Optional.of(configured.certificatePath().toString()));
+        when(tls.keyPath()).thenReturn(Optional.of(tempDir.resolve("server.key").toString()));
+        Container survivor = new ObjectMapper().readValue("""
+                {"Id":"container-1","Labels":{"io.floci.eks.node-capacity":"m5.large:unbounded"}}
+                """, Container.class);
+        when(lifecycleManager.findByName("floci-aws-eks-demo")).thenReturn(Optional.of(survivor));
+        when(lifecycleManager.adopt(CONTAINER_ID, List.of(6443), Optional.empty()))
+                .thenReturn(new ContainerInfo(CONTAINER_ID, Map.of(), Map.of(6443, 6520)));
+
+        manager.restoreCluster(cluster);
+
+        assertEquals(2, uploads.size(), "adoption must replace the old webhook manifest");
+        assertEquals(configured.caPem() + CA_PEM, uploadedCa(uploads.getLast()));
+        assertEquals(CONTAINER_ID, cluster.getContainerId());
+    }
+
+    private static X509TrustManager trustManager(String pem) throws Exception {
+        KeyStore store = KeyStore.getInstance("PKCS12");
+        store.load(null, null);
+        CertificateFactory certificates = CertificateFactory.getInstance("X.509");
+        int index = 0;
+        try (InputStream input = new ByteArrayInputStream(pem.getBytes(StandardCharsets.UTF_8))) {
+            for (Certificate certificate : certificates.generateCertificates(input)) {
+                store.setCertificateEntry("anchor-" + index++, certificate);
+            }
+        }
+        TrustManagerFactory factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        factory.init(store);
+        for (TrustManager trust : factory.getTrustManagers()) {
+            if (trust instanceof X509TrustManager x509) {
+                return x509;
+            }
+        }
+        throw new IllegalStateException("No X509 trust manager");
+    }
+
+    private static String uploadedCa(ArchiveUpload upload) {
+        String manifest = new String(upload.entries().getFirst().content(), StandardCharsets.UTF_8);
+        String encoded = manifest.split("caBundle: \"")[1].split("\"")[0];
+        return new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
     }
 
     @Test

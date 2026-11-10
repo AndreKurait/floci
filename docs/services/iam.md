@@ -2712,6 +2712,8 @@ floci populates:
   `logs:CreateLogStream`, `logs:DeleteLogStream`, `logs:TagResource`, `logs:UntagResource`,
   `logs:ListTagsForResource`, `logs:DeleteLogGroup`, `logs:PutRetentionPolicy` and
   `logs:DeleteRetentionPolicy` use the owning log group's tags.
+  EC2 security-group deletion and authorize/revoke ingress/egress requests read the
+  current tags of the group named by `GroupId`, including revocations that also name rule IDs.
 - `s3:ExistingObjectTag/<key>`: the tags already on the target object version, for
   `s3:GetObject`, `s3:GetObjectTagging`, `s3:GetObjectAcl`, `s3:PutObjectAcl`,
   `s3:DeleteObjectTagging`, `s3:PutObjectTagging` and the annotation actions, and for their
@@ -3102,10 +3104,9 @@ New local temporary credentials record their issuance time. Shared IAM principal
 exposes this timestamp as `aws:TokenIssueTime` for policy conditions, preserving it across
 storage serialization and later requests. Long-term access keys do not include this key.
 Older persisted session records without an issuance timestamp leave it absent; Floci does
-not derive a replacement timestamp from expiration or restart time. This does not add
-MFA/session-tag context or issue new service execution-role sessions.
+not derive a replacement timestamp from expiration or restart time.
 
-Attached IAM user and role tags are available as `aws:PrincipalTag/<key>` in resolved caller policy contexts, including existing local STS user and role sessions. Each resolution reads current identity tags and retains an immutable snapshot for that evaluation. Policy simulation still requires explicitly supplied tag context. Session-tag issuance, transitive tags and session-tag overrides are not implemented by this change.
+Attached IAM user and role tags are available as `aws:PrincipalTag/<key>` in resolved caller policy contexts, including existing local STS user and role sessions. Federated sessions also carry their issuing user's attached tags while retaining the federated principal's identity. Each resolution reads current identity tags and retains an immutable snapshot for that evaluation. Policy simulation still requires explicitly supplied tag context. Session-tag issuance, transitive tags and session-tag overrides are not implemented by this change.
 
 
 ### Service execution-role authorization sessions

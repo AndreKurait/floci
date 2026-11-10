@@ -33,7 +33,7 @@ through a suffix match or upstream DNS fallback.
 | ModifyLoadBalancerAttributes | Updates persisted load balancer attributes. |
 | DescribeLoadBalancerAttributes | Returns attributes stored for a load balancer. |
 | DescribeCapacityReservation | Returns the stored capacity reservation fields for a load balancer. |
-| DescribeProvisionedCapacity | Floci extension returning synthetic status without allocating ALB capacity. |
+| DescribeProvisionedCapacity | Legacy capacity view for an application load balancer without a reservation. |
 | SetSecurityGroups | Replaces the security groups associated with a load balancer. |
 | SetSubnets | Replaces the subnets associated with a load balancer. |
 | SetIpAddressType | Updates the IP address type stored for a load balancer. |
@@ -178,15 +178,20 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - `CreateLoadBalancer` takes `Subnets` or `SubnetMappings` for every load balancer type, and both together are refused with `ValidationError`. An Application Load Balancer takes at least two: with one or none it returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` and creates nothing. The count comes before any subnet is looked up, as on AWS, so one subnet that does not exist gets that error too. A Network or Gateway Load Balancer with neither returns `ValidationError` `At least one subnet must be specified`. CloudFormation refuses such an `AWS::ElasticLoadBalancingV2::LoadBalancer` the same way when it creates or replaces the balancer; an update that keeps the balancer and names no subnets leaves it on its subnets.
 - `SetSubnets`, like `CreateLoadBalancer`, takes `Subnets` or `SubnetMappings`, and both together are refused with `ValidationError`. With neither it returns the same `ValidationError` as `CreateLoadBalancer` for the balancer's type, `At least two subnets in two different Availability Zones must be specified` for an Application Load Balancer and `At least one subnet must be specified` for a Network or Gateway Load Balancer, and leaves the balancer on its subnets. A `SetSubnets` that names subnets is counted as `CreateLoadBalancer` counts them, following the two-zone rule its API reference states: one subnet for an Application Load Balancer, in `Subnets` or `SubnetMappings`, returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` before any subnet is looked up, and leaves the balancer on its subnets. AWS does not document the error for this case, so Floci gives `CreateLoadBalancer`'s error, in the same order. A CloudFormation update that keeps an Application Load Balancer and names one subnet fails with that error and rolls back. A Network Load Balancer can be set onto one subnet. The `SetSubnets` API reference requires a Gateway Load Balancer's `Subnets` to include every subnet it is already on; Floci does not enforce that.
 - Single-zone Application Load Balancers (opt-in, off by default): AWS refuses an Application Load Balancer in fewer than two Availability Zones, as above. For local setups that model single-zone deployments, `floci.services.elbv2.single-zone-alb-accounts` (`FLOCI_SERVICES_ELBV2_SINGLE_ZONE_ALB_ACCOUNTS`, comma-separated 12-digit account ids; spaces around an id are ignored) lowers that minimum to one zone for the accounts it lists: for a listed account, `CreateLoadBalancer` and `SetSubnets` (including CloudFormation's) take an Application Load Balancer on one subnet, for either scheme. Neither `Subnets` nor `SubnetMappings` is still refused with the same message. Unlisted accounts, and every account while the setting is unset, keep the two-zone rule; Network and Gateway Load Balancers are unchanged. A value that is not a 12-digit account id is rejected during startup.
+- The two-zone rule above is the default regional zone policy, described under [Application Load Balancer zone policy](#application-load-balancer-zone-policy). Where that policy accepts one Availability Zone (Osaka, `ap-northeast-3`, by default, or a region set to `allow-single-zone`), `CreateLoadBalancer` and `SetSubnets` take an Application Load Balancer on one subnet for every account, and a request that names no subnets returns `ValidationError` `At least one subnet must be specified`.
+- Each subnet given to `CreateLoadBalancer` or `SetSubnets` must be in a different Availability Zone. Two subnets in the same zone return `InvalidConfigurationRequest` `A load balancer cannot be attached to multiple subnets in the same Availability Zone`, even where one zone is enough.
 - `DescribeProvisionedCapacity` is a Floci Query extension, using version `2015-12-01`
-  and one `LoadBalancerArn`. It returns synthetic `ProvisionedCapacity.Status=disabled`
-  for an active application load balancer, or `pending` while provisioning. It rejects
-  invalid scope, other types and other states, and hides deleted or inaccessible load
-  balancers. With IAM enforcement enabled, its policy action is
+  and one `LoadBalancerArn`. Its `ProvisionedCapacity` has `MinimumLBCapacityUnits=0`,
+  `Status=disabled` and `DecreasesRemaining=4`; `LastModifiedTime` is absent.
+  Capacity is never reserved, so no daily decreases are consumed. Load balancer
+  startup or health does not imply a pending capacity reservation. Per-account
+  capacity quota overrides and reservation mutations are not implemented.
+  The action rejects invalid scope and other types, and hides deleted or inaccessible
+  load balancers. With IAM enforcement enabled, its policy action is
   `elasticloadbalancing:DescribeProvisionedCapacity`, scoped to the named load balancer.
   The public AWS ELBv2 endpoint rejected this action with `InvalidAction` in a live
-  comparison; these statuses do not describe AWS capacity. The public
-  `DescribeCapacityReservation` action remains separate. No capacity is allocated.
+  comparison using an ordinary account; it is not in the public SDK model. The public
+  `DescribeCapacityReservation` action remains separate.
 - EC2 refuses deletion of subnets and VPCs still referenced by load balancers with `DependencyViolation`. These account- and region-scoped dependencies follow persisted load balancer state; changing subnets or deleting the load balancer releases its old references. A CloudFormation update that names other subnets in `Subnets` or `SubnetMappings` moves the load balancer the way `SetSubnets` does, and a rolled-back update moves it back. An independent target group does not prevent subnet or VPC deletion.
 - HTTP listener sockets are preserved when listener actions change and are restarted only when socket-level settings such as port change.
 - Gateway listeners require `Protocol` and `Port` to be omitted on create and modify. Their control-plane response reports `GENEVE` without a port. CloudFormation preserves omitted gateway listener settings on create and update; other load balancer types retain their existing `HTTP` and port 80 defaults.
@@ -201,7 +206,11 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   by the API. Real HTTP probes, their timeouts, healthy and unhealthy thresholds,
   and the bounded probe queue still apply; one target never has overlapping probes.
   This deliberately accelerates local health transitions and does not reproduce
-  AWS wall-clock timing. Negative values are rejected during startup.
+  AWS wall-clock timing. Negative values are rejected during startup. Registration
+  probes start a target's cadence; an earlier group timer tick does not advance its
+  health threshold. Probe ownership survives deregistration until the worker exits.
+- `CreateTargetGroup` and `ModifyTargetGroup` validate `HealthCheckIntervalSeconds`
+  against the AWS range of 5 to 300 before changing stored settings or active timers.
 - Each `CreateListener` automatically creates an immutable default rule (`priority=default`, `isDefault=true`). This rule cannot be deleted; use `ModifyListener` to change its action.
 - Rule priorities are unique per listener: `CreateRule` and `SetRulePriorities` only reject a priority held by another rule on the same listener. `SetRulePriorities` is atomic: all priority assignments are validated before any change is committed.
 - `DeleteTargetGroup` is rejected with `ResourceInUse` while the target group is referenced by any listener or rule.
@@ -261,11 +270,17 @@ on the listener socket.
 
 ### Health checks
 
-For non-Lambda targets, the checker sends an HTTP or HTTPS GET to `HealthCheckPath`
-on `HealthCheckPort`, or the target's traffic port when configured as `traffic-port`.
-`HealthCheckProtocol` selects TLS independently of the target's application protocol.
-The response-code matcher and healthy/unhealthy thresholds affect target health.
-`HealthCheckProtocol=TCP` does not perform a TCP-only probe.
+For non-Lambda targets, TCP health checks open and close a connection without sending
+an application payload or evaluating the HTTP response-code matcher. HTTP and HTTPS
+checks send a GET to `HealthCheckPath`; HTTPS uses TLS independently of the target's
+application protocol. Checks use `HealthCheckPort`, or the target's traffic port when
+configured as `traffic-port`, and retain the configured health thresholds and deadline.
+
+TCP, TLS, UDP, TCP_UDP and GENEVE target groups default to TCP health checks. HTTP/HTTPS
+groups and target groups of type `alb` default to HTTP. TCP health checks are rejected
+for HTTP/HTTPS groups and target types `alb` and `lambda`; supported combinations are
+validated before creating or modifying the target group. Switching a TCP health check
+to HTTP or HTTPS requires an explicit health-check path and response-code matcher.
 Lambda targets are not actively probed. In ELBv2 mock mode, sockets
 and active monitoring are disabled. The proxy can route to initial targets and fails
 open to registered targets when none are healthy, so a successful request alone does
@@ -372,8 +387,12 @@ Listener sockets bind on the Floci host. Expose any listener ports you need in D
 The shared HTTP API endpoint also forwards requests whose Host names an existing load balancer
 or a public Route 53 alias/CNAME chain to one. An explicit Host port selects that listener;
 otherwise HTTP selects port 80 and HTTPS selects port 443. This supports an external TLS
-front door forwarding to the HTTP listener. The shared endpoint does not use the single-listener
+front door forwarding to the HTTP listener. Only HTTP listeners participate in shared-endpoint
+dispatch; HTTPS and TCP listeners retain their dedicated transports. An explicit port zero does
+not select the default listener. The shared endpoint does not use the single-listener
 fallback for unrelated hosts, so ordinary AWS API requests retain their existing handlers.
+Configured API hostnames and emulator DNS suffixes also retain ordinary API handling when
+a public alias uses the same name. Dedicated listener ports continue to resolve those aliases.
 After selecting a listener, target groups and load-balancer attributes are read in that
 listener's owning account. Unsigned data requests therefore work for load balancers created
 outside the emulator's default account.
@@ -389,13 +408,15 @@ on port 80 is correct for AWS and stays accepted here, but the request has to na
 A listener is chosen in this order:
 
 1. The Host header equals a load balancer's own DNS name (`{name}-{id}.elb.localhost.floci.io`).
-2. A public Route 53 alias/CNAME chain resolves the Host to a load balancer on the port.
-   Alias target hosted-zone IDs must match that load balancer's canonical zone.
+2. A public Route 53 A/AAAA alias or CNAME chain resolves the Host to a load balancer on the port.
+   A and AAAA aliases can coexist when they identify the same target. Alias target hosted-zone
+   IDs, with or without `/hostedzone/`, must match that load balancer's canonical zone.
    Fully qualified targets and the `dualstack.` DNS prefix are supported.
-   An alias to a removed or different load balancer cannot fall back to another listener.
+   Broken chains, conflicting answers, delegated names, and aliases to a removed or different
+   load balancer cannot fall back to another listener.
 3. Exactly one listener on the port has a rule whose `host-header` condition matches the Host
    header. This uses the same matching as the rule evaluation that follows, so it is
-   case-insensitive, ignores the port, and applies AWS's wildcards: `*` matches 0 or more
+   case-insensitive, ignores the port and final dot, and applies AWS's wildcards: `*` matches 0 or more
    characters and `?` matches exactly 1, which means `*.example.com` claims `test.example.com`
    but not `example.com`. `HostHeaderConfig.RegexValues` is not supported, by rule evaluation or
    by selection, so a load balancer that names itself only through a regex cannot be selected
@@ -419,3 +440,36 @@ outstanding probe per target. Repeated target registration preserves probe caden
 Changing the health interval reschedules monitoring, and late results from old
 registrations or settings cannot change current health. Configured healthy and
 unhealthy thresholds still apply to real HTTP results.
+
+## Application Load Balancer zone policy
+
+One Floci instance serves multiple regions. The ALB policy uses each request's
+region, including CloudFormation provisioning, rather than the server's default region.
+By default, ordinary ALB subnets require two distinct Availability Zones, except
+in Osaka (`ap-northeast-3`), where one is accepted. Empty subnet lists remain invalid.
+Each selected subnet must belong to a different AZ, even when a single AZ is allowed.
+This applies to CreateLoadBalancer and SetSubnets; NLB and GWLB rules are unchanged.
+Local Zone and Outpost-specific placement is not implemented by this setting.
+
+To override this rule globally, set
+`FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE=allow-single-zone` or `require-two-zones`.
+The default is `aws`. Individual regions can override the global setting in YAML:
+
+```yaml
+floci:
+  services:
+    elbv2:
+      alb-zone-rule: allow-single-zone
+      alb-zone-rule-by-region:
+        us-east-1: require-two-zones
+        ap-northeast-3: aws
+```
+
+Precedence is per-region setting, global setting, then AWS behavior.
+A per-region `aws` entry restores AWS behavior even when the global rule is overridden.
+These explicit overrides intentionally change local compatibility; they do not
+change the AWS API shape or require a separate Floci process for each region.
+
+`floci.services.elbv2.single-zone-alb-accounts` is independent of this policy: an
+account it lists may use one zone in every region, including a region set to
+`require-two-zones`.

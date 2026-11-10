@@ -222,6 +222,11 @@ class ApiGatewayPassRoleIntegrationTest {
                     () -> f.rest.updateAccount(b -> b.patchOperations(assignment))).statusCode());
             f.policy("apigateway.amazonaws.com");
             assertEquals(f.role, f.rest.updateAccount(b -> b.patchOperations(assignment)).cloudwatchRoleArn());
+            assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.updateAccount(b -> b.patchOperations(
+                    assignment,
+                    PatchOperation.builder().op(Op.REPLACE).path("/cloudwatchRoleArn").value(f.role + "other").build()
+            ))).statusCode());
+            assertEquals(f.role, f.rest.getAccount().cloudwatchRoleArn());
             f.policy(null);
             assertEquals(403, assertThrows(ApiGatewayException.class, () -> f.rest.updateAccount(b -> b.patchOperations(
                     PatchOperation.builder().op(Op.REPLACE).path("/cloudwatchRoleArn").value(f.role + "other").build(),
@@ -229,6 +234,13 @@ class ApiGatewayPassRoleIntegrationTest {
             assertEquals(f.role, f.rest.getAccount().cloudwatchRoleArn());
             assertEquals(null, f.rest.updateAccount(b -> b.patchOperations(PatchOperation.builder()
                     .op(Op.REMOVE).path("/cloudwatchRoleArn").build())).cloudwatchRoleArn());
+            PatchOperation addition = PatchOperation.builder().op(Op.ADD)
+                    .path("/cloudwatchRoleArn").value(f.role).build();
+            assertEquals(403, assertThrows(ApiGatewayException.class,
+                    () -> f.rest.updateAccount(b -> b.patchOperations(addition))).statusCode());
+            assertEquals(null, f.rest.getAccount().cloudwatchRoleArn());
+            f.policy("apigateway.amazonaws.com");
+            assertEquals(f.role, f.rest.updateAccount(b -> b.patchOperations(addition)).cloudwatchRoleArn());
         }
     }
 
@@ -256,6 +268,7 @@ class ApiGatewayPassRoleIntegrationTest {
             String api = f.v2.createApi(b -> b.name(f.name).protocolType("HTTP").target(target)
                     .credentialsArn(f.role)).apiId();
             assertEquals(target, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().integrationUri());
+            assertEquals(f.role, f.v2.getIntegrations(b -> b.apiId(api)).items().getFirst().credentialsArn());
             assertEquals(1, f.v2.getRoutes(b -> b.apiId(api)).items().size());
             assertEquals(1, f.v2.getStages(b -> b.apiId(api)).items().size());
             f.policy(null);

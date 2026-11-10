@@ -200,6 +200,8 @@ class Ec2ExternalImageCatalogTest {
         assertTrue(external.findByRegistrationName("Worker-release").isEmpty());
         assertTrue(external.findByRegistrationName("worker-release-extra").isEmpty());
         assertTrue(external.findByRegistrationName("local-worker").isEmpty());
+        assertTrue(external.findByRegistrationName(null).isEmpty());
+        assertTrue(external.findByRegistrationName(" ").isEmpty());
 
         ResolvedAmiImage fallback = resolver.resolveImage("ami-unknown");
         assertEquals("example/base:1", fallback.dockerImage());

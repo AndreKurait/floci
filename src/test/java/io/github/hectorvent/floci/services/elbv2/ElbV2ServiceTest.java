@@ -104,6 +104,77 @@ class ElbV2ServiceTest {
         stubAlbSubnets(ec2Service);
     }
 
+    @ParameterizedTest
+    @CsvSource({
+        "ap-northeast-3,AWS,none,true",
+        "us-east-1,AWS,none,false",
+        "us-east-1,ALLOW_SINGLE_ZONE,none,true",
+        "ap-northeast-3,REQUIRE_TWO_ZONES,none,false",
+        "us-east-1,ALLOW_SINGLE_ZONE,REQUIRE_TWO_ZONES,false",
+        "us-east-1,REQUIRE_TWO_ZONES,ALLOW_SINGLE_ZONE,true",
+        "ap-northeast-3,REQUIRE_TWO_ZONES,AWS,true",
+        "us-east-1,ALLOW_SINGLE_ZONE,AWS,false"
+    })
+    void albZonePolicyAppliesToCreateAndSetSubnets(String region, EmulatorConfig.AlbZoneRule global,
+                                                  String regional, boolean allowed) {
+        EmulatorConfig settings = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.ElbV2ServiceConfig elbv2 = mock(EmulatorConfig.ElbV2ServiceConfig.class);
+        when(settings.services()).thenReturn(services);
+        when(services.elbv2()).thenReturn(elbv2);
+        when(elbv2.albZoneRule()).thenReturn(global);
+        Map<String, EmulatorConfig.AlbZoneRule> overrides = "none".equals(regional) ? Map.of()
+                : Map.of(region, EmulatorConfig.AlbZoneRule.valueOf(regional));
+        when(elbv2.albZoneRuleByRegion()).thenReturn(overrides);
+        lenient().when(settings.hostname()).thenReturn(Optional.empty());
+        service.config = settings;
+        service.regionResolver = new RegionResolver(region, "000000000000");
+        lenient().when(ec2Service.describeSubnets(eq(region), anyList(), eq(Map.of())))
+                .thenAnswer(invocation -> invocation.<List<String>>getArgument(1).stream()
+                        .map(id -> subnet(id, region + ("subnet-a".equals(id) ? "a" : "b"))).toList());
+        lenient().when(ec2Service.requireSubnet(eq(region), anyString()))
+                .thenAnswer(invocation -> subnet(invocation.getArgument(1), region + "a"));
+        LoadBalancer twoZones = service.createLoadBalancer(region, "two-zones", "internal", "application",
+                "ipv4", ALB_SUBNETS, List.of(), Map.of());
+        if (allowed) {
+            LoadBalancer single = service.createLoadBalancer(region, "one-zone", "internal", "application",
+                    "ipv4", List.of("subnet-a"), List.of(), Map.of());
+            assertEquals(1, single.getAvailabilityZones().size());
+            service.setSubnetsFromRequest(region, twoZones.getLoadBalancerArn(), List.of("subnet-a"));
+            assertEquals(1, twoZones.getAvailabilityZones().size());
+        } else {
+            assertThrows(AwsException.class, () -> service.createLoadBalancer(region, "one-zone", "internal",
+                    "application", "ipv4", List.of("subnet-a"), List.of(), Map.of()));
+            assertThrows(AwsException.class, () -> service.setSubnetsFromRequest(region,
+                    twoZones.getLoadBalancerArn(), List.of("subnet-a")));
+            assertEquals(2, twoZones.getAvailabilityZones().size());
+        }
+        assertThrows(AwsException.class, () -> service.createLoadBalancer(region, "no-zone", "internal",
+                "application", "ipv4", List.of(), List.of(), Map.of()));
+        assertThrows(AwsException.class, () -> service.setSubnetsFromRequest(region,
+                twoZones.getLoadBalancerArn(), List.of()));
+    }
+
+    @Test
+    void singleZonePolicyStillRejectsMultipleSubnetsInTheSameZone() {
+        String region = "ap-northeast-3";
+        Subnet first = subnet("subnet-a", region + "a");
+        Subnet second = subnet("subnet-b", region + "a");
+        when(ec2Service.describeSubnets(region, ALB_SUBNETS, Map.of())).thenReturn(List.of(first, second));
+        when(ec2Service.describeSubnets(region, List.of("subnet-a"), Map.of())).thenReturn(List.of(first));
+        AwsException rejected = assertThrows(AwsException.class, () -> service.createLoadBalancer(region,
+                "same-zone", "internal", "application", "ipv4", ALB_SUBNETS, List.of(), Map.of()));
+        assertEquals("InvalidConfigurationRequest", rejected.getErrorCode());
+        assertEquals("A load balancer cannot be attached to multiple subnets in the same Availability Zone",
+                rejected.getMessage());
+        LoadBalancer single = service.createLoadBalancer(region, "single-zone", "internal", "application",
+                "ipv4", List.of("subnet-a"), List.of(), Map.of());
+        assertThrows(AwsException.class,
+                () -> service.setSubnetsFromRequest(region, single.getLoadBalancerArn(), ALB_SUBNETS));
+        assertEquals(List.of("subnet-a"), single.getAvailabilityZones().stream()
+                .map(AvailabilityZone::getSubnetId).toList());
+    }
+
     @Test
     void describeListenersRequiresEveryExplicitArn() {
         String lb = service.createLoadBalancer(REGION, "listener-lookup", "internal", "application", "ipv4",
@@ -150,30 +221,17 @@ class ElbV2ServiceTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"active, disabled", "provisioning, pending"})
-    void provisionedCapacityReadReturnsSyntheticStatusWithoutChangingTheLoadBalancer(String state, String status) {
+    @ValueSource(strings = {"active", "provisioning", "failed", "active_impaired"})
+    void provisionedCapacityReadDoesNotConfuseLoadBalancerStateWithAReservation(String state) {
         LoadBalancer lb = service.createLoadBalancer(REGION, "capacity", null, "application", null,
                 ALB_SUBNETS, List.of(), Map.of());
         lb.setState(state);
-        assertEquals(status, service.describeProvisionedCapacity(REGION, lb.getLoadBalancerArn()));
+        assertEquals(new ElbV2Service.ProvisionedCapacity(0, "disabled", 4),
+                service.describeProvisionedCapacity(REGION, lb.getLoadBalancerArn()));
         assertEquals(state, lb.getState());
         assertEquals(1, service.describeLoadBalancers(REGION, null, null, null, null).size());
         assertEquals(new ElbV2Service.CapacityReservation(null, null, null),
                 service.describeCapacityReservation(REGION, lb.getLoadBalancerArn()));
-    }
-
-    @ParameterizedTest
-    @NullAndEmptySource
-    @ValueSource(strings = {"failed", "active_impaired", "unknown"})
-    void provisionedCapacityReadRejectsUnsupportedStoredStates(String state) {
-        LoadBalancer lb = service.createLoadBalancer(REGION, "capacity", null, "application", null,
-                ALB_SUBNETS, List.of(), Map.of());
-        lb.setState(state);
-        AwsException error = assertThrows(AwsException.class,
-                () -> service.describeProvisionedCapacity(REGION, lb.getLoadBalancerArn()));
-        assertEquals("InternalFailure", error.getErrorCode());
-        assertEquals(500, error.getHttpStatus());
-        assertEquals(state, lb.getState());
     }
 
     @ParameterizedTest
@@ -216,6 +274,45 @@ class ElbV2ServiceTest {
         service.deleteLoadBalancer(REGION, arn);
         assertEquals("LoadBalancerNotFound", assertThrows(AwsException.class,
                 () -> service.describeProvisionedCapacity(REGION, arn)).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "cn-north-1, aws-cn, local-test-1, aws",
+            "us-gov-west-1, aws-us-gov, local-test-1, aws",
+            "cn-north-1, aws-cn, us-east-1, aws",
+            "us-east-1, aws, cn-north-1, aws-cn",
+            "us-east-1, aws, us-gov-west-1, aws-us-gov"})
+    void provisionedCapacityReadsTheCreatedAndPersistedResourcePartition(
+            String deploymentRegion, String deploymentPartition, String requestRegion, String resourcePartition,
+            @TempDir Path directory) {
+        RegionResolver resolver = new RegionResolver(deploymentRegion, "000000000000", deploymentPartition);
+        StorageFactory storage = new PersistentStorageFactory(directory);
+        ElbV2Service first = serviceWithStorage(storage, dataPlane, healthChecker, ec2Service);
+        first.regionResolver = resolver;
+        lenient().when(ec2Service.requireSubnet(requestRegion, "subnet-a"))
+                .thenReturn(subnet("subnet-a", requestRegion + "a"));
+        lenient().when(ec2Service.requireSubnet(requestRegion, "subnet-b"))
+                .thenReturn(subnet("subnet-b", requestRegion + "b"));
+        when(ec2Service.describeSubnets(eq(requestRegion), eq(ALB_SUBNETS), eq(Map.of())))
+                .thenReturn(List.of(subnet("subnet-a", requestRegion + "a"),
+                        subnet("subnet-b", requestRegion + "b")));
+        LoadBalancer created = first.createLoadBalancer(requestRegion, "capacity", "internal", "application",
+                "ipv4", ALB_SUBNETS, List.of(), Map.of("owner", "capacity-test"));
+        String arn = created.getLoadBalancerArn();
+        assertTrue(arn.startsWith("arn:" + resourcePartition + ":elasticloadbalancing:" + requestRegion + ":"));
+        assertEquals(new ElbV2Service.ProvisionedCapacity(0, "disabled", 4),
+                first.describeProvisionedCapacity(requestRegion, arn));
+
+        ElbV2Service reloaded = serviceWithStorage(storage, dataPlane, healthChecker, ec2Service);
+        reloaded.regionResolver = resolver;
+        assertEquals(arn, reloaded.describeLoadBalancers(
+                requestRegion, List.of(arn), null, null, null).getFirst().getLoadBalancerArn());
+        assertEquals(new ElbV2Service.ProvisionedCapacity(0, "disabled", 4),
+                reloaded.describeProvisionedCapacity(requestRegion, arn));
+        reloaded.deleteLoadBalancer(requestRegion, arn);
+        assertEquals("LoadBalancerNotFound", assertThrows(AwsException.class,
+                () -> reloaded.describeProvisionedCapacity(requestRegion, arn)).getErrorCode());
     }
 
     /**
@@ -962,6 +1059,9 @@ class ElbV2ServiceTest {
     void createLoadBalancerUsesConfiguredHostnameForDnsSuffix() {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.hostname()).thenReturn(Optional.of("floci"));
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.elbv2()).thenReturn(mock(EmulatorConfig.ElbV2ServiceConfig.class));
         service.config = config;
 
         String dnsName = service.createLoadBalancer(
@@ -1383,6 +1483,42 @@ class ElbV2ServiceTest {
     }
 
     @ParameterizedTest
+    @ValueSource(ints = {-1, 0, 4, 301, Integer.MAX_VALUE})
+    void invalidHealthIntervalLeavesGroupAndMonitoringUntouched(int interval) {
+        String arn = createTargetGroup("interval-state");
+        TargetGroup group = service.describeTargetGroups(REGION, null, List.of(arn), null).getFirst();
+        clearInvocations(healthChecker, dataPlane);
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyTargetGroup(
+                REGION, arn, "HTTPS", "443", false, "/changed", interval, 10, 3, 4, "204"));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("HTTP", group.getHealthCheckProtocol());
+        assertEquals("traffic-port", group.getHealthCheckPort());
+        assertTrue(group.getHealthCheckEnabled());
+        assertEquals("/v1/ready", group.getHealthCheckPath());
+        assertEquals(30, group.getHealthCheckIntervalSeconds());
+        assertEquals(5, group.getHealthCheckTimeoutSeconds());
+        assertEquals(5, group.getHealthyThresholdCount());
+        assertEquals(2, group.getUnhealthyThresholdCount());
+        assertEquals("200", group.getMatcher());
+        verifyNoInteractions(healthChecker, dataPlane);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {5, 300})
+    void healthIntervalBoundariesAndOmittedUpdateRemainValid(int interval) {
+        TargetGroup group = service.createTargetGroup(REGION, "interval-boundary", "HTTP", "HTTP1", 80,
+                "vpc-a", "ip", "HTTP", "traffic-port", true, "/", interval, 5, 5, 2,
+                "200", "ipv4", Map.of());
+        assertEquals(interval, group.getHealthCheckIntervalSeconds());
+        service.modifyTargetGroup(REGION, group.getTargetGroupArn(), null, null, null,
+                "/changed", null, null, null, null, null);
+        assertEquals(interval, group.getHealthCheckIntervalSeconds());
+        service.modifyTargetGroup(REGION, group.getTargetGroupArn(), null, null, null,
+                null, interval == 5 ? 300 : 5, null, null, null, null);
+        assertEquals(interval == 5 ? 300 : 5, group.getHealthCheckIntervalSeconds());
+    }
+
+    @ParameterizedTest
     @ValueSource(ints = {2, 120})
     void healthTimeoutBoundariesAndOmittedUpdateRemainValid(int timeout) {
         TargetGroup group = service.createTargetGroup(REGION, "timeout-boundary", "HTTP", "HTTP1", 80,
@@ -1395,6 +1531,68 @@ class ElbV2ServiceTest {
         service.modifyTargetGroup(REGION, group.getTargetGroupArn(), null, null, null,
                 null, null, timeout == 2 ? 120 : 2, null, null, null);
         assertEquals(timeout == 2 ? 120 : 2, group.getHealthCheckTimeoutSeconds());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"HTTP,ip,HTTP", "HTTPS,ip,HTTP", "TCP,ip,TCP", "TLS,ip,TCP", "UDP,ip,TCP",
+            "TCP_UDP,ip,TCP", "GENEVE,ip,TCP", "TCP,alb,HTTP"})
+    void healthCheckProtocolDefaultsFollowTheTargetProtocol(String protocol, String targetType, String expected) {
+        TargetGroup group = service.createTargetGroup(REGION, "default-check", protocol, null,
+                "GENEVE".equals(protocol) ? 6081 : 8080, "vpc-a", targetType, null, null, null, null,
+                null, null, null, null, null, null, Map.of());
+        assertEquals(expected, group.getHealthCheckProtocol());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"HTTP,ip,TCP", "HTTPS,ip,TCP", "TCP,ip,TLS", "TCP,ip,UDP", "TCP,alb,TCP"})
+    void invalidHealthCheckProtocolIsRejectedBeforePublication(String protocol, String targetType, String check) {
+        AwsException error = assertThrows(AwsException.class, () -> service.createTargetGroup(REGION,
+                "invalid-check", protocol, null, 8080, "vpc-a", targetType, check, null, null,
+                null, null, null, null, null, null, null, Map.of()));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertTrue(service.describeTargetGroups(REGION, null, List.of(), List.of()).isEmpty());
+        verifyNoInteractions(healthChecker, dataPlane);
+    }
+
+    @Test
+    void rejectedHealthProtocolChangeDoesNotChangeThePort() {
+        String arn = createTargetGroup("modify-check");
+        TargetGroup group = service.getTargetGroup(REGION, arn);
+        String originalPort = group.getHealthCheckPort();
+        clearInvocations(healthChecker, dataPlane);
+        assertThrows(AwsException.class, () -> service.modifyTargetGroup(REGION, arn,
+                "TCP", "8081", null, null, null, null, null, null, null));
+        assertEquals("HTTP", group.getHealthCheckProtocol());
+        assertEquals(originalPort, group.getHealthCheckPort());
+        verifyNoInteractions(healthChecker, dataPlane);
+    }
+
+    @ParameterizedTest
+    @CsvSource({",", "/,", ",200"})
+    void switchingTcpHealthToHttpRequiresExplicitPathAndMatcher(String path, String matcher) {
+        TargetGroup group = createTcpHealthGroup();
+        String originalPort = group.getHealthCheckPort();
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyTargetGroup(REGION,
+                group.getTargetGroupArn(), "HTTPS", "8081", null, path, null, null, null, null, matcher));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertEquals("TCP", group.getHealthCheckProtocol());
+        assertEquals(originalPort, group.getHealthCheckPort());
+    }
+
+    @Test
+    void switchingTcpHealthToHttpAcceptsExplicitPathAndMatcher() {
+        TargetGroup group = createTcpHealthGroup();
+        service.modifyTargetGroup(REGION, group.getTargetGroupArn(), "HTTPS", "8081", null,
+                "/ready", null, null, null, null, "200");
+        assertEquals("HTTPS", group.getHealthCheckProtocol());
+        assertEquals("8081", group.getHealthCheckPort());
+        assertEquals("/ready", group.getHealthCheckPath());
+        assertEquals("200", group.getMatcher());
+    }
+
+    private TargetGroup createTcpHealthGroup() {
+        return service.createTargetGroup(REGION, "tcp-health", "TCP", null, 8080, "vpc-a", "ip",
+                "TCP", null, null, null, null, null, null, null, null, null, Map.of());
     }
 
     private String createTargetGroup(String name) {
@@ -1497,10 +1695,10 @@ class ElbV2ServiceTest {
         }
     }
 
-    private static final class SharedStorageFactory extends StorageFactory {
+    static final class SharedStorageFactory extends StorageFactory {
         private final Map<String, StorageBackend<String, ?>> stores = new HashMap<>();
 
-        private SharedStorageFactory() {
+        SharedStorageFactory() {
             super(null, null);
         }
 

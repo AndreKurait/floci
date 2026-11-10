@@ -42,11 +42,14 @@ class ElbV2ProvisionedCapacityIntegrationTest {
     final PartitionCleanup cleanup = new PartitionCleanup();
 
     @Test
-    void extensionReportsSyntheticDisabledStatusAndLeavesPublicReservationReadUnchanged() {
+    void extensionReportsCompleteDisabledCapacityAndLeavesPublicReservationReadUnchanged() {
         String arn = loadBalancer();
         query(ACCOUNT, ACTION).formParam("LoadBalancerArn", arn).post("/").then()
                 .statusCode(200).contentType("application/xml")
+                .body(RESULT + ".ProvisionedCapacity.MinimumLBCapacityUnits", equalTo("0"))
                 .body(RESULT + ".ProvisionedCapacity.Status", equalTo("disabled"))
+                .body(RESULT + ".ProvisionedCapacity.DecreasesRemaining", equalTo("4"))
+                .body(RESULT + ".ProvisionedCapacity.LastModifiedTime.size()", equalTo(0))
                 .body("DescribeProvisionedCapacityResponse.ResponseMetadata.RequestId", not(emptyOrNullString()));
         query(ACCOUNT, "DescribeCapacityReservation").formParam("LoadBalancerArn", arn).post("/").then()
                 .statusCode(200)

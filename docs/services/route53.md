@@ -102,6 +102,13 @@ or private API Gateway custom-domain support.
 
 Public `A` aliases can target an existing Classic load balancer when VPC frontends are enabled. The target DNS name, including the optional `dualstack.` prefix, and canonical hosted-zone ID must identify that load balancer. Answers use its current frontend addresses and 60-second TTL, including when the public zone and load balancer belong to different accounts. Alias resolution reads owned resources without following DNS or replacing targets with the emulator API address. Removing the target makes its aliases return REFUSED.
 
+Public `A` aliases can target an existing Application Load Balancer using its exact
+DNS name and canonical hosted-zone ID. The answer is Floci's listener IPv4 address
+with a 60-second TTL. The target is located across accounts without changing
+management API authorization. Unknown, deleted, ambiguous, or mismatched targets
+are refused; the resolver never infers ownership from an emulator suffix.
+See [ELB v2](elb.md#route-53-aliases).
+
 Other public alias targets, alias `AAAA` records, `EvaluateTargetHealth=true`, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones or alias targets, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary. Clients can retry over TCP, which supports messages up to 65,535 bytes, fragmented input, pipelining and connection reuse. TCP admission is bounded to 128 connections and 16 pending queries per connection; idle connections expire after 30 seconds.
 
 ## Default Nameservers
