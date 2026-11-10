@@ -11,17 +11,21 @@ import io.github.hectorvent.floci.services.kinesisanalytics.model.ApplicationSta
 import io.github.hectorvent.floci.services.kinesisanalytics.model.FlinkApplication;
 import io.github.hectorvent.floci.services.kinesisanalytics.model.Snapshot;
 import io.github.hectorvent.floci.services.kinesisanalytics.model.SnapshotStatus;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.when;
@@ -675,14 +679,132 @@ class KinesisAnalyticsV2ServiceTest {
     }
 
     @Test
-    void readinessPollerPersistsFlinkJobIdAssignedBeforeReachingRunning() throws InterruptedException {
+    void readinessPollerPersistsFlinkJobIdAssignedBeforeReachingRunning() {
         // Regression test: advanceToRunning can assign flinkJobId on a tick where the Flink job has
         // been submitted but hasn't reached RUNNING yet (it returns false in that case). That
         // intermediate state must still be persisted — not just the final RUNNING transition — since
         // pendingJars (a separate in-process-only cache) is already cleared by then; an emulator
         // restart before the next persist would otherwise leave the application permanently stuck.
+        TestTime time = TestTime.create();
         AccountAwareStorageBackend<FlinkApplication> store =
                 Mockito.spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        KinesisAnalyticsV2Service realMode = startingApplication(store, jobSubmittedButNotRunning(),
+                time.scheduler());
+
+        realMode.init();
+        try {
+            // The first poll runs one second after start.
+            time.advance(Duration.ofSeconds(1).minusMillis(1));
+            Mockito.verify(store, Mockito.never())
+                    .putForAccount(Mockito.anyString(), Mockito.anyString(), Mockito.any());
+            assertNull(realMode.describeApplication("demo").getFlinkJobId());
+
+            time.advance(Duration.ofMillis(1));
+            Mockito.verify(store, Mockito.times(1))
+                    .putForAccount(Mockito.eq("000000000000"), Mockito.eq("us-east-1/demo"), Mockito.any());
+            assertEquals("job-1", realMode.describeApplication("demo").getFlinkJobId());
+        } finally {
+            realMode.shutdown();
+        }
+    }
+
+    @Test
+    void readinessPollerPollsEveryTwoSecondsAndPersistsOnlyWhatChanged() {
+        TestTime time = TestTime.create();
+        AccountAwareStorageBackend<FlinkApplication> store =
+                Mockito.spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        FlinkContainerManager manager = jobSubmittedButNotRunning();
+        KinesisAnalyticsV2Service realMode = startingApplication(store, manager, time.scheduler());
+
+        realMode.init();
+        try {
+            time.advance(Duration.ofSeconds(1));
+            Mockito.verify(manager, Mockito.times(1)).advanceToRunning(Mockito.any());
+
+            // The second poll comes two seconds after the first and finds the same job id: nothing to store.
+            time.advance(Duration.ofSeconds(2).minusMillis(1));
+            Mockito.verify(manager, Mockito.times(1)).advanceToRunning(Mockito.any());
+            time.advance(Duration.ofMillis(1));
+            Mockito.verify(manager, Mockito.times(2)).advanceToRunning(Mockito.any());
+            Mockito.verify(store, Mockito.times(1))
+                    .putForAccount(Mockito.anyString(), Mockito.anyString(), Mockito.any());
+
+            // The job reaches RUNNING: the third poll stores the new status.
+            Mockito.doReturn(true).when(manager).advanceToRunning(Mockito.any());
+            time.advance(Duration.ofSeconds(2));
+            Mockito.verify(store, Mockito.times(2))
+                    .putForAccount(Mockito.eq("000000000000"), Mockito.eq("us-east-1/demo"), Mockito.any());
+            assertEquals(ApplicationStatus.RUNNING, realMode.describeApplication("demo").getApplicationStatus());
+
+            // A running application is no longer polled.
+            time.advance(Duration.ofMinutes(10));
+            Mockito.verify(manager, Mockito.times(3)).advanceToRunning(Mockito.any());
+            Mockito.verify(store, Mockito.times(2))
+                    .putForAccount(Mockito.anyString(), Mockito.anyString(), Mockito.any());
+        } finally {
+            realMode.shutdown();
+        }
+    }
+
+    @Test
+    void aPollThatFailsDoesNotStopTheNextOne() {
+        TestTime time = TestTime.create();
+        FlinkContainerManager manager = Mockito.mock(FlinkContainerManager.class);
+        when(manager.advanceToRunning(Mockito.any()))
+                .thenThrow(new IllegalStateException("the JobManager is not answering"))
+                .thenReturn(true);
+        KinesisAnalyticsV2Service realMode = startingApplication(
+                Mockito.spy(AccountAwareStorageBackend.inMemory("000000000000")), manager, time.scheduler());
+
+        realMode.init();
+        try {
+            time.advance(Duration.ofSeconds(1));
+            assertEquals(ApplicationStatus.STARTING, realMode.describeApplication("demo").getApplicationStatus());
+            time.advance(Duration.ofSeconds(2));
+            assertEquals(ApplicationStatus.RUNNING, realMode.describeApplication("demo").getApplicationStatus());
+        } finally {
+            realMode.shutdown();
+        }
+    }
+
+    /** The poller's own thread in real time; the cases above cover when it polls and what it stores. */
+    @Test
+    void readinessPollerRunsOnTheServicesOwnExecutor() {
+        AccountAwareStorageBackend<FlinkApplication> store =
+                Mockito.spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        KinesisAnalyticsV2Service realMode = startingApplication(store, jobSubmittedButNotRunning(), null);
+
+        // @PostConstruct isn't wired by a plain `new` in this unit test; start the poller manually.
+        realMode.init();
+        try {
+            Mockito.verify(store, Mockito.timeout(30_000))
+                    .putForAccount(Mockito.eq("000000000000"), Mockito.eq("us-east-1/demo"), Mockito.any());
+            assertEquals("job-1", realMode.describeApplication("demo").getFlinkJobId());
+        } finally {
+            realMode.shutdown();
+        }
+    }
+
+    /** A manager whose first poll submits the Flink job, which then stays short of RUNNING. */
+    private static FlinkContainerManager jobSubmittedButNotRunning() {
+        FlinkContainerManager manager = Mockito.mock(FlinkContainerManager.class);
+        when(manager.advanceToRunning(Mockito.any())).thenAnswer(invocation -> {
+            FlinkApplication app = invocation.getArgument(0);
+            if (app.getFlinkJobId() == null) {
+                app.setFlinkJobId("job-1"); // job just submitted; not yet RUNNING
+            }
+            return false;
+        });
+        return manager;
+    }
+
+    /**
+     * A real-mode service holding one application, "demo", that is STARTING, in a spied {@code store}.
+     * With a {@code poller} the readiness poller runs on it, with {@code null} on the service's own executor.
+     */
+    private KinesisAnalyticsV2Service startingApplication(AccountAwareStorageBackend<FlinkApplication> store,
+                                                          FlinkContainerManager manager,
+                                                          ScheduledExecutorService poller) {
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
         Mockito.doReturn(store).when(storageFactory)
                 .create(Mockito.anyString(), Mockito.anyString(), Mockito.any());
@@ -695,35 +817,15 @@ class KinesisAnalyticsV2ServiceTest {
         when(kaConfig.mock()).thenReturn(false);
         when(config.defaultRegion()).thenReturn("us-east-1");
 
-        FlinkContainerManager manager = Mockito.mock(FlinkContainerManager.class);
-        when(manager.advanceToRunning(Mockito.any())).thenAnswer(invocation -> {
-            FlinkApplication app = invocation.getArgument(0);
-            if (app.getFlinkJobId() == null) {
-                app.setFlinkJobId("job-1"); // job just submitted; not yet RUNNING
-            }
-            return false;
-        });
-
         RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
-        KinesisAnalyticsV2Service realMode =
-                new KinesisAnalyticsV2Service(storageFactory, config, regionResolver, manager);
+        KinesisAnalyticsV2Service realMode = poller == null
+                ? new KinesisAnalyticsV2Service(storageFactory, config, regionResolver, manager)
+                : new KinesisAnalyticsV2Service(storageFactory, config, regionResolver, manager, poller);
         realMode.createApplication("demo", "FLINK-1_18", ROLE, null, null, "bucket", "app.jar", null, 1);
         FlinkApplication app = realMode.describeApplication("demo");
         app.setApplicationStatus(ApplicationStatus.STARTING);
         Mockito.clearInvocations(store); // ignore createApplication's own put()
-
-        try {
-            // @PostConstruct isn't wired by a plain `new` in this unit test; start the poller manually.
-            realMode.init();
-            // The poller's first tick fires ~1s after scheduling; give it margin.
-            Thread.sleep(1500);
-
-            Mockito.verify(store, Mockito.atLeastOnce())
-                    .putForAccount(Mockito.eq("000000000000"), Mockito.eq("us-east-1/demo"), Mockito.any());
-            assertEquals("job-1", realMode.describeApplication("demo").getFlinkJobId());
-        } finally {
-            realMode.shutdown();
-        }
+        return realMode;
     }
 
     private KinesisAnalyticsV2Service mockModeService() {
