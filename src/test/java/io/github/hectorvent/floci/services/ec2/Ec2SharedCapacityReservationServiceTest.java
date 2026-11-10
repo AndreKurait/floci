@@ -351,6 +351,25 @@ class Ec2SharedCapacityReservationServiceTest {
     }
 
     @Test
+    void creatingOwnedOpenCapacityDoesNotCountAnExistingSharedMemberTwice() throws Exception {
+        try (Fixture f = new Fixture("memory", directory)) {
+            CapacityReservation shared = f.create();
+            f.service.modifyCapacityReservation(REGION, shared.getCapacityReservationId(), null, null, null, "open");
+            f.shared.set(true);
+            f.account.set(RECIPIENT);
+            Instance instance = f.launch(null);
+            f.service.describeInstances(REGION, List.of(instance.getInstanceId()), Map.of());
+            CapacityReservation owned = f.service.createCapacityReservation(REGION, "t3.micro", "Linux/UNIX",
+                    REGION + "a", null, 1, null, null, null, null, null, "open", null, null);
+            assertEquals(1, owned.getAvailableInstanceCount());
+            assertTrue(owned.getInstanceIds().isEmpty());
+            assertEquals(shared.getCapacityReservationId(), f.service.instanceCapacityReservationId(instance));
+            f.account.set(OWNER);
+            assertEquals(0, f.describe(shared).getAvailableInstanceCount());
+        }
+    }
+
+    @Test
     void sharedOpenAdoptionDoesNotIgnoreGroupMembership() throws Exception {
         try (Fixture f = new Fixture("memory", directory)) {
             f.account.set(RECIPIENT);
