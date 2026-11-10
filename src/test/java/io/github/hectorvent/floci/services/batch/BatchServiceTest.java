@@ -15,8 +15,11 @@ import io.github.hectorvent.floci.services.batch.model.BatchJobQueue;
 import io.github.hectorvent.floci.services.batch.model.BatchNodeExecution;
 import io.github.hectorvent.floci.services.batch.model.BatchRunResult;
 import io.github.hectorvent.floci.services.batch.model.BatchStatus;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -25,6 +28,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -50,6 +54,8 @@ class BatchServiceTest {
     private static final String ACCOUNT = "000000000000";
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final TestTime time = TestTime.create();
+    private final TimelineJobs jobs = new TimelineJobs(time, true);
 
     @Test
     void dockerTimeoutFailsWithoutRetryingRemainingAttempts() throws Exception {
@@ -91,6 +97,65 @@ class BatchServiceTest {
         assertEquals("Job timed out", job.path("statusReason").asText());
         assertEquals(1, job.path("attempts").size());
         verify(runner, times(1)).run(any(BatchJob.class), anyInt());
+    }
+
+    @Test
+    void aJobMovesOneStateEveryTenMillisecondsAndARetryStartsOverFromPending() throws Exception {
+        List<Instant> runs = new CopyOnWriteArrayList<>();
+        BatchDockerRunner runner = mock(BatchDockerRunner.class);
+        when(runner.run(any(BatchJob.class), anyInt())).thenAnswer(invocation -> {
+            runs.add(time.now());
+            return runs.size() == 1
+                    ? new BatchRunResult(1, "first failed", "log-1", 1L, 2L, false)
+                    : new BatchRunResult(0, null, "log-2", 3L, 4L, false);
+        });
+        BatchService service = service("docker", new InMemoryStorage<String, BatchJob>(), runner,
+                new TimelineJobs(time, false));
+        String queueArn = arrayReadyQueue(service);
+        String definitionArn = service.registerJobDefinition(json("""
+                {
+                  "jobDefinitionName":"paced-job",
+                  "type":"container",
+                  "containerProperties":{"image":"job:latest"},
+                  "retryStrategy":{"attempts":2}
+                }
+                """), REGION).path("jobDefinitionArn").asText();
+        Instant submitted = time.now();
+
+        String jobId = service.submitJob(json("""
+                {"jobName":"paced","jobQueue":"%s","jobDefinition":"%s"}
+                """.formatted(queueArn, definitionArn)), REGION).path("jobId").asText();
+
+        time.awaitSleepers(1);
+        assertEquals("PENDING", describedJob(service, jobId).path("status").asText());
+        assertEquals(submitted.toEpochMilli(), describedJob(service, jobId).path("createdAt").asLong());
+        assertStaysThenBecomes(service, jobId, "PENDING", "RUNNABLE");
+        assertStaysThenBecomes(service, jobId, "RUNNABLE", "STARTING");
+        // The third pause ends in RUNNING; the attempt fails at once and the retry is PENDING again.
+        assertStaysThenBecomes(service, jobId, "STARTING", "PENDING");
+        assertEquals(List.of(submitted.plusMillis(30)), runs);
+        JsonNode retrying = describedJob(service, jobId);
+        assertEquals("Attempt failed; retrying", retrying.path("statusReason").asText());
+        assertEquals(1, retrying.path("attempts").size());
+        assertEquals(submitted.plusMillis(30).toEpochMilli(), retrying.path("startedAt").asLong());
+        assertStaysThenBecomes(service, jobId, "PENDING", "RUNNABLE");
+        assertStaysThenBecomes(service, jobId, "RUNNABLE", "STARTING");
+        assertStaysThenBecomes(service, jobId, "STARTING", "SUCCEEDED");
+
+        assertEquals(List.of(submitted.plusMillis(30), submitted.plusMillis(60)), runs);
+        JsonNode succeeded = describedJob(service, jobId);
+        assertEquals(2, succeeded.path("attempts").size());
+        // The job keeps the start of its first attempt.
+        assertEquals(submitted.plusMillis(30).toEpochMilli(), succeeded.path("startedAt").asLong());
+        assertEquals(0, time.sleepers());
+    }
+
+    /** The job is still in {@code from} 9 ms into a pause and in {@code to} when the 10 ms are up. */
+    private void assertStaysThenBecomes(BatchService service, String jobId, String from, String to) {
+        time.advance(Duration.ofMillis(9));
+        assertEquals(from, describedJob(service, jobId).path("status").asText());
+        time.advance(Duration.ofMillis(1));
+        assertEquals(to, describedJob(service, jobId).path("status").asText());
     }
 
     @Test
@@ -1206,6 +1271,11 @@ class BatchServiceTest {
 
     private BatchService service(String runnerMode, StorageBackend<String, BatchJob> jobStore,
                                  BatchDockerRunner runner) {
+        return service(runnerMode, jobStore, runner, jobs);
+    }
+
+    private BatchService service(String runnerMode, StorageBackend<String, BatchJob> jobStore,
+                                 BatchDockerRunner runner, TimelineJobs jobThreads) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.BatchServiceConfig batch = mock(EmulatorConfig.BatchServiceConfig.class);
@@ -1221,7 +1291,9 @@ class BatchServiceTest {
                 new RegionResolver(REGION, ACCOUNT),
                 config,
                 objectMapper,
-                runner);
+                runner,
+                time.clock(),
+                jobThreads);
     }
 
     private BatchService immediateService(StorageBackend<String, BatchJob> jobStore) {
@@ -1246,30 +1318,60 @@ class BatchServiceTest {
         return (ObjectNode) objectMapper.readTree(body);
     }
 
+    /** The job once every job run has finished, when it ended in {@code status}. */
     private JsonNode waitForJobStatus(BatchService service, String jobId, String status) throws Exception {
-        ObjectNode request = objectMapper.createObjectNode();
-        request.putArray("jobs").add(jobId);
-        for (int i = 0; i < 100; i++) {
-            JsonNode job = service.describeJobs(request).path("jobs").get(0);
-            if (job != null && status.equals(job.path("status").asText())) {
-                return job;
-            }
-            Thread.sleep(10);
-        }
-        return null;
+        jobs.awaitFinished();
+        JsonNode job = describedJob(service, jobId);
+        return job != null && status.equals(job.path("status").asText()) ? job : null;
     }
 
+    /** The job once every job run has finished, when it made {@code attemptCount} attempts. */
     private JsonNode waitForJobAttemptCount(BatchService service, String jobId, int attemptCount) throws Exception {
+        jobs.awaitFinished();
+        JsonNode job = describedJob(service, jobId);
+        return job != null && job.path("attempts").size() == attemptCount ? job : null;
+    }
+
+    private JsonNode describedJob(BatchService service, String jobId) {
         ObjectNode request = objectMapper.createObjectNode();
         request.putArray("jobs").add(jobId);
-        for (int i = 0; i < 100; i++) {
-            JsonNode job = service.describeJobs(request).path("jobs").get(0);
-            if (job != null && job.path("attempts").size() == attemptCount) {
-                return job;
-            }
-            Thread.sleep(10);
+        return service.describeJobs(request).path("jobs").get(0);
+    }
+
+    /**
+     * Job runs on the test's timeline. A pause between job states either moves the timeline on from
+     * the thread that takes it, so a run finishes without anyone waiting, or parks until the test
+     * advances past it.
+     */
+    private static final class TimelineJobs implements BatchService.JobThreads {
+        private final TestTime time;
+        private final boolean selfAdvancing;
+        private final List<Thread> threads = new CopyOnWriteArrayList<>();
+
+        TimelineJobs(TestTime time, boolean selfAdvancing) {
+            this.time = time;
+            this.selfAdvancing = selfAdvancing;
         }
-        return null;
+
+        @Override
+        public void start(Runnable jobRun) {
+            threads.add(Thread.startVirtualThread(jobRun));
+        }
+
+        @Override
+        public void sleepMillis(long millis) throws InterruptedException {
+            if (selfAdvancing) {
+                time.sleepAdvancing(Duration.ofMillis(millis));
+            } else {
+                time.sleepMillis(millis);
+            }
+        }
+
+        void awaitFinished() throws InterruptedException {
+            for (Thread thread : threads) {
+                assertTrue(thread.join(Duration.ofSeconds(10)), "a job run did not finish");
+            }
+        }
     }
 
     private static final class ReverseScanJobStorage implements StorageBackend<String, BatchJob> {
