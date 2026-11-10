@@ -44,6 +44,7 @@ import io.floci.aws.services.ec2.model.InstanceState;
 import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.services.ec2instanceconnect.InstanceConnectKeys;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -81,6 +82,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.zip.GZIPOutputStream;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -2459,41 +2461,29 @@ class Ec2ContainerManagerTest {
         VpcNetworkManager vpcNetworkManager = mock(VpcNetworkManager.class);
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
-        Ec2ContainerManager manager = executor == null
-                ? new Ec2ContainerManager(
-                        containerBuilder,
-                        lifecycleManager,
-                        logStreamer,
-                        mock(ContainerDetector.class),
-                        dockerHostResolver,
-                        dockerClient,
-                        portAllocator,
-                        config,
-                        metadataServer,
-                        portForwardManager,
-                        regionResolver,
-                        mock(ContainerNetworkReachability.class),
-                        vpcNetworkManager,
-                        reachableEndpoint)
-                : new Ec2ContainerManager(
-                        containerBuilder,
-                        lifecycleManager,
-                        logStreamer,
-                        mock(ContainerDetector.class),
-                        dockerHostResolver,
-                        dockerClient,
-                        portAllocator,
-                        config,
-                        metadataServer,
-                        portForwardManager,
-                        regionResolver,
-                        mock(ContainerNetworkReachability.class),
-                        vpcNetworkManager,
-                        reachableEndpoint,
-                        executor,
-                        userDataTimeout);
+        TestTime time = TestTime.create();
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                containerBuilder,
+                lifecycleManager,
+                logStreamer,
+                mock(ContainerDetector.class),
+                dockerHostResolver,
+                dockerClient,
+                portAllocator,
+                config,
+                metadataServer,
+                portForwardManager,
+                regionResolver,
+                mock(ContainerNetworkReachability.class),
+                vpcNetworkManager,
+                reachableEndpoint,
+                new Ec2InstanceTypeCatalog(),
+                executor != null ? executor : Ec2ContainerManager.createLaunchExecutor(),
+                Ec2ContainerManager.createServiceNetworkRetryExecutor(),
+                userDataTimeout,
+                timelinePause(time));
         return new LaunchHarness(manager, lifecycleManager, dockerClient, metadataServer, logStreamer, builder,
-                portAllocator, portForwardManager, config, vpcNetworkManager, new CopyOnWriteArrayList<>());
+                portAllocator, portForwardManager, config, vpcNetworkManager, new CopyOnWriteArrayList<>(), time);
     }
 
     // ── startup reconciliation of EC2 containers orphaned by a previous run ──────
@@ -2745,15 +2735,22 @@ class Ec2ContainerManagerTest {
         return inspect;
     }
 
-    private static void awaitUntil(BooleanSupplier condition, Duration timeout) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (System.nanoTime() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
+    private static void awaitUntil(BooleanSupplier condition, Duration timeout) {
+        await().atMost(timeout).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(5))
+                .until(condition::getAsBoolean);
+    }
+
+    /**
+     * The manager's pauses pass on the harness timeline instead of the wall clock, each for its
+     * production length, and stay interruptible like the sleeps they stand in for.
+     */
+    private static Ec2ContainerPause timelinePause(TestTime time) {
+        return millis -> {
+            if (Thread.interrupted()) {
+                throw new InterruptedException();
             }
-            Thread.sleep(10);
-        }
-        assertTrue(condition.getAsBoolean(), "condition was not met before timeout");
+            time.sleepAdvancing(Duration.ofMillis(millis));
+        };
     }
 
     @Test
@@ -2820,6 +2817,8 @@ class Ec2ContainerManagerTest {
 
         awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
         assertFalse(ran.get(), "the hook must not run when the container is still present");
+        // One removal attempt, so the teardown pause passed once at its production length
+        assertEquals(TestTime.DEFAULT_START.plusMillis(500), harness.time().now());
     }
 
     @Test
@@ -3038,7 +3037,8 @@ class Ec2ContainerManagerTest {
                                  Ec2PortForwardManager portForwardManager,
                                  EmulatorConfig config,
                                  VpcNetworkManager vpcNetworkManager,
-                                 List<String[]> executedCommands) {
+                                 List<String[]> executedCommands,
+                                 TestTime time) {
         void stubSuccessfulExecs(CountDownLatch userDataStarted, CountDownLatch finishUserData) throws Exception {
             AtomicReference<String[]> currentCommand = new AtomicReference<>();
             ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
