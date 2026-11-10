@@ -516,6 +516,24 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
+    void authorizerForwardsCredentials() throws Exception {
+        Authorizer authorizer = new Authorizer();
+        authorizer.setId("auth-credentials");
+        when(api.createAuthorizer(eq("us-east-1"), eq("api-1"), anyMap())).thenReturn(authorizer);
+        StackResource r = resource("AWS::ApiGateway::Authorizer", "Auth");
+        provisioner.provision(r, props("""
+                {"RestApiId":"api-1","Name":"token","Type":"TOKEN",
+                 "AuthorizerCredentials":"arn:aws:iam::000000000000:role/authorizer"}
+                """), ctx());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, Object>> request = ArgumentCaptor.forClass(Map.class);
+        verify(api).createAuthorizer(eq("us-east-1"), eq("api-1"), request.capture());
+        assertEquals("arn:aws:iam::000000000000:role/authorizer", request.getValue().get("authorizerCredentials"));
+        assertEquals("auth-credentials", r.getPhysicalId());
+        assertEquals("auth-credentials", r.getAttributes().get("AuthorizerId"));
+    }
+
+    @Test
     void authorizerPublishesAuthorizerId() throws Exception {
         Authorizer authorizer = new Authorizer();
         authorizer.setId("auth-1");
