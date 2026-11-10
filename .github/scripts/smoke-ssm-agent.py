@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise an unchanged SSM agent against the published Floci JVM image."""
+"""Exercise an unchanged SSM agent against a published Floci image."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -25,6 +25,10 @@ AGENT_URL = (
 BASE_IMAGE = (
     "public.ecr.aws/amazonlinux/amazonlinux@sha256:"
     "957ff255a4ca9c60138ea636b8ae09e29ba146ea7bc95d0dae3923a5faeeb122"
+)
+AWS_CLI_IMAGE = (
+    "public.ecr.aws/aws-cli/aws-cli@sha256:"
+    "1c2d7a51b1ff4f460bc3f1e1ee46a6cef47c7429ad9089ef99012a95e472a1a5"
 )
 AMI = "ami-00000000000000001"
 REGION = "ap-southeast-7"
@@ -65,6 +69,7 @@ class Smoke:
         self.image, self.helper, self.output, self.work = image, helper, output, work
         self.owner = "floci-agent-smoke-" + uuid.uuid4().hex[:12]
         self.server, self.guest_image = self.owner + "-server", self.owner + "-guest"
+        self.cli = self.owner + "-cli"
         self.network = self.owner + "-network"
         self.guest = None
         self.created = {}
@@ -86,8 +91,8 @@ class Smoke:
             "exec", "-e", "AWS_ACCESS_KEY_ID=test", "-e", "AWS_SECRET_ACCESS_KEY=test",
             "-e", "AWS_SESSION_TOKEN=", "-e", "AWS_EC2_METADATA_DISABLED=true",
             "-e", "AWS_CONFIG_FILE=/dev/null", "-e", "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
-            "-e", "AWS_CA_BUNDLE=/app/data/tls/floci-root-ca.crt", "-e", "AWS_PAGER=",
-            self.server, "aws", "--endpoint-url", "https://localhost:4566",
+            "-e", "AWS_CA_BUNDLE=/floci-root-ca.crt", "-e", "AWS_PAGER=",
+            self.cli, "aws", "--endpoint-url", "https://localhost:4566",
             "--region", REGION, "--output", "json", "--no-paginate",
             service, operation, *arguments, *options,
             timeout=timeout,
@@ -116,7 +121,7 @@ class Smoke:
         architecture = docker("info", "--format", "{{.Architecture}}").stdout.strip()
         if architecture not in ("x86_64", "amd64"):
             raise ValueError("This smoke currently qualifies the x86_64 agent")
-        socket = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
+        socket = docker("context", "inspect", "--format", "{{.Endpoints.docker.Host}}").stdout.strip()
         if not socket.startswith("unix://"):
             raise ValueError("Run this smoke on a local Docker daemon")
         if "@sha256:" not in self.image or "@sha256:" not in self.helper:
@@ -136,8 +141,8 @@ class Smoke:
         )
         built = docker("build", "--platform", "linux/amd64", "--tag", self.guest_image,
                        str(self.work), timeout=240)
-        (self.output / "guest-build.log").write_text(built.stdout + built.stderr)
         self.created["guest_image"] = True
+        (self.output / "guest-build.log").write_text(built.stdout + built.stderr)
         guest_image = json.loads(docker("image", "inspect", self.guest_image).stdout)[0]
         self.record["guest_image_id"] = guest_image["Id"]
         self.record["agent_rpm_sha256"] = AGENT_SHA256
@@ -152,7 +157,9 @@ class Smoke:
         docker("pull", "--platform", "linux/amd64", self.image, timeout=240)
         docker("pull", "--platform", "linux/amd64", self.helper, timeout=240)
         docker("pull", "--platform", "linux/amd64", LAMBDA_IMAGE, timeout=240)
+        docker("pull", "--platform", "linux/amd64", AWS_CLI_IMAGE, timeout=240)
         self.record["lambda_runtime_image"] = LAMBDA_IMAGE
+        self.record["aws_cli_image"] = AWS_CLI_IMAGE
         image = json.loads(docker("image", "inspect", self.image).stdout)[0]
         configured = dict(value.split("=", 1) for value in image["Config"]["Env"] if "=" in value)
         for key in ("FLOCI_SERVICES_EC2_METADATA_HELPER_IMAGE",
@@ -211,6 +218,17 @@ class Smoke:
             if runtime["Config"][field] != image["Config"][field]:
                 raise ValueError("The stock image launch changed: " + field)
         self.record["healthy_ready_seconds"] = time.monotonic() - began
+        ca = self.work / "floci-root-ca.crt"
+        docker("cp", self.server + ":/app/data/tls/floci-root-ca.crt", str(ca))
+        docker(
+            "run", "--detach", "--name", self.cli, "--network", "container:" + self.server,
+            "--label", "floci.smoke.owner=" + self.owner, "--read-only",
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=16m",
+            "--mount", f"type=bind,source={ca},target=/floci-root-ca.crt,readonly",
+            "--entrypoint", "/bin/sh", AWS_CLI_IMAGE,
+            "-ec", "exec sleep 2147483647",
+        )
+        self.record["aws_cli_version"] = docker("exec", self.cli, "aws", "--version").stdout.strip()
 
     def prepare_vpc(self):
         print("Preparing private and public subnets with a routed NAT gateway", flush=True)
@@ -430,6 +448,14 @@ class Smoke:
         for name, service, operation, parameters in actions:
             if name in self.created:
                 attempt(name, lambda s=service, op=operation, p=parameters: self.aws(s, op, **p))
+        def remove_cli():
+            observed = docker("inspect", self.cli, check=False)
+            if observed.returncode:
+                return
+            if json.loads(observed.stdout)[0]["Config"]["Labels"].get("floci.smoke.owner") != self.owner:
+                raise ValueError("The CLI name belongs to a different owner")
+            docker("rm", "--force", "--volumes", self.cli)
+        attempt("cli-remove", remove_cli)
         def remove_server():
             observed = docker("inspect", self.server, check=False)
             if observed.returncode:
@@ -606,6 +632,19 @@ def exercise_commands(smoke):
     smoke.record["native_custom_document_executed"] = True
 
 
+FIFO_READER = r"""
+test -p "$1" && test -f "$2" || exit 1
+expected=$(printf 'cat\n%s' "$1")
+for entry in /proc/[0-9]*/cmdline; do
+    arguments=$(tr '\000' '\n' < "$entry" 2>/dev/null) || continue
+    if [ "$arguments" = "$expected" ]; then
+        exit 0
+    fi
+done
+exit 1
+"""
+
+
 def exercise_cancellation(smoke):
     print("Cancelling a real agent command blocked on a FIFO", flush=True)
     prefix = "/tmp/floci-cancel-" + uuid.uuid4().hex
@@ -620,7 +659,7 @@ def exercise_cancellation(smoke):
 
     def running():
         return docker("exec", smoke.guest, "/bin/sh", "-ec",
-                            'test -p "$1" && test -f "$2"', "ready-check", fifo, ready,
+                            FIFO_READER, "reader-admission", fifo, ready,
                             check=False).returncode == 0
 
     wait_for("The real command did not reach its blocking operation", running, seconds=45)
