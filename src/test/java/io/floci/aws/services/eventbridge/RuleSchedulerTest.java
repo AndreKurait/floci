@@ -3,6 +3,7 @@ package io.floci.aws.services.eventbridge;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.eventbridge.model.Rule;
 import io.floci.aws.services.eventbridge.model.RuleState;
 import io.floci.aws.services.eventbridge.model.Target;
@@ -200,6 +201,7 @@ class RuleSchedulerTest {
 
     private static RuleScheduler newScheduler(Vertx vertx, EventBridgeInvoker invoker) {
         TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class),
                 "http://localhost:4566", Clock.systemUTC(), null);
         return new RuleScheduler(vertx, testConfig(), new ObjectMapper(), dispatcher,
                 Clock.fixed(JUST_BEFORE_MINUTE_BOUNDARY, ZoneOffset.UTC));
@@ -217,6 +219,11 @@ class RuleSchedulerTest {
         StoppingInvoker(Runnable onDelivery) {
             super(null, null, null, new ObjectMapper(), testConfig());
             this.onDelivery = onDelivery;
+        }
+
+        @Override
+        void invokeTarget(Target target, String eventJson, String region, String targetArn, String ruleArn) {
+            invokeTarget(target, eventJson, region, ruleArn);
         }
 
         @Override

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.eventbridge.model.Archive;
@@ -46,6 +47,7 @@ class EventBridgeSchedulerIntegrationTest {
 
         EventBridgeInvoker invoker = new EventBridgeInvoker(null, null, null, new ObjectMapper(), createConfig());
         TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class),
                 "http://localhost:4566", Clock.systemUTC(), null);
         scheduler = new RuleScheduler(vertx, createConfig(), new ObjectMapper(), dispatcher);
 
