@@ -553,6 +553,21 @@ public final class TestTime {
     }
 
     /**
+     * Whether {@code thread} has stopped running somewhere other than on its way onto this timeline.
+     * Queued for the timeline's own lock, a thread is entering its next sleep, wait or schedule: it
+     * looks parked but has not come to rest. Read with the lock held, it cannot leave that queue
+     * between the two checks. For the fixtures of this package that settle a thread they woke.
+     */
+    boolean blockedOffTheTimeline(Thread thread) {
+        lock.lock();
+        try {
+            return ThreadStates.PARKED_OR_DONE.contains(thread.getState()) && !lock.hasQueuedThread(thread);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Ends a timed wait and says whether its deadline was reached. A deadline that fired while the
      * call was returning on its own left an interrupt nobody consumed; it belongs to this wait, so it
      * is cleared here.
@@ -599,7 +614,10 @@ public final class TestTime {
             this.interrupts = interrupts;
         }
 
-        /** Wakes the thread, then holds the timeline still until it has stopped running again. */
+        /**
+         * Wakes the thread, then holds the timeline still until it has stopped running again: back
+         * on the timeline, blocked somewhere else, or finished.
+         */
         @Override
         void fire() {
             long deadline = System.nanoTime() + settleTimeout.toNanos();
@@ -624,8 +642,18 @@ public final class TestTime {
                 lock.unlock();
             }
             int parkedSamples = 0;
-            while (thread.isAlive() && !isParked(thread)) {
-                parkedSamples = ThreadStates.PARKED_OR_DONE.contains(thread.getState()) ? parkedSamples + 1 : 0;
+            while (thread.isAlive()) {
+                boolean blockedElsewhere;
+                lock.lock();
+                try {
+                    if (isParked(thread)) {
+                        return;
+                    }
+                    blockedElsewhere = blockedOffTheTimeline(thread);
+                } finally {
+                    lock.unlock();
+                }
+                parkedSamples = blockedElsewhere ? parkedSamples + 1 : 0;
                 if (parkedSamples >= SETTLED_SAMPLES) {
                     return;
                 }

@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SignedMarkers;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.concurrent.DeadlineWaits;
 import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -63,6 +64,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private final int maxTotal;
     private final boolean ephemeral;
     private final long drainTimeoutNanos;
+    private final DeadlineWaits waits;
     private final Map<String, Allocation> allocations = new HashMap<>();
     private final SignedMarkers listMarkers = new SignedMarkers();
     private final Map<ContainerHandle, Allocation> leases = new HashMap<>();
@@ -155,6 +157,19 @@ public class ProvisionedConcurrencyPool implements Resettable {
                               LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
                               Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
                               LambdaConcurrencyLimiter concurrencyLimiter, ScheduledExecutorService scheduler) {
+        this(launcher, functions, aliases, storage, clock, maxPerFunction, maxTotal, ephemeral,
+                drainSeconds, concurrencyLimiter, scheduler, DeadlineWaits.SYSTEM);
+    }
+
+    /**
+     * @param waits the time source of every drain deadline, including the one
+     *              {@link #stopManagedContainers(long)} is handed, and the bounded waits that honor it
+     */
+    ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                              LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
+                              Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
+                              LambdaConcurrencyLimiter concurrencyLimiter, ScheduledExecutorService scheduler,
+                              DeadlineWaits waits) {
         this.launcher = launcher;
         this.functions = functions;
         this.aliases = aliases;
@@ -166,6 +181,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
         this.ephemeral = ephemeral;
         this.drainTimeoutNanos = TimeUnit.SECONDS.toNanos(drainSeconds);
         this.scheduler = scheduler;
+        this.waits = waits;
     }
 
     @PostConstruct
@@ -378,7 +394,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             long deadline;
             synchronized (lock) {
                 shutdownDrain = stopped;
-                long now = System.nanoTime();
+                long now = waits.nanoTime();
                 deadline = stopped && shutdownDeadlineNanos > now
                         ? shutdownDeadlineNanos : now + drainTimeoutNanos;
             }
@@ -665,7 +681,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             long deadline;
             synchronized (lock) {
                 shutdownDrain = stopped;
-                long now = System.nanoTime();
+                long now = waits.nanoTime();
                 deadline = stopped && shutdownDeadlineNanos > now
                         ? shutdownDeadlineNanos : now + drainTimeoutNanos;
             }
@@ -715,7 +731,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     }
 
     private void stop(List<ContainerHandle> handles, boolean shutdownDrain) {
-        stop(handles, shutdownDrain, System.nanoTime() + drainTimeoutNanos);
+        stop(handles, shutdownDrain, waits.nanoTime() + drainTimeoutNanos);
     }
 
     private void stop(List<ContainerHandle> handles, boolean shutdownDrain, long deadlineNanos) {
@@ -732,7 +748,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             }
         }
         ContainerTeardowns.stopInParallel(handles, handle -> stop(handle, shutdownDrain, deadlineNanos),
-                LOG, deadlineNanos);
+                LOG, deadlineNanos, waits);
     }
 
     private void stop(ContainerHandle handle, boolean shutdownDrain, long deadlineNanos) {
@@ -754,7 +770,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             // drain instead of returning while it runs, or issuing another Docker stop.
             if (shutdownDrain) {
                 try {
-                    completion.await(Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+                    waits.await(completion, Math.max(0, deadlineNanos - waits.nanoTime()));
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                 }
@@ -905,7 +921,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     }
 
     public void stopManagedContainers() {
-        stopManagedContainers(System.nanoTime() + drainTimeoutNanos);
+        stopManagedContainers(waits.nanoTime() + drainTimeoutNanos);
     }
 
     void stopManagedContainers(long deadlineNanos) {
@@ -924,8 +940,8 @@ public class ProvisionedConcurrencyPool implements Resettable {
         synchronized (lock) {
             try {
                 long remaining;
-                while (activeLaunches > 0 && (remaining = deadlineNanos - System.nanoTime()) > 0) {
-                    TimeUnit.NANOSECONDS.timedWait(lock, remaining);
+                while (activeLaunches > 0 && (remaining = deadlineNanos - waits.nanoTime()) > 0) {
+                    waits.waitOn(lock, remaining);
                 }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();

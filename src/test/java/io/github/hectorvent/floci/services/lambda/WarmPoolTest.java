@@ -7,6 +7,8 @@ import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
+import io.github.hectorvent.floci.testing.TestTime;
+import io.github.hectorvent.floci.testing.TimelineDeadlineWaits;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -35,6 +37,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -57,7 +60,13 @@ class WarmPoolTest {
     @Mock LambdaRuntimeLauncher containerLauncher;
     @Mock EmulatorConfig config;
 
+    /** The drain timeout the deadline cases configure, in place of the default fifteen seconds. */
+    private static final Duration DRAIN = Duration.ofSeconds(1);
+    private static final Duration ONE_NANOSECOND = Duration.ofNanos(1);
+
     private final MutableClock clock = new MutableClock(Instant.parse("2026-09-29T12:00:00Z"));
+    private final TestTime time = TestTime.create();
+    private final TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
 
     private WarmPool buildPool() {
         return buildPool(Optional.empty(), 0);
@@ -69,6 +78,21 @@ class WarmPoolTest {
 
     private WarmPool buildPool(Optional<Integer> maxPerFunction, int maxTotal,
                                ProvisionedConcurrencyPool provisioned, int drainSeconds) {
+        stubConfig(maxPerFunction, maxTotal, drainSeconds);
+        return new WarmPool(containerLauncher, config, clock, provisioned);
+    }
+
+    /**
+     * A pool with the {@link #DRAIN} timeout whose deadlines are read from {@link #time} and whose
+     * bounded waits end only when the test advances it. A call that waits out a deadline must run
+     * on another thread than the one advancing.
+     */
+    private WarmPool buildTimelinePool(ProvisionedConcurrencyPool provisioned) {
+        stubConfig(Optional.empty(), 0, (int) DRAIN.toSeconds());
+        return new WarmPool(containerLauncher, config, clock, provisioned, waits);
+    }
+
+    private void stubConfig(Optional<Integer> maxPerFunction, int maxTotal, int drainSeconds) {
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
         when(config.services()).thenReturn(services);
@@ -78,7 +102,6 @@ class WarmPoolTest {
         when(lambda.warmPoolMaxPerFunction()).thenReturn(maxPerFunction);
         when(lambda.warmPoolMaxTotal()).thenReturn(maxTotal);
         when(lambda.containerDrainTimeoutSeconds()).thenReturn(drainSeconds);
-        return new WarmPool(containerLauncher, config, clock, provisioned);
     }
 
     private static LambdaFunction function(String name) {
@@ -192,7 +215,7 @@ class WarmPoolTest {
 
     @Test
     void shutdownDeadlineCancelsConcurrentRemovalsAndResetRetainsThemForRetry() throws Exception {
-        WarmPool pool = buildPool(Optional.empty(), 0, null, 1);
+        WarmPool pool = buildTimelinePool(null);
         ContainerHandle first = new ContainerHandle("first", "first", null, ContainerState.WARM);
         ContainerHandle second = new ContainerHandle("second", "second", null, ContainerState.WARM);
         when(containerLauncher.launch(any())).thenReturn(first, second);
@@ -216,6 +239,12 @@ class WarmPoolTest {
             pool.release(pool.acquire(function("second")));
             Future<?> drain = executor.submit(pool::stopManagedContainers);
             assertTrue(bothStarted.await(3, TimeUnit.SECONDS));
+            // The shutdown and its drain of the known containers each wait on the one deadline.
+            waits.awaitWaiting(2);
+            time.advance(DRAIN.minus(ONE_NANOSECOND));
+            assertFalse(drain.isDone());
+            assertEquals(2, bothInterrupted.getCount());
+            time.advance(ONE_NANOSECOND);
             drain.get(3, TimeUnit.SECONDS);
             assertTrue(bothInterrupted.await(3, TimeUnit.SECONDS));
             pool.stopManagedContainers();
@@ -225,11 +254,12 @@ class WarmPoolTest {
             pool.afterReset();
             doNothing().when(containerLauncher).stop(any());
             // Cancellation can return before workers finish releasing their teardown ownership.
-            await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
-                pool.evictIdleContainers();
-                verify(containerLauncher, times(2)).stop(first);
-                verify(containerLauncher, times(2)).stop(second);
-            });
+            await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        pool.evictIdleContainers();
+                        verify(containerLauncher, times(2)).stop(first);
+                        verify(containerLauncher, times(2)).stop(second);
+                    });
         } finally {
             release.countDown();
             executor.shutdownNow();
@@ -241,7 +271,7 @@ class WarmPoolTest {
 
     @Test
     void releaseAfterShutdownDeadlineRetriesFailedRemoval() throws Exception {
-        WarmPool pool = buildPool(Optional.empty(), 0, null, 1);
+        WarmPool pool = buildTimelinePool(null);
         LambdaFunction fn = function("late-release");
         ContainerHandle busy = new ContainerHandle("busy", "late-release", null, ContainerState.WARM);
         ContainerHandle slow = new ContainerHandle("slow", "late-release", null, ContainerState.WARM);
@@ -261,6 +291,10 @@ class WarmPoolTest {
             assertSame(slow, pool.acquire(fn));
             Future<?> shutdown = executor.submit(pool::stopManagedContainers);
             assertTrue(slowStopStarted.await(3, TimeUnit.SECONDS));
+            waits.awaitWaiting(2);
+            time.advance(DRAIN.minus(ONE_NANOSECOND));
+            assertFalse(shutdown.isDone());
+            time.advance(ONE_NANOSECOND);
             shutdown.get(3, TimeUnit.SECONDS);
             verify(containerLauncher, times(1)).stop(busy);
 
@@ -305,7 +339,7 @@ class WarmPoolTest {
 
     @Test
     void functionDrainUsesConfiguredBudgetAndMaintenanceRetriesCanceledRemoval() throws Exception {
-        WarmPool pool = buildPool(Optional.empty(), 0, null, 1);
+        WarmPool pool = buildTimelinePool(null);
         ContainerHandle handle = new ContainerHandle("bounded-drain", "bounded", null, ContainerState.WARM);
         when(containerLauncher.launch(any())).thenReturn(handle);
         AtomicInteger attempts = new AtomicInteger();
@@ -324,15 +358,20 @@ class WarmPoolTest {
             Future<?> drain = tasks.submit(() -> pool.drainFunction("bounded"));
             try {
                 assertTrue(entered.await(2, TimeUnit.SECONDS));
+                waits.awaitWaiting(1);
+                time.advance(DRAIN.minus(ONE_NANOSECOND));
+                assertFalse(drain.isDone());
+                time.advance(ONE_NANOSECOND);
                 drain.get(3, TimeUnit.SECONDS);
                 assertEquals(1, attempts.get());
             } finally {
                 release.countDown();
             }
-            await().atMost(Duration.ofSeconds(3)).until(() -> {
-                pool.evictIdleContainers();
-                return attempts.get() == 2;
-            });
+            await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> {
+                        pool.evictIdleContainers();
+                        return attempts.get() == 2;
+                    });
         } finally {
             release.countDown();
             pool.shutdown();
@@ -343,7 +382,7 @@ class WarmPoolTest {
     @Test
     void bothPoolsUseOneConfiguredDeadlineAndCanceledRemovalRemainsRetryable() throws Exception {
         ProvisionedConcurrencyPool provisioned = mock(ProvisionedConcurrencyPool.class);
-        WarmPool pool = buildPool(Optional.empty(), 0, provisioned, 1);
+        WarmPool pool = buildTimelinePool(provisioned);
         pool.init();
         ContainerHandle handle = new ContainerHandle("cid-canceled", "cancel-fn", null, ContainerState.WARM);
         when(containerLauncher.launch(any())).thenReturn(handle);
@@ -376,15 +415,21 @@ class WarmPoolTest {
             return null;
         }).when(containerLauncher).stop(handle);
         ExecutorService executor = Executors.newSingleThreadExecutor();
-        long before = System.nanoTime();
+        long before = waits.nanoTime();
         Future<?> drain = executor.submit(pool::stopManagedContainers);
         try {
             assertTrue(bothStarted.await(3, TimeUnit.SECONDS),
                     "Both pools must start draining before either pool finishes");
+            assertEquals(before + DRAIN.toNanos(), provisionedDeadline.get());
+            // The shutdown waits on the provisioned pool's drain, the on-demand drain on its container.
+            waits.awaitWaiting(2);
+            time.advance(DRAIN.minus(ONE_NANOSECOND));
+            assertFalse(drain.isDone());
+            assertEquals(2, bothInterrupted.getCount());
+            time.advance(ONE_NANOSECOND);
             drain.get(5, TimeUnit.SECONDS);
             assertTrue(bothInterrupted.await(3, TimeUnit.SECONDS));
-            assertTrue(provisionedDeadline.get() >= before + TimeUnit.SECONDS.toNanos(1));
-            assertTrue(provisionedDeadline.get() <= System.nanoTime());
+            assertEquals(waits.nanoTime(), provisionedDeadline.get());
             assertThrows(RuntimeException.class, () -> pool.acquire(fn));
             pool.shutdown();
             verify(containerLauncher, times(1)).stop(handle);
@@ -437,7 +482,7 @@ class WarmPoolTest {
 
     @Test
     void knownWarmHandleStopsWhileColdLaunchRemainsBlocked() throws Exception {
-        WarmPool pool = buildPool(Optional.empty(), 0, null, 1);
+        WarmPool pool = buildTimelinePool(null);
         pool.init();
         ContainerHandle warm = new ContainerHandle("cid-known", "known-fn", null, ContainerState.WARM);
         ContainerHandle late = new ContainerHandle("cid-blocked", "blocked-fn", null, ContainerState.WARM);
@@ -462,6 +507,12 @@ class WarmPoolTest {
             Future<?> drain = executor.submit(pool::stopManagedContainers);
             assertTrue(warmStopped.await(500, TimeUnit.MILLISECONDS),
                     "Known containers must retire before waiting for a blocked launch");
+            // The shutdown, its drain and the wait for the blocked launch all end at the one deadline.
+            waits.awaitWaiting(3);
+            time.advance(DRAIN.minus(ONE_NANOSECOND));
+            assertFalse(drain.isDone());
+            verify(containerLauncher, never()).stop(late);
+            time.advance(ONE_NANOSECOND);
             drain.get(3, TimeUnit.SECONDS);
             finishLaunch.countDown();
             assertThrows(ExecutionException.class, () -> acquire.get(3, TimeUnit.SECONDS));
@@ -479,7 +530,7 @@ class WarmPoolTest {
 
     @Test
     void oldColdLaunchCannotAcquireAfterResetReopensPool() throws Exception {
-        WarmPool pool = buildPool(Optional.empty(), 0, null, 1);
+        WarmPool pool = buildTimelinePool(null);
         pool.init();
         LambdaFunction fn = function("reset-fn");
         ContainerHandle old = new ContainerHandle("cid-old-launch", "reset-fn", null, ContainerState.WARM);
@@ -491,11 +542,17 @@ class WarmPoolTest {
             assertTrue(finishLaunch.await(5, TimeUnit.SECONDS));
             return old;
         }).thenReturn(current);
-        ExecutorService executor = Executors.newSingleThreadExecutor();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
         try {
             Future<ContainerHandle> acquire = executor.submit(() -> pool.acquire(fn));
             assertTrue(launchStarted.await(3, TimeUnit.SECONDS));
-            pool.stopManagedContainers();
+            Future<?> shutdown = executor.submit(pool::stopManagedContainers);
+            // The shutdown gives the blocked launch the whole drain timeout, and no longer.
+            waits.awaitWaiting(3);
+            time.advance(DRAIN.minus(ONE_NANOSECOND));
+            assertFalse(shutdown.isDone());
+            time.advance(ONE_NANOSECOND);
+            shutdown.get(3, TimeUnit.SECONDS);
             pool.afterReset();
             assertSame(current, pool.acquire(fn));
             pool.release(current);
@@ -556,9 +613,13 @@ class WarmPoolTest {
         verify(containerLauncher, times(1)).stop(current);
     }
 
+    /**
+     * Real-time wiring: the injected constructor's system waits time the configured drain, which
+     * the other deadline cases step through on a timeline.
+     */
     @Test
     void launchBeyondShutdownDeadlineIsRefusedAndStopped() throws Exception {
-        WarmPool pool = buildPool(Optional.empty(), 0, null, 1);
+        WarmPool pool = buildPool(Optional.empty(), 0, null, (int) DRAIN.toSeconds());
         pool.init();
         LambdaFunction fn = function("late-fn");
         ContainerHandle handle = new ContainerHandle("cid-late", "late-fn", null, ContainerState.WARM);
@@ -573,8 +634,10 @@ class WarmPoolTest {
         try {
             Future<ContainerHandle> acquire = executor.submit(() -> pool.acquire(fn));
             assertTrue(launched.await(3, TimeUnit.SECONDS));
+            long started = System.nanoTime();
             Future<?> drain = executor.submit(pool::stopManagedContainers);
             drain.get(3, TimeUnit.SECONDS);
+            assertTrue(System.nanoTime() - started >= DRAIN.toNanos());
             verify(containerLauncher, never()).stop(handle);
             finishLaunch.countDown();
             ExecutionException failure = assertThrows(ExecutionException.class,
