@@ -115,7 +115,7 @@ public class CodePipelineService {
     private final S3Service s3Service;
     private final CodePipelineEventPublisher eventPublisher;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    private final ScheduledExecutorService sourcePoller = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService sourcePoller;
     private final KeyedLockPool pipelineLocks = new KeyedLockPool();
     private final KeyedLockPool sourcePollLocks = new KeyedLockPool();
     private static final String MANUAL_TRIGGER_DETAIL = "manual";
@@ -130,6 +130,7 @@ public class CodePipelineService {
     // Package-private so tests can assert the resolved intervals instead of timing schedules and sleeps.
     final long sourcePollIntervalMs;
     final long workerPollIntervalMs;
+    private final Sleeper workerSleeper;
     // Test hooks, set only through the package-private constructor: a shortened wait, and a probe
     // for the gap before the override timeout cleanup.
     private final long runFinishWaitNanos;
@@ -138,10 +139,10 @@ public class CodePipelineService {
     /** Internal override type: a rollback pins a GitHub source action to the target's commit. */
     private static final String GITHUB_COMMIT_ID = "GITHUB_COMMIT_ID";
 
-    private static final long DEFAULT_RUN_FINISH_WAIT_NANOS = TimeUnit.SECONDS.toNanos(5);
+    static final long DEFAULT_RUN_FINISH_WAIT_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     /** Matches the {@code source-poll-interval-ms} default in application.yml. */
-    private static final long DEFAULT_SOURCE_POLL_INTERVAL_MS = 500L;
+    static final long DEFAULT_SOURCE_POLL_INTERVAL_MS = 500L;
 
     /**
      * Package-private constructor for the tests that build the service without CDI. The source
@@ -197,12 +198,36 @@ public class CodePipelineService {
         return fallback;
     }
 
-    @SuppressWarnings("unchecked")
     CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
                         CodeBuildService codeBuildService, CodeDeployService codeDeployService,
                         LambdaService lambdaService, S3Service s3Service,
                         CodePipelineEventPublisher eventPublisher, long sourcePollIntervalMs, long workerPollIntervalMs,
                         long runFinishWaitNanos, Runnable beforeOverrideTimeoutCleanup) {
+        this(storageFactory, mapper, codeBuildService, codeDeployService, lambdaService, s3Service,
+                eventPublisher, sourcePollIntervalMs, workerPollIntervalMs, runFinishWaitNanos,
+                beforeOverrideTimeoutCleanup, Executors.newSingleThreadScheduledExecutor());
+    }
+
+    /** Package-private so tests can run the S3 source poller on a scheduler they control. */
+    CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
+                        CodeBuildService codeBuildService, CodeDeployService codeDeployService,
+                        LambdaService lambdaService, S3Service s3Service,
+                        CodePipelineEventPublisher eventPublisher, long sourcePollIntervalMs, long workerPollIntervalMs,
+                        long runFinishWaitNanos, Runnable beforeOverrideTimeoutCleanup,
+                        ScheduledExecutorService sourcePoller) {
+        this(storageFactory, mapper, codeBuildService, codeDeployService, lambdaService, s3Service,
+                eventPublisher, sourcePollIntervalMs, workerPollIntervalMs, runFinishWaitNanos,
+                beforeOverrideTimeoutCleanup, sourcePoller, TimeUnit.MILLISECONDS::sleep);
+    }
+
+    /** Package-private so tests can also control the pause between two checks of an external action. */
+    @SuppressWarnings("unchecked")
+    CodePipelineService(StorageFactory storageFactory, ObjectMapper mapper,
+                        CodeBuildService codeBuildService, CodeDeployService codeDeployService,
+                        LambdaService lambdaService, S3Service s3Service,
+                        CodePipelineEventPublisher eventPublisher, long sourcePollIntervalMs, long workerPollIntervalMs,
+                        long runFinishWaitNanos, Runnable beforeOverrideTimeoutCleanup,
+                        ScheduledExecutorService sourcePoller, Sleeper workerSleeper) {
         this.pipelineStore = storageFactory.create(
                 "codepipeline", "codepipeline-pipelines.json", new TypeReference<Map<String, CodePipelinePipeline>>() {});
         this.executionStore = storageFactory.create(
@@ -221,6 +246,14 @@ public class CodePipelineService {
                 DEFAULT_WORKER_POLL_INTERVAL_MS);
         this.runFinishWaitNanos = runFinishWaitNanos;
         this.beforeOverrideTimeoutCleanup = beforeOverrideTimeoutCleanup;
+        this.sourcePoller = sourcePoller;
+        this.workerSleeper = workerSleeper;
+    }
+
+    /** The pause an action worker takes between two checks of the build, deployment or job it waits for. */
+    @FunctionalInterface
+    interface Sleeper {
+        void sleepMillis(long millis) throws InterruptedException;
     }
 
     public JsonNode handle(String action, JsonNode request, String region, String account) {
@@ -2357,7 +2390,7 @@ public class CodePipelineService {
             if (abandonExternalActionIfRequested(execution, state)) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
+            workerSleeper.sleepMillis(workerPollIntervalMs);
             build = codeBuildService.getBuild(execution.getRegion(), execution.getAccountId(), build.getId());
         }
         if (abandonExternalActionIfRequested(execution, state)) {
@@ -2390,7 +2423,7 @@ public class CodePipelineService {
             if (abandonExternalActionIfRequested(execution, state)) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
+            workerSleeper.sleepMillis(workerPollIntervalMs);
             deployment = codeDeployService.getDeployment(execution.getRegion(), deploymentId);
         }
         if (abandonExternalActionIfRequested(execution, state)) {
@@ -2460,7 +2493,7 @@ public class CodePipelineService {
                     now() + TimeUnit.DAYS.toSeconds(7));
         }
         while ("InProgress".equals(state.getStatus()) && !execution.isStopRequested()) {
-            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
+            workerSleeper.sleepMillis(workerPollIntervalMs);
         }
         if (execution.isStopRequested()) {
             state.setStatus(execution.isAbandon() ? "Abandoned" : "Stopped");
@@ -2515,7 +2548,7 @@ public class CodePipelineService {
                 }
                 throw new AwsException("ActionExecutionFailed", message, 400);
             }
-            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
+            workerSleeper.sleepMillis(workerPollIntervalMs);
         }
         state.setStatus("Abandoned");
         state.setSummary("Action abandoned.");
@@ -2577,7 +2610,7 @@ public class CodePipelineService {
             if (enabled) {
                 return;
             }
-            TimeUnit.MILLISECONDS.sleep(workerPollIntervalMs);
+            workerSleeper.sleepMillis(workerPollIntervalMs);
             pipeline = requirePipeline(execution.getAccountId(), execution.getRegion(), execution.getPipelineName());
         }
     }

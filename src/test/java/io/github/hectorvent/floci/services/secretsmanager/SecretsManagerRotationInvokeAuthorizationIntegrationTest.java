@@ -196,7 +196,8 @@ class SecretsManagerRotationInvokeAuthorizationIntegrationTest {
      * trying to update.
      */
     private static void awaitRotationFinished(String secretName) {
-        await().atMost(Duration.ofSeconds(5)).until(() -> secretsManager(ACCOUNT_ID, "DescribeSecret",
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> secretsManager(ACCOUNT_ID, "DescribeSecret",
                 "{\"SecretId\":\"" + secretName + "\"}").statusCode(200).extract().path("LastRotatedDate") != null);
     }
 

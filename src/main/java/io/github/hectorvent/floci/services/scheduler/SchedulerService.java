@@ -20,6 +20,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.List;
@@ -46,6 +47,7 @@ public class SchedulerService {
     private final StorageBackend<String, ScheduleGroup> groupStore;
     private final StorageBackend<String, Schedule> scheduleStore;
     private final RegionResolver regionResolver;
+    private final Clock clock;
 
     @Inject
     public SchedulerService(StorageFactory storageFactory, RegionResolver regionResolver) {
@@ -61,9 +63,18 @@ public class SchedulerService {
     SchedulerService(StorageBackend<String, ScheduleGroup> groupStore,
                      StorageBackend<String, Schedule> scheduleStore,
                      RegionResolver regionResolver) {
+        this(groupStore, scheduleStore, regionResolver, Clock.systemUTC());
+    }
+
+    /** Package-private so tests can stamp groups and schedules on a clock they control. */
+    SchedulerService(StorageBackend<String, ScheduleGroup> groupStore,
+                     StorageBackend<String, Schedule> scheduleStore,
+                     RegionResolver regionResolver,
+                     Clock clock) {
         this.groupStore = groupStore;
         this.scheduleStore = scheduleStore;
         this.regionResolver = regionResolver;
+        this.clock = clock;
     }
 
     // ──────────────────────────── Schedule Groups ────────────────────────────
@@ -71,7 +82,7 @@ public class SchedulerService {
     public ScheduleGroup getOrCreateDefaultGroup(String region) {
         String key = groupKey(region, DEFAULT_GROUP);
         return groupStore.get(key).orElseGet(() -> {
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             ScheduleGroup group = new ScheduleGroup(
                     DEFAULT_GROUP,
                     buildGroupArn(region, DEFAULT_GROUP),
@@ -95,7 +106,7 @@ public class SchedulerService {
             throw new AwsException("ConflictException",
                     "ScheduleGroup already exists: " + name, 409);
         }
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         ScheduleGroup group = new ScheduleGroup(
                 name,
                 buildGroupArn(region, name),
@@ -156,7 +167,7 @@ public class SchedulerService {
         }
         ScheduleGroup group = getScheduleGroup(name, region);
         group.getTags().putAll(tags);
-        group.setLastModificationDate(Instant.now());
+        group.setLastModificationDate(clock.instant());
         groupStore.put(groupKey(region, group.getName()), group);
     }
 
@@ -166,7 +177,7 @@ public class SchedulerService {
         }
         ScheduleGroup group = getScheduleGroup(name, region);
         tagKeys.forEach(group.getTags()::remove);
-        group.setLastModificationDate(Instant.now());
+        group.setLastModificationDate(clock.instant());
         groupStore.put(groupKey(region, group.getName()), group);
     }
 
@@ -199,7 +210,7 @@ public class SchedulerService {
                     "Schedule already exists: " + req.getName(), 409);
         }
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Schedule schedule = new Schedule();
         schedule.setName(req.getName());
         schedule.setArn(buildScheduleArn(region, effectiveGroup, req.getName()));
@@ -240,7 +251,7 @@ public class SchedulerService {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Schedule not found: " + req.getName(), 404));
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Schedule updated = new Schedule();
         updated.setName(req.getName());
         updated.setArn(existing.getArn());

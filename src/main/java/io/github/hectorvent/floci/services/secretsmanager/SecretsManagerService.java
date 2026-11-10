@@ -30,6 +30,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -68,6 +69,7 @@ public class SecretsManagerService implements ResourceProvider {
     public static final String SCHEDULED_DELETION_ERROR_MESSAGE =
         "You can't perform this operation on the secret because it was marked for deletion.";
 
+    private final Clock clock;
     private final StorageBackend<String, Secret> store;
     private final int defaultRecoveryWindowDays;
     private final RegionResolver regionResolver;
@@ -171,6 +173,16 @@ public class SecretsManagerService implements ResourceProvider {
                           RegionResolver regionResolver, LambdaService lambdaService,
                           ObjectMapper objectMapper, KmsService kmsService,
                           List<ManagedSecretRotator> managedSecretRotators) {
+        this(store, defaultRecoveryWindowDays, regionResolver, lambdaService, objectMapper, kmsService,
+                managedSecretRotators, Clock.systemUTC());
+    }
+
+    /** Package-private so tests can stamp and schedule secrets on a clock they control. */
+    SecretsManagerService(StorageBackend<String, Secret> store, int defaultRecoveryWindowDays,
+                          RegionResolver regionResolver, LambdaService lambdaService,
+                          ObjectMapper objectMapper, KmsService kmsService,
+                          List<ManagedSecretRotator> managedSecretRotators, Clock clock) {
+        this.clock = clock;
         this.store = store;
         this.defaultRecoveryWindowDays = defaultRecoveryWindowDays;
         this.regionResolver = regionResolver;
@@ -258,7 +270,7 @@ public class SecretsManagerService implements ResourceProvider {
         }
 
         String arn = buildSecretArn(region, name);
-        Instant now = Instant.now();
+        Instant now = clock.instant();
 
         String versionId = clientRequestToken != null ? clientRequestToken : UUID.randomUUID().toString();
         SecretVersion version = new SecretVersion();
@@ -316,8 +328,8 @@ public class SecretsManagerService implements ResourceProvider {
             }
         }
 
-        version.setLastAccessedDate(Instant.now());
-        secret.setLastAccessedDate(Instant.now());
+        version.setLastAccessedDate(clock.instant());
+        secret.setLastAccessedDate(clock.instant());
         // Deliberately not persist(): reading a secret is not a change to replicate, and pushing
         // the primary out to every replica on each read would rebuild them constantly and
         // clobber each replica's own last-accessed bookkeeping.
@@ -357,7 +369,7 @@ public class SecretsManagerService implements ResourceProvider {
                 }
             }
 
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             String newVersionId = clientRequestToken != null ? clientRequestToken : UUID.randomUUID().toString();
 
             List<String> stages;
@@ -456,7 +468,7 @@ public class SecretsManagerService implements ResourceProvider {
                 // aws/secretsmanager" - which DescribeSecret reports by omitting KmsKeyId entirely.
                 secret.setKmsKeyId(kmsKeyId.isEmpty() ? null : kmsKeyId);
             }
-            secret.setLastChangedDate(Instant.now());
+            secret.setLastChangedDate(clock.instant());
 
             persist(secret, region);
             LOG.infov("Updated secret metadata: {0}", secret.getName());
@@ -822,8 +834,8 @@ public class SecretsManagerService implements ResourceProvider {
             credentialsChanged = true;
             synchronized (lockFor(secretArn)) {
                 putManagedRotationVersion(secret, UUID.randomUUID().toString(), previousCurrent, value);
-                secret.setLastChangedDate(Instant.now());
-                secret.setLastRotatedDate(Instant.now());
+                secret.setLastChangedDate(clock.instant());
+                secret.setLastRotatedDate(clock.instant());
                 persist(secret, region);
             }
         } catch (RuntimeException failure) {
@@ -893,7 +905,7 @@ public class SecretsManagerService implements ResourceProvider {
             if (forceDelete) {
                 store.delete(storageKey);
                 LOG.infov("Force-deleted secret: {0}", secret.getName());
-                secret.setDeletedDate(Instant.now());
+                secret.setDeletedDate(clock.instant());
                 return secret;
             }
 
@@ -905,7 +917,7 @@ public class SecretsManagerService implements ResourceProvider {
             throwIfPendingDeletion(secret);
 
             int windowDays = (recoveryWindowInDays != null) ? recoveryWindowInDays : defaultRecoveryWindowDays;
-            Instant deletedDate = Instant.now().plusSeconds((long) windowDays * 86400);
+            Instant deletedDate = clock.instant().plusSeconds((long) windowDays * 86400);
             secret.setDeletedDate(deletedDate);
             store.put(storageKey, secret);
             LOG.infov("Scheduled deletion of secret: {0} at {1}", secret.getName(), deletedDate);
@@ -1094,7 +1106,7 @@ public class SecretsManagerService implements ResourceProvider {
             }
 
             primary.setReplicationStatus(statuses);
-            primary.setLastChangedDate(Instant.now());
+            primary.setLastChangedDate(clock.instant());
             putSecret(region, primary);
             return primary;
         }
@@ -1195,7 +1207,7 @@ public class SecretsManagerService implements ResourceProvider {
             }
 
             primary.setReplicationStatus(statuses);
-            primary.setLastChangedDate(Instant.now());
+            primary.setLastChangedDate(clock.instant());
             putSecret(region, primary);
             return primary;
         }
@@ -1235,7 +1247,7 @@ public class SecretsManagerService implements ResourceProvider {
             }
             throwIfManagedRelease(replica.getArn());
             replica.setPrimaryRegion(null);
-            replica.setLastChangedDate(Instant.now());
+            replica.setLastChangedDate(clock.instant());
             putSecret(region, replica);
 
             // Detach from the old primary too, so it stops syncing over the promoted copy and can
@@ -1469,11 +1481,11 @@ public class SecretsManagerService implements ResourceProvider {
                     secret.setRotationRules(rotationRules);
                 }
                 secret.setRotationEnabled(true);
-                secret.setLastChangedDate(Instant.now());
+                secret.setLastChangedDate(clock.instant());
                 // Scheduled from now rather than from the rotation's completion on purpose: the
                 // rotation itself runs asynchronously and may fail, and a schedule that only advanced
                 // on success would leave the background sweep retrying it on every tick forever.
-                secret.setNextRotationDate(computeNextRotationDate(secret.getRotationRules(), Instant.now()));
+                secret.setNextRotationDate(computeNextRotationDate(secret.getRotationRules(), clock.instant()));
                 persist(secret, region);
                 rotationPrepared = true;
             }
@@ -1536,8 +1548,8 @@ public class SecretsManagerService implements ResourceProvider {
                         synchronized (lockFor(secretArn)) {
                             Secret current = resolveSecret(secretArn, region);
                             putManagedRotationVersion(current, token, current.getCurrentVersionId(), newValue);
-                            current.setLastRotatedDate(Instant.now());
-                            current.setLastChangedDate(Instant.now());
+                            current.setLastRotatedDate(clock.instant());
+                            current.setLastChangedDate(clock.instant());
                             persist(current, region);
                         }
                         committed.set(1);
@@ -1603,7 +1615,7 @@ public class SecretsManagerService implements ResourceProvider {
         rotated.setVersionId(token);
         rotated.setSecretString(secretString);
         rotated.setVersionStages(List.of(AWSCURRENT));
-        rotated.setCreatedDate(Instant.now());
+        rotated.setCreatedDate(clock.instant());
         secret.getVersions().put(token, rotated);
         secret.setCurrentVersionId(token);
     }
@@ -1674,7 +1686,7 @@ public class SecretsManagerService implements ResourceProvider {
             // The schedule goes with the rotation; leaving it set would keep the background sweep
             // firing a rotation the caller just turned off.
             secret.setNextRotationDate(null);
-            secret.setLastChangedDate(Instant.now());
+            secret.setLastChangedDate(clock.instant());
             persist(secret, region);
 
             // AWSPENDING sitting on the AWSCURRENT version is the signature of a rotation that
@@ -1717,7 +1729,7 @@ public class SecretsManagerService implements ResourceProvider {
                         SecretVersion pendingVersion = new SecretVersion();
                         pendingVersion.setVersionId(clientRequestToken);
                         pendingVersion.setVersionStages(List.of("AWSPENDING"));
-                        pendingVersion.setCreatedDate(Instant.now());
+                        pendingVersion.setCreatedDate(clock.instant());
                         if (secret.getVersions() == null) {
                             secret.setVersions(new HashMap<>());
                         }
@@ -1735,7 +1747,7 @@ public class SecretsManagerService implements ResourceProvider {
 
             synchronized (lockFor(secretArn)) {
                 Secret refreshed = resolveSecret(secretArn, region);
-                refreshed.setLastRotatedDate(Instant.now());
+                refreshed.setLastRotatedDate(clock.instant());
                 persist(refreshed, region);
             }
         } catch (Exception e) {
@@ -2197,7 +2209,7 @@ public class SecretsManagerService implements ResourceProvider {
             resources.add(new ExplorerResource(
                     arn, "secretsmanager:secret", "secretsmanager",
                     parsed.region(), parsed.accountId(),
-                    secret.getCreatedDate() != null ? secret.getCreatedDate() : Instant.now(),
+                    secret.getCreatedDate() != null ? secret.getCreatedDate() : clock.instant(),
                     tags));
         }
         return resources;

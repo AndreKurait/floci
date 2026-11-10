@@ -5,10 +5,12 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -409,11 +411,8 @@ class ManagedSecretRotationServiceTest {
         }
     }
 
-    private static void await(BooleanSupplier condition) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
-        assertTrue(condition.getAsBoolean(), "rotation did not finish");
+    private static void await(BooleanSupplier condition) {
+        Awaitility.await("rotation finished").atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10)).until(condition::getAsBoolean);
     }
 }

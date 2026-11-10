@@ -36,16 +36,21 @@ public class SwfTimeoutSweeper {
 
     @Inject
     public SwfTimeoutSweeper(SwfService swfService, EmulatorConfig config) {
+        this(swfService, config, Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "swf-timeout-sweeper");
+            thread.setDaemon(true);
+            return thread;
+        }));
+    }
+
+    /** Package-private so tests can run the sweep on a scheduler they control. */
+    SwfTimeoutSweeper(SwfService swfService, EmulatorConfig config, ScheduledExecutorService executor) {
         this.swfService = swfService;
         this.enabled = config.services().swf().enabled()
                 && config.services().swf().timeoutSweepEnabled();
         this.tickIntervalMillis = resolveInterval(config.services().swf().timeoutSweepIntervalMillis(),
                 config.services().swf().timeoutSweepIntervalSeconds());
-        this.executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "swf-timeout-sweeper");
-            thread.setDaemon(true);
-            return thread;
-        });
+        this.executor = executor;
     }
 
     /**

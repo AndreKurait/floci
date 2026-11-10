@@ -16,12 +16,14 @@ import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -148,21 +150,17 @@ class IotMqttWebSocketLazyStartIntegrationTest {
     }
 
     /** The close future can resolve before the OS releases the port; wait until it refuses. */
-    private static void awaitPortClosed() throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (System.currentTimeMillis() < deadline) {
-            try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress("127.0.0.1", PORT), 100);
-            } catch (Exception refused) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        assertThrows(Exception.class, () -> {
-            try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress("127.0.0.1", PORT), 100);
-            }
-        }, "the broker port is still accepting after stop()");
+    private static void awaitPortClosed() {
+        await("the broker port to refuse connections after stop()").atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                .until(() -> {
+                    try (Socket socket = new Socket()) {
+                        socket.connect(new InetSocketAddress("127.0.0.1", PORT), 100);
+                        return false;
+                    } catch (Exception refused) {
+                        return true;
+                    }
+                });
     }
 
 }

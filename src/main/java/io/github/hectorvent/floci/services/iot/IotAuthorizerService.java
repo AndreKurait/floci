@@ -16,6 +16,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.X509EncodedKeySpec;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -44,6 +45,7 @@ public class IotAuthorizerService {
 
     private final StorageBackend<String, IotAuthorizer> store;
     private final RegionResolver regionResolver;
+    private final Clock clock;
     /** Guards every read-modify-write on the store, the default-authorizer flag included. */
     private final Object lock = new Object();
 
@@ -54,8 +56,13 @@ public class IotAuthorizerService {
     }
 
     IotAuthorizerService(StorageBackend<String, IotAuthorizer> store, RegionResolver regionResolver) {
+        this(store, regionResolver, Clock.systemUTC());
+    }
+
+    IotAuthorizerService(StorageBackend<String, IotAuthorizer> store, RegionResolver regionResolver, Clock clock) {
         this.store = store;
         this.regionResolver = regionResolver;
+        this.clock = clock;
     }
 
     public IotAuthorizer createAuthorizer(String name, JsonNode body, String region) {
@@ -92,7 +99,7 @@ public class IotAuthorizerService {
         authorizer.setStatus(status == null ? "INACTIVE" : status);
         authorizer.setSigningDisabled(signingDisabled);
         authorizer.setEnableCachingForHttp(body.path("enableCachingForHttp").asBoolean(false));
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         authorizer.setCreationDate(now);
         authorizer.setLastModifiedDate(now);
         authorizer.setTags(IotDomainConfigurationService.parseTags(body.path("tags")));
@@ -150,7 +157,7 @@ public class IotAuthorizerService {
             }
             // ponytail: AWS bumps on any member sent; whether an unchanged value bumps it is unmeasured.
             if (functionArn != null || status != null || tokenKeyName != null || keys != null || caching.isBoolean()) {
-                authorizer.setLastModifiedDate(Instant.now());
+                authorizer.setLastModifiedDate(clock.instant());
             }
             store.put(key(region, name), authorizer);
             return authorizer;

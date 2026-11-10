@@ -9,10 +9,10 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.contains;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -121,12 +121,9 @@ class IotFleetIndexingConnectivityIntegrationTest {
 
     /** The broker learns of a disconnect on its event loop, a moment after the client returns. */
     private static Map<String, Object> awaitDisconnected(String thingName) throws InterruptedException {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-        Map<String, Object> state = connectivity(null, thingName);
-        while (Boolean.TRUE.equals(state.get("connected")) && Instant.now().isBefore(deadline)) {
-            Thread.sleep(25);
-            state = connectivity(null, thingName);
-        }
+        Map<String, Object> state = await("the index to show " + thingName + " disconnected")
+                .atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                .until(() -> connectivity(null, thingName), found -> !Boolean.TRUE.equals(found.get("connected")));
         assertEquals(false, state.get("connected"));
         return state;
     }

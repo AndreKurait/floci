@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
+import io.github.hectorvent.floci.testing.LockWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import jakarta.inject.Inject;
@@ -31,7 +32,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.*;
@@ -98,8 +98,8 @@ class SecretsManagerEventsResetIntegrationTest {
             secrets.putSecretValue(r -> r.secretId(oldArn).secretString("queued-before-reset"));
 
             Future<?> reset = resets.submit(() -> given().post("/_floci/state/reset").then().statusCode(200));
-            assertThrows(TimeoutException.class, () -> reset.get(200, TimeUnit.MILLISECONDS),
-                    "reset must drain blocked target deliveries before clearing their state");
+            LockWaits.awaitWaitingIn(SecretsManagerEventPublisher.class, "beforeReset");
+            assertFalse(reset.isDone(), "reset must drain blocked target deliveries before clearing their state");
             release.countDown();
             reset.get(15, TimeUnit.SECONDS);
 

@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -635,19 +636,10 @@ class CodePipelineRetryRollbackTest {
     }
 
     private JsonNode awaitStatus(String pipelineName, String executionId, String expected) {
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
-        while (System.currentTimeMillis() < deadline) {
-            JsonNode execution = getExecution(pipelineName, executionId);
-            if (expected.equals(execution.path("status").asText())) {
-                return execution;
-            }
-            try {
-                TimeUnit.MILLISECONDS.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        return fail("Execution " + executionId + " did not reach " + expected + " in time");
+        return await("execution " + executionId + " to reach " + expected).atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> getExecution(pipelineName, executionId),
+                        execution -> expected.equals(execution.path("status").asText()));
     }
 
     private List<JsonNode> actionDetails(String pipelineName, String executionId) {

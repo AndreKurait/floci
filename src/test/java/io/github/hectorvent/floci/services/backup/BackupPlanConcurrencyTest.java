@@ -8,17 +8,16 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.backup.model.BackupPlan;
 import io.github.hectorvent.floci.services.sns.SnsService;
+import io.github.hectorvent.floci.testing.ThreadStates;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -68,8 +67,7 @@ class BackupPlanConcurrencyTest {
             Thread deleter = new Thread(delete, "backup-plan-delete");
             deleter.setDaemon(true);
             deleter.start();
-            await().atMost(Duration.ofSeconds(5)).until(() ->
-                    deleter.getState() == Thread.State.BLOCKED || delete.isDone());
+            ThreadStates.awaitBlockedOrDone(deleter);
             release.countDown();
             write.get(5, TimeUnit.SECONDS);
             delete.get(5, TimeUnit.SECONDS);

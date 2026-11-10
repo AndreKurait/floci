@@ -240,6 +240,22 @@ public class FirehoseService implements ResourceProvider {
                            FirehoseLambdaTransformer lambdaTransformer,
                            FirehoseRedshiftDelivery redshiftDelivery,
                            Executor redshiftDeliveryExecutor) {
+        this(storageFactory, s3Service, kinesisService, regionResolver, clock, config, parquetConverter,
+                lambdaTransformer, redshiftDelivery, redshiftDeliveryExecutor,
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "firehose-buffer-flusher");
+                    t.setDaemon(true);
+                    return t;
+                }));
+    }
+
+    /** Package-private so tests can run the buffer flusher on a scheduler they control. */
+    FirehoseService(StorageFactory storageFactory, S3Service s3Service, KinesisService kinesisService,
+                    RegionResolver regionResolver, Clock clock, EmulatorConfig config,
+                    FirehoseParquetConverter parquetConverter,
+                    FirehoseLambdaTransformer lambdaTransformer,
+                    FirehoseRedshiftDelivery redshiftDelivery,
+                    Executor redshiftDeliveryExecutor, ScheduledExecutorService flushExecutor) {
         this.redshiftDelivery = redshiftDelivery;
         this.redshiftDeliveryExecutor = redshiftDeliveryExecutor != null
                 ? redshiftDeliveryExecutor
@@ -261,11 +277,7 @@ public class FirehoseService implements ResourceProvider {
         this.tickIntervalSeconds = Math.max(1, config.services().firehose().tickIntervalSeconds());
         this.flushRecordCount = Math.max(0, config.services().firehose().flushRecordCount());
         this.flusherEnabled = config.services().firehose().enabled();
-        this.flushExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "firehose-buffer-flusher");
-            t.setDaemon(true);
-            return t;
-        });
+        this.flushExecutor = flushExecutor;
     }
 
     void onStart(@Observes StartupEvent ignored) {

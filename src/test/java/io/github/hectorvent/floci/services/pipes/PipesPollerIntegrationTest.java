@@ -1,8 +1,17 @@
 package io.github.hectorvent.floci.services.pipes;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbStreamReader;
+import io.github.hectorvent.floci.services.kinesis.KinesisService;
+import io.github.hectorvent.floci.services.sqs.SqsService;
+import io.github.hectorvent.floci.testing.TestTime;
+import io.quarkus.arc.Arc;
+import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.*;
 
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -11,13 +20,58 @@ import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
+/**
+ * Pipes over HTTP with the real poller and the real services behind it, its one-second poll timers
+ * on a {@link TestTime}: a source is polled when the test lets a second pass, not when a Vert.x
+ * timer gets to it. {@code PipesPollerWiringIntegrationTest} covers the injected poller in real time.
+ */
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class PipesPollerIntegrationTest {
 
     private static final String SQS_CONTENT_TYPE = "application/x-www-form-urlencoded";
+    private static final Duration POLL_INTERVAL = Duration.ofSeconds(1);
+    private static final TestTime time = TestTime.create();
+
+    @BeforeAll
+    static void pollOnAControlledTimeline() {
+        QuarkusMock.installMockForType(new PipesPoller(TimelineVertx.on(time),
+                bean(SqsService.class), bean(KinesisService.class), bean(DynamoDbStreamReader.class),
+                bean(PipesKafkaConsumerManager.class), bean(PipesTargetInvoker.class),
+                bean(PipesFilterMatcher.class), bean(ObjectMapper.class), bean(EmulatorConfig.class),
+                time.newScheduler()), PipesPoller.class);
+    }
+
+    private static <T> T bean(Class<T> type) {
+        return Arc.container().instance(type).get();
+    }
+
+    private static String receive(String queue, int max) {
+        return given()
+            .contentType(SQS_CONTENT_TYPE)
+            .formParam("Action", "ReceiveMessage")
+            .formParam("QueueUrl", "http://localhost:4566/000000000000/" + queue)
+            .formParam("MaxNumberOfMessages", String.valueOf(max))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().body().asString();
+    }
+
+    private static String visibleMessageCount(String queue) {
+        return given()
+            .contentType(SQS_CONTENT_TYPE)
+            .formParam("Action", "GetQueueAttributes")
+            .formParam("QueueUrl", "http://localhost:4566/000000000000/" + queue)
+            .formParam("AttributeName.1", "ApproximateNumberOfMessages")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().body().asString();
+    }
 
     @Test
     @Order(1)
@@ -81,50 +135,26 @@ class PipesPollerIntegrationTest {
 
     @Test
     @Order(5)
-    void targetQueueReceivesForwardedMessage() throws Exception {
-        String body = null;
-        for (int i = 0; i < 10; i++) {
-            Thread.sleep(500);
-            body = given()
-                .contentType(SQS_CONTENT_TYPE)
-                .formParam("Action", "ReceiveMessage")
-                .formParam("QueueUrl", "http://localhost:4566/000000000000/pipe-target-queue")
-                .formParam("MaxNumberOfMessages", "1")
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().body().asString();
+    void targetQueueReceivesForwardedMessage() {
+        // The pipe polls one second after it started, and not a millisecond sooner.
+        time.advance(POLL_INTERVAL.minusMillis(1));
+        assertFalse(receive("pipe-target-queue", 1).contains("hello from pipes"),
+                "Nothing is forwarded before the first poll");
+        assertTrue(visibleMessageCount("pipe-source-queue").contains("<Value>1</Value>"),
+                "The message is still in the source before the first poll");
 
-            if (body.contains("hello from pipes")) {
-                break;
-            }
-        }
+        time.advance(Duration.ofMillis(1));
+        String body = receive("pipe-target-queue", 1);
         assertTrue(body.contains("hello from pipes"),
                 "Target queue should contain forwarded message but got: " + body);
     }
 
     @Test
     @Order(6)
-    void sourceQueueIsDrained() throws Exception {
-        for (int i = 0; i < 10; i++) {
-            Thread.sleep(500);
-            String body = given()
-                .contentType(SQS_CONTENT_TYPE)
-                .formParam("Action", "GetQueueAttributes")
-                .formParam("QueueUrl", "http://localhost:4566/000000000000/pipe-source-queue")
-                .formParam("AttributeName.1", "ApproximateNumberOfMessages")
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().body().asString();
-
-            if (body.contains("<Value>0</Value>")) {
-                return;
-            }
-        }
-        fail("Source queue should be drained");
+    void sourceQueueIsDrained() {
+        // The poll that forwarded the message also deleted it from the source.
+        assertTrue(visibleMessageCount("pipe-source-queue").contains("<Value>0</Value>"),
+                "Source queue should be drained");
     }
 
     @Test
@@ -148,7 +178,9 @@ class PipesPollerIntegrationTest {
         .then()
             .statusCode(200);
 
-        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+        time.advance(Duration.ofMinutes(1));
+        assertFalse(receive("pipe-target-queue", 1).contains("should stay in source"),
+                "A stopped pipe forwards nothing");
 
         given()
             .contentType(SQS_CONTENT_TYPE)
@@ -254,25 +286,9 @@ class PipesPollerIntegrationTest {
 
     @Test
     @Order(14)
-    void onlyMatchingMessageForwardedToTarget() throws Exception {
-        String body = null;
-        for (int i = 0; i < 10; i++) {
-            Thread.sleep(500);
-            body = given()
-                .contentType(SQS_CONTENT_TYPE)
-                .formParam("Action", "ReceiveMessage")
-                .formParam("QueueUrl", "http://localhost:4566/000000000000/pipe-filter-target")
-                .formParam("MaxNumberOfMessages", "10")
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().body().asString();
-
-            if (body.contains("match-1")) {
-                break;
-            }
-        }
+    void onlyMatchingMessageForwardedToTarget() {
+        time.advance(POLL_INTERVAL);
+        String body = receive("pipe-filter-target", 10);
         assertTrue(body.contains("match-1"),
                 "Target should contain the matching message");
         assertFalse(body.contains("no-match"),
@@ -281,26 +297,12 @@ class PipesPollerIntegrationTest {
 
     @Test
     @Order(15)
-    void nonMatchingMessageDeletedFromSource() throws Exception {
-        for (int i = 0; i < 10; i++) {
-            Thread.sleep(500);
-            String body = given()
-                .contentType(SQS_CONTENT_TYPE)
-                .formParam("Action", "GetQueueAttributes")
-                .formParam("QueueUrl", "http://localhost:4566/000000000000/pipe-filter-source")
-                .formParam("AttributeName.1", "ApproximateNumberOfMessages")
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().body().asString();
-
-            if (body.contains("<Value>0</Value>")) {
-                return;
-            }
-        }
-        fail(
+    void nonMatchingMessageDeletedFromSource() {
+        assertTrue(visibleMessageCount("pipe-filter-source").contains("<Value>0</Value>"),
                 "Source queue should be drained (non-matching messages deleted per AWS behavior)");
+        time.advance(POLL_INTERVAL);
+        assertFalse(receive("pipe-filter-target", 10).contains("no-match"),
+                "A later poll must not forward the non-matching message either");
     }
 
     @Test
@@ -385,27 +387,21 @@ class PipesPollerIntegrationTest {
 
     @Test
     @Order(24)
-    void allBatchMessagesEventuallyForwarded() throws Exception {
+    void allBatchMessagesEventuallyForwarded() {
+        // BatchSize 1: each poll takes one message, so three messages take three polls.
         Set<String> found = new HashSet<>();
-        for (int i = 0; i < 20 && found.size() < 3; i++) {
-            Thread.sleep(500);
-            String body = given()
-                .contentType(SQS_CONTENT_TYPE)
-                .formParam("Action", "ReceiveMessage")
-                .formParam("QueueUrl", "http://localhost:4566/000000000000/pipe-batch-target")
-                .formParam("MaxNumberOfMessages", "10")
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().body().asString();
-
+        for (int poll = 1; poll <= 3; poll++) {
+            time.advance(POLL_INTERVAL);
+            String body = receive("pipe-batch-target", 10);
             for (int j = 1; j <= 3; j++) {
                 if (body.contains("batch-msg-" + j)) found.add("batch-msg-" + j);
             }
+            assertEquals(poll, found.size(),
+                    "One more batch message should reach the target with each poll, found: " + found);
         }
         assertEquals(3, found.size(),
                 "All 3 batch messages should eventually reach the target, found: " + found);
+        assertTrue(visibleMessageCount("pipe-batch-source").contains("<Value>0</Value>"));
     }
 
     @Test
@@ -486,25 +482,9 @@ class PipesPollerIntegrationTest {
 
     @Test
     @Order(34)
-    void inputTemplateTransformsPayload() throws Exception {
-        String body = null;
-        for (int i = 0; i < 10; i++) {
-            Thread.sleep(500);
-            body = given()
-                .contentType(SQS_CONTENT_TYPE)
-                .formParam("Action", "ReceiveMessage")
-                .formParam("QueueUrl", "http://localhost:4566/000000000000/pipe-tmpl-target")
-                .formParam("MaxNumberOfMessages", "1")
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().body().asString();
-
-            if (body.contains("transformed")) {
-                break;
-            }
-        }
+    void inputTemplateTransformsPayload() {
+        time.advance(POLL_INTERVAL);
+        String body = receive("pipe-tmpl-target", 1);
         assertTrue(body.contains("transformed"),
                 "Target should contain the InputTemplate-transformed message but got: " + body);
         assertTrue(body.contains("template-test-payload"),
@@ -593,25 +573,9 @@ class PipesPollerIntegrationTest {
 
     @Test
     @Order(44)
-    void failedDeliveryRoutesToDlq() throws Exception {
-        String body = null;
-        for (int i = 0; i < 15; i++) {
-            Thread.sleep(500);
-            body = given()
-                .contentType(SQS_CONTENT_TYPE)
-                .formParam("Action", "ReceiveMessage")
-                .formParam("QueueUrl", "http://localhost:4566/000000000000/pipe-dlq-queue")
-                .formParam("MaxNumberOfMessages", "1")
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().body().asString();
-
-            if (body.contains("should-end-up-in-dlq")) {
-                break;
-            }
-        }
+    void failedDeliveryRoutesToDlq() {
+        time.advance(POLL_INTERVAL);
+        String body = receive("pipe-dlq-queue", 1);
         assertTrue(body.contains("should-end-up-in-dlq"),
                 "DLQ should contain the failed message but got: " + body);
     }
@@ -700,25 +664,9 @@ class PipesPollerIntegrationTest {
 
     @Test
     @Order(54)
-    void messageAttributesForwardedAndAccessibleViaInputTemplate() throws Exception {
-        String body = null;
-        for (int i = 0; i < 10; i++) {
-            Thread.sleep(500);
-            body = given()
-                .contentType(SQS_CONTENT_TYPE)
-                .formParam("Action", "ReceiveMessage")
-                .formParam("QueueUrl", "http://localhost:4566/000000000000/pipe-msgattr-target")
-                .formParam("MaxNumberOfMessages", "1")
-            .when()
-                .post("/")
-            .then()
-                .statusCode(200)
-                .extract().body().asString();
-
-            if (body.contains("trace-abc-123")) {
-                break;
-            }
-        }
+    void messageAttributesForwardedAndAccessibleViaInputTemplate() {
+        time.advance(POLL_INTERVAL);
+        String body = receive("pipe-msgattr-target", 1);
         assertTrue(body.contains("trace-abc-123"),
                 "Target should contain traceId extracted from message attributes but got: " + body);
         assertTrue(body.contains("&quot;body&quot;") || body.contains("\"body\""),

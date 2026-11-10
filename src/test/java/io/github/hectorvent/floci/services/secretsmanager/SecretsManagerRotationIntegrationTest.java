@@ -125,7 +125,8 @@ public class SecretsManagerRotationIntegrationTest {
 
         // Let the rotation finish before cleanup deletes the secret, which it would otherwise go on
         // trying to update.
-        await().atMost(Duration.ofSeconds(5)).until(() -> given()
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> given()
                 .header("X-Amz-Target", "secretsmanager.DescribeSecret")
                 .contentType(SM_CONTENT_TYPE)
                 .body("{\"SecretId\": \"" + secretName + "\"}")

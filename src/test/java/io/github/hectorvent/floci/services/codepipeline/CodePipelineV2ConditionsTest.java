@@ -150,21 +150,12 @@ class CodePipelineV2ConditionsTest {
     }
 
     private JsonNode awaitStatus(String pipelineName, String executionId, String expected) {
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
-        while (System.currentTimeMillis() < deadline) {
-            JsonNode execution = service.handle("GetPipelineExecution", mapper.createObjectNode()
+        return await("execution " + executionId + " to reach " + expected).atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> service.handle("GetPipelineExecution", mapper.createObjectNode()
                             .put("pipelineName", pipelineName).put("pipelineExecutionId", executionId),
-                    REGION, ACCOUNT).path("pipelineExecution");
-            if (expected.equals(execution.path("status").asText())) {
-                return execution;
-            }
-            try {
-                TimeUnit.MILLISECONDS.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        return fail("Execution " + executionId + " did not reach " + expected + " in time");
+                    REGION, ACCOUNT).path("pipelineExecution"),
+                        execution -> expected.equals(execution.path("status").asText()));
     }
 
     private JsonNode ruleExecutions(String pipelineName) {

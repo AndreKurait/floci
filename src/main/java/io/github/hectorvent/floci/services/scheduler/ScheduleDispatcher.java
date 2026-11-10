@@ -18,6 +18,7 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -75,6 +76,7 @@ public class ScheduleDispatcher implements Resettable {
     private final long tickIntervalSeconds;
     private final boolean enabled;
     private final ScheduledExecutorService executor;
+    private final Clock clock;
     private final ConcurrentHashMap<String, Instant> lastFireByArn = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> firedOnceByArn = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Occurrence, Delivery> pendingRetries = new ConcurrentHashMap<>();
@@ -84,6 +86,21 @@ public class ScheduleDispatcher implements Resettable {
                               ScheduleInvoker invoker,
                               SqsService sqsService,
                               EmulatorConfig config) {
+        this(schedulerService, invoker, sqsService, config,
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "scheduler-dispatcher");
+                    t.setDaemon(true);
+                    return t;
+                }), Clock.systemUTC());
+    }
+
+    /** Package-private so tests can run the dispatcher on a scheduler and a clock they control. */
+    ScheduleDispatcher(SchedulerService schedulerService,
+                       ScheduleInvoker invoker,
+                       SqsService sqsService,
+                       EmulatorConfig config,
+                       ScheduledExecutorService executor,
+                       Clock clock) {
         this.schedulerService = schedulerService;
         this.invoker = invoker;
         this.sqsService = sqsService;
@@ -92,11 +109,8 @@ public class ScheduleDispatcher implements Resettable {
         this.tickIntervalSeconds = config.services().scheduler().tickIntervalSeconds();
         this.enabled = config.services().scheduler().enabled()
                 && config.services().scheduler().invocationEnabled();
-        this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "scheduler-dispatcher");
-            t.setDaemon(true);
-            return t;
-        });
+        this.executor = executor;
+        this.clock = clock;
     }
 
     void onStart(@Observes StartupEvent ignored) {
@@ -120,7 +134,7 @@ public class ScheduleDispatcher implements Resettable {
 
     void tickSafely() {
         try {
-            tick(Instant.now());
+            tick(clock.instant());
         } catch (Throwable t) {
             LOG.warnv("Scheduler dispatcher tick failed: {0}", t.getMessage());
         }

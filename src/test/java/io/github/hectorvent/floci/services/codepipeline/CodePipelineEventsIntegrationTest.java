@@ -17,16 +17,17 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
+import java.util.Objects;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * End-to-end proof that pipeline executions emit {@code aws.codepipeline} events onto the
@@ -202,14 +203,15 @@ class CodePipelineEventsIntegrationTest {
             .extract().path("pipelineExecutionId");
 
         String queueUrl = sqsService.getQueueUrl("cp-approval-it-q", REGION);
-        JsonNode envelope = null;
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
-        while (envelope == null && System.currentTimeMillis() < deadline) {
-            for (Message message : sqsService.receiveMessage(queueUrl, 10, 30, 0, REGION)) {
-                envelope = mapper.readTree(message.getBody());
-            }
-            TimeUnit.MILLISECONDS.sleep(100);
-        }
+        JsonNode envelope = await("an approval notification on the topic").atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    JsonNode received = null;
+                    for (Message message : sqsService.receiveMessage(queueUrl, 10, 30, 0, REGION)) {
+                        received = mapper.readTree(message.getBody());
+                    }
+                    return received;
+                }, Objects::nonNull);
         assertNotNull(envelope, "No approval notification reached the topic");
         String subject = envelope.path("Subject").asText();
         assertEquals(100, subject.length());
@@ -242,18 +244,18 @@ class CodePipelineEventsIntegrationTest {
     }
 
     private JsonNode awaitEvent(String detailType, String state) throws Exception {
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
         String queueUrl = sqsService.getQueueUrl("cp-events-it", REGION);
-        while (System.currentTimeMillis() < deadline) {
-            for (Message message : sqsService.receiveMessage(queueUrl, 10, 30, 0, REGION)) {
-                JsonNode event = mapper.readTree(message.getBody());
-                if (detailType.equals(event.path("detail-type").asText())
-                        && state.equals(event.path("detail").path("state").asText())) {
-                    return event;
-                }
-            }
-            TimeUnit.MILLISECONDS.sleep(100);
-        }
-        return fail("No " + detailType + " event with state " + state + " arrived on the queue");
+        return await("a " + detailType + " event with state " + state + " on the queue")
+                .atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    for (Message message : sqsService.receiveMessage(queueUrl, 10, 30, 0, REGION)) {
+                        JsonNode event = mapper.readTree(message.getBody());
+                        if (detailType.equals(event.path("detail-type").asText())
+                                && state.equals(event.path("detail").path("state").asText())) {
+                            return event;
+                        }
+                    }
+                    return null;
+                }, Objects::nonNull);
     }
 }
