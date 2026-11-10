@@ -228,7 +228,7 @@ public final class TestTime {
      * the call returns if it comes back by itself. If {@link #advance} reaches the deadline first, the
      * waiting thread is interrupted out of the call and this throws {@link TimeoutException}; the
      * advance goes on once the thread has parked again or finished. A call that returns just as the
-     * deadline is reached wins. The waiting thread counts among the {@link #sleepers}.
+     * deadline is reached wins. The waiting thread counts among the {@link #waiters}.
      *
      * <p>Times out at once, without calling, for a zero or negative timeout. Not for a task the
      * timeline itself is running, which would stop the timeline: use {@link #getAdvancing} there.
@@ -400,12 +400,11 @@ public final class TestTime {
         try {
             Instant deadline = now.plus(limit);
             while (!condition.getAsBoolean()) {
-                Instant next = nextDue();
-                if (next == null || next.isAfter(deadline)) {
-                    advanceTo(deadline);
+                Instant next = nextDue().filter(due -> !due.isAfter(deadline)).orElse(deadline);
+                advanceTo(next.isAfter(now) ? next : now);
+                if (next.equals(deadline)) {
                     return condition.getAsBoolean();
                 }
-                advanceTo(next.isAfter(now) ? next : now);
             }
             return true;
         } finally {
@@ -434,37 +433,73 @@ public final class TestTime {
         }
     }
 
-    /** How many threads are parked on this timeline right now, in {@link #sleep} or a timed wait. */
+    /**
+     * When the next thing on this timeline is due, if anything is waiting: a scheduled task, the end
+     * of a sleep or the deadline of a timed wait.
+     */
+    public Optional<Instant> nextDue() {
+        lock.lock();
+        try {
+            return Optional.ofNullable(queue.peek()).map(entry -> entry.due);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** How many threads are parked in {@link #sleep} right now. */
     public int sleepers() {
         lock.lock();
         try {
-            return sleeperCount();
+            return parkedCount(false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** How many threads are in a timed wait right now: {@link #within}, {@link #get} or {@link #poll}. */
+    public int waiters() {
+        lock.lock();
+        try {
+            return parkedCount(true);
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * Waits, in real time, until at least {@code count} threads are parked in {@link #sleep} or in a
-     * timed wait ({@link #within}, {@link #get}, {@link #poll}). Call it before advancing past a sleep
-     * or a deadline a background thread is about to take: a thread that has not reached it yet would
-     * otherwise measure it from the later time. Fails after the settle timeout.
+     * Waits, in real time, until at least {@code count} threads are parked in {@link #sleep}. Call it
+     * before advancing past a sleep a background thread is about to take: a thread that has not
+     * reached its sleep yet would otherwise measure it from the later time. Fails after the settle
+     * timeout.
      */
     public void awaitSleepers(int count) {
+        awaitParked(count, false, "sleeping");
+    }
+
+    /**
+     * {@link #awaitSleepers} for timed waits: waits, in real time, until at least {@code count}
+     * threads have their deadline on the timeline, so that the advance that follows measures it from
+     * now. Such a thread may not have blocked yet; the deadline reaches it either way.
+     */
+    public void awaitWaiters(int count) {
+        awaitParked(count, true, "waiting");
+    }
+
+    private void awaitParked(int count, boolean timedWaits, String doing) {
         long deadline = System.nanoTime() + settleTimeout.toNanos();
         lock.lock();
         try {
-            while (sleeperCount() < count) {
+            while (parkedCount(timedWaits) < count) {
                 long remaining = deadline - System.nanoTime();
                 if (remaining <= 0) {
-                    throw new AssertionError("expected " + count + " sleeping thread(s) within " + settleTimeout
-                            + ", found " + sleeperCount());
+                    throw new AssertionError("expected " + count + " " + doing + " thread(s) within "
+                            + settleTimeout + ", found " + parkedCount(timedWaits));
                 }
                 changed.awaitNanos(remaining);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted waiting for " + count + " sleeping thread(s)", e);
+            throw new AssertionError("interrupted waiting for " + count + " " + doing + " thread(s)", e);
         } finally {
             lock.unlock();
         }
@@ -472,7 +507,8 @@ public final class TestTime {
 
     /**
      * How long, in real time, {@link #advance} waits for a woken thread to park again or finish, and
-     * {@link #awaitSleepers} for threads to arrive, before failing the test. Ten seconds by default.
+     * {@link #awaitSleepers} and {@link #awaitWaiters} for threads to arrive, before failing the test.
+     * Ten seconds by default.
      */
     public TestTime settleTimeout(Duration timeout) {
         this.settleTimeout = Objects.requireNonNull(timeout, "timeout");
@@ -484,8 +520,9 @@ public final class TestTime {
         return "TestTime[" + now + "]";
     }
 
-    private int sleeperCount() {
-        return (int) queue.stream().filter(entry -> entry instanceof Parked).count();
+    private int parkedCount(boolean timedWaits) {
+        return (int) queue.stream()
+                .filter(entry -> entry instanceof Parked parked && parked.interrupts == timedWaits).count();
     }
 
     /** Removes the earliest entry due by {@code target} and moves the clock up to it. */
@@ -501,17 +538,6 @@ public final class TestTime {
                 now = head.due;
             }
             return head;
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /** When the earliest task or parked thread is due, or {@code null} with nothing waiting. */
-    private Instant nextDue() {
-        lock.lock();
-        try {
-            Entry head = queue.peek();
-            return head == null ? null : head.due;
         } finally {
             lock.unlock();
         }

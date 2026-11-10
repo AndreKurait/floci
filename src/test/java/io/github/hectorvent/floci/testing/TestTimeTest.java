@@ -387,15 +387,15 @@ class TestTimeTest {
             }
             interruptLeftBehind.set(Thread.currentThread().isInterrupted());
         });
-        time.awaitSleepers(1);
+        time.awaitWaiters(1);
 
         time.advance(Duration.ofMinutes(5).minusNanos(1));
         assertNull(outcome.get());
-        assertEquals(1, time.sleepers());
+        assertEquals(1, time.waiters());
 
         time.advance(Duration.ofNanos(1));
         assertInstanceOf(TimeoutException.class, outcome.get());
-        assertEquals(0, time.sleepers());
+        assertEquals(0, time.waiters());
         waiter.join();
         assertFalse(interruptLeftBehind.get());
     }
@@ -408,7 +408,7 @@ class TestTimeTest {
         AtomicReference<Object> failed = new AtomicReference<>();
         Thread first = Thread.ofVirtual().name("first").start(() -> answered.set(timedGet(answer)));
         Thread second = Thread.ofPlatform().name("second").start(() -> failed.set(timedGet(failure)));
-        time.awaitSleepers(2);
+        time.awaitWaiters(2);
         time.advance(Duration.ofMinutes(5).minusNanos(1));
 
         answer.complete("signalled");
@@ -418,7 +418,7 @@ class TestTimeTest {
 
         assertEquals("signalled", answered.get());
         assertInstanceOf(IllegalStateException.class, ((ExecutionException) failed.get()).getCause());
-        assertEquals(0, time.sleepers());
+        assertEquals(0, time.waiters());
         time.advance(Duration.ofMinutes(1));
         assertEquals("signalled", answered.get());
     }
@@ -436,7 +436,7 @@ class TestTimeTest {
                 Thread.currentThread().interrupt();
             }
         });
-        time.awaitSleepers(1);
+        time.awaitWaiters(1);
 
         time.advance(Duration.ofSeconds(50));
         assertEquals(List.of("null at " + START.plusSeconds(20), "null at " + START.plusSeconds(40)), polled);
@@ -446,7 +446,7 @@ class TestTimeTest {
         poller.join();
         assertEquals(List.of("message at " + START.plusSeconds(50), "another at " + START.plusSeconds(50)),
                 polled.subList(2, 4));
-        assertEquals(0, time.sleepers());
+        assertEquals(0, time.waiters());
     }
 
     @Test
@@ -482,7 +482,7 @@ class TestTimeTest {
                 order.add("interrupted");
             }
         });
-        time.awaitSleepers(2);
+        time.awaitWaiters(2);
 
         time.advance(Duration.ofMinutes(1));
 
@@ -497,13 +497,13 @@ class TestTimeTest {
         AtomicReference<Object> outcome = new AtomicReference<>();
         Thread waiter = Thread.ofPlatform().name("waiter").start(
                 () -> outcome.set(timedGet(new CompletableFuture<>())));
-        time.awaitSleepers(1);
+        time.awaitWaiters(1);
 
         waiter.interrupt();
         waiter.join();
 
         assertInstanceOf(InterruptedException.class, outcome.get());
-        assertEquals(0, time.sleepers());
+        assertEquals(0, time.waiters());
         time.advance(Duration.ofMinutes(10));
     }
 
@@ -601,5 +601,34 @@ class TestTimeTest {
         } catch (TimeoutException | InterruptedException | ExecutionException e) {
             return e;
         }
+    }
+
+    @Test
+    void sleepersAndTimedWaitersAreCountedApart() throws Exception {
+        Thread sleeper = Thread.ofVirtual().name("sleeper").start(() -> {
+            try {
+                time.sleep(Duration.ofMinutes(1));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        Thread waiter = Thread.ofVirtual().name("waiter").start(() -> timedGet(new CompletableFuture<>()));
+        time.awaitSleepers(1);
+        time.awaitWaiters(1);
+
+        assertEquals(1, time.sleepers());
+        assertEquals(1, time.waiters());
+
+        time.advance(Duration.ofMinutes(1));
+        sleeper.join();
+        assertEquals(0, time.sleepers());
+        assertEquals(1, time.waiters());
+
+        time.advance(Duration.ofMinutes(4));
+        waiter.join();
+        assertEquals(0, time.waiters());
+        time.settleTimeout(Duration.ofMillis(50));
+        AssertionError error = assertThrows(AssertionError.class, () -> time.awaitWaiters(1));
+        assertTrue(error.getMessage().contains("expected 1 waiting thread(s)"), error.getMessage());
     }
 }

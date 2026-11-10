@@ -16,7 +16,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -258,10 +257,7 @@ class CustomResourceProviderFrameworkTest {
         @Override
         public JsonNode get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException,
                 TimeoutException {
-            Instant deadline = time.now().plusNanos(unit.toNanos(timeout));
-            while (!isDone() && time.now().isBefore(deadline)) {
-                time.advanceTo(time.nextTaskDue().filter(due -> due.isBefore(deadline)).orElse(deadline));
-            }
+            time.advanceUntil(this::isDone, Duration.ofNanos(unit.toNanos(timeout)));
             return super.get(0, TimeUnit.NANOSECONDS);
         }
     }
