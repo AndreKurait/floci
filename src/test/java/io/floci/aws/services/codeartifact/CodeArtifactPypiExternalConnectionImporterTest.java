@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.services.codeartifact.model.CodeArtifactRepository;
 import io.floci.aws.services.codeartifact.model.ExternalConnection;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
@@ -23,6 +24,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -514,6 +516,61 @@ class CodeArtifactPypiExternalConnectionImporterTest {
 
         verify(service, times(1)).retainAssetUnderVersionFence(any(), any(), any(), any(), any(), any(), any(),
                 any(), anyLong(), anyLong(), anyLong(), any(), eq(SDIST_FILENAME), any(), any());
+    }
+
+    @Test
+    void serializesHyphenatedSdistAndUnderscoredWheelImports() throws Exception {
+        String sdist = "is-even-0.0.0.tar.gz";
+        String wheel = "is_even-0.0.0-py3-none-any.whl";
+        byte[] index = simpleIndexJson(List.of("0.0.0"), sdist, wheel);
+        CountDownLatch backgroundWriteStarted = new CountDownLatch(1);
+        CountDownLatch releaseBackgroundWrite = new CountDownLatch(1);
+        CountDownLatch requestedWheelFetched = new CountDownLatch(1);
+        AtomicBoolean wheelWritten = new AtomicBoolean();
+        AtomicInteger wheelWrites = new AtomicInteger();
+        AtomicReference<Thread> requestingThread = new AtomicReference<>();
+        when(externalConnectionClient.fetchSimpleIndex(eq("public:pypi"), anyString()))
+                .thenReturn(Optional.of(new PypiExternalConnectionClient.FetchedAsset(index)));
+        when(externalConnectionClient.fetchFile("public:pypi", urlFor(sdist)))
+                .thenReturn(Optional.of(new PypiExternalConnectionClient.FetchedAsset(SDIST_CONTENT)));
+        when(externalConnectionClient.fetchFile("public:pypi", urlFor(wheel))).thenAnswer(invocation -> {
+            if (Thread.currentThread() == requestingThread.get()) {
+                requestedWheelFetched.countDown();
+            }
+            return Optional.of(new PypiExternalConnectionClient.FetchedAsset(WHEEL_CONTENT));
+        });
+        when(pypiserver.listPackageVersionAssetNames(anyString(), anyString(), anyString(), any(), anyString(),
+                anyString())).thenAnswer(invocation -> wheelWritten.get() ? List.of(sdist, wheel) : List.of());
+        when(service.retainedVersionOriginConnection(anyString(), anyString(), anyString(), anyString(),
+                anyString(), any(), anyString(), anyString())).thenReturn(Optional.of("public:pypi"));
+        when(service.retainAssetUnderVersionFence(any(), any(), any(), any(), any(), any(), any(), any(), anyLong(),
+                anyLong(), anyLong(), any(), eq(wheel), any(), any())).thenAnswer(invocation -> {
+            if (wheelWrites.incrementAndGet() != 1) {
+                return new CodeArtifactService.AssetRetentionAttemptResult(true, false);
+            }
+            backgroundWriteStarted.countDown();
+            assertTrue(releaseBackgroundWrite.await(5, TimeUnit.SECONDS));
+            wheelWritten.set(true);
+            return new CodeArtifactService.AssetRetentionAttemptResult(true, true);
+        });
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            assertTrue(importer.tryImportAsset(REGION, DOMAIN, OWNER, REPOSITORY, REPO_ID, sdist));
+            assertTrue(backgroundWriteStarted.await(5, TimeUnit.SECONDS));
+            Future<Boolean> requested = pool.submit(() -> {
+                requestingThread.set(Thread.currentThread());
+                return importer.tryImportAsset(REGION, DOMAIN, OWNER, REPOSITORY, REPO_ID, wheel);
+            });
+            assertTrue(requestedWheelFetched.await(5, TimeUnit.SECONDS));
+            ThreadStates.awaitBlockedOrDone(requestingThread, requested);
+            releaseBackgroundWrite.countDown();
+            assertTrue(requested.get(5, TimeUnit.SECONDS), "the existing sibling must remain downloadable");
+            assertEquals(1, wheelWrites.get(), "normalized package aliases must share the write lock");
+        } finally {
+            releaseBackgroundWrite.countDown();
+            pool.shutdownNow();
+            importer.shutdown();
+        }
     }
 
     private static String urlFor(String filename) {
