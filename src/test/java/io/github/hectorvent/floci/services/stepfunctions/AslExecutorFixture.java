@@ -124,6 +124,7 @@ final class AslExecutorFixture {
         private EmrTaskInvoker emrTaskInvoker;
         private EmrServerlessTaskInvoker emrServerlessTaskInvoker;
         private EventBridgeInvoker eventBridgeInvoker;
+        private BoundedWaits waits;
 
         private Builder() {
         }
@@ -293,6 +294,11 @@ final class AslExecutorFixture {
             return this;
         }
 
+        Builder waits(BoundedWaits waits) {
+            this.waits = waits;
+            return this;
+        }
+
         Builder eventBridgeInvoker(EventBridgeInvoker eventBridgeInvoker) {
             this.eventBridgeInvoker = eventBridgeInvoker;
             return this;
@@ -308,7 +314,7 @@ final class AslExecutorFixture {
                     sfnService, config, vertx, customResourceLiveness, clock, sleeper, maxWaitSeconds,
                     redshiftDataHandler, serviceRegistry, null, lambdaTaskAuthorizer, expressMaxExecutionTime,
                     nanoTime, null, emrTaskInvoker, emrServerlessTaskInvoker, null, nestedWaiter,
-                    eventBridgeInvoker);
+                    eventBridgeInvoker, waits);
         }
     }
 }
