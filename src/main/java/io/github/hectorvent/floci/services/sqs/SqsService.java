@@ -92,7 +92,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, List<Message>> messageStore;
     private final StorageBackend<String, Map<String, Long>> dedupStore;
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
-    private final SqsResetAdmission resetAdmission = new SqsResetAdmission(this::recoverResetState);
+    private final SqsResetAdmission resetAdmission;
     private final SqsQueueLifecycle queueLifecycle = new SqsQueueLifecycle();
     private boolean resetDrained;
     private final Object resetRecoveryLock = new Object();
@@ -456,6 +456,7 @@ public class SqsService implements Resettable, ResourceProvider {
                Instance<RequestContext> requestContextInstance, IamService iamService,
                EndpointStrategy endpointStrategy, SqsTiming timing, ExecutorService moveTaskExecutor) {
         this.timing = timing;
+        this.resetAdmission = new SqsResetAdmission(this::recoverResetState, timing);
         this.moveTaskExecutor = moveTaskExecutor;
         this.queueStore = queueStore;
         this.messageStore = messageStore;

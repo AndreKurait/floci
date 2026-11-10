@@ -6,7 +6,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Where message delivery reads time and waits for it: visibility timeouts, delivery delays,
- * retention, long polls and the move-task rate. Production always runs on {@link #SYSTEM}. The
+ * retention, long polls, the move-task rate and the drain before a reset. Production always runs on {@link #SYSTEM}. The
  * only way to supply another one is a package-private constructor, which tests use to put the
  * service on a timeline they move.
  */
@@ -35,6 +35,11 @@ interface SqsTiming {
         public boolean await(CountDownLatch latch, long timeoutMillis) throws InterruptedException {
             return latch.await(timeoutMillis, TimeUnit.MILLISECONDS);
         }
+
+        @Override
+        public void timedWait(Object monitor, long timeoutNanos) throws InterruptedException {
+            TimeUnit.NANOSECONDS.timedWait(monitor, timeoutNanos);
+        }
     };
 
     /** The clock a message's sent time, visibility deadline and retention are measured on. */
@@ -51,4 +56,10 @@ interface SqsTiming {
 
     /** {@link CountDownLatch#await(long, TimeUnit)}: true as soon as the latch opens, false after the timeout. */
     boolean await(CountDownLatch latch, long timeoutMillis) throws InterruptedException;
+
+    /**
+     * {@link TimeUnit#timedWait(Object, long)} on a monitor the caller holds: returns when the
+     * monitor is notified or after {@code timeoutNanos}, whichever is first.
+     */
+    void timedWait(Object monitor, long timeoutNanos) throws InterruptedException;
 }
