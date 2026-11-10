@@ -599,6 +599,7 @@
       "capacity-reservation": "arn:${Partition}:ec2:${Region}:${Account}:capacity-reservation/${CapacityReservationId}",
       "capacity-reservation-cancellation-quote": "arn:${Partition}:ec2:${Region}:${Account}:capacity-reservation-cancellation-quote/${CapacityReservationCancellationQuoteId}",
       "capacity-reservation-fleet": "arn:${Partition}:ec2:${Region}:${Account}:capacity-reservation-fleet/${CapacityReservationFleetId}",
+      "capacity-reservation-modification-quote": "arn:${Partition}:ec2:${Region}:${Account}:capacity-reservation-modification-quote/${CapacityReservationModificationQuoteId}",
       "carrier-gateway": "arn:${Partition}:ec2:${Region}:${Account}:carrier-gateway/${CarrierGatewayId}",
       "certificate": "arn:${Partition}:acm:${Region}:${Account}:certificate/${CertificateId}",
       "client-vpn-endpoint": "arn:${Partition}:ec2:${Region}:${Account}:client-vpn-endpoint/${ClientVpnEndpointId}",
@@ -11043,7 +11044,10 @@
     },
     "ec2:CreateCapacityReservationDateChangeQuote": {
       "action": "ec2:CreateCapacityReservationDateChangeQuote",
-      "types": [],
+      "types": [
+        "capacity-reservation",
+        "capacity-reservation-modification-quote"
+      ],
       "resources": []
     },
     "ec2:CreateCapacityReservationFleet": {
@@ -12030,7 +12034,9 @@
     },
     "ec2:DeleteClientVpnEndpointAuthorizationPolicy": {
       "action": "ec2:DeleteClientVpnEndpointAuthorizationPolicy",
-      "types": [],
+      "types": [
+        "client-vpn-endpoint"
+      ],
       "resources": []
     },
     "ec2:DeleteClientVpnRoute": {
@@ -14453,7 +14459,9 @@
     },
     "ec2:GetClientVpnEndpointAuthorizationPolicy": {
       "action": "ec2:GetClientVpnEndpointAuthorizationPolicy",
-      "types": [],
+      "types": [
+        "client-vpn-endpoint"
+      ],
       "resources": []
     },
     "ec2:GetCoipPoolUsage": {
@@ -14537,7 +14545,9 @@
     },
     "ec2:GetImageFindings": {
       "action": "ec2:GetImageFindings",
-      "types": [],
+      "types": [
+        "image"
+      ],
       "resources": []
     },
     "ec2:GetInstanceMetadataDefaults": {
@@ -14803,7 +14813,9 @@
     },
     "ec2:GetTransitGatewayAttachmentNatConfiguration": {
       "action": "ec2:GetTransitGatewayAttachmentNatConfiguration",
-      "types": [],
+      "types": [
+        "transit-gateway-attachment"
+      ],
       "resources": []
     },
     "ec2:GetTransitGatewayAttachmentPropagations": {
@@ -15001,7 +15013,8 @@
     "ec2:ModifyCapacityReservation": {
       "action": "ec2:ModifyCapacityReservation",
       "types": [
-        "capacity-reservation"
+        "capacity-reservation",
+        "capacity-reservation-modification-quote"
       ],
       "resources": []
     },
@@ -15024,7 +15037,9 @@
     },
     "ec2:ModifyClientVpnEndpointAuthorizationPolicy": {
       "action": "ec2:ModifyClientVpnEndpointAuthorizationPolicy",
-      "types": [],
+      "types": [
+        "client-vpn-endpoint"
+      ],
       "resources": []
     },
     "ec2:ModifyDefaultCreditSpecification": {
@@ -15378,7 +15393,9 @@
     },
     "ec2:ModifyTransitGatewayAttachmentNatConfiguration": {
       "action": "ec2:ModifyTransitGatewayAttachmentNatConfiguration",
-      "types": [],
+      "types": [
+        "transit-gateway-attachment"
+      ],
       "resources": []
     },
     "ec2:ModifyTransitGatewayMeteringPolicy": {
