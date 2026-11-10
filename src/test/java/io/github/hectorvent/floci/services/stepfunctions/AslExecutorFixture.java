@@ -31,8 +31,13 @@ import jakarta.enterprise.inject.Instance;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 import static org.mockito.Mockito.mock;
 
@@ -48,6 +53,7 @@ import static org.mockito.Mockito.mock;
 final class AslExecutorFixture {
 
     private static final String ACCOUNT = "000000000000";
+    private static final long FINISH_TIMEOUT_SECONDS = 10;
 
     private AslExecutorFixture() {
     }
@@ -77,6 +83,40 @@ final class AslExecutorFixture {
 
         executor.executeSync(stateMachine, execution, history, (updated, events) -> { });
         return execution;
+    }
+
+    /**
+     * Starts {@code run} on a thread of its own, for a test that drives the timeline the run pauses
+     * on: the test thread advances, and reads the outcome with {@link #finished}.
+     */
+    static <T> CompletableFuture<T> start(Supplier<T> run) {
+        CompletableFuture<T> outcome = new CompletableFuture<>();
+        Thread.ofPlatform().name("sfn-test-run").daemon().start(() -> {
+            try {
+                outcome.complete(run.get());
+            } catch (RuntimeException | Error e) {
+                outcome.completeExceptionally(e);
+            }
+        });
+        return outcome;
+    }
+
+    /**
+     * The outcome of a started run that has nothing left on the timeline to wait for. A run that is
+     * still pausing fails here instead of blocking the test.
+     */
+    static <T> T finished(Future<T> run) {
+        try {
+            return run.get(FINISH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            throw new AssertionError("the run had not finished after " + FINISH_TIMEOUT_SECONDS
+                    + " s; it is waiting for time nobody advanced", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted waiting for the run", e);
+        } catch (ExecutionException e) {
+            throw new AssertionError("the run failed", e.getCause());
+        }
     }
 
     /** The execution a {@code .sync} wait reads to learn whether it was stopped, in {@code status}. */
