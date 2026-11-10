@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.codedeploy;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.BuildImageResultCallback;
+import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.services.ec2.AmiImageResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -16,10 +17,15 @@ import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
 import org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream;
 import org.jboss.logging.Logger;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
@@ -54,6 +60,7 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -66,6 +73,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.Mockito.when;
 
 /** Shared stock-agent image, owning ASG and S3 revision fixture. */
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@Execution(ExecutionMode.SAME_THREAD)
 abstract class CodeDeployAgentDockerFixture {
     static final Logger LOG = Logger.getLogger(CodeDeployAgentDockerFixture.class);
     static final String REGION = "us-east-1";
@@ -74,9 +83,13 @@ abstract class CodeDeployAgentDockerFixture {
             AwsBasicCredentials.create("test", "test"));
     final Deque<Executable> cleanup = new ArrayDeque<>();
     private List<String> targetInstances = List.of();
+    private String agentImage;
+    private boolean imageBuildStarted;
+    private final String agentImageTag = "floci-test-" + AgentProfile.NAMESPACE + "-" + UUID.randomUUID();
 
     public static class AgentProfile implements QuarkusTestProfile {
-        static final String NAMESPACE = "codedeploy-agent-" + UUID.randomUUID();
+        static final String NAMESPACE = System.getProperty("floci.docker.resource-namespace",
+                "codedeploy-agent-" + UUID.randomUUID());
 
         @Override
         public Map<String, String> getConfigOverrides() {
@@ -100,8 +113,16 @@ abstract class CodeDeployAgentDockerFixture {
     @TempDir Path imageContext;
 
     @BeforeEach
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
     void prepareOfficialAgentImage() throws Exception {
         assumeTrue(DockerAvailability.isAvailable(), "Docker is required for the AWS CodeDeploy agent");
+        if (agentImage != null) {
+            LOG.infof("Reusing verified CodeDeploy agent image for %s", getClass().getSimpleName());
+            when(images.resolveImage("ami-codedeploy-agent")).thenReturn(
+                    new ResolvedAmiImage(agentImage, ResolvedAmiImage.IMAGE_RUNTIME, false, null));
+            return;
+        }
+        long preparationStarted = System.nanoTime();
         String architecture = docker.infoCmd().exec().getArchitecture();
         boolean arm = "aarch64".equals(architecture) || "arm64".equals(architecture);
         assertTrue(arm || "x86_64".equals(architecture) || "amd64".equals(architecture), architecture);
@@ -111,6 +132,7 @@ abstract class CodeDeployAgentDockerFixture {
                 : "ecafc903fd2dce929c7b4dba4c5c54593507245a177eedccec41d033a37325ac";
         URI source = URI.create("https://github.com/aws/aws-codedeploy-agent/releases/download/v"
                 + VERSION + "/" + packageName);
+        LOG.infof("Downloading verified CodeDeploy agent %s for %s", VERSION, architecture);
         try (HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL)
                 .connectTimeout(Duration.ofSeconds(15)).build()) {
             HttpResponse<InputStream> response = client.send(HttpRequest.newBuilder(source)
@@ -123,16 +145,35 @@ abstract class CodeDeployAgentDockerFixture {
                 Files.write(imageContext.resolve("agent.deb"), bytes);
             }
         }
+        LOG.infof("CodeDeploy agent download and digest verification completed in %d ms",
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - preparationStarted));
         try (InputStream dockerfile = getClass().getResourceAsStream("/codedeploy/agent/Dockerfile")) {
             assertNotNull(dockerfile);
             Files.copy(dockerfile, imageContext.resolve("Dockerfile"));
         }
-        try (BuildImageResultCallback build = docker.buildImageCmd(imageContext.toFile())
+        long buildStarted = System.nanoTime();
+        LOG.infof("Building CodeDeploy fixture image under owned tag %s", agentImageTag);
+        imageBuildStarted = true;
+        try (BuildImageResultCallback build = docker.buildImageCmd(imageContext.toFile()).withTags(Set.of(agentImageTag))
                 .withBuildArg("BASE_IMAGE", TestImages.UBUNTU_NOBLE).start()) {
-            String image = build.awaitImageId(180, TimeUnit.SECONDS);
-            cleanup.addFirst(() -> docker.removeImageCmd(image).exec());
+            agentImage = build.awaitImageId(180, TimeUnit.SECONDS);
+            LOG.infof("CodeDeploy fixture image build completed in %d ms",
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - buildStarted));
             when(images.resolveImage("ami-codedeploy-agent")).thenReturn(
-                    new ResolvedAmiImage(image, ResolvedAmiImage.IMAGE_RUNTIME, false, null));
+                    new ResolvedAmiImage(agentImage, ResolvedAmiImage.IMAGE_RUNTIME, false, null));
+        }
+    }
+
+    @AfterAll
+    void deleteOwnedAgentImage() {
+        if (imageBuildStarted) {
+            try {
+                docker.removeImageCmd(agentImageTag).exec();
+            } catch (NotFoundException ignored) {
+                LOG.debugf("Owned CodeDeploy fixture image was not created or is already gone: %s", agentImageTag);
+            } finally {
+                agentImage = null;
+            }
         }
     }
 
@@ -144,7 +185,12 @@ abstract class CodeDeployAgentDockerFixture {
                     output(target, "tail", "-n", "80", "/var/log/aws/codedeploy-agent/codedeploy-agent.log")));
         }
         actions.addAll(cleanup);
-        assertAll("CodeDeploy agent diagnostics and resources", actions);
+        try {
+            assertAll("CodeDeploy agent diagnostics and resources", actions);
+        } finally {
+            cleanup.clear();
+            targetInstances = List.of();
+        }
     }
 
     Fleet fleet() {
