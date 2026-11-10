@@ -7,7 +7,11 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.*;
 
+import java.time.Duration;
+
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -633,52 +637,34 @@ class StepFunctionsDynamoDbIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private String waitForExecution(String execArn) throws InterruptedException {
-        for (int i = 0; i < 50; i++) {
-            Response resp = given()
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(SFN_CONTENT_TYPE)
-                    .body("""
-                            {"executionArn": "%s"}
-                            """.formatted(execArn))
-                    .when()
-                    .post("/");
-            String status = resp.jsonPath().getString("status");
-            if ("SUCCEEDED".equals(status)) {
-                String output = resp.jsonPath().getString("output");
-                if (output != null) {
-                    return output;
-                }
-            }
-            if ("FAILED".equals(status) || "ABORTED".equals(status)) {
-                fail("Execution " + status + ": " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete within timeout");
-        return null;
+    private String waitForExecution(String execArn) {
+        Response resp = await("execution " + execArn + " to succeed with an output, or to fail")
+                .atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> given()
+                                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
+                                .contentType(SFN_CONTENT_TYPE)
+                                .body("""
+                                        {"executionArn": "%s"}
+                                        """.formatted(execArn))
+                                .when()
+                                .post("/"),
+                        response -> {
+                            String polled = response.jsonPath().getString("status");
+                            return "FAILED".equals(polled) || "ABORTED".equals(polled)
+                                    || ("SUCCEEDED".equals(polled)
+                                    && response.jsonPath().getString("output") != null);
+                        });
+        String status = resp.jsonPath().getString("status");
+        assertEquals("SUCCEEDED", status, "Execution " + status + ": " + resp.body().asString());
+        return resp.jsonPath().getString("output");
     }
 
-    private void assertExecutionFailed(String execArn) throws InterruptedException {
-        for (int i = 0; i < 50; i++) {
-            Response resp = given()
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(SFN_CONTENT_TYPE)
-                    .body("""
-                            {"executionArn": "%s"}
-                            """.formatted(execArn))
-                    .when()
-                    .post("/");
-            String status = resp.jsonPath().getString("status");
-            if ("FAILED".equals(status)) {
-                return; // Expected
-            }
-            if ("SUCCEEDED".equals(status)) {
-                fail("Execution should have failed but succeeded: " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete within timeout");
+    private void assertExecutionFailed(String execArn) {
+        Response resp = waitForTerminalState(execArn, Duration.ofSeconds(5));
+        assertEquals("FAILED", resp.jsonPath().getString("status"),
+                "Execution should have failed but succeeded: " + resp.body().asString());
     }
 
     private static String quote(String raw) {

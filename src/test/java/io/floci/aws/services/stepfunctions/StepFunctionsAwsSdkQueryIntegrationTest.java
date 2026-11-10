@@ -11,13 +11,14 @@ import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Exercises the Step Functions {@code aws-sdk:*} / optimized service integrations added for query and
@@ -138,26 +139,22 @@ class StepFunctionsAwsSdkQueryIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private String waitForExecution(String auth, String execArn) throws InterruptedException {
-        for (int i = 0; i < 50; i++) {
-            Response resp = signed(auth)
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(SFN_CONTENT_TYPE)
-                    .body("""
-                            {"executionArn": "%s"}
-                            """.formatted(execArn))
-                    .when().post("/");
-            String status = resp.jsonPath().getString("status");
-            if ("SUCCEEDED".equals(status)) {
-                return resp.jsonPath().getString("output");
-            }
-            if ("FAILED".equals(status) || "ABORTED".equals(status) || "TIMED_OUT".equals(status)) {
-                fail("Execution " + status + ": " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete within timeout");
-        return null;
+    private String waitForExecution(String auth, String execArn) {
+        Response resp = await("execution " + execArn + " to leave RUNNING")
+                .atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> signed(auth)
+                                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
+                                .contentType(SFN_CONTENT_TYPE)
+                                .body("""
+                                        {"executionArn": "%s"}
+                                        """.formatted(execArn))
+                                .when().post("/"),
+                        response -> !"RUNNING".equals(response.jsonPath().getString("status")));
+        String status = resp.jsonPath().getString("status");
+        assertEquals("SUCCEEDED", status, "Execution " + status + ": " + resp.body().asString());
+        return resp.jsonPath().getString("output");
     }
 
     private static String quote(String raw) {

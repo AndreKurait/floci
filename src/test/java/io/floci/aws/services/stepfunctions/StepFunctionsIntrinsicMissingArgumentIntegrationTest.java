@@ -6,9 +6,11 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * End to end coverage for issue #2870. A {@code $.} argument of a {@code States.*} intrinsic that
@@ -125,19 +127,10 @@ class StepFunctionsIntrinsicMissingArgumentIntegrationTest {
         assertEquals("{\"v\":\"null\"}", describe.jsonPath().getString("output"));
     }
 
-    private Response run(String label, String definition, String input) throws InterruptedException {
+    private Response run(String label, String definition, String input) {
         String smArn = create(label + "-" + System.currentTimeMillis(), definition);
         String execArn = start(smArn, input);
-        for (int i = 0; i < 50; i++) {
-            Response resp = describe(execArn);
-            String status = resp.jsonPath().getString("status");
-            if (!"RUNNING".equals(status)) {
-                return resp;
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete");
-        return null;
+        return waitForTerminalState(execArn, Duration.ofSeconds(5));
     }
 
     private String create(String name, String definition) {
@@ -159,14 +152,6 @@ class StepFunctionsIntrinsicMissingArgumentIntegrationTest {
                 .when().post("/");
         resp.then().statusCode(200);
         return resp.jsonPath().getString("executionArn");
-    }
-
-    private Response describe(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("{\"executionArn\":\"" + execArn + "\"}")
-                .when().post("/");
     }
 
     private static String quote(String raw) {
