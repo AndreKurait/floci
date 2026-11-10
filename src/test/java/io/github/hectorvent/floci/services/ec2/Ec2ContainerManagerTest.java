@@ -104,6 +104,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Answers.RETURNS_SELF;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anySet;
@@ -121,6 +122,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -212,6 +214,8 @@ class Ec2ContainerManagerTest {
         AtomicInteger peerUpdates = new AtomicInteger();
         AtomicBoolean retired = new AtomicBoolean();
         AtomicBoolean helperRemoved = new AtomicBoolean();
+        Runnable firewallCleanup = mock(Runnable.class);
+        when(firewall.captureUnregister("eni-firewall-teardown")).thenReturn(firewallCleanup);
         doAnswer(invocation -> {
             assertFalse(helperRemoved.get(), "Peer reconciliation still needs this registered namespace");
             if (peerUpdates.incrementAndGet() == 1 && peerRefreshFailure) {
@@ -219,7 +223,7 @@ class Ec2ContainerManagerTest {
             }
             retired.set(true);
             return null;
-        }).when(firewall).unregister("eni-firewall-teardown");
+        }).when(firewallCleanup).run();
         doAnswer(invocation -> {
             assertTrue(retired.get(), "A removed helper must no longer be visible to peer reconciliation");
             helperRemoved.set(true);
@@ -239,8 +243,66 @@ class Ec2ContainerManagerTest {
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             assertEquals("terminated", instance.getState().getName());
             assertTrue(helperRemoved.get());
-            verify(firewall, times(peerRefreshFailure ? 2 : 1)).unregister("eni-firewall-teardown");
+            verify(firewall).captureUnregister("eni-firewall-teardown");
+            verify(firewallCleanup, times(peerRefreshFailure ? 2 : 1)).run();
             assertEquals(transientFailure || peerRefreshFailure ? 2 : 1, removals.get());
+        } finally {
+            manager.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void terminationCannotRemoveAReplacementRegisteredBeforeDockerCleanup(boolean replace) throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        ContainerLifecycleManager firewallLifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager firewall = spy(new SecurityGroupFirewallManager(
+                mock(DockerClient.class, RETURNS_DEEP_STUBS), mock(ContainerBuilder.class), firewallLifecycle,
+                mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
+        doNothing().when(firewall).reconcileAll();
+        doNothing().when(firewall).admit(anyString(), anyBoolean());
+        doReturn(true).when(firewall).enabled();
+        firewall.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-old",
+                "eni-firewall-teardown", "10.0.1.10", "172.18.0.2", Set.of(), List.of()), "old-helper", Map.of());
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.port()).thenReturn(4566);
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
+                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), config,
+                mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), firewall);
+        Instance instance = instance("i-firewall-teardown");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-firewall-teardown");
+        instance.setNetworkInterfaces(new ArrayList<>(List.of(eni)));
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        when(docker.removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspected = inspectResponse("172.18.0.12");
+        when(inspect.exec()).thenReturn(inspected);
+        when(docker.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        doAnswer(invocation -> {
+            // The service releases ENIs while container teardown is still in progress.
+            instance.getNetworkInterfaces().clear();
+            if (replace) {
+                firewall.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-new",
+                        "eni-firewall-teardown", "10.0.1.10", "172.18.0.3", Set.of(), List.of()),
+                        "new-helper", Map.of());
+            }
+            return null;
+        }).when(remove).exec();
+        CountDownLatch completed = new CountDownLatch(1);
+        try {
+            manager.terminate(instance, completed::countDown);
+            assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
+            assertEquals("terminated", instance.getState().getName());
+            verify(firewallLifecycle).removeIfExistsStrict("old-helper");
+            verify(firewallLifecycle, never()).removeIfExistsStrict("new-helper");
+            assertEquals(replace, firewall.vpcForClient("172.18.0.3").isPresent());
         } finally {
             manager.stop();
         }

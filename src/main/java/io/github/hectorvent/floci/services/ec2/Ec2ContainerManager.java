@@ -2100,6 +2100,9 @@ public class Ec2ContainerManager {
                     ? null : instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
             instance.setState(InstanceState.shuttingDown());
         }
+        // Capture ownership now: a retained ENI may be registered again before Docker cleanup runs.
+        Runnable firewallCleanup = firewallManager != null && firewallManager.enabled() && firewallEniId != null
+                ? firewallManager.captureUnregister(firewallEniId) : null;
         return () -> {
             // The post-teardown hook's only precondition; see the Javadoc above for why.
             boolean containerGone = false;
@@ -2138,8 +2141,8 @@ public class Ec2ContainerManager {
                 containerGone = false;
                 systemdV1.remove(instance);
                 // Retire the endpoint before removing its namespace: another termination may reconcile peers.
-                if (firewallManager != null && firewallManager.enabled() && firewallEniId != null) {
-                    firewallManager.unregister(firewallEniId);
+                if (firewallCleanup != null) {
+                    firewallCleanup.run();
                 }
                 removeNetworkHelper(instance);
                 containerGone = true;

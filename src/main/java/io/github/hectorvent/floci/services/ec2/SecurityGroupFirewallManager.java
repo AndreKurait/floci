@@ -44,6 +44,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
@@ -63,6 +65,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private final EmbeddedDnsServer embeddedDnsServer;
     private final Map<String, ProtectedEndpoint> endpoints = new HashMap<>();
     private final Map<String, Set<String>> pendingHelperCleanup = new HashMap<>();
+    private final Set<String> requestedHelperCleanup = new HashSet<>();
+    private final Map<String, CompletableFuture<Void>> helperRemovalsInProgress = new HashMap<>();
     private final ConcurrentMap<String, DnsOrigin> dnsOrigins = new ConcurrentHashMap<>();
     private boolean peerPoliciesNeedRefresh;
     /** What each admitted helper's nftables table currently enforces, recorded only after it installed. */
@@ -120,6 +124,14 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     /** Observe Docker outside the firewall monitor; never inspect a container on a DNS query. */
     void retireDnsOrigins() {
+        try {
+            observeDnsOrigins();
+        } finally {
+            retryRequestedHelperCleanup();
+        }
+    }
+
+    private void observeDnsOrigins() {
         Map<String, DnsOrigin> observed = Map.copyOf(dnsOrigins);
         if (observed.isEmpty()) {
             retireEndpoints(List.of());
@@ -168,6 +180,12 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                         .add(current.helperId());
                 peerPoliciesNeedRefresh = true;
                 quarantine(current.helperId());
+            } else if (endpoints.values().stream()
+                    .noneMatch(endpoint -> endpoint.helperId().equals(origin.helperId()))) {
+                // The observer may lose the monitor to a replacement, but still owns the old helper.
+                pendingHelperCleanup.computeIfAbsent(origin.eniId(), ignored -> new HashSet<>())
+                        .add(origin.helperId());
+                quarantine(origin.helperId());
             }
         }
         if (peerPoliciesNeedRefresh) {
@@ -175,6 +193,74 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             reconcileAll();
             peerPoliciesNeedRefresh = false;
         }
+    }
+
+    /** The observer retries removals an owning service requested but Docker has not completed. */
+    private void retryRequestedHelperCleanup() {
+        Set<String> helpers;
+        synchronized (this) {
+            helpers = Set.copyOf(requestedHelperCleanup);
+        }
+        for (String helper : helpers) {
+            synchronized (this) {
+                if (helperRemovalsInProgress.containsKey(helper)) {
+                    continue;
+                }
+            }
+            try {
+                removeRequestedHelper(helper);
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Could not remove retired security-group helper {0}; retaining cleanup", helper);
+            }
+        }
+    }
+
+    /** Removes a requested helper outside the monitor; a concurrent caller joins the removal in progress. */
+    private void removeRequestedHelper(String helper) {
+        CompletableFuture<Void> removal;
+        boolean startRemoval;
+        synchronized (this) {
+            if (!requestedHelperCleanup.contains(helper)) {
+                return;
+            }
+            removal = helperRemovalsInProgress.get(helper);
+            startRemoval = removal == null;
+            if (startRemoval) {
+                removal = new CompletableFuture<>();
+                helperRemovalsInProgress.put(helper, removal);
+            }
+        }
+        if (!startRemoval) {
+            try {
+                removal.join();
+            } catch (CompletionException failure) {
+                if (failure.getCause() instanceof RuntimeException cause) {
+                    throw cause;
+                }
+                throw new IllegalStateException("Security-group helper removal failed", failure.getCause());
+            }
+            return;
+        }
+        try {
+            lifecycleManager.removeIfExistsStrict(helper);
+            synchronized (this) {
+                forgetHelperCleanup(helper);
+            }
+            removal.complete(null);
+        } catch (RuntimeException | Error failure) {
+            removal.completeExceptionally(failure);
+            throw failure;
+        } finally {
+            synchronized (this) {
+                helperRemovalsInProgress.remove(helper, removal);
+            }
+        }
+    }
+
+    private void forgetHelperCleanup(String helper) {
+        requestedHelperCleanup.remove(helper);
+        pendingHelperCleanup.values().forEach(helpers -> helpers.remove(helper));
+        pendingHelperCleanup.values().removeIf(Set::isEmpty);
     }
 
     private void removeDnsOrigin(ProtectedEndpoint protectedEndpoint) {
@@ -380,6 +466,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                                              Arrival arrival) {
         // The monitor is held from here until admit() has installed this endpoint's own policy.
         currentArrival = arrival;
+        if (helperRemovalsInProgress.containsKey(helperId)) {
+            throw new IllegalStateException("Security-group helper removal is in progress");
+        }
         List<String> addresses = endpoint.transportAddresses();
         if (endpoints.values().stream().map(ProtectedEndpoint::endpoint)
                 .anyMatch(existing -> !existing.eniId().equals(endpoint.eniId())
@@ -412,12 +501,18 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             if (previous != null) {
                 removeDnsOrigin(previous);
+                if (!previous.helperId().equals(helperId) && endpoints.values().stream()
+                        .noneMatch(current -> current.helperId().equals(previous.helperId()))) {
+                    // The replaced helper stays the ENI owner's to remove.
+                    pendingHelperCleanup.computeIfAbsent(endpoint.eniId(), ignored -> new HashSet<>())
+                            .add(previous.helperId());
+                    quarantine(previous.helperId());
+                }
             }
             ProtectedEndpoint admitted = endpoints.get(endpoint.eniId());
             if (admitted != null) {
                 addresses.forEach(address -> dnsOrigins.put(address, admitted.dnsOrigin()));
-                pendingHelperCleanup.values().forEach(helpers -> helpers.remove(helperId));
-                pendingHelperCleanup.values().removeIf(Set::isEmpty);
+                forgetHelperCleanup(helperId);
             }
         } catch (RuntimeException e) {
             // Revert only this registration: a concurrent one for the same ENI may have replaced it.
@@ -530,37 +625,65 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     /** Removes the port-owning helper without forgetting its identity if Docker fails. */
     public void removeNamespaceStrict(String eniId) {
-        ProtectedEndpoint endpoint;
+        Set<String> helpers;
         synchronized (this) {
-            endpoint = endpoints.get(eniId);
+            helpers = new HashSet<>(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
+            ProtectedEndpoint endpoint = endpoints.get(eniId);
+            if (endpoint != null) {
+                helpers.add(endpoint.helperId());
+            }
+            requestedHelperCleanup.addAll(helpers);
         }
-        if (endpoint != null) {
-            lifecycleManager.removeIfExistsStrict(endpoint.helperId());
+        for (String helper : helpers) {
+            removeRequestedHelper(helper);
         }
     }
 
-    public synchronized void unregister(String eniId) {
-        if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
-            vpcRouting.get().unregister(eniId);
+    public void unregister(String eniId) {
+        captureUnregister(eniId).run();
+    }
+
+    /** Captures ownership before asynchronous teardown makes a retained ENI available again. */
+    public synchronized Runnable captureUnregister(String eniId) {
+        ProtectedEndpoint captured = endpoints.get(eniId);
+        Set<String> helpers = new HashSet<>(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
+        if (captured != null) {
+            helpers.add(captured.helperId());
         }
-        ProtectedEndpoint removed = endpoints.remove(eniId);
-        applied.remove(eniId);
-        if (removed != null) {
-            removeDnsOrigin(removed);
-            pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(removed.helperId());
-            peerPoliciesNeedRefresh = true;
+        return () -> unregisterCaptured(eniId, captured, helpers);
+    }
+
+    private void unregisterCaptured(String eniId, ProtectedEndpoint captured, Set<String> capturedHelpers) {
+        Set<String> helpers;
+        synchronized (this) {
+            ProtectedEndpoint current = endpoints.get(eniId);
+            boolean owned = captured != null && current != null && current.dnsOrigin() == captured.dnsOrigin();
+            if ((current == null || owned) && vpcRouting != null && !vpcRouting.isUnsatisfied()) {
+                // A replacement registered on this ENI after the capture keeps its routes.
+                vpcRouting.get().unregister(eniId);
+            }
+            if (owned) {
+                endpoints.remove(eniId);
+                applied.remove(eniId);
+                removeDnsOrigin(current);
+                pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(current.helperId());
+                peerPoliciesNeedRefresh = true;
+                quarantine(current.helperId());
+            }
+            // Retiring peer permissions must not discard the owning service's later cleanup obligation.
+            helpers = new HashSet<>(capturedHelpers);
+            helpers.removeIf(helper -> endpoints.values().stream()
+                    .anyMatch(endpoint -> endpoint.helperId().equals(helper)));
+            helpers.retainAll(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
+            requestedHelperCleanup.addAll(helpers);
+            if (peerPoliciesNeedRefresh) {
+                reconcileAll();
+                peerPoliciesNeedRefresh = false;
+            }
         }
-        if (peerPoliciesNeedRefresh) {
-            reconcileAll();
-            peerPoliciesNeedRefresh = false;
+        for (String helper : helpers) {
+            removeRequestedHelper(helper);
         }
-        // Retiring peer permissions must not discard the owning service's later cleanup obligation.
-        Set<String> helpers = pendingHelperCleanup.getOrDefault(eniId, Set.of());
-        for (String helper : new ArrayList<>(helpers)) {
-            lifecycleManager.removeIfExistsStrict(helper);
-            helpers.remove(helper);
-        }
-        pendingHelperCleanup.remove(eniId);
     }
 
     public synchronized void publishPublicAddress(String eniId, String address) {
