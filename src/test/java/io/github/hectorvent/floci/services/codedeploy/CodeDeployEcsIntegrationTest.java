@@ -5,9 +5,10 @@ import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.*;
 
-import java.util.concurrent.TimeUnit;
+import java.time.Duration;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.*;
 
 @QuarkusTest
@@ -284,12 +285,11 @@ class CodeDeployEcsIntegrationTest {
 
     @Test
     @Order(11)
-    void deploymentCompletesSuccessfully() throws InterruptedException {
+    void deploymentCompletesSuccessfully() {
         Assumptions.assumeTrue(deploymentId != null, "deploymentId must be set");
 
-        String status = null;
-        for (int i = 0; i < 20; i++) {
-            status = given()
+        String status = await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(25)).until(() -> given()
                 .header("X-Amz-Target", "CodeDeploy_20141006.GetDeployment")
                 .contentType(CONTENT_TYPE)
                 .body(String.format("{\"deploymentId\": \"%s\"}", deploymentId))
@@ -297,13 +297,8 @@ class CodeDeployEcsIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
-                .extract().path("deploymentInfo.status");
-
-            if ("Succeeded".equals(status) || "Failed".equals(status) || "Stopped".equals(status)) {
-                break;
-            }
-            TimeUnit.MILLISECONDS.sleep(500);
-        }
+                .extract().<String>path("deploymentInfo.status"),
+                reached -> "Succeeded".equals(reached) || "Failed".equals(reached) || "Stopped".equals(reached));
 
         Assertions.assertEquals("Succeeded", status, "ECS deployment should succeed");
     }
