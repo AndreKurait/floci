@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.autoscaling;
 
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -80,6 +81,44 @@ class AutoScalingTerminationIntegrationTest {
                 assertEquals(Set.copyOf(requested), Set.copyOf(returned));
                 assertTrue(client.describeScalingActivities(request -> request.autoScalingGroupName(name)
                         .activityIds(UUID.randomUUID().toString())).activities().isEmpty());
+            });
+        }
+    }
+
+    @Test
+    void sdkCanTerminateAStandbyInstanceWithoutReplacingIt() {
+        String name = "termination-" + UUID.randomUUID();
+        try (AutoScalingClient client = AutoScalingClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create("414141414141", "test"))).build()) {
+            AutoScalingStandbyIntegrationTest.withStandbyGroup(client, name, () -> {
+                client.updateAutoScalingGroup(request -> request.autoScalingGroupName(name).minSize(0));
+                await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                        assertEquals(1, activeCount(group(client, name))));
+                String instance = group(client, name).instances().getFirst().instanceId();
+                client.enterStandby(request -> request.autoScalingGroupName(name)
+                        .instanceIds(instance).shouldDecrementDesiredCapacity(true));
+                await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals("Standby",
+                        group(client, name).instances().getFirst().lifecycleStateAsString()));
+
+                Activity response = client.terminateInstanceInAutoScalingGroup(request -> request
+                        .instanceId(instance).shouldDecrementDesiredCapacity(false)).activity();
+                assertNotNull(response, "TerminateInstanceInAutoScalingGroup must return its scaling activity");
+                assertFalse(response.activityId().isBlank());
+                assertEquals(name, response.autoScalingGroupName());
+                assertEquals("InProgress", response.statusCodeAsString());
+                assertTrue(response.description().contains(instance));
+
+                await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                    Activity completed = client.describeScalingActivities(request -> request
+                            .autoScalingGroupName(name).activityIds(response.activityId())).activities().getFirst();
+                    assertEquals("Successful", completed.statusCodeAsString());
+                    assertEquals(100, completed.progress());
+                    assertNotNull(completed.endTime());
+                    AutoScalingGroup current = group(client, name);
+                    assertEquals(0, current.desiredCapacity());
+                    assertTrue(current.instances().isEmpty());
+                });
             });
         }
     }

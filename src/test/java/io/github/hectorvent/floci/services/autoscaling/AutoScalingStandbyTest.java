@@ -506,6 +506,21 @@ class AutoScalingStandbyTest {
     }
 
     @Test
+    void standbyTerminationReturnsAnActivityWithoutLaunchingAReplacement() {
+        ok(enterStandby(true, "i-a"));
+        reconciler.reconcile(group());
+        assertEquals("Standby", lifecycle("i-a"));
+
+        String activityId = service.terminateInstanceInAutoScalingGroup(REGION, "i-a", false).getActivityId();
+        reconciler.reconcile(group());
+
+        assertEquals(List.of("i-b"), memberIds());
+        assertEquals(1, group().getDesiredCapacity());
+        assertEquals("Successful", activity(describeScalingActivities(), activityId, "StatusCode"));
+        assertNoLaunch();
+    }
+
+    @Test
     void anInstanceEc2NoLongerHasIsReplacedWhenItLeavesStandby() {
         ok(enterStandby(true, "i-a"));
         reconciler.reconcile(group());
