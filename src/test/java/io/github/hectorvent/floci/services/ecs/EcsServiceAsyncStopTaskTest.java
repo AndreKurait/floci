@@ -78,10 +78,7 @@ class EcsServiceAsyncStopTaskTest {
         assertEquals("STOPPING", describe(service, task).getLastStatus());
 
         draining.countDown();
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (!"STOPPED".equals(describe(service, task).getLastStatus()) && System.currentTimeMillis() < deadline) {
-            Thread.sleep(20);
-        }
+        service.awaitPendingStops();
         assertEquals("STOPPED", describe(service, task).getLastStatus());
         assertEquals(0, describe(service, task).getContainers().getFirst().getExitCode());
     }

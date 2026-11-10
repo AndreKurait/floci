@@ -19,7 +19,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.Closeable;
-import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,7 +29,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -376,8 +374,8 @@ class EcsServiceTeardownTest {
 
         // The tick's retry runs off the reconciler thread and lands the task once Docker is done.
         service.reconcile();
-        await().atMost(Duration.ofSeconds(5)).until(() ->
-                "STOPPED".equals(service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus()));
+        service.awaitPendingStops();
+        assertEquals("STOPPED", service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus());
         verify(containerManager, times(2)).stopTaskAndCollectExitCodes(handle);
     }
 

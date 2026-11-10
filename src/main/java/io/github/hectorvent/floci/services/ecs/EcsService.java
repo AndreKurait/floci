@@ -2164,6 +2164,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    /** Waits for one task's background stop, when one is in flight, while other stops keep running. */
+    void awaitPendingStop(String taskArn) throws Exception {
+        CompletableFuture<Void> stop = taskStops.get(taskArn);
+        if (stop != null) {
+            stop.get(60, TimeUnit.SECONDS);
+        }
+    }
+
     /**
      * @param stopCode why the task is going away, as the {@code stopCode} AWS reports: a caller's
      *                 StopTask is {@code UserInitiated}, anything the reconciler decides is
