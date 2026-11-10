@@ -3107,7 +3107,7 @@ Older persisted session records without an issuance timestamp leave it absent; F
 not derive a replacement timestamp from expiration or restart time. This does not add
 MFA/session-tag context or issue new service execution-role sessions.
 
-Attached IAM user and role tags are available as `aws:PrincipalTag/<key>` in resolved caller policy contexts, including existing local STS user and role sessions. Each resolution reads current identity tags and retains an immutable snapshot for that evaluation. Policy simulation still requires explicitly supplied tag context. Session-tag issuance, transitive tags and session-tag overrides are not implemented by this change.
+Attached IAM user and role tags are available as `aws:PrincipalTag/<key>` in resolved caller policy contexts, including existing local STS user and role sessions. Federated sessions also carry their issuing user's attached tags while retaining the federated principal's identity. Each resolution reads current identity tags and retains an immutable snapshot for that evaluation. Policy simulation still requires explicitly supplied tag context. Session-tag issuance, transitive tags and session-tag overrides are not implemented by this change.
 
 
 ### Service execution-role authorization sessions
