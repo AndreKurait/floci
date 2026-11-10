@@ -44,6 +44,14 @@ cleanup removes that parameter and the key. Imported public keys create no priva
 parameter. `Ref`, `KeyPairId`, and `KeyFingerprint` report the backing EC2 identity.
 Failed follow-up writes keep created keys and parameters tracked for cleanup retries;
 parameters that already existed remain outside the stack's ownership.
+
+Stack deletion, replacement cleanup and rollback use the recorded `KeyPairId`. A key created
+outside the stack under a reused name remains untouched. Generated keys lose only their owned
+`/ec2/keypair/{KeyPairId}` parameter; imported keys do not own a private-key parameter.
+Pending cleanup preserves the key identity and parameter ownership across retries and reloads.
+Exhausting one cleanup entry does not discard another entry that still has attempts remaining.
+Cloud Control and legacy records without a key ID retain name-based deletion.
+
 Generated Ed25519 keys and PPK output are currently rejected before any resource is
 created. The CloudFormation strict unsupported-resource policy remains enabled by
 callers that require it.

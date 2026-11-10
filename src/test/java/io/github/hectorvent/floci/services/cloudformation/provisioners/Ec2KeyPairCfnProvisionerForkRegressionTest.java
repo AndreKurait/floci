@@ -150,8 +150,8 @@ class Ec2KeyPairCfnProvisionerForkRegressionTest {
         verify(ec2, times(2)).deleteKeyPair("us-east-1", null, "key-next");
         verify(ec2, never()).deleteKeyPair("us-east-1", null, "key-old");
         verify(ssm, never()).deleteParameter(anyString(), anyString());
-        verify(ec2).describeKeyPairs("us-east-1", List.of("next"), List.of());
-        verify(ec2, never()).describeKeyPairs("us-east-1", List.of("old"), List.of());
+        // Cleanup goes by the recorded key id, so it never looks a key up by a reusable name.
+        verify(ec2, never()).describeKeyPairs(anyString(), anyList(), anyList());
     }
 
     @Test
