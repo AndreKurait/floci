@@ -1068,7 +1068,9 @@ so blocked application traffic does not prevent invocation delivery or results.
 This does not open the emulator's other API ports. EC2 instance metadata is blocked.
 Privileged containers and Docker network, port, DNS or host overrides cannot be
 combined with protected VPC execution. Ordinary environment retirement removes the
-container before releasing its helper and ENI; startup retires surviving owned
+container before releasing its helper and ENI. The firewall retires the namespace
+while its helper is still present, and the ENI remains reserved until helper removal
+is confirmed; startup retires surviving owned
 helpers and their workloads.
 
 This currently allocates an ENI per execution environment. Hyperplane ENI sharing,

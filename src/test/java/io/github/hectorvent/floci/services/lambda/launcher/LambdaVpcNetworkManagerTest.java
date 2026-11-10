@@ -32,9 +32,11 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -83,8 +85,8 @@ class LambdaVpcNetworkManagerTest {
 
         if (helperRemoved) {
             InOrder order = inOrder(lifecycle, firewall, ec2);
-            order.verify(lifecycle).removeIfExistsStrict("helper");
             order.verify(firewall).unregister("eni-caller");
+            order.verify(lifecycle).removeIfExistsStrict("helper");
             order.verify(ec2).releaseNetworkInterfaceFromService("us-east-1", "eni-caller");
             order.verify(ec2).deleteNetworkInterface("us-east-1", "eni-caller");
         } else {
@@ -147,7 +149,47 @@ class LambdaVpcNetworkManagerTest {
 
         assertThrows(IllegalStateException.class, () -> manager.release(attachment));
 
-        verifyNoInteractions(ec2, firewall);
+        verifyNoInteractions(ec2);
+        verify(firewall).unregister("eni-caller");
+    }
+
+    @Test
+    void retirementCanQuarantineTheNamespaceBeforeItDisappears() {
+        AtomicBoolean helperExists = new AtomicBoolean(true);
+        AtomicBoolean retired = new AtomicBoolean();
+        doAnswer(ignored -> {
+            if (!helperExists.get()) {
+                throw new IllegalStateException("Cannot quarantine a removed namespace");
+            }
+            retired.set(true);
+            return null;
+        }).when(firewall).unregister("eni-caller");
+        doAnswer(ignored -> {
+            helperExists.set(false);
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("helper");
+
+        assertDoesNotThrow(() -> manager.release(attachment()));
+
+        assertTrue(retired.get());
+        assertFalse(helperExists.get());
+        verify(ec2).releaseNetworkInterfaceFromService("us-east-1", "eni-caller");
+        verify(ec2).deleteNetworkInterface("us-east-1", "eni-caller");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retirementAndRemovalFailuresKeepTheEniReservedAndPreserveBothErrors(boolean sameFailure) {
+        IllegalStateException retirementFailure = new IllegalStateException("peer policy failed");
+        IllegalStateException removalFailure = sameFailure
+                ? retirementFailure : new IllegalStateException("helper is still present");
+        doThrow(retirementFailure).when(firewall).unregister("eni-caller");
+        doThrow(removalFailure).when(lifecycle).removeIfExistsStrict("helper");
+
+        assertSame(retirementFailure, assertThrows(IllegalStateException.class, () -> manager.release(attachment())));
+
+        assertEquals(sameFailure ? List.of() : List.of(removalFailure), List.of(retirementFailure.getSuppressed()));
+        verifyNoInteractions(ec2);
     }
 
     @Test
@@ -216,8 +258,8 @@ class LambdaVpcNetworkManagerTest {
 
         InOrder order = inOrder(lifecycle, firewall, ec2);
         order.verify(lifecycle).stopAndRemoveStrict("workload", null, 1);
-        order.verify(lifecycle).removeIfExistsStrict("helper");
         order.verify(firewall).unregister("eni-caller");
+        order.verify(lifecycle).removeIfExistsStrict("helper");
         order.verify(ec2).releaseNetworkInterfaceFromService("us-east-1", "eni-caller");
         order.verify(ec2).deleteNetworkInterface("us-east-1", "eni-caller");
     }
