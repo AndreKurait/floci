@@ -3,11 +3,20 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmResourceDataSyncAdmissionTimeline;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SsmResourceDataSyncCfnProvisioner;
+import io.github.hectorvent.floci.services.ssm.SsmResourceDataSyncService;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.testing.TestTime;
+import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -30,6 +39,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -47,10 +57,31 @@ class CloudFormationSsmResourceDataSyncSdkIntegrationTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final AtomicLong ACCOUNTS = new AtomicLong(830033330000L);
+    /** Marks the one test that keeps the provisioner's real two-second admission pause. */
+    private static final String REAL_ADMISSION_PAUSE = "real-admission-pause";
+
+    @Inject
+    SsmResourceDataSyncService syncs;
+
+    private final TestTime time = TestTime.create();
 
     @BeforeAll
     static void configureJson() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    /**
+     * The provider's admission pauses (two seconds, then ten-second retries) pass on this test's
+     * timeline, so no stack operation here is held for real seconds. The pause schedule itself is
+     * covered by SsmResourceDataSyncCfnProvisionerTest; the tagged test keeps the real pause and the
+     * real sync worker.
+     */
+    @BeforeEach
+    void putAdmissionPausesOnTheTimeline(TestInfo test) {
+        if (!test.getTags().contains(REAL_ADMISSION_PAUSE)) {
+            QuarkusMock.installMockForType(SsmResourceDataSyncAdmissionTimeline.provisioner(syncs, time),
+                    SsmResourceDataSyncCfnProvisioner.class);
+        }
     }
 
     @ParameterizedTest
@@ -58,6 +89,8 @@ class CloudFormationSsmResourceDataSyncSdkIntegrationTest {
     void stackOwnsSyncAndExportsUploadedInventory(String region, boolean nested) throws Exception {
         try (Scenario scenario = new Scenario(region)) {
             Stack stack = scenario.create(scenario.template(nested));
+            assertEquals(TestTime.DEFAULT_START.plusSeconds(2), time.now(),
+                    "admission starts with one two-second callback");
             assertEquals(scenario.name, output(stack, "SyncRef"),
                     "Ref must name the real SSM sync, not a CloudFormation placeholder");
             assertEquals(scenario.name, scenario.cfn.describeStackResource(request -> request
@@ -75,7 +108,10 @@ class CloudFormationSsmResourceDataSyncSdkIntegrationTest {
             }
             scenario.upload("first");
             scenario.awaitExport("reports", "first");
-            assertNotNull(scenario.sync(scenario.name).lastSuccessfulSyncTime());
+            // The worker writes the export before it records the cycle's outcome.
+            assertNotNull(await("the exporting cycle records its success").atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> scenario.sync(scenario.name).lastSuccessfulSyncTime(), Objects::nonNull));
 
             scenario.deleteStack();
             assertTrue(scenario.ssm.listResourceDataSync().resourceDataSyncItems().isEmpty());
@@ -177,6 +213,7 @@ class CloudFormationSsmResourceDataSyncSdkIntegrationTest {
     }
 
     @Test
+    @Tag(REAL_ADMISSION_PAUSE)
     void aFailedAsynchronousDestinationFailsAdmissionAndRemovesItsSync() throws Exception {
         try (Scenario scenario = new Scenario("us-east-1")) {
             ObjectNode template = scenario.template(false);
@@ -390,11 +427,12 @@ class CloudFormationSsmResourceDataSyncSdkIntegrationTest {
         }
 
         private void awaitExport(String prefix, String value) {
-            await().atMost(Duration.ofSeconds(10)).ignoreExceptions().untilAsserted(() -> {
-                JsonNode row = JSON.readTree(body(prefix));
-                assertEquals(value, row.path("Name").asText());
-                assertEquals(instance, row.path("resourceId").asText());
-            });
+            await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .ignoreExceptions().untilAsserted(() -> {
+                        JsonNode row = JSON.readTree(body(prefix));
+                        assertEquals(value, row.path("Name").asText());
+                        assertEquals(instance, row.path("resourceId").asText());
+                    });
         }
 
         private void deleteStack() {
@@ -402,17 +440,18 @@ class CloudFormationSsmResourceDataSyncSdkIntegrationTest {
                 return;
             }
             cfn.deleteStack(request -> request.stackName(name));
-            await().atMost(Duration.ofSeconds(10)).until(() -> {
-                try {
-                    Stack stack = cfn.describeStacks(request -> request.stackName(name)).stacks().getFirst();
-                    assertNotEquals("DELETE_FAILED", stack.stackStatusAsString(), stack.stackStatusReason());
-                    return false;
-                } catch (CloudFormationException error) {
-                    assertEquals("ValidationError", error.awsErrorDetails().errorCode());
-                    assertTrue(error.getMessage().contains("does not exist"), error.getMessage());
-                    return true;
-                }
-            });
+            await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> {
+                        try {
+                            Stack stack = cfn.describeStacks(request -> request.stackName(name)).stacks().getFirst();
+                            assertNotEquals("DELETE_FAILED", stack.stackStatusAsString(), stack.stackStatusReason());
+                            return false;
+                        } catch (CloudFormationException error) {
+                            assertEquals("ValidationError", error.awsErrorDetails().errorCode());
+                            assertTrue(error.getMessage().contains("does not exist"), error.getMessage());
+                            return true;
+                        }
+                    });
             stackCreated = false;
         }
 
