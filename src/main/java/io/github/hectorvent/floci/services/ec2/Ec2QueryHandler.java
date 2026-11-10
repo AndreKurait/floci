@@ -4383,20 +4383,8 @@ public class Ec2QueryHandler {
             throw new AwsException("UnsupportedOperation",
                     "CreateSnapshot supports regional snapshots without an OutpostArn.", 400);
         }
-        for (String prefix : new String[] {"TagSpecification", "TagSpecifications"}) {
-            for (int i = 1; ; i++) {
-                String resourceType = p.getFirst(prefix + "." + i + ".ResourceType");
-                if (resourceType == null) {
-                    break;
-                }
-                if (!"snapshot".equals(resourceType)) {
-                    throw new AwsException("InvalidParameterValue",
-                            "CreateSnapshot supports tags for the snapshot resource type only.", 400);
-                }
-            }
-        }
         Snapshot snapshot = service.createSnapshot(region, p.getFirst("VolumeId"),
-                p.getFirst("Description"), parseTagsForResource(p, "snapshot"),
+                p.getFirst("Description"), parseTagsForResource(p, "snapshot", Set.of("snapshot")),
                 Boolean.parseBoolean(p.getFirst("DryRun")));
         return xmlResponse(new XmlBuilder()
                 .start("CreateSnapshotResponse", AwsNamespaces.EC2)

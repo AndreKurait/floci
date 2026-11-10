@@ -149,7 +149,8 @@ class Ec2CreateSnapshotIntegrationTest {
 
     @ParameterizedTest
     @CsvSource({"Location,local,UnsupportedOperation", "OutpostArn,unsupported,UnsupportedOperation",
-            "TagSpecification.1.ResourceType,volume,InvalidParameterValue"})
+            "TagSpecification.1.ResourceType,volume,InvalidParameterValue",
+            "TagSpecification.1.Tag.1.Key,Purpose,InvalidParameterValue"})
     void unsupportedPlacementAndWrongTagResourceDoNotCreateASnapshot(String parameter, String value, String code) {
         String volumeId = volume();
         try {
