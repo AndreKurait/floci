@@ -115,12 +115,7 @@ public class SqsService implements Resettable, ResourceProvider {
             new ConcurrentHashMap<>();
     /** Move tasks execute on a background thread so MaxNumberOfMessagesPerSecond can throttle
      * and CancelMessageMoveTask has something to interrupt. One thread per task is sufficient. */
-    private final ExecutorService moveTaskExecutor =
-            Executors.newCachedThreadPool(r -> {
-                Thread t = new Thread(r, "sqs-move-task");
-                t.setDaemon(true);
-                return t;
-            });
+    private final ExecutorService moveTaskExecutor;
     private final AtomicLong sequenceCounter = new AtomicLong(0);
 
     private record RedrivePolicy(int maxReceiveCount, String deadLetterTargetArn) {
@@ -151,8 +146,9 @@ public class SqsService implements Resettable, ResourceProvider {
             return requested.getCount() == 0;
         }
 
-        boolean awaitRequested(long millis) throws InterruptedException {
-            return requested.await(millis, TimeUnit.MILLISECONDS);
+        /** The worker's wait between moves: true, and early, once the task is cancelled. */
+        boolean awaitRequested(SqsTiming timing, long millis) throws InterruptedException {
+            return timing.await(requested, millis);
         }
     }
 
@@ -297,6 +293,8 @@ public class SqsService implements Resettable, ResourceProvider {
     private final boolean clearFifoDeduplicationCacheOnPurge;
     private final SnsService snsService;
     private final Clock clock;
+    /** Delivery timing. Separate from {@link #clock}, which tests of other services hold still. */
+    private final SqsTiming timing;
     private final String receiptHandleSecret;
     private final Instance<RequestContext> requestContextInstance;
     private final IamService iamService;
@@ -434,6 +432,31 @@ public class SqsService implements Resettable, ResourceProvider {
                SnsService snsService, Clock clock, String receiptHandleSecret,
                Instance<RequestContext> requestContextInstance, IamService iamService,
                EndpointStrategy endpointStrategy) {
+        this(queueStore, messageStore, dedupStore, dedupIdentityStore, defaultVisibilityTimeout, maxMessageSize,
+                baseUrl, regionResolver, clearFifoDeduplicationCacheOnPurge, snsService, clock,
+                receiptHandleSecret, requestContextInstance, iamService, endpointStrategy,
+                SqsTiming.SYSTEM, newMoveTaskExecutor());
+    }
+
+    /** For tests that move time themselves: delivery runs on {@code timing}, move tasks on {@code moveTaskExecutor}. */
+    SqsService(StorageBackend<String, Queue> queueStore,
+               int defaultVisibilityTimeout, int maxMessageSize, String baseUrl, Clock clock,
+               SqsTiming timing, ExecutorService moveTaskExecutor) {
+        this(queueStore, null, null, null, defaultVisibilityTimeout, maxMessageSize, baseUrl,
+                new RegionResolver("us-east-1", "000000000000"), false, null, clock, // partition-literal: test-shaped constructor default
+                ReceiptHandle.DEFAULT_SECRET, null, null, EndpointStrategy.FLOCI, timing, moveTaskExecutor);
+    }
+
+    SqsService(StorageBackend<String, Queue> queueStore, StorageBackend<String, List<Message>> messageStore,
+               StorageBackend<String, Map<String, Long>> dedupStore,
+               StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore,
+               int defaultVisibilityTimeout, int maxMessageSize, String baseUrl,
+               RegionResolver regionResolver, boolean clearFifoDeduplicationCacheOnPurge,
+               SnsService snsService, Clock clock, String receiptHandleSecret,
+               Instance<RequestContext> requestContextInstance, IamService iamService,
+               EndpointStrategy endpointStrategy, SqsTiming timing, ExecutorService moveTaskExecutor) {
+        this.timing = timing;
+        this.moveTaskExecutor = moveTaskExecutor;
         this.queueStore = queueStore;
         this.messageStore = messageStore;
         this.dedupStore = dedupStore;
@@ -461,6 +484,15 @@ public class SqsService implements Resettable, ResourceProvider {
         loadPersistedMessages();
         loadPersistedDedup();
         loadPersistedDedupIdentities();
+    }
+
+    /** One daemon thread per running move task. */
+    static ExecutorService newMoveTaskExecutor() {
+        return Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "sqs-move-task");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     @PreDestroy
@@ -704,7 +736,7 @@ public class SqsService implements Resettable, ResourceProvider {
         Object persistenceLock = messagePersistenceLocks[Math.floorMod(storageKey.hashCode(),
                 messagePersistenceLocks.length)];
         return new GuardedMessageQueue(initial, messageStore, storageKey, receiptHandleSecret,
-                persistenceLock, () -> generation == queueResetGeneration);
+                persistenceLock, () -> generation == queueResetGeneration, timing.clock());
     }
 
     private void persistDedup(String storageKey) {
@@ -1199,7 +1231,7 @@ public class SqsService implements Resettable, ResourceProvider {
                         // The original message may have been received and deleted, but SQS
                         // continues tracking the deduplication ID for the full interval.
                         // Return the original identity without re-enqueueing a message.
-                        Message response = new Message(body);
+                        Message response = new Message(body, timing.clock().instant());
                         response.setSenderId(effectiveSenderId);
                         if (identity != null) {
                             response.setMessageId(identity.messageId());
@@ -1221,14 +1253,15 @@ public class SqsService implements Resettable, ResourceProvider {
                     GuardedMessageQueue messages;
                     try {
                         persistDedup(storageKey);
-                        message = new Message(body);
+                        Instant sentAt = timing.clock().instant();
+                        message = new Message(body, sentAt);
                         message.setSenderId(effectiveSenderId);
                         message.setMessageGroupId(messageGroupId);
                         message.setMessageDeduplicationId(dedupId);
                         message.setSequenceNumber(sequenceCounter.incrementAndGet());
                         message.setAwsTraceHeader(awsTraceHeader);
                         if (effectiveDelaySeconds > 0) {
-                            message.setVisibleAt(Instant.now().plusSeconds(effectiveDelaySeconds));
+                            message.setVisibleAt(sentAt.plusSeconds(effectiveDelaySeconds));
                         }
                         if (messageAttributes != null && !messageAttributes.isEmpty()) {
                             message.getMessageAttributes().putAll(messageAttributes);
@@ -1262,12 +1295,13 @@ public class SqsService implements Resettable, ResourceProvider {
 
             // Standard queue. MessageGroupId is retained for ReceiveMessage to
             // return (fair queues); it has no effect on standard-queue delivery.
-            Message message = new Message(body);
+            Instant sentAt = timing.clock().instant();
+            Message message = new Message(body, sentAt);
             message.setSenderId(effectiveSenderId);
             message.setMessageGroupId(messageGroupId);
             message.setAwsTraceHeader(awsTraceHeader);
             if (effectiveDelaySeconds > 0) {
-                message.setVisibleAt(Instant.now().plusSeconds(effectiveDelaySeconds));
+                message.setVisibleAt(sentAt.plusSeconds(effectiveDelaySeconds));
             }
             if (messageAttributes != null && !messageAttributes.isEmpty()) {
                 message.getMessageAttributes().putAll(messageAttributes);
@@ -1539,7 +1573,7 @@ public class SqsService implements Resettable, ResourceProvider {
                 }
 
                 maxWait = TimeUnit.SECONDS.toNanos(resolveWaitTimeSeconds(queue, waitTimeSeconds));
-                deadline = System.nanoTime() + maxWait;
+                deadline = timing.nanoTime() + maxWait;
                 synchronized (messagesByQueue) {
                     Set<Object> lookups = pendingQueueLookups.get(storageKey);
                     if (resetGeneration != queueResetGeneration || lookups == null || !lookups.contains(lookup)) {
@@ -1581,12 +1615,12 @@ public class SqsService implements Resettable, ResourceProvider {
                     }
                     return recordReceive(polledQueue, result);
                 }
-                long remaining = deadline - System.nanoTime();
+                long remaining = deadline - timing.nanoTime();
                 if (remaining <= 0) {
                     return recordReceive(polledQueue, result);
                 }
                 try {
-                    polledQueue.awaitChange(observed, remaining);
+                    timing.awaitChange(polledQueue, observed, remaining);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return recordReceive(polledQueue, result);
@@ -1667,7 +1701,7 @@ public class SqsService implements Resettable, ResourceProvider {
                     // with no DestinationArn can put it back.
                     msg.setOriginalSourceQueueUrl(queue.getQueueUrl());
                     if (queue.isFifo()) {
-                        msg.setRetentionStartTimestamp(Instant.now());
+                        msg.setRetentionStartTimestamp(timing.clock().instant());
                     }
                 }
                 String dlqStorageKey = regionKey(region, dlqUrl);
@@ -1985,7 +2019,7 @@ public class SqsService implements Resettable, ResourceProvider {
      *  fails, the caller can restore it to the source exactly as it was.
      *  Returns true when the message was placed. */
     private boolean deliverMovedMessage(Message msg, String destUrl, String region) {
-        Message moved = msg.copyForRedrive();
+        Message moved = msg.copyForRedrive(timing.clock().instant());
         if (destUrl != null) {
             String destKey = regionKey(region, destUrl);
             getOrCreateQueue(destKey).addAll(List.of(moved));
@@ -2050,7 +2084,7 @@ public class SqsService implements Resettable, ResourceProvider {
             while (!cancelled.isRequested() && !resetAdmission.isPaused()) {
                 if (intervalMillis > 0) {
                     try {
-                        if (cancelled.awaitRequested(intervalMillis)) {
+                        if (cancelled.awaitRequested(timing, intervalMillis)) {
                             break;
                         }
                     } catch (InterruptedException ie) {
@@ -2455,7 +2489,7 @@ public class SqsService implements Resettable, ResourceProvider {
         return messages;
     }
 
-    private static Instant retentionCutoff(Queue queue) {
+    private Instant retentionCutoff(Queue queue) {
         int retentionSeconds = DEFAULT_MESSAGE_RETENTION_PERIOD_SECONDS;
         String value = queue.getAttributes().get("MessageRetentionPeriod");
         if (value != null) {
@@ -2465,7 +2499,7 @@ public class SqsService implements Resettable, ResourceProvider {
                 LOG.debugv("Ignoring invalid MessageRetentionPeriod {0} on queue {1}", value, queue.getQueueUrl());
             }
         }
-        return Instant.now().minusSeconds(retentionSeconds);
+        return timing.clock().instant().minusSeconds(retentionSeconds);
     }
 
     /** Frees the memory and storage held by expired messages. Reads already skip them. */

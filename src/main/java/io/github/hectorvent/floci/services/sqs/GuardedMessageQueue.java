@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -36,6 +37,8 @@ class GuardedMessageQueue {
     private final BooleanSupplier currentGeneration;
     private final boolean detachedSnapshots;
     private final SqsQueueActivity activity = new SqsQueueActivity();
+    /** Reads the time a visibility deadline is set from and checked against. */
+    private final Clock clock;
     private volatile boolean closed;
 
     @FunctionalInterface
@@ -64,6 +67,14 @@ class GuardedMessageQueue {
 
     GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
                         String receiptHandleSecret, Object persistenceLock, BooleanSupplier currentGeneration) {
+        this(initial, messageStore, storageKey, receiptHandleSecret, persistenceLock, currentGeneration,
+                Clock.systemUTC());
+    }
+
+    GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
+                        String receiptHandleSecret, Object persistenceLock, BooleanSupplier currentGeneration,
+                        Clock clock) {
+        this.clock = clock;
         this.persistenceLock = persistenceLock;
         this.currentGeneration = currentGeneration;
         this.detachedSnapshots = messageStore != null
@@ -110,12 +121,13 @@ class GuardedMessageQueue {
             List<Message> dlqCandidates = new ArrayList<>();
 
             List<DeliveryState> previous = new ArrayList<>();
+            Instant now = clock.instant();
             try {
                 if (fifo) {
-                    claimFifo(maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
+                    claimFifo(now, maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
                             claimed, dlqCandidates, previous);
                 } else {
-                    claimStandard(maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
+                    claimStandard(now, maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
                             claimed, dlqCandidates, previous);
                 }
                 if (!dlqCandidates.isEmpty()) {
@@ -146,13 +158,13 @@ class GuardedMessageQueue {
         }
     }
 
-    private boolean tryClaim(Message msg, int effectiveTimeout, int maxReceiveCount,
+    private boolean tryClaim(Instant now, Message msg, int effectiveTimeout, int maxReceiveCount,
                              String deadLetterTargetArn, List<Message> claimed,
                              List<Message> dlqCandidates, List<DeliveryState> previous) {
         previous.add(new DeliveryState(msg));
         msg.setReceiveCount(msg.getReceiveCount() + 1);
         if (msg.getFirstReceiveTimestamp() == null) {
-            msg.setFirstReceiveTimestamp(Instant.now());
+            msg.setFirstReceiveTimestamp(now);
         }
 
         if (maxReceiveCount > 0 && deadLetterTargetArn != null
@@ -162,22 +174,22 @@ class GuardedMessageQueue {
         }
 
         msg.setReceiptHandle(ReceiptHandle.issue(storageKey, msg.getMessageId(), receiptHandleSecret).encode());
-        msg.setVisibleAt(Instant.now().plusSeconds(effectiveTimeout));
+        msg.setVisibleAt(now.plusSeconds(effectiveTimeout));
         claimed.add(msg);
         return true;
     }
 
-    private void claimStandard(int maxMessages, int effectiveTimeout,
+    private void claimStandard(Instant now, int maxMessages, int effectiveTimeout,
                                int maxReceiveCount, String deadLetterTargetArn,
                                List<Message> claimed, List<Message> dlqCandidates, List<DeliveryState> previous) {
         for (Message msg : messages) {
             if (claimed.size() >= maxMessages) break;
-            if (!msg.isVisible()) continue;
-            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
+            if (!msg.isVisible(now)) continue;
+            tryClaim(now, msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
         }
     }
 
-    private void claimFifo(int maxMessages, int effectiveTimeout,
+    private void claimFifo(Instant now, int maxMessages, int effectiveTimeout,
                            int maxReceiveCount, String deadLetterTargetArn,
                            List<Message> claimed, List<Message> dlqCandidates, List<DeliveryState> previous) {
         // Cross-call group locking: a group that already has an in-flight
@@ -189,18 +201,18 @@ class GuardedMessageQueue {
         // DelaySeconds and must not lock its group.
         Set<String> groupsWithInFlight =
                 messages.stream()
-                        .filter(msg -> !msg.isVisible() && msg.getReceiptHandle() != null
+                        .filter(msg -> !msg.isVisible(now) && msg.getReceiptHandle() != null
                                 && msg.getMessageGroupId() != null)
                         .map(Message::getMessageGroupId).collect(Collectors.toSet());
 
         for (Message msg : messages) {
             if (claimed.size() >= maxMessages) break;
-            if (!msg.isVisible()) continue;
+            if (!msg.isVisible(now)) continue;
 
             String groupId = msg.getMessageGroupId();
             if (groupId != null && groupsWithInFlight.contains(groupId)) continue;
 
-            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
+            tryClaim(now, msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
         }
     }
 
@@ -227,7 +239,7 @@ class GuardedMessageQueue {
             HandleResult result = checkHandle(msg, handle, fifo);
             if (result == HandleResult.APPLIED) {
                 Instant previous = msg.getVisibleAt();
-                msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
+                msg.setVisibleAt(clock.instant().plusSeconds(visibilityTimeout));
                 try {
                     persist(messages);
                     changes.signal();
@@ -253,11 +265,11 @@ class GuardedMessageQueue {
      * On a standard queue an older handle of the message still works. On a FIFO queue only the
      * handle of the receive still in flight does.
      */
-    private static HandleResult checkHandle(Message msg, ReceiptHandle handle, boolean fifo) {
+    private HandleResult checkHandle(Message msg, ReceiptHandle handle, boolean fifo) {
         if (msg == null) {
             return HandleResult.MESSAGE_GONE;
         }
-        if (fifo && (!handle.encode().equals(msg.getReceiptHandle()) || msg.isVisible())) {
+        if (fifo && (!handle.encode().equals(msg.getReceiptHandle()) || msg.isVisible(clock.instant()))) {
             return HandleResult.HANDLE_EXPIRED;
         }
         return HandleResult.APPLIED;
@@ -337,8 +349,9 @@ class GuardedMessageQueue {
             long visible = 0;
             long inFlight = 0;
             long delayed = 0;
+            Instant now = clock.instant();
             for (Message m : messages) {
-                if (m.isVisible()) {
+                if (m.isVisible(now)) {
                     visible++;
                 } else if (m.getReceiptHandle() == null) {
                     delayed++;
@@ -365,8 +378,9 @@ class GuardedMessageQueue {
         try (Guard _ = hold()) {
             Instant oldest = null;
             Set<String> groupsInFlight = new HashSet<>();
+            Instant visibleBy = clock.instant();
             for (Message m : messages) {
-                if (!m.isVisible() && m.getReceiptHandle() != null && m.getMessageGroupId() != null) {
+                if (!m.isVisible(visibleBy) && m.getReceiptHandle() != null && m.getMessageGroupId() != null) {
                     groupsInFlight.add(m.getMessageGroupId());
                 }
                 // ponytail: AWS also leaves out a standard-queue message received 3+ times in this queue;
@@ -432,13 +446,16 @@ class GuardedMessageQueue {
     }
 
     void awaitChange(long observed, long timeoutNanos) throws InterruptedException {
-        long pause;
+        changes.awaitChange(observed, pollPause(timeoutNanos));
+    }
+
+    /** How long a receiver with {@code timeoutNanos} left waits for a change before it scans again. */
+    long pollPause(long timeoutNanos) {
         try (Guard _ = hold()) {
             // Empty queues need no clock-driven scans. Nonempty queues retain recovery for
             // visibility/retention expiry and failed redrive attempts, which may enable work.
-            pause = messages.isEmpty() ? timeoutNanos : Math.min(timeoutNanos, TimeUnit.SECONDS.toNanos(1));
+            return messages.isEmpty() ? timeoutNanos : Math.min(timeoutNanos, TimeUnit.SECONDS.toNanos(1));
         }
-        changes.awaitChange(observed, pause);
     }
 
     private void commit(MessageList candidate) {
