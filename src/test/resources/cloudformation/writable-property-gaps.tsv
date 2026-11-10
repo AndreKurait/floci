@@ -43,11 +43,9 @@ AWS::ApiGatewayV2::Api	IpAddressType	accepted and ignored
 AWS::ApiGatewayV2::Api	RouteKey	accepted and ignored
 AWS::ApiGatewayV2::Api	Target	accepted and ignored
 AWS::ApiGatewayV2::Api	Version	accepted and ignored
-AWS::ApiGatewayV2::Authorizer	AuthorizerCredentialsArn	accepted and ignored
 AWS::ApiGatewayV2::Authorizer	IdentityValidationExpression	accepted and ignored
 AWS::ApiGatewayV2::Deployment	StageName	accepted and ignored
 AWS::ApiGatewayV2::Integration	ContentHandlingStrategy	accepted and ignored
-AWS::ApiGatewayV2::Integration	CredentialsArn	accepted and ignored
 AWS::ApiGatewayV2::Integration	Description	accepted and ignored
 AWS::ApiGatewayV2::Integration	IntegrationSubtype	accepted and ignored
 AWS::ApiGatewayV2::Integration	PassthroughBehavior	accepted and ignored
