@@ -1543,7 +1543,7 @@ final class CognitoAuthFlowHandler {
         }
 
         String challengeName = (String) defineResp.getOrDefault("challengeName", "CUSTOM_CHALLENGE");
-        state.currentChallengeName = challengeName;
+        state.currentChallengeName = customResponseChallengeName(challengeName);
         if (srpAuth && "PASSWORD_VERIFIER".equals(challengeName)) {
             return buildSrpChallenge(pool, client, user, authParameters.get("SRP_A"), state.clientMetadata, state,
                     false);
@@ -1614,7 +1614,7 @@ final class CognitoAuthFlowHandler {
         }
 
         String nextChallenge = (String) defineResp.getOrDefault("challengeName", "CUSTOM_CHALLENGE");
-        state.currentChallengeName = nextChallenge;
+        state.currentChallengeName = customResponseChallengeName(nextChallenge);
         Map<String, String> publicParams = new HashMap<>();
         publicParams.put("USERNAME", state.username);
         applyCreateResponse(state, nextChallenge,
@@ -1679,7 +1679,7 @@ final class CognitoAuthFlowHandler {
         }
 
         String nextChallenge = (String) defineResp.getOrDefault("challengeName", "CUSTOM_CHALLENGE");
-        state.currentChallengeName = nextChallenge;
+        state.currentChallengeName = customResponseChallengeName(nextChallenge);
         Map<String, String> publicParams = new HashMap<>();
         publicParams.put("USERNAME", state.username);
         applyCreateResponse(state, nextChallenge,
@@ -1694,6 +1694,15 @@ final class CognitoAuthFlowHandler {
         result.put("Session", newSession);
         result.put("ChallengeParameters", publicParams);
         return result;
+    }
+
+    /** Custom trigger labels stay in responses/history; clients answer them with CUSTOM_CHALLENGE. */
+    private static String customResponseChallengeName(String challengeName) {
+        if (challengeName == null || "PASSWORD_VERIFIER".equals(challengeName)
+                || "NEW_PASSWORD_REQUIRED".equals(challengeName)) {
+            return challengeName;
+        }
+        return "CUSTOM_CHALLENGE";
     }
 
     private CustomAuthSession requireCustomSession(UserPool pool, UserPoolClient client,
