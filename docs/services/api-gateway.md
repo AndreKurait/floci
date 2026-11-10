@@ -582,7 +582,7 @@ in that map, return `BadRequestException` rather than silently discarding or cha
 | `contentHandling` | `CONVERT_TO_TEXT` base64-encodes a binary request for mapping templates; `CONVERT_TO_BINARY` base64-decodes a text request before sending it |
 | `connectionType` / `connectionId` | `VPC_LINK` requires `connectionId` to name an existing, available VPC link; an unknown link yields `502` |
 | `cacheNamespace` / `cacheKeyParameters` | Form the response cache key (see below) |
-| `credentials` | Persisted and returned. Floci does not enforce IAM, so the role is not actually assumed |
+| `credentials` | Persisted and returned. With IAM enforcement enabled, REST Lambda integration roles and documented caller passthrough are checked as described above. Other service integrations retain their existing behavior |
 
 Integration responses additionally accept `contentHandling`, applied as an output conversion after response templates.
 
@@ -1198,3 +1198,21 @@ AWS or native-image parity remain outside this support.
 When IAM enforcement is enabled, REST methods using `NONE` require an explicit anonymous grant from an attached resource policy. Cognito user-pool methods authenticate the token first, then require that resource-policy grant. Missing policies retain existing access; an explicit deny or an attached policy without a matching allow rejects the request before backend dispatch. Source-IP conditions use the connection address. Anonymous policy context omits `aws:PrincipalIsAWSService`, while signed AWS credentials retain their existing context. These checks use the current stored policy. Complete inbound condition context and deployment-snapshot activation remain separate work.
 
 REST `CUSTOM` authorizers combine their validated policy with the API resource policy when IAM enforcement is enabled. An explicit resource-policy deny stops the request before the authorizer is called. After authorizer evaluation, either policy can grant access, while an explicit deny from either policy wins. The API policy is evaluated for every request, including authorizer cache hits; flushing the authorizer cache still invalidates its cached policy. Custom `principalId` strings do not establish a verified IAM identity. The current transport source-IP and secure-transport conditions are supported; complete inbound condition context and deployment-snapshot policy activation remain separate limitations.
+
+### REST Lambda caller passthrough
+
+For REST `AWS` and `AWS_PROXY` Lambda integrations, the documented IAM caller sentinel
+(`arn:<partition>:iam::*:user/*`) forwards a verified SigV4 identity into Lambda permission
+evaluation when IAM enforcement is enabled. The caller's current identity and session policies,
+permissions boundary, SCPs and the target's resource policy are evaluated for the exact qualified
+function. Cross-account calls require both identity and resource grants. No execution role is
+assumed for this mode, and an anonymous or invalid signature cannot supply a caller identity.
+The API owner still determines the integration configuration; the caller can belong to a different
+account. Cached responses do not invoke Lambda again.
+
+The verified local `test` credential represents account root and still obeys resource-policy and SCP denials.
+IAM-disabled behavior and the historical bare `*` credential spelling retain their local bypass;
+bare `*` is not the documented AWS sentinel. This check is distinct from `execute-api:Invoke`
+route authorization. Issued session identities are read from IAM, not synthesized; full forwarded
+request condition context, other service integrations and HTTP/WebSocket caller modes remain
+outside this implementation.
