@@ -14,6 +14,7 @@ on:
       - 'docker/healthcheck.sh'
       - 'docker/run-docker-tests.sh'
       - 'docker/test-run-docker-tests.sh'
+      - 'docker/test-signed-python-iam-runner.py'
       - 'docker/test-compat-socket.sh'
       - 'compatibility-tests/**'
       - '.github/ci/compat-timing-report.py'
@@ -48,7 +49,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Test Docker runner failure aggregation
-        run: bash docker/test-run-docker-tests.sh
+        run: |
+          bash docker/test-run-docker-tests.sh
+          python3 docker/test-signed-python-iam-runner.py
 
       - name: Test Java SDK timeout and report collection
         run: python3 -m unittest discover -s compatibility-tests/sdk-test-java -p test_runner.py -v
@@ -480,7 +483,11 @@ jobs:
         run: |
           docker logs floci > test-results/floci-default.log 2>&1
           docker rm -f floci
+          DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
           docker run -d --name floci --network compat-net \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            --group-add "$DOCKER_GID" \
+            -e FLOCI_SERVICES_DOCKER_NETWORK=compat-net \
             -e FLOCI_BASE_URL=http://floci:4566 \
             -e FLOCI_HOSTNAME=floci \
             -e FLOCI_AUTH_VALIDATE_SIGNATURES=true \
