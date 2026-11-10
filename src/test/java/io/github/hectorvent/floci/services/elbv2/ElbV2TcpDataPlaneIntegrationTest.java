@@ -628,10 +628,21 @@ class ElbV2TcpDataPlaneIntegrationTest {
     }
 
     private void replaceBackend(NetServerOptions options, Handler<NetSocket> handler) throws Exception {
-        int port = backend.actualPort();
+        int oldPort = backend.actualPort();
         backend.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
-        backend = vertx.createNetServer(options).connectHandler(handler).listen(port, "127.0.0.1")
-                .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        backend = vertx.createNetServer(options).connectHandler(handler);
+        backend.listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        client.deregisterTargets(request -> request.targetGroupArn(targetGroupArn)
+                .targets(TargetDescription.builder().id("127.0.0.1").port(oldPort).build()));
+        client.registerTargets(request -> request.targetGroupArn(targetGroupArn)
+                .targets(TargetDescription.builder().id("127.0.0.1").port(backend.actualPort()).build()));
+        completeInitialHealthChecks(1);
+        await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals(
+                        TargetHealthStateEnum.HEALTHY,
+                        client.describeTargetHealth(request -> request.targetGroupArn(targetGroupArn))
+                                .targetHealthDescriptions().getFirst().targetHealth().state()));
     }
 
     private static Socket connect(int port) throws IOException {
