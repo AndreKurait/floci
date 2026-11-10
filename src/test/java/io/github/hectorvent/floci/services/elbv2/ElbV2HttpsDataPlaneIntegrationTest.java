@@ -749,8 +749,10 @@ class ElbV2HttpsDataPlaneIntegrationTest {
 
     private static void awaitPlainResponse(String host, int port, String body) {
         await().ignoreException(ConnectException.class)
-                .atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
-                assertPlainResponse(host, port, body));
+                .atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+                .pollDelay(Duration.ZERO)
+                .untilAsserted(() ->
+                        assertPlainResponse(host, port, body));
     }
 
     @Test
@@ -1501,13 +1503,15 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static void awaitListenerPortClosed(int port) {
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            try (Socket socket = new Socket()) {
-                IOException failure = assertThrows(IOException.class,
-                        () -> socket.connect(new InetSocketAddress("127.0.0.1", port), 1000));
-                assertTrue(hasCause(failure, ConnectException.class), failure.toString());
-            }
-        });
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    try (Socket socket = new Socket()) {
+                        IOException failure = assertThrows(IOException.class,
+                                () -> socket.connect(new InetSocketAddress("127.0.0.1", port), 1000));
+                        assertTrue(hasCause(failure, ConnectException.class), failure.toString());
+                    }
+                });
     }
 
     @Test
@@ -1648,17 +1652,19 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static void awaitTargetHealthy(String targetGroupArn) {
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
-                given()
-                        .formParam("Action", "DescribeTargetHealth")
-                        .formParam("TargetGroupArn", targetGroupArn)
-                        .header("Authorization", AUTH)
-                    .when()
-                        .post("/")
-                    .then()
-                        .statusCode(200)
-                        .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.TargetHealth.State",
-                                equalTo("healthy")));
+        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+                .pollDelay(Duration.ZERO)
+                .untilAsserted(() ->
+                        given()
+                                .formParam("Action", "DescribeTargetHealth")
+                                .formParam("TargetGroupArn", targetGroupArn)
+                                .header("Authorization", AUTH)
+                            .when()
+                                .post("/")
+                            .then()
+                                .statusCode(200)
+                                .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.TargetHealth.State",
+                                        equalTo("healthy")));
     }
 
     private static void describeHttpsListener(String listenerArn, String certificateArn) {
