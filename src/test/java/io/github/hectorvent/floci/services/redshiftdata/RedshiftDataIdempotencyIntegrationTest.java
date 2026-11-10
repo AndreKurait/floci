@@ -140,7 +140,8 @@ class RedshiftDataIdempotencyIntegrationTest {
     }
 
     private void finished(String id) {
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(10))
+                .untilAsserted(() ->
                 assertEquals(StatusString.FINISHED, data.describeStatement(r -> r.id(id)).status()));
     }
 }
