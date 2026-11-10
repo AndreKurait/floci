@@ -64,11 +64,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     private final Set<String> finishedShards = ConcurrentHashMap.newKeySet();
     /** Set during a reset and after shutdown: no invocation starts and no checkpoint is saved. */
     private volatile boolean quiesced;
-    private final ExecutorService pollExecutor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "dynamodb-streams-esm-poller");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService pollExecutor;
 
     @Inject
     public DynamoDbStreamsEventSourcePoller(Vertx vertx, DynamoDbStreamReader streamReader,
@@ -92,6 +88,21 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                                      PipesFilterMatcher filterMatcher,
                                      StreamBatchFailures batchFailures,
                                      LongSupplier clock) {
+        this(vertx, streamReader, executorService, targetResolver, esmStore, objectMapper, config,
+                filterMatcher, batchFailures, clock, newPollExecutor());
+    }
+
+    /** Test seam: {@code pollExecutor} runs the polls, so a test can wait for them or run them inline. */
+    DynamoDbStreamsEventSourcePoller(Vertx vertx, DynamoDbStreamReader streamReader,
+                                     LambdaExecutorService executorService,
+                                     LambdaTargetResolver targetResolver,
+                                     EsmStore esmStore,
+                                     ObjectMapper objectMapper,
+                                     EmulatorConfig config,
+                                     PipesFilterMatcher filterMatcher,
+                                     StreamBatchFailures batchFailures,
+                                     LongSupplier clock,
+                                     ExecutorService pollExecutor) {
         this.vertx = vertx;
         this.streamReader = streamReader;
         this.executorService = executorService;
@@ -102,6 +113,15 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         this.filterMatcher = filterMatcher;
         this.batchFailures = batchFailures;
         this.clock = clock;
+        this.pollExecutor = pollExecutor;
+    }
+
+    private static ExecutorService newPollExecutor() {
+        return Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "dynamodb-streams-esm-poller");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public void startPersistedPollers() {
