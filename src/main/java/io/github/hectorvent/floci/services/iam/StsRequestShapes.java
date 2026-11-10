@@ -20,6 +20,7 @@ import java.util.Map;
  * anything, and a value that is no integer at all is {@code InvalidParameterValue} rather than a
  * constraint violation. So the operation asks for the violations where its hand-written check ran
  * and answers them in the namespace it answers everything else in.
+ * The authorization filter also reads these constraints before authenticating supplied MFA.
  *
  * <p>The vendored file carries a wave of operations rather than all 11, and grows a wave at a time,
  * each one chosen where no operation answers a declared constraint in a wording of its own.
@@ -28,7 +29,7 @@ import java.util.Map;
  * {@code TokenCode} and {@code MinimumSessionTokenSize}, which nothing read at all; and
  * {@code GetWebIdentityToken} is where the audience and tag checks come off hand-written code.
  */
-final class StsRequestShapes {
+public final class StsRequestShapes {
 
     private static final QueryConstraintCheck CHECK = QueryConstraintCheck.load(
             "aws/sts-request-shapes.json", "STS request shapes",
@@ -38,7 +39,7 @@ final class StsRequestShapes {
     }
 
     /** Every constraint the model declares for {@code action} that {@code params} breaks. */
-    static List<String> violations(String action, MultivaluedMap<String, String> params) {
+    public static List<String> violations(String action, MultivaluedMap<String, String> params) {
         return CHECK.violations(action, params);
     }
 

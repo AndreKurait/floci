@@ -164,9 +164,14 @@ class AssumeRoleMfaIntegrationTest {
                         assertNotNull(ssm.describeParameters());
                     }
                 } else {
-                    assertEquals(error, assertThrows(StsException.class,
-                            () -> issued.set(sts.assumeRole(request.build()).credentials()))
-                            .awsErrorDetails().errorCode());
+                    StsException failure = assertThrows(StsException.class,
+                            () -> issued.set(sts.assumeRole(request.build()).credentials()));
+                    assertEquals(error, failure.awsErrorDetails().errorCode());
+                    if (scenario.startsWith("malformed-")) {
+                        assertEquals(400, failure.statusCode());
+                        assertTrue(failure.awsErrorDetails().errorMessage()
+                                .startsWith("2 validation errors detected:"));
+                    }
                 }
             } finally {
                 if (issued.get() != null) {

@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
 import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
+import io.github.hectorvent.floci.services.iam.StsRequestShapes;
 import io.github.hectorvent.floci.services.iam.StsSessionTags;
 import io.github.hectorvent.floci.services.iam.StsSourceIdentity;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
@@ -39,6 +40,7 @@ import jakarta.ws.rs.container.ContainerRequestFilter;
 import jakarta.ws.rs.container.ResourceInfo;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
@@ -591,6 +593,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
             if (parameters.containsKey("SerialNumber") || parameters.containsKey("TokenCode")) {
                 try {
+                    List<String> violations = StsRequestShapes.violations("AssumeRole",
+                            new MultivaluedHashMap<>(parameters));
+                    if (!violations.isEmpty()) {
+                        throw SmithyValidationErrors.validationError(violations);
+                    }
                     callerArns = Optional.of(iamService.authenticateRequestMfa(callerArns.get(),
                             parameters.get("SerialNumber"), parameters.get("TokenCode"), now));
                 } catch (AwsException denied) {
