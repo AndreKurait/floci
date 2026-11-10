@@ -30,11 +30,13 @@ import io.github.hectorvent.floci.services.s3.model.S3Object;
 import io.github.hectorvent.floci.services.s3.model.S3ObjectUpdatedEvent;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
+import io.github.hectorvent.floci.testing.TestTime;
 import io.quarkus.test.junit.QuarkusTest;
 import io.vertx.core.Vertx;
 import jakarta.enterprise.event.Event;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -45,6 +47,7 @@ import org.mockito.stubbing.Answer;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -72,6 +75,7 @@ import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
@@ -112,6 +116,8 @@ class DynamoDbStreamsEventSourcePollerTest {
     private S3Service s3Service;
     private final AtomicLong clock = new AtomicLong();
     private final AtomicLong sequence = new AtomicLong();
+    /** Runs the polls of every poller the test builds, and knows when they are done. */
+    private final PollExecutor polls = PollExecutor.onThreads();
 
     @Inject
     Instance<RequestContext> requestContextInstance;
@@ -142,11 +148,16 @@ class DynamoDbStreamsEventSourcePollerTest {
         poller = pollerOver(reader, esmStore);
     }
 
+    @AfterEach
+    void stopPolls() {
+        polls.shutdownNow();
+    }
+
     /** A mocked Vertx makes setPeriodic a no-op, so startPolling registers no live timer and tests drive the polls. */
     private DynamoDbStreamsEventSourcePoller pollerOver(DynamoDbStreamReader streamReader, EsmStore store) {
         return new DynamoDbStreamsEventSourcePoller(
                 mock(Vertx.class), streamReader, executorService, new LambdaTargetResolver(functionStore, aliasStore),
-                store, OBJECT_MAPPER, config, filterMatcher, batchFailures(), clock::get);
+                store, OBJECT_MAPPER, config, filterMatcher, batchFailures(), clock::get, polls);
     }
 
     private StreamBatchFailures batchFailures() {
@@ -320,28 +331,15 @@ class DynamoDbStreamsEventSourcePollerTest {
     }
 
     /**
-     * Hard happens-after barrier: re-kick until a SECOND fetch is observed. {@code activePolls} serializes
-     * polls per ESM, so fetch #2 cannot begin until poll #1's finally-block ran, so poll #1 is fully complete.
+     * Hard happens-after barrier: waits for poll #1 to finish, then runs a second poll to its end and checks
+     * that it fetched. {@code activePolls} serializes polls per ESM, so fetch #2 cannot begin until poll #1's
+     * finally-block ran.
      */
     private void awaitPollCompletedViaSecondFetch(DynamoDbStreamsEventSourcePoller p, EventSourceMapping esm) {
-        long deadline = System.currentTimeMillis() + 5000;
-        while (true) {
-            p.pollAndInvoke(esm);
-            try {
-                verify(reader, atLeast(2)).getRecords(any(), eq(10));
-                return;
-            } catch (AssertionError retry) {
-                if (System.currentTimeMillis() > deadline) {
-                    throw retry;
-                }
-                try {
-                    Thread.sleep(25);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw retry;
-                }
-            }
-        }
+        polls.awaitIdle();
+        p.pollAndInvoke(esm);
+        polls.awaitIdle();
+        verify(reader, atLeast(2)).getRecords(any(), eq(10));
     }
 
     private EventSourceMapping filterEsm(String... patterns) {
@@ -823,14 +821,8 @@ class DynamoDbStreamsEventSourcePollerTest {
         p.pollAndInvoke(esm);
         // Verify invoke was called for attempt 1
         verify(executorService, timeout(2000)).invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse));
-        // Wait for poll 1 to finish by ensuring activePolls is released
-        long deadline = System.currentTimeMillis() + 3000;
-        while (System.currentTimeMillis() < deadline) {
-            if (p.activePolls.isEmpty()) {
-                break;
-            }
-            Thread.sleep(25);
-        }
+        // Wait for poll 1 to finish
+        polls.awaitIdle();
         // After 1st failure: checkpoint not advanced, no DLQ delivery
         verify(store, never()).saveForAccount(anyString(), any());
         verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
@@ -1083,13 +1075,7 @@ class DynamoDbStreamsEventSourcePollerTest {
         p.pollAndInvoke(esm);
         verify(executorService, timeout(2000)).invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse));
 
-        long deadline = System.currentTimeMillis() + 3000;
-        while (System.currentTimeMillis() < deadline) {
-            if (p.activePolls.isEmpty()) {
-                break;
-            }
-            Thread.sleep(25);
-        }
+        polls.awaitIdle();
 
         shard.add(ddbRecord("s2", "INSERT", "{\"status\":{\"S\":\"active\"}}"));
         advancePastRetry(p);
@@ -1139,13 +1125,7 @@ class DynamoDbStreamsEventSourcePollerTest {
         p.pollAndInvoke(esm);
         verify(executorService, timeout(2000)).invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse));
 
-        long deadline = System.currentTimeMillis() + 3000;
-        while (System.currentTimeMillis() < deadline) {
-            if (p.activePolls.isEmpty()) {
-                break;
-            }
-            Thread.sleep(25);
-        }
+        polls.awaitIdle();
 
         // After 1st failure: checkpoint not advanced, no DLQ delivery
         verify(store, never()).saveForAccount(anyString(), any());
@@ -1258,13 +1238,7 @@ class DynamoDbStreamsEventSourcePollerTest {
         assertEquals("s1", esm.getShardSequenceNumbers().get(SHARD_ID));
         verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
 
-        long deadline = System.currentTimeMillis() + 3000;
-        while (System.currentTimeMillis() < deadline) {
-            if (p.activePolls.isEmpty()) {
-                break;
-            }
-            Thread.sleep(25);
-        }
+        polls.awaitIdle();
 
         // Second poll: fetches [s2], s2 fails again -> maxRetries=1 exhausts (attempt 2, retry 1)
         advancePastRetry(p);
@@ -1453,7 +1427,7 @@ class DynamoDbStreamsEventSourcePollerTest {
         return esm;
     }
 
-    private void pollOnce(DynamoDbStreamsEventSourcePoller p, EventSourceMapping esm) throws InterruptedException {
+    private void pollOnce(DynamoDbStreamsEventSourcePoller p, EventSourceMapping esm) {
         p.pollAndInvoke(esm);
         awaitPollCompleted(p);
     }
@@ -2250,12 +2224,195 @@ class DynamoDbStreamsEventSourcePollerTest {
         assertEquals("s1500", checkpoint(esm));
     }
 
-    private void awaitPollCompleted(DynamoDbStreamsEventSourcePoller poller) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 3_000;
-        while (!poller.activePolls.isEmpty() && System.currentTimeMillis() < deadline) {
-            Thread.sleep(25);
+    private void awaitPollCompleted(DynamoDbStreamsEventSourcePoller poller) {
+        polls.awaitIdle();
+        assertTrue(poller.activePolls.isEmpty(), "a finished poll must release its mapping");
+    }
+
+    // ─────────── The poll timer, backoff and record age on a controlled timeline ───────────
+
+    private static final Instant TIMELINE_START = Instant.ofEpochSecond(1_800_000_000L);
+
+    /** A poller whose timer, clock and polls all run on {@code time}: a tick returns once its poll is done. */
+    private DynamoDbStreamsEventSourcePoller timelinePoller(TestTime time) {
+        return new DynamoDbStreamsEventSourcePoller(
+                TimelineVertx.timersOn(time), reader, executorService, new LambdaTargetResolver(functionStore, aliasStore),
+                esmStore, OBJECT_MAPPER, config, filterMatcher, batchFailures(), time::currentTimeMillis,
+                PollExecutor.inline());
+    }
+
+    /** Polls that reached the stream: each lists the shards once. */
+    private int pollsStarted() {
+        return (int) mockingDetails(reader).getInvocations().stream()
+                .filter(invocation -> invocation.getMethod().getName().equals("shards")).count();
+    }
+
+    private String storedCheckpoint(EventSourceMapping esm) {
+        return esmStore.getForAccount(ACCOUNT_ID, esm.getUuid()).orElseThrow().getShardSequenceNumbers().get(SHARD_ID);
+    }
+
+    @Test
+    void timerPollsAnEnabledMappingOncePerConfiguredIntervalUntilItIsStopped() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        stubStream();
+        EventSourceMapping esm = filterEsm();
+        DynamoDbStreamsEventSourcePoller timed = timelinePoller(time);
+
+        timed.startPolling(esm);
+        time.advance(Duration.ofMillis(999));
+        assertEquals(0, pollsStarted(), "polled before the 1 s poll interval elapsed");
+        time.advance(Duration.ofMillis(1));
+        assertEquals(1, pollsStarted(), "not polled when the poll interval elapsed");
+        time.advance(Duration.ofSeconds(9));
+        assertEquals(10, pollsStarted(), "one poll per second");
+
+        esm.setEnabled(false);
+        esmStore.saveForAccount(ACCOUNT_ID, esm);
+        time.advance(Duration.ofSeconds(5));
+        assertEquals(10, pollsStarted(), "a disabled mapping was polled");
+        esm.setEnabled(true);
+        esmStore.saveForAccount(ACCOUNT_ID, esm);
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(11, pollsStarted(), "the timer must keep running while the mapping is disabled");
+
+        timed.stopPolling(esm.getUuid());
+        time.advance(Duration.ofMinutes(1));
+        assertEquals(11, pollsStarted(), "polled after stopPolling");
+        assertEquals(0, time.pendingTasks(), "stopPolling must cancel the timer");
+    }
+
+    @Test
+    void startingAMappingTwiceKeepsOneTimer() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        stubStream();
+        EventSourceMapping esm = filterEsm();
+        DynamoDbStreamsEventSourcePoller timed = timelinePoller(time);
+
+        timed.startPolling(esm);
+        timed.startPolling(esm);
+        time.advance(Duration.ofSeconds(3));
+
+        assertEquals(1, time.pendingTasks());
+        assertEquals(3, pollsStarted());
+    }
+
+    @Test
+    void timerRetriesAFailedBatchOnTheFirstTickAtItsBackoffAndDiscardsItAfterTheLastRetry() throws Exception {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        stubStream("s1");
+        List<List<String>> invocations = failInvocationsContaining("s1");
+        EventSourceMapping esm = esmWithDlq(3);
+        esmStore.saveForAccount(ACCOUNT_ID, esm);
+        timelinePoller(time).startPolling(esm);
+
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(1, invocations.size(), "the first tick invokes");
+        time.advanceTo(TIMELINE_START.plusMillis(2_999));
+        assertEquals(1, invocations.size(), "retried before the first backoff (2 s after the failure at 1 s)");
+        time.advance(Duration.ofMillis(1));
+        assertEquals(2, invocations.size(), "not retried on the tick at 3 s");
+
+        time.advanceTo(TIMELINE_START.plusMillis(6_999));
+        assertEquals(2, invocations.size(), "retried before the second backoff (4 s after the failure at 3 s)");
+        time.advance(Duration.ofMillis(1));
+        assertEquals(3, invocations.size(), "not retried on the tick at 7 s");
+
+        time.advanceTo(TIMELINE_START.plusMillis(14_999));
+        assertEquals(3, invocations.size(), "retried before the third backoff (8 s after the failure at 7 s)");
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+        assertNull(storedCheckpoint(esm), "a batch with retries left must not be checkpointed");
+        time.advance(Duration.ofMillis(1));
+        assertEquals(4, invocations.size(), "not retried on the tick at 15 s");
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(sqsService, times(1)).sendMessage(anyString(), body.capture(), anyInt(), anyString());
+        JsonNode requestContext = OBJECT_MAPPER.readTree(body.getValue()).path("requestContext");
+        assertEquals("RetryAttemptsExhausted", requestContext.path("condition").asText());
+        assertEquals(4, requestContext.path("approximateInvokeCount").asInt());
+        assertEquals("s1", storedCheckpoint(esm));
+
+        time.advance(Duration.ofMinutes(5));
+        assertEquals(4, invocations.size(), "a discarded batch was invoked again");
+        verify(sqsService, times(1)).sendMessage(anyString(), anyString(), anyInt(), anyString());
+    }
+
+    /**
+     * The failing batch is invoked on the ticks at 1, 3, 7, 15, 31 and 63 s: each backoff doubles from twice
+     * the 1 s poll interval. Its record age is checked when an invocation fails.
+     */
+    @Test
+    void timerDiscardsAFailingBatchOnTheFailureThatFindsItAtItsMaximumRecordAge() throws Exception {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        shard.add(createdAt(ddbRecord("s1", "INSERT", "{}"), TIMELINE_START.getEpochSecond()));
+        stubFunction();
+        List<List<String>> invocations = failInvocationsContaining("s1");
+        EventSourceMapping esm = esmWithDlq(-1);
+        esm.setMaximumRecordAgeInSeconds(63);
+        esmStore.saveForAccount(ACCOUNT_ID, esm);
+        timelinePoller(time).startPolling(esm);
+
+        time.advance(Duration.ofMillis(62_999));
+        assertEquals(5, invocations.size());
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+        time.advance(Duration.ofMillis(1));
+
+        assertEquals(6, invocations.size());
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(sqsService, times(1)).sendMessage(anyString(), body.capture(), anyInt(), anyString());
+        JsonNode requestContext = OBJECT_MAPPER.readTree(body.getValue()).path("requestContext");
+        assertEquals("MaximumRecordAgeExceeded", requestContext.path("condition").asText());
+        assertEquals(6, requestContext.path("approximateInvokeCount").asInt());
+        assertEquals("s1", storedCheckpoint(esm));
+    }
+
+    @Test
+    void timerKeepsRetryingAFailingBatchOneMillisecondShortOfItsMaximumRecordAge() throws Exception {
+        TestTime time = TestTime.startingAt(TIMELINE_START.minusMillis(1));
+        shard.add(createdAt(ddbRecord("s1", "INSERT", "{}"), TIMELINE_START.getEpochSecond()));
+        stubFunction();
+        List<List<String>> invocations = failInvocationsContaining("s1");
+        EventSourceMapping esm = esmWithDlq(-1);
+        esm.setMaximumRecordAgeInSeconds(63);
+        esmStore.saveForAccount(ACCOUNT_ID, esm);
+        timelinePoller(time).startPolling(esm);
+
+        time.advance(Duration.ofSeconds(63));
+        assertEquals(6, invocations.size());
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+        assertNull(storedCheckpoint(esm), "a batch 62.999 s old is within its 63 s maximum age");
+
+        // The sixth backoff is capped at 60 s, so the seventh invocation runs on the tick at 123 s.
+        time.advance(Duration.ofMillis(59_999));
+        assertEquals(6, invocations.size());
+        time.advance(Duration.ofMillis(1));
+        assertEquals(7, invocations.size());
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(sqsService, times(1)).sendMessage(anyString(), body.capture(), anyInt(), anyString());
+        assertEquals("MaximumRecordAgeExceeded",
+                OBJECT_MAPPER.readTree(body.getValue()).path("requestContext").path("condition").asText());
+    }
+
+    /** Wiring: the production executor and a real Vert.x timer, at the configured 1 s interval. */
+    @Test
+    void realVertxTimerPollsTheMappingAndDeliversItsRecords() {
+        stubStream("s1");
+        List<List<String>> invocations = recordInvocations(sequences -> new InvokeResult());
+        EventSourceMapping esm = filterEsm();
+        EsmStore store = spy(esmStore);
+        Vertx vertx = Vertx.vertx();
+        DynamoDbStreamsEventSourcePoller real = new DynamoDbStreamsEventSourcePoller(
+                vertx, reader, executorService, new LambdaTargetResolver(functionStore, aliasStore),
+                store, OBJECT_MAPPER, config, filterMatcher, batchFailures());
+        try {
+            real.startPolling(esm);
+
+            verify(store, timeout(10_000)).saveForAccount(eq(ACCOUNT_ID), any());
+            assertEquals(List.of(List.of("s1")), invocations);
+            assertEquals("s1", storedCheckpoint(esm));
+        } finally {
+            real.shutdown();
+            vertx.close().toCompletionStage().toCompletableFuture().join();
         }
-        assertTrue(poller.activePolls.isEmpty(), "poll did not complete before the test timeout");
     }
 
     private JsonNode readRecords(byte[] payload) {

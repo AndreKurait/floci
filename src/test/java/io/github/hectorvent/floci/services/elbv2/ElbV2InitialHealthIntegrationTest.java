@@ -58,16 +58,18 @@ class ElbV2InitialHealthIntegrationTest {
                     .then().statusCode(200);
 
             String registeredGroupArn = groupArn;
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> given()
-                    .header("Authorization", AUTH)
-                    .formParam("Action", "DescribeTargetHealth")
-                    .formParam("TargetGroupArn", registeredGroupArn)
-                    .when().post("/")
-                    .then().statusCode(200)
-                    .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.TargetHealth.State",
-                            equalTo("healthy"))
-                    .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.TargetHealth.Reason.size()",
-                            equalTo(0)));
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> given()
+                            .header("Authorization", AUTH)
+                            .formParam("Action", "DescribeTargetHealth")
+                            .formParam("TargetGroupArn", registeredGroupArn)
+                            .when().post("/")
+                            .then().statusCode(200)
+                            .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.TargetHealth.State",
+                                    equalTo("healthy"))
+                            .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.TargetHealth.Reason.size()",
+                                    equalTo(0)));
             assertEquals(1, probes.get(), "Initial admission must not wait for the recovery threshold");
         } finally {
             try {

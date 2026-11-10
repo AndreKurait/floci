@@ -424,11 +424,16 @@ class AslExecutorEcsRunTaskModeTest {
         executor = newTimelineExecutor();
         CompletableFuture<Execution> running = AslExecutorFixture.start(() -> runDefinition(definition, input));
         time.awaitSleepers(1);
-        time.advance(bound.minus(ONE_NANOSECOND));
+        int polls = Math.toIntExact(bound.dividedBy(SYNC_POLL_INTERVAL)) - 1;
+        for (int poll = 0; poll < polls; poll++) {
+            time.advance(SYNC_POLL_INTERVAL);
+            // A worker may briefly block inside a poll before registering its next sleep.
+            time.awaitSleepers(1);
+        }
+        time.advance(bound.minus(SYNC_POLL_INTERVAL.multipliedBy(polls)).minus(ONE_NANOSECOND));
         assertEquals(1, time.sleepers());
         assertFalse(running.isDone());
         // The poll that would fall on the bound itself is never made: the bound ends the wait.
-        int polls = Math.toIntExact(bound.dividedBy(SYNC_POLL_INTERVAL)) - 1;
         verify(ecsService, times(polls)).describeTasks(any(), any(), any());
         verify(ecsService, never()).stopTask(any(), any(), any(), any());
         time.advance(ONE_NANOSECOND);

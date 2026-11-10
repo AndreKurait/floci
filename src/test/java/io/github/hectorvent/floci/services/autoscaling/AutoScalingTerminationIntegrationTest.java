@@ -40,8 +40,10 @@ class AutoScalingTerminationIntegrationTest {
             AutoScalingStandbyIntegrationTest.withStandbyGroup(client, name, () -> {
                 client.updateAutoScalingGroup(request -> request.autoScalingGroupName(name)
                         .minSize(0).desiredCapacity(2));
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                        assertEquals(2, activeCount(group(client, name))));
+                await().atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() ->
+                                assertEquals(2, activeCount(group(client, name))));
                 String instance = group(client, name).instances().getFirst().instanceId();
                 Activity response = client.terminateInstanceInAutoScalingGroup(request -> request
                         .instanceId(instance).shouldDecrementDesiredCapacity(decrement)).activity();
@@ -55,22 +57,24 @@ class AutoScalingTerminationIntegrationTest {
                 assertTrue(response.description().contains(instance));
                 assertTrue(response.cause().contains("user request"));
 
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-                    AutoScalingGroup current = group(client, name);
-                    assertEquals(decrement ? 1 : 2, current.desiredCapacity());
-                    assertEquals(decrement ? 1 : 2, activeCount(current));
-                    assertFalse(current.instances().stream().anyMatch(item -> instance.equals(item.instanceId())));
-                    List<Activity> matching = client.describeScalingActivities(request -> request
-                            .autoScalingGroupName(name).activityIds(response.activityId())).activities();
-                    assertEquals(1, matching.size(), "The service must filter activities by the requested ID");
-                    Activity completed = matching.getFirst();
-                    assertEquals(response.activityId(), completed.activityId());
-                    assertEquals("Successful", completed.statusCodeAsString());
-                    assertEquals(100, completed.progress());
-                    assertNotNull(completed.endTime());
-                    assertEquals(response.startTime(), completed.startTime());
-                    assertEquals(response.description(), completed.description());
-                });
+                await().atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() -> {
+                            AutoScalingGroup current = group(client, name);
+                            assertEquals(decrement ? 1 : 2, current.desiredCapacity());
+                            assertEquals(decrement ? 1 : 2, activeCount(current));
+                            assertFalse(current.instances().stream().anyMatch(item -> instance.equals(item.instanceId())));
+                            List<Activity> matching = client.describeScalingActivities(request -> request
+                                    .autoScalingGroupName(name).activityIds(response.activityId())).activities();
+                            assertEquals(1, matching.size(), "The service must filter activities by the requested ID");
+                            Activity completed = matching.getFirst();
+                            assertEquals(response.activityId(), completed.activityId());
+                            assertEquals("Successful", completed.statusCodeAsString());
+                            assertEquals(100, completed.progress());
+                            assertNotNull(completed.endTime());
+                            assertEquals(response.startTime(), completed.startTime());
+                            assertEquals(response.description(), completed.description());
+                        });
                 List<String> requested = client.describeScalingActivities(request -> request.autoScalingGroupName(name))
                         .activities().stream().map(Activity::activityId).limit(2).toList();
                 assertEquals(2, requested.size());
@@ -93,13 +97,17 @@ class AutoScalingTerminationIntegrationTest {
                         AwsBasicCredentials.create("414141414141", "test"))).build()) {
             AutoScalingStandbyIntegrationTest.withStandbyGroup(client, name, () -> {
                 client.updateAutoScalingGroup(request -> request.autoScalingGroupName(name).minSize(0));
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                        assertEquals(1, activeCount(group(client, name))));
+                await().atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() ->
+                                assertEquals(1, activeCount(group(client, name))));
                 String instance = group(client, name).instances().getFirst().instanceId();
                 client.enterStandby(request -> request.autoScalingGroupName(name)
                         .instanceIds(instance).shouldDecrementDesiredCapacity(true));
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals("Standby",
-                        group(client, name).instances().getFirst().lifecycleStateAsString()));
+                await().atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() -> assertEquals("Standby",
+                                group(client, name).instances().getFirst().lifecycleStateAsString()));
 
                 Activity response = client.terminateInstanceInAutoScalingGroup(request -> request
                         .instanceId(instance).shouldDecrementDesiredCapacity(false)).activity();
@@ -109,16 +117,18 @@ class AutoScalingTerminationIntegrationTest {
                 assertEquals("InProgress", response.statusCodeAsString());
                 assertTrue(response.description().contains(instance));
 
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-                    Activity completed = client.describeScalingActivities(request -> request
-                            .autoScalingGroupName(name).activityIds(response.activityId())).activities().getFirst();
-                    assertEquals("Successful", completed.statusCodeAsString());
-                    assertEquals(100, completed.progress());
-                    assertNotNull(completed.endTime());
-                    AutoScalingGroup current = group(client, name);
-                    assertEquals(0, current.desiredCapacity());
-                    assertTrue(current.instances().isEmpty());
-                });
+                await().atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() -> {
+                            Activity completed = client.describeScalingActivities(request -> request
+                                    .autoScalingGroupName(name).activityIds(response.activityId())).activities().getFirst();
+                            assertEquals("Successful", completed.statusCodeAsString());
+                            assertEquals(100, completed.progress());
+                            assertNotNull(completed.endTime());
+                            AutoScalingGroup current = group(client, name);
+                            assertEquals(0, current.desiredCapacity());
+                            assertTrue(current.instances().isEmpty());
+                        });
             });
         }
     }

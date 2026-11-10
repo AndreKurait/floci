@@ -883,14 +883,7 @@ class EcrRegistryDataPlaneTest {
      * end, and with it its lock release, runs on the event loop after its answer is seen.
      */
     private static boolean acquiredWithin(Semaphore semaphore, long millis) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + millis;
-        while (!semaphore.tryAcquire()) {
-            if (System.currentTimeMillis() >= deadline) {
-                return false;
-            }
-            Thread.sleep(10);
-        }
-        return true;
+        return semaphore.tryAcquire(millis, TimeUnit.MILLISECONDS);
     }
 
     private ManifestResponse putManifest(int port) throws Exception {

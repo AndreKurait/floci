@@ -65,12 +65,14 @@ class AutoScalingLaunchLifecycleIntegrationTest {
                 client.setDesiredCapacity(request -> request.autoScalingGroupName(name).desiredCapacity(1));
                 String abandoned = awaitInstance(client, name, "Pending:Wait");
                 complete(client, name, "prepare", abandoned, "ABANDON");
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-                    AutoScalingGroup replacement = group(client, name);
-                    assertEquals(1, replacement.instances().size());
-                    assertNotEquals(abandoned, replacement.instances().getFirst().instanceId());
-                    assertEquals("Pending:Wait", replacement.instances().getFirst().lifecycleStateAsString());
-                });
+                await().atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() -> {
+                            AutoScalingGroup replacement = group(client, name);
+                            assertEquals(1, replacement.instances().size());
+                            assertNotEquals(abandoned, replacement.instances().getFirst().instanceId());
+                            assertEquals("Pending:Wait", replacement.instances().getFirst().lifecycleStateAsString());
+                        });
                 String deleted = group(client, name).instances().getFirst().instanceId();
 
                 client.deleteLifecycleHook(request -> request.autoScalingGroupName(name).lifecycleHookName("prepare"));
@@ -132,11 +134,13 @@ class AutoScalingLaunchLifecycleIntegrationTest {
     }
 
     private static String awaitInstance(AutoScalingClient client, String name, String state) {
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            AutoScalingGroup group = group(client, name);
-            assertEquals(1, group.instances().size());
-            assertEquals(state, group.instances().getFirst().lifecycleStateAsString());
-        });
+        await().atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    AutoScalingGroup group = group(client, name);
+                    assertEquals(1, group.instances().size());
+                    assertEquals(state, group.instances().getFirst().lifecycleStateAsString());
+                });
         return group(client, name).instances().getFirst().instanceId();
     }
 

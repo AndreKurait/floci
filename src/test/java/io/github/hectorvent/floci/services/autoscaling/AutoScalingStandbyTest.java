@@ -682,8 +682,10 @@ class AutoScalingStandbyTest {
                 changer.set(Thread.currentThread());
                 return handler.handle(action, change, REGION);
             });
-            await().atMost(Duration.ofSeconds(5)).until(() -> changing.isDone()
-                    || changer.get() != null && changer.get().getState() == Thread.State.BLOCKED);
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> changing.isDone()
+                            || changer.get() != null && changer.get().getState() == Thread.State.BLOCKED);
             assertFalse(changing.isDone(), action + " must wait for a standby move or reconcile pass in progress");
             release.countDown();
             assertEquals(200, changing.get(5, TimeUnit.SECONDS).getStatus());

@@ -2037,8 +2037,10 @@ class Ec2ServiceTest {
                     deleter.set(Thread.currentThread());
                     service.deleteEgressOnlyInternetGateway(region, eigwId);
                 });
-                Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> deleting.isDone()
-                        || (deleter.get() != null && deleter.get().getState() == Thread.State.BLOCKED));
+                Awaitility.await().atMost(Duration.ofSeconds(5))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> deleting.isDone()
+                                || (deleter.get() != null && deleter.get().getState() == Thread.State.BLOCKED));
                 assertFalse(deleting.isDone(), "delete must take the gateway's tag lock");
             }
             deleting.get(5, TimeUnit.SECONDS);
@@ -3318,8 +3320,10 @@ class Ec2ServiceTest {
                 (associateFirst ? delete : associate).run();
             });
             String secondMethod = associateFirst ? "deleteNetworkInterface" : "associateAddress";
-            Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> second.isDone()
-                    || isBlockedIn(secondWorker.get(), secondMethod, firstWorker.get()));
+            Awaitility.await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> second.isDone()
+                            || isBlockedIn(secondWorker.get(), secondMethod, firstWorker.get()));
             parking.release();
             first.get(10, TimeUnit.SECONDS);
             if (associateFirst) {
@@ -3814,9 +3818,11 @@ class Ec2ServiceTest {
                 deletingThread.set(Thread.currentThread());
                 service.deleteNatGateway(region, nat);
             });
-            Awaitility.await().atMost(Duration.ofSeconds(5)).until(() ->
-                    store.get(region + "::" + nat).isEmpty() && (deletion.isDone()
-                            || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED));
+            Awaitility.await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() ->
+                            store.get(region + "::" + nat).isEmpty() && (deletion.isDone()
+                                    || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED));
             parking.release();
             mutation.get(5, TimeUnit.SECONDS);
             deletion.get(5, TimeUnit.SECONDS);
@@ -4231,8 +4237,10 @@ class Ec2ServiceTest {
                         service.associateVpcCidrBlock("us-east-1", vpc.getVpcId(), "198.18.0.0/16");
                     }
                 });
-                Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> editing.isDone()
-                        || (editor.get() != null && editor.get().getState() == Thread.State.BLOCKED));
+                Awaitility.await().atMost(Duration.ofSeconds(5))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> editing.isDone()
+                                || (editor.get() != null && editor.get().getState() == Thread.State.BLOCKED));
                 assertFalse(editing.isDone(), "CIDR edits must not mutate the list while subnet validation scans it");
                 resume.countDown();
                 assertEquals("10.1.1.0/24", creating.get(5, TimeUnit.SECONDS).getCidrBlock());
@@ -4428,6 +4436,7 @@ class Ec2ServiceTest {
                 String method = "create".equals(operation) ? "createLaunchTemplateVersion" : "modifyLaunchTemplate";
                 Awaitility.await("mutation has resolved the original name and waits for its monitor")
                         .atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                         .until(() -> isBlockedIn(mutationThread.get(), method, owner));
                 service.deleteLaunchTemplate("us-east-1", original.getLaunchTemplateId(), null);
                 replacement = service.createLaunchTemplate("us-east-1", name, new LaunchTemplateData(), List.of());
@@ -6582,8 +6591,10 @@ class Ec2ServiceTest {
                 return request.apply(second);
             });
             Awaitility.await("the second request to finish or to wait in storeNewKeyPair")
-                    .atMost(Duration.ofSeconds(30)).until(() -> secondResult.isDone()
-                    || isBlockedIn(secondWorker.get(), "storeNewKeyPair", firstWorker.get()));
+                    .atMost(Duration.ofSeconds(30))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> secondResult.isDone()
+                            || isBlockedIn(secondWorker.get(), "storeNewKeyPair", firstWorker.get()));
             parking.release();
 
             KeyPair stored = firstResult.get(30, TimeUnit.SECONDS);
@@ -6633,8 +6644,10 @@ class Ec2ServiceTest {
                 return service.deleteKeyPair("us-east-1", "retagged", null);
             });
             Awaitility.await("the delete to finish or to wait in deleteKeyPair")
-                    .atMost(Duration.ofSeconds(30)).until(() -> deleting.isDone()
-                    || isBlockedIn(deleteWorker.get(), "deleteKeyPair", tagWorker.get()));
+                    .atMost(Duration.ofSeconds(30))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> deleting.isDone()
+                            || isBlockedIn(deleteWorker.get(), "deleteKeyPair", tagWorker.get()));
             parking.release();
             tagging.get(30, TimeUnit.SECONDS);
 
@@ -10601,9 +10614,11 @@ class Ec2ServiceTest {
             });
             // An unlocked contender finishes; a correct contender waits behind the parked owner.
             Awaitility.await("the competing image mutation to finish or enter the registry monitor")
-                    .atMost(Duration.ofSeconds(5)).until(() -> secondResult.isDone()
-                    || isBlockedIn(secondWorker.get(), deregister ? "deregisterImage" : "registerImage",
-                            firstWorker.get()));
+                    .atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> secondResult.isDone()
+                            || isBlockedIn(secondWorker.get(), deregister ? "deregisterImage" : "registerImage",
+                                    firstWorker.get()));
             parking.release();
             assertAll(
                     () -> assertDoesNotThrow(() -> firstResult.get(
@@ -11467,9 +11482,11 @@ class Ec2ServiceTest {
                         null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
             });
             Awaitility.await("reuse completes or waits for the reconciling read")
-                    .atMost(Duration.ofSeconds(10)).until(() -> launching.isDone()
-                    || isBlockedIn(launchingThread.get(), "releaseIfHostIsGone", readingThread.get())
-                    || isBlockedIn(launchingThread.get(), "runInstances", readingThread.get()));
+                    .atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> launching.isDone()
+                            || isBlockedIn(launchingThread.get(), "releaseIfHostIsGone", readingThread.get())
+                            || isBlockedIn(launchingThread.get(), "runInstances", readingThread.get()));
             parking.release();
             reading.get(10, TimeUnit.SECONDS);
             Instance newHost = launching.get(10, TimeUnit.SECONDS);
@@ -11577,9 +11594,11 @@ class Ec2ServiceTest {
                         null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
             });
             Awaitility.await("reuse completes or waits for the reconciling read")
-                    .atMost(Duration.ofSeconds(10)).until(() -> launching.isDone()
-                    || isBlockedIn(launchingThread.get(), "releaseIfHostIsGone", readingThread.get())
-                    || isBlockedIn(launchingThread.get(), "runInstances", readingThread.get()));
+                    .atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> launching.isDone()
+                            || isBlockedIn(launchingThread.get(), "releaseIfHostIsGone", readingThread.get())
+                            || isBlockedIn(launchingThread.get(), "runInstances", readingThread.get()));
             parking.release();
             reading.get(10, TimeUnit.SECONDS);
             Instance newHost = launching.get(10, TimeUnit.SECONDS);
@@ -11734,8 +11753,10 @@ class Ec2ServiceTest {
                 return service.deleteLaunchTemplateVersions("us-east-1", template.getLaunchTemplateId(), null,
                         List.of("2"), false);
             });
-            Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> deleted.isDone()
-                    || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
+            Awaitility.await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> deleted.isDone()
+                            || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED);
             release.countDown();
             assertEquals("ami-second", assertDoesNotThrow(() -> resolved.get(5, TimeUnit.SECONDS)).getImageId());
             assertNull(deleted.get(5, TimeUnit.SECONDS).getFirst().errorCode());

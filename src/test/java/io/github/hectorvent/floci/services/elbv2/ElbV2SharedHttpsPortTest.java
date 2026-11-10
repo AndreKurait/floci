@@ -132,13 +132,11 @@ class ElbV2SharedHttpsPortTest {
                                     .setKeyValue(Buffer.buffer(apiCertificate.privateKeyPem()))))
                     .requestHandler(request -> request.response().end("api-control"))
                     .listen().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
-            // Probed last, and together: a port is only free until something else binds it, so
-            // nothing of this test's (the API listener above takes an ephemeral port too) may
-            // bind between the probe and the proxy, and the two ports must differ.
-            int[] ports = FreePorts.anyInterfacePorts(2);
-            int publicPort = ports[0];
-            int sharedPort = ports[1];
-            EmulatorConfig config = configuration(publicPort, sharedPort);
+            // Probed last: a port is only free until something else binds it, so nothing of this
+            // test's (the API listener above takes an ephemeral port too) may bind between the
+            // probe and the proxy. The public port needs no probe: the proxy binds port zero.
+            int sharedPort = FreePorts.anyInterfacePort();
+            EmulatorConfig config = configuration(0, sharedPort);
             try (TlsProxyFixture proxy = new TlsProxyFixture(vertx, config, api.actualPort(), api.actualPort())) {
                 ElbV2TlsReadiness.await(Duration.ofSeconds(5), () ->
                         assertTrue(request(trust, sharedPort, "callbacks.example.test", apiCertificate)

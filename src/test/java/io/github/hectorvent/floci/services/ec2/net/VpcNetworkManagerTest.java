@@ -25,6 +25,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -144,6 +145,7 @@ class VpcNetworkManagerTest {
                 assertTrue(entered.await(2, TimeUnit.SECONDS));
                 Future<?> deleting = executor.submit(() -> manager.deleteVpcNetwork(REGION, "vpc-1"));
                 await().atMost(2, TimeUnit.SECONDS)
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                         .until(() -> manager.effectiveVpcCidr(REGION, "vpc-1").isEmpty());
                 release.countDown();
                 attaching.get(2, TimeUnit.SECONDS);

@@ -68,6 +68,8 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
+import io.github.hectorvent.floci.testing.LockWaits;
+import io.github.hectorvent.floci.testing.ThreadStates;
 import io.smallrye.config.EnvConfigSource;
 import io.smallrye.config.SmallRyeConfig;
 import io.smallrye.config.SmallRyeConfigBuilder;
@@ -3044,8 +3046,9 @@ class ContainerLauncherTest {
                 });
                 rollbackThread.start();
 
-                // Give the rollback every chance to (wrongly) proceed if the lock weren't shared.
-                Thread.sleep(200);
+                // The rollback must stop behind the lock cleanup holds; if the lock weren't shared it
+                // would run to the end instead, which fails here.
+                LockWaits.awaitBlockedBehind(rollbackThread, cleanupThread);
                 assertFalse(rollbackReturned.get(),
                         "rollback must block while cleanup holds the volume's lock, not race past it");
 
@@ -3196,9 +3199,9 @@ class ContainerLauncherTest {
             });
             launchThread.start();
 
-            // Give the launch every chance to (wrongly) proceed if the transition weren't guarded
-            // by this same lock.
-            Thread.sleep(200);
+            // The launch must stop behind the holder of the function lock; if the transition weren't
+            // guarded by this same lock it would run to the end instead, which fails here.
+            LockWaits.awaitBlockedBehind(launchThread, holderThread);
             assertFalse(launchReturned.get(),
                     "launch must block on the function lock while another holder has it, not race past it");
 
@@ -3480,11 +3483,21 @@ class ContainerLauncherTest {
         fn.setPackageType("Image");
         fn.setImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:latest");
 
-        // Readiness is delayed: awaitExtensionsReady only reports success after a pause, standing
-        // in for extension processes that take a moment to start up and poll for their first event.
+        // Readiness is delayed: awaitExtensionsReady only reports success once the launching thread
+        // has been seen held up on it, standing in for extension processes that take a moment to
+        // start up and poll for their first event. A launch that returned without waiting reaches
+        // the assertion below with readiness still outstanding.
+        Thread launching = Thread.currentThread();
         AtomicBoolean readinessComplete = new AtomicBoolean(false);
         when(runtimeApiServer.awaitExtensionsReady(anyLong())).thenAnswer(inv -> {
-            Thread.sleep(150);
+            CountDownLatch launchHeldUp = new CountDownLatch(1);
+            Thread watcher = new Thread(() -> {
+                ThreadStates.awaitParkedOrDone(launching);
+                launchHeldUp.countDown();
+            });
+            watcher.setDaemon(true);
+            watcher.start();
+            assertTrue(launchHeldUp.await(10, TimeUnit.SECONDS), "launch was never seen waiting on readiness");
             readinessComplete.set(true);
             return true;
         });

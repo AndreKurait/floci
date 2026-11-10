@@ -301,14 +301,16 @@ class ElbV2ListenerOwnershipTest {
                     return current.get();
                 });
             });
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-                assertNotNull(refresher.get());
-                ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(refresher.get().threadId(), 30);
-                assertNotNull(info);
-                assertEquals(Thread.State.BLOCKED, info.getThreadState());
-                assertEquals(owner.get().threadId(), info.getLockOwnerId());
-                assertTrue(Arrays.stream(info.getStackTrace()).anyMatch(frame -> frame.getMethodName().equals("onPort")));
-            });
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        assertNotNull(refresher.get());
+                        ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(refresher.get().threadId(), 30);
+                        assertNotNull(info);
+                        assertEquals(Thread.State.BLOCKED, info.getThreadState());
+                        assertEquals(owner.get().threadId(), info.getLockOwnerId());
+                        assertTrue(Arrays.stream(info.getStackTrace()).anyMatch(frame -> frame.getMethodName().equals("onPort")));
+                    });
             assertEquals(0, reads.get(), "rule membership must not be read before acquiring the gate");
             current.set(List.of(rule("added"), rule("old")));
             publishRuntime(fixture.plane, listener("unrelated", 10443, false), REGION, null, List.of(rule("progress")));
@@ -450,14 +452,16 @@ class ElbV2ListenerOwnershipTest {
             stopping.start();
             assertTrue(insideClose.await(5, TimeUnit.SECONDS));
             publishing.start();
-            await().atMost(5, TimeUnit.SECONDS).until(() -> {
-                ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(publishing.threadId(), 30);
-                return info != null && info.getThreadState() == Thread.State.BLOCKED
-                        && info.getLockOwnerId() == stopping.threadId()
-                        && Arrays.stream(info.getStackTrace()).anyMatch(frame ->
-                                frame.getClassName().equals(ElbV2DataPlane.class.getName())
-                                        && frame.getMethodName().equals("onPort"));
-            });
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> {
+                        ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(publishing.threadId(), 30);
+                        return info != null && info.getThreadState() == Thread.State.BLOCKED
+                                && info.getLockOwnerId() == stopping.threadId()
+                                && Arrays.stream(info.getStackTrace()).anyMatch(frame ->
+                                        frame.getClassName().equals(ElbV2DataPlane.class.getName())
+                                                && frame.getMethodName().equals("onPort"));
+                    });
             publishRuntime(fixture.plane, listener("unrelated", 9443, false), REGION, null, List.of(rule("unrelated")));
             fixture.serves(9443, "unrelated");
             releaseClose.countDown();

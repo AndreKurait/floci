@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -41,7 +42,9 @@ class SecurityGroupFirewallOwnPolicyTest extends SecurityGroupFirewallPeerFixtur
         }
         assertTrue(violations.isEmpty(), () -> String.join("\n", violations));
 
-        await().atMost(10, TimeUnit.SECONDS).untilAsserted(() -> assertFinal(3));
+        await().atMost(10, TimeUnit.SECONDS)
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertFinal(3));
         assertTrue(violations.isEmpty(), () -> String.join("\n", violations));
     }
 
@@ -62,7 +65,9 @@ class SecurityGroupFirewallOwnPolicyTest extends SecurityGroupFirewallPeerFixtur
                     .map(install -> install[0]).toList();
             assertEquals(List.of(helper(3)), touched, "only the newcomer's own policy is installed");
         }
-        await().atMost(10, TimeUnit.SECONDS).untilAsserted(() -> assertFinal(4));
+        await().atMost(10, TimeUnit.SECONDS)
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertFinal(4));
         for (int index = 0; index < 3; index++) {
             assertFalse(peers.get(helper(index)).equals(installed.get(helper(index))),
                     "peer " + index + " learns the newcomer in the coalesced refresh");

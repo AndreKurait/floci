@@ -102,15 +102,43 @@ public class KubernetesApiClient {
     private URI baseUri;
     private HttpClient http;
     private Supplier<String> tokenSupplier;
+    private final PollTimer pollTimer;
+
+    /** The elapsed-time source and the pause between two polls of {@link #waitForPod}. */
+    interface PollTimer {
+
+        PollTimer SYSTEM = new PollTimer() {
+            @Override
+            public long nanoTime() {
+                return System.nanoTime();
+            }
+
+            @Override
+            public void sleepMillis(long millis) throws InterruptedException {
+                Thread.sleep(millis);
+            }
+        };
+
+        long nanoTime();
+
+        void sleepMillis(long millis) throws InterruptedException;
+    }
 
     public KubernetesApiClient() {
+        this.pollTimer = PollTimer.SYSTEM;
     }
 
     /** Test-only: points the client at an explicit, already-configured endpoint. */
     KubernetesApiClient(URI baseUri, HttpClient http, Supplier<String> tokenSupplier) {
+        this(baseUri, http, tokenSupplier, PollTimer.SYSTEM);
+    }
+
+    /** Test-only: as above, with the timer {@link #waitForPod} measures its timeout and pauses on. */
+    KubernetesApiClient(URI baseUri, HttpClient http, Supplier<String> tokenSupplier, PollTimer pollTimer) {
         this.baseUri = baseUri;
         this.http = http;
         this.tokenSupplier = tokenSupplier;
+        this.pollTimer = pollTimer;
         this.initialized = true;
     }
 
@@ -156,17 +184,17 @@ public class KubernetesApiClient {
      * @throws IllegalStateException if {@code condition} is not satisfied within {@code timeoutSeconds}
      */
     public JsonNode waitForPod(String namespace, String name, Predicate<JsonNode> condition, int timeoutSeconds) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        long deadline = pollTimer.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
         while (true) {
             JsonNode pod = getPod(namespace, name).orElse(null);
             if (condition.test(pod)) {
                 return pod;
             }
-            if (System.nanoTime() >= deadline) {
+            if (pollTimer.nanoTime() >= deadline) {
                 throw new IllegalStateException("timed out after " + timeoutSeconds + "s waiting for pod " + name);
             }
             try {
-                Thread.sleep(POLL_INTERVAL_MS);
+                pollTimer.sleepMillis(POLL_INTERVAL_MS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("interrupted while waiting for pod " + name, e);

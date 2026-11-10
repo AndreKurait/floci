@@ -17,7 +17,9 @@ import io.github.hectorvent.floci.services.pipes.PipesFilterMatcher;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
+import io.github.hectorvent.floci.testing.TestTime;
 import io.vertx.core.Vertx;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -51,6 +53,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
@@ -68,7 +71,8 @@ import static org.mockito.Mockito.when;
  * invoke itself. {@code never()} assertions target actions the exercised code path never performs on any thread
  * (invoke in a fully-filtered path; save in an invoke-error path), so they are timing-independent.
  * Tests that drive several polls in a row wait for each one with {@link #pollOnce}, and move the injected
- * clock past the retry backoff themselves.
+ * clock past the retry backoff themselves. The polls run on {@link PollExecutor}, which knows when they are done.
+ * The timer that starts them in production is driven on a {@link TestTime} timeline at the end of the class.
  */
 class KinesisEventSourcePollerTest {
 
@@ -94,6 +98,8 @@ class KinesisEventSourcePollerTest {
     private SqsService sqsService;
     private SnsService snsService;
     private S3Service s3Service;
+    private EmulatorConfig config;
+    private final PollExecutor polls = PollExecutor.onThreads();
     private final AtomicLong clock = new AtomicLong();
     /** What the store holds for the mapping while a poll runs; a test changes it to delete or disable it. */
     private final AtomicReference<Optional<EventSourceMapping>> storedMapping = new AtomicReference<>();
@@ -101,7 +107,7 @@ class KinesisEventSourcePollerTest {
     @BeforeEach
     void setUp() {
         clock.set(FIRST_ARRIVAL.plusSeconds(30).toEpochMilli());
-        EmulatorConfig config = mock(EmulatorConfig.class);
+        config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.LambdaServiceConfig lambdaConfig = mock(EmulatorConfig.LambdaServiceConfig.class);
         when(config.services()).thenReturn(services);
@@ -123,7 +129,12 @@ class KinesisEventSourcePollerTest {
         poller = new KinesisEventSourcePoller(mock(Vertx.class), kinesisService, executorService,
                 new LambdaTargetResolver(functionStore, aliasStore), esmStore, config, MAPPER,
                 new PipesFilterMatcher(MAPPER), new StreamBatchFailures(sqsService, snsService, s3Service, MAPPER, config),
-                clock::get);
+                clock::get, polls);
+    }
+
+    @AfterEach
+    void stopPolls() {
+        polls.shutdownNow();
     }
 
     @Test
@@ -198,30 +209,16 @@ class KinesisEventSourcePollerTest {
     }
 
     /**
-     * Hard happens-after barrier: re-kick the poll until a SECOND fetch is observed. Because {@code activePolls}
-     * serializes polls per ESM, fetch #2 cannot begin until poll #1's finally-block ran, so poll #1, including its
-     * invoke/checkpoint decision, is fully complete. Negative assertions after this are race-free rather than
-     * relying on structural unreachability alone. (A kick while poll #1 is still in flight is a no-op, so we retry.)
+     * Hard happens-after barrier: waits for poll #1 to finish, including its invoke/checkpoint decision, then
+     * runs a second poll to its end and checks that it fetched. Because {@code activePolls} serializes polls per
+     * ESM, fetch #2 cannot begin until poll #1's finally-block ran. Negative assertions after this are race-free
+     * rather than relying on structural unreachability alone.
      */
     private void awaitPollCompletedViaSecondFetch(EventSourceMapping esm) {
-        long deadline = System.currentTimeMillis() + 5000;
-        while (true) {
-            poller.pollAndInvoke(esm);
-            try {
-                verify(kinesisService, atLeast(2)).getRecordsForAccount(eq(ACCOUNT), eq("iter-0"), anyInt(), eq(REGION));
-                return;
-            } catch (AssertionError retry) {
-                if (System.currentTimeMillis() > deadline) {
-                    throw retry;
-                }
-                try {
-                    Thread.sleep(25);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw retry;
-                }
-            }
-        }
+        polls.awaitIdle();
+        poller.pollAndInvoke(esm);
+        polls.awaitIdle();
+        verify(kinesisService, atLeast(2)).getRecordsForAccount(eq(ACCOUNT), eq("iter-0"), anyInt(), eq(REGION));
     }
 
     @Test
@@ -1053,13 +1050,190 @@ class KinesisEventSourcePollerTest {
         verifyNoInteractions(sqsService);
     }
 
-    private void pollOnce(EventSourceMapping esm) throws InterruptedException {
+    private void pollOnce(EventSourceMapping esm) {
         poller.pollAndInvoke(esm);
-        long deadline = System.currentTimeMillis() + 3_000;
-        while (!poller.activePolls.isEmpty() && System.currentTimeMillis() < deadline) {
-            Thread.sleep(5);
+        polls.awaitIdle();
+        assertTrue(poller.activePolls.isEmpty(), "a finished poll must release its mapping");
+    }
+
+    // ─────────── The poll timer, backoff and record age on a controlled timeline ───────────
+
+    /** A poller whose timer, clock and polls all run on {@code time}: a tick returns once its poll is done. */
+    private KinesisEventSourcePoller timelinePoller(TestTime time) {
+        return new KinesisEventSourcePoller(TimelineVertx.timersOn(time), kinesisService, executorService,
+                new LambdaTargetResolver(functionStore, aliasStore), esmStore, config, MAPPER,
+                new PipesFilterMatcher(MAPPER), new StreamBatchFailures(sqsService, snsService, s3Service, MAPPER, config),
+                time::currentTimeMillis, PollExecutor.inline());
+    }
+
+    private int fetches() {
+        return (int) mockingDetails(kinesisService).getInvocations().stream()
+                .filter(invocation -> invocation.getMethod().getName().equals("getRecordsForAccount")).count();
+    }
+
+    @Test
+    void timerPollsAnEnabledMappingOncePerConfiguredIntervalUntilItIsStopped() {
+        TestTime time = TestTime.startingAt(FIRST_ARRIVAL);
+        stubShard();
+        EventSourceMapping esm = esmWithOnFailure(null, null);
+        storedMapping.set(Optional.of(esm));
+        KinesisEventSourcePoller timed = timelinePoller(time);
+
+        timed.startPolling(esm);
+        time.advance(Duration.ofMillis(999));
+        assertEquals(0, fetches(), "polled before the 1 s poll interval elapsed");
+        time.advance(Duration.ofMillis(1));
+        assertEquals(1, fetches(), "not polled when the poll interval elapsed");
+        time.advance(Duration.ofSeconds(9));
+        assertEquals(10, fetches(), "one poll per second");
+
+        esm.setEnabled(false);
+        time.advance(Duration.ofSeconds(5));
+        assertEquals(10, fetches(), "a disabled mapping was polled");
+        esm.setEnabled(true);
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(11, fetches(), "the timer must keep running while the mapping is disabled");
+
+        timed.stopPolling(esm.getUuid());
+        time.advance(Duration.ofMinutes(1));
+        assertEquals(11, fetches(), "polled after stopPolling");
+        assertEquals(0, time.pendingTasks(), "stopPolling must cancel the timer");
+    }
+
+    @Test
+    void startingAMappingTwiceKeepsOneTimer() {
+        TestTime time = TestTime.startingAt(FIRST_ARRIVAL);
+        stubShard();
+        EventSourceMapping esm = esmWithOnFailure(null, null);
+        storedMapping.set(Optional.of(esm));
+        KinesisEventSourcePoller timed = timelinePoller(time);
+
+        timed.startPolling(esm);
+        timed.startPolling(esm);
+        time.advance(Duration.ofSeconds(3));
+
+        assertEquals(1, time.pendingTasks());
+        assertEquals(3, fetches());
+    }
+
+    @Test
+    void timerRetriesAFailedBatchOnTheFirstTickAtItsBackoffAndDiscardsItAfterTheLastRetry() throws Exception {
+        TestTime time = TestTime.startingAt(FIRST_ARRIVAL);
+        stubShard("s1");
+        List<byte[]> events = failInvocationsContaining("s1");
+        EventSourceMapping esm = esmWithOnFailure(3, QUEUE_ARN);
+        storedMapping.set(Optional.of(esm));
+        KinesisEventSourcePoller timed = timelinePoller(time);
+        timed.startPolling(esm);
+        Instant start = time.now();
+
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(1, events.size(), "the first tick invokes");
+        time.advanceTo(start.plusMillis(2_999));
+        assertEquals(1, events.size(), "retried before the first backoff (2 s after the failure at 1 s)");
+        assertEquals(1, fetches(), "a batch in backoff must not be fetched");
+        time.advance(Duration.ofMillis(1));
+        assertEquals(2, events.size(), "not retried on the tick at 3 s");
+
+        time.advanceTo(start.plusMillis(6_999));
+        assertEquals(2, events.size(), "retried before the second backoff (4 s after the failure at 3 s)");
+        time.advance(Duration.ofMillis(1));
+        assertEquals(3, events.size(), "not retried on the tick at 7 s");
+
+        time.advanceTo(start.plusMillis(14_999));
+        assertEquals(3, events.size(), "retried before the third backoff (8 s after the failure at 7 s)");
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+        assertNull(checkpoint(esm), "a batch with retries left must not be checkpointed");
+        time.advance(Duration.ofMillis(1));
+        assertEquals(4, events.size(), "not retried on the tick at 15 s");
+
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(sqsService, times(1)).sendMessage(eq(QUEUE_URL), body.capture(), eq(0), eq(REGION));
+        JsonNode record = MAPPER.readTree(body.getValue());
+        assertEquals("RetryAttemptsExhausted", record.at("/requestContext/condition").asText());
+        assertEquals(4, record.at("/requestContext/approximateInvokeCount").asInt());
+        assertEquals("s1", checkpoint(esm));
+
+        time.advance(Duration.ofMinutes(5));
+        assertEquals(4, events.size(), "a discarded batch was invoked again");
+        verify(sqsService, times(1)).sendMessage(anyString(), anyString(), anyInt(), anyString());
+    }
+
+    /**
+     * The failing batch is invoked on the ticks at 1, 3, 7, 15, 31 and 63 s: each backoff doubles from twice
+     * the 1 s poll interval. Its record age is checked when an invocation fails.
+     */
+    @Test
+    void timerDiscardsAFailingBatchOnTheFailureThatFindsItAtItsMaximumRecordAge() throws Exception {
+        TestTime time = TestTime.startingAt(FIRST_ARRIVAL);
+        stubShard("s1");
+        List<byte[]> events = failInvocationsContaining("s1");
+        EventSourceMapping esm = esmWithOnFailure(-1, QUEUE_ARN);
+        esm.setMaximumRecordAgeInSeconds(63);
+        storedMapping.set(Optional.of(esm));
+        timelinePoller(time).startPolling(esm);
+
+        time.advance(Duration.ofMillis(62_999));
+        assertEquals(5, events.size());
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+        time.advance(Duration.ofMillis(1));
+
+        assertEquals(6, events.size());
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(sqsService, times(1)).sendMessage(eq(QUEUE_URL), body.capture(), eq(0), eq(REGION));
+        JsonNode record = MAPPER.readTree(body.getValue());
+        assertEquals("MaximumRecordAgeExceeded", record.at("/requestContext/condition").asText());
+        assertEquals(6, record.at("/requestContext/approximateInvokeCount").asInt());
+        assertEquals("s1", checkpoint(esm));
+    }
+
+    @Test
+    void timerKeepsRetryingAFailingBatchOneMillisecondShortOfItsMaximumRecordAge() throws Exception {
+        TestTime time = TestTime.startingAt(FIRST_ARRIVAL.minusMillis(1));
+        stubShard("s1");
+        List<byte[]> events = failInvocationsContaining("s1");
+        EventSourceMapping esm = esmWithOnFailure(-1, QUEUE_ARN);
+        esm.setMaximumRecordAgeInSeconds(63);
+        storedMapping.set(Optional.of(esm));
+        timelinePoller(time).startPolling(esm);
+
+        time.advance(Duration.ofSeconds(63));
+        assertEquals(6, events.size());
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+        assertNull(checkpoint(esm), "a batch 62.999 s old is within its 63 s maximum age");
+
+        // The sixth backoff is capped at 60 s, so the seventh invocation runs on the tick at 123 s.
+        time.advance(Duration.ofMillis(59_999));
+        assertEquals(6, events.size());
+        time.advance(Duration.ofMillis(1));
+        assertEquals(7, events.size());
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(sqsService, times(1)).sendMessage(eq(QUEUE_URL), body.capture(), eq(0), eq(REGION));
+        assertEquals("MaximumRecordAgeExceeded",
+                MAPPER.readTree(body.getValue()).at("/requestContext/condition").asText());
+    }
+
+    /** Wiring: the production executor and a real Vert.x timer, at the configured 1 s interval. */
+    @Test
+    void realVertxTimerPollsTheMappingAndDeliversItsRecords() {
+        stubShard("s1");
+        List<byte[]> events = recordInvocations(seqs -> new InvokeResult());
+        EventSourceMapping esm = esmWithOnFailure(null, null);
+        storedMapping.set(Optional.of(esm));
+        Vertx vertx = Vertx.vertx();
+        KinesisEventSourcePoller real = new KinesisEventSourcePoller(vertx, kinesisService, executorService,
+                new LambdaTargetResolver(functionStore, aliasStore), esmStore, config, MAPPER,
+                new PipesFilterMatcher(MAPPER), new StreamBatchFailures(sqsService, snsService, s3Service, MAPPER, config));
+        try {
+            real.startPolling(esm);
+
+            verify(esmStore, timeout(10_000)).saveForAccount(eq(ACCOUNT), eq(esm));
+            assertEquals(List.of(List.of("s1")), invokedSequences(events));
+            assertEquals("s1", checkpoint(esm));
+        } finally {
+            real.shutdown();
+            vertx.close().toCompletionStage().toCompletableFuture().join();
         }
-        assertTrue(poller.activePolls.isEmpty(), "poll did not complete before the test timeout");
     }
 
     private static KinesisRecord record(String seq, Instant arrival) {

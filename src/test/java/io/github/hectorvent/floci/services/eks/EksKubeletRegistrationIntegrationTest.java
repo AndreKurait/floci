@@ -78,11 +78,13 @@ class EksKubeletRegistrationIntegrationTest {
                     .post("/").then().statusCode(200)
                     .extract().path("RunInstancesResponse.instancesSet.item.instanceId");
             String joinedId = instanceId;
-            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-                assertTrue(RequestScopes.callAs(account, region, () -> eksService.isInstanceJoined(clusterName, joinedId)));
-                Cluster stored = RequestScopes.callAs(account, region, () -> eksService.describeCluster(clusterName));
-                assertEquals(region, stored.getJoinedInstanceIds().get(joinedId));
-            });
+            await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        assertTrue(RequestScopes.callAs(account, region, () -> eksService.isInstanceJoined(clusterName, joinedId)));
+                        Cluster stored = RequestScopes.callAs(account, region, () -> eksService.describeCluster(clusterName));
+                        assertEquals(region, stored.getJoinedInstanceIds().get(joinedId));
+                    });
             Instance instance = RequestScopes.callAs(account, region,
                     () -> ec2Service.getInstance(region, joinedId).orElseThrow());
             assertEquals("ami-kubelet-alias", instance.getImageId());

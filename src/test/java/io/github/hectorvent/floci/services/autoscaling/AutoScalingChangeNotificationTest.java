@@ -55,8 +55,10 @@ class AutoScalingChangeNotificationTest {
             } else {
                 instance.setState(InstanceState.running());
             }
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
-                    verify(service).describeAutoScalingGroups(CHANGE.region(), List.of(CHANGE.name())));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
+                            verify(service).describeAutoScalingGroups(CHANGE.region(), List.of(CHANGE.name())));
         } finally {
             reconciler.stop();
         }
@@ -84,11 +86,15 @@ class AutoScalingChangeNotificationTest {
                 reconciler.onGroupChanged(CHANGE);
             }
             reconciler.onGroupChanged(new AutoScalingGroupChanged(CHANGE.accountId(), CHANGE.region(), "other"));
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
-                    verify(service).describeAutoScalingGroups(CHANGE.region(), List.of("other")));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
+                            verify(service).describeAutoScalingGroups(CHANGE.region(), List.of("other")));
             assertEquals(1, reads.get());
             release.countDown();
-            await().atMost(Duration.ofSeconds(2)).until(() -> reads.get() == 2);
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> reads.get() == 2);
         } finally {
             release.countDown();
             reconciler.stop();
@@ -105,8 +111,10 @@ class AutoScalingChangeNotificationTest {
         try {
             reconciler.onGroupChanged(CHANGE);
             reconciler.onGroupChanged(new AutoScalingGroupChanged(CHANGE.accountId(), CHANGE.region(), "deleted"));
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
-                    verify(service).describeAutoScalingGroups(CHANGE.region(), List.of("deleted")));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
+                            verify(service).describeAutoScalingGroups(CHANGE.region(), List.of("deleted")));
             verify(reconciler, never()).reconcile(any());
         } finally {
             reconciler.stop();
