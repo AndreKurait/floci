@@ -4,6 +4,8 @@ import datetime
 import io
 import logging
 import os
+from pathlib import Path
+import time
 import uuid
 import zipfile
 from contextlib import ExitStack, closing
@@ -18,6 +20,41 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 logger = logging.getLogger(__name__)
+
+
+class AppConfigClock:
+    """Advance only AppConfig deployment time when using the compat-clock image."""
+
+    def __init__(self):
+        configured = os.environ.get("FLOCI_TEST_APPCONFIG_CLOCK_FILE")
+        self.file = Path(configured) if configured else None
+
+    def monotonic(self):
+        if self.file is None:
+            return time.monotonic()
+        return datetime.datetime.fromisoformat(self.file.read_text().strip()).timestamp()
+
+    def advance(self, seconds):
+        assert seconds >= 0
+        if self.file is None:
+            time.sleep(seconds)
+            return
+        instant = datetime.datetime.fromisoformat(self.file.read_text().strip())
+        next_file = self.file.with_name(self.file.name + ".next")
+        next_file.write_text((instant + datetime.timedelta(seconds=seconds)).isoformat())
+        next_file.replace(self.file)
+
+    def assert_started(self, deployment):
+        if self.file is not None:
+            assert deployment["StartedAt"].timestamp() == self.monotonic(), (
+                "Floci must use the compat-clock build and the same clock directory as the SDK client")
+
+
+@pytest.fixture
+def appconfig_clock(record_property):
+    clock = AppConfigClock()
+    record_property("appconfig_clock", "manual" if clock.file else "wall")
+    return clock
 
 
 @pytest.fixture(scope="session")

@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.services.appconfig.model.Environment;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersionSummary;
 import io.github.hectorvent.floci.services.appconfig.model.Monitor;
+import io.smallrye.common.annotation.Identifier;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -64,13 +65,14 @@ public class AppConfigService {
     private static final ObjectMapper COPIER = new ObjectMapper();
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
-    @Inject
     public AppConfigService(StorageFactory storageFactory, RegionResolver regions, AppConfigAlarmMonitor alarms,
                             AppConfigS3Source s3Source) {
         this(storageFactory, regions, Clock.systemUTC(), alarms, s3Source);
     }
 
-    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock, AppConfigAlarmMonitor alarms,
+    @Inject
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions,
+                     @Identifier("appconfig") Clock clock, AppConfigAlarmMonitor alarms,
                      AppConfigS3Source s3Source) {
         this.clock = clock;
         this.regions = regions;
