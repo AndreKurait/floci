@@ -75,7 +75,8 @@ class WebSocketHandlerFailureTest {
         when(apiService.getApi(REGION, "api")).thenReturn(api);
         when(apiService.getStage(REGION, "api", "prod")).thenReturn(new Stage());
         when(apiService.getIntegration(REGION, "api", "integration")).thenReturn(integration);
-        when(invoker.invoke(eq(REGION), same(integration), nullable(String.class), anyMap(), anyMap(), anyMap()))
+        when(invoker.invoke(eq(REGION), eq("api"), eq("prod"), anyString(),
+                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap()))
                 .thenReturn(new WebSocketIntegrationInvoker.IntegrationResult(200, null, null, Map.of()));
     }
 
@@ -118,7 +119,7 @@ class WebSocketHandlerFailureTest {
             verify(request, never()).toWebSocket();
             verifyNoInteractions(connections);
         });
-        verifyInvocation();
+        verifyInvocation("$connect");
         assertCause(records, "$connect integration invocation failed for API {0}: {1}", failure,
                 "api", failure.getMessage());
     }
@@ -134,7 +135,7 @@ class WebSocketHandlerFailureTest {
             completeTask();
         });
         verify(connections).updateLastActiveAt("connection");
-        verifyInvocation();
+        verifyInvocation("$default");
         ArgumentCaptor<String> frame = ArgumentCaptor.forClass(String.class);
         verify(socket).writeTextMessage(frame.capture());
         JsonNode json = mapper.readTree(frame.getValue());
@@ -158,7 +159,7 @@ class WebSocketHandlerFailureTest {
             verify(connections, times(1)).unregister("connection");
             verifyNoInteractions(socket);
         });
-        verifyInvocation();
+        verifyInvocation("$disconnect");
         assertCause(records, "Error invoking $disconnect route for connection {0}: {1}", failure,
                 "connection", failure.getMessage());
     }
@@ -192,7 +193,7 @@ class WebSocketHandlerFailureTest {
             completeTask();
             verify(connections, times(1)).unregister("connection");
         });
-        verifyInvocation();
+        verifyInvocation("$disconnect");
         assertNoFailureWarning(records);
     }
 
@@ -205,12 +206,14 @@ class WebSocketHandlerFailureTest {
     }
 
     private void failInvocation(RuntimeException failure) {
-        when(invoker.invoke(eq(REGION), same(integration), nullable(String.class), anyMap(), anyMap(), anyMap()))
+        when(invoker.invoke(eq(REGION), eq("api"), eq("prod"), anyString(),
+                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap()))
                 .thenThrow(failure);
     }
 
-    private void verifyInvocation() {
-        verify(invoker).invoke(eq(REGION), same(integration), nullable(String.class), anyMap(), anyMap(), anyMap());
+    private void verifyInvocation(String routeKey) {
+        verify(invoker).invoke(eq(REGION), eq("api"), eq("prod"), eq(routeKey),
+                same(integration), nullable(String.class), anyMap(), anyMap(), anyMap());
     }
 
     private void completeTask() {
