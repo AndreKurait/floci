@@ -10,6 +10,7 @@ import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
@@ -38,8 +39,8 @@ class CognitoCustomAuthIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void customAuthWithoutCreateSupportsMultipleRounds(boolean admin) throws Exception {
+    @CsvSource({"false,CUSTOM_CHALLENGE", "true,CUSTOM_CHALLENGE", "false,MY_CHALLENGE", "true,MY_CHALLENGE"})
+    void customAuthWithoutCreateSupportsMultipleRounds(boolean admin, String challengeLabel) throws Exception {
         String id = UUID.randomUUID().toString();
         String define = "arn:aws:lambda:us-east-1:000000000000:function:define-" + id;
         String verify = "arn:aws:lambda:us-east-1:000000000000:function:verify-" + id;
@@ -59,9 +60,9 @@ class CognitoCustomAuthIntegrationTest {
                     .then().statusCode(200);
             when(lambdaService.invoke(anyString(), eq(define), any(byte[].class), eq(InvocationType.RequestResponse)))
                     .thenReturn(new InvokeResult(200, null, MAPPER.writeValueAsBytes(Map.of(
-                            "response", Map.of("challengeName", "CUSTOM_CHALLENGE"))), null, "request"))
+                            "response", Map.of("challengeName", challengeLabel))), null, "request"))
                     .thenReturn(new InvokeResult(200, null, MAPPER.writeValueAsBytes(Map.of(
-                            "response", Map.of("challengeName", "CUSTOM_CHALLENGE"))), null, "request"))
+                            "response", Map.of("challengeName", challengeLabel))), null, "request"))
                     .thenReturn(new InvokeResult(200, null, MAPPER.writeValueAsBytes(Map.of(
                             "response", Map.of("issueTokens", true))), null, "request"));
             when(lambdaService.invoke(anyString(), eq(verify), any(byte[].class), eq(InvocationType.RequestResponse)))
@@ -75,7 +76,7 @@ class CognitoCustomAuthIntegrationTest {
             }
             JsonNode started = cognitoJson(admin ? "AdminInitiateAuth" : "InitiateAuth",
                     MAPPER.writeValueAsString(request));
-            assertEquals("CUSTOM_CHALLENGE", started.path("ChallengeName").asText());
+            assertEquals(challengeLabel, started.path("ChallengeName").asText());
             assertEquals(MAPPER.valueToTree(Map.of("USERNAME", "alice")), started.path("ChallengeParameters"));
             String session = started.path("Session").asText();
             assertFalse(session.isBlank());
@@ -87,7 +88,7 @@ class CognitoCustomAuthIntegrationTest {
             request.put("Session", session);
             String action = admin ? "AdminRespondToAuthChallenge" : "RespondToAuthChallenge";
             JsonNode next = cognitoJson(action, MAPPER.writeValueAsString(request));
-            assertEquals("CUSTOM_CHALLENGE", next.path("ChallengeName").asText());
+            assertEquals(challengeLabel, next.path("ChallengeName").asText());
             assertFalse(next.has("AuthenticationResult"));
             assertEquals(started.path("ChallengeParameters"), next.path("ChallengeParameters"));
             assertFalse(next.path("Session").asText().isBlank());
@@ -105,7 +106,7 @@ class CognitoCustomAuthIntegrationTest {
                 JsonNode history = MAPPER.readTree(payloads.getAllValues().get(round)).path("request").path("session");
                 assertEquals(round, history.size());
                 for (JsonNode entry : history) {
-                    assertEquals("CUSTOM_CHALLENGE", entry.path("challengeName").asText());
+                    assertEquals(challengeLabel, entry.path("challengeName").asText());
                     assertTrue(entry.path("challengeResult").asBoolean());
                 }
             }
