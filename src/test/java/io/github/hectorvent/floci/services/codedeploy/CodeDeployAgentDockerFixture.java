@@ -1,7 +1,6 @@
 package io.github.hectorvent.floci.services.codedeploy;
 
 import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.command.BuildImageResultCallback;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.services.ec2.AmiImageResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -129,8 +128,9 @@ abstract class CodeDeployAgentDockerFixture {
             assertNotNull(dockerfile);
             Files.copy(dockerfile, imageContext.resolve("Dockerfile"));
         }
-        try (BuildImageResultCallback build = docker.buildImageCmd(imageContext.toFile())
-                .withBuildArg("BASE_IMAGE", TestImages.UBUNTU_NOBLE).start()) {
+        try (CodeDeployImageBuild build = new CodeDeployImageBuild()) {
+            docker.buildImageCmd(imageContext.toFile())
+                    .withBuildArg("BASE_IMAGE", TestImages.UBUNTU_NOBLE).exec(build);
             String image = build.awaitImageId(180, TimeUnit.SECONDS);
             cleanup.addFirst(() -> docker.removeImageCmd(image).exec());
             when(images.resolveImage("ami-codedeploy-agent")).thenReturn(
