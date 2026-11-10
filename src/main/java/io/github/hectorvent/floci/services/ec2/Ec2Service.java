@@ -355,6 +355,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final Set<String> seededAccountRegions = ConcurrentHashMap.newKeySet();
     // References held while a group assignment applies firewall state before publishing its instance.
     private final Map<String, Integer> pendingSecurityGroupAssignments = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RefCountedLock> instanceGroupLocks = new ConcurrentHashMap<>();
     // region::subnetId → offset the next synthesised address is tried at. Only an ordering hint:
     // restart forgets it, and privateIpsInUse is what keeps addresses from being handed out twice.
     private final Map<String, Long> subnetIpCursors = new HashMap<>();
@@ -4549,6 +4550,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("DryRunOperation", "Request would have succeeded, but DryRun flag is set.", 412);
             }
             synchronized (attachmentTopologyLock(region)) {
+                if (finalSubnetId != null) {
+                    requireSubnet(region, finalSubnetId);
+                }
                 for (GroupIdentifier group : sgIdentifiers) {
                     getRequiredSecurityGroup(region, group.getGroupId());
                 }
@@ -6647,6 +6651,26 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public void modifyInstanceGroups(String region, String instanceId, List<String> groupIds) {
         ensureDefaultResources(region);
+        String instanceKey = callerAccountId() + "::" + key(region, instanceId);
+        RefCountedLock assignment = instanceGroupLocks.compute(instanceKey, (ignored, existing) -> {
+            if (existing == null) {
+                return new RefCountedLock();
+            }
+            existing.refCount.incrementAndGet();
+            return existing;
+        });
+        // This per-instance lock precedes the topology lock; external I/O holds only this lock.
+        assignment.lock.lock();
+        try {
+            modifyInstanceGroupsLocked(region, instanceId, groupIds);
+        } finally {
+            assignment.lock.unlock();
+            instanceGroupLocks.computeIfPresent(instanceKey, (ignored, existing) ->
+                    existing.refCount.decrementAndGet() == 0 ? null : existing);
+        }
+    }
+
+    private void modifyInstanceGroupsLocked(String region, String instanceId, List<String> groupIds) {
         Instance inst = getRequiredInstance(region, instanceId);
 
         List<GroupIdentifier> identifiers = new ArrayList<>();
@@ -6674,17 +6698,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         new HashSet<>(groupIds), byId, policyPrefixLists(region, current));
             }
 
-            inst.setSecurityGroups(new ArrayList<>(identifiers));
-            if (inst.getNetworkInterfaces() != null) {
-                inst.getNetworkInterfaces().forEach(eni -> {
-                    eni.setGroups(new ArrayList<>(identifiers));
-                    networkInterfaces.get(key(region, eni.getNetworkInterfaceId())).ifPresent(standalone -> {
-                        standalone.setGroups(new ArrayList<>(identifiers));
-                        networkInterfaces.put(key(region, standalone.getNetworkInterfaceId()), standalone);
+            synchronized (attachmentTopologyLock(region)) {
+                inst.setSecurityGroups(new ArrayList<>(identifiers));
+                if (inst.getNetworkInterfaces() != null) {
+                    inst.getNetworkInterfaces().forEach(eni -> {
+                        eni.setGroups(new ArrayList<>(identifiers));
+                        networkInterfaces.get(key(region, eni.getNetworkInterfaceId())).ifPresent(stored -> {
+                            NetworkInterfaceAttachment attachment = stored.getAttachment();
+                            if (attachment != null && instanceId.equals(attachment.getInstanceId())) {
+                                stored.setGroups(new ArrayList<>(identifiers));
+                                networkInterfaces.put(key(region, stored.getNetworkInterfaceId()), stored);
+                            }
+                        });
                     });
-                });
+                }
+                instances.put(key(region, instanceId), inst);
             }
-            instances.put(key(region, instanceId), inst);
 
             if (config.services().ec2().publishSecurityGroupPorts() && !config.services().ec2().mock()
                     && inst.getDockerContainerId() != null
@@ -7725,10 +7754,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         endpoint.setPolicyDocument(policyDocument);
         if (endpointTags != null && !endpointTags.isEmpty()) {
             endpoint.setTags(new ArrayList<>(endpointTags));
-            putTags(region, endpoint.getVpcEndpointId(), new ArrayList<>(endpointTags));
         }
         synchronized (attachmentTopologyLock(region)) {
             getRequiredVpc(region, vpcId);
+            // Re-checked under the lock DeleteSecurityGroup holds, so the endpoint cannot publish a
+            // reference to a group deleted since the first read.
+            for (String securityGroupId : securityGroupIds) {
+                getRequiredSecurityGroup(region, securityGroupId);
+            }
+            if (endpointTags != null && !endpointTags.isEmpty()) {
+                putTags(region, endpoint.getVpcEndpointId(), new ArrayList<>(endpointTags));
+            }
             vpcEndpoints.put(key(region, endpoint.getVpcEndpointId()), endpoint);
         }
         return endpoint;
@@ -7792,11 +7828,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // each caller reads the same association list, adds its own id, and the last write
         // wins -- leaving the other caller's waiter polling for an association that was
         // silently dropped.
-        synchronized (lockFor(key(region, endpointId))) {
-            return modifyVpcEndpointLocked(region, endpointId,
-                    addRouteTableIds, removeRouteTableIds, addSubnetIds, removeSubnetIds,
-                    addSecurityGroupIds, removeSecurityGroupIds,
-                    policyDocument, resetPolicy, privateDnsEnabled, subnetConfigurations, ipAddressType);
+        synchronized (attachmentTopologyLock(region)) {
+            synchronized (lockFor(key(region, endpointId))) {
+                return modifyVpcEndpointLocked(region, endpointId,
+                        addRouteTableIds, removeRouteTableIds, addSubnetIds, removeSubnetIds,
+                        addSecurityGroupIds, removeSecurityGroupIds,
+                        policyDocument, resetPolicy, privateDnsEnabled, subnetConfigurations, ipAddressType);
+            }
         }
     }
 
@@ -7944,11 +7982,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         List<VpcEndpoint> deleted = new ArrayList<>();
         for (String endpointId : endpointIds) {
-            VpcEndpoint endpoint = getRequiredVpcEndpoint(region, endpointId);
-            endpoint.setState("deleted");
-            vpcEndpoints.delete(key(region, endpointId));
-            removeTags(region, endpointId);
-            deleted.add(endpoint);
+            synchronized (attachmentTopologyLock(region)) {
+                synchronized (lockFor(key(region, endpointId))) {
+                    VpcEndpoint endpoint = getRequiredVpcEndpoint(region, endpointId);
+                    endpoint.setState("deleted");
+                    vpcEndpoints.delete(key(region, endpointId));
+                    removeTags(region, endpointId);
+                    deleted.add(endpoint);
+                }
+            }
         }
         return deleted;
     }
@@ -8677,14 +8719,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId) {
         vpcId = requireSecurityGroupVpc(region, vpcId).getVpcId();
-        // Check duplicate
-        String finalVpcId = vpcId;
-        boolean exists = securityGroups.scan(k -> true).stream()
-                .anyMatch(sg -> sg.getRegion().equals(region) && Objects.equals(sg.getGroupName(), groupName)
-                        && finalVpcId.equals(sg.getVpcId()));
-        if (exists) {
-            throw new AwsException("InvalidGroup.Duplicate", "The security group '" + groupName + "' already exists", 400);
-        }
         String sgId = "sg-" + randomHex(17);
         SecurityGroup sg = new SecurityGroup();
         sg.setGroupId(sgId);
@@ -8700,11 +8734,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         sg.getIpPermissionsEgress().add(egressAll);
         synchronized (attachmentTopologyLock(region)) {
             getRequiredVpc(region, sg.getVpcId());
+            boolean exists = securityGroups.scan(k -> true).stream()
+                    .anyMatch(existing -> existing.getRegion().equals(region)
+                            && Objects.equals(existing.getGroupName(), groupName)
+                            && sg.getVpcId().equals(existing.getVpcId()));
+            if (exists) {
+                throw new AwsException("InvalidGroup.Duplicate",
+                        "The security group '" + groupName + "' already exists", 400);
+            }
             securityGroups.put(key(region, sgId), sg);
+            // Persist the default egress rule as a SecurityGroupRule so that
+            // DescribeSecurityGroupRules can find it immediately (#1093), and before a
+            // concurrent delete can remove this group.
+            createRules(region, sgId, egressAll, true);
         }
-        // Persist the default egress rule as a SecurityGroupRule so that
-        // DescribeSecurityGroupRules can find it immediately (#1093).
-        createRules(region, sgId, egressAll, true);
         return sg;
     }
 
@@ -8772,9 +8815,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             "Request would have succeeded, but DryRun flag is set.", 412);
                 }
                 securityGroups.delete(key(region, selectedId));
+                removeTags(region, selectedId);
                 securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
                         .filter(rule -> selected.getGroupId().equals(rule.getGroupId()))
-                        .forEach(rule -> securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId())));
+                        .forEach(rule -> {
+                            securityGroupRules.delete(key(region, rule.getSecurityGroupRuleId()));
+                            removeTags(region, rule.getSecurityGroupRuleId());
+                        });
             }
         }
         return selectedId;
@@ -8813,6 +8860,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(instance -> !"terminated".equals(instance.getState().getName()))
                 .anyMatch(instance -> instance.getSecurityGroups().stream()
                         .anyMatch(group -> groupId.equals(group.getGroupId())))) {
+            return true;
+        }
+        if (vpcEndpoints.scan(k -> k.startsWith(region + "::")).stream()
+                .anyMatch(endpoint -> endpoint.getSecurityGroupIds().contains(groupId))) {
             return true;
         }
         return securityGroups.scan(k -> k.startsWith(region + "::")).stream()
