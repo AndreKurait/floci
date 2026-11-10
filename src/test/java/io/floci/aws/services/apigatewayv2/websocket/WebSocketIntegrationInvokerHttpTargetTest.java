@@ -2,6 +2,7 @@ package io.floci.aws.services.apigatewayv2.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
 import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
@@ -44,7 +45,7 @@ class WebSocketIntegrationInvokerHttpTargetTest {
                 mock(LambdaService.class),
                 mock(AwsServiceRouter.class),
                 new ObjectMapper(),
-                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class));
+                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class));
         backend = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         backend.createContext("/", exchange -> {
             receivedHost.set(exchange.getRequestHeaders().getFirst("Host"));
@@ -112,7 +113,7 @@ class WebSocketIntegrationInvokerHttpTargetTest {
                 mock(LambdaService.class),
                 mock(AwsServiceRouter.class),
                 new ObjectMapper(),
-                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class),
+                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class),
                 host -> {
                     if (lookups.incrementAndGet() == 1) {
                         return new InetAddress[] {InetAddress.getByName("127.0.0.1")};

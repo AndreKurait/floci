@@ -2,6 +2,7 @@ package io.floci.aws.services.apigatewayv2.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
 import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
@@ -87,7 +88,7 @@ class WebSocketIntegrationRoleTest {
         when(lambda.invokeTarget(anyString(), anyString(), any(byte[].class), any())).thenReturn(
                 new InvokeResult(200, null, "{\"statusCode\":200,\"body\":\"ok\"}".getBytes(StandardCharsets.UTF_8), null, "request"));
         service = new WebSocketIntegrationInvoker(lambda, mock(AwsServiceRouter.class), mapper,
-                mock(VtlTemplateEngine.class), direct, new RegionResolver("us-east-1", OWNER), roles);
+                mock(VtlTemplateEngine.class), direct, new RegionResolver("us-east-1", OWNER), roles, mock(CallerCallAuthorizer.class));
 
     }
 
