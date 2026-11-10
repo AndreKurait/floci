@@ -4,26 +4,33 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
+import io.github.hectorvent.floci.testing.TestTime;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -43,8 +50,10 @@ import static org.mockito.Mockito.when;
  * them waits on is aborted too (measured: within about 0.15 s, with the same cause, whether or not
  * a Catch on the Map keeps the execution going).
  *
- * <p>The failing branch pauses in a Wait that the sleeper holds until every other branch is
- * parked on its own wait, so the cut always lands while the others are mid-state.
+ * <p>Every pause and bounded wait is on one {@link TestTime} timeline. The failing branch pauses in
+ * a one-second Wait, and the test moves the timeline only once every other branch is parked on its
+ * own wait, so the cut always lands while the others are mid-state: one nanosecond before the Wait
+ * ends nothing has been cut, and at that instant the execution ends.
  */
 @Timeout(20)
 class AslExecutorParallelCutTest {
@@ -60,7 +69,10 @@ class AslExecutorParallelCutTest {
     private static final String ABORT_CAUSE =
             "The Task state in AWS Step Functions execution [" + PARENT_ARN
                     + "] which was managing this resource was aborted";
-    private static final long PAUSE_NANOS = TimeUnit.SECONDS.toNanos(1);
+    /** The failing branch's Wait, and the execution budget of the test that has one. */
+    private static final Duration PAUSE = Duration.ofSeconds(1);
+    private static final Duration ONE_NANOSECOND = Duration.ofNanos(1);
+    private static final long JOIN_TIMEOUT_SECONDS = 10;
     private static final String FAILING_BRANCH = """
             {"StartAt":"Pause","States":{
               "Pause":{"Type":"Wait","Seconds":1,"Next":"Boom"},
@@ -105,8 +117,24 @@ class AslExecutorParallelCutTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private StepFunctionsService sfnService;
+    private final TestTime time = TestTime.create();
+    private final TimelineWaits timeline = new TimelineWaits(time);
+    /** One permit for every time the Parallel or Map goes to wait for its next finished branch. */
+    private final Semaphore joinWaits = new Semaphore(0);
+    private final BoundedWaits waits = new BoundedWaits() {
+        @Override
+        public <T> T get(Future<T> future, long timeoutNanos)
+                throws InterruptedException, ExecutionException, TimeoutException {
+            return timeline.get(future, timeoutNanos);
+        }
+
+        @Override
+        public <T> T poll(BlockingQueue<T> queue, long timeoutNanos) throws InterruptedException {
+            joinWaits.release();
+            return timeline.poll(queue, timeoutNanos);
+        }
+    };
     private List<HistoryEvent> history;
-    private Runnable nestedWaitStarted = () -> { };
 
     @BeforeEach
     void setUp() {
@@ -121,7 +149,7 @@ class AslExecutorParallelCutTest {
 
     @Test
     void siblingFailureAbortsTheChildAndRecordsTaskStateAbortedBesideTheFailure() {
-        Execution execution = run(parallel(FAILING_BRANCH, NESTED_SYNC_BRANCH), 1, 0);
+        Execution execution = runThroughThePause(parallel(FAILING_BRANCH, NESTED_SYNC_BRANCH), 1, 1);
 
         assertEquals("FAILED", execution.getStatus());
         assertEquals("Boom", execution.getError());
@@ -141,7 +169,7 @@ class AslExecutorParallelCutTest {
     @Test
     @Timeout(20)
     void aFailureInALaterBranchCutsAnEarlierBranchStillWaitingOnItsJob() {
-        Execution execution = run(parallel(NESTED_SYNC_BRANCH, FAILING_BRANCH), 1, 0);
+        Execution execution = runThroughThePause(parallel(NESTED_SYNC_BRANCH, FAILING_BRANCH), 1, 1);
 
         assertEquals("FAILED", execution.getStatus());
         assertEquals("Boom", execution.getError());
@@ -153,11 +181,14 @@ class AslExecutorParallelCutTest {
         verify(sfnService, timeout(5_000)).stopExecution(eq(CHILD_ARN), eq(ABORT_CAUSE), isNull());
     }
 
-    /** The earlier branch's Wait really sleeps 20 s; a declaration-order join sees the failure only then. */
+    /**
+     * The earlier branch's Wait asks for 20 s and the timeline stops at 1 s; a declaration-order
+     * join sees the failure only at 20 s, which nobody advances to.
+     */
     @Test
     @Timeout(10)
     void aFailureInALaterBranchIsSeenWhileAnEarlierWaitStillRuns() {
-        Execution execution = run(parallel(LONG_WAIT_BRANCH, FAILING_BRANCH), 1, 0);
+        Execution execution = runThroughThePause(parallel(LONG_WAIT_BRANCH, FAILING_BRANCH), 2, 0);
 
         assertEquals("FAILED", execution.getStatus());
         assertEquals("Boom", execution.getError());
@@ -171,8 +202,8 @@ class AslExecutorParallelCutTest {
 
     @Test
     void outputsStayInDeclarationOrderWhenAnEarlierBranchFinishesLast() throws Exception {
-        AslExecutor.Sleeper sleeper = nanos -> TimeUnit.MILLISECONDS.sleep(200);
-        Execution execution = run(parallel(SLOW_RESULT_BRANCH, FAST_RESULT_BRANCH), sleeper, 0);
+        // The fast branch has been joined before the slow one's Wait is allowed to end.
+        Execution execution = runThroughThePause(parallel(SLOW_RESULT_BRANCH, FAST_RESULT_BRANCH), 1, 0, 1, "{}");
 
         assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
         assertEquals(objectMapper.readTree("[\"slow\",\"fast\"]"), objectMapper.readTree(execution.getOutput()));
@@ -180,7 +211,8 @@ class AslExecutorParallelCutTest {
 
     @Test
     void everyCutBranchRecordsItsOwnTaskStateAbortedAgainstTheSameEvent() {
-        Execution execution = run(parallel(FAILING_BRANCH, NESTED_SYNC_BRANCH, NESTED_SYNC_BRANCH), 2, 0);
+        Execution execution = runThroughThePause(
+                parallel(FAILING_BRANCH, NESTED_SYNC_BRANCH, NESTED_SYNC_BRANCH), 1, 2);
 
         assertEquals("FAILED", execution.getStatus());
         long failure = eventOfType("FailStateEntered").getId();
@@ -193,7 +225,7 @@ class AslExecutorParallelCutTest {
 
     @Test
     void aWaitCutByASiblingFailureIsRecordedAsWaitStateAborted() {
-        Execution execution = run(parallel(FAILING_BRANCH, LONG_WAIT_BRANCH), 1, 0);
+        Execution execution = runThroughThePause(parallel(FAILING_BRANCH, LONG_WAIT_BRANCH), 2, 0);
 
         assertEquals("FAILED", execution.getStatus());
         long failure = eventOfType("FailStateEntered").getId();
@@ -205,9 +237,8 @@ class AslExecutorParallelCutTest {
 
     @Test
     void aBranchThatFinishedBeforeTheFailureRecordsNoAbortedState() {
-        // The failing branch's Pause really sleeps, so the Pass branch has long finished by then.
-        AslExecutor.Sleeper sleeper = nanos -> TimeUnit.MILLISECONDS.sleep(200);
-        Execution execution = run(parallel(FAILING_BRANCH, PASS_BRANCH), sleeper, 0);
+        // The Pass branch has been joined before the failing branch's Pause is allowed to end.
+        Execution execution = runThroughThePause(parallel(FAILING_BRANCH, PASS_BRANCH), 1, 0, 1, "{}");
 
         assertEquals("FAILED", execution.getStatus());
         assertTrue(types().contains("PassStateExited"), types().toString());
@@ -216,7 +247,7 @@ class AslExecutorParallelCutTest {
 
     @Test
     void aMapIterationFailureAbortsTheChildAnotherIterationWaitsOn() {
-        Execution execution = run(MAP_WITH_A_FAILING_ITERATION, sleeper(1), 0,
+        Execution execution = runThroughThePause(MAP_WITH_A_FAILING_ITERATION, 1, 1, 0,
                 "[{\"kind\":\"nest\"},{\"kind\":\"fail\"}]");
 
         assertEquals("FAILED", execution.getStatus());
@@ -233,7 +264,7 @@ class AslExecutorParallelCutTest {
      */
     @Test
     void aMapIterationCutInsideItsTaskRecordsMapIterationAbortedAndTaskStateAborted() {
-        Execution execution = run(MAP_WITH_A_FAILING_ITERATION, sleeper(1), 0,
+        Execution execution = runThroughThePause(MAP_WITH_A_FAILING_ITERATION, 1, 1, 0,
                 "[{\"kind\":\"nest\"},{\"kind\":\"fail\"}]");
 
         assertEquals("FAILED", execution.getStatus());
@@ -253,7 +284,7 @@ class AslExecutorParallelCutTest {
 
     @Test
     void aMapIterationCutInsideItsWaitRecordsMapIterationAbortedAndWaitStateAborted() {
-        Execution execution = run(MAP_WITH_A_FAILING_ITERATION, sleeper(1), 0,
+        Execution execution = runThroughThePause(MAP_WITH_A_FAILING_ITERATION, 2, 0, 0,
                 "[{\"kind\":\"fail\"},{\"kind\":\"wait\"}]");
 
         assertEquals("FAILED", execution.getStatus());
@@ -278,7 +309,7 @@ class AslExecutorParallelCutTest {
     void aRuntimeFailureThatExceedsTheToleranceRecordsTheOnesItCutButNotItself() {
         String map = MAP_WITH_A_RUNTIME_FAILING_ITERATION.replace("\"Type\":\"Map\",",
                 "\"Type\":\"Map\",\"ToleratedFailureCount\":0,");
-        Execution execution = run(map, sleeper(1), 0, "[{\"kind\":\"wait\"},{\"kind\":\"fail\"}]");
+        Execution execution = runThroughThePause(map, 2, 0, 0, "[{\"kind\":\"wait\"},{\"kind\":\"fail\"}]");
 
         assertEquals("FAILED", execution.getStatus());
         assertEquals("States.ExceedToleratedFailureThreshold", execution.getError());
@@ -294,7 +325,7 @@ class AslExecutorParallelCutTest {
      */
     @Test
     void aRuntimeFailureThatEndsTheMapRecordsNothingForTheOnesItCut() {
-        Execution execution = run(MAP_WITH_A_RUNTIME_FAILING_ITERATION, sleeper(1), 0,
+        Execution execution = runThroughThePause(MAP_WITH_A_RUNTIME_FAILING_ITERATION, 2, 0, 0,
                 "[{\"kind\":\"wait\"},{\"kind\":\"fail\"}]");
 
         assertEquals("FAILED", execution.getStatus());
@@ -322,8 +353,8 @@ class AslExecutorParallelCutTest {
                   "ItemProcessor":{"ProcessorConfig":{"Mode":"INLINE"},"StartAt":"Long","States":{
                     "Long":{"Type":"Wait","Seconds":20,"End":true}}}}""";
         for (int round = 0; round < 40; round++) {
-            Execution execution = run(map, nanos -> TimeUnit.NANOSECONDS.sleep(nanos), 0,
-                    "[{\"kind\":\"wait\",\"v\":1},{\"kind\":\"selector\"}]");
+            // Nothing here waits for time: the other iteration's Wait parks until the failure cuts it.
+            Execution execution = execute(map, 0, "[{\"kind\":\"wait\",\"v\":1},{\"kind\":\"selector\"}]");
 
             assertEquals("FAILED", execution.getStatus(), types().toString());
             assertEquals("States.QueryEvaluationError", execution.getError(), types().toString());
@@ -342,8 +373,8 @@ class AslExecutorParallelCutTest {
 
     @Test
     void aMapIterationThatFinishedBeforeTheFailureRecordsNoAbortedEvent() {
-        AslExecutor.Sleeper sleeper = nanos -> TimeUnit.MILLISECONDS.sleep(200);
-        Execution execution = run(MAP_WITH_A_FAILING_ITERATION, sleeper, 0,
+        // The "done" iteration has been joined before the failing one's Pause is allowed to end.
+        Execution execution = runThroughThePause(MAP_WITH_A_FAILING_ITERATION, 1, 0, 1,
                 "[{\"kind\":\"done\"},{\"kind\":\"fail\"}]");
 
         assertEquals("FAILED", execution.getStatus());
@@ -355,7 +386,14 @@ class AslExecutorParallelCutTest {
 
     @Test
     void executionBudgetCuttingTheParallelAbortsTheChildAndRecordsNoAbortedState() {
-        Execution execution = run(parallel(NESTED_SYNC_BRANCH), 0, 1);
+        CompletableFuture<Execution> running = AslExecutorFixture.start(
+                () -> execute(parallel(NESTED_SYNC_BRANCH), (int) PAUSE.toSeconds(), "{}"));
+        awaitAtRest(0, 1, 0);
+        time.advance(PAUSE.minus(ONE_NANOSECOND));
+        assertStillAtRest(running, 0, 1);
+
+        time.advance(ONE_NANOSECOND);
+        Execution execution = AslExecutorFixture.finished(running);
 
         assertEquals("TIMED_OUT", execution.getStatus());
         assertTrue(types().stream().noneMatch(type -> type.endsWith("StateAborted")), types().toString());
@@ -376,56 +414,67 @@ class AslExecutorParallelCutTest {
         return "{\"Type\":\"Parallel\",\"End\":true,\"Branches\":[" + String.join(",", branches) + "]}";
     }
 
+    private Execution runThroughThePause(String state, int pausing, int nesting) {
+        return runThroughThePause(state, pausing, nesting, 0, "{}");
+    }
+
     /**
-     * The failing branch's one-second Pause is held until {@code waitingBranches} other branch
-     * threads have entered a nested status wait or a longer Wait; every
-     * other sleep is real, so the cut interrupts it.
+     * Runs the state to its end through the one-second Pause of the branch that pauses. The timeline
+     * moves only once {@code pausing} branches sleep in a Wait, {@code nesting} branches wait on a
+     * child and {@code joined} branches have finished and been joined; one nanosecond before the
+     * Pause ends all of them are still where they were and no child has been stopped.
      */
-    private AslExecutor.Sleeper sleeper(int waitingBranches) {
-        CountDownLatch othersWaiting = new CountDownLatch(waitingBranches);
-        Set<Thread> seen = ConcurrentHashMap.newKeySet();
-        nestedWaitStarted = () -> {
-            if (seen.add(Thread.currentThread())) {
-                othersWaiting.countDown();
-            }
-        };
-        return nanos -> {
-            if (nanos == PAUSE_NANOS) {
-                assertTrue(othersWaiting.await(5, TimeUnit.SECONDS), "other branches must enter their waits");
-                return;
-            }
-            nestedWaitStarted.run();
-            TimeUnit.NANOSECONDS.sleep(nanos);
-        };
+    private Execution runThroughThePause(String state, int pausing, int nesting, int joined, String input) {
+        CompletableFuture<Execution> running = AslExecutorFixture.start(() -> execute(state, 0, input));
+        awaitAtRest(pausing, nesting, joined);
+        time.advance(PAUSE.minus(ONE_NANOSECOND));
+        assertStillAtRest(running, pausing, nesting);
+
+        time.advance(ONE_NANOSECOND);
+        return AslExecutorFixture.finished(running);
+    }
+
+    /**
+     * Besides the branches waiting on a child, two threads are in a bounded wait: the caller, for
+     * the execution, and its worker, for the next finished branch.
+     */
+    private void awaitAtRest(int pausing, int nesting, int joined) {
+        try {
+            assertTrue(joinWaits.tryAcquire(joined + 1, JOIN_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "the join must have taken " + joined + " finished branch(es) and be waiting for the next");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted waiting for the join", e);
+        }
+        time.awaitSleepers(pausing);
+        timeline.awaitWaiting(nesting + 2);
+    }
+
+    private void assertStillAtRest(CompletableFuture<Execution> running, int pausing, int nesting) {
+        assertEquals(pausing, time.sleepers());
+        assertEquals(nesting + 2, timeline.waiting());
+        assertFalse(running.isDone());
+        verify(sfnService, never()).stopExecution(any(), any(), any());
     }
 
     @SuppressWarnings("unchecked")
-    private AslExecutor newExecutor(AslExecutor.Sleeper sleeper) {
+    private AslExecutor newExecutor() {
         Instance<StepFunctionsService> instance = mock(Instance.class);
         when(instance.get()).thenReturn(sfnService);
         return AslExecutorFixture.builder()
                 .objectMapper(objectMapper)
                 .sfnService(instance)
                 .customResourceLiveness(null)
-                .sleeper(sleeper)
-                .nestedWaiter((subscription, observed, nanos) -> {
-                    nestedWaitStarted.run();
-                    subscription.awaitChange(observed, nanos);
-                })
+                .clock(time.clock())
+                .nanoTime(time::nanoTime)
+                .sleeper(time::sleepNanos)
+                .nestedWaiter(timeline)
+                .waits(waits)
                 .maxWaitSeconds(30)
                 .build();
     }
 
-    private Execution run(String parallelState, int waitingBranches, int executionTimeoutSeconds) {
-        return run(parallelState, sleeper(waitingBranches), executionTimeoutSeconds);
-    }
-
-    private Execution run(String parallelState, AslExecutor.Sleeper sleeper, int executionTimeoutSeconds) {
-        return run(parallelState, sleeper, executionTimeoutSeconds, "{}");
-    }
-
-    private Execution run(String state, AslExecutor.Sleeper sleeper, int executionTimeoutSeconds,
-                          String input) {
+    private Execution execute(String state, int executionTimeoutSeconds, String input) {
         String budget = executionTimeoutSeconds > 0
                 ? "\"TimeoutSeconds\":%d,".formatted(executionTimeoutSeconds)
                 : "";
@@ -444,7 +493,7 @@ class AslExecutorParallelCutTest {
         execution.setInput(input);
 
         history = new ArrayList<>();
-        newExecutor(sleeper).executeSync(stateMachine, execution, history, (updated, events) -> { });
+        newExecutor().executeSync(stateMachine, execution, history, (updated, events) -> { });
         return execution;
     }
 
