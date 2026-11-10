@@ -93,6 +93,9 @@ FLOCI_ENDPOINT=http://localhost:4566 .venv-legacy/bin/python -m pytest legacy/te
 `tests/test_elb_classic_public_alias.py` creates a Classic load balancer and
 weighted public alias through Boto 3, checking account ownership, missing-target
 responses and alias/load-balancer deletion through the shared HTTP edge.
+It creates an Organizations member account and assumes its access role through
+STS, so account isolation is exercised with issued credentials and works with
+IAM enforcement and signature validation enabled.
 
 ## Configuration
 
