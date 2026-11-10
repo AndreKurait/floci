@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.github.hectorvent.floci.testutil.LogCapture;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -22,6 +23,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.logging.LogRecord;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -32,11 +34,14 @@ class WebSocketAuthorizerPermissionTest {
     private static final String REGION = "us-east-1";
     private static final String SOURCE = "arn:aws:execute-api:us-east-1:" + OWNER + ":api/authorizers/auth";
     private static final String TARGET = "arn:aws:lambda:us-west-2:444455556666:function:auth:live";
-    private final ObjectMapper mapper = new ObjectMapper();
+    private static final String ROLE = "arn:aws:iam::" + OWNER + ":role/authorizer";
+    private final ObjectMapper mapper = spy(new ObjectMapper());
     private final Authorizer authorizer = new Authorizer();
     private final LambdaService lambda = mock(LambdaService.class);
+    private final ServiceRoleCallAuthorizer roles = mock(ServiceRoleCallAuthorizer.class);
     private final EmulatorConfig.IamServiceConfig iam = mock(EmulatorConfig.IamServiceConfig.class);
     private String policy;
+    private RuntimeException policyFailure;
     private WebSocketAuthorizerService service;
 
     @BeforeEach
@@ -47,6 +52,9 @@ class WebSocketAuthorizerPermissionTest {
         when(services.iam()).thenReturn(iam);
         when(iam.enforcementEnabled()).thenReturn(true);
         ResourcePolicyProvider provider = (scope, arn) -> {
+            if (policyFailure != null) {
+                throw policyFailure;
+            }
             assertEquals("lambda", scope);
             assertEquals(TARGET, arn);
             return policy == null ? List.of() : List.of(new ResourcePolicyProvider.ResourcePolicy(policy,
@@ -66,7 +74,9 @@ class WebSocketAuthorizerPermissionTest {
         IamPolicyEvaluator evaluator = new IamPolicyEvaluator(mapper);
         service = new WebSocketAuthorizerService(gateway, lambda, builder, mapper,
                 new AuthorizerPolicyEvaluator(evaluator), new ServiceCallAuthorizer(config, evaluator, providers),
-                builder.regionResolver, mock(ServiceRoleCallAuthorizer.class));
+                builder.regionResolver, roles);
+        when(roles.authorizeWithoutSourceContext("apigateway", ROLE, "lambda:InvokeFunction",
+                TARGET, OWNER, "aws")).thenReturn(IamPolicyEvaluator.Decision.ALLOW);
         when(lambda.invokeTarget(eq(REGION), eq(TARGET), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, null, """
                         {"principalId":"user","policyDocument":{"Version":"2012-10-17",
@@ -123,7 +133,7 @@ class WebSocketAuthorizerPermissionTest {
 
     @Test
     void configuredRoleRetainsItsSeparateExecutionPath() {
-        authorizer.setAuthorizerCredentialsArn("arn:aws:iam::" + OWNER + ":role/authorizer");
+        authorizer.setAuthorizerCredentialsArn(ROLE);
         assertEquals(200, invoke());
     }
 
@@ -132,6 +142,50 @@ class WebSocketAuthorizerPermissionTest {
         authorizer.setIdentitySource(List.of("$request.header.Authorization"));
         assertEquals(401, invoke());
         verifyNoInteractions(lambda);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"service-policy", "role-policy", "service-invocation", "configured-invocation", "policy-parsing"})
+    void unexpectedAuthorizerFailureRetainsOriginalCause(String failureStage) throws Exception {
+        RuntimeException cause = new IllegalStateException("authorizer underlying failure");
+        RuntimeException failure = new IllegalStateException("authorizer failure detail", cause);
+        policy = grant();
+        if ("configured-invocation".equals(failureStage) || "role-policy".equals(failureStage)) {
+            authorizer.setAuthorizerCredentialsArn(ROLE);
+        }
+        if ("service-policy".equals(failureStage)) {
+            policyFailure = failure;
+        } else if ("role-policy".equals(failureStage)) {
+            when(roles.authorizeWithoutSourceContext("apigateway", ROLE, "lambda:InvokeFunction",
+                    TARGET, OWNER, "aws")).thenThrow(failure);
+        } else if ("policy-parsing".equals(failureStage)) {
+            doThrow(failure).when(mapper).readTree(any(byte[].class));
+        } else {
+            when(lambda.invokeTarget(anyString(), anyString(), any(byte[].class), any())).thenThrow(failure);
+        }
+        List<LogRecord> records = LogCapture.capture(WebSocketAuthorizerService.class,
+                () -> assertEquals(500, invoke()));
+        boolean failedBeforeInvocation = "service-policy".equals(failureStage) || "role-policy".equals(failureStage);
+        verify(lambda, times(failedBeforeInvocation ? 0 : 1)).invokeTarget(
+                eq(REGION), eq(TARGET), any(byte[].class), eq(InvocationType.RequestResponse));
+        String template = "policy-parsing".equals(failureStage)
+                ? "Failed to parse authorizer policy for API {0}: {1}"
+                : "Lambda authorizer invocation failed for API {0}: {1}";
+        LogRecord warning = records.stream().filter(record -> template.equals(record.getMessage()))
+                .findFirst().orElseThrow();
+        assertArrayEquals(new Object[]{"api", failure.getMessage()}, warning.getParameters());
+        assertSame(failure, warning.getThrown());
+        assertSame(cause, warning.getThrown().getCause());
+    }
+
+    @Test
+    void modeledPermissionDenialDoesNotLogUnexpectedAuthorizerFailure() {
+        List<LogRecord> records = LogCapture.capture(WebSocketAuthorizerService.class,
+                () -> assertEquals(500, invoke()));
+        verifyNoInteractions(lambda);
+        assertTrue(records.stream().noneMatch(record -> record.getThrown() != null
+                || "Lambda authorizer invocation failed for API {0}: {1}".equals(record.getMessage())
+                || "Failed to parse authorizer policy for API {0}: {1}".equals(record.getMessage())));
     }
 
     private int invoke() {
