@@ -12,8 +12,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
@@ -40,22 +40,21 @@ class BedrockProxyTimeoutIntegrationTest {
     private static final String MAPPED_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0";
 
     private HttpServer backend;
+    private CountDownLatch held;
 
     @BeforeEach
     void setUp() throws IOException {
         backend = HttpServer.create(new InetSocketAddress("127.0.0.1", PORT), 0);
+        held = new CountDownLatch(1);
+        CountDownLatch release = held;
         backend.createContext("/v1/chat/completions", exchange -> {
+            // Never answers: the request ends when the proxy's timeout does, and the handler
+            // when the test is over.
             try {
-                Thread.sleep(2000);
+                release.await();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                exchange.close();
-                return;
             }
-            byte[] resp = "{}".getBytes(StandardCharsets.UTF_8);
-            exchange.getResponseHeaders().add("Content-Type", "application/json");
-            exchange.sendResponseHeaders(200, resp.length);
-            exchange.getResponseBody().write(resp);
             exchange.close();
         });
         backend.start();
@@ -63,6 +62,7 @@ class BedrockProxyTimeoutIntegrationTest {
 
     @AfterEach
     void tearDown() {
+        held.countDown();
         backend.stop(0);
     }
 
