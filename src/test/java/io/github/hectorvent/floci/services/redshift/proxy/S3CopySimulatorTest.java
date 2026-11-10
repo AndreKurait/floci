@@ -17,16 +17,18 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.zip.GZIPInputStream;
@@ -335,12 +337,15 @@ class S3CopySimulatorTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        listener = new ServerSocket(0);
-        simClient = new Socket("localhost", listener.getLocalPort());
+        // Bound to the loopback address itself: a listener on every address can be handed a port
+        // that another process already listens on at 127.0.0.1, and the connect would reach that one.
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        listener = new ServerSocket(0, 1, loopback);
+        simClient = new Socket(loopback, listener.getLocalPort());
         testClient = listener.accept();
 
-        ServerSocket backendListener = new ServerSocket(0);
-        simBackend = new Socket("localhost", backendListener.getLocalPort());
+        ServerSocket backendListener = new ServerSocket(0, 1, loopback);
+        simBackend = new Socket(loopback, backendListener.getLocalPort());
         testBackend = backendListener.accept();
         backendListener.close();
 
@@ -374,6 +379,18 @@ class S3CopySimulatorTest {
                 backendFailure.compareAndSet(null, t);
             }
         });
+    }
+
+    /**
+     * The simulator has returned and the fake backend has ended, so what the simulator wrote is all
+     * the client will ever get: end the simulator's side of the stream and expect nothing before
+     * that end.
+     */
+    private void assertNothingMoreReachesTheClient(String message) throws IOException {
+        if (!simClient.isClosed() && !simClient.isOutputShutdown()) {
+            simClient.shutdownOutput();
+        }
+        assertEquals(-1, testClient.getInputStream().read(), message);
     }
 
     private void joinBackend(Thread t) throws InterruptedException {
@@ -957,8 +974,7 @@ class S3CopySimulatorTest {
         PostgresWireDecoder in = new PostgresWireDecoder(testClient.getInputStream());
         assertEquals('E', in.nextMessage().type());
         assertEquals('Z', in.nextMessage().type());
-        testClient.setSoTimeout(400);
-        assertThrows(SocketTimeoutException.class, () -> testClient.getInputStream().read());
+        assertNothingMoreReachesTheClient("no second response should follow");
     }
 
     @Test
@@ -1075,9 +1091,7 @@ class S3CopySimulatorTest {
             PostgresWireDecoder in = new PostgresWireDecoder(testClient.getInputStream());
             assertEquals('E', in.nextMessage().type());
             assertEquals('Z', in.nextMessage().type());
-            testClient.setSoTimeout(400);
-            assertThrows(SocketTimeoutException.class, () -> testClient.getInputStream().read(),
-                    "no leftover or duplicate messages should reach client");
+            assertNothingMoreReachesTheClient("no leftover or duplicate messages should reach client");
         } finally {
             S3CopySimulator.UNLOAD_TARGET_FILE_BYTES = saved;
         }
@@ -1585,9 +1599,7 @@ class S3CopySimulatorTest {
         PostgresWireDecoder in = new PostgresWireDecoder(testClient.getInputStream());
         assertEquals('E', in.nextMessage().type());
         assertEquals('Z', in.nextMessage().type());
-        testClient.setSoTimeout(400);
-        assertThrows(SocketTimeoutException.class, () -> testClient.getInputStream().read(),
-                "no second response should follow");
+        assertNothingMoreReachesTheClient("no second response should follow");
     }
 
     @Test
@@ -1682,16 +1694,15 @@ class S3CopySimulatorTest {
 
         simBackend.setSoTimeout(100);
 
+        // The backend reads the query and then says nothing for as long as the simulator waits.
+        CompletableFuture<Void> simulatorReturned = new CompletableFuture<>();
         Thread backend = backendThread(() -> {
             new PostgresWireDecoder(testBackend.getInputStream()).nextMessage();
-            try {
-                Thread.sleep(300);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            simulatorReturned.orTimeout(10, TimeUnit.SECONDS).join();
         });
 
         boolean handled = S3CopySimulator.runCopyFrom(simClient, simBackend, spec, s3, null, 'I');
+        simulatorReturned.complete(null);
         joinBackend(backend);
         assertTrue(handled);
 

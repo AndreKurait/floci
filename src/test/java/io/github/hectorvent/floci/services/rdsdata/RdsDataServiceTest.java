@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.h2.Driver;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -32,6 +33,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -55,6 +57,10 @@ class RdsDataServiceTest {
     private static final String UNKNOWN_RESOURCE_ARN = "arn:aws:rds:us-east-1:000000000000:cluster:missing";
     private static final String SECRET_ARN = "arn:aws:secretsmanager:us-east-1:000000000000:secret:local/rds-data";
     private static final String REGION = "us-east-1";
+    // floci.services.rds-data.transaction-ttl-seconds as shipped, and the sweep interval it gives.
+    private static final Duration DEFAULT_TRANSACTION_TTL = Duration.ofSeconds(180);
+    private static final Duration CLEANUP_INTERVAL = Duration.ofSeconds(60);
+    private static final Duration ONE_NANO = Duration.ofNanos(1);
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -910,14 +916,15 @@ class RdsDataServiceTest {
 
     @Test
     void rollsBackExpiredTransactionsDuringCleanup() throws Exception {
-        TestHarness harness = new TestHarness(Duration.ofMillis(50));
+        TestTime time = TestTime.create();
+        TestHarness harness = new TestHarness(time);
         harness.createTables();
 
         String tx = harness.service.beginTransaction(harness.beginRequest(), REGION).get("transactionId").asText();
         ObjectNode insert = harness.request("insert into data_api_items(id, title, score) values ('expired', 'Expired', 1)");
         insert.put("transactionId", tx);
         harness.service.executeStatement(insert, REGION);
-        Thread.sleep(500);
+        time.advance(DEFAULT_TRANSACTION_TTL.plus(ONE_NANO));
 
         ObjectNode nextTxRequest = harness.request("select 1");
         nextTxRequest.put("transactionId", tx);
@@ -926,6 +933,63 @@ class RdsDataServiceTest {
 
         assertEquals("TransactionNotFoundException", expired.getErrorCode());
         assertEquals(0L, harness.countById("expired"));
+    }
+
+    @Test
+    void aTransactionIsStillUsableAtTheInstantItsIdleTimeoutEnds() throws Exception {
+        TestTime time = TestTime.create();
+        TestHarness harness = new TestHarness(time);
+        harness.createTables();
+        String tx = harness.service.beginTransaction(harness.beginRequest(), REGION).get("transactionId").asText();
+        ObjectNode insert = harness.request("insert into data_api_items(id, title, score) values ('kept', 'Kept', 1)");
+        insert.put("transactionId", tx);
+
+        time.advance(DEFAULT_TRANSACTION_TTL);
+        harness.service.executeStatement(insert, REGION);
+        // The statement restarted the idle timeout, so the transaction lives a whole one from here.
+        time.advance(DEFAULT_TRANSACTION_TTL);
+        harness.service.commitTransaction(harness.transactionRequest(tx), REGION);
+
+        assertEquals(1L, harness.countById("kept"));
+    }
+
+    @Test
+    void theCleanupSweepRollsBackAnIdleTransactionNobodyAsksAbout() throws Exception {
+        TestTime time = TestTime.create();
+        TestHarness harness = new TestHarness(time);
+        harness.createTables();
+        harness.service.startTransactionCleanup();
+        String tx = harness.service.beginTransaction(harness.beginRequest(), REGION).get("transactionId").asText();
+        ObjectNode insert = harness.request("insert into data_api_items(id, title, score) values ('idle', 'Idle', 1)");
+        insert.put("transactionId", tx);
+        harness.service.executeStatement(insert, REGION);
+
+        // Sweeps run every minute. The one at three minutes finds the transaction at the very end
+        // of its idle timeout, which is not past it; the next one is a nanosecond away.
+        time.advance(DEFAULT_TRANSACTION_TTL.plus(CLEANUP_INTERVAL).minus(ONE_NANO));
+        assertEquals(1, harness.gate.held.get(), "no sweep has seen the transaction expired yet");
+
+        time.advance(ONE_NANO);
+        assertEquals(0, harness.gate.held.get());
+        assertEquals(0L, harness.countById("idle"));
+        harness.service.shutdown();
+        assertEquals(0, time.pendingTasks());
+    }
+
+    @Test
+    void theCleanupSweepRunsOnTheRealSchedulerWithoutARequestToTriggerIt() throws Exception {
+        // Real-time wiring check: the one-second interval is the shortest the service schedules.
+        TestHarness harness = new TestHarness(Duration.ofSeconds(1));
+        harness.service.beginTransaction(harness.beginRequest(), REGION);
+        assertEquals(1, harness.gate.held.get());
+        harness.service.startTransactionCleanup();
+        try {
+
+            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(20))
+                    .until(() -> harness.gate.held.get() == 0);
+        } finally {
+            harness.service.shutdown();
+        }
     }
 
     @Test
@@ -978,10 +1042,13 @@ class RdsDataServiceTest {
 
     @Test
     void expiredTransactionLetsTheClusterPause() throws Exception {
-        TestHarness harness = new TestHarness(Duration.ofMillis(50));
+        TestTime time = TestTime.create();
+        TestHarness harness = new TestHarness(time);
         String tx = harness.service.beginTransaction(harness.beginRequest(), REGION)
                 .get("transactionId").asText();
-        Thread.sleep(200);
+        time.advance(DEFAULT_TRANSACTION_TTL);
+        assertEquals(1, harness.gate.held.get());
+        time.advance(ONE_NANO);
 
         ObjectNode next = harness.request("select 1");
         next.put("transactionId", tx);
@@ -1325,6 +1392,11 @@ class RdsDataServiceTest {
             this(DatabaseEngine.MYSQL, transactionTtl);
         }
 
+        /** The default transaction idle timeout, on a timeline the test moves. */
+        private TestHarness(TestTime time) {
+            this(defaultSecrets(), DatabaseEngine.MYSQL, DEFAULT_TRANSACTION_TTL, false, time);
+        }
+
         private TestHarness(DatabaseEngine engine, Duration transactionTtl) {
             this(defaultSecrets(), engine, transactionTtl);
         }
@@ -1335,6 +1407,11 @@ class RdsDataServiceTest {
 
         private TestHarness(SecretsManagerService secrets, DatabaseEngine engine, Duration transactionTtl,
                             boolean resumingExceptionEnabled) {
+            this(secrets, engine, transactionTtl, resumingExceptionEnabled, null);
+        }
+
+        private TestHarness(SecretsManagerService secrets, DatabaseEngine engine, Duration transactionTtl,
+                            boolean resumingExceptionEnabled, TestTime time) {
             jdbcUrl = "jdbc:h2:mem:rdsdata_" + UUID.randomUUID() + ";MODE=" + h2Mode(engine)
                     + ";DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1";
             resolver = mock(RdsDataResourceResolver.class);
@@ -1364,8 +1441,12 @@ class RdsDataServiceTest {
                     return getConnection();
                 }
             };
-            service = new RdsDataService(resolver, secrets, objectMapper, connectionFactory,
-                    transactionTtl, gate, backendEndpointResolver, resumingExceptionEnabled);
+            service = time == null
+                    ? new RdsDataService(resolver, secrets, objectMapper, connectionFactory,
+                            transactionTtl, gate, backendEndpointResolver, resumingExceptionEnabled)
+                    : new RdsDataService(resolver, secrets, objectMapper, connectionFactory,
+                            transactionTtl, gate, backendEndpointResolver, resumingExceptionEnabled,
+                            time.clock(), time.scheduler());
         }
 
         private Connection getConnection() throws SQLException {

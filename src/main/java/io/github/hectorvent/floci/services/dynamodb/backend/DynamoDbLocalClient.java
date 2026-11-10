@@ -40,13 +40,17 @@ class DynamoDbLocalClient implements AutoCloseable {
     private final String path;
 
     DynamoDbLocalClient(URI endpoint, Duration connectTimeout, Duration requestTimeout, ObjectMapper mapper) {
+        this(endpoint, requestTimeout, mapper, HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(connectTimeout)
+                .build());
+    }
+
+    DynamoDbLocalClient(URI endpoint, Duration requestTimeout, ObjectMapper mapper, HttpClient http) {
         this.endpoint = endpoint;
         this.requestTimeout = requestTimeout;
         this.mapper = mapper;
-        this.http = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1)
-                .connectTimeout(connectTimeout)
-                .build();
+        this.http = http;
         this.host = endpoint.getHost() + (endpoint.getPort() != -1 ? ":" + endpoint.getPort() : "");
         String rawPath = endpoint.getRawPath();
         this.path = rawPath == null || rawPath.isEmpty() ? "/" : rawPath;

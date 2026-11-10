@@ -5,10 +5,12 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
 import io.github.hectorvent.floci.testing.ParkingStore;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -113,41 +115,27 @@ class SqsNotificationWaitTest {
                 return super.get(key);
             }
         };
-        SqsService service = new SqsService(storage, 30, 1048576, "http://localhost:4566", Clock.systemUTC());
+        TestTime time = TestTime.create();
+        TimelineSqsTiming timing = new TimelineSqsTiming(time);
+        SqsService service = new SqsService(storage, 30, 1048576, "http://localhost:4566", time.clock(), timing,
+                SqsService.newMoveTaskExecutor());
         Queue queue = service.createQueue("idle-signal", null, REGION);
-        Field field = SqsService.class.getDeclaredField("messagesByQueue");
-        field.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        ConcurrentHashMap<String, GuardedMessageQueue> queues =
-                (ConcurrentHashMap<String, GuardedMessageQueue>) field.get(service);
-        String key = queues.keySet().iterator().next();
-        CountDownLatch waiting = new CountDownLatch(1);
-        CountDownLatch releaseWait = new CountDownLatch(1);
-        AtomicInteger waits = new AtomicInteger();
-        GuardedMessageQueue observedQueue = new GuardedMessageQueue(null, null) {
-            @Override
-            void awaitChange(long observed, long timeoutNanos) throws InterruptedException {
-                waits.incrementAndGet();
-                waiting.countDown();
-                assertTrue(releaseWait.await(5, TimeUnit.SECONDS));
-                assertEquals(2, reads.get(), "Empty poll rescanned before its deadline");
-                super.awaitChange(observed, timeoutNanos);
-            }
-        };
-        queues.put(key, observedQueue).close();
         reads.set(0);
         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         try {
             Future<List<Message>> receive = executor.submit(
-                    () -> service.receiveMessage(queue.getQueueUrl(), 1, 30, 2, REGION));
-            assertTrue(waiting.await(5, TimeUnit.SECONDS), "Receive must reach its notification wait");
+                    () -> service.receiveMessage(queue.getQueueUrl(), 1, 30, 20, REGION));
+            assertEquals(Duration.ofSeconds(20), timing.awaitPark(),
+                    "An idle receive waits once, for all of its WaitTimeSeconds");
             assertEquals(2, reads.get(), "Initial lookup and first claim precede waiting");
-            releaseWait.countDown();
+            time.advance(Duration.ofSeconds(20).minusNanos(1));
+            assertEquals(2, reads.get(), "Empty poll rescanned before its deadline");
+            assertFalse(receive.isDone());
+            time.advance(Duration.ofNanos(1));
             assertTrue(receive.get(5, TimeUnit.SECONDS).isEmpty());
-            assertEquals(1, waits.get(), "An idle receive waits once until its deadline");
+            assertEquals(0, timing.unreportedParks(), "An idle receive waits once until its deadline");
             assertEquals(3, reads.get(), "Only initial lookup, first claim and deadline claim are needed");
         } finally {
-            releaseWait.countDown();
             executor.shutdownNow();
             assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
             service.stop();

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.sqs;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.EmulatorConfig.SqsServiceConfig.EndpointStrategy;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -14,6 +15,7 @@ import io.github.hectorvent.floci.lifecycle.EmulatorInfoController;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
 import io.github.hectorvent.floci.testing.ParkingStore;
+import io.github.hectorvent.floci.testing.TestTime;
 import io.github.hectorvent.floci.testing.ThreadStates;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.core.Response;
@@ -24,9 +26,11 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -256,8 +260,13 @@ class SqsOuterResetPersistenceTest {
             call.callRealMethod();
             return null;
         }).when(messages).putForAccount(anyString(), anyString(), anyList());
-        SqsService service = service(factory.create("sqs", "queues.json", QUEUES), messages,
-                factory.create("sqs", "dedup.json", DEDUP), factory.create("sqs", "identities.json", IDENTITIES));
+        TestTime time = TestTime.create();
+        TimelineSqsTiming timing = new TimelineSqsTiming(time);
+        SqsService service = new SqsService(factory.create("sqs", "queues.json", QUEUES), messages,
+                factory.create("sqs", "dedup.json", DEDUP), factory.create("sqs", "identities.json", IDENTITIES),
+                30, 1048576, "http://localhost:4566", new RegionResolver(REGION, ACCOUNT), false, null, time.clock(),
+                ReceiptHandle.DEFAULT_SECRET, null, null, EndpointStrategy.FLOCI, timing,
+                SqsService.newMoveTaskExecutor());
         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
         Future<?> write = null;
         try {
@@ -265,8 +274,13 @@ class SqsOuterResetPersistenceTest {
             parked.parkNextWrite();
             write = executor.submit(() -> service.sendMessage(queue.getQueueUrl(), "retained", null, REGION));
             assertTrue(parked.awaitParked());
-            IllegalStateException failure = assertThrows(IllegalStateException.class,
-                    () -> controller(factory, service).reset());
+            Future<Response> reset = executor.submit(() -> controller(factory, service).reset());
+            assertEquals(Duration.ofSeconds(5), timing.awaitPark(), "reset gives admitted operations 5 s to drain");
+            time.advance(Duration.ofSeconds(5).minusNanos(1));
+            assertFalse(reset.isDone(), "reset is still waiting for the parked write one nanosecond before the timeout");
+            time.advance(Duration.ofNanos(1));
+            ExecutionException failed = assertThrows(ExecutionException.class, () -> reset.get(5, TimeUnit.SECONDS));
+            IllegalStateException failure = assertInstanceOf(IllegalStateException.class, failed.getCause());
             assertEquals("Timed out draining SQS operations before reset", failure.getMessage());
             verify(factory, never()).clearAll();
             service.createQueue("resumed-before-writer", null, REGION);

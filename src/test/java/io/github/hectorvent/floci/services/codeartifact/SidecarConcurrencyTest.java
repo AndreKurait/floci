@@ -3,25 +3,28 @@ package io.github.hectorvent.floci.services.codeartifact;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
-import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Focused unit coverage for the bounded-fan-out helper {@code PypiserverSidecarClient} and {@code
@@ -38,21 +41,31 @@ class SidecarConcurrencyTest {
     @Test
     void mapBoundedPreservesInputOrderRegardlessOfCompletionOrder() {
         List<Integer> items = List.of(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+        // Items 3 to 10 finish in strictly reverse order: each waits for the item after it, and the
+        // last one waits for nobody. Eight of them fit under the cap together, so none is left
+        // waiting on an item that cannot start.
+        Map<Integer, CountDownLatch> finished = new ConcurrentHashMap<>();
+        for (int item : items) {
+            finished.put(item, new CountDownLatch(1));
+        }
+        List<Integer> completionOrder = new CopyOnWriteArrayList<>();
         List<String> result = SidecarConcurrency.mapBounded(new Object(), items, i -> {
-            // Later items sleep less, so they would finish first if order depended on completion.
-            try {
-                Thread.sleep((11 - i) % 4);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                fail("interrupted");
+            if (i >= 3 && i < 10) {
+                awaitOpen(finished.get(i + 1), "item " + (i + 1) + " never finished");
             }
+            if (i >= 3) {
+                completionOrder.add(i);
+            }
+            finished.get(i).countDown();
             return "v" + i;
         });
         assertThat(result, equalTo(List.of("v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10")));
+        assertThat(completionOrder, equalTo(List.of(10, 9, 8, 7, 6, 5, 4, 3)));
     }
 
     @Test
-    void mapBoundedNeverRunsMoreThanTheConcurrencyCapAtOnce() throws InterruptedException {
+    void mapBoundedNeverRunsMoreThanTheConcurrencyCapAtOnce() throws Exception {
+        Object key = new Object();
         int itemCount = 32;
         List<Integer> items = new ArrayList<>(itemCount);
         for (int i = 0; i < itemCount; i++) {
@@ -60,29 +73,31 @@ class SidecarConcurrencyTest {
         }
         AtomicInteger concurrent = new AtomicInteger();
         AtomicInteger maxObserved = new AtomicInteger();
+        Semaphore hold = new Semaphore(0);
         CountDownLatch allDone = new CountDownLatch(1);
         Thread worker = new Thread(() -> {
-            SidecarConcurrency.mapBounded(new Object(), items, i -> {
+            SidecarConcurrency.mapBounded(key, items, i -> {
                 int current = concurrent.incrementAndGet();
                 maxObserved.getAndUpdate(previous -> Math.max(previous, current));
-                try {
-                    Thread.sleep(20);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
+                hold.acquireUninterruptibly();
                 concurrent.decrementAndGet();
                 return i;
             });
             allDone.countDown();
         });
         worker.start();
+
+        // Every item is accounted for: eight are running and held, the other 24 are parked on the cap.
+        awaitRunningAndQueued(key, concurrent, 8, itemCount - 8);
+        assertEquals(8, maxObserved.get());
+
+        hold.release(itemCount);
         assertTrue(allDone.await(10, TimeUnit.SECONDS), "mapBounded did not finish in time");
-        assertTrue(maxObserved.get() <= 8, "expected at most 8 concurrent items, saw " + maxObserved.get());
-        assertTrue(maxObserved.get() > 1, "expected real parallelism, saw " + maxObserved.get());
+        assertEquals(8, maxObserved.get(), "the cap held while the queued items ran");
     }
 
     @Test
-    void mapBoundedCapsConcurrencyAcrossSimultaneousCallsSharingTheSameSidecarKey() throws InterruptedException {
+    void mapBoundedCapsConcurrencyAcrossSimultaneousCallsSharingTheSameSidecarKey() throws Exception {
         Object sharedKey = new Object();
         int itemsPerCall = 6;
         List<Integer> items = new ArrayList<>(itemsPerCall);
@@ -91,14 +106,11 @@ class SidecarConcurrencyTest {
         }
         AtomicInteger concurrent = new AtomicInteger();
         AtomicInteger maxObserved = new AtomicInteger();
+        Semaphore hold = new Semaphore(0);
         Runnable call = () -> SidecarConcurrency.mapBounded(sharedKey, items, i -> {
             int current = concurrent.incrementAndGet();
             maxObserved.getAndUpdate(previous -> Math.max(previous, current));
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            hold.acquireUninterruptibly();
             concurrent.decrementAndGet();
             return i;
         });
@@ -106,12 +118,50 @@ class SidecarConcurrencyTest {
         Thread callB = new Thread(call);
         callA.start();
         callB.start();
-        callA.join(10_000);
-        callB.join(10_000);
-        assertThat("two simultaneous calls sharing one sidecar key must not exceed the shared cap in aggregate",
-                maxObserved.get(), lessThanOrEqualTo(8));
+
+        // Twelve items across the two calls: eight running, which is more than one call has, and
+        // the other four parked on the shared cap.
+        awaitRunningAndQueued(sharedKey, concurrent, 8, 2 * itemsPerCall - 8);
         assertThat("expected the two calls' work to actually overlap under the shared cap", maxObserved.get(),
                 greaterThan(itemsPerCall));
+
+        hold.release(2 * itemsPerCall);
+        callA.join(10_000);
+        callB.join(10_000);
+        assertFalse(callA.isAlive() || callB.isAlive(), "the calls did not finish in time");
+        assertEquals(8, maxObserved.get(),
+                "two simultaneous calls sharing one sidecar key must not exceed the shared cap in aggregate");
+    }
+
+    /** Waits until {@code running} items are inside {@code perItem} and {@code queued} more wait for a permit. */
+    private static void awaitRunningAndQueued(Object key, AtomicInteger concurrent, int running, int queued)
+            throws Exception {
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> concurrent.get() == running && permitsOf(key).getQueueLength() == queued);
+        assertEquals(0, permitsOf(key).availablePermits());
+    }
+
+    private static Semaphore permitsOf(Object key) throws Exception {
+        Field permits = SidecarConcurrency.class.getDeclaredField("SIDECAR_PERMITS");
+        permits.setAccessible(true);
+        Object use = ((Map<?, ?>) permits.get(null)).get(key);
+        if (use == null) {
+            return new Semaphore(0);
+        }
+        Field semaphore = use.getClass().getDeclaredField("semaphore");
+        semaphore.setAccessible(true);
+        return (Semaphore) semaphore.get(use);
+    }
+
+    private static void awaitOpen(CountDownLatch latch, String otherwise) {
+        try {
+            if (!latch.await(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException(otherwise);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(otherwise, e);
+        }
     }
 
     @Test

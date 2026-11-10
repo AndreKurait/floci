@@ -17,6 +17,7 @@ import java.io.InputStreamReader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -26,6 +27,7 @@ import java.util.zip.GZIPInputStream;
 import static io.github.hectorvent.floci.testing.DynamoDbRequests.ddb;
 import static io.github.hectorvent.floci.testing.DynamoDbRequests.decimalAt;
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -359,9 +361,9 @@ class DynamoDbExportIntegrationTest {
                 "Point in time recovery is not enabled for table '" + table + "'");
 
         // EarliestRestorableDateTime is in whole seconds. Enabling in a later second puts it after the creation.
-        while (System.currentTimeMillis() / 1000 <= afterCreate / 1000) {
-            Thread.sleep(10);
-        }
+        // The service reads the system clock, so the next second is a real one: at most a second away.
+        await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(10))
+                .until(() -> System.currentTimeMillis() / 1000 > afterCreate / 1000);
         BigDecimal earliest = decimalAt(enablePointInTimeRecovery(table),
                 "/ContinuousBackupsDescription/PointInTimeRecoveryDescription/EarliestRestorableDateTime");
         expectError(exportAt(table, "export-checks", BigDecimal.valueOf(beforeCreate - 1000, 3)),
@@ -544,27 +546,14 @@ class DynamoDbExportIntegrationTest {
     }
 
     private String pollUntilCompleted(String exportArn, long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < deadline) {
-            String status = given()
+        return await().atMost(Duration.ofMillis(timeoutMs)).until(() -> given()
                 .header("X-Amz-Target", "DynamoDB_20120810.DescribeExport")
                 .contentType(DYNAMODB_CONTENT_TYPE)
                 .body("{\"ExportArn\": \"" + exportArn + "\"}")
                 .when().post("/")
                 .then().statusCode(200)
-                .extract().path("ExportDescription.ExportStatus");
-
-            if ("COMPLETED".equals(status) || "FAILED".equals(status)) {
-                return status;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return status;
-            }
-        }
-        return "TIMEOUT";
+                .extract().<String>path("ExportDescription.ExportStatus"),
+                status -> "COMPLETED".equals(status) || "FAILED".equals(status));
     }
 
     private String decompressGzip(byte[] data) throws Exception {

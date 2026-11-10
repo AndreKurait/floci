@@ -13,6 +13,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.everyItem;
@@ -71,21 +72,12 @@ class SesExportJobV2IntegrationTest {
     }
 
     private static String awaitTerminal(String jobId) {
-        for (int attempt = 0; attempt < 100; attempt++) {
-            String status = given().header("Authorization", AUTH)
-            .when().get("/v2/email/export-jobs/" + jobId).then().statusCode(200)
-                    .extract().path("JobStatus");
-            if (!"PROCESSING".equals(status) && !"CREATED".equals(status)) {
-                return status;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("interrupted while waiting for the job", e);
-            }
-        }
-        throw new AssertionError("export job " + jobId + " never reached a terminal state");
+        return await("export job " + jobId + " reaches a terminal state")
+                .atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> given().header("Authorization", AUTH)
+                        .when().get("/v2/email/export-jobs/" + jobId).then().statusCode(200)
+                        .extract().path("JobStatus"),
+                    status -> !"PROCESSING".equals(status) && !"CREATED".equals(status));
     }
 
     @Test

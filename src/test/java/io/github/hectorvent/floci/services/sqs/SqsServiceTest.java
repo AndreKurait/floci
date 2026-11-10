@@ -13,9 +13,10 @@ import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
-import io.github.hectorvent.floci.testing.MutableClock;
+import io.github.hectorvent.floci.testing.TestTime;
 import jakarta.enterprise.context.ContextNotActiveException;
 import jakarta.enterprise.inject.Instance;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -23,19 +24,21 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -46,14 +49,45 @@ import static org.mockito.Mockito.when;
 
 class SqsServiceTest {
 
-    private SqsService sqsService;
-    private MutableClock clock;
     private static final String BASE_URL = "http://localhost:4566";
+    private static final Duration ONE_NANO = Duration.ofNanos(1);
+
+    private final TestTime time = TestTime.create();
+    private final Clock clock = time.clock();
+    private final TimelineSqsTiming timing = new TimelineSqsTiming(time);
+    private final JoinableMoveTasks moveTasks = new JoinableMoveTasks();
+    private SqsService sqsService;
 
     @BeforeEach
     void setUp() {
-        clock = new MutableClock();
-        sqsService = new SqsService(new InMemoryStorage<>(), 30, 1048576, BASE_URL, clock);
+        sqsService = new SqsService(new InMemoryStorage<>(), 30, 1048576, BASE_URL, clock, timing, moveTasks);
+    }
+
+    @AfterEach
+    void stopMoveTaskWorkers() {
+        sqsService.stop();
+    }
+
+    /** A service on this test's timeline over the stores a test wants to hold. */
+    private SqsService timelineService(StorageBackend<String, Queue> queueStore,
+                                       StorageBackend<String, List<Message>> messageStore,
+                                       RegionResolver regionResolver) {
+        return new SqsService(queueStore, messageStore, null, null, 30, 1048576, BASE_URL, regionResolver, false,
+                null, clock, ReceiptHandle.DEFAULT_SECRET, null, null, EndpointStrategy.FLOCI, timing, moveTasks);
+    }
+
+    /** A ReceiveMessage on its own thread, for a test that acts while the long poll is parked. */
+    private CompletableFuture<List<Message>> receiveOnAnotherThread(String queueUrl, Integer waitTimeSeconds,
+                                                                    String region) {
+        CompletableFuture<List<Message>> received = new CompletableFuture<>();
+        Thread.ofVirtual().start(() -> {
+            try {
+                received.complete(sqsService.receiveMessage(queueUrl, 1, 30, waitTimeSeconds, region));
+            } catch (Throwable failure) {
+                received.completeExceptionally(failure);
+            }
+        });
+        return received;
     }
 
     @Test
@@ -954,7 +988,7 @@ class SqsServiceTest {
     void getQueueAttributesReportsDelayedMessages() {
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("delayed-attr-queue", null, region);
-        sqsService.sendMessage(queue.getQueueUrl(), "msg", 1, region);
+        sqsService.sendMessage(queue.getQueueUrl(), "msg", 900, region);
 
         Map<String, String> whileDelayed =
                 sqsService.getQueueAttributes(queue.getQueueUrl(), List.of("All"), region);
@@ -963,7 +997,13 @@ class SqsServiceTest {
                 "A delayed message is not in flight");
         assertEquals("1", whileDelayed.get("ApproximateNumberOfMessagesDelayed"));
 
-        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        time.advance(Duration.ofSeconds(900).minus(ONE_NANO));
+        Map<String, String> justBefore =
+                sqsService.getQueueAttributes(queue.getQueueUrl(), List.of("All"), region);
+        assertEquals("0", justBefore.get("ApproximateNumberOfMessages"));
+        assertEquals("1", justBefore.get("ApproximateNumberOfMessagesDelayed"),
+                "Still delayed one nanosecond before its 900 s DelaySeconds is up");
+        time.advance(ONE_NANO);
 
         Map<String, String> afterDelay =
                 sqsService.getQueueAttributes(queue.getQueueUrl(), List.of("All"), region);
@@ -1133,9 +1173,16 @@ class SqsServiceTest {
     void fifoDeduplicationExpiresAtTheFiveMinuteBoundary() {
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("expired-dedup.fifo", null, region);
-        sqsService.sendMessage(queue.getQueueUrl(), "original", 0, "group-a", "dedup-a", region);
+        Message original = sqsService.sendMessage(queue.getQueueUrl(), "original", 0, "group-a", "dedup-a", region);
 
-        clock.advance(Duration.ofMinutes(5));
+        time.advance(Duration.ofMinutes(5).minus(ONE_NANO));
+        Message insideWindow =
+                sqsService.sendMessage(queue.getQueueUrl(), "inside-window", 0, "group-a", "dedup-a", region);
+        assertEquals(original.getMessageId(), insideWindow.getMessageId(),
+                "one nanosecond before the five minutes are up the id still deduplicates");
+        assertEquals(1, sqsService.peekMessages(queue.getQueueUrl(), region).size());
+
+        time.advance(ONE_NANO);
         sqsService.sendMessage(queue.getQueueUrl(), "after-window", 0, "group-a", "dedup-a", region);
 
         List<Message> received = sqsService.receiveMessage(queue.getQueueUrl(), 2, 30, 0, region);
@@ -1154,7 +1201,7 @@ class SqsServiceTest {
                 sqsService.sendMessage(queueUrl, "original", 0, "group-a", "dedup-a", region);
                 Message original = sqsService.receiveMessage(queueUrl, 1, 30, 0, region).getFirst();
                 sqsService.deleteMessage(queueUrl, original.getReceiptHandle(), region);
-                clock.advance(Duration.ofMinutes(5));
+                time.advance(Duration.ofMinutes(5));
 
                 CountDownLatch ready = new CountDownLatch(2);
                 CountDownLatch start = new CountDownLatch(1);
@@ -1320,9 +1367,9 @@ class SqsServiceTest {
     void receiveMessageUsesQueueVisibilityTimeoutWhenNotSpecified() {
         String region = "eu-west-1";
 
-        // Create queue with a short visibility timeout (1 second)
+        // A queue whose visibility timeout (10 seconds) is shorter than the global default (30 seconds)
         Queue queue = sqsService.createQueue("short-vt-queue",
-                Map.of("VisibilityTimeout", "1"), region);
+                Map.of("VisibilityTimeout", "10"), region);
         sqsService.sendMessage(queue.getQueueUrl(), "test-msg", 0, region);
 
         // Receive without specifying visibility timeout (-1 means "use queue default")
@@ -1333,12 +1380,15 @@ class SqsServiceTest {
         List<Message> second = sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0, region);
         assertTrue(second.isEmpty());
 
-        // Wait for the queue's visibility timeout (1s) to expire, not the global default (30s)
-        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        // The queue's visibility timeout (10s) decides, not the global default (30s)
+        time.advance(Duration.ofSeconds(10).minus(ONE_NANO));
+        assertTrue(sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0, region).isEmpty(),
+                "Message is still in flight one nanosecond before the queue's VisibilityTimeout is up");
+        time.advance(ONE_NANO);
 
         // Message should now be visible again
         List<Message> third = sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0, region);
-        assertEquals(1, third.size(), "Message should become visible after queue's VisibilityTimeout (1s), not global default (30s)");
+        assertEquals(1, third.size(), "Message should become visible after queue's VisibilityTimeout (10s), not global default (30s)");
     }
 
     // --- Queue-level DelaySeconds for FIFO queues (issue #475) ---
@@ -1348,14 +1398,17 @@ class SqsServiceTest {
         String region = "eu-west-1";
 
         Queue queue = sqsService.createQueue("delay-fifo.fifo",
-                Map.of("ContentBasedDeduplication", "true", "DelaySeconds", "1"), region);
+                Map.of("ContentBasedDeduplication", "true", "DelaySeconds", "900"), region);
         sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", null, region);
 
         List<Message> immediate = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0, region);
         assertTrue(immediate.isEmpty(),
                 "FIFO queue should honor queue-level DelaySeconds (issue #475)");
 
-        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        time.advance(Duration.ofSeconds(900).minus(ONE_NANO));
+        assertTrue(sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0, region).isEmpty(),
+                "Message is still delayed one nanosecond before DelaySeconds elapses");
+        time.advance(ONE_NANO);
 
         List<Message> later = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0, region);
         assertEquals(1, later.size(),
@@ -1369,10 +1422,10 @@ class SqsServiceTest {
         // message in the same group unreceivable.
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("delay-group-lock.fifo",
-                Map.of("ContentBasedDeduplication", "true", "DelaySeconds", "1"), region);
+                Map.of("ContentBasedDeduplication", "true", "DelaySeconds", "900"), region);
         sqsService.sendMessage(queue.getQueueUrl(), "A", 0, "group1", null, region);
 
-        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        time.advance(Duration.ofSeconds(900));
 
         sqsService.sendMessage(queue.getQueueUrl(), "B", 0, "group1", null, region);
 
@@ -1404,14 +1457,17 @@ class SqsServiceTest {
     void queueLevelDelaySecondsAppliesToStandardQueue() {
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("delay-standard",
-                Map.of("DelaySeconds", "1"), region);
+                Map.of("DelaySeconds", "900"), region);
         sqsService.sendMessage(queue.getQueueUrl(), "msg", null, region);
 
         List<Message> immediate = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0, region);
         assertTrue(immediate.isEmpty(),
                 "Standard queue should honor queue-level DelaySeconds");
 
-        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        time.advance(Duration.ofSeconds(900).minus(ONE_NANO));
+        assertTrue(sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0, region).isEmpty(),
+                "Message is still delayed one nanosecond before DelaySeconds elapses");
+        time.advance(ONE_NANO);
 
         List<Message> later = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0, region);
         assertEquals(1, later.size(),
@@ -1821,9 +1877,9 @@ class SqsServiceTest {
             }
             return requestContext;
         });
-        SqsService service = new SqsService(
+        SqsService service = timelineService(
                 new AccountAwareStorageBackend<>(new InMemoryStorage<>(), requestContextInstance, "000000000000"),
-                null, null, 30, 1048576, BASE_URL, new RegionResolver("us-east-1", account), false, null, clock);
+                null, new RegionResolver("us-east-1", account));
         String dlqArn = "arn:aws:sqs:us-east-1:" + account + ":acct-dlq";
         Queue dlq = service.createQueue("acct-dlq", null, "us-east-1");
         service.createQueue("acct-source", Map.of("RedrivePolicy", redrivePolicy(dlqArn)), "us-east-1");
@@ -1929,8 +1985,7 @@ class SqsServiceTest {
                 super.put(key, value);
             }
         };
-        return new SqsService(new InMemoryStorage<>(), messageStore, null, 30, 1048576, BASE_URL,
-                new RegionResolver("us-east-1", "000000000000"), false, null, clock);
+        return timelineService(new InMemoryStorage<>(), messageStore, new RegionResolver("us-east-1", "000000000000"));
     }
 
     private static String redrivePolicy(String dlqArn) {
@@ -2046,19 +2101,21 @@ class SqsServiceTest {
         // reflects a cancel immediately (CANCELLING, then CANCELLED once nothing is in
         // flight); the worker must be woken, not left to sleep out its interval.
         String taskHandle = sqsService.startMessageMoveTask(dlqArn, destinationArn, 1, "us-east-1");
+        assertEquals(Duration.ofSeconds(1), timing.awaitPark(), "the worker waits a second before its next move");
+        Instant parkedAt = time.now();
         sqsService.cancelMessageMoveTask(taskHandle, "us-east-1");
 
         String statusRightAfterCancel = moveTaskStatus(dlqArn, taskHandle);
         assertTrue("CANCELLING".equals(statusRightAfterCancel) || "CANCELLED".equals(statusRightAfterCancel),
                 "expected CANCELLING or CANCELLED right after CancelMessageMoveTask returned, was " + statusRightAfterCancel);
 
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
-        while (!"CANCELLED".equals(moveTaskStatus(dlqArn, taskHandle))) {
-            assertTrue(System.nanoTime() < deadline,
-                    "move task still " + moveTaskStatus(dlqArn, taskHandle) + " 300 ms after the cancel");
-            Thread.sleep(5);
-        }
-        assertEquals(1, sqsService.listMessageMoveTasks(dlqArn, "us-east-1").size());
+        // The timeline has not moved, so the worker's one-second wait can only have ended on the cancel.
+        moveTasks.join();
+        assertEquals(parkedAt, time.now());
+        assertEquals("CANCELLED", moveTaskStatus(dlqArn, taskHandle));
+        List<SqsService.MoveTask> tasks = sqsService.listMessageMoveTasks(dlqArn, "us-east-1");
+        assertEquals(1, tasks.size());
+        assertEquals(1, tasks.getFirst().approximateNumberOfMessagesMoved(), "nothing moved after the cancel");
     }
 
     @Test
@@ -2081,43 +2138,55 @@ class SqsServiceTest {
         String taskHandle = sqsService.startMessageMoveTask(dlqArn, destinationArn, "us-east-1");
         sqsService.cancelMessageMoveTask(taskHandle, "us-east-1");
 
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        String status;
-        while (!"CANCELLED".equals(status = moveTaskStatus(dlqArn, taskHandle))) {
-            assertNotEquals("RUNNING", status, "a cancelled task reported RUNNING again");
-            assertTrue(System.nanoTime() < deadline, "move task never reached CANCELLED, last seen " + status);
+        CompletableFuture<Void> workerDone = CompletableFuture.runAsync(moveTasks::join);
+        while (!workerDone.isDone()) {
+            assertNotEquals("RUNNING", moveTaskStatus(dlqArn, taskHandle), "a cancelled task reported RUNNING again");
         }
+        workerDone.get();
+        assertEquals("CANCELLED", moveTaskStatus(dlqArn, taskHandle));
     }
 
     @Test
-    void cancelMessageMoveTask_acceptedCancelIsNotOverwrittenByTheWorkersTerminalWrite() throws Exception {
-        Queue dlq = sqsService.createQueue("cancel-terminal-dlq", null, "us-east-1");
+    void cancelMessageMoveTask_acceptedCancelIsNotOverwrittenByTheWorkersTerminalWrite() {
+        // The worker is held until the test runs it, so the task is still CANCELLING, not yet
+        // CANCELLED by the worker itself, when the stale terminal write is replayed.
+        ScheduledExecutorService heldWorker = time.newScheduler();
+        SqsService service = new SqsService(new InMemoryStorage<>(), 30, 1048576, BASE_URL, clock, timing, heldWorker);
+        Queue dlq = service.createQueue("cancel-terminal-dlq", null, "us-east-1");
         String dlqArn = queueArn("cancel-terminal-dlq");
-        sqsService.createQueue("cancel-terminal-source",
+        service.createQueue("cancel-terminal-source",
                 Map.of("RedrivePolicy",
                         "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":\"1\"}"),
                 "us-east-1");
-        sqsService.createQueue("cancel-terminal-destination", null, "us-east-1");
+        service.createQueue("cancel-terminal-destination", null, "us-east-1");
         String destinationArn = queueArn("cancel-terminal-destination");
         for (int i = 0; i < 50; i++) {
-            sqsService.sendMessage(dlq.getQueueUrl(), "msg-" + i, 0, null, null, "us-east-1");
+            service.sendMessage(dlq.getQueueUrl(), "msg-" + i, 0, null, null, "us-east-1");
         }
 
         // The interleaving: the worker reads its own signal and concludes COMPLETED, the cancel is
         // accepted (the task reads CANCELLING), and only then does the worker's terminal write
         // land. Replaying that write with the stale decision must not turn CANCELLING back into
         // COMPLETED.
-        String taskHandle = sqsService.startMessageMoveTask(dlqArn, destinationArn, 1, "us-east-1");
-        sqsService.cancelMessageMoveTask(taskHandle, "us-east-1");
-        sqsService.finishMoveTask(taskHandle, 1, false);
+        String taskHandle = service.startMessageMoveTask(dlqArn, destinationArn, 1, "us-east-1");
+        service.cancelMessageMoveTask(taskHandle, "us-east-1");
+        assertEquals("CANCELLING", moveTaskStatus(service, dlqArn, taskHandle));
+        service.finishMoveTask(taskHandle, 1, false);
 
-        assertEquals("CANCELLED", moveTaskStatus(dlqArn, taskHandle));
-        awaitMoveTaskStatus(dlqArn, taskHandle, "CANCELLED");
-        assertEquals("CANCELLED", moveTaskStatus(dlqArn, taskHandle));
+        assertEquals("CANCELLED", moveTaskStatus(service, dlqArn, taskHandle));
+        // The worker itself now runs, sees the cancel and makes its own terminal write.
+        time.runDue();
+        assertEquals("CANCELLED", moveTaskStatus(service, dlqArn, taskHandle));
+        assertEquals(0, time.pendingTasks());
+        service.stop();
     }
 
     private String moveTaskStatus(String sourceArn, String taskHandle) {
-        return sqsService.listMessageMoveTasks(sourceArn, "us-east-1").stream()
+        return moveTaskStatus(sqsService, sourceArn, taskHandle);
+    }
+
+    private static String moveTaskStatus(SqsService service, String sourceArn, String taskHandle) {
+        return service.listMessageMoveTasks(sourceArn, "us-east-1").stream()
                 .filter(task -> task.taskHandle().equals(taskHandle))
                 .map(SqsService.MoveTask::status)
                 .findFirst()
@@ -2139,17 +2208,11 @@ class SqsServiceTest {
         for (int i = 0; i < 11; i++) {
             String taskHandle = sqsService.startMessageMoveTask(dlqArn, destinationArn, 0, "us-east-1");
             taskHandles.add(taskHandle);
-            for (int attempt = 0; attempt < 50; attempt++) {
-                if (sqsService.listMessageMoveTasks(dlqArn, "us-east-1").stream()
-                        .anyMatch(task -> task.taskHandle().equals(taskHandle) && "COMPLETED".equals(task.status()))) {
-                    break;
-                }
-                Thread.sleep(10);
-            }
+            moveTasks.join();
             assertTrue(sqsService.listMessageMoveTasks(dlqArn, "us-east-1").stream()
                     .anyMatch(task -> task.taskHandle().equals(taskHandle) && "COMPLETED".equals(task.status())));
             if (i < 10) {
-                clock.advance(Duration.ofSeconds(2));
+                time.advance(Duration.ofSeconds(2));
             }
         }
 
@@ -2157,7 +2220,11 @@ class SqsServiceTest {
         assertEquals(10, recentTasks.size());
         assertFalse(recentTasks.stream().anyMatch(task -> task.taskHandle().equals(taskHandles.getFirst())));
 
-        clock.advance(Duration.ofHours(1).plusMillis(1));
+        // Each summary is kept for an hour after its task finished; the last one finished now.
+        time.advance(Duration.ofHours(1).minus(ONE_NANO));
+        assertEquals(List.of(taskHandles.getLast()), sqsService.listMessageMoveTasks(dlqArn, "us-east-1").stream()
+                .map(SqsService.MoveTask::taskHandle).toList());
+        time.advance(ONE_NANO);
         assertTrue(sqsService.listMessageMoveTasks(dlqArn, "us-east-1").isEmpty());
         AwsException ex = assertThrows(AwsException.class, () ->
                 sqsService.cancelMessageMoveTask(taskHandles.getLast(), "us-east-1"));
@@ -2187,7 +2254,7 @@ class SqsServiceTest {
         for (int i = 0; i < 10; i++) {
             String taskHandle = sqsService.startMessageMoveTask(sourceArnA, destinationArnA, 0, "us-east-1");
             awaitMoveTaskStatus(sourceArnA, taskHandle, "COMPLETED");
-            clock.advance(Duration.ofSeconds(2));
+            time.advance(Duration.ofSeconds(2));
         }
         String taskHandleB = sqsService.startMessageMoveTask(sourceArnB, destinationArnB, 0, "us-east-1");
         awaitMoveTaskStatus(sourceArnB, taskHandleB, "COMPLETED");
@@ -2217,7 +2284,7 @@ class SqsServiceTest {
             sqsService.cancelMessageMoveTask(taskHandle, "us-east-1");
             awaitMoveTaskStatus(dlqArn, taskHandle, "CANCELLED");
             if (i < 10) {
-                clock.advance(Duration.ofSeconds(2));
+                time.advance(Duration.ofSeconds(2));
             }
         }
 
@@ -2225,12 +2292,15 @@ class SqsServiceTest {
         assertEquals(10, recentTasks.size());
         assertFalse(recentTasks.stream().anyMatch(task -> task.taskHandle().equals(taskHandles.getFirst())));
 
-        clock.advance(Duration.ofSeconds(2));
+        time.advance(Duration.ofSeconds(2));
         String nextTask = sqsService.startMessageMoveTask(dlqArn, destinationArn, 1, "us-east-1");
         sqsService.cancelMessageMoveTask(nextTask, "us-east-1");
         awaitMoveTaskStatus(dlqArn, nextTask, "CANCELLED");
 
-        clock.advance(Duration.ofHours(1).plusMillis(1));
+        time.advance(Duration.ofHours(1).minus(ONE_NANO));
+        assertEquals(List.of(nextTask), sqsService.listMessageMoveTasks(dlqArn, "us-east-1").stream()
+                .map(SqsService.MoveTask::taskHandle).toList());
+        time.advance(ONE_NANO);
         assertTrue(sqsService.listMessageMoveTasks(dlqArn, "us-east-1").isEmpty());
     }
 
@@ -2238,18 +2308,11 @@ class SqsServiceTest {
         awaitMoveTaskStatus(sqsService, sourceArn, taskHandle, expectedStatus);
     }
 
-    private static void awaitMoveTaskStatus(SqsService service, String sourceArn, String taskHandle,
-                                            String expectedStatus) throws Exception {
-        for (int attempt = 0; attempt < 500; attempt++) {
-            boolean reachedStatus = service.listMessageMoveTasks(sourceArn, "us-east-1").stream()
-                    .anyMatch(task -> task.taskHandle().equals(taskHandle)
-                            && expectedStatus.equals(task.status()));
-            if (reachedStatus) {
-                return;
-            }
-            Thread.sleep(10);
-        }
-        fail("Move task did not transition to " + expectedStatus + " within timeout");
+    /** Waits for the task's worker to return, which is when it has written the terminal status. */
+    private void awaitMoveTaskStatus(SqsService service, String sourceArn, String taskHandle,
+                                     String expectedStatus) {
+        moveTasks.join();
+        assertEquals(expectedStatus, moveTaskStatus(service, sourceArn, taskHandle));
     }
 
     @Test
@@ -2373,84 +2436,71 @@ class SqsServiceTest {
     // --- DeleteQueue releases in-flight ReceiveMessage long polls ---
 
     @Test
-    void deleteQueueReleasesParkedLongPoll() throws InterruptedException {
+    void deleteQueueReleasesParkedLongPoll() throws Exception {
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("longpoll-release-queue", null, region);
         String queueUrl = queue.getQueueUrl();
 
-        CountDownLatch pollerEntered = new CountDownLatch(1);
-        AtomicReference<List<Message>> staleResult = new AtomicReference<>();
-        Thread stalePoller = new Thread(() -> {
-            pollerEntered.countDown();
-            staleResult.set(sqsService.receiveMessage(queueUrl, 1, 30, 8, region));
-        });
-        stalePoller.start();
-        assertTrue(pollerEntered.await(5, TimeUnit.SECONDS));
-        Thread.sleep(300); // let the poller park inside its long-poll wait
+        CompletableFuture<List<Message>> stalePoll = receiveOnAnotherThread(queueUrl, 8, region);
+        assertEquals(Duration.ofSeconds(8), timing.awaitPark(), "the poll parks for its whole WaitTimeSeconds");
+        Instant parkedAt = time.now();
 
         sqsService.deleteQueue(queueUrl, region);
-        stalePoller.join(2000);
 
-        assertFalse(stalePoller.isAlive(),
-                "DeleteQueue must release a parked long poll promptly, not leave it to wait out its full WaitTimeSeconds");
-        assertTrue(staleResult.get().isEmpty(),
+        // The timeline never reaches the poll's deadline, so only the delete can have released it:
+        // DeleteQueue must not leave a parked long poll to wait out its full WaitTimeSeconds.
+        assertTrue(stalePoll.get(30, TimeUnit.SECONDS).isEmpty(),
                 "A long poll released by DeleteQueue must complete without messages");
+        assertEquals(parkedAt, time.now());
     }
 
     @Test
-    void staleLongPollMustNotConsumeMessagesFromARecreatedQueue() throws InterruptedException {
+    void staleLongPollMustNotConsumeMessagesFromARecreatedQueue() throws Exception {
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("recreate-longpoll-queue", null, region);
         String queueUrl = queue.getQueueUrl();
 
         // A long poll opened before the delete, e.g. a listener generation
         // that is being torn down while its queue is recreated.
-        CountDownLatch pollerEntered = new CountDownLatch(1);
-        AtomicReference<List<Message>> staleResult = new AtomicReference<>();
-        Thread stalePoller = new Thread(() -> {
-            pollerEntered.countDown();
-            staleResult.set(sqsService.receiveMessage(queueUrl, 1, 30, 8, region));
-        });
-        stalePoller.start();
-        assertTrue(pollerEntered.await(5, TimeUnit.SECONDS));
-        Thread.sleep(300); // let the poller park inside its long-poll wait
+        CompletableFuture<List<Message>> stalePoll = receiveOnAnotherThread(queueUrl, 8, region);
+        assertEquals(Duration.ofSeconds(8), timing.awaitPark(), "the poll parks for its whole WaitTimeSeconds");
 
         sqsService.deleteQueue(queueUrl, region);
         Queue recreated = sqsService.createQueue("recreate-longpoll-queue", null, region);
         sqsService.sendMessage(recreated.getQueueUrl(), "for-the-new-queue", 0, region);
-        // Give a surviving stale poll every chance to (incorrectly) grab the
-        // message before the legitimate receive arrives.
-        Thread.sleep(200);
+        // Give the stale poll every chance to (incorrectly) grab the message before the
+        // legitimate receive arrives: let it run all the way to its return.
+        List<Message> staleResult = stalePoll.get(30, TimeUnit.SECONDS);
+        assertTrue(staleResult.isEmpty(),
+                "The pre-delete long poll must not consume the recreated queue's delivery");
 
         List<Message> fresh = sqsService.receiveMessage(recreated.getQueueUrl(), 1, 30, 1, region);
-        stalePoller.join(9000);
-        assertFalse(stalePoller.isAlive());
 
         assertEquals(1, fresh.size(),
                 "A receive opened after the recreate must get the new queue's message");
         assertEquals("for-the-new-queue", fresh.get(0).getBody());
         assertEquals(1, fresh.get(0).getReceiveCount(),
                 "The delivery to the live receiver must be the first receive (ApproximateReceiveCount = 1)");
-        assertTrue(staleResult.get().isEmpty(),
-                "The pre-delete long poll must not consume the recreated queue's delivery");
     }
 
 
     // --- ReceiveMessage falls back to the queue's ReceiveMessageWaitTimeSeconds ---
 
     @Test
-    void receiveMessageWithoutWaitTimeUsesQueueReceiveMessageWaitTimeSeconds() {
+    void receiveMessageWithoutWaitTimeUsesQueueReceiveMessageWaitTimeSeconds() throws Exception {
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("queue-default-longpoll",
-                Map.of("ReceiveMessageWaitTimeSeconds", "1"), region);
+                Map.of("ReceiveMessageWaitTimeSeconds", "20"), region);
 
-        long start = System.nanoTime();
-        List<Message> result = sqsService.receiveMessage(queue.getQueueUrl(), 1, 30, null, region);
-        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        CompletableFuture<List<Message>> result = receiveOnAnotherThread(queue.getQueueUrl(), null, region);
+        assertEquals(Duration.ofSeconds(20), timing.awaitPark(),
+                "A receive that omits WaitTimeSeconds must long poll for the queue's ReceiveMessageWaitTimeSeconds");
 
-        assertTrue(result.isEmpty());
-        assertTrue(elapsedMs >= 900,
-                "A receive that omits WaitTimeSeconds must long poll for the queue's ReceiveMessageWaitTimeSeconds, but returned after " + elapsedMs + "ms");
+        time.advance(Duration.ofSeconds(20).minus(ONE_NANO));
+        assertFalse(result.isDone(), "the long poll is still waiting one nanosecond before its 20 seconds are up");
+
+        time.advance(ONE_NANO);
+        assertTrue(result.get(30, TimeUnit.SECONDS).isEmpty());
     }
 
     @Test
@@ -2459,13 +2509,13 @@ class SqsServiceTest {
         Queue queue = sqsService.createQueue("queue-longpoll-override",
                 Map.of("ReceiveMessageWaitTimeSeconds", "20"), region);
 
-        long start = System.nanoTime();
+        Instant start = time.now();
         List<Message> result = sqsService.receiveMessage(queue.getQueueUrl(), 1, 30, 0, region);
-        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
 
         assertTrue(result.isEmpty());
-        assertTrue(elapsedMs < 1000,
-                "WaitTimeSeconds=0 in the request must override the queue attribute, but returned after " + elapsedMs + "ms");
+        assertEquals(0, timing.unreportedParks(),
+                "WaitTimeSeconds=0 in the request must override the queue attribute: the receive must not wait");
+        assertEquals(start, time.now());
     }
 
     @Test
@@ -2474,13 +2524,13 @@ class SqsServiceTest {
         Queue queue = sqsService.createQueue("queue-no-longpoll", null, region);
         assertEquals("0", queue.getAttributes().get("ReceiveMessageWaitTimeSeconds"));
 
-        long start = System.nanoTime();
+        Instant start = time.now();
         List<Message> result = sqsService.receiveMessage(queue.getQueueUrl(), 1, 30, null, region);
-        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
 
         assertTrue(result.isEmpty());
-        assertTrue(elapsedMs < 1000,
-                "A queue without ReceiveMessageWaitTimeSeconds must short poll, but returned after " + elapsedMs + "ms");
+        assertEquals(0, timing.unreportedParks(),
+                "A queue without ReceiveMessageWaitTimeSeconds must short poll: the receive must not wait");
+        assertEquals(start, time.now());
     }
 
     @Test
@@ -2504,29 +2554,24 @@ class SqsServiceTest {
     }
 
     @Test
-    void queueDefaultLongPollReturnsAsSoonAsAMessageArrives() throws InterruptedException {
+    void queueDefaultLongPollReturnsAsSoonAsAMessageArrives() throws Exception {
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("queue-longpoll-wakeup", null, region);
         String queueUrl = queue.getQueueUrl();
         sqsService.setQueueAttributes(queueUrl, Map.of("ReceiveMessageWaitTimeSeconds", "20"), region);
 
-        CountDownLatch pollerEntered = new CountDownLatch(1);
-        AtomicReference<List<Message>> result = new AtomicReference<>();
-        Thread poller = new Thread(() -> {
-            pollerEntered.countDown();
-            result.set(sqsService.receiveMessage(queueUrl, 1, 30, null, region));
-        });
-        poller.start();
-        assertTrue(pollerEntered.await(5, TimeUnit.SECONDS));
-        Thread.sleep(300);
+        CompletableFuture<List<Message>> poll = receiveOnAnotherThread(queueUrl, null, region);
+        assertEquals(Duration.ofSeconds(20), timing.awaitPark());
+        Instant parkedAt = time.now();
 
         sqsService.sendMessage(queueUrl, "wake-up", 0, region);
-        poller.join(3000);
 
-        assertFalse(poller.isAlive(),
-                "A long poll driven by the queue attribute must return as soon as a message arrives");
-        assertEquals(1, result.get().size());
-        assertEquals("wake-up", result.get().get(0).getBody());
+        // No time passes on the timeline: a long poll driven by the queue attribute must return
+        // as soon as a message arrives.
+        List<Message> result = poll.get(30, TimeUnit.SECONDS);
+        assertEquals(1, result.size());
+        assertEquals("wake-up", result.get(0).getBody());
+        assertEquals(parkedAt, time.now());
     }
 
     @Test
@@ -2534,10 +2579,16 @@ class SqsServiceTest {
         String region = "us-east-1";
         Queue queue = sqsService.createQueue("retention-queue",
                 Map.of("MessageRetentionPeriod", "60"), region);
-        Message sent = sqsService.sendMessage(queue.getQueueUrl(), "old", 0, region);
+        sqsService.sendMessage(queue.getQueueUrl(), "old", 0, region);
+        time.advance(Duration.ofSeconds(1));
         sqsService.sendMessage(queue.getQueueUrl(), "fresh", 0, region);
-        sent.setSentTimestamp(Instant.now().minusSeconds(61));
 
+        time.advance(Duration.ofSeconds(59).minus(ONE_NANO));
+        assertEquals("2", sqsService.getQueueAttributes(queue.getQueueUrl(),
+                List.of("ApproximateNumberOfMessages"), region).get("ApproximateNumberOfMessages"),
+                "a message is retained until its MessageRetentionPeriod is up");
+
+        time.advance(ONE_NANO);
         Map<String, String> attrs = sqsService.getQueueAttributes(queue.getQueueUrl(),
                 List.of("ApproximateNumberOfMessages"), region);
         assertEquals("1", attrs.get("ApproximateNumberOfMessages"));
@@ -2549,8 +2600,8 @@ class SqsServiceTest {
     void shorterRetentionPeriodExpiresExistingMessages() {
         String region = "us-east-1";
         Queue queue = sqsService.createQueue("retention-shrink", null, region);
-        Message sent = sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, region);
-        sent.setSentTimestamp(Instant.now().minusSeconds(120));
+        sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, region);
+        time.advance(Duration.ofSeconds(120));
         assertEquals(1, sqsService.peekMessages(queue.getQueueUrl(), region).size());
 
         sqsService.setQueueAttributes(queue.getQueueUrl(), Map.of("MessageRetentionPeriod", "60"), region);
@@ -2566,12 +2617,16 @@ class SqsServiceTest {
         Queue source = sqsService.createQueue("retention-src",
                 Map.of("RedrivePolicy", "{\"deadLetterTargetArn\":\"" + queueArn("retention-dlq")
                         + "\",\"maxReceiveCount\":\"1\"}"), region);
-        Message sent = sqsService.sendMessage(source.getQueueUrl(), "msg", 0, region);
+        sqsService.sendMessage(source.getQueueUrl(), "msg", 0, region);
+        time.advance(Duration.ofSeconds(30));
         sqsService.receiveMessage(source.getQueueUrl(), 1, 0, 0, region);
         sqsService.receiveMessage(source.getQueueUrl(), 1, 0, 0, region);
         assertEquals(1, sqsService.peekMessages(dlq.getQueueUrl(), region).size());
 
-        sent.setSentTimestamp(Instant.now().minusSeconds(61));
+        // 60 seconds after it was sent to the source queue, 30 after it reached the dead-letter queue.
+        time.advance(Duration.ofSeconds(30).minus(ONE_NANO));
+        assertEquals(1, sqsService.peekMessages(dlq.getQueueUrl(), region).size());
+        time.advance(ONE_NANO);
 
         assertTrue(sqsService.peekMessages(dlq.getQueueUrl(), region).isEmpty());
     }
@@ -2584,13 +2639,21 @@ class SqsServiceTest {
         Queue source = sqsService.createQueue("retention-src.fifo",
                 Map.of("FifoQueue", "true", "RedrivePolicy", "{\"deadLetterTargetArn\":\""
                         + queueArn("retention-dlq.fifo") + "\",\"maxReceiveCount\":\"1\"}"), region);
-        Message sent = sqsService.sendMessage(source.getQueueUrl(), "msg", 0, "g1", "d1", region);
+        sqsService.sendMessage(source.getQueueUrl(), "msg", 0, "g1", "d1", region);
+        time.advance(Duration.ofSeconds(30));
         sqsService.receiveMessage(source.getQueueUrl(), 1, 0, 0, region);
         sqsService.receiveMessage(source.getQueueUrl(), 1, 0, 0, region);
 
-        sent.setSentTimestamp(Instant.now().minusSeconds(61));
+        // 61 seconds after it was sent to the source queue, 31 after it reached the dead-letter queue.
+        time.advance(Duration.ofSeconds(31));
 
         assertEquals(1, sqsService.peekMessages(dlq.getQueueUrl(), region).size());
+
+        time.advance(Duration.ofSeconds(29).minus(ONE_NANO));
+        assertEquals(1, sqsService.peekMessages(dlq.getQueueUrl(), region).size());
+        time.advance(ONE_NANO);
+        assertTrue(sqsService.peekMessages(dlq.getQueueUrl(), region).isEmpty(),
+                "the restarted retention period ends 60 seconds after the message reached the dead-letter queue");
     }
 
     @Test
@@ -2602,37 +2665,49 @@ class SqsServiceTest {
                         + "\",\"maxReceiveCount\":\"1\"}"), region);
         Queue dest = sqsService.createQueue("retention-mv-dest",
                 Map.of("MessageRetentionPeriod", "60"), region);
-        Message sent = sqsService.sendMessage(source.getQueueUrl(), "msg", 0, region);
+        Instant sentAt = time.now();
+        sqsService.sendMessage(source.getQueueUrl(), "msg", 0, region);
         sqsService.receiveMessage(source.getQueueUrl(), 1, 0, 0, region);
         sqsService.receiveMessage(source.getQueueUrl(), 1, 0, 0, region);
-        Instant sentAt = Instant.now().minusSeconds(61);
-        sent.setSentTimestamp(sentAt);
+        time.advance(Duration.ofSeconds(61));
 
         sqsService.startMessageMoveTask(queueArn("retention-mv-dlq"), queueArn("retention-mv-dest"), region);
 
         List<Message> moved = sqsService.peekMessages(dest.getQueueUrl(), region);
         assertEquals(1, moved.size());
         assertEquals(sentAt, moved.get(0).getSentTimestamp());
+
+        time.advance(Duration.ofSeconds(60).minus(ONE_NANO));
+        assertEquals(1, sqsService.peekMessages(dest.getQueueUrl(), region).size());
+        time.advance(ONE_NANO);
+        assertTrue(sqsService.peekMessages(dest.getQueueUrl(), region).isEmpty(),
+                "the restarted retention period ends 60 seconds after the move");
     }
 
     @Test
     void rateLimitedMessageMoveTaskDropsMessagesThatExpireDuringTheMove() throws Exception {
         String region = "us-east-1";
-        sqsService.createQueue("retention-rl-dlq", Map.of("MessageRetentionPeriod", "60"), region);
+        String dlqUrl = sqsService.createQueue("retention-rl-dlq", Map.of("MessageRetentionPeriod", "60"), region)
+                .getQueueUrl();
         Queue source = sqsService.createQueue("retention-rl-src",
                 Map.of("RedrivePolicy", "{\"deadLetterTargetArn\":\"" + queueArn("retention-rl-dlq")
                         + "\",\"maxReceiveCount\":\"1\"}"), region);
         Queue dest = sqsService.createQueue("retention-rl-dest", null, region);
         sqsService.sendMessage(source.getQueueUrl(), "first", 0, region);
-        Message second = sqsService.sendMessage(source.getQueueUrl(), "second", 0, region);
+        sqsService.sendMessage(source.getQueueUrl(), "second", 0, region);
         sqsService.receiveMessage(source.getQueueUrl(), 10, 0, 0, region);
         sqsService.receiveMessage(source.getQueueUrl(), 10, 0, 0, region);
         String dlqArn = queueArn("retention-rl-dlq");
         // Still live when the task starts, expired when the worker reaches it a second later.
-        second.setSentTimestamp(Instant.now().minusSeconds(59));
+        time.advance(Duration.ofSeconds(59));
 
         String taskHandle = sqsService.startMessageMoveTask(dlqArn, queueArn("retention-rl-dest"), 1, region);
+        assertEquals(Duration.ofSeconds(1), timing.awaitPark(), "one message a second: the worker waits before the next");
+        time.advance(Duration.ofSeconds(1).minus(ONE_NANO));
+        assertEquals(List.of("second"), sqsService.peekMessages(dlqUrl, region).stream().map(Message::getBody).toList());
+        time.advance(ONE_NANO);
         awaitMoveTaskStatus(dlqArn, taskHandle, "COMPLETED");
+        assertTrue(sqsService.peekMessages(dlqUrl, region).isEmpty());
         assertEquals(2, sqsService.listMessageMoveTasks(dlqArn, region).get(0).approximateNumberOfMessagesToMove());
 
         List<Message> moved = sqsService.peekMessages(dest.getQueueUrl(), region);
@@ -2643,14 +2718,19 @@ class SqsServiceTest {
     void deleteExpiredMessagesRemovesThemFromStorage() {
         String region = "us-east-1";
         InMemoryStorage<String, List<Message>> messageStore = new InMemoryStorage<>();
-        SqsService service = new SqsService(new InMemoryStorage<>(), messageStore, new InMemoryStorage<>(),
-                30, 1048576, BASE_URL, new RegionResolver("us-east-1", "000000000000"));
+        SqsService service = timelineService(new InMemoryStorage<>(), messageStore,
+                new RegionResolver("us-east-1", "000000000000"));
         Queue queue = service.createQueue("retention-sweep", Map.of("MessageRetentionPeriod", "60"), region);
-        Message sent = service.sendMessage(queue.getQueueUrl(), "msg", 0, region);
-        sent.setSentTimestamp(Instant.now().minusSeconds(61));
+        service.sendMessage(queue.getQueueUrl(), "msg", 0, region);
         String storageKey = region + "::/000000000000/retention-sweep";
         assertEquals(1, messageStore.get(storageKey).orElseThrow().size());
 
+        time.advance(Duration.ofSeconds(60).minus(ONE_NANO));
+        service.deleteExpiredMessages();
+        assertEquals(1, messageStore.get(storageKey).orElseThrow().size(),
+                "a sweep one nanosecond before the retention period is up removes nothing");
+
+        time.advance(ONE_NANO);
         service.deleteExpiredMessages();
 
         assertTrue(messageStore.get(storageKey).orElseThrow().isEmpty());

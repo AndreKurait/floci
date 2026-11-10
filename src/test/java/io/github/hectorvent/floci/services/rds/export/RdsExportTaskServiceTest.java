@@ -7,16 +7,21 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.rds.RdsService;
 import io.github.hectorvent.floci.services.rds.model.ExportTask;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
@@ -47,6 +52,13 @@ class RdsExportTaskServiceTest {
     private static final String SNAPSHOT_ARN = "arn:aws:rds:us-east-1:000000000000:snapshot:appdb-snap";
     private static final Instant SNAPSHOT_TIME = Instant.parse("2026-10-13T08:00:00Z");
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-13T09:00:00Z"), ZoneOffset.UTC);
+    private static final Duration ONE_NANO = Duration.ofNanos(1);
+    private static final Duration RESET_DRAIN_TIMEOUT =
+            Duration.ofMillis(RdsExportTaskService.RESET_DRAIN_TIMEOUT_MILLIS);
+    private static final Duration RESET_ADMISSION_WAIT =
+            Duration.ofMillis(RdsExportTaskService.RESET_ADMISSION_WAIT_MILLIS);
+    // Real-time guard on waits for another thread that is already free to finish.
+    private static final Duration STUCK = Duration.ofSeconds(30);
 
     private RdsService rdsService;
     private S3Service s3Service;
@@ -66,6 +78,11 @@ class RdsExportTaskServiceTest {
     private RdsExportTaskService service(SnapshotExporter exporter) {
         return new RdsExportTaskService(new InMemoryStorage<>(), rdsService, s3Service, exporter,
                 regionResolver, false, CLOCK, workers::add);
+    }
+
+    private RdsExportTaskService service(SnapshotExporter exporter, ExportResetWait resetWait) {
+        return new RdsExportTaskService(new InMemoryStorage<>(), rdsService, s3Service, exporter,
+                regionResolver, false, CLOCK, workers::add, resetWait);
     }
 
     private static SnapshotExporter.Outcome outcome(long bytes, List<String> warnings) {
@@ -423,19 +440,50 @@ class RdsExportTaskServiceTest {
 
     @Test
     void aStartDuringAResetWaitsForItToFinish() throws Exception {
-        RdsExportTaskService service = service((task, source, progress) -> outcome(0, List.of()));
+        TestTime time = TestTime.create();
+        TimelineResetWait resetWait = new TimelineResetWait(time);
+        RdsExportTaskService service = service((task, source, progress) -> outcome(0, List.of()), resetWait);
         service.beforeReset();
         List<ExportTask> admitted = new CopyOnWriteArrayList<>();
         Thread caller = Thread.ofVirtual().start(() -> admitted.add(start(service, "appdb-export", List.of())));
 
-        caller.join(300);
+        assertThat(resetWait.awaitPark(), equalTo(RESET_ADMISSION_WAIT));
+        // Nothing but afterReset or the end of the admission wait releases the start: it is still
+        // parked on its first wait however close the timeline comes to that deadline.
+        time.advance(RESET_ADMISSION_WAIT.minus(ONE_NANO));
+        assertThat(resetWait.unreportedParks(), equalTo(0));
         assertThat("the start waits while the reset runs", admitted, empty());
         service.clear();
         service.afterReset();
-        caller.join(5_000);
+        assertThat(caller.join(STUCK), equalTo(true));
 
         assertThat(admitted, hasSize(1));
         assertThat(describe(service, "appdb-export").getStatus(), equalTo("STARTING"));
+    }
+
+    @Test
+    void aStartStillWaitingWhenTheAdmissionWaitEndsIsRefusedAsThrottled() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineResetWait resetWait = new TimelineResetWait(time);
+        RdsExportTaskService service = service((task, source, progress) -> outcome(0, List.of()), resetWait);
+        service.beforeReset();
+        FutureTask<ExportTask> starting = new FutureTask<>(() -> start(service, "appdb-export", List.of()));
+        Thread.ofVirtual().start(starting);
+        assertThat(resetWait.awaitPark(), equalTo(RESET_ADMISSION_WAIT));
+
+        time.advance(RESET_ADMISSION_WAIT.minus(ONE_NANO));
+        assertThat(resetWait.unreportedParks(), equalTo(0));
+        assertThat("one nanosecond short of the admission wait the start is still waiting",
+                starting.isDone(), equalTo(false));
+
+        time.advance(ONE_NANO);
+        ExecutionException refused = assertThrows(ExecutionException.class,
+                () -> starting.get(STUCK.toSeconds(), TimeUnit.SECONDS));
+        AwsException cause = (AwsException) refused.getCause();
+        assertThat(cause.getErrorCode(), equalTo("Throttling"));
+        assertThat(cause.getHttpStatus(), equalTo(429));
+        service.afterReset();
+        assertThat(service.describeExportTasks(null, null, null, Map.of(), REGION), empty());
     }
 
     @Test
@@ -453,19 +501,29 @@ class RdsExportTaskServiceTest {
 
     @Test
     void aWorkerThatOutlivesAResetLeavesTheNewTaskWithItsIdentifierAlone() {
+        TestTime time = TestTime.create();
+        // The worker is the thread that resets, so the drain waits for itself and has to run out.
+        TimelineResetWait resetWait = TimelineResetWait.passingTime(time);
+        Instant resetStarted = time.now();
+        List<Duration> drained = new ArrayList<>();
         RdsExportTaskService[] holder = new RdsExportTaskService[1];
         holder[0] = service((task, source, progress) -> {
             holder[0].beforeReset();
+            drained.add(Duration.between(resetStarted, time.now()));
             holder[0].clear();
             holder[0].afterReset();
             start(holder[0], task.getExportTaskIdentifier(), List.of());
             progress.extracting(50);
             throw new IllegalStateException("the restore container was removed by the reset");
-        });
+        }, resetWait);
         start(holder[0], "appdb-export", List.of());
 
         runWorkers();
 
+        assertThat("the drain gives up on its deadline, after one wait for all of it",
+                drained, contains(RESET_DRAIN_TIMEOUT));
+        assertThat(resetWait.awaitPark(), equalTo(RESET_DRAIN_TIMEOUT));
+        assertThat(resetWait.unreportedParks(), equalTo(0));
         ExportTask restarted = describe(holder[0], "appdb-export");
         assertThat(restarted.getStatus(), equalTo("STARTING"));
         assertThat(restarted.getPercentProgress(), equalTo(0));

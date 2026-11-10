@@ -10,11 +10,17 @@ final class SqsResetAdmission {
 
     private final ThreadLocal<Integer> depth = ThreadLocal.withInitial(() -> 0);
     private final Runnable recovery;
+    private final SqsTiming timing;
     private volatile boolean paused;
     private int active;
 
     SqsResetAdmission(Runnable recovery) {
+        this(recovery, SqsTiming.SYSTEM);
+    }
+
+    SqsResetAdmission(Runnable recovery, SqsTiming timing) {
         this.recovery = recovery;
+        this.timing = timing;
     }
 
     @FunctionalInterface
@@ -79,14 +85,14 @@ final class SqsResetAdmission {
     }
 
     synchronized void awaitDrained() {
-        long deadline = System.nanoTime() + DRAIN_TIMEOUT_NANOS;
+        long deadline = timing.nanoTime() + DRAIN_TIMEOUT_NANOS;
         while (active != 0) {
-            long remaining = deadline - System.nanoTime();
+            long remaining = deadline - timing.nanoTime();
             if (remaining <= 0) {
                 throw new IllegalStateException("Timed out draining SQS operations before reset");
             }
             try {
-                TimeUnit.NANOSECONDS.timedWait(this, remaining);
+                timing.timedWait(this, remaining);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Interrupted while draining SQS operations before reset", exception);

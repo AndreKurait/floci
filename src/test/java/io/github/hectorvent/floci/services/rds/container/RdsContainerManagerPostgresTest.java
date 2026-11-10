@@ -29,6 +29,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -149,23 +150,10 @@ class RdsContainerManagerPostgresTest {
 
     private void waitForPostgresReady(String containerId, String user, String dbName, int maxSeconds) {
         String[] cmd = {"psql", "-h", "127.0.0.1", "-U", user, "-d", dbName, "-c", "SELECT 1"};
-        for (int i = 0; i < maxSeconds; i++) {
-            try {
-                ContainerExec.Result result = exec(containerId, cmd, 5);
-                if (result.exitCode() == 0) {
-                    return;
-                }
-            } catch (Exception ignored) {
-                // not ready yet
-            }
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("Interrupted waiting for PostgreSQL", e);
-            }
-        }
-        throw new RuntimeException("PostgreSQL did not become ready within " + maxSeconds + "s");
+        await().alias("PostgreSQL ready within " + maxSeconds + "s")
+                .atMost(Duration.ofSeconds(maxSeconds)).pollDelay(Duration.ZERO).pollInterval(Duration.ofSeconds(1))
+                .ignoreExceptions()
+                .until(() -> exec(containerId, cmd, 5).exitCode() == 0);
     }
 
     private void execPsql(String containerId, String user, String db, String sql) throws Exception {

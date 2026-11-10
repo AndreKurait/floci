@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -42,6 +43,9 @@ class SsmResourceDataSyncSdkIntegrationTest {
     private static final AtomicLong ACCOUNTS = new AtomicLong(830022220000L);
     private static final String CAPTURE = "2026-01-02T03:04:05Z";
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    @Inject
+    SsmResourceDataSyncService dataSyncs;
 
     @BeforeAll
     static void configureJson() {
@@ -120,8 +124,9 @@ class SsmResourceDataSyncSdkIntegrationTest {
             await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals("", scenario.body()));
             scenario.ssm.deleteResourceDataSync(request -> request.syncName("inventory-sync"));
             scenario.upload("after-deletion", "different", refreshed);
-            await().during(Duration.ofMillis(350)).atMost(Duration.ofSeconds(3))
-                    .untilAsserted(() -> assertEquals("", scenario.body()));
+            // A whole pass over every sync, run here instead of waiting for the worker to tick.
+            dataSyncs.synchronizeAll();
+            assertEquals("", scenario.body());
             assertTrue(scenario.ssm.listResourceDataSync().resourceDataSyncItems().isEmpty());
         }
     }
