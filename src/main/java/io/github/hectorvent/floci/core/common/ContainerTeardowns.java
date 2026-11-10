@@ -121,7 +121,7 @@ public final class ContainerTeardowns {
             }
             try {
                 waits.get(drain, Math.max(0, deadlineNanos - waits.nanoTime()));
-            } catch (ExecutionException | CancellationException finished) {
+            } catch (ExecutionException | CancellationException expected) {
                 // Reported with the other outcomes once the wait is over.
             } catch (TimeoutException expired) {
                 return;
