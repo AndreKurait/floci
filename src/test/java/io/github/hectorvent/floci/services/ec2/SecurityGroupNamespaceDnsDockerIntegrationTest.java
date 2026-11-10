@@ -2,8 +2,10 @@ package io.github.hectorvent.floci.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -14,7 +16,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -48,8 +50,9 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
     private DnsTarget activeTarget;
 
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void ordinaryResolverWorksWithoutAnExternalRouteOrWorkloadOverride(boolean internal) throws Exception {
+    @CsvSource({"true,false", "false,false", "true,true", "false,true"})
+    void ordinaryResolverWorksWithoutAnExternalRouteOrWorkloadOverride(boolean internal, boolean publishPort)
+            throws Exception {
         Assumptions.assumeTrue(firewall.enabled());
         Assumptions.assumeTrue("Linux".equals(System.getProperty("os.name")));
         Assumptions.assumeTrue("linux".equalsIgnoreCase(docker.infoCmd().exec().getOsType()));
@@ -79,13 +82,21 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
                         .getNetworks().values().iterator().next().getIpAddress();
                 when(embeddedDns.getServerIp()).thenReturn(Optional.of(resolver));
                 namespace = firewall.createNamespace("ec2", eni, "000000000000", "us-east-1",
-                        Optional.of(network), Map.of());
+                        Optional.of(network), publishPort ? Map.of(22, 0) : Map.of());
+                String networkName = docker.inspectNetworkCmd().withNetworkId(network).exec().getName();
+                Map<String, ContainerNetwork> attached = docker.inspectContainerCmd(namespace.helperId()).exec()
+                        .getNetworkSettings().getNetworks();
+                String serviceAddress = attached.get(networkName).getIpAddress();
+                assertEquals(serviceAddress, namespace.transportAddress(),
+                        "The caller identity must use the address that reaches the VPC resolver");
                 SecurityGroup group = new SecurityGroup();
                 group.setGroupId("sg-resolver-" + suffix);
                 firewall.register(new SecurityGroupNftCompiler.Endpoint(
                         "000000000000", "us-east-1", "vpc-resolver", eni, "10.0.0.2",
                         namespace.transportAddress(), Set.of(group.getGroupId()), List.of(group)),
                         namespace.helperId(), Map.of());
+                assertEquals(Optional.of(new ClientVpc("000000000000", "us-east-1", "vpc-resolver")),
+                        firewall.vpcForClient(serviceAddress));
                 workload = lifecycle.createAndStart(builder.newContainer("alpine:3.21")
                         .withName("floci-resolver-workload-" + suffix)
                         .withNetworkMode("container:" + namespace.helperId())

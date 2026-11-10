@@ -292,10 +292,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         String helperId = null;
         try {
             helperId = lifecycleManager.createAndStart(spec).containerId();
-            String ip = dockerClient.inspectContainerCmd(helperId).exec().getNetworkSettings()
-                    .getNetworks().values().stream().map(n -> n.getIpAddress())
-                    .filter(address -> address != null && !address.isBlank())
-                    .findFirst().orElseThrow(() -> new IllegalStateException("Firewall helper has no Docker IP"));
+            String ip = lifecycleManager.resolveContainerNetworkIp(helperId, spec.networkMode());
+            if (ip == null || ip.isBlank()) {
+                throw new IllegalStateException("Firewall helper has no Docker IP");
+            }
             apply(helperId, SecurityGroupNftCompiler.initialRuleset());
             String resolver = embeddedDnsServer.getServerIp().orElse(null);
             if (resolver != null) {

@@ -15,6 +15,8 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
@@ -218,9 +220,80 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
 
         for (List<DnsRecordSource> sources : sourceOrders()) {
             assertEquals(3, answer("api." + name, "192.0.2.10", sources).orElseThrow().responseCode());
+            assertEquals(List.of("203.0.113.7"),
+                    answer("api." + name, "192.0.2.20", sources).orElseThrow().addresses());
+            assertEquals(List.of("203.0.113.7"),
+                    answer("api." + name, null, sources).orElseThrow().addresses());
         }
-        assertEquals(List.of("203.0.113.7"),
-                answer("api." + name, "192.0.2.20", List.of(cloudMapRecords)).orElseThrow().addresses());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 28})
+    void publicAddressAnswersRespectTheQueryingVpcPrivateAuthority(int type) {
+        String name = uniqueName();
+        zone(name, firstVpc);
+        String value = type == 1 ? "192.0.2.71" : "2001:db8::71";
+        addRecord(zone(name, null), "api." + name, type == 1 ? "A" : "AAAA", value);
+
+        assertEquals(List.of(new DnsRecord.Address(type, value)),
+                answer("api." + name, "192.0.2.20", type).orElseThrow().records());
+        assertEquals(List.of(new DnsRecord.Address(type, value)),
+                answer("api." + name, null, type).orElseThrow().records());
+        DnsAnswer privateAnswer = answer("api." + name, "192.0.2.10", type).orElseThrow();
+        assertEquals(3, privateAnswer.responseCode());
+        assertTrue(privateAnswer.records().isEmpty(),
+                "An associated private zone must not fall through to a public address record");
+    }
+
+    @Test
+    void publicChildZoneNegativeAnswerCannotFallThroughToParentCloudMapNamespace() {
+        String parent = uniqueName();
+        register(cloudMapNamespace(parent, null), "api.child", "203.0.113.7");
+        zone("child." + parent, null);
+
+        for (List<DnsRecordSource> sources : sourceOrders()) {
+            assertEquals(3, answer("api.child." + parent, null, sources).orElseThrow().responseCode());
+        }
+    }
+
+    @Test
+    void ambiguousPublicZoneCannotBeResolvedThroughCloudMapRegistration() {
+        String name = uniqueName();
+        register(cloudMapNamespace(name, null), "api", "203.0.113.7");
+        zone(name, null);
+
+        for (List<DnsRecordSource> sources : sourceOrders()) {
+            assertEquals(5, answer("api." + name, null, sources).orElseThrow().responseCode());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"A", "CNAME", "NS"})
+    void publicRegistrationPreservesExplicitRecordsAndDelegation(String type) {
+        String name = uniqueName();
+        String namespace = cloudMapNamespace(name, null);
+        register(namespace, "api.child", "203.0.113.7");
+        String backingZone = cloudMap.getNamespace(namespace).getHostedZoneId();
+        ResourceRecordSet stored = new ResourceRecordSet();
+        stored.setName(("NS".equals(type) ? "child." : "api.child.") + name);
+        stored.setType(type);
+        stored.setTtl(60L);
+        stored.setRecords(List.of(new ResourceRecord("A".equals(type) ? "192.0.2.72" : "target.example.")));
+        route53.changeResourceRecordSets(
+                backingZone, List.of(Map.of("action", "CREATE", "rrs", stored)), null);
+        try {
+            for (List<DnsRecordSource> sources : sourceOrders()) {
+                DnsAnswer resolved = answer("api.child." + name, null, sources).orElseThrow();
+                if ("A".equals(type)) {
+                    assertEquals(List.of("192.0.2.72"), resolved.addresses());
+                } else {
+                    assertEquals(5, resolved.responseCode());
+                }
+            }
+        } finally {
+            route53.changeResourceRecordSets(
+                    backingZone, List.of(Map.of("action", "DELETE", "rrs", stored)), null);
+        }
     }
 
     private List<List<DnsRecordSource>> sourceOrders() {
@@ -249,6 +322,14 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
     }
 
     private Optional<DnsAnswer> answer(String name, String sourceAddress, List<DnsRecordSource> sources) {
+        return answer(name, sourceAddress, sources, 1);
+    }
+
+    private Optional<DnsAnswer> answer(String name, String sourceAddress, int type) {
+        return answer(name, sourceAddress, List.of(records), type);
+    }
+
+    private Optional<DnsAnswer> answer(String name, String sourceAddress, List<DnsRecordSource> sources, int type) {
         DnsClientVpcSource clients = address -> switch (address) {
             case "192.0.2.10" -> Optional.of(new DnsClientVpcSource.ClientVpc(
                     config.defaultAccountId(), "us-east-1", firstVpc));
@@ -258,7 +339,7 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
         };
         EmbeddedDnsServer server = new EmbeddedDnsServer(
                 List.of(), sources, List.of(), List.of(clients));
-        return server.planQuery(name, sourceAddress, "127.0.0.1", 1).answer();
+        return server.planQuery(name, sourceAddress, "127.0.0.1", type).answer();
     }
 
     private String zone(String name, String vpc) {
@@ -269,11 +350,15 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
     }
 
     private void addAddress(String zone, String name, String address) {
+        addRecord(zone, name, "A", address);
+    }
+
+    private void addRecord(String zone, String name, String type, String value) {
         ResourceRecordSet record = new ResourceRecordSet();
         record.setName(name);
-        record.setType("A");
+        record.setType(type);
         record.setTtl(60L);
-        record.setRecords(List.of(new ResourceRecord(address)));
+        record.setRecords(List.of(new ResourceRecord(value)));
         route53.changeResourceRecordSets(zone, List.of(Map.of("action", "CREATE", "rrs", record)), null);
     }
 
