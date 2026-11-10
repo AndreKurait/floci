@@ -587,7 +587,8 @@ External extensions subscribed to SHUTDOWN receive the event while the Runtime A
 remains available. Floci waits up to two seconds for their exec output streams to
 finish, preserving prompt cleanup and final logs. An INVOKE-only extension does not
 add an extension wait, and a disconnected log stream cannot masquerade as a finished
-extension.
+extension: when a stream is lost, Floci asks the container engine whether the process
+is still running, and stops waiting as soon as it is not.
 
 The runtime then gets its one-second signal grace even if an extension used its full
 budget. These sequential Docker shutdown phases can take up to three seconds, plus

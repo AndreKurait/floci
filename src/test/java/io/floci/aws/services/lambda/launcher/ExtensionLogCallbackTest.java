@@ -2,6 +2,7 @@ package io.floci.aws.services.lambda.launcher;
 
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
+import io.floci.aws.services.lambda.launcher.ExtensionShutdownWait.ExtensionExec;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 import org.junit.jupiter.api.Test;
 
@@ -10,6 +11,8 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -22,6 +25,11 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ExtensionLogCallbackTest {
+    /** The daemon is only asked about a process whose output stream failed. */
+    private static final Predicate<String> NEVER_ASKED = execId -> {
+        throw new AssertionError("Unexpected daemon inspection of " + execId);
+    };
+
     @Test
     void cleanupRetriesKeepTheFirstExtensionDeadline() {
         ContainerHandle handle = new ContainerHandle("container", "function", null, null);
@@ -68,56 +76,83 @@ class ExtensionLogCallbackTest {
     @Test
     void invokeOnlyAndUnregisteredExtensionsDoNotBlockShutdown() {
         ContainerHandle handle = handle(Map.of("invoke-only", false, "no-events", false));
-        handle.setExtensionExits(Map.of(
-                "invoke-only", new CompletableFuture<>(),
-                "no-events", new CompletableFuture<>(),
-                "not-registered", new CompletableFuture<>()));
-        assertTrue(handle.extensionShutdownCompletion().isDone());
+        handle.setExtensionExecs(Map.of(
+                "invoke-only", running("invoke-only"),
+                "no-events", running("no-events"),
+                "not-registered", running("not-registered")));
+        assertTrue(handle.extensionShutdownWait(NEVER_ASKED).isComplete());
     }
 
     @Test
     void shutdownWaitTracksOnlySubscribedExternalExtensions() {
         ContainerHandle handle = handle(Map.of("shutdown", true, "invoke-only", false, "internal", true));
         CompletableFuture<Void> exit = new CompletableFuture<>();
-        handle.setExtensionExits(Map.of("shutdown", exit, "invoke-only", new CompletableFuture<>()));
-        CompletableFuture<Void> shutdown = handle.extensionShutdownCompletion();
-        assertFalse(shutdown.isDone());
+        handle.setExtensionExecs(Map.of(
+                "shutdown", new ExtensionExec("exec-shutdown", exit),
+                "invoke-only", running("invoke-only")));
+        ExtensionShutdownWait shutdown = handle.extensionShutdownWait(NEVER_ASKED);
+        assertFalse(shutdown.isComplete());
         exit.complete(null);
-        assertTrue(shutdown.isDone());
+        assertTrue(shutdown.isComplete());
     }
 
     @Test
     void registrationAliasRetainsUnmatchedExternalProcessGrace() {
         ContainerHandle handle = handle(Map.of("custom-name", true, "invoke-only", false));
         CompletableFuture<Void> exit = new CompletableFuture<>();
-        handle.setExtensionExits(Map.of("binary-name", exit, "invoke-only", new CompletableFuture<>()));
-        CompletableFuture<Void> shutdown = handle.extensionShutdownCompletion();
-        assertFalse(shutdown.isDone());
+        handle.setExtensionExecs(Map.of(
+                "binary-name", new ExtensionExec("exec-binary-name", exit),
+                "invoke-only", running("invoke-only")));
+        ExtensionShutdownWait shutdown = handle.extensionShutdownWait(NEVER_ASKED);
+        assertFalse(shutdown.isComplete());
         exit.complete(null);
-        assertTrue(shutdown.isDone());
+        assertTrue(shutdown.isComplete());
     }
 
     @Test
     void expiredBudgetDoesNotFabricateProcessCompletion() throws Exception {
         ContainerHandle handle = handle(Map.of("shutdown", true));
         CompletableFuture<Void> exit = new CompletableFuture<>();
-        handle.setExtensionExits(Map.of("shutdown", exit));
+        handle.setExtensionExecs(Map.of("shutdown", new ExtensionExec("exec-shutdown", exit)));
+        ExtensionShutdownWait shutdown = handle.extensionShutdownWait(NEVER_ASKED);
 
-        ContainerLauncher.awaitExtensionShutdown(handle, 0);
+        assertFalse(shutdown.await(0));
 
         assertFalse(exit.isDone());
-        assertFalse(handle.extensionShutdownCompletion().isDone());
+        assertFalse(shutdown.isComplete());
     }
 
     @Test
-    void failedTransportRetainsProcessGraceUntilTheDeadline() throws Exception {
+    void failedTransportRetainsProcessGraceWhileTheDaemonReportsTheProcessRunning() throws Exception {
         ContainerHandle handle = handle(Map.of("shutdown", true));
-        handle.setExtensionExits(Map.of("shutdown",
-                CompletableFuture.failedFuture(new IOException("exec disconnected"))));
+        handle.setExtensionExecs(Map.of("shutdown", new ExtensionExec("exec-shutdown",
+                CompletableFuture.failedFuture(new IOException("exec disconnected")))));
+        AtomicBoolean exited = new AtomicBoolean();
+        ExtensionShutdownWait shutdown = handle.extensionShutdownWait(execId -> exited.get());
 
-        assertFalse(handle.extensionShutdownCompletion().isDone());
-        ContainerLauncher.awaitExtensionShutdown(handle, 0);
-        assertFalse(handle.extensionShutdownCompletion().isDone());
+        assertFalse(shutdown.isComplete());
+        assertFalse(shutdown.await(0));
+        exited.set(true);
+        assertTrue(shutdown.isComplete());
+    }
+
+    @Test
+    void cleanupRetriesKeepTheFirstExtensionSelection() {
+        RuntimeApiServer server = mock(RuntimeApiServer.class);
+        // A quiesced server may report differently; the retry must not select again.
+        when(server.extensionShutdownSubscriptions()).thenReturn(Map.of("shutdown", true), Map.of());
+        ContainerHandle handle = new ContainerHandle("id", "fn", server, null);
+        handle.setExtensionExecs(Map.of("shutdown", running("shutdown")));
+
+        ExtensionShutdownWait first = handle.extensionShutdownWait(NEVER_ASKED);
+
+        assertSame(first, handle.extensionShutdownWait(NEVER_ASKED));
+        assertFalse(first.isComplete());
+        verify(server).extensionShutdownSubscriptions();
+    }
+
+    private static ExtensionExec running(String name) {
+        return new ExtensionExec("exec-" + name, new CompletableFuture<>());
     }
 
     private static ContainerHandle handle(Map<String, Boolean> subscriptions) {
