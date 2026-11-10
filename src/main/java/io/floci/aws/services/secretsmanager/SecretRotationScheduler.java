@@ -9,6 +9,7 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.Executors;
@@ -36,26 +37,33 @@ public class SecretRotationScheduler {
     private final long tickIntervalSeconds;
     private final boolean enabled;
     private final ScheduledExecutorService executor;
+    private final Clock clock;
 
     @Inject
     public SecretRotationScheduler(SecretsManagerService service, EmulatorConfig config) {
-        this.service = service;
-        this.tickIntervalSeconds = config.services().secretsmanager().rotationTickSeconds();
-        this.enabled = config.services().secretsmanager().enabled()
-                && config.services().secretsmanager().scheduledRotationEnabled();
-        this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "secretsmanager-rotation-scheduler");
-            t.setDaemon(true);
-            return t;
-        });
+        this(service, config.services().secretsmanager().rotationTickSeconds(),
+                config.services().secretsmanager().enabled()
+                        && config.services().secretsmanager().scheduledRotationEnabled(),
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "secretsmanager-rotation-scheduler");
+                    t.setDaemon(true);
+                    return t;
+                }), Clock.systemUTC());
     }
 
     /** Test seam: a scheduler that never starts its thread, so {@link #tick} drives it directly. */
     SecretRotationScheduler(SecretsManagerService service) {
+        this(service, 60, false, null, Clock.systemUTC());
+    }
+
+    /** Package-private so tests can run the sweep on a scheduler and a clock they control. */
+    SecretRotationScheduler(SecretsManagerService service, long tickIntervalSeconds, boolean enabled,
+                            ScheduledExecutorService executor, Clock clock) {
         this.service = service;
-        this.tickIntervalSeconds = 60;
-        this.enabled = false;
-        this.executor = null;
+        this.tickIntervalSeconds = tickIntervalSeconds;
+        this.enabled = enabled;
+        this.executor = executor;
+        this.clock = clock;
     }
 
     void onStart(@Observes StartupEvent ignored) {
@@ -76,7 +84,7 @@ public class SecretRotationScheduler {
 
     void tickSafely() {
         try {
-            tick(Instant.now());
+            tick(clock.instant());
         } catch (Throwable t) {
             LOG.warnv("Secrets Manager rotation sweep failed: {0}", t.getMessage());
         }

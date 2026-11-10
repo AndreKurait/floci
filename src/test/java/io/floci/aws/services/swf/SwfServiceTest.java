@@ -1,6 +1,7 @@
 package io.floci.aws.services.swf;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
@@ -19,7 +20,9 @@ import io.floci.aws.services.swf.model.SwfHistoryEvent;
 import io.floci.aws.services.swf.model.SwfWorkflowExecution;
 import io.floci.aws.services.swf.model.SwfWorkflowType;
 import io.floci.aws.testing.MutableClock;
+import io.floci.aws.testing.TestTime;
 import io.floci.aws.testutil.LogCapture;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -29,6 +32,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -86,12 +90,28 @@ class SwfServiceTest {
         lambdaResponse = new LambdaInvocationResult("{\"ok\":true}", null);
         lambdaFailure = null;
         lambdaGate = null;
-        service = new SwfService(new InMemoryStorageFactory(),
-                new RegionResolver("us-east-1", "000000000000"), clock, recordingLambdaInvoker());
+        service = registeredService(clock);
+    }
 
-        service.registerDomain(DOMAIN, "unit test domain", "7", Map.of(), REGION);
-        service.registerWorkflowType(REGION, DOMAIN, workflowType("W", "1"));
-        service.registerActivityType(REGION, DOMAIN, activityType("A", "1"));
+    private SwfService registeredService(Clock serviceClock) {
+        SwfService registered = new SwfService(new InMemoryStorageFactory(),
+                new RegionResolver("us-east-1", "000000000000"), serviceClock, recordingLambdaInvoker());
+
+        registered.registerDomain(DOMAIN, "unit test domain", "7", Map.of(), REGION);
+        registered.registerWorkflowType(REGION, DOMAIN, workflowType("W", "1"));
+        registered.registerActivityType(REGION, DOMAIN, activityType("A", "1"));
+        return registered;
+    }
+
+    /**
+     * Puts the service on a timeline that moves only when the test advances it. {@link #clock}
+     * also moves a millisecond with every reading, which keeps task ordering distinct but leaves
+     * no exact instant to assert a timeout at.
+     */
+    private TestTime exactTimeline() {
+        TestTime time = TestTime.create();
+        service = registeredService(time.clock());
+        return time;
     }
 
     /**
@@ -323,10 +343,16 @@ class SwfServiceTest {
 
     @Test
     void activityScheduleToStartTimeout_expiresTheTaskAndSchedulesANewDecision() {
+        TestTime time = exactTimeline();
         String runId = start("wf-s2s");
         scheduleActivity("wf-s2s", "act-s2s");
 
-        clock.advance(Duration.ofSeconds(31));
+        time.advance(Duration.ofSeconds(30).minusMillis(1));
+        service.sweep();
+        assertNull(lastAttribute(service.describeWorkflowExecution(REGION, DOMAIN, "wf-s2s", runId),
+                "ActivityTaskTimedOut", "timeoutType"), "the task has one millisecond left to be started");
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-s2s", runId);
@@ -340,12 +366,18 @@ class SwfServiceTest {
 
     @Test
     void activityStartToCloseTimeout_expiresAStartedTask() {
+        TestTime time = exactTimeline();
         start("wf-s2c");
         scheduleActivity("wf-s2c", "act-s2c");
         SwfActivityTask task = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "w").orElseThrow();
         assertEquals("act-s2c", task.getActivityId());
 
-        clock.advance(Duration.ofSeconds(61));
+        time.advance(Duration.ofSeconds(60).minusMillis(1));
+        service.sweep();
+        assertNull(lastAttribute(service.describeWorkflowExecution(REGION, DOMAIN, "wf-s2c", null),
+                "ActivityTaskTimedOut", "timeoutType"), "the worker has one millisecond left to finish");
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-s2c", null);
@@ -357,6 +389,7 @@ class SwfServiceTest {
 
     @Test
     void activityHeartbeatTimeout_expiresATaskThatStopsHeartbeating() {
+        TestTime time = exactTimeline();
         SwfActivityType heartbeating = activityType("HB", "1");
         heartbeating.setDefaultTaskHeartbeatTimeout("10");
         heartbeating.setDefaultTaskStartToCloseTimeout("600");
@@ -371,15 +404,21 @@ class SwfServiceTest {
         SwfActivityTask task = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "w").orElseThrow();
 
         // A heartbeat resets the window, so the task survives the first advance.
-        clock.advance(Duration.ofSeconds(8));
+        time.advance(Duration.ofSeconds(8));
         assertFalse(service.recordActivityTaskHeartbeat(task.getTaskToken(), "alive"));
-        clock.advance(Duration.ofSeconds(8));
+        time.advance(Duration.ofSeconds(8));
         service.sweep();
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-hb", null);
         assertNull(lastAttribute(execution, "ActivityTaskTimedOut", "timeoutType"),
                 "a heartbeat within the window must keep the task alive");
 
-        clock.advance(Duration.ofSeconds(11));
+        time.advance(Duration.ofSeconds(2).minusMillis(1));
+        service.sweep();
+        execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-hb", null);
+        assertNull(lastAttribute(execution, "ActivityTaskTimedOut", "timeoutType"),
+                "the window runs for ten seconds from the last heartbeat");
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
         execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-hb", null);
         assertEquals("HEARTBEAT", lastAttribute(execution, "ActivityTaskTimedOut", "timeoutType"));
@@ -387,10 +426,16 @@ class SwfServiceTest {
 
     @Test
     void decisionTaskStartToCloseTimeout_reschedulesTheTaskForAnotherDecider() {
+        TestTime time = exactTimeline();
         String runId = start("wf-dt-timeout");
         SwfDecisionTask abandoned = service.pollForDecisionTask(REGION, DOMAIN, "tl", "dead").orElseThrow();
 
-        clock.advance(Duration.ofSeconds(11));
+        time.advance(Duration.ofSeconds(10).minusMillis(1));
+        service.sweep();
+        assertNull(lastAttribute(service.describeWorkflowExecution(REGION, DOMAIN, "wf-dt-timeout", runId),
+                "DecisionTaskTimedOut", "timeoutType"), "the decider has one millisecond left to respond");
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-dt-timeout", runId);
@@ -404,9 +449,15 @@ class SwfServiceTest {
 
     @Test
     void workflowExecutionStartToCloseTimeout_closesTheExecutionAsTimedOut() {
+        TestTime time = exactTimeline();
         String runId = start("wf-exec-timeout");
 
-        clock.advance(Duration.ofSeconds(301));
+        time.advance(Duration.ofSeconds(300).minusMillis(1));
+        service.sweep();
+        assertEquals("OPEN",
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-exec-timeout", runId).getExecutionStatus());
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-exec-timeout", runId);
@@ -417,6 +468,7 @@ class SwfServiceTest {
 
     @Test
     void timerFires_onceItsStartToFireTimeoutElapses() {
+        TestTime time = exactTimeline();
         String runId = start("wf-timer");
         SwfDecisionTask decision = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d").orElseThrow();
         service.respondDecisionTaskCompleted(decision.getTaskToken(), List.of(
@@ -426,11 +478,42 @@ class SwfServiceTest {
         assertEquals(1, service.openTimerCount(
                 service.describeWorkflowExecution(REGION, DOMAIN, "wf-timer", runId)));
 
-        clock.advance(Duration.ofSeconds(31));
+        time.advance(Duration.ofSeconds(30).minusMillis(1));
+        service.sweep();
+        assertEquals(1, service.openTimerCount(
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-timer", runId)));
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-timer", runId);
         assertEquals("t-1", lastAttribute(execution, "TimerFired", "timerId"));
+        assertEquals(0, service.openTimerCount(execution));
+    }
+
+    @Test
+    void aTimerDueBetweenTwoSweepsFiresOnTheLaterOne() {
+        TestTime time = exactTimeline();
+        EmulatorConfig config = Mockito.mock(EmulatorConfig.class, Mockito.RETURNS_DEEP_STUBS);
+        Mockito.when(config.services().swf().enabled()).thenReturn(true);
+        Mockito.when(config.services().swf().timeoutSweepEnabled()).thenReturn(true);
+        Mockito.when(config.services().swf().timeoutSweepIntervalSeconds()).thenReturn(1L);
+        new SwfTimeoutSweeper(service, config, time.scheduler()).onStart(new StartupEvent());
+        String runId = start("wf-swept-timer");
+        SwfDecisionTask decision = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d").orElseThrow();
+        time.advance(Duration.ofMillis(400));
+        service.respondDecisionTaskCompleted(decision.getTaskToken(), List.of(
+                new Decision("StartTimer", Map.of("timerId", "t-swept", "startToFireTimeout", "30"))), null);
+
+        // Due 30.4 s in, between the sweeps at 30 s and 31 s.
+        time.advance(Duration.ofSeconds(31).minusMillis(401));
+        assertEquals(1, service.openTimerCount(
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-swept-timer", runId)));
+
+        time.advance(Duration.ofMillis(1));
+
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-swept-timer", runId);
+        assertEquals("t-swept", lastAttribute(execution, "TimerFired", "timerId"));
         assertEquals(0, service.openTimerCount(execution));
     }
 
