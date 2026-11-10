@@ -624,7 +624,8 @@ class CloudFormationLogsMetricFilterIntegrationTest {
                 .body(Map.of("logGroupName", group, "logStreamName", stream,
                         "logEvents", List.of(Map.of("timestamp", timestamp, "message", message))))
                 .post("/").then().statusCode(200);
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> given().contentType("application/x-amz-json-1.0")
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given().contentType("application/x-amz-json-1.0")
                 .header("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260908/us-east-1/monitoring/aws4_request")
                 .header("X-Amz-Target", "GraniteServiceVersion20100801.GetMetricStatistics")
                 .body(Map.of("Namespace", namespace, "MetricName", "ErrorCount", "Period", 60,

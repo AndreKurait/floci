@@ -267,7 +267,8 @@ class CloudFormationRuleImportIntegrationTest {
                 assertEquals(original, rule(original.securityGroupRuleId()));
             } finally {
                 foreign.deleteStack(request -> request.stackName(changeSet.stackId()));
-                await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> assertEquals("DELETE_COMPLETE",
+                await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() -> assertEquals("DELETE_COMPLETE",
                         foreign.describeStacks(request -> request.stackName(changeSet.stackId()))
                                 .stacks().getFirst().stackStatusAsString()));
             }
@@ -381,7 +382,8 @@ class CloudFormationRuleImportIntegrationTest {
                 execution.get();
             }
         }
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
             List<String> statuses = competing.stream().map(changeSet ->
                     cfn.describeStacks(request -> request.stackName(changeSet.stackId()))
                             .stacks().getFirst().stackStatusAsString()).toList();
@@ -480,7 +482,8 @@ class CloudFormationRuleImportIntegrationTest {
     }
 
     private DescribeChangeSetResponse ready(String changeSet) {
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
             DescribeChangeSetResponse response = cfn.describeChangeSet(request -> request.changeSetName(changeSet));
             assertEquals("CREATE_COMPLETE", response.statusAsString(), response.statusReason());
             assertEquals("AVAILABLE", response.executionStatusAsString());
@@ -489,7 +492,8 @@ class CloudFormationRuleImportIntegrationTest {
     }
 
     private void awaitStatus(String stack, String status) {
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals(status, cfn.describeStacks(request -> request.stackName(stack))
                         .stacks().getFirst().stackStatusAsString()));
     }

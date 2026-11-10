@@ -82,7 +82,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
         try {
             if (stack != null) {
                 cfn("DeleteStack", null).then().statusCode(200);
-                await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() ->
                         assertEquals(400, cfn("DescribeStacks", null).statusCode()));
             }
         } finally {
@@ -130,7 +131,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
         assertEquals("new", identity.jsonPath().getString("Tags.find { it.Key == 'purpose' }.Value"));
 
         cfn("DeleteStack", null).then().statusCode(200);
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals(404, sesIdentity(first).statusCode()));
         stack = null;
     }
@@ -201,7 +203,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
         assertEquals(null, identity.jsonPath().getString("DkimAttributes.SigningHostedZone"));
 
         cfn("DeleteStack", null).then().statusCode(200);
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals(404, sesIdentity(address).statusCode()));
         stack = null;
     }
@@ -254,7 +257,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
                 assertTrue(XmlParser.containsValue(published, "Value", outputs.get("DkimValue" + index)));
             }
             clock.advance(Duration.ofSeconds(5));
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertEquals("SUCCESS", sesIdentity(domain).jsonPath().getString("DkimAttributes.Status")));
             assertEquals(signingZone, sesIdentity(email).jsonPath().getString("DkimAttributes.SigningHostedZone"));
         } finally {
@@ -282,7 +286,9 @@ class CloudFormationSesEmailIdentityIntegrationTest {
         clearInvocations(sesService);
 
         cfn("UpdateStack", conditionalOptionsTemplate(identityName, false, members)).then().statusCode(200);
-        String omitted = await().atMost(Duration.ofSeconds(15)).until(
+        String omitted = await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(
                 () -> cfn("DescribeStacks", null).then().statusCode(200).extract().asString(),
                 body -> List.of("UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE", "UPDATE_ROLLBACK_FAILED")
                         .contains(XmlParser.extractFirst(body, "StackStatus", null)));
@@ -314,7 +320,9 @@ class CloudFormationSesEmailIdentityIntegrationTest {
         template.withObject("/Resources/Identity/Properties").set("ConfigurationSetAttributes",
                 optionalValue(MAPPER.createObjectNode().put("ConfigurationSetName", "unused")));
         cfn("CreateStack", template.toString()).then().statusCode(200);
-        String created = await().atMost(Duration.ofSeconds(15)).until(
+        String created = await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(
                 () -> cfn("DescribeStacks", null).then().statusCode(200).extract().asString(),
                 body -> List.of("CREATE_COMPLETE", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED")
                         .contains(XmlParser.extractFirst(body, "StackStatus", null)));
@@ -337,7 +345,9 @@ class CloudFormationSesEmailIdentityIntegrationTest {
             properties.put(invalid, "");
         }
         cfn("CreateStack", template.toString()).then().statusCode(200);
-        String failed = await().atMost(Duration.ofSeconds(15)).until(
+        String failed = await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(
                 () -> cfn("DescribeStacks", null).then().statusCode(200).extract().asString(),
                 body -> List.of("CREATE_COMPLETE", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED")
                         .contains(XmlParser.extractFirst(body, "StackStatus", null)));
@@ -368,7 +378,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
                 sesIdentity(original).then().statusCode(200);
             }
             cfn("DeleteStack", null).then().statusCode(200);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertEquals(400, cfn("DescribeStacks", null).statusCode()));
             stack = null;
             sesIdentity(original).then().statusCode(404);
@@ -474,7 +485,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
                     .getString("Tags.find { it.Key == 'purpose' }.Value"));
 
             cfn("DeleteStack", null).then().statusCode(200);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertEquals(404, sesIdentity(second).statusCode()));
             assertEquals(200, sesIdentity(first).statusCode(),
                     "UpdateReplacePolicy Retain must release the displaced identity from stack ownership");
@@ -524,7 +536,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
             cfn("UpdateStack", template(identityName, true)).then().statusCode(200);
             awaitStatus("UPDATE_COMPLETE");
             cfn("DeleteStack", null).then().statusCode(200);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertEquals(404, sesIdentity(identityName, owner).statusCode()));
             assertEquals(200, sesIdentity(identityName, other).statusCode(),
                     "Deleting the owner stack must not delete another account's same-named identity");
@@ -726,7 +739,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
             awaitStatus("DELETE_FAILED");
             assertEquals(200, sesIdentity(identityName).statusCode());
             cfn("DeleteStack", null).then().statusCode(200);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertEquals(404, sesIdentity(identityName).statusCode()));
             assertEquals(otherTokens, sesIdentity(identityName, otherAccount).jsonPath()
                     .getList("DkimAttributes.Tokens", String.class));
@@ -906,7 +920,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
             verify(sesService, times(2)).deleteIdentity(replacement, "us-east-1");
 
             cfn("DeleteStack", null).then().statusCode(200);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertEquals(404, sesIdentity(original).statusCode()));
             stack = null;
         } finally {
@@ -938,7 +953,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
             assertEquals(200, sesIdentity(replacement).statusCode());
 
             cfn("DeleteStack", null).then().statusCode(200);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
                 assertEquals(404, sesIdentity(original).statusCode());
                 assertEquals(404, sesIdentity(replacement).statusCode());
             });
@@ -979,7 +995,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
             verify(sesService, times(3)).deleteIdentity(replacement, "us-east-1");
 
             cfn("DeleteStack", null).then().statusCode(200);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertEquals(400, cfn("DescribeStacks", null).statusCode()));
             assertEquals(200, sesIdentity(replacement).statusCode());
             verify(sesService, times(3)).deleteIdentity(replacement, "us-east-1");
@@ -1033,7 +1050,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
 
             stack = originalStack;
             cfn("DeleteStack", null).then().statusCode(200);
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertEquals(400, cfn("DescribeStacks", null).statusCode()));
             assertEquals(404, sesIdentity(original).statusCode());
             stack = adoptingStack;
@@ -1052,7 +1070,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
                 stack = ownedStack;
                 if (cfn("DescribeStacks", null).statusCode() == 200) {
                     cfn("DeleteStack", null).then().statusCode(200);
-                    await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                    await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                            .untilAsserted(() ->
                             assertEquals(400, cfn("DescribeStacks", null).statusCode()));
                 }
             }
@@ -1063,7 +1082,8 @@ class CloudFormationSesEmailIdentityIntegrationTest {
     }
 
     private String awaitStatus(String expected) {
-        return await().atMost(Duration.ofSeconds(15)).until(
+        return await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(
                 () -> cfn("DescribeStacks", null).then().statusCode(200).extract().asString(),
                 body -> expected.equals(XmlParser.extractFirst(body, "StackStatus", null)));
     }

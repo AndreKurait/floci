@@ -178,7 +178,8 @@ class OrganizationsCfnIntegrationTest {
     }
 
     private static void awaitStackStatus(String expected) {
-        await().atMost(Duration.ofSeconds(30)).pollInterval(200, TimeUnit.MILLISECONDS).until(() ->
+        await().atMost(Duration.ofSeconds(30)).pollDelay(Duration.ZERO).pollInterval(200, TimeUnit.MILLISECONDS)
+                .until(() ->
                 expected.equals(describeStacks().xmlPath().getString(
                         "DescribeStacksResponse.DescribeStacksResult.Stacks.member.StackStatus")));
     }
@@ -343,7 +344,8 @@ class OrganizationsCfnIntegrationTest {
     void deleteStackTearsTheOrganizationDown() {
         cloudFormation("DeleteStack", "StackName", STACK_NAME).then().statusCode(200);
 
-        await().atMost(Duration.ofSeconds(30)).pollInterval(200, TimeUnit.MILLISECONDS).until(() ->
+        await().atMost(Duration.ofSeconds(30)).pollDelay(Duration.ZERO).pollInterval(200, TimeUnit.MILLISECONDS)
+                .until(() ->
                 organizations("DescribeOrganization", "{}").statusCode() == 400);
 
         organizations("DescribeOrganization", "{}")

@@ -190,7 +190,8 @@ class CloudFormationSecurityGroupEgressIntegrationTest {
     }
 
     private void awaitStatus(String status) {
-        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(50)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(30)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                .untilAsserted(() ->
                 assertEquals(status, cfn.describeStacks(request -> request.stackName(stack))
                         .stacks().getFirst().stackStatusAsString()));
     }

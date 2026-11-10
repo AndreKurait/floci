@@ -276,7 +276,7 @@ class CloudFormationDynamicReplacementIntegrationTest {
     private DescribeChangeSetResponse preview(String stack, String template) {
         String id = cfn.createChangeSet(request -> request.stackName(stack).changeSetName("preview")
                 .changeSetType("UPDATE").templateBody(template)).id();
-        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(50))
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
                 .untilAsserted(() -> assertEquals("CREATE_COMPLETE",
                         cfn.describeChangeSet(request -> request.changeSetName(id)).statusAsString()));
         return cfn.describeChangeSet(request -> request.changeSetName(id));
@@ -305,7 +305,7 @@ class CloudFormationDynamicReplacementIntegrationTest {
     }
 
     private void awaitStatus(String stack, String status) {
-        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(50))
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
                 .untilAsserted(() -> assertEquals(status,
                         cfn.describeStacks(request -> request.stackName(stack)).stacks().getFirst()
                                 .stackStatusAsString()));

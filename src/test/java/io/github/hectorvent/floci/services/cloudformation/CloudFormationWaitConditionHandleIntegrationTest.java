@@ -75,7 +75,8 @@ class CloudFormationWaitConditionHandleIntegrationTest {
         try {
             if (cfn.describeStacks().stacks().stream().anyMatch(value -> stack.equals(value.stackName()))) {
                 cfn.deleteStack(request -> request.stackName(stack));
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() ->
                         assertFalse(cfn.describeStacks().stacks().stream()
                                 .anyMatch(value -> stack.equals(value.stackName()))));
             }
@@ -182,7 +183,8 @@ class CloudFormationWaitConditionHandleIntegrationTest {
     }
 
     private void awaitStatus(String expected) {
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals(expected, cfn.describeStacks(request -> request.stackName(stack))
                         .stacks().getFirst().stackStatusAsString()));
     }

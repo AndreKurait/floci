@@ -2314,7 +2314,8 @@ class SamTransformIntegrationTest {
             given().contentType("application/x-www-form-urlencoded")
                     .formParam("Action", "DeleteStack").formParam("StackName", stack)
                     .when().post("/").then().statusCode(200);
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     given().when().get("/2018-10-31/layers/sam-shared-layer/versions/2")
                             .then().statusCode(404));
         } finally {

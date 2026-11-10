@@ -52,9 +52,11 @@ class CloudFormationCodeDeployIntegrationTest {
     void cleanup() {
         try {
             if (cfn.describeStacks().stacks().stream().anyMatch(value -> stack.equals(value.stackName()))) {
-                await().atMost(Duration.ofSeconds(15)).until(() -> !status().endsWith("_IN_PROGRESS"));
+                await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> !status().endsWith("_IN_PROGRESS"));
                 cfn.deleteStack(request -> request.stackName(stack));
-                await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() ->
                         assertFalse(cfn.describeStacks().stacks().stream()
                                 .anyMatch(value -> stack.equals(value.stackName()))));
             }
@@ -86,7 +88,8 @@ class CloudFormationCodeDeployIntegrationTest {
                           "Role":{"Value":{"Fn::GetAtt":["Role","Arn"]}}
                         }}
                         """));
-        await().atMost(Duration.ofSeconds(15)).until(() -> !status().endsWith("_IN_PROGRESS"));
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !status().endsWith("_IN_PROGRESS"));
         assertEquals("CREATE_COMPLETE", status(), () ->
                 cfn.describeStackEvents(request -> request.stackName(stack)).stackEvents().toString());
         Map<String, String> outputs = cfn.describeStacks(request -> request.stackName(stack)).stacks()
@@ -335,7 +338,7 @@ class CloudFormationCodeDeployIntegrationTest {
     }
 
     private void awaitStatus(CloudFormationClient client, String expected) {
-        await().atMost(Duration.ofSeconds(15)).until(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).until(() ->
                 !client.describeStacks(request -> request.stackName(stack)).stacks()
                         .getFirst().stackStatusAsString().endsWith("_IN_PROGRESS"));
         assertEquals(expected, client.describeStacks(request -> request.stackName(stack)).stacks()
@@ -347,10 +350,12 @@ class CloudFormationCodeDeployIntegrationTest {
         if (client.describeStacks().stacks().stream().noneMatch(value -> stack.equals(value.stackName()))) {
             return;
         }
-        await().atMost(Duration.ofSeconds(15)).until(() -> !client.describeStacks(request -> request.stackName(stack))
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !client.describeStacks(request -> request.stackName(stack))
                 .stacks().getFirst().stackStatusAsString().endsWith("_IN_PROGRESS"));
         client.deleteStack(request -> request.stackName(stack));
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> assertFalse(client.describeStacks().stacks().stream()
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertFalse(client.describeStacks().stacks().stream()
                 .anyMatch(value -> stack.equals(value.stackName()))));
     }
 

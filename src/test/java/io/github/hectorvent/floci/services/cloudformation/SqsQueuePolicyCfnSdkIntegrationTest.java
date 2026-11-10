@@ -205,7 +205,8 @@ class SqsQueuePolicyCfnSdkIntegrationTest {
     }
 
     private static void waitFor(CloudFormationClient cfn, String name, StackStatus status) {
-        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(50)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(30)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                .untilAsserted(() ->
                 assertEquals(status, cfn.describeStacks(request -> request.stackName(name)).stacks().getFirst().stackStatus()));
     }
 
@@ -214,7 +215,7 @@ class SqsQueuePolicyCfnSdkIntegrationTest {
             return;
         }
         cfn.deleteStack(request -> request.stackName(name));
-        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(50))
+        await().atMost(Duration.ofSeconds(30)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
                 .until(() -> stackDeleted(cfn, name));
     }
 
