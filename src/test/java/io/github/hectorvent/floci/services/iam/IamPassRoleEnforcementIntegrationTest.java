@@ -29,6 +29,7 @@ import java.util.zip.GZIPOutputStream;
 import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -691,6 +692,47 @@ class IamPassRoleEnforcementIntegrationTest {
                 .formParam("InstanceId", instanceId).post("/").then().statusCode(200);
         cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteLaunchConfiguration")
                 .formParam("LaunchConfigurationName", name).post("/"));
+    }
+
+    @Test
+    void omittedLaunchTemplateVersionChecksTheDefaultProfileBeforeCreatingAGroup() {
+        String role = role("asg-default");
+        String templateId = launchTemplate(instanceProfile(roleName(role)), null);
+        User user = user("passrole-asg-default");
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*"));
+        String name = "passrole-default-" + suffix();
+        cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteAutoScalingGroup")
+                .formParam("AutoScalingGroupName", name).formParam("ForceDelete", "true").post("/"));
+
+        denied(group(user, "CreateAutoScalingGroup", name)
+                .formParam("LaunchTemplate.LaunchTemplateId", templateId).post("/").then());
+        String mixed = "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.";
+        denied(group(user, "CreateAutoScalingGroup", name)
+                .formParam(mixed + "LaunchTemplateId", templateId).post("/").then());
+        admin("autoscaling").formParam("Action", "DescribeAutoScalingGroups")
+                .formParam("AutoScalingGroupNames.member.1", name).post("/").then().statusCode(200)
+                .body("DescribeAutoScalingGroupsResponse.DescribeAutoScalingGroupsResult.AutoScalingGroups.member.size()",
+                        equalTo(0));
+
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*") + "," + passRole(role, "ec2.amazonaws.com"));
+        group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .post("/").then().statusCode(200);
+    }
+
+    @Test
+    void omittedLaunchTemplateVersionDoesNotCheckAnUnselectedLatestProfile() {
+        String role = role("asg-latest-only");
+        String templateId = launchTemplate(null, instanceProfile(roleName(role)));
+        User user = user("passrole-asg-plain-default");
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*"));
+        String name = "passrole-plain-default-" + suffix();
+        cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteAutoScalingGroup")
+                .formParam("AutoScalingGroupName", name).formParam("ForceDelete", "true").post("/"));
+
+        denied(group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .formParam("LaunchTemplate.Version", "$Latest").post("/").then());
+        group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .post("/").then().statusCode(200);
     }
 
     @Test

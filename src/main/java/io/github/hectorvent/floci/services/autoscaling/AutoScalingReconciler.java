@@ -374,7 +374,9 @@ public class AutoScalingReconciler {
                 }
                 if ("running".equals(ec2State)) {
                     boolean returningFromStandby = asgInst.getStandbyActivityId() != null;
-                    if (!returningFromStandby && "Pending".equals(asgInst.getLifecycleState())
+                    // An attached instance was not launched by the group, so it only waits for registration.
+                    if (!returningFromStandby && !asgInst.isPendingAttachment()
+                            && "Pending".equals(asgInst.getLifecycleState())
                             && asgService.beginLaunchLifecycleActions(asg, asgInst, Instant.now())) {
                         changed = true;
                         continue;
@@ -382,7 +384,12 @@ public class AutoScalingReconciler {
                     registerWithTargetGroups(asg, asgInst, returningFromStandby);
                     registerWithClassicLoadBalancers(asg, asgInst, returningFromStandby);
                     asgInst.setLifecycleState("InService");
-                    if (returningFromStandby) {
+                    if (asgInst.isPendingAttachment()) {
+                        asgInst.setPendingAttachment(false);
+                        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                                "Attaching an EC2 instance: " + asgInst.getInstanceId(),
+                                "An instance was attached to the Auto Scaling group.", "Successful");
+                    } else if (returningFromStandby) {
                         asgService.completeStandbyActivity(asgInst, "Successful", null);
                     } else {
                         asgInst.setHealthStatus("Healthy");
@@ -1114,8 +1121,8 @@ public class AutoScalingReconciler {
             } catch (Exception e) {
                 LOG.warnv(e, "ASG {0}: could not register {1} with Classic ELB {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), lbName, e.getMessage());
-                if (returningFromStandby && !(e instanceof AwsException aws
-                        && "LoadBalancerNotFound".equals(aws.getErrorCode()))) {
+                if (asgInst.isPendingAttachment() || (returningFromStandby && !(e instanceof AwsException aws
+                        && "LoadBalancerNotFound".equals(aws.getErrorCode())))) {
                     throw e;
                 }
             }
@@ -1134,8 +1141,8 @@ public class AutoScalingReconciler {
             } catch (Exception e) {
                 LOG.warnv(e, "ASG {0}: could not register {1} with TG {2}: {3}",
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), tgArn, e.getMessage());
-                if (returningFromStandby && !(e instanceof AwsException aws
-                        && "TargetGroupNotFound".equals(aws.getErrorCode()))) {
+                if (asgInst.isPendingAttachment() || (returningFromStandby && !(e instanceof AwsException aws
+                        && "TargetGroupNotFound".equals(aws.getErrorCode())))) {
                     throw e;
                 }
             }

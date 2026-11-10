@@ -285,6 +285,10 @@ class ElbClassicDrainingPacketIntegrationTest extends ElbClassicPublicNatPacketI
                 .instanceIds(topology.first()));
         assertEquals(1, scaling.describeAutoScalingGroups(query -> query.autoScalingGroupNames(topology.name()))
                 .autoScalingGroups().getFirst().desiredCapacity());
+        // An attached instance stays Pending until the group's load balancer registration succeeds.
+        await().atMost(Duration.ofSeconds(30)).until(() -> scaling.describeAutoScalingGroups(
+                query -> query.autoScalingGroupNames(topology.name())).autoScalingGroups().getFirst()
+                .instances().stream().allMatch(instance -> "InService".equals(instance.lifecycleStateAsString())));
         return scaling;
     }
 

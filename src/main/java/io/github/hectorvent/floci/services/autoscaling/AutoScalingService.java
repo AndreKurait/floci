@@ -653,6 +653,16 @@ public class AutoScalingService implements PassedRoleLookup {
                         "Auto Scaling group '" + name + "' has " + active.size()
                                 + " instance(s). Set ForceDelete=true to delete anyway.", 400);
             }
+            // The group stays stored, marked as deleting, until its children are gone, so a failed
+            // cleanup can be retried by name, also after a restart.
+            String previousStatus = asg.getStatus();
+            asg.setStatus("Delete in progress");
+            try {
+                groups.put(key, asg);
+            } catch (RuntimeException failure) {
+                asg.setStatus(previousStatus);
+                throw failure;
+            }
             if (forceDelete && ec2Service != null && !active.isEmpty()) {
                 active.stream()
                         .map(AsgInstance::getInstanceId)
@@ -673,7 +683,6 @@ public class AutoScalingService implements PassedRoleLookup {
                     "The Auto Scaling group was deleted."));
             active.forEach(instance -> completeTerminationActivity(instance, "Cancelled",
                     "The Auto Scaling group was deleted."));
-            groups.remove(key);
             instanceRefreshes.entrySet().removeIf(e -> region.equals(e.getValue().getRegion())
                     && name.equals(e.getValue().getAutoScalingGroupName()));
             hooks.entrySet().removeIf(e -> e.getKey().startsWith(region + "::")
@@ -683,6 +692,7 @@ public class AutoScalingService implements PassedRoleLookup {
             scheduledActions.entrySet().removeIf(e -> region.equals(e.getValue().getRegion())
                     && name.equals(e.getValue().getAutoScalingGroupName()));
             warmPools.remove(warmPoolKey(region, name));
+            groups.remove(key);
         }
     }
 
@@ -715,7 +725,7 @@ public class AutoScalingService implements PassedRoleLookup {
     void reconcileIfPresent(AutoScalingGroup asg, Runnable reconciliation) {
         String key = asgKey(asg.getRegion(), asg.getAutoScalingGroupName());
         synchronized (lockFor(key)) {
-            if (groups.get(key) == asg) {
+            if (groups.get(key) == asg && !"Delete in progress".equals(asg.getStatus())) {
                 reconciliation.run();
             }
         }
@@ -1153,11 +1163,14 @@ public class AutoScalingService implements PassedRoleLookup {
                 }
                 Map<String, Instance> instances = attachmentInstances(region, asg, requested);
                 ec2Service.createSystemTags(region, requested, propagatedInstanceTags(asg, List.of()));
+                boolean registrationPending = !asg.getTargetGroupARNs().isEmpty()
+                        || !asg.getLoadBalancerNames().isEmpty();
                 for (String id : requested) {
                     Instance instance = instances.get(id);
                     AsgInstance inst = new AsgInstance();
                     inst.setInstanceId(id);
-                    inst.setLifecycleState("InService");
+                    inst.setLifecycleState(registrationPending ? "Pending" : "InService");
+                    inst.setPendingAttachment(registrationPending);
                     inst.setHealthStatus("Healthy");
                     inst.setAvailabilityZone(instance.getPlacement().getAvailabilityZone());
                     inst.setInstanceType(instance.getInstanceType());
@@ -1276,6 +1289,10 @@ public class AutoScalingService implements PassedRoleLookup {
                             + " is not in InService or Standby or Pending:Retained or Terminating:Retained"
                             + " or Warmed:Pending:Retained or Warmed:Terminating:Retained.", 400);
                 }
+                if (decrementDesiredCapacity && instance.getLifecycleState().endsWith(":Retained")) {
+                    throw new AwsException("ValidationError",
+                            "ShouldDecrementDesiredCapacity must be false for a retained instance.", 400);
+                }
                 detached.add(id);
             }
             int desired = asg.getDesiredCapacity() - detached.size();
@@ -1302,16 +1319,24 @@ public class AutoScalingService implements PassedRoleLookup {
     private boolean selectedRefreshOriginalIsRunning(String region, AutoScalingGroup asg, AsgInstance instance) {
         InstanceRefresh refresh = activeInstanceRefresh(asg);
         if (!"Terminating".equals(instance.getLifecycleState()) || refresh == null
-                || refresh.getReplacements() == null || refresh.getReplacements().stream().noneMatch(replacement ->
+                || (refresh.getReplacements() != null && refresh.getReplacements().stream().noneMatch(replacement ->
                 instance.getInstanceId().equals(replacement.getOriginalInstanceId())
-                        && "Selected".equals(replacement.getPhase()))) {
+                        && "Selected".equals(replacement.getPhase())))) {
             return false;
         }
         // Selection marks the member Terminating before the refresh actually stops its EC2 instance.
-        return ec2Service.describeInstances(region, List.of(instance.getInstanceId()), null).stream()
-                .flatMap(reservation -> reservation.getInstances().stream())
-                .anyMatch(ec2 -> instance.getInstanceId().equals(ec2.getInstanceId())
-                        && ec2.getState() != null && "running".equals(ec2.getState().getName()));
+        try {
+            return ec2Service.describeInstances(region, List.of(instance.getInstanceId()), null).stream()
+                    .flatMap(reservation -> reservation.getInstances().stream())
+                    .anyMatch(ec2 -> instance.getInstanceId().equals(ec2.getInstanceId())
+                            && ec2.getState() != null && "running".equals(ec2.getState().getName()));
+        } catch (AwsException e) {
+            if (!"InvalidInstanceID.NotFound".equals(e.getErrorCode())) {
+                throw e;
+            }
+            LOG.debugv("Selected refresh original {0} no longer exists in EC2", instance.getInstanceId());
+            return false;
+        }
     }
 
     public ScalingActivity terminateInstanceInAutoScalingGroup(String region, String instanceId,
@@ -2431,7 +2456,7 @@ public class AutoScalingService implements PassedRoleLookup {
         if (ec2Service == null) {
             return;
         }
-        List<String> versions = isBlank(launchTemplateVersion) ? List.of() : List.of(launchTemplateVersion);
+        List<String> versions = List.of(isBlank(launchTemplateVersion) ? "$Default" : launchTemplateVersion);
         List<LaunchTemplate> launchTemplateVersions = ec2Service.describeLaunchTemplateVersions(
                 region,
                 launchTemplateId,
@@ -2469,7 +2494,7 @@ public class AutoScalingService implements PassedRoleLookup {
         List<LaunchTemplate> versions;
         try {
             versions = ec2Service.describeLaunchTemplateVersions(region, templateId, templateName,
-                    isBlank(version) ? List.of() : List.of(version));
+                    List.of(isBlank(version) ? "$Default" : version));
         } catch (AwsException e) {
             // A version that does not exist is the operation's to refuse, and passes no role.
             LOG.debugv("Launch template {0} has no version {1}, so it passes no role: {2}",

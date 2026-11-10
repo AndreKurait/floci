@@ -149,7 +149,7 @@ described below.
 | `SetInstanceHealth` | Updates an instance's health status immediately; accepts but does not enforce the grace-period flag |
 | `SetInstanceProtection` | Enables or disables scale-in protection for named instances in a group |
 | `SetDesiredCapacity` | Queues capacity reconciliation; Classic draining can postpone termination |
-| `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
+| `AttachInstances` | Attaches existing EC2 instances to a group; waits for configured load-balancer registration before `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
 | `EnterStandby` | Preserves membership while removing traffic and excluding the instances from active capacity; optionally decrements desired capacity within the group's minimum |
 | `ExitStandby` | Restores traffic and `InService` state; increments desired capacity within the group's maximum |
@@ -189,12 +189,25 @@ Attachment checks EC2 existence, running state and the group's effective Availab
 Zones before changing tags or membership. A different subnet or VPC in a matching
 zone is accepted. Repeated IDs count once toward desired capacity. Suspended Launch
 or capacity above the maximum rejects the attachment.
+When the group names target groups or Classic load balancers, attached instances
+remain `Pending` until registration succeeds. Failed registrations retry through
+reconciliation, including after a storage reload. Groups without load balancers
+complete attachment immediately.
 
 Detach validates the whole batch before deleting membership tags or refresh ownership.
 Missing members, Pending or Detaching members, and a decremented desired capacity below
-the minimum are rejected. Selected refresh originals remain detachable while their EC2
-instances are still running. Floci completes attachment and detachment synchronously;
-it does not reproduce AWS's asynchronous Pending and Detaching transitions.
+the minimum are rejected. Retained lifecycle states require
+`ShouldDecrementDesiredCapacity=false`, as the
+[DetachInstances API](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_DetachInstances.html)
+specifies. Selected refresh originals remain detachable while their EC2
+instances are still running, including refreshes stored before replacement ownership
+was recorded. A missing EC2 original produces the same lifecycle `ValidationError`
+as a terminated original. Detachment completes synchronously; Floci does not
+reproduce AWS's asynchronous Detaching transition.
+
+Group deletion retains a `Delete in progress` entry until child cleanup finishes.
+If a storage operation fails, retrying deletion continues cleanup; reconciliation
+does not launch replacement instances for the retained deleting group.
 
 ### Standby
 
@@ -444,6 +457,7 @@ execution text retain that text through a UTF-8 fallback.
 
 For direct and mixed launch templates, omitting the version selects `$Default`.
 Explicit `$Default`, `$Latest`, and numeric versions keep their requested selection.
+Image validation and instance-profile authorization use that same version selection.
 
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
 

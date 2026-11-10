@@ -27,6 +27,7 @@ import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.elb.ElbClassicService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import org.junit.jupiter.api.BeforeEach;
@@ -631,6 +632,33 @@ class AutoScalingServiceTest {
         verifyNoInteractions(service.ec2Service);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"Pending:Retained", "Terminating:Retained",
+            "Warmed:Pending:Retained", "Warmed:Terminating:Retained"})
+    void retainedMembersDetachOnlyWithoutDecrementingCapacity(String state) {
+        service.ec2Service = mock(Ec2Service.class);
+        AutoScalingGroup group = service.requireGroup(REGION, "test-asg");
+        AsgInstance instance = new AsgInstance();
+        instance.setInstanceId("i-retained");
+        instance.setLifecycleState(state);
+        group.getInstances().add(instance);
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "test-asg", List.of("i-retained"), true));
+
+        assertEquals("ValidationError", failure.getErrorCode());
+        assertEquals(1, group.getDesiredCapacity());
+        assertEquals(List.of(instance), group.getInstances());
+        verifyNoInteractions(service.ec2Service);
+
+        service.detachInstances(REGION, "test-asg", List.of("i-retained"), false);
+
+        assertEquals(1, group.getDesiredCapacity());
+        assertTrue(group.getInstances().isEmpty());
+        verify(service.ec2Service).deleteSystemTag(
+                REGION, List.of("i-retained"), AutoScalingService.GROUP_NAME_TAG, "test-asg");
+    }
+
     @Test
     void anInstanceRefreshResolvesTheProfileOfTheTemplateItsGroupLaunchesFromOnceItApplies() {
         Ec2Service ec2Service = mock(Ec2Service.class);
@@ -662,10 +690,140 @@ class AutoScalingServiceTest {
         verifyNoInteractions(ec2Service);
     }
 
+    private static Stream<Arguments> launchTemplateVersionSelections() {
+        return Stream.of(Arguments.of(null, "$Default"), Arguments.of("", "$Default"),
+                Arguments.of(" ", "$Default"), Arguments.of("$Default", "$Default"),
+                Arguments.of("$Latest", "$Latest"), Arguments.of("2", "2"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("launchTemplateVersionSelections")
+    void launchTemplateProfileUsesTheSelectedVersion(String requested, String resolved) {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-selected", null, List.of()))
+                .thenReturn(List.of(withProfile("unselected-profile")));
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-selected", null, List.of(resolved)))
+                .thenReturn(List.of(withProfile("selected-profile")));
+
+        assertEquals(Optional.of("selected-profile"),
+                service.launchTemplateInstanceProfile("lt-selected", null, requested, REGION));
+    }
+
+    @ParameterizedTest
+    @MethodSource("launchTemplateVersionSelections")
+    void launchTemplateImageValidationAcceptsTheSelectedVersion(String requested, String resolved) {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        LaunchTemplate selected = new LaunchTemplate();
+        selected.getData().setImageId("ami-selected");
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-selected", null, List.of()))
+                .thenReturn(List.of(new LaunchTemplate()));
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-selected", null, List.of(resolved)))
+                .thenReturn(List.of(selected));
+
+        createVersionSelectionGroup(requested);
+
+        assertEquals(1, service.describeAutoScalingGroups(REGION, List.of("version-asg")).size());
+    }
+
+    @ParameterizedTest
+    @MethodSource("launchTemplateVersionSelections")
+    void launchTemplateImageValidationRejectsTheSelectedVersionBeforeMutation(String requested, String resolved) {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        service.ec2Service = ec2Service;
+        LaunchTemplate unselected = new LaunchTemplate();
+        unselected.getData().setImageId("ami-unselected");
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-selected", null, List.of()))
+                .thenReturn(List.of(unselected));
+        when(ec2Service.describeLaunchTemplateVersions(REGION, "lt-selected", null, List.of(resolved)))
+                .thenReturn(List.of(new LaunchTemplate()));
+
+        AwsException failure = assertThrows(AwsException.class, () -> createVersionSelectionGroup(requested));
+
+        assertEquals("ValidationError", failure.getErrorCode());
+        assertEquals(AutoScalingService.MISSING_LAUNCH_TEMPLATE_IMAGE_ID_MESSAGE, failure.getMessage());
+        assertTrue(service.describeAutoScalingGroups(REGION, List.of("version-asg")).isEmpty());
+    }
+
+    private void createVersionSelectionGroup(String version) {
+        service.createAutoScalingGroup(REGION, "version-asg", null, "lt-selected", null, version,
+                null, 0, 1, 0, 300, List.of("us-east-1a"), List.of(), List.of(), List.of(),
+                "EC2", 0, List.of("Default"), Map.of(), Map.of(), AsgOptionalFields.none());
+    }
+
     private static LaunchTemplate withProfile(String profileName) {
         LaunchTemplate version = new LaunchTemplate();
         version.getData().setIamInstanceProfile(new LaunchTemplateData.IamInstanceProfile(null, profileName));
         return version;
+    }
+
+    @ParameterizedTest
+    @CsvSource(value = {"-,true", "'',true", "$Default,true", "$Latest,false", "2,false"}, nullValues = "-")
+    void validationAndPassRoleUseTheSameDefaultTemplateVersion(String requestedVersion, boolean defaultVersion) {
+        service.ec2Service = mock(Ec2Service.class);
+        LaunchTemplate original = withProfile("default-profile");
+        original.getData().setImageId("ami-default");
+        LaunchTemplate latest = withProfile("latest-profile");
+        when(service.ec2Service.describeLaunchTemplateVersions(eq(REGION), eq("lt-default"), isNull(), anyList()))
+                .thenAnswer(invocation -> {
+                    List<String> selectors = invocation.getArgument(3);
+                    return selectors.equals(List.of("$Default")) ? List.of(original) : List.of(latest);
+                });
+
+        assertAll(
+                () -> assertEquals(Optional.of(defaultVersion ? "default-profile" : "latest-profile"),
+                        service.launchTemplateInstanceProfile("lt-default", null, requestedVersion, REGION)),
+                () -> {
+                    Runnable create = () -> service.createAutoScalingGroup(REGION, "default-version",
+                            null, "lt-default", null, requestedVersion, null, 0, 1, 0, 300,
+                            List.of(REGION + "a"), List.of(), List.of(), List.of(), "EC2", 0,
+                            List.of("Default"), Map.of(), Map.of(), AsgOptionalFields.none());
+                    if (defaultVersion) {
+                        assertDoesNotThrow(create::run);
+                    } else {
+                        assertEquals("ValidationError", assertThrows(AwsException.class, create::run).getErrorCode());
+                    }
+                });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"target", "classic"})
+    void attachedInstancesRetryBothLoadBalancerRegistrationsBeforeBecomingInService(String failingService) {
+        service.ec2Service = mock(Ec2Service.class);
+        stubRunningAttachments("i-attached");
+        when(service.ec2Service.isInstanceContainerRunning("i-attached")).thenReturn(true);
+        AutoScalingGroup group = service.requireGroup(REGION, "test-asg");
+        group.setDesiredCapacity(0);
+        group.setTargetGroupARNs(List.of("attached-targets"));
+        group.setLoadBalancerNames(List.of("attached-classic"));
+        ElbV2Service targets = mock(ElbV2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AwsException failure = new AwsException("InternalFailure", "registration unavailable", 500);
+        if ("target".equals(failingService)) {
+            doThrow(failure).doNothing().when(targets).registerTargets(eq(REGION), eq("attached-targets"), anyList());
+        } else {
+            when(classic.registerInstances(REGION, "attached-classic", List.of("i-attached")))
+                    .thenThrow(failure).thenReturn(List.of("i-attached"));
+        }
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(
+                service, service.ec2Service, targets, classic, null);
+
+        service.attachInstances(REGION, "test-asg", List.of("i-attached"));
+        assertEquals(1, group.getDesiredCapacity());
+        reconciler.reconcile(group);
+
+        assertEquals("Pending", group.getInstances().getFirst().getLifecycleState());
+        assertTrue(service.describeScalingActivities(REGION, "test-asg").isEmpty());
+        reconciler.reconcile(group);
+
+        assertEquals("InService", group.getInstances().getFirst().getLifecycleState());
+        verify(targets, times(2)).registerTargets(eq(REGION), eq("attached-targets"), anyList());
+        verify(classic, times("classic".equals(failingService) ? 2 : 1))
+                .registerInstances(REGION, "attached-classic", List.of("i-attached"));
+        assertEquals(List.of("Attaching an EC2 instance: i-attached"),
+                service.describeScalingActivities(REGION, "test-asg").stream()
+                        .map(activity -> activity.getDescription()).toList());
     }
 
     @Test
