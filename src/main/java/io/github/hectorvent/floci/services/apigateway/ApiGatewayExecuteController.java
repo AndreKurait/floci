@@ -1307,7 +1307,7 @@ public class ApiGatewayExecuteController {
             return new AuthorizerResult(null, verified.principalId(), verified.context(),
                     verified.usageIdentifierKey());
         } catch (Exception exception) {
-            LOG.warnv("Authorizer failure: {0}", exception.getMessage());
+            LOG.warnv(exception, "Authorizer failure: {0}", exception.getMessage());
             return authorizerError(scope, GatewayResponseType.AUTHORIZER_FAILURE, 500);
         }
     }
