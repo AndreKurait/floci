@@ -14,6 +14,8 @@ import io.floci.aws.services.backup.model.BackupVault;
 import io.floci.aws.services.backup.model.RecoveryPoint;
 import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.services.sqs.model.MessageAttributeValue;
+import io.floci.aws.testing.TestTime;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
@@ -30,7 +32,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -44,10 +45,10 @@ class BackupJobRecoveryTest {
     @Test
     void restartResumesEachNonTerminalStateAndDoesNotDuplicateRecoveryPoints() {
         try (Fixture fixture = new Fixture()) {
-            fixture.vault().setCreationDate(Instant.now().getEpochSecond() - 60);
+            fixture.vault().setCreationDate(fixture.time.now().getEpochSecond() - 60);
             BackupJob original = fixture.service.startBackupJob(VAULT, "arn:aws:s3:::bucket", "role", null, REGION);
             fixture.service.shutdown();
-            long now = Instant.now().getEpochSecond();
+            long now = fixture.time.now().getEpochSecond();
             original.setExpectedCompletionDate(now - 1);
             fixture.jobs.put(original.getBackupJobId(), original);
             for (String state : List.of("RUNNING", "ABORTING", "COMPLETED", "FAILED", "ABORTED")) {
@@ -79,13 +80,14 @@ class BackupJobRecoveryTest {
             fixture.service.resumeJobs();
             assertEquals("RUNNING", fixture.service.describeBackupJob("future").getState());
             assertEquals(now + 3600, fixture.service.describeBackupJob("future").getExpectedCompletionDate());
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-                assertEquals("COMPLETED", fixture.service.describeBackupJob(original.getBackupJobId()).getState());
-                assertEquals("COMPLETED", fixture.service.describeBackupJob("RUNNING").getState());
-                assertEquals("ABORTED", fixture.service.describeBackupJob("ABORTING").getState());
-                assertEquals("EXPIRED", fixture.service.describeBackupJob("expired").getState());
-                assertEquals("FAILED", fixture.service.describeBackupJob("missing-vault").getState());
-            });
+            fixture.time.runDue();
+            assertEquals("COMPLETED", fixture.service.describeBackupJob(original.getBackupJobId()).getState());
+            assertEquals("COMPLETED", fixture.service.describeBackupJob("RUNNING").getState());
+            assertEquals("ABORTED", fixture.service.describeBackupJob("ABORTING").getState());
+            assertEquals("EXPIRED", fixture.service.describeBackupJob("expired").getState());
+            assertEquals("FAILED", fixture.service.describeBackupJob("missing-vault").getState());
+            assertEquals("RUNNING", fixture.service.describeBackupJob("future").getState(),
+                    "A deadline an hour away must not be met by the restart");
             fixture.service.resumeJobs();
             assertEquals(2, fixture.service.listRecoveryPointsByBackupVault(VAULT, REGION).size());
             assertEquals(2, fixture.vault().getNumberOfRecoveryPoints());
@@ -118,8 +120,7 @@ class BackupJobRecoveryTest {
                 synchronized (monitor) {
                     worker.start();
                     assertTrue(entered.await(5, TimeUnit.SECONDS));
-                    await().atMost(Duration.ofSeconds(5)).until(() ->
-                            worker.getState() == Thread.State.BLOCKED || deletion.isDone());
+                    ThreadStates.awaitBlockedOrDone(worker);
                     waited = worker.getState() == Thread.State.BLOCKED && !deletion.isDone();
                     fixture.complete(second);
                 }
@@ -170,7 +171,7 @@ class BackupJobRecoveryTest {
                     () -> fixture.service.deleteRecoveryPoint(VAULT, job.getRecoveryPointArn(), REGION));
             assertEquals("InvalidRequestException", protectedPoint.getErrorCode());
             verify(fixture.points, never()).delete(anyString());
-            point.setCreationDate(Instant.now().minus(Duration.ofDays(2)).getEpochSecond());
+            point.setCreationDate(fixture.time.now().minus(Duration.ofDays(2)).getEpochSecond());
             fixture.service.deleteRecoveryPoint(VAULT, job.getRecoveryPointArn(), REGION);
             verify(fixture.points).delete(job.getRecoveryPointArn());
             doCallRealMethod().when(fixture.vaults).get(anyString());
@@ -214,14 +215,14 @@ class BackupJobRecoveryTest {
             original.setCreationDate(42L);
             fixture.vault().setNumberOfRecoveryPoints(9);
             job.setState("RUNNING");
-            job.setExpectedCompletionDate(Instant.now().getEpochSecond() - 1);
+            job.setExpectedCompletionDate(fixture.time.now().getEpochSecond() - 1);
             fixture.jobs.put(job.getBackupJobId(), job);
             fixture.service.shutdown();
             clearInvocations(fixture.points);
             fixture.service = fixture.newService();
             fixture.service.resumeJobs();
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                    assertEquals("COMPLETED", fixture.service.describeBackupJob(job.getBackupJobId()).getState()));
+            fixture.time.runDue();
+            assertEquals("COMPLETED", fixture.service.describeBackupJob(job.getBackupJobId()).getState());
             verify(fixture.points, atLeastOnce()).scan(any());
             assertEquals(1, fixture.points.keys().size());
             assertEquals(1, fixture.vault().getNumberOfRecoveryPoints());
@@ -310,7 +311,7 @@ class BackupJobRecoveryTest {
     @Test
     void restartKeepsLegacyStartAndCompletionDeadlinesInOriginalRegion() {
         try (Fixture fixture = new Fixture()) {
-            long now = Instant.now().getEpochSecond();
+            long now = fixture.time.now().getEpochSecond();
             fixture.vault().setCreationDate(now - 20);
             BackupJob expired = fixture.legacy("CREATED", now - 10);
             expired.setStartBy(now - 1);
@@ -320,12 +321,19 @@ class BackupJobRecoveryTest {
             fixture.jobs.put("future", future);
             fixture.jobs.put("legacy", expired);
             fixture.service.resumeJobs();
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                    assertEquals("EXPIRED", fixture.service.describeBackupJob("legacy").getState()));
+            fixture.time.runDue();
+            assertEquals("EXPIRED", fixture.service.describeBackupJob("legacy").getState());
             assertEquals("RUNNING", fixture.service.describeBackupJob("future").getState());
             assertEquals(now + 3600, fixture.service.describeBackupJob("future").getExpectedCompletionDate());
             assertTrue(fixture.points.keys().isEmpty());
             assertEquals(0, fixture.vault().getNumberOfRecoveryPoints());
+            fixture.time.advance(Duration.ofSeconds(3600).minusMillis(1));
+            assertEquals("RUNNING", fixture.service.describeBackupJob("future").getState(),
+                    "The kept deadline has not been reached yet");
+            fixture.time.advance(Duration.ofMillis(1));
+            assertEquals("COMPLETED", fixture.service.describeBackupJob("future").getState());
+            assertEquals(now + 3600, fixture.service.describeBackupJob("future").getCompletionDate());
+            assertEquals(1, fixture.vault().getNumberOfRecoveryPoints());
         }
     }
 
@@ -355,7 +363,7 @@ class BackupJobRecoveryTest {
         for (boolean replace : List.of(false, true)) {
             try (Fixture fixture = new Fixture()) {
                 BackupJob job = fixture.startRunning();
-                job.setExpectedCompletionDate(Instant.now().getEpochSecond() - 1);
+                job.setExpectedCompletionDate(fixture.time.now().getEpochSecond() - 1);
                 BackupVault original = fixture.vault();
                 String capturedId = original.getVaultId();
                 String jobJson = fixture.mapper.writeValueAsString(job);
@@ -373,18 +381,17 @@ class BackupJobRecoveryTest {
                 }
                 fixture.service.putBackupVaultNotifications(VAULT, REGION, TOPIC, List.of("BACKUP_JOB_COMPLETED"));
                 fixture.service.resumeJobs();
-                await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(
-                        replace ? "FAILED" : "COMPLETED",
-                        fixture.service.describeBackupJob(job.getBackupJobId()).getState()));
+                fixture.time.runDue();
+                assertEquals(replace ? "FAILED" : "COMPLETED",
+                        fixture.service.describeBackupJob(job.getBackupJobId()).getState());
                 assertEquals(capturedId, fixture.service.describeBackupJob(job.getBackupJobId()).getVaultId());
                 assertEquals(replace ? 0 : 1, fixture.points.keys().size());
                 assertEquals(replace ? 0 : 1, fixture.vault().getNumberOfRecoveryPoints());
                 if (replace) {
                     verifyNoInteractions(fixture.sns);
                 } else {
-                    await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                            verify(fixture.sns).publish(eq(TOPIC), isNull(), isNull(), anyString(),
-                                    eq("Notification from AWS Backup"), anyMap(), eq(REGION)));
+                    verify(fixture.sns).publish(eq(TOPIC), isNull(), isNull(), anyString(),
+                            eq("Notification from AWS Backup"), anyMap(), eq(REGION));
                 }
             }
         }
@@ -395,31 +402,27 @@ class BackupJobRecoveryTest {
         try (Fixture fixture = new Fixture()) {
             fixture.service.putBackupVaultNotifications(VAULT, REGION, TOPIC, List.of("BACKUP_JOB_FAILED"));
             BackupJob quiet = fixture.startRunning();
-            quiet.setExpectedCompletionDate(Instant.now().getEpochSecond() - 1);
+            quiet.setExpectedCompletionDate(fixture.time.now().getEpochSecond() - 1);
             fixture.service.shutdown();
             fixture.service = fixture.newService();
             fixture.service.resumeJobs();
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                    assertEquals("COMPLETED", fixture.service.describeBackupJob(quiet.getBackupJobId()).getState()));
-            // The terminal state is visible before notify returns; wait for the completion monitor
-            // before changing the event filter for the next job.
-            synchronized (fixture.vaultMonitor()) {
-                verifyNoInteractions(fixture.sns);
-                fixture.service.putBackupVaultNotifications(VAULT, REGION, TOPIC, List.of("BACKUP_JOB_COMPLETED"));
-            }
+            fixture.time.runDue();
+            assertEquals("COMPLETED", fixture.service.describeBackupJob(quiet.getBackupJobId()).getState());
+            verifyNoInteractions(fixture.sns);
+            fixture.service.putBackupVaultNotifications(VAULT, REGION, TOPIC, List.of("BACKUP_JOB_COMPLETED"));
             BackupJob job = fixture.startRunning();
-            job.setExpectedCompletionDate(Instant.now().getEpochSecond() - 1);
+            job.setExpectedCompletionDate(fixture.time.now().getEpochSecond() - 1);
             fixture.service.shutdown();
             fixture.service = fixture.newService();
             fixture.service.resumeJobs();
             @SuppressWarnings("unchecked")
             ArgumentCaptor<Map<String, MessageAttributeValue>> attrs = ArgumentCaptor.forClass(Map.class);
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                    verify(fixture.sns).publish(eq(TOPIC), isNull(), isNull(), eq(
-                            "An AWS Backup job was completed successfully. Recovery point ARN: "
-                                    + job.getRecoveryPointArn() + ". Resource ARN : " + job.getResourceArn()
-                                    + ". BackupJob ID : " + job.getBackupJobId()),
-                            eq("Notification from AWS Backup"), attrs.capture(), eq(REGION)));
+            fixture.time.runDue();
+            verify(fixture.sns).publish(eq(TOPIC), isNull(), isNull(), eq(
+                    "An AWS Backup job was completed successfully. Recovery point ARN: "
+                            + job.getRecoveryPointArn() + ". Resource ARN : " + job.getResourceArn()
+                            + ". BackupJob ID : " + job.getBackupJobId()),
+                    eq("Notification from AWS Backup"), attrs.capture(), eq(REGION));
             Map<String, MessageAttributeValue> expected = Map.of(
                     "EventType", new MessageAttributeValue("BACKUP_JOB", "String"),
                     "State", new MessageAttributeValue("COMPLETED", "String"),
@@ -440,16 +443,15 @@ class BackupJobRecoveryTest {
             doThrow(new IllegalStateException("offline topic")).when(fixture.sns)
                     .publish(anyString(), isNull(), isNull(), anyString(), anyString(), anyMap(), anyString());
             BackupJob job = fixture.startRunning();
-            job.setExpectedCompletionDate(Instant.now().getEpochSecond() - 1);
+            job.setExpectedCompletionDate(fixture.time.now().getEpochSecond() - 1);
             fixture.service.shutdown();
             fixture.service = fixture.newService();
             fixture.service.resumeJobs();
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-                verify(fixture.sns).publish(eq(TOPIC), isNull(), isNull(), anyString(), anyString(), anyMap(), eq(REGION));
-                assertEquals("COMPLETED", fixture.service.describeBackupJob(job.getBackupJobId()).getState());
-                assertEquals(1, fixture.points.keys().size());
-                assertEquals(1, fixture.vault().getNumberOfRecoveryPoints());
-            });
+            fixture.time.runDue();
+            verify(fixture.sns).publish(eq(TOPIC), isNull(), isNull(), anyString(), anyString(), anyMap(), eq(REGION));
+            assertEquals("COMPLETED", fixture.service.describeBackupJob(job.getBackupJobId()).getState());
+            assertEquals(1, fixture.points.keys().size());
+            assertEquals(1, fixture.vault().getNumberOfRecoveryPoints());
         }
     }
 
@@ -457,7 +459,7 @@ class BackupJobRecoveryTest {
     void terminalJobsCannotBeStoppedOrCompletedAgain() throws Exception {
         for (String state : List.of("COMPLETED", "ABORTED", "FAILED", "EXPIRED", "PARTIAL")) {
             try (Fixture fixture = new Fixture()) {
-                BackupJob job = fixture.legacy(state, Instant.now().getEpochSecond());
+                BackupJob job = fixture.legacy(state, fixture.time.now().getEpochSecond());
                 AwsException error = assertThrows(AwsException.class, () -> fixture.service.stopBackupJob("legacy"));
                 assertEquals("InvalidRequestException", error.getErrorCode());
                 fixture.complete(job);
@@ -474,6 +476,7 @@ class BackupJobRecoveryTest {
     void persistentJsonStoresReloadCapturedIdentityBeforeResumingOriginalOrReplacement(@TempDir Path directory)
             throws Exception {
         for (boolean replace : List.of(false, true)) {
+            TestTime time = TestTime.create();
             EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
             Path path = directory.resolve(Boolean.toString(replace));
             when(config.storage().persistentPath()).thenReturn(path.toString());
@@ -485,7 +488,8 @@ class BackupJobRecoveryTest {
             RegionResolver resolver = new RegionResolver("us-east-1", ACCOUNT);
             ObjectMapper mapper = new ObjectMapper();
             SnsService sns = mock(SnsService.class);
-            BackupService first = new BackupService(firstStorage, config, resolver, mapper, sns);
+            BackupService first = new BackupService(firstStorage, config, resolver, mapper, sns,
+                    time.clock(), time.newScheduler());
             String jobId;
             String capturedId;
             long capturedDate;
@@ -495,7 +499,7 @@ class BackupJobRecoveryTest {
                 capturedDate = vault.getCreationDate();
                 BackupJob job = first.startBackupJob(VAULT, "arn:aws:s3:::persisted", "role", null, REGION);
                 jobId = job.getBackupJobId();
-                job.setExpectedCompletionDate(Instant.now().getEpochSecond() - 1);
+                job.setExpectedCompletionDate(time.now().getEpochSecond() - 1);
                 AccountAwareStorageBackend<BackupJob> jobs = firstStorage.create("backup", "backup-jobs.json",
                         new TypeReference<Map<String, BackupJob>>() {});
                 jobs.put(jobId, job);
@@ -506,7 +510,8 @@ class BackupJobRecoveryTest {
             JsonNode disk = mapper.readTree(path.resolve("backup-jobs.json").toFile()).path(ACCOUNT + "/" + jobId);
             assertEquals(capturedId, disk.path("FlociVaultId").asText());
             StorageFactory reloadedStorage = new StorageFactory(config, access);
-            BackupService restarted = new BackupService(reloadedStorage, config, resolver, mapper, sns);
+            BackupService restarted = new BackupService(reloadedStorage, config, resolver, mapper, sns,
+                    time.clock(), time.newScheduler());
             try {
                 assertEquals(capturedId, restarted.describeBackupJob(jobId).getVaultId());
                 assertEquals(capturedId, restarted.describeBackupVault(VAULT, REGION).getVaultId());
@@ -518,16 +523,15 @@ class BackupJobRecoveryTest {
                 }
                 restarted.putBackupVaultNotifications(VAULT, REGION, TOPIC, List.of("BACKUP_JOB_COMPLETED"));
                 restarted.resumeJobs();
-                await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(
-                        replace ? "FAILED" : "COMPLETED", restarted.describeBackupJob(jobId).getState()));
+                time.runDue();
+                assertEquals(replace ? "FAILED" : "COMPLETED", restarted.describeBackupJob(jobId).getState());
                 assertEquals(replace ? 0 : 1, restarted.listRecoveryPointsByBackupVault(VAULT, REGION).size());
                 assertEquals(replace ? 0 : 1, restarted.describeBackupVault(VAULT, REGION).getNumberOfRecoveryPoints());
                 assertEquals(capturedId, restarted.describeBackupJob(jobId).getVaultId());
                 if (replace) {
                     verifyNoInteractions(sns);
                 } else {
-                    await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                            verify(sns).publish(eq(TOPIC), isNull(), isNull(), anyString(), anyString(), anyMap(), eq(REGION)));
+                    verify(sns).publish(eq(TOPIC), isNull(), isNull(), anyString(), anyString(), anyMap(), eq(REGION));
                 }
             } finally {
                 restarted.shutdown();
@@ -560,13 +564,13 @@ class BackupJobRecoveryTest {
     @Test
     void legacyMissingCompletionDeadlineUsesCreationPlusConfiguredDelay() {
         try (Fixture fixture = new Fixture()) {
-            long now = Instant.now().getEpochSecond();
+            long now = fixture.time.now().getEpochSecond();
             fixture.vault().setCreationDate(now - 7200);
             BackupJob job = fixture.legacy("CREATED", now - 3601);
             job.setExpectedCompletionDate(null);
             fixture.service.resumeJobs();
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                    assertEquals("COMPLETED", fixture.service.describeBackupJob("legacy").getState()));
+            fixture.time.runDue();
+            assertEquals("COMPLETED", fixture.service.describeBackupJob("legacy").getState());
             assertEquals(1, fixture.points.keys().size());
             assertEquals(1, fixture.vault().getNumberOfRecoveryPoints());
             assertTrue(job.getRecoveryPointArn().contains(":" + REGION + ":" + ACCOUNT + ":"));
@@ -574,6 +578,7 @@ class BackupJobRecoveryTest {
     }
 
     private static class Fixture implements AutoCloseable {
+        private final TestTime time = TestTime.create();
         private final Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
         private final StorageFactory storage = mock(StorageFactory.class);
         private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
@@ -603,7 +608,7 @@ class BackupJobRecoveryTest {
         }
 
         private BackupService newService() {
-            return new BackupService(storage, config, resolver, mapper, sns);
+            return new BackupService(storage, config, resolver, mapper, sns, time.clock(), time.newScheduler());
         }
 
         private BackupVault vault() {
@@ -626,8 +631,8 @@ class BackupJobRecoveryTest {
             job.setAccountId(ACCOUNT);
             job.setState(state);
             job.setCreationDate(creationDate);
-            job.setStartBy(Instant.now().getEpochSecond() + 3600);
-            job.setExpectedCompletionDate(Instant.now().getEpochSecond() - 1);
+            job.setStartBy(time.now().getEpochSecond() + 3600);
+            job.setExpectedCompletionDate(time.now().getEpochSecond() - 1);
             jobs.put(job.getBackupJobId(), job);
             return job;
         }

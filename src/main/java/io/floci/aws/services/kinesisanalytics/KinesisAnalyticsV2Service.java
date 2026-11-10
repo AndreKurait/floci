@@ -74,7 +74,7 @@ public class KinesisAnalyticsV2Service implements StoredResourceArns {
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
     private final FlinkContainerManager containerManager;
-    private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService poller;
     /**
      * The applications a restore is bringing back, by {@code account:key}, which the readiness poller leaves alone:
      * their records still name the old cluster until the restore keeps it or starts a new one. In memory only, so
@@ -93,11 +93,20 @@ public class KinesisAnalyticsV2Service implements StoredResourceArns {
     public KinesisAnalyticsV2Service(StorageFactory storageFactory, EmulatorConfig config,
                                      RegionResolver regionResolver,
                                      FlinkContainerManager containerManager) {
+        this(storageFactory, config, regionResolver, containerManager,
+                Executors.newSingleThreadScheduledExecutor());
+    }
+
+    /** Package-private so tests can run the readiness poller on a scheduler they control. */
+    KinesisAnalyticsV2Service(StorageFactory storageFactory, EmulatorConfig config,
+                              RegionResolver regionResolver,
+                              FlinkContainerManager containerManager, ScheduledExecutorService poller) {
         this.storage = storageFactory.create("kinesisanalytics", "kinesisanalytics-applications.json",
                 new TypeReference<Map<String, FlinkApplication>>() {});
         this.config = config;
         this.regionResolver = regionResolver;
         this.containerManager = containerManager;
+        this.poller = poller;
     }
 
     @PostConstruct
