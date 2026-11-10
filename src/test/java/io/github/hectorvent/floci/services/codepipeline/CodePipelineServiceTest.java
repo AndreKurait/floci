@@ -50,6 +50,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -262,9 +263,62 @@ class CodePipelineServiceTest {
         assertWorkerPollingProgress(0L, false);
     }
 
+    /**
+     * The same on a controlled timeline, where each check of the build can be counted. The test above
+     * leaves the pauses to the worker's own thread in real time.
+     */
     @Test
     void invalidDirectWorkerIntervalKeepsPollingAndStopsAfterBuildCompletion() throws Exception {
-        assertWorkerPollingProgress(Long.MIN_VALUE, true);
+        TestTime time = TestTime.create();
+        CodeBuildService codeBuild = mock(CodeBuildService.class);
+        AtomicReference<Build> currentBuild = new AtomicReference<>(build("IN_PROGRESS", false));
+        when(codeBuild.startBuild(anyString(), anyString(), anyString(),
+                any(), any(), any(), any(), any(), any(), any())).thenAnswer(invocation -> currentBuild.get());
+        when(codeBuild.getBuild(anyString(), anyString(), anyString()))
+                .thenAnswer(invocation -> currentBuild.get());
+        // An interval that is not positive: the worker pauses for the 100 ms fallback instead.
+        CodePipelineService pipelineService = new CodePipelineService(new InMemoryStorageFactory(), mapper,
+                codeBuild, mock(CodeDeployService.class), mock(LambdaService.class), mock(S3Service.class),
+                new CodePipelineEventPublisher(null, null, mapper), 500L, Long.MIN_VALUE,
+                TimeUnit.SECONDS.toNanos(5), () -> { }, time.scheduler(), time::sleepMillis);
+        String pipeline = "worker-poll-timeline";
+        try {
+            createExternalActionPipeline(pipelineService, pipeline, """
+                    {"name":"BuildAction","actionTypeId":{
+                      "category":"Build","owner":"AWS","provider":"CodeBuild","version":"1"},
+                     "configuration":{"ProjectName":"build-project"}}
+                    """);
+            String execution = startExecution(pipelineService, pipeline);
+
+            for (int checks = 1; checks <= 3; checks++) {
+                time.awaitSleepers(1);
+                time.advance(Duration.ofMillis(99));
+                verify(codeBuild, times(checks - 1)).getBuild(anyString(), anyString(), anyString());
+                time.advance(Duration.ofMillis(1));
+                verify(codeBuild, times(checks)).getBuild(anyString(), anyString(), anyString());
+            }
+
+            // A stop that does not abandon lets the build finish: the worker keeps its pace.
+            stopExecution(pipelineService, pipeline, execution, false);
+            waitForExecutionStatus(pipelineService, pipeline, execution, "Stopping");
+            currentBuild.set(build("SUCCEEDED", true));
+            time.awaitSleepers(1);
+            time.advance(Duration.ofMillis(99));
+            assertEquals("Stopping", handle(pipelineService, "GetPipelineExecution", """
+                    {"pipelineName": "%s", "pipelineExecutionId": "%s"}
+                    """.formatted(pipeline, execution)).path("pipelineExecution").path("status").asText());
+            time.advance(Duration.ofMillis(1));
+
+            waitForExecutionStatus(pipelineService, pipeline, execution, "Stopped");
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(3))
+                    .until(() -> !pipelineService.activeRuns.contains(ACCOUNT + ":" + execution));
+            verify(codeBuild, times(4)).getBuild(anyString(), anyString(), anyString());
+            assertEquals("Succeeded", pipelineState(pipelineService, pipeline).path("stageStates").path(0)
+                    .path("actionStates").path(0).path("latestExecution").path("status").asText());
+            verify(codeBuild, never()).stopBuild(anyString(), anyString(), anyString());
+        } finally {
+            pipelineService.shutdown();
+        }
     }
 
     private CodePipelineService workerPollingService(CodeBuildService codeBuild, long interval, boolean direct) {
