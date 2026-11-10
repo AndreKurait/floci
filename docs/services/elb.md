@@ -385,8 +385,12 @@ Listener sockets bind on the Floci host. Expose any listener ports you need in D
 The shared HTTP API endpoint also forwards requests whose Host names an existing load balancer
 or a public Route 53 alias/CNAME chain to one. An explicit Host port selects that listener;
 otherwise HTTP selects port 80 and HTTPS selects port 443. This supports an external TLS
-front door forwarding to the HTTP listener. The shared endpoint does not use the single-listener
+front door forwarding to the HTTP listener. Only HTTP listeners participate in shared-endpoint
+dispatch; HTTPS and TCP listeners retain their dedicated transports. An explicit port zero does
+not select the default listener. The shared endpoint does not use the single-listener
 fallback for unrelated hosts, so ordinary AWS API requests retain their existing handlers.
+Configured API hostnames and emulator DNS suffixes also retain ordinary API handling when
+a public alias uses the same name. Dedicated listener ports continue to resolve those aliases.
 After selecting a listener, target groups and load-balancer attributes are read in that
 listener's owning account. Unsigned data requests therefore work for load balancers created
 outside the emulator's default account.
@@ -402,13 +406,15 @@ on port 80 is correct for AWS and stays accepted here, but the request has to na
 A listener is chosen in this order:
 
 1. The Host header equals a load balancer's own DNS name (`{name}-{id}.elb.localhost.floci.io`).
-2. A public Route 53 alias/CNAME chain resolves the Host to a load balancer on the port.
-   Alias target hosted-zone IDs must match that load balancer's canonical zone.
+2. A public Route 53 A/AAAA alias or CNAME chain resolves the Host to a load balancer on the port.
+   A and AAAA aliases can coexist when they identify the same target. Alias target hosted-zone
+   IDs, with or without `/hostedzone/`, must match that load balancer's canonical zone.
    Fully qualified targets and the `dualstack.` DNS prefix are supported.
-   An alias to a removed or different load balancer cannot fall back to another listener.
+   Broken chains, conflicting answers, delegated names, and aliases to a removed or different
+   load balancer cannot fall back to another listener.
 3. Exactly one listener on the port has a rule whose `host-header` condition matches the Host
    header. This uses the same matching as the rule evaluation that follows, so it is
-   case-insensitive, ignores the port, and applies AWS's wildcards: `*` matches 0 or more
+   case-insensitive, ignores the port and final dot, and applies AWS's wildcards: `*` matches 0 or more
    characters and `?` matches exactly 1, which means `*.example.com` claims `test.example.com`
    but not `example.com`. `HostHeaderConfig.RegexValues` is not supported, by rule evaluation or
    by selection, so a load balancer that names itself only through a regex cannot be selected

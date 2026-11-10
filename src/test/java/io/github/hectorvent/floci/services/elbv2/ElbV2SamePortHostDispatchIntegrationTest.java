@@ -126,6 +126,8 @@ class ElbV2SamePortHostDispatchIntegrationTest {
         assertHostResponse("app.example.test", "second-rule");
         assertHostResponse("api.wild.example.test", "second-rule");
         assertHostResponse("APP.EXAMPLE.TEST", "second-rule");
+        assertHostResponse("APP.EXAMPLE.TEST.:" + LISTENER_PORT, "second-rule");
+        assertHostResponse("api.wild.example.test.:" + LISTENER_PORT, "second-rule");
     }
 
     /**
