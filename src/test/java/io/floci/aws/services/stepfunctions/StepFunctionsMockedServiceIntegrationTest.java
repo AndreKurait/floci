@@ -11,11 +11,11 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Integration tests for Step Functions Local compatible mocked service integrations:
@@ -340,30 +340,6 @@ class StepFunctionsMockedServiceIntegrationTest {
                 .when().post("/");
         resp.then().statusCode(200);
         return resp.jsonPath().getString("executionArn");
-    }
-
-    private static Response waitForTerminalState(String execArn) {
-        for (int i = 0; i < 100; i++) {
-            Response resp = given()
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(SFN_CONTENT_TYPE)
-                    .body("""
-                            {"executionArn": "%s"}
-                            """.formatted(execArn))
-                    .when().post("/");
-            String status = resp.jsonPath().getString("status");
-            if (!"RUNNING".equals(status)) {
-                return resp;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                fail("Interrupted while waiting for execution " + execArn);
-            }
-        }
-        fail("Execution did not complete within timeout: " + execArn);
-        return null;
     }
 
     private static String quote(String raw) {
