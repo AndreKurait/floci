@@ -752,7 +752,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             endpoints.put(entry.getKey(), new ProtectedEndpoint(updated, current.helperId(),
                     Map.copyOf(prefixLists), current.dnsOrigin()));
         }
-        reconcileAll();
+        retireStoppedHelpers();
+        converge(false);
     }
 
     /**
