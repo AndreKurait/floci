@@ -1,16 +1,18 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * End-to-end check that CloudFormation provisions the leaf IAM types into IamService for real
@@ -188,16 +190,9 @@ class CloudFormationIamLeafIntegrationTest {
     }
 
     private static void awaitStackStatus(String stackId, String status) throws InterruptedException {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = describeStacks(stackId);
-            if (xml.contains("<StackStatus>" + status + "</StackStatus>")) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        fail("stack " + stackId + " never reached " + status + ": " + xml);
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> describeStacks(stackId),
+                xml -> xml.contains("<StackStatus>" + status + "</StackStatus>"),
+                xml -> "stack " + stackId + " never reached " + status + ": " + xml);
     }
 
     private static String describeStacks(String stackId) {

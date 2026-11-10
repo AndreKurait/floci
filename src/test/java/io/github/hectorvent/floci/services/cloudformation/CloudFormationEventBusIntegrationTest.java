@@ -9,9 +9,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -357,21 +360,15 @@ class CloudFormationEventBusIntegrationTest {
     }
 
     private void awaitStackStatus(String stackName, String expectedStatus) throws InterruptedException {
-        String lastBody = null;
-        for (int i = 0; i < 100; i++) {
-            lastBody = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(5), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackName)
-            .when().post("/").then().extract().asString();
-            if (lastBody.contains("<StackStatus>" + expectedStatus + "</StackStatus>")) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        throw new AssertionError("Timed out waiting for stack " + stackName + " to reach "
-                + expectedStatus + ". Last response: " + lastBody);
+            .when().post("/").then().extract().asString(),
+                body -> body.contains("<StackStatus>" + expectedStatus + "</StackStatus>"),
+                body -> "Timed out waiting for stack " + stackName + " to reach "
+                        + expectedStatus + ". Last response: " + body);
     }
 
     @Test
@@ -732,7 +729,11 @@ class CloudFormationEventBusIntegrationTest {
         createStack(stackName, template);
         assertStackStatus(stackName, "CREATE_COMPLETE");
         callEventBridge("AWSEvents.DeleteEventBus", "{\"Name\":\"" + busName + "\"}", 200);
-        Thread.sleep(2);
+        // The engine tells the recreated bus from its own by the creation time, which EventBridge reads
+        // from the wall clock: the new bus has to be created at a later instant than the old one was.
+        Instant deleted = Instant.now();
+        await().atMost(Duration.ofSeconds(1)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> Instant.now().isAfter(deleted));
         callEventBridge("AWSEvents.CreateEventBus",
                 "{\"Name\":\"" + busName + "\",\"Description\":\"external\"}", 200);
 

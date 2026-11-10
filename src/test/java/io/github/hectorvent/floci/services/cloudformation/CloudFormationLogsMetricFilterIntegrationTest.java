@@ -47,7 +47,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -690,23 +689,14 @@ class CloudFormationLogsMetricFilterIntegrationTest {
     }
 
     private static String describeStacks(String stack, String expectedStatus) {
-        String body = "";
-        for (int i = 0; i < 100; i++) {
-            body = given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
-                    .formParam("Action", "DescribeStacks").formParam("StackName", stack).post("/").asString();
-            if (body.contains("<StackStatus>" + expectedStatus + "</StackStatus>")
-                    && newEvents(stack).stream().anyMatch(e -> stack.equals(e.get("LogicalResourceId"))
-                    && expectedStatus.equals(e.get("ResourceStatus")))) {
-                return body;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError(e);
-            }
-        }
-        return fail("Expected new " + expectedStatus + " for " + stack + ": " + body + "\n" + describeEvents(stack));
+        return CfnStackWaits.awaitState(Duration.ofSeconds(5),
+                () -> given().contentType("application/x-www-form-urlencoded").header("Authorization", CFN_AUTH)
+                        .formParam("Action", "DescribeStacks").formParam("StackName", stack).post("/").asString(),
+                body -> body.contains("<StackStatus>" + expectedStatus + "</StackStatus>")
+                        && newEvents(stack).stream().anyMatch(e -> stack.equals(e.get("LogicalResourceId"))
+                        && expectedStatus.equals(e.get("ResourceStatus"))),
+                body -> "Expected new " + expectedStatus + " for " + stack + ": " + body + "\n"
+                        + describeEvents(stack));
     }
 
     private static String describeEvents(String stack) {
@@ -719,19 +709,15 @@ class CloudFormationLogsMetricFilterIntegrationTest {
     }
 
     private static String awaitStackStatus(String stack, String expectedStatus) throws InterruptedException {
-        for (int i = 0; i < 100; i++) {
-            String body = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(5), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stack)
-            .when().post("/").then().extract().asString();
-            if (body.contains("<StackStatus>" + expectedStatus + "</StackStatus>")) {
-                return describeEvents(stack);
-            }
-            Thread.sleep(50);
-        }
-        return fail("stack " + stack + " did not reach " + expectedStatus + " within the timeout");
+            .when().post("/").then().extract().asString(),
+                body -> body.contains("<StackStatus>" + expectedStatus + "</StackStatus>"),
+                body -> "stack " + stack + " did not reach " + expectedStatus + " within the timeout");
+        return describeEvents(stack);
     }
 
     private static String outputValue(String xml, String key) {
