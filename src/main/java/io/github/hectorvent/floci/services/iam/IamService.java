@@ -2779,6 +2779,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             // profile deleted and recreated takes its history with it.
             checkPasswordPolicy(password, null);
             profile = new LoginProfile(userName, password, passwordResetRequired);
+            // Stamped from the service's clock, as every later password change is, so the
+            // credential report compares times read from one timeline.
+            Instant now = clock.instant();
+            profile.setCreateDate(now);
+            profile.setPasswordLastChanged(now);
             loginProfiles.put(userName, profile);
         }
         LOG.infov("Created IAM login profile for user: {0}", userName);
@@ -2807,7 +2812,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 checkPasswordPolicy(password, profile);
                 recordSupersededPassword(profile);
                 profile.setPassword(password);
-                profile.setPasswordLastChanged(Instant.now());
+                profile.setPasswordLastChanged(clock.instant());
             }
             if (passwordResetRequired != null) {
                 profile.setPasswordResetRequired(passwordResetRequired);
@@ -2869,7 +2874,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             checkPasswordPolicy(newPassword, profile);
             recordSupersededPassword(profile);
             profile.setPassword(newPassword);
-            profile.setPasswordLastChanged(Instant.now());
+            profile.setPasswordLastChanged(clock.instant());
             profile.setPasswordResetRequired(false);
             loginProfiles.put(userName, profile);
         }
@@ -6725,7 +6730,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * AWS's own documented example response for the no-report-exists case.
      */
     public CredentialReportGeneration generateCredentialReport() {
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Optional<CredentialReport> existing = credentialReports.get(credentialReportKey());
         if (existing.isPresent() && now.isBefore(existing.get().getGeneratedTime().plus(CREDENTIAL_REPORT_MAX_AGE))) {
             return new CredentialReportGeneration("COMPLETE",
@@ -6749,7 +6754,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .orElseThrow(() -> new AwsException("ReportNotPresent",
                         "The request was rejected because the credential report does not exist. "
                                 + "To generate a credential report, use GenerateCredentialReport.", 410));
-        if (Instant.now().isAfter(report.getGeneratedTime().plus(CREDENTIAL_REPORT_MAX_AGE))) {
+        if (clock.instant().isAfter(report.getGeneratedTime().plus(CREDENTIAL_REPORT_MAX_AGE))) {
             throw new AwsException("ReportExpired",
                     "The request was rejected because the most recent credential report has expired. "
                             + "To generate a new credential report, use GenerateCredentialReport.", 410);
