@@ -252,7 +252,7 @@ public class LambdaExecutorService implements Resettable {
 
         Capacity capacity = acquire(lambdaService, fn, invokedQualifier);
         try {
-            return executeSync(fn, payload, requestId, clientContext, capacity.provisioned());
+            return executeSync(fn, payload, requestId, invokedQualifier, clientContext, capacity.provisioned());
         } finally {
             capacity.permit().close();
         }
@@ -327,7 +327,8 @@ public class LambdaExecutorService implements Resettable {
         }
         InvokeResult result;
         try (LambdaConcurrencyLimiter.Permit ignored = capacity.permit()) {
-            result = executeSync(event.fn(), event.payload(), event.requestId(), null, capacity.provisioned());
+            result = executeSync(event.fn(), event.payload(), event.requestId(),
+                    event.invokedQualifier(), null, capacity.provisioned());
         } catch (RuntimeException e) {
             LOG.warnv("Error in async Lambda execution for {0}: {1}", event.fn().getFunctionName(), e.getMessage());
             // Stops retrying, as upstream did: routes the previous attempt's result, or UnknownError when
@@ -384,8 +385,17 @@ public class LambdaExecutorService implements Resettable {
         return "Failed to start Lambda container: " + e.getMessage();
     }
 
+    private static String invokedFunctionArn(LambdaFunction fn, String qualifier) {
+        if (qualifier == null) {
+            return fn.getFunctionArn();
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(fn.getFunctionArn());
+        return LambdaArnUtils.functionArn(fn.getFunctionName() + ":" + qualifier,
+                arn.partition(), arn.region(), arn.accountId());
+    }
+
     private InvokeResult executeSync(LambdaFunction fn, byte[] payload, String requestId,
-                                     String clientContext, ContainerHandle provisioned) {
+                                     String invokedQualifier, String clientContext, ContainerHandle provisioned) {
         ContainerHandle handle;
         try {
             handle = provisioned != null ? provisioned : warmPool.acquire(fn);
@@ -397,7 +407,7 @@ public class LambdaExecutorService implements Resettable {
         }
         long deadlineMs = System.currentTimeMillis() + (long) fn.getTimeout() * 1000;
         PendingInvocation invocation = new PendingInvocation(
-                requestId, payload, deadlineMs, fn.getFunctionArn(),
+                requestId, payload, deadlineMs, invokedFunctionArn(fn, invokedQualifier),
                 new CompletableFuture<>());
         invocation.setClientContext(clientContext);
         RuntimeApiServer runtimeApiServer = handle.getRuntimeApiServer();

@@ -570,7 +570,9 @@ these allocations without counting provisioned capacity twice when a function ha
 reservation. Cold spillover still consumes ordinary unreserved permits. Automatic scaling
 and weighted-alias allocation remain unsupported. Provisioned runtimes receive
 their numeric `AWS_LAMBDA_FUNCTION_VERSION` and
-`AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`.
+`AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`. For both provisioned and ordinary
+invocations, `context.invoked_function_arn` retains the requested qualifier, including an
+alias name, without changing the executed function version.
 
 Configuration replacement and deletion remain committed if environment removal fails.
 Failed removals retain ownership and are retried while Floci is running; they continue
