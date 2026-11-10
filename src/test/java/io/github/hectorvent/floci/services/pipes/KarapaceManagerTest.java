@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.E
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -26,6 +27,7 @@ import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
@@ -63,6 +65,9 @@ class KarapaceManagerTest {
     @Mock private DockerHostResolver dockerHostResolver;
     @Mock private EmbeddedDnsServer embeddedDnsServer;
 
+    /** The readiness wait runs on the calling thread, so its pauses move this timeline themselves. */
+    private final TestTime time = TestTime.create();
+    private final AtomicInteger healthProbes = new AtomicInteger();
     private KarapaceManager manager;
     private HttpServer fakeRestServer;
 
@@ -88,7 +93,8 @@ class KarapaceManagerTest {
 
         ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
         manager = new KarapaceManager(containerBuilder, lifecycleManager, containerDetector, config, portAllocator,
-                dockerHostResolver, Duration.ofMillis(500));
+                dockerHostResolver, KarapaceManager.READY_TIMEOUT,
+                time::nanoTime, millis -> time.sleepAdvancing(Duration.ofMillis(millis)));
     }
 
     @AfterEach
@@ -107,6 +113,7 @@ class KarapaceManagerTest {
     private int startFakeRestServer(AtomicInteger healthStatus) throws Exception {
         fakeRestServer = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
         fakeRestServer.createContext("/_health", exchange -> {
+            healthProbes.incrementAndGet();
             byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(healthStatus.get(), body.length);
             exchange.getResponseBody().write(body);
@@ -224,11 +231,52 @@ class KarapaceManagerTest {
                 Map.of(REST_PORT, new EndpointInfo("localhost", 1)));
         when(lifecycleManager.createAndStart(any())).thenReturn(info);
 
+        Instant started = time.now();
         assertThrows(IllegalStateException.class,
                 () -> manager.ensureStarted("broker-1:9092"));
 
+        assertEquals(started.plus(KarapaceManager.READY_TIMEOUT), time.now(),
+                "the wait gives up when the 30 s readiness timeout is up, not before and not after");
         verify(lifecycleManager).stopAndRemoveStrict("container-1", null);
         verify(portAllocator).release(54321);
+    }
+
+    @Test
+    void readinessIsProbedEvery200MillisecondsUntilTheTimeoutIsUp() throws Exception {
+        AtomicInteger healthStatus = new AtomicInteger(503);
+        int hostPort = startFakeRestServer(healthStatus);
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        when(portAllocator.allocate(9500, 9599)).thenReturn(hostPort);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerInfo("container-1", Map.of(REST_PORT, new EndpointInfo("localhost", hostPort))));
+
+        Instant started = time.now();
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.ensureStarted("broker:9092"));
+
+        assertTrue(failure.getMessage().contains("did not become ready within 30000ms"), failure.getMessage());
+        assertEquals(started.plusSeconds(30), time.now());
+        assertEquals(150, healthProbes.get(), "one probe at the start and one every 200 ms before the 30 s mark");
+    }
+
+    @Test
+    void aProxyThatTurnsReadyOnTheLastProbeBeforeTheTimeoutIsStarted() throws Exception {
+        AtomicInteger healthStatus = new AtomicInteger(503);
+        int hostPort = startFakeRestServer(healthStatus);
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        when(portAllocator.allocate(9500, 9599)).thenReturn(hostPort);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerInfo("container-1", Map.of(REST_PORT, new EndpointInfo("localhost", hostPort))));
+        Instant started = time.now();
+        Instant lastProbe = started.plus(KarapaceManager.READY_TIMEOUT).minusMillis(200);
+        time.scheduler().schedule(() -> healthStatus.set(200),
+                Duration.between(started, lastProbe).toMillis(), TimeUnit.MILLISECONDS);
+
+        assertEquals(URI.create("http://localhost:" + hostPort + "/"), manager.ensureStarted("broker:9092"));
+
+        assertEquals(lastProbe, time.now());
+        assertEquals(150, healthProbes.get());
+        verify(lifecycleManager, never()).stopAndRemoveStrict(any(), any());
     }
 
     @Test
@@ -298,7 +346,8 @@ class KarapaceManagerTest {
         when(containerDetector.isRunningInContainer()).thenReturn(false);
         PortAllocator allocator = new PortAllocator();
         manager = new KarapaceManager(new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer),
-                lifecycleManager, containerDetector, config, allocator, dockerHostResolver, Duration.ofMillis(500));
+                lifecycleManager, containerDetector, config, allocator, dockerHostResolver, KarapaceManager.READY_TIMEOUT,
+                time::nanoTime, millis -> time.sleepAdvancing(Duration.ofMillis(millis)));
         when(lifecycleManager.createAndStart(any())).thenReturn(
                 new ContainerInfo("container-1", Map.of(REST_PORT, new EndpointInfo("localhost", endpointPort))),
                 new ContainerInfo("container-2", Map.of(REST_PORT, new EndpointInfo("localhost", endpointPort))));
