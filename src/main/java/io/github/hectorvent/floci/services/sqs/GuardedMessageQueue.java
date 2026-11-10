@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.concurrent.VersionedSignal;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -14,6 +15,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -30,6 +32,8 @@ class GuardedMessageQueue {
     private final StorageBackend<String, List<Message>> messageStore;
     private final String storageKey;
     private final String receiptHandleSecret;
+    private final Object persistenceLock;
+    private final BooleanSupplier currentGeneration;
     private final boolean detachedSnapshots;
     private final SqsQueueActivity activity = new SqsQueueActivity();
     private volatile boolean closed;
@@ -55,6 +59,13 @@ class GuardedMessageQueue {
 
     GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
                         String receiptHandleSecret) {
+        this(initial, messageStore, storageKey, receiptHandleSecret, new Object(), () -> true);
+    }
+
+    GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
+                        String receiptHandleSecret, Object persistenceLock, BooleanSupplier currentGeneration) {
+        this.persistenceLock = persistenceLock;
+        this.currentGeneration = currentGeneration;
         this.detachedSnapshots = messageStore != null
                 && !(messageStore instanceof InMemoryStorage<?, ?>
                 || messageStore instanceof AccountAwareStorageBackend<?> aware && aware.isInMemory());
@@ -69,13 +80,22 @@ class GuardedMessageQueue {
 
     void addMessage(Message message) {
         try (Guard _ = hold()) {
+            requireOpen();
             commit(messages.plus(message));
         }
     }
 
     void addAll(List<Message> toAdd) {
         try (Guard _ = hold()) {
+            requireOpen();
             commit(messages.plusAll(toAdd));
+        }
+    }
+
+    private void requireOpen() {
+        if (closed) {
+            throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                    "The specified queue does not exist.", 400);
         }
     }
 
@@ -288,6 +308,19 @@ class GuardedMessageQueue {
         }
     }
 
+    /** Restore a rejected automatic redrive in its original order without reviving a deleted queue. */
+    void restoreFirst(List<Message> rejected) {
+        try (Guard _ = hold()) {
+            requireOpen();
+            List<Message> restored = new ArrayList<>(rejected);
+            restored.addAll(messages);
+            // Retain recovered messages in memory if the storage retry also fails.
+            messages = MessageList.copyOf(restored);
+            persist(messages);
+            changes.signal();
+        }
+    }
+
     record MessageCounts(long visible, long inFlight, long delayed) {
     }
 
@@ -390,6 +423,10 @@ class GuardedMessageQueue {
         return closed;
     }
 
+    void signalChange() {
+        changes.signal();
+    }
+
     long changeVersion() {
         return changes.version();
     }
@@ -424,18 +461,25 @@ class GuardedMessageQueue {
     }
 
     private void persist(List<Message> candidate) {
-        if (closed || messageStore == null || storageKey == null) {
-            return;
-        }
-        List<Message> snapshot = snapshot(candidate);
-        if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
-            String accountId = extractAccountFromStorageKey(storageKey);
-            if (accountId != null) {
-                aware.putForAccount(accountId, storageKey, snapshot);
+        // Old and new generations serialize writes on the same storage-key stripe.
+        synchronized (persistenceLock) {
+            if (closed || !currentGeneration.getAsBoolean() || messageStore == null || storageKey == null) {
                 return;
             }
+            List<Message> snapshot = snapshot(candidate);
+            String accountId = extractAccountFromStorageKey(storageKey);
+            if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware && accountId != null) {
+                aware.putForAccount(accountId, storageKey, snapshot);
+                if (!currentGeneration.getAsBoolean()) {
+                    aware.deleteForAccount(accountId, storageKey);
+                }
+            } else {
+                messageStore.put(storageKey, snapshot);
+                if (!currentGeneration.getAsBoolean()) {
+                    messageStore.delete(storageKey);
+                }
+            }
         }
-        messageStore.put(storageKey, snapshot);
     }
 
     /**
