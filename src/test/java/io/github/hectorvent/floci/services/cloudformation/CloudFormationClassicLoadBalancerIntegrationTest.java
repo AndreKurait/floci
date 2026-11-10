@@ -276,7 +276,8 @@ class CloudFormationClassicLoadBalancerIntegrationTest {
     }
 
     private void awaitStatus(String expected) {
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals(expected, cfn.describeStacks(request -> request.stackName(stackId))
                         .stacks().getFirst().stackStatusAsString()));
     }

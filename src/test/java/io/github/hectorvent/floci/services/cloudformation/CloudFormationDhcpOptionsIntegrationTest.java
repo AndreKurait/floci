@@ -234,14 +234,16 @@ class CloudFormationDhcpOptionsIntegrationTest {
     }
 
     private void awaitStatus(String expected) {
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals(expected, cfn.describeStacks(request -> request.stackName(name))
                         .stacks().getFirst().stackStatusAsString()));
     }
 
     private void deleteStack() {
         cfn.deleteStack(request -> request.stackName(name));
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
             CloudFormationException missing = assertThrows(CloudFormationException.class,
                     () -> cfn.describeStacks(request -> request.stackName(name)));
             assertEquals("ValidationError", missing.awsErrorDetails().errorCode());

@@ -52,7 +52,8 @@ class CloudFormationConditionOrderIntegrationTest {
     void cleanup() {
         try {
             cfn.deleteStack(request -> request.stackName(name));
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
                 assertStackAbsent();
                 assertTrue(ec2.describeAddresses().addresses().isEmpty(),
                         "Stack deletion must release every conditionally created address");
@@ -81,7 +82,8 @@ class CloudFormationConditionOrderIntegrationTest {
 
         cfn.createChangeSet(request -> request.stackName(name).changeSetName("one-zone")
                 .changeSetType("UPDATE").templateBody(template()).parameters(parameters("false", "false")));
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals("CREATE_COMPLETE", cfn.describeChangeSet(request -> request
                         .stackName(name).changeSetName("one-zone")).statusAsString()));
         List<Change> changes = cfn.describeChangeSet(request -> request
@@ -150,7 +152,8 @@ class CloudFormationConditionOrderIntegrationTest {
     }
 
     private void awaitStatus(String expected) {
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals(expected, cfn.describeStacks(request -> request.stackName(name))
                         .stacks().getFirst().stackStatusAsString()));
     }

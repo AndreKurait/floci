@@ -284,7 +284,8 @@ class CloudFormationExecutionRoleIntegrationTest {
         client.createStack(request -> request.stackName(name).templateBody(template).roleARN(roleArn));
         cleanup.push(() -> {
             client.deleteStack(request -> request.stackName(name));
-            await().atMost(Duration.ofSeconds(10)).until(() -> {
+            await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> {
                 try {
                     return "DELETE_COMPLETE".equals(client.describeStacks(request -> request.stackName(name))
                             .stacks().getFirst().stackStatusAsString());
@@ -301,7 +302,8 @@ class CloudFormationExecutionRoleIntegrationTest {
     }
 
     private static Stack terminal(CloudFormationClient client, String name) {
-        return await().atMost(Duration.ofSeconds(15)).until(
+        return await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(
                 () -> client.describeStacks(request -> request.stackName(name)).stacks().getFirst(),
                 stack -> !stack.stackStatusAsString().endsWith("_IN_PROGRESS"));
     }

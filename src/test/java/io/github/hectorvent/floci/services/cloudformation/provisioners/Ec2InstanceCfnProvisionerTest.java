@@ -13,12 +13,14 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -61,7 +63,9 @@ class Ec2InstanceCfnProvisionerTest {
     private static final String PROFILE_B = "arn:aws:iam::000000000000:instance-profile/web-v2";
 
     private final Ec2Service ec2 = mock(Ec2Service.class);
-    private final Ec2InstanceCfnProvisioner provisioner = new Ec2InstanceCfnProvisioner(ec2);
+    private final TestTime time = TestTime.create();
+    private final Ec2InstanceCfnProvisioner provisioner =
+            new Ec2InstanceCfnProvisioner(ec2, time::nanoTime, time::sleepAdvancing);
     private final ObjectMapper mapper = new ObjectMapper();
 
     @Test
@@ -435,8 +439,7 @@ class Ec2InstanceCfnProvisionerTest {
     }
 
     @Test
-    void deleteWaitsUntilTheInstanceIsTerminated() {
-        provisioner.terminatePollMillis = 1L;
+    void deletePollsEveryQuarterSecondUntilTheInstanceIsTerminated() {
         Instance shuttingDown = new Instance();
         shuttingDown.setInstanceId("i-1");
         shuttingDown.setState(InstanceState.shuttingDown());
@@ -453,6 +456,7 @@ class Ec2InstanceCfnProvisionerTest {
         InOrder order = inOrder(ec2);
         order.verify(ec2).terminateInstances("us-east-1", List.of("i-1"));
         order.verify(ec2, times(3)).describeInstances("us-east-1", List.of("i-1"), null);
+        assertEquals(TestTime.DEFAULT_START.plusMillis(500), time.now());
     }
 
     @Test
@@ -464,9 +468,7 @@ class Ec2InstanceCfnProvisionerTest {
     }
 
     @Test
-    void deleteFailsWhenTheInstanceNeverReachesTerminated() {
-        provisioner.terminateTimeoutMillis = 20L;
-        provisioner.terminatePollMillis = 1L;
+    void deleteFailsWhenTheInstanceHasNotTerminatedAfterNinetySeconds() {
         Instance shuttingDown = new Instance();
         shuttingDown.setInstanceId("i-1");
         shuttingDown.setState(InstanceState.shuttingDown());
@@ -475,7 +477,39 @@ class Ec2InstanceCfnProvisionerTest {
 
         AwsException failure = assertThrows(AwsException.class,
                 () -> provisioner.delete(TYPE, "i-1", "us-east-1"));
-        assertTrue(failure.getMessage().contains("Instance i-1 did not reach terminated"), failure.getMessage());
+        assertEquals("Instance i-1 did not reach terminated within 90s", failure.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(90), time.now());
+        verify(ec2, times(361)).describeInstances("us-east-1", List.of("i-1"), null);
+    }
+
+    @Test
+    void deleteStillSeesAnInstanceThatTerminatesAtTheNinetySecondDeadline() {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        terminatesAt(instance, TestTime.DEFAULT_START.plusSeconds(90));
+
+        assertDoesNotThrow(() -> provisioner.delete(TYPE, "i-1", "us-east-1"));
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(90), time.now());
+    }
+
+    @Test
+    void deleteDoesNotWaitPastTheDeadlineForAnInstanceThatTerminatesLater() {
+        Instance instance = new Instance();
+        instance.setInstanceId("i-1");
+        terminatesAt(instance, TestTime.DEFAULT_START.plusSeconds(90).plusNanos(1));
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> provisioner.delete(TYPE, "i-1", "us-east-1"));
+        assertEquals("Instance i-1 did not reach terminated within 90s", failure.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(90), time.now());
+    }
+
+    /** The instance reads as shutting down until the timeline reaches {@code instant}. */
+    private void terminatesAt(Instance instance, Instant instant) {
+        when(ec2.describeInstances("us-east-1", List.of("i-1"), null)).thenAnswer(call -> {
+            instance.setState(time.now().isBefore(instant) ? InstanceState.shuttingDown() : InstanceState.terminated());
+            return List.of(reservationOf(instance));
+        });
     }
 
     @Test
@@ -884,7 +918,6 @@ class Ec2InstanceCfnProvisionerTest {
         List<Instance> instances = stubLaunches("i-1", "i-2");
         StackResource r = launchRequiringTokensThenReplace(instances.get(0));
         instances.get(1).setState(InstanceState.terminated());
-        provisioner.terminateTimeoutMillis = 20L;
 
         assertTrue(provisioner.rollbackUpdate(r));
 
@@ -937,7 +970,6 @@ class Ec2InstanceCfnProvisionerTest {
         assertEquals(declared, declarations(r));
 
         instances.get(1).setState(InstanceState.terminated());
-        provisioner.terminateTimeoutMillis = 20L;
         assertTrue(provisioner.rollbackUpdate(r));
         assertEquals("i-1", r.getPhysicalId());
         assertEquals(declared, declarations(r));
@@ -1194,7 +1226,6 @@ class Ec2InstanceCfnProvisionerTest {
         StackResource committed = launchRequiringTokensThenReplace(instances.get(0));
         assertTrue(committed.getAttributes().containsKey("__FlociPriorDeclarations"));
         instances.get(0).setState(InstanceState.terminated());
-        provisioner.terminateTimeoutMillis = 20L;
         provisioner.completeUpdate(committed);
         assertFalse(committed.getAttributes().containsKey("__FlociPriorDeclarations"));
 

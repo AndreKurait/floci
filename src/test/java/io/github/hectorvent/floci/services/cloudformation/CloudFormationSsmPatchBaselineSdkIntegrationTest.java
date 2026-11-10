@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import org.junit.jupiter.api.Test;
@@ -22,6 +23,7 @@ import software.amazon.awssdk.services.ssm.model.SsmException;
 import software.amazon.awssdk.services.ssm.model.Tag;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -34,7 +36,6 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 @QuarkusTest
 class CloudFormationSsmPatchBaselineSdkIntegrationTest {
@@ -496,19 +497,17 @@ class CloudFormationSsmPatchBaselineSdkIntegrationTest {
 
     private static void deleteStack(CloudFormationClient client, String name) throws Exception {
         client.deleteStack(request -> request.stackName(name));
-        long deadline = System.nanoTime() + 10_000_000_000L;
-        while (System.nanoTime() < deadline) {
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> {
             try {
                 Stack stack = client.describeStacks(request -> request.stackName(name)).stacks().getFirst();
                 assertNotEquals("DELETE_FAILED", stack.stackStatusAsString(), stack.stackStatusReason());
+                return false;
             } catch (CloudFormationException error) {
                 assertEquals("ValidationError", error.awsErrorDetails().errorCode());
                 assertTrue(error.getMessage().contains("does not exist"), error.getMessage());
-                return;
+                return true;
             }
-            Thread.sleep(25);
-        }
-        fail("Stack was not deleted: " + name);
+        }, deleted -> deleted, deleted -> "Stack was not deleted: " + name);
     }
 
     private static CloudFormationClient cfn(String region) {

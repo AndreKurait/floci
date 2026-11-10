@@ -55,7 +55,8 @@ class CloudFormationSesReceiptRuleIntegrationTest {
     void cleanUp() {
         try {
             cfn.deleteStack(r -> r.stackName(stackName));
-            await().atMost(Duration.ofSeconds(15)).until(() -> {
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> {
                 try {
                     return cfn.describeStacks(r -> r.stackName(stackName)).stacks().isEmpty();
                 } catch (CloudFormationException expected) {
@@ -298,7 +299,8 @@ class CloudFormationSesReceiptRuleIntegrationTest {
         assertFalse(ses.describeReceiptRule(ruleSet, "store", "us-east-1").isEnabled());
 
         cfn.deleteStack(r -> r.stackName(stackName));
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals("RuleDoesNotExist", assertThrows(AwsException.class,
                         () -> ses.describeReceiptRule(ruleSet, "store", "us-east-1")).getErrorCode()));
     }

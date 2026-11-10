@@ -184,7 +184,7 @@ class CloudFormationDynamoDbProtectionIntegrationTest {
     }
 
     private void awaitStatus(String expected) {
-        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(25))
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
                 .untilAsserted(() -> assertEquals(expected, status()));
     }
 

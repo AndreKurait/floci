@@ -133,7 +133,8 @@ class CloudFormationAsyncAcceptanceIntegrationTest {
     }
 
     private static void awaitStatus(String stack, String status) {
-        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(50)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                .untilAsserted(() ->
                 cfn("DescribeStacks", stack).post("/").then().statusCode(200)
                         .body(containsString("<StackStatus>" + status + "</StackStatus>")));
     }

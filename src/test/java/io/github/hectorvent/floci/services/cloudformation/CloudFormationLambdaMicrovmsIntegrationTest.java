@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -118,7 +119,7 @@ class CloudFormationLambdaMicrovmsIntegrationTest {
         .then()
             .statusCode(200);
 
-        await().untilAsserted(() ->
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).untilAsserted(() ->
                 given()
                         .when()
                         .get("/2025-09-09/microvm-images/" + imageName)
@@ -153,7 +154,7 @@ class CloudFormationLambdaMicrovmsIntegrationTest {
             .body("Configuration.VpcEgressConfiguration.SubnetIds[0]", equalTo("subnet-0cfn000000000002"));
 
         cloudFormation(stackName, "DeleteStack", null);
-        await().untilAsserted(() ->
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).untilAsserted(() ->
                 given()
                         .when()
                         .get("/2026-04-04/network-connectors/" + connectorArn)

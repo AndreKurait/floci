@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -482,22 +483,16 @@ class CloudFormationS3BucketPropertiesIntegrationTest {
     }
 
     private static void await(String stackId, String status) throws InterruptedException {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = given()
+        String wanted = "<StackStatus>" + status + "</StackStatus>";
+        String xml = CfnStackWaits.lastStateWithin(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackId)
-            .when().post("/").then().statusCode(200).extract().asString();
-            if (xml.contains("<StackStatus>" + status + "</StackStatus>")) {
-                return;
-            }
-            if (xml.contains("_FAILED</StackStatus>") || xml.contains("ROLLBACK_COMPLETE</StackStatus>")) {
-                break;
-            }
-            Thread.sleep(50);
+            .when().post("/").then().statusCode(200).extract().asString(),
+                described -> described.contains(wanted) || described.contains("_FAILED</StackStatus>")
+                        || described.contains("ROLLBACK_COMPLETE</StackStatus>"));
+        if (!xml.contains(wanted)) {
+            fail("stack " + stackId + " never reached " + status + ": " + xml);
         }
-        fail("stack " + stackId + " never reached " + status + ": " + xml);
     }
 }

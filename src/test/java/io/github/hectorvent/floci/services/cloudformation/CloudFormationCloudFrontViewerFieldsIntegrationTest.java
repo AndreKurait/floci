@@ -71,7 +71,8 @@ class CloudFormationCloudFrontViewerFieldsIntegrationTest {
                     .parameters(p -> p.parameterKey("ViewerArn").parameterValue(first)));
             cleanup.push(() -> {
                 cfn.deleteStack(r -> r.stackName(name));
-                await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(50)).untilAsserted(() -> {
+                await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                        .untilAsserted(() -> {
                     CloudFormationException absent = assertThrows(CloudFormationException.class,
                             () -> cfn.describeStacks(r -> r.stackName(name)));
                     assertEquals("ValidationError", absent.awsErrorDetails().errorCode());

@@ -7,15 +7,18 @@ import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
+import org.awaitility.core.ConditionTimeoutException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -149,21 +152,18 @@ class CloudFormationDeletedStackListingRaceTest {
     }
 
     private void awaitDeleted(String stackId) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            String body = given()
-                .contentType("application/x-www-form-urlencoded")
-                .formParam("Action", "DescribeStacks")
-                .formParam("StackName", stackId)
-            .when()
-                .post("/")
-            .then()
-                .extract().asString();
-            if (body.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")) {
-                return;
-            }
-            Thread.sleep(2);
+        try {
+            await().pollInSameThread().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO)
+                    .pollInterval(Duration.ofMillis(2)).until(() -> given()
+                        .contentType("application/x-www-form-urlencoded")
+                        .formParam("Action", "DescribeStacks")
+                        .formParam("StackName", stackId)
+                    .when()
+                        .post("/")
+                    .then()
+                        .extract().asString().contains("<StackStatus>DELETE_COMPLETE</StackStatus>"));
+        } catch (ConditionTimeoutException timeout) {
+            fail("stack " + stackId + " never reached DELETE_COMPLETE");
         }
-        fail("stack " + stackId + " never reached DELETE_COMPLETE");
     }
 }

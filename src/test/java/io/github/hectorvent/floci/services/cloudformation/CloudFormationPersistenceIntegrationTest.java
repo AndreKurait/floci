@@ -100,7 +100,8 @@ class CloudFormationPersistenceIntegrationTest {
         // Read the on-disk file the way a fresh Floci process would on the next boot.
         PersistentStorage<String, Stack> store = new PersistentStorage<>(
                 STACKS_FILE, new TypeReference<Map<String, Stack>>() {});
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
             store.load();
             assertEquals("CREATE_COMPLETE", store.get("000000000000/us-east-1:persist-it-stack")
                     .map(Stack::getStatus).orElse(null));

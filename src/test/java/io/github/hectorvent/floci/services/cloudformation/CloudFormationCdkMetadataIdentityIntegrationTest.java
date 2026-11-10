@@ -37,7 +37,8 @@ class CloudFormationCdkMetadataIdentityIntegrationTest {
 
                 cfn.createChangeSet(request -> request.stackName(name).changeSetName("analytics")
                         .changeSetType("UPDATE").templateBody(template("change-set")));
-                await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() ->
                         assertEquals("CREATE_COMPLETE", cfn.describeChangeSet(request -> request
                                 .stackName(name).changeSetName("analytics")).statusAsString()));
                 cfn.executeChangeSet(request -> request.stackName(name).changeSetName("analytics"));
@@ -46,7 +47,8 @@ class CloudFormationCdkMetadataIdentityIntegrationTest {
                 assertAnalytics(cfn, name, "change-set");
             } finally {
                 cfn.deleteStack(request -> request.stackName(name));
-                await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+                await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() -> {
                     CloudFormationException absent = assertThrows(CloudFormationException.class,
                             () -> cfn.describeStacks(request -> request.stackName(name)));
                     assertEquals("ValidationError", absent.awsErrorDetails().errorCode());
@@ -68,7 +70,8 @@ class CloudFormationCdkMetadataIdentityIntegrationTest {
     }
 
     private static void awaitStatus(CloudFormationClient cfn, String name, String expected) {
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+        await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() ->
                 assertEquals(expected, cfn.describeStacks(request -> request.stackName(name))
                         .stacks().getFirst().stackStatusAsString()));
     }

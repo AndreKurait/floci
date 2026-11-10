@@ -23,21 +23,19 @@ public class AppConfigDeploymentCfnProvisioner implements CfnResourceProvisioner
     private static final String TYPE = "AWS::AppConfig::Deployment";
     private static final String PROPERTIES_ATTR = CfnRollback.USES_ATTR_PREFIX + "AppConfigDeploymentProperties";
     private static final Duration POLL_INTERVAL = Duration.ofSeconds(1);
+    private static final Duration TIMEOUT = Duration.ofHours(24);
 
     private final AppConfigService service;
-    private final Duration timeout;
     private final LongSupplier nanoTime;
     private final Sleeper sleeper;
 
     @Inject
     public AppConfigDeploymentCfnProvisioner(AppConfigService service) {
-        this(service, Duration.ofHours(24), System::nanoTime, Thread::sleep);
+        this(service, System::nanoTime, Thread::sleep);
     }
 
-    AppConfigDeploymentCfnProvisioner(AppConfigService service, Duration timeout,
-                                     LongSupplier nanoTime, Sleeper sleeper) {
+    AppConfigDeploymentCfnProvisioner(AppConfigService service, LongSupplier nanoTime, Sleeper sleeper) {
         this.service = service;
-        this.timeout = timeout;
         this.nanoTime = nanoTime;
         this.sleeper = sleeper;
     }
@@ -113,10 +111,10 @@ public class AppConfigDeploymentCfnProvisioner implements CfnResourceProvisioner
                         ctx.isUpdate() ? "UPDATE_IN_PROGRESS" : "CREATE_IN_PROGRESS", progress);
                 lastProgress = progress;
             }
-            long remaining = timeout.toNanos() - (nanoTime.getAsLong() - began);
+            long remaining = TIMEOUT.toNanos() - (nanoTime.getAsLong() - began);
             if (remaining <= 0) {
                 throw invalid("AppConfig deployment " + resource.getPhysicalId() + " did not complete within "
-                        + timeout.toSeconds() + "s (state " + state + ").");
+                        + TIMEOUT.toSeconds() + "s (state " + state + ").");
             }
             try {
                 sleeper.sleep(Duration.ofNanos(Math.min(remaining, POLL_INTERVAL.toNanos())));

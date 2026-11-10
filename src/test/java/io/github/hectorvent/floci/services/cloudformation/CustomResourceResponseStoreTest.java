@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -15,7 +16,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongConsumer;
 import java.util.logging.Handler;
 import java.util.logging.Level;
@@ -28,14 +28,17 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
-/** Exercises idle-time accounting without depending on thread scheduling or wall-clock delays. */
+/**
+ * Exercises idle-time accounting at the production three-minute budget, on a timeline the test controls
+ * rather than thread scheduling or wall-clock delays.
+ */
 class CustomResourceResponseStoreTest {
 
-    private static final Duration IDLE_TIMEOUT = Duration.ofMillis(300);
-    private final AtomicLong now = new AtomicLong();
+    private static final Duration IDLE_TIMEOUT = Duration.ofMinutes(3);
+    private final TestTime time = TestTime.create();
     private final ScriptedResponse response = new ScriptedResponse();
     private final CustomResourceResponseStore store = new CustomResourceResponseStore(
-            new ProviderFrameworkDetector(mock(LambdaService.class)), now::get, () -> response);
+            new ProviderFrameworkDetector(mock(LambdaService.class)), time::nanoTime, () -> response);
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ObjectNode success() {
@@ -44,11 +47,15 @@ class CustomResourceResponseStoreTest {
         return node;
     }
 
+    private Duration elapsed() {
+        return Duration.between(TestTime.DEFAULT_START, time.now());
+    }
+
     private void heartbeatDuringWait(String token) {
         response.onWait(remaining -> {
-            now.addAndGet(remaining - 1);
+            time.advance(Duration.ofNanos(remaining - 1));
             store.touch(token);
-            now.incrementAndGet();
+            time.advance(Duration.ofNanos(1));
         });
     }
 
@@ -63,7 +70,7 @@ class CustomResourceResponseStoreTest {
         JsonNode result = store.await(token, IDLE_TIMEOUT);
 
         assertEquals("SUCCESS", result.get("Status").asText());
-        assertTrue(now.get() > IDLE_TIMEOUT.multipliedBy(3).toNanos());
+        assertEquals(IDLE_TIMEOUT.multipliedBy(4).minusNanos(3), elapsed());
         assertEquals(List.of(IDLE_TIMEOUT.toNanos(), IDLE_TIMEOUT.toNanos() - 1,
                 IDLE_TIMEOUT.toNanos() - 1, IDLE_TIMEOUT.toNanos() - 1,
                 IDLE_TIMEOUT.toNanos() - 1), response.waits);
@@ -75,11 +82,11 @@ class CustomResourceResponseStoreTest {
         String token = store.register();
         heartbeatDuringWait(token);
         heartbeatDuringWait(token);
-        response.onWait(now::addAndGet);
+        response.onWait(remaining -> time.advance(Duration.ofNanos(remaining)));
 
         assertThrows(TimeoutException.class, () -> store.await(token, IDLE_TIMEOUT));
 
-        assertEquals(3 * IDLE_TIMEOUT.toNanos() - 2, now.get());
+        assertEquals(IDLE_TIMEOUT.multipliedBy(3).minusNanos(2), elapsed());
         assertEquals(3, response.waits.size());
         assertThrows(IllegalStateException.class, () -> store.await(token, IDLE_TIMEOUT));
     }
@@ -87,12 +94,12 @@ class CustomResourceResponseStoreTest {
     @Test
     void awaitTimesOutWhenNothingEverHappens() {
         String token = store.register();
-        response.onWait(now::addAndGet);
+        response.onWait(remaining -> time.advance(Duration.ofNanos(remaining)));
 
         assertThrows(TimeoutException.class, () -> store.await(token, IDLE_TIMEOUT));
 
         assertEquals(List.of(IDLE_TIMEOUT.toNanos()), response.waits);
-        assertEquals(IDLE_TIMEOUT.toNanos(), now.get());
+        assertEquals(IDLE_TIMEOUT, elapsed());
     }
 
     @Test
@@ -109,9 +116,9 @@ class CustomResourceResponseStoreTest {
     @Test
     void awaitBudgetsIdlenessFromWhenTheCallerStartsWaitingNotFromRegistration() throws Exception {
         String token = store.register();
-        now.addAndGet(IDLE_TIMEOUT.multipliedBy(4).toNanos());
+        time.advance(IDLE_TIMEOUT.multipliedBy(4));
         response.onWait(remaining -> {
-            now.addAndGet(remaining - 1);
+            time.advance(Duration.ofNanos(remaining - 1));
             store.complete(token, success());
         });
 

@@ -108,12 +108,4 @@ class ProviderFrameworkDetectorTest {
         stubEnvironment(Map.of("USER_ON_EVENT_FUNCTION_ARN", "arn:aws:lambda:us-east-1:0:function:onEvent"));
         assertEquals(SYNCHRONOUS, detector.responseTimeout(SERVICE_TOKEN, REGION, SYNCHRONOUS));
     }
-
-    @Test
-    void testSeamShortensTheAsyncBudget() {
-        stubEnvironment(frameworkEnv());
-        detector.setAsyncCustomResourceTimeoutForTesting(Duration.ofMillis(300));
-
-        assertEquals(Duration.ofMillis(300), detector.responseTimeout(SERVICE_TOKEN, REGION, SYNCHRONOUS));
-    }
 }

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.testing.AwsTestClients;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -16,6 +17,7 @@ import software.amazon.awssdk.services.ssm.model.AssociationDescription;
 import software.amazon.awssdk.services.ssm.model.SsmException;
 import software.amazon.awssdk.services.ssm.model.Target;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -26,7 +28,6 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 @QuarkusTest
 class CloudFormationSsmAssociationSdkIntegrationTest {
@@ -304,16 +305,11 @@ class CloudFormationSsmAssociationSdkIntegrationTest {
         }
 
         private void await(String expected) throws Exception {
-            long deadline = System.nanoTime() + 15_000_000_000L;
-            do {
-                Stack stack = cfn.describeStacks(request -> request.stackName(stackName)).stacks().getFirst();
-                if (!stack.stackStatusAsString().endsWith("_IN_PROGRESS")) {
-                    assertEquals(expected, stack.stackStatusAsString(), stack.stackStatusReason());
-                    return;
-                }
-                Thread.sleep(25);
-            } while (System.nanoTime() < deadline);
-            fail("Stack did not reach " + expected + ": " + stackName);
+            Stack stack = CfnStackWaits.awaitState(Duration.ofSeconds(15),
+                    () -> cfn.describeStacks(request -> request.stackName(stackName)).stacks().getFirst(),
+                    described -> !described.stackStatusAsString().endsWith("_IN_PROGRESS"),
+                    described -> "Stack did not reach " + expected + ": " + stackName);
+            assertEquals(expected, stack.stackStatusAsString(), stack.stackStatusReason());
         }
 
         private String output(String key) {
@@ -327,20 +323,18 @@ class CloudFormationSsmAssociationSdkIntegrationTest {
 
         private void delete() throws Exception {
             cfn.deleteStack(request -> request.stackName(stackName));
-            long deadline = System.nanoTime() + 15_000_000_000L;
-            do {
+            CfnStackWaits.awaitState(Duration.ofSeconds(15), () -> {
                 try {
                     Stack stack = cfn.describeStacks(request -> request.stackName(stackName)).stacks().getFirst();
                     assertNotEquals("DELETE_FAILED", stack.stackStatusAsString(), stack.stackStatusReason());
+                    return false;
                 } catch (CloudFormationException failure) {
                     assertEquals("ValidationError", failure.awsErrorDetails().errorCode());
                     assertTrue(failure.getMessage().contains("does not exist"), failure.getMessage());
-                    created = false;
-                    return;
+                    return true;
                 }
-                Thread.sleep(25);
-            } while (System.nanoTime() < deadline);
-            fail("Stack was not deleted: " + stackName);
+            }, deleted -> deleted, deleted -> "Stack was not deleted: " + stackName);
+            created = false;
         }
 
         @Override

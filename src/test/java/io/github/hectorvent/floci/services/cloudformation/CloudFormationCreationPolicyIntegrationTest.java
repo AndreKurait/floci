@@ -59,10 +59,12 @@ class CloudFormationCreationPolicyIntegrationTest {
             }
             if ("CREATE_IN_PROGRESS".equals(status()) || "UPDATE_IN_PROGRESS".equals(status())) {
                 signal(cfn, stack, "Compute", "cleanup", "FAILURE");
-                await().atMost(Duration.ofSeconds(10)).until(() -> !status().endsWith("_IN_PROGRESS"));
+                await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> !status().endsWith("_IN_PROGRESS"));
             }
             cfn.deleteStack(request -> request.stackName(stack));
-            await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     assertFalse(cfn.describeStacks().stacks().stream()
                             .anyMatch(value -> stack.equals(value.stackName()))));
             assertTrue(s3.listBuckets().buckets().isEmpty());
@@ -223,6 +225,7 @@ class CloudFormationCreationPolicyIntegrationTest {
         cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
         awaitStatus("UPDATE_IN_PROGRESS");
         String replacement = await().atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .until(this::physicalId, id -> !original.equals(id));
         assertNotEquals(original, replacement);
         assertEquals("running", ec2.describeInstances(request -> request.instanceIds(original))
@@ -246,6 +249,7 @@ class CloudFormationCreationPolicyIntegrationTest {
         cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
         awaitStatus("UPDATE_IN_PROGRESS");
         String replacement = await().atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .until(this::physicalId, id -> !original.equals(id));
         assertNotEquals(original, replacement);
         signal(cfn, stack, "Compute", replacement, "FAILURE");
@@ -302,7 +306,8 @@ class CloudFormationCreationPolicyIntegrationTest {
     }
 
     private String physicalId() {
-        return await().atMost(Duration.ofSeconds(10)).until(() ->
+        return await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() ->
                 cfn.describeStackResources(request -> request.stackName(stack)).stackResources().stream()
                         .filter(value -> "Compute".equals(value.logicalResourceId()))
                         .map(StackResource::physicalResourceId).filter(id -> id != null && !id.isBlank())
@@ -310,7 +315,8 @@ class CloudFormationCreationPolicyIntegrationTest {
     }
 
     private List<String> groupInstances(String group, int expectedCount) {
-        return await().atMost(Duration.ofSeconds(10)).until(() ->
+        return await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() ->
                 scaling.describeAutoScalingGroups(request -> request.autoScalingGroupNames(group))
                         .autoScalingGroups().stream().flatMap(value -> value.instances().stream())
                         .map(value -> value.instanceId()).toList(), instances -> instances.size() == expectedCount);
@@ -321,7 +327,8 @@ class CloudFormationCreationPolicyIntegrationTest {
     }
 
     private void awaitStatus(String expected) {
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals(expected, status()));
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals(expected, status()));
     }
 
     private List<StackEvent> events() {

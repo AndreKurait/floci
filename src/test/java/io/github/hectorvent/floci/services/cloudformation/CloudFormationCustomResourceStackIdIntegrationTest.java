@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
@@ -10,13 +11,13 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Every request CloudFormation sends a custom resource carries the {@code StackId} of the stack that
@@ -147,17 +148,10 @@ class CloudFormationCustomResourceStackIdIntegrationTest {
 
     /** Polls DescribeStacks by stack id, which also answers for a deleted stack, and returns its XML. */
     private static String awaitStackStatus(String stackId, String status) throws InterruptedException {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = cfn(Map.of("Action", "DescribeStacks", "StackName", stackId));
-            if (xml.contains("<StackStatus>" + status + "</StackStatus>")) {
-                return xml;
-            }
-            Thread.sleep(50);
-        }
-        fail("stack " + stackId + " never reached " + status + ": " + xml);
-        return xml;
+        return CfnStackWaits.awaitState(Duration.ofSeconds(10),
+                () -> cfn(Map.of("Action", "DescribeStacks", "StackName", stackId)),
+                xml -> xml.contains("<StackStatus>" + status + "</StackStatus>"),
+                xml -> "stack " + stackId + " never reached " + status + ": " + xml);
     }
 
     private static String cfn(Map<String, String> params) {

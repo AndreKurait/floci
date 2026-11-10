@@ -2,15 +2,26 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -19,6 +30,9 @@ class CfnResourceSignalsTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private final CfnResourceSignals signals = new CfnResourceSignals();
     private final List<String> events = new ArrayList<>();
+    private final TestTime time = TestTime.create();
+    private final Semaphore deadlinesSet = new Semaphore(0);
+    private final CfnResourceSignals timed = new CfnResourceSignals(this::getOnTimeline);
 
     @Test
     void signalsReceivedDuringProvisioningSurviveUntilTheWaitStarts() throws Exception {
@@ -38,14 +52,60 @@ class CfnResourceSignalsTest {
 
     @Test
     void timeoutStartsAfterProvisioningAndReportsTheObservedCount() throws Exception {
-        CfnResourceSignals.Pending pending = begin("""
-                {"ResourceSignal":{"Count":2,"Timeout":"PT1S"}}
+        CfnResourceSignals.Pending pending = beginOnTimeline("""
+                {"ResourceSignal":{"Count":2,"Timeout":"PT15M"}}
                 """);
-        Thread.sleep(Duration.ofMillis(1050));
-        signals.signal("stack", "Compute", "first", "SUCCESS", events::add);
-        long started = System.nanoTime();
-        assertTrue(pending.await().contains("received 1 of 2"));
-        assertTrue(Duration.ofNanos(System.nanoTime() - started).compareTo(Duration.ofSeconds(1)) >= 0);
+        time.advance(Duration.ofMinutes(16));
+        timed.signal("stack", "Compute", "first", "SUCCESS", events::add);
+
+        FutureTask<String> outcome = startWaiting(pending);
+        Instant deadline = time.now().plus(Duration.ofMinutes(15));
+        time.advance(Duration.ofMinutes(15).minusNanos(1));
+        assertEquals(Optional.of(deadline), time.nextTaskDue());
+        assertFalse(outcome.isDone());
+
+        time.advance(Duration.ofNanos(1));
+        assertEquals("ResourceSignal timed out after PT15M: received 1 of 2 required success signals.",
+                outcome.get(10, TimeUnit.SECONDS));
+        assertEquals(deadline, time.now());
+    }
+
+    @Test
+    void anUnsetTimeoutWaitsTheDefaultFiveMinutes() throws Exception {
+        CfnResourceSignals.Pending pending = beginOnTimeline("{\"ResourceSignal\":{}}");
+
+        FutureTask<String> outcome = startWaiting(pending);
+        Instant deadline = time.now().plus(Duration.ofMinutes(5));
+        time.advance(Duration.ofMinutes(5).minusNanos(1));
+        assertEquals(Optional.of(deadline), time.nextTaskDue());
+        assertFalse(outcome.isDone());
+
+        time.advance(Duration.ofNanos(1));
+        assertEquals("ResourceSignal timed out after PT5M: received 0 of 1 required success signals.",
+                outcome.get(10, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void aSignalJustBeforeTheDeadlineCompletesTheWaitAndALateOneIsIgnored() throws Exception {
+        CfnResourceSignals.Pending onTime = beginOnTimeline("""
+                {"ResourceSignal":{"Timeout":"PT12H"}}
+                """);
+        FutureTask<String> succeeded = startWaiting(onTime);
+        time.advance(Duration.ofHours(12).minusNanos(1));
+        timed.signal("stack", "Compute", "first", "SUCCESS", events::add);
+        assertNull(succeeded.get(10, TimeUnit.SECONDS));
+        assertEquals(1, events.size());
+        assertEquals(0, time.pendingTasks());
+        timed.finish("stack", "Compute", onTime);
+
+        CfnResourceSignals.Pending late = beginOnTimeline("""
+                {"ResourceSignal":{"Timeout":"PT12H"}}
+                """);
+        FutureTask<String> expired = startWaiting(late);
+        time.advance(Duration.ofHours(12));
+        assertTrue(expired.get(10, TimeUnit.SECONDS).startsWith("ResourceSignal timed out after PT12H"));
+        timed.signal("stack", "Compute", "second", "SUCCESS", events::add);
+        assertEquals(1, events.size());
     }
 
     @Test
@@ -149,5 +209,38 @@ class CfnResourceSignalsTest {
 
     private CfnResourceSignals.Pending begin(String policy) throws Exception {
         return signals.begin("stack", "Compute", "AWS::EC2::Instance", JSON.readTree(policy), JSON.createObjectNode());
+    }
+
+    private CfnResourceSignals.Pending beginOnTimeline(String policy) throws Exception {
+        return timed.begin("stack", "Compute", "AWS::EC2::Instance", JSON.readTree(policy), JSON.createObjectNode());
+    }
+
+    /** Starts {@code pending.await()} on its own thread and returns once its deadline is on the timeline. */
+    private FutureTask<String> startWaiting(CfnResourceSignals.Pending pending) throws InterruptedException {
+        FutureTask<String> outcome = new FutureTask<>(pending::await);
+        Thread.ofVirtual().name("signal-wait").start(outcome);
+        assertTrue(deadlinesSet.tryAcquire(10, TimeUnit.SECONDS), "the wait never set its deadline");
+        return outcome;
+    }
+
+    /**
+     * {@code Future.get(timeout)} with the timeout on the test's timeline: the deadline is a task the
+     * timeline runs, so the wait ends when a signal completes it or the test advances to the deadline.
+     */
+    private String getOnTimeline(CompletableFuture<String> completion, long timeoutNanos)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        CompletableFuture<String> expired = new CompletableFuture<>();
+        ScheduledFuture<?> deadline = time.scheduler().schedule(() -> expired.complete(null),
+                timeoutNanos, TimeUnit.NANOSECONDS);
+        deadlinesSet.release();
+        try {
+            CompletableFuture.anyOf(completion, expired).get();
+        } finally {
+            deadline.cancel(false);
+        }
+        if (completion.isDone()) {
+            return completion.get();
+        }
+        throw new TimeoutException();
     }
 }

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import org.junit.jupiter.api.Test;
@@ -23,13 +24,13 @@ import software.amazon.awssdk.services.ssm.model.GetDocumentResponse;
 import software.amazon.awssdk.services.ssm.model.SsmException;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 @QuarkusTest
 class CloudFormationSsmDocumentSdkIntegrationTest {
@@ -431,17 +432,13 @@ class CloudFormationSsmDocumentSdkIntegrationTest {
         String id = client.createChangeSet(request -> request.stackName(stack)
                 .changeSetName("preview-" + UUID.randomUUID()).changeSetType("UPDATE")
                 .templateBody(template.toString())).id();
-        long deadline = System.nanoTime() + 10_000_000_000L;
-        do {
-            DescribeChangeSetResponse preview = client.describeChangeSet(request -> request.changeSetName(id));
-            if (!"CREATE_IN_PROGRESS".equals(preview.statusAsString())
-                    && !"CREATE_PENDING".equals(preview.statusAsString())) {
-                assertEquals("CREATE_COMPLETE", preview.statusAsString(), preview.statusReason());
-                return preview;
-            }
-            Thread.sleep(25);
-        } while (System.nanoTime() < deadline);
-        throw new AssertionError("Change set did not finish: " + id);
+        DescribeChangeSetResponse preview = CfnStackWaits.awaitState(Duration.ofSeconds(10),
+                () -> client.describeChangeSet(request -> request.changeSetName(id)),
+                described -> !"CREATE_IN_PROGRESS".equals(described.statusAsString())
+                        && !"CREATE_PENDING".equals(described.statusAsString()),
+                described -> "Change set did not finish: " + id);
+        assertEquals("CREATE_COMPLETE", preview.statusAsString(), preview.statusReason());
+        return preview;
     }
 
     private static ResourceChange inventoryChange(DescribeChangeSetResponse preview) {
@@ -515,33 +512,25 @@ class CloudFormationSsmDocumentSdkIntegrationTest {
 
     private static void deleteStack(CloudFormationClient client, String name) throws Exception {
         client.deleteStack(request -> request.stackName(name));
-        long deadline = System.nanoTime() + 10_000_000_000L;
-        while (System.nanoTime() < deadline) {
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> {
             try {
                 Stack stack = client.describeStacks(request -> request.stackName(name)).stacks().getFirst();
                 assertNotEquals("DELETE_FAILED", stack.stackStatusAsString(), stack.stackStatusReason());
+                return false;
             } catch (CloudFormationException error) {
                 assertEquals("ValidationError", error.awsErrorDetails().errorCode());
                 assertTrue(error.getMessage().contains("does not exist"), error.getMessage());
-                return;
+                return true;
             }
-            Thread.sleep(25);
-        }
-        fail("Stack was not deleted: " + name);
+        }, deleted -> deleted, deleted -> "Stack was not deleted: " + name);
     }
 
     private static Stack awaitStack(CloudFormationClient client, String name, String expected) throws Exception {
-        long deadline = System.nanoTime() + 10_000_000_000L;
-        Stack stack;
-        do {
-            stack = client.describeStacks(request -> request.stackName(name)).stacks().getFirst();
-            if (!stack.stackStatusAsString().endsWith("_IN_PROGRESS")) {
-                assertEquals(expected, stack.stackStatusAsString(), stack.stackStatusReason());
-                return stack;
-            }
-            Thread.sleep(25);
-        } while (System.nanoTime() < deadline);
-        fail("Stack did not finish: " + stack.stackStatusAsString());
+        Stack stack = CfnStackWaits.awaitState(Duration.ofSeconds(10),
+                () -> client.describeStacks(request -> request.stackName(name)).stacks().getFirst(),
+                described -> !described.stackStatusAsString().endsWith("_IN_PROGRESS"),
+                described -> "Stack did not finish: " + described.stackStatusAsString());
+        assertEquals(expected, stack.stackStatusAsString(), stack.stackStatusReason());
         return stack;
     }
 

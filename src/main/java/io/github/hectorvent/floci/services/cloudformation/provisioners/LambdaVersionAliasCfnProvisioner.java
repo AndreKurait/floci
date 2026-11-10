@@ -20,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 /**
  * CloudFormation provisioning for {@code AWS::Lambda::Version} and {@code AWS::Lambda::Alias}.
@@ -39,27 +40,38 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
     private static final Logger LOG = Logger.getLogger(LambdaVersionAliasCfnProvisioner.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String SNAPSHOT_ATTR = "__FlociLambdaAliasUpdateSnapshot";
+    /** How long an alias waits for its provisioned concurrency to initialize, and how often it looks. */
+    private static final Duration READINESS_TIMEOUT = Duration.ofMinutes(5);
+    private static final Duration READINESS_POLL = Duration.ofMillis(200);
 
     private final LambdaService lambdaService;
     private final ProvisionedConcurrencyPool provisionedConcurrency;
     private final LambdaAliasDeployment deployments;
-    private final Duration readinessTimeout;
+    private final LongSupplier nanoTime;
+    private final Sleeper sleeper;
 
     @Inject
     public LambdaVersionAliasCfnProvisioner(LambdaService lambdaService,
                                            ProvisionedConcurrencyPool provisionedConcurrency,
                                            LambdaAliasDeployment deployments) {
-        this(lambdaService, provisionedConcurrency, deployments, Duration.ofMinutes(5));
+        this(lambdaService, provisionedConcurrency, deployments, System::nanoTime, Thread::sleep);
     }
 
+    /** For tests that put the wait for provisioned concurrency on a timeline they control. */
     LambdaVersionAliasCfnProvisioner(LambdaService lambdaService,
                                      ProvisionedConcurrencyPool provisionedConcurrency,
                                      LambdaAliasDeployment deployments,
-                                     Duration readinessTimeout) {
+                                     LongSupplier nanoTime, Sleeper sleeper) {
         this.lambdaService = lambdaService;
         this.provisionedConcurrency = provisionedConcurrency;
         this.deployments = deployments;
-        this.readinessTimeout = readinessTimeout;
+        this.nanoTime = nanoTime;
+        this.sleeper = sleeper;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(Duration delay) throws InterruptedException;
     }
 
     @Override
@@ -327,19 +339,19 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
 
     private void awaitProvisionedConcurrency(String functionName, String aliasName, int requested,
                                             ProvisionedConcurrencyPool.Status status, String region, String account) {
-        long deadline = System.nanoTime() + readinessTimeout.toNanos();
+        long started = nanoTime.getAsLong();
         while (true) {
             if ("READY".equals(status.status()) && status.requested() == requested
                     && status.allocated() == requested) {
                 return;
             }
-            if ("FAILED".equals(status.status()) || System.nanoTime() >= deadline) {
+            if ("FAILED".equals(status.status()) || nanoTime.getAsLong() - started >= READINESS_TIMEOUT.toNanos()) {
                 throw new AwsException("InternalFailure", "Provisioned concurrency for alias " + aliasName
                         + " did not become READY (status " + status.status() + "): "
                         + (status.reason() == null ? "initialization deadline exceeded" : status.reason()), 500);
             }
             try {
-                Thread.sleep(200);
+                sleeper.sleep(READINESS_POLL);
             } catch (InterruptedException failure) {
                 Thread.currentThread().interrupt();
                 throw new AwsException("InternalFailure",

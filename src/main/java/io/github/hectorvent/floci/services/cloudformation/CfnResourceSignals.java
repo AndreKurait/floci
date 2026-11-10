@@ -17,13 +17,30 @@ import java.util.function.Consumer;
 /** Transient signal collectors owned by active CloudFormation resource operations. */
 final class CfnResourceSignals {
     private final ConcurrentHashMap<Key, Pending> pending = new ConcurrentHashMap<>();
+    private final TimedWait timedWait;
+
+    CfnResourceSignals() {
+        this((completion, timeoutNanos) -> completion.get(timeoutNanos, TimeUnit.NANOSECONDS));
+    }
+
+    /** For tests that put the signal deadline on a timeline they control. */
+    CfnResourceSignals(TimedWait timedWait) {
+        this.timedWait = timedWait;
+    }
+
+    /** The bounded wait for a collector's outcome; the default is {@link CompletableFuture#get(long, TimeUnit)}. */
+    @FunctionalInterface
+    interface TimedWait {
+        String get(CompletableFuture<String> completion, long timeoutNanos)
+                throws InterruptedException, ExecutionException, TimeoutException;
+    }
 
     Pending begin(String stackId, String logicalId, String type, JsonNode creationPolicy, JsonNode properties) {
         Policy policy = Policy.parse(type, creationPolicy, properties);
         if (policy == null) {
             return null;
         }
-        Pending collector = new Pending(policy);
+        Pending collector = new Pending(policy, timedWait);
         if (pending.putIfAbsent(new Key(stackId, logicalId), collector) != null) {
             throw new IllegalStateException("A creation signal collector already owns " + logicalId);
         }
@@ -139,11 +156,13 @@ final class CfnResourceSignals {
 
     static final class Pending {
         private final Policy policy;
+        private final TimedWait timedWait;
         private final Set<String> successes = new HashSet<>();
         private final CompletableFuture<String> completion = new CompletableFuture<>();
 
-        private Pending(Policy policy) {
+        private Pending(Policy policy, TimedWait timedWait) {
             this.policy = policy;
+            this.timedWait = timedWait;
             if (policy.count() == 0) {
                 completion.complete(null);
             }
@@ -171,7 +190,7 @@ final class CfnResourceSignals {
 
         String await() {
             try {
-                return completion.get(policy.timeout().toNanos(), TimeUnit.NANOSECONDS);
+                return timedWait.get(completion, policy.timeout().toNanos());
             } catch (TimeoutException failure) {
                 String reason;
                 synchronized (this) {

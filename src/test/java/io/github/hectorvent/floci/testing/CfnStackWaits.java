@@ -4,6 +4,7 @@ import io.restassured.path.xml.XmlPath;
 import io.restassured.path.xml.element.Node;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
+import org.awaitility.core.ConditionTimeoutException;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 import software.amazon.awssdk.services.cloudformation.model.DescribeStacksRequest;
 import software.amazon.awssdk.services.cloudformation.model.Stack;
@@ -11,6 +12,10 @@ import software.amazon.awssdk.services.cloudformation.model.Stack;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.function.Predicate;
 
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
@@ -39,6 +44,10 @@ public final class CfnStackWaits {
 
     private static final Set<String> OPERATION_STARTS = Set.of("CREATE_IN_PROGRESS", "UPDATE_IN_PROGRESS");
 
+    /** The stack operation runs on another thread: the first look is immediate and the rest are close together. */
+    private static final Duration TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration POLL = Duration.ofMillis(10);
+
     /**
      * Waits until DescribeStacks reports a terminal status for a create or update and returns
      * it, so the caller decides what counts as success. A DescribeStacks that is not 200 (the
@@ -50,36 +59,35 @@ public final class CfnStackWaits {
     }
 
     public static StackState awaitTerminal(String stackName, String authorization) {
-        long deadline = System.currentTimeMillis() + 10_000;
-        StackState last = new StackState(null, "");
-        while (System.currentTimeMillis() < deadline) {
-            RequestSpecification request = given()
-                .contentType("application/x-www-form-urlencoded")
-                .formParam("Action", "DescribeStacks")
-                .formParam("StackName", stackName);
-            if (authorization != null) {
-                request.header("Authorization", authorization);
-            }
-            Response response = request.when().post("/");
-            if (response.statusCode() != 200) {
-                fail("DescribeStacks " + stackName + " answered " + response.statusCode() + ": " + response.asString());
-            }
-            XmlPath xml = response.xmlPath();
-            String status = xml.getString("**.find { it.name() == 'StackStatus' }");
-            String reason = xml.getString("**.find { it.name() == 'StackStatusReason' }");
-            last = new StackState(status == null || status.isEmpty() ? null : status, reason == null ? "" : reason);
-            if (last.status() != null && TERMINAL.contains(last.status())) {
-                return last;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("Interrupted while waiting for stack " + stackName, e);
-            }
+        AtomicReference<StackState> last = new AtomicReference<>(new StackState(null, ""));
+        try {
+            return await("Stack " + stackName + " to reach a terminal status")
+                    .atMost(TIMEOUT).pollDelay(Duration.ZERO).pollInterval(POLL).until(() -> {
+                        last.set(describe(stackName, authorization));
+                        return last.get();
+                    }, state -> state.status() != null && TERMINAL.contains(state.status()));
+        } catch (ConditionTimeoutException timeout) {
+            return fail("Stack " + stackName + " reached no terminal status within ten seconds, last: " + last.get());
         }
-        fail("Stack " + stackName + " reached no terminal status within ten seconds, last: " + last);
-        return last;
+    }
+
+    /** One DescribeStacks; anything but 200 fails at once with the error body. */
+    private static StackState describe(String stackName, String authorization) {
+        RequestSpecification request = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName);
+        if (authorization != null) {
+            request.header("Authorization", authorization);
+        }
+        Response response = request.when().post("/");
+        if (response.statusCode() != 200) {
+            fail("DescribeStacks " + stackName + " answered " + response.statusCode() + ": " + response.asString());
+        }
+        XmlPath xml = response.xmlPath();
+        String status = xml.getString("**.find { it.name() == 'StackStatus' }");
+        String reason = xml.getString("**.find { it.name() == 'StackStatusReason' }");
+        return new StackState(status == null || status.isEmpty() ? null : status, reason == null ? "" : reason);
     }
 
     /**
@@ -92,43 +100,24 @@ public final class CfnStackWaits {
     }
 
     public static StackState awaitStatus(String stackName, String expectedStatus, String authorization) {
-        long deadline = System.currentTimeMillis() + 10_000;
-        StackState last = new StackState(null, "");
-        while (System.currentTimeMillis() < deadline) {
-            RequestSpecification request = given()
-                .contentType("application/x-www-form-urlencoded")
-                .formParam("Action", "DescribeStacks")
-                .formParam("StackName", stackName);
-            if (authorization != null) {
-                request.header("Authorization", authorization);
-            }
-            Response response = request.when().post("/");
-            if (response.statusCode() != 200) {
-                fail("DescribeStacks " + stackName + " answered " + response.statusCode() + ": " + response.asString());
-            }
-            XmlPath xml = response.xmlPath();
-            String status = xml.getString("**.find { it.name() == 'StackStatus' }");
-            String reason = xml.getString("**.find { it.name() == 'StackStatusReason' }");
-            last = new StackState(status == null || status.isEmpty() ? null : status, reason == null ? "" : reason);
-            if (hasExpectedStatus(stackName, expectedStatus, last)) {
-                return last;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("Interrupted while waiting for stack " + stackName, e);
-            }
+        AtomicReference<StackState> last = new AtomicReference<>(new StackState(null, ""));
+        try {
+            return await("Stack " + stackName + " to reach " + expectedStatus)
+                    .atMost(TIMEOUT).pollDelay(Duration.ZERO).pollInterval(POLL).until(() -> {
+                        last.set(describe(stackName, authorization));
+                        return last.get();
+                    }, state -> hasExpectedStatus(stackName, expectedStatus, state));
+        } catch (ConditionTimeoutException timeout) {
+            return fail("Stack " + stackName + " did not reach " + expectedStatus + " within ten seconds, last: "
+                    + last.get());
         }
-        fail("Stack " + stackName + " did not reach " + expectedStatus + " within ten seconds, last: " + last);
-        return last;
     }
 
     /** SDK counterpart of {@link #awaitStatus(String, String)}, retaining the complete stack response. */
     public static Stack awaitStatus(CloudFormationClient client, String stackName, String expectedStatus) {
         DescribeStacksRequest request = DescribeStacksRequest.builder().stackName(stackName).build();
         return await("Stack " + stackName + " to reach " + expectedStatus)
-                .atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(50)).until(() -> {
+                .atMost(TIMEOUT).pollDelay(Duration.ZERO).pollInterval(POLL).until(() -> {
                     List<Stack> stacks = client.describeStacks(request).stacks();
                     if (stacks.isEmpty()) {
                         fail("DescribeStacks " + stackName + " returned no stacks");
@@ -137,6 +126,44 @@ public final class CfnStackWaits {
                 }, stack -> hasExpectedStatus(stackName, expectedStatus,
                         new StackState(stack.stackStatusAsString(),
                                 stack.stackStatusReason() == null ? "" : stack.stackStatusReason())));
+    }
+
+    /**
+     * Waits for state that a stack operation's executor changes after the request was answered: reads
+     * until {@code settled} accepts what was read, and returns it. The first read is immediate and the
+     * rest are ten milliseconds apart, on the calling thread. A read or a check that throws ends the wait
+     * at once; when {@code atMost} passes first the wait fails with {@code onTimeout} of the last read.
+     */
+    public static <T> T awaitState(Duration atMost, Callable<T> read, Predicate<T> settled,
+                                   Function<T, String> onTimeout) {
+        AtomicReference<T> last = new AtomicReference<>();
+        if (!settledWithin(atMost, read, settled, last)) {
+            fail(onTimeout.apply(last.get()));
+        }
+        return last.get();
+    }
+
+    /**
+     * As {@link #awaitState}, but returns the last read when {@code atMost} passes without {@code settled}
+     * accepting one, for a caller that asserts on what it gets.
+     */
+    public static <T> T lastStateWithin(Duration atMost, Callable<T> read, Predicate<T> settled) {
+        AtomicReference<T> last = new AtomicReference<>();
+        settledWithin(atMost, read, settled, last);
+        return last.get();
+    }
+
+    private static <T> boolean settledWithin(Duration atMost, Callable<T> read, Predicate<T> settled,
+                                             AtomicReference<T> last) {
+        try {
+            await().pollInSameThread().atMost(atMost).pollDelay(Duration.ZERO).pollInterval(POLL).until(() -> {
+                last.set(read.call());
+                return settled.test(last.get());
+            });
+            return true;
+        } catch (ConditionTimeoutException timeout) {
+            return false;
+        }
     }
 
     private static boolean hasExpectedStatus(String stackName, String expectedStatus, StackState state) {
@@ -240,29 +267,24 @@ public final class CfnStackWaits {
     }
 
     public static void awaitStackDeleted(String stackName, String authorization) {
-        long deadline = System.currentTimeMillis() + 10_000;
-        String body = "";
-        while (System.currentTimeMillis() < deadline) {
-            RequestSpecification request = given()
-                .contentType("application/x-www-form-urlencoded")
-                .formParam("Action", "DescribeStacks")
-                .formParam("StackName", stackName);
-            if (authorization != null) {
-                request.header("Authorization", authorization);
-            }
-            Response response = request.when().post("/");
-            body = response.asString();
-            assertThat(body, not(containsString("<StackStatus>DELETE_FAILED</StackStatus>")));
-            if (response.statusCode() == 400) {
-                return;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("Interrupted while waiting for stack " + stackName + " to be deleted", e);
-            }
+        AtomicReference<String> body = new AtomicReference<>("");
+        try {
+            await("Stack " + stackName + " to be deleted")
+                    .atMost(TIMEOUT).pollDelay(Duration.ZERO).pollInterval(POLL).until(() -> {
+                        RequestSpecification request = given()
+                            .contentType("application/x-www-form-urlencoded")
+                            .formParam("Action", "DescribeStacks")
+                            .formParam("StackName", stackName);
+                        if (authorization != null) {
+                            request.header("Authorization", authorization);
+                        }
+                        Response response = request.when().post("/");
+                        body.set(response.asString());
+                        assertThat(body.get(), not(containsString("<StackStatus>DELETE_FAILED</StackStatus>")));
+                        return response.statusCode() == 400;
+                    });
+        } catch (ConditionTimeoutException timeout) {
+            fail("Stack " + stackName + " was not deleted within ten seconds: " + body.get());
         }
-        fail("Stack " + stackName + " was not deleted within ten seconds: " + body);
     }
 }
