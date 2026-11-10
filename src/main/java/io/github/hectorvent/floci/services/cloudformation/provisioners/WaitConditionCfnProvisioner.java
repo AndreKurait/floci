@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
@@ -21,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 /** Consumes real, versioned S3 signals written to a CloudFormation wait handle. */
 @ApplicationScoped
@@ -34,11 +36,26 @@ public class WaitConditionCfnProvisioner implements CfnResourceProvisioner {
     private final S3Service s3;
     private final ObjectMapper mapper;
     private final ContainerReachableEndpoint endpoint;
+    private final LongSupplier nanoTime;
+    private final Sleeper sleeper;
 
+    @Inject
     public WaitConditionCfnProvisioner(S3Service s3, ObjectMapper mapper, ContainerReachableEndpoint endpoint) {
+        this(s3, mapper, endpoint, System::nanoTime, Thread::sleep);
+    }
+
+    WaitConditionCfnProvisioner(S3Service s3, ObjectMapper mapper, ContainerReachableEndpoint endpoint,
+                                LongSupplier nanoTime, Sleeper sleeper) {
         this.s3 = s3;
         this.mapper = mapper;
         this.endpoint = endpoint;
+        this.nanoTime = nanoTime;
+        this.sleeper = sleeper;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(Duration delay) throws InterruptedException;
     }
 
     @Override
@@ -111,9 +128,9 @@ public class WaitConditionCfnProvisioner implements CfnResourceProvisioner {
     private Map<String, String> awaitSignals(String bucket, int count, int timeout) {
         Map<String, String> data = new LinkedHashMap<>();
         Set<String> observed = new HashSet<>();
-        long deadline = System.nanoTime() + Duration.ofSeconds(timeout).toNanos();
+        long deadline = nanoTime.getAsLong() + Duration.ofSeconds(timeout).toNanos();
         while (data.size() < count) {
-            if (System.nanoTime() >= deadline) {
+            if (nanoTime.getAsLong() >= deadline) {
                 throw timedOut(timeout, count, data.size());
             }
             for (S3Object version : signalVersions(bucket)) {
@@ -144,12 +161,12 @@ public class WaitConditionCfnProvisioner implements CfnResourceProvisioner {
                     return data;
                 }
             }
-            long remaining = deadline - System.nanoTime();
+            long remaining = deadline - nanoTime.getAsLong();
             if (remaining <= 0) {
                 throw timedOut(timeout, count, data.size());
             }
             try {
-                Thread.sleep(Duration.ofNanos(Math.min(remaining, Duration.ofMillis(50).toNanos())));
+                sleeper.sleep(Duration.ofNanos(Math.min(remaining, Duration.ofMillis(50).toNanos())));
             } catch (InterruptedException failure) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Interrupted while waiting for CloudFormation signals", failure);

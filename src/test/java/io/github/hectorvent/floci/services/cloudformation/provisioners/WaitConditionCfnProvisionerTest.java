@@ -8,12 +8,15 @@ import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplate
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +33,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -43,6 +47,10 @@ class WaitConditionCfnProvisionerTest {
     private final S3Service s3 = mock(S3Service.class);
     private final ContainerReachableEndpoint endpoint = mock(ContainerReachableEndpoint.class);
     private final WaitConditionCfnProvisioner provisioner = new WaitConditionCfnProvisioner(s3, mapper, endpoint);
+    private final TestTime time = TestTime.create();
+    /** The same provisioner with its deadline and its 50 ms poll pause on the test's timeline. */
+    private final WaitConditionCfnProvisioner timed =
+            new WaitConditionCfnProvisioner(s3, mapper, endpoint, time::nanoTime, time::sleepAdvancing);
 
     @BeforeEach
     void ownHandle() {
@@ -125,6 +133,58 @@ class WaitConditionCfnProvisionerTest {
     }
 
     @Test
+    void unsignaledConditionPollsEveryFiftyMillisecondsAndTimesOutAtItsTimeout() {
+        when(s3.listObjectVersions(BUCKET, "signals", null, 1000, null, null)).thenReturn(noSignals());
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> timed.provision(resource(), properties(1).put("Timeout", "300"), context(null)));
+
+        assertEquals("WaitCondition timed out after 300 seconds: received 0 of 1 required unique success signals.",
+                failure.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(300), time.now());
+        verify(s3, times(6000)).listObjectVersions(BUCKET, "signals", null, 1000, null, null);
+    }
+
+    @Test
+    void signalSeenByTheLastPollBeforeTheDeadlineCompletesTheCondition() throws Exception {
+        Instant lastPoll = time.now().plusSeconds(300).minus(Duration.ofMillis(50));
+        signalArrivesAt(lastPoll, signalVersion("only", "f", "only", "ready"));
+
+        StackResource resource = resource();
+        timed.provision(resource, properties(1).put("Timeout", "300"), context(null));
+
+        assertEquals(mapper.valueToTree(Map.of("only", "ready")),
+                mapper.readTree(resource.getAttributes().get("Data")));
+        assertEquals(lastPoll, time.now());
+    }
+
+    @Test
+    void signalThatArrivesAtTheDeadlineIsTooLate() {
+        Instant deadline = time.now().plusSeconds(300);
+        signalArrivesAt(deadline, signalVersion("late", "f", "late", "ready"));
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> timed.provision(resource(), properties(1).put("Timeout", "300"), context(null)));
+
+        assertEquals("WaitCondition timed out after 300 seconds: received 0 of 1 required unique success signals.",
+                failure.getMessage());
+        assertEquals(deadline, time.now());
+        verify(s3, never()).getObject(BUCKET, "signals", "late");
+    }
+
+    @Test
+    void timeoutReportsTheSignalsReceivedSoFar() {
+        signalArrivesAt(time.now().plusSeconds(10), signalVersion("first", "f", "first", "ready"));
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> timed.provision(resource(), properties(2).put("Timeout", "300"), context(null)));
+
+        assertEquals("WaitCondition timed out after 300 seconds: received 1 of 2 required unique success signals.",
+                failure.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(300), time.now());
+    }
+
+    @Test
     void interruptionStopsAWaitingResourceAndPreservesTheInterrupt() throws Exception {
         CountDownLatch reading = new CountDownLatch(1);
         AtomicBoolean interrupted = new AtomicBoolean();
@@ -149,6 +209,18 @@ class WaitConditionCfnProvisionerTest {
             worker.interrupt();
             worker.join(3000);
         }
+    }
+
+    private static S3Service.ListVersionsResult noSignals() {
+        return new S3Service.ListVersionsResult(List.of(), List.of(), false, null, null);
+    }
+
+    /** The signal version is listed from {@code arrival} on the timeline, and not before. */
+    private void signalArrivesAt(Instant arrival, S3Object signal) {
+        S3Service.ListVersionsResult arrived =
+                new S3Service.ListVersionsResult(List.of(signal), List.of(), false, null, null);
+        when(s3.listObjectVersions(BUCKET, "signals", null, 1000, null, null))
+                .thenAnswer(invocation -> time.now().isBefore(arrival) ? noSignals() : arrived);
     }
 
     private ObjectNode properties(int count) {
