@@ -226,7 +226,7 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
                 filter.setFilterName(filterName);
                 filter.setFilterPattern(definition.getFilterPattern());
                 filter.setMetricTransformations(List.of(copy(transformation)));
-                filter.setCreationTime(before == null ? System.currentTimeMillis() : before.getCreationTime());
+                filter.setCreationTime(before == null ? logsService.currentTimeMillis() : before.getCreationTime());
                 filter.setApplyOnTransformedLogs(definition.getApplyOnTransformedLogs());
                 filter.setFieldSelectionCriteria(definition.getFieldSelectionCriteria());
                 filter.setEmitSystemFieldDimensions(definition.getEmitSystemFieldDimensions() == null
