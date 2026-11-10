@@ -139,17 +139,20 @@ final class Ec2RunInstancesReplay {
     void recoverPending(Consumer<Recovery> compensate) {
         for (AccountEntry<RunInstancesReplayJournal> entry : records.scanAllAccountEntries(key -> true)) {
             RunInstancesReplayJournal journal = entry.value();
-            int separator = entry.key().indexOf(':');
-            int regionStart = separator + 1 + Integer.parseInt(entry.key().substring(0, separator));
-            int regionSeparator = entry.key().indexOf(':', regionStart);
-            int regionLength = Integer.parseInt(entry.key().substring(regionStart, regionSeparator));
-            String region = entry.key().substring(regionSeparator + 1, regionSeparator + 1 + regionLength);
+            String accountPrefix = entry.accountId() + "/";
+            String key = entry.key().startsWith(accountPrefix)
+                    ? entry.key().substring(accountPrefix.length()) : entry.key();
+            int separator = key.indexOf(':');
+            int regionStart = separator + 1 + Integer.parseInt(key.substring(0, separator));
+            int regionSeparator = key.indexOf(':', regionStart);
+            int regionLength = Integer.parseInt(key.substring(regionStart, regionSeparator));
+            String region = key.substring(regionSeparator + 1, regionSeparator + 1 + regionLength);
             for (Map.Entry<String, RunInstancesReplayRecord> zone : entry.value().zones().entrySet()) {
                 if (zone.getValue().result() == null) {
                     try {
                         compensate.accept(new Recovery(entry.accountId(), region, zone.getValue().allocations()));
                         RunInstancesReplayJournal remaining = without(journal, zone.getKey());
-                        publish(entry.accountId(), entry.key(), remaining);
+                        publish(entry.accountId(), key, remaining);
                         journal = remaining;
                     } catch (RuntimeException failure) {
                         LOG.warnv(failure, "Unable to recover pending RunInstances allocation for account {0}, region {1}, zone {2}",

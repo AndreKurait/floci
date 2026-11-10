@@ -71,7 +71,9 @@ An explicitly supplied network interface must still exist: a deleted interface r
 `InvalidNetworkInterfaceID.NotFound` before exact replay or parameter mismatch.
 `DryRun` retains its validation behavior and does not consume a token.
 
-A subnet or explicit availability zone scopes the token to that zone. A request without either
+A subnet or explicit availability zone, supplied by name or ID, scopes the token to that zone.
+Request placement overrides launch-template placement for both launch and replay.
+A request without either
 binds to its selected zone; an explicit request for that zone uses the same outcome and must
 match the original parameters. Other zones are independent. Request matching retains original
 parameter presence, including omitted versus explicit `Monitoring.Enabled=false` and
@@ -83,6 +85,8 @@ The journal and generated resource ownership use the EC2 storage backend. Persis
 and WAL modes persist allocation intent before resource publication and flush launch resources
 before acknowledging a completed outcome. Interrupted attempts reclaim their owned resources
 before retry; cleanup failures retain that ownership for retry or service startup recovery.
+This includes a generated primary interface requested to survive normal instance termination.
+Compensation preserves supplied interfaces and generated interfaces subsequently attached to another instance.
 Startup logs failed recovery attempts and continues recovering other pending requests and zones.
 Memory mode remains volatile. This is request replay, separate from Capacity Reservation
 membership recovery. Tokens and protected instance tombstones currently have no automatic
@@ -1637,6 +1641,13 @@ These members of `RequestLaunchTemplateData` are stored and read back unchanged 
 `InstanceRequirementsRequest`, including the nested `BaselinePerformanceFactors.Cpu.References`.
 Within `NetworkInterfaces`, `ConnectionTrackingSpecification` is stored and read back with all
 three of its timeout members.
+
+`RunInstances` accepts either `Placement.AvailabilityZone` or `Placement.AvailabilityZoneId`.
+The request's selector takes precedence over either selector in the selected launch template;
+when neither is requested, the template supplies the zone. Zone IDs must be published by
+`DescribeAvailabilityZones`, and specifying both selectors is rejected. An explicit subnet or
+existing primary network interface must belong to the selected zone; invalid or contradictory
+placement is rejected before launch, including dry runs.
 
 At launch, `RunInstances` and `CreateFleet` apply the template's `BlockDeviceMappings` under the
 request's, field by field: a request entry for a `DeviceName` the template maps, spelled `xvdf` or

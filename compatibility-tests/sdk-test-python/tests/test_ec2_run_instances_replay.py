@@ -1,5 +1,6 @@
 """RunInstances request replay through the EC2 SDK, independent of membership replay."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import os
 import subprocess
 import uuid
@@ -109,6 +110,38 @@ def test_concurrent_replay_admits_once(launches):
         replies = list(workers.map(lambda _: launch(ec2, parameters), range(8)))
     assert len({reply["ReservationId"] for reply in replies}) == 1
     assert len({reply["Instances"][0]["InstanceId"] for reply in replies}) == 1
+
+
+@pytest.mark.parametrize("placement_source", ["request", "template", "request-overrides-template"])
+def test_zone_ids_select_independent_replay_scopes(launches, placement_source):
+    connect, launch = launches
+    ec2 = connect()
+    zones = [zone for zone in ec2.describe_availability_zones()["AvailabilityZones"]
+             if zone["State"] == "available"][:2]
+    assert len(zones) == 2
+    token = uuid.uuid4().hex
+    reservations = []
+    with ExitStack() as cleanup:
+        for index, zone in enumerate(zones):
+            parameters = request(ClientToken=token)
+            if placement_source != "request":
+                placement = ({"AvailabilityZoneId": zone["ZoneId"]} if placement_source == "template"
+                             else {"AvailabilityZone": zones[1 - index]["ZoneName"]})
+                template = ec2.create_launch_template(
+                    LaunchTemplateName="zone-replay-" + uuid.uuid4().hex,
+                    LaunchTemplateData={"ImageId": parameters["ImageId"],
+                                        "InstanceType": parameters["InstanceType"],
+                                        "Placement": placement})["LaunchTemplate"]["LaunchTemplateId"]
+                cleanup.callback(ec2.delete_launch_template, LaunchTemplateId=template)
+                parameters["LaunchTemplate"] = {"LaunchTemplateId": template, "Version": "1"}
+            if placement_source != "template":
+                parameters["Placement"] = {"AvailabilityZoneId": zone["ZoneId"]}
+            first = launch(ec2, parameters)
+            assert first["Instances"][0]["Placement"]["AvailabilityZone"] == zone["ZoneName"]
+            reservations.append(first["ReservationId"])
+            assert launch(ec2, parameters)["ReservationId"] == first["ReservationId"]
+            assert_mismatch(ec2, dict(parameters, InstanceType="t3.small"))
+    assert len(set(reservations)) == 2
 
 
 def test_replay_does_not_reapply_network_interface_tags(launches):

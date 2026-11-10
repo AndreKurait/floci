@@ -315,6 +315,41 @@ class Ec2RunInstancesReplayServiceTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void recoveryPreservesCompletedAndClearsPendingJournalsForConfiguredAccounts(String mode) {
+        for (String account : List.of(ACCOUNT, "123", "local-account")) {
+            Path path = directory.resolve(account);
+            try (Fixture fixture = new Fixture(mode, path, account)) {
+                assertEquals(RESULT, fixture.replay.execute(account, REGION, "us-east-1a", true,
+                        "completed", PARAMETERS, attempt -> RESULT, owned -> fail()));
+                assertThrows(AssertionError.class, () -> fixture.replay.execute(account, REGION, "us-east-1a", true,
+                        "pending", PARAMETERS, attempt -> {
+                            attempt.remember(ALLOCATION);
+                            throw new AssertionError("interrupted launch");
+                        }, owned -> fail()));
+            }
+            try (Fixture fixture = new Fixture(mode, path, account)) {
+                List<Ec2RunInstancesReplay.Recovery> recovered = new ArrayList<>();
+                fixture.replay.recoverPending(recovered::add);
+                assertEquals(List.of(new Ec2RunInstancesReplay.Recovery(account, REGION, List.of(ALLOCATION))), recovered);
+                assertEquals(2, fixture.store.keysForAccount(account).size(), "Recovery must overwrite the original key");
+                assertEquals(RESULT, fixture.replay.execute(account, REGION, "us-east-1a", true,
+                        "completed", PARAMETERS, attempt -> fail("Completed request must replay"), owned -> fail()));
+            }
+            try (Fixture fixture = new Fixture(mode, path, account)) {
+                fixture.replay.recoverPending(owned -> fail("Compensation must not repeat after restart"));
+                AtomicInteger launches = new AtomicInteger();
+                assertEquals(RESULT, fixture.replay.execute(account, REGION, "us-east-1a", true,
+                        "pending", PARAMETERS, attempt -> {
+                            launches.incrementAndGet();
+                            return RESULT;
+                        }, owned -> fail()));
+                assertEquals(1, launches.get());
+            }
+        }
+    }
+
     @Test
     void requestCollectionsCannotMutatePublishedIdentity() {
         try (Fixture fixture = new Fixture("memory", directory)) {
@@ -337,8 +372,12 @@ class Ec2RunInstancesReplayServiceTest {
         private final Ec2RunInstancesReplay replay;
 
         private Fixture(String mode, Path directory) {
+            this(mode, directory, ACCOUNT);
+        }
+
+        private Fixture(String mode, Path directory, String account) {
             EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-            when(config.defaultAccountId()).thenReturn(ACCOUNT);
+            when(config.defaultAccountId()).thenReturn(account);
             when(config.storage().persistentPath()).thenReturn(directory.toString());
             when(config.storage().wal().compactionIntervalMs()).thenReturn(3600000L);
             ServiceConfigAccess access = mock(ServiceConfigAccess.class);
