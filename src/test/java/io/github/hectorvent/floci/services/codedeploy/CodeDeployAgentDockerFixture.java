@@ -18,6 +18,7 @@ import org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.api.io.TempDir;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -100,6 +101,7 @@ abstract class CodeDeployAgentDockerFixture {
     @TempDir Path imageContext;
 
     @BeforeEach
+    @Timeout(value = 5, unit = TimeUnit.MINUTES) // Allows the 90-second download and 180-second cold image build.
     void prepareOfficialAgentImage() throws Exception {
         assumeTrue(DockerAvailability.isAvailable(), "Docker is required for the AWS CodeDeploy agent");
         String architecture = docker.infoCmd().exec().getArchitecture();
