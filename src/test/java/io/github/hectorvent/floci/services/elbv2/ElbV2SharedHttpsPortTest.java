@@ -136,7 +136,9 @@ class ElbV2SharedHttpsPortTest {
                     .requestHandler(request -> request.response().end("api-control"))
                     .listen().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             try (TlsProxyFixture proxy = new TlsProxyFixture(vertx, config, api.actualPort(), api.actualPort())) {
-                assertTrue(request(trust, sharedPort, "callbacks.example.test", apiCertificate).contains("api-control"));
+                ElbV2TlsReadiness.await(Duration.ofSeconds(5), () ->
+                        assertTrue(request(trust, sharedPort, "callbacks.example.test", apiCertificate)
+                                .contains("api-control")));
                 plane.vertx = vertx;
                 plane.config = config;
                 plane.tlsProxyServer = proxy.server();
