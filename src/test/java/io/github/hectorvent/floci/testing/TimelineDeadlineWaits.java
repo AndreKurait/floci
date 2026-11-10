@@ -54,10 +54,23 @@ public final class TimelineDeadlineWaits implements DeadlineWaits {
             }
             throw new TimeoutException();
         }
+        return bounded(timeoutNanos, future::get);
+    }
+
+    /**
+     * Runs a blocking wait that has no timeout of its own, and ends it with {@link TimeoutException}
+     * when the timeline reaches {@code timeoutNanos} from now. For timed waits that are not on a
+     * {@link Future}: a latch, a queue, a Docker callback.
+     */
+    public <T> T bounded(long timeoutNanos, UntimedWait<T> wait)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        if (timeoutNanos <= 0) {
+            throw new TimeoutException();
+        }
         Expiry expiry = new Expiry(timeoutNanos);
         boolean interrupted = false;
         try {
-            return future.get();
+            return wait.await();
         } catch (InterruptedException e) {
             interrupted = true;
             if (expiry.fired()) {
@@ -67,6 +80,12 @@ public final class TimelineDeadlineWaits implements DeadlineWaits {
         } finally {
             expiry.end(interrupted);
         }
+    }
+
+    /** A blocking wait that only its own completion or an interrupt ends. */
+    @FunctionalInterface
+    public interface UntimedWait<T> {
+        T await() throws InterruptedException, ExecutionException;
     }
 
     /** How many threads are inside a wait right now. */
