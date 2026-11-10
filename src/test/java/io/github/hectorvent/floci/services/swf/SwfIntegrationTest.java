@@ -22,12 +22,12 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -42,7 +42,6 @@ import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -50,6 +49,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 
 /**
  * End-to-end coverage of the SWF wire protocol: registration, the decider/worker
@@ -95,8 +95,20 @@ class SwfIntegrationTest {
 
     @Test
     void decisionPollWaitsForALaterTask() throws Exception {
-        QuarkusMock.installMockForType(realService, SwfService.class);
         String domain = uniqueName("long-poll");
+        // The real service with the production 60-second deadline, reporting when the poll has
+        // looked at the task list and found it empty.
+        CountDownLatch emptyScan = new CountDownLatch(1);
+        SwfService scannedService = spy(realService);
+        doAnswer(call -> {
+            Optional<?> claimed = (Optional<?>) call.callRealMethod();
+            if (claimed.isEmpty()) {
+                emptyScan.countDown();
+            }
+            return claimed;
+        }).when(scannedService).pollForDecisionTask(anyString(), eq(domain), eq("floci-tl"),
+                nullable(String.class));
+        QuarkusMock.installMockForType(scannedService, SwfService.class);
         registerDomain(domain);
         registerWorkflowType(domain, "TestWf", "1.0");
         ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -109,7 +121,10 @@ class SwfIntegrationTest {
         });
         try {
             assertTrue(started.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class, () -> poll.get(300, TimeUnit.MILLISECONDS),
+            // The task is published only after the poll came up empty, so the response can carry
+            // it only if the poll was held open instead of answering with that empty result.
+            assertTrue(emptyScan.await(5, TimeUnit.SECONDS));
+            assertFalse(poll.isDone(),
                     "An empty task list must hold the poll rather than trigger a tight client loop");
             startExecution(domain, "later-task", null);
             poll.get(5, TimeUnit.SECONDS).then().statusCode(200)

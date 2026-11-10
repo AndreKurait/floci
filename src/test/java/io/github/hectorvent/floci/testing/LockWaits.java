@@ -67,6 +67,42 @@ public final class LockWaits {
         return fail("no thread ever waited in " + owner.getSimpleName() + "." + method);
     }
 
+    /**
+     * Returns once at least {@code threads} threads are in a timed wait entered straight from
+     * {@code owner}'s {@code method}, with none of the owner's other code in between: each is idle
+     * there until it is notified or its own timeout ends. For a long poll that must stay open, this
+     * shows it is held at its wait, where a fixed wait only showed it had not returned yet. Sees
+     * platform threads only. Fails after ten seconds.
+     */
+    public static void awaitTimedWaitIn(Class<?> owner, String method, int threads) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        int waiting = 0;
+        while (System.nanoTime() - deadline < 0) {
+            waiting = 0;
+            for (Map.Entry<Thread, StackTraceElement[]> entry : Thread.getAllStackTraces().entrySet()) {
+                if (entry.getKey().getState() == Thread.State.TIMED_WAITING
+                        && waitsDirectlyIn(entry.getValue(), owner, method)) {
+                    waiting++;
+                }
+            }
+            if (waiting >= threads) {
+                return;
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+        }
+        fail(waiting + " of " + threads + " threads waited in " + owner.getSimpleName() + "." + method);
+    }
+
+    private static boolean waitsDirectlyIn(StackTraceElement[] stack, Class<?> owner, String method) {
+        for (StackTraceElement frame : stack) {
+            if (frame.getClassName().startsWith("java.") || frame.getClassName().startsWith("jdk.")) {
+                continue;
+            }
+            return frame.getClassName().equals(owner.getName()) && frame.getMethodName().equals(method);
+        }
+        return false;
+    }
+
     private static void awaitBlockedBehind(Supplier<Thread> waiter, Supplier<Thread> holder,
                                            BooleanSupplier finished) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
