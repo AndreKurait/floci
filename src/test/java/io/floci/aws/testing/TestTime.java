@@ -553,6 +553,21 @@ public final class TestTime {
     }
 
     /**
+     * Whether {@code thread} has stopped running somewhere other than on its way onto this timeline.
+     * Queued for the timeline's own lock, a thread is entering its next sleep, wait or schedule: it
+     * looks parked but has not come to rest. Read with the lock held, it cannot leave that queue
+     * between the two checks. For the fixtures of this package that settle a thread they woke.
+     */
+    boolean blockedOffTheTimeline(Thread thread) {
+        lock.lock();
+        try {
+            return ThreadStates.PARKED_OR_DONE.contains(thread.getState()) && !lock.hasQueuedThread(thread);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Ends a timed wait and says whether its deadline was reached. A deadline that fired while the
      * call was returning on its own left an interrupt nobody consumed; it belongs to this wait, so it
      * is cleared here.
@@ -634,11 +649,7 @@ public final class TestTime {
                     if (isParked(thread)) {
                         return;
                     }
-                    // Queued for this lock, the thread is on its way into its next sleep or wait:
-                    // it looks parked but has not come to rest. Read with the lock held, it cannot
-                    // leave that queue in between.
-                    blockedElsewhere = ThreadStates.PARKED_OR_DONE.contains(thread.getState())
-                            && !lock.hasQueuedThread(thread);
+                    blockedElsewhere = blockedOffTheTimeline(thread);
                 } finally {
                     lock.unlock();
                 }
