@@ -2737,6 +2737,8 @@ class Ec2ContainerManagerTest {
         verify(harness.portAllocator, timeout(2_000)).release(2201);
         assertNull(instance.getDockerContainerId());
         verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
+        // The address was looked for thirty times, half a second apart, before the launch gave up.
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(15), harness.time().now());
     }
 
     @Test
