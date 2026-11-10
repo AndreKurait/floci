@@ -21,7 +21,9 @@ import io.github.hectorvent.floci.services.msk.model.ScramSecretAssociation;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
+import io.github.hectorvent.floci.testing.TestTime;
 import io.github.hectorvent.floci.testutil.LogCapture;
+import org.awaitility.core.ConditionFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
@@ -40,6 +42,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.LogRecord;
@@ -74,6 +77,8 @@ class MskScramServiceTest {
     private static final String ACCOUNT = "000000000000";
     private static final String SECRET =
         "arn:aws:secretsmanager:us-east-1:000000000000:secret:AmazonMSK_alice";
+    // The default of floci.services.msk.scram-reconciliation-interval-ms.
+    private static final Duration RECONCILIATION_INTERVAL = Duration.ofSeconds(5);
     private AccountAwareStorageBackend<MskCluster> clusters;
     private AccountAwareStorageBackend<MskScramAssociations> associations;
     private StorageFactory storageFactory;
@@ -192,6 +197,9 @@ class MskScramServiceTest {
 
     @Test
     void scheduledReconciliationKeepsOtherClustersSyncingWhileOneBrokerIsBlocked() throws Exception {
+        TestTime time = TestTime.create();
+        ThreadPoolExecutor workers = MskScramSecretsService.newReconciliationWorkers();
+        service = onTimeline(time, workers);
         when(config.services().msk().mock()).thenReturn(true);
         MskCluster healthyCluster = clusterService.createCluster("healthy-scram");
         when(config.services().msk().mock()).thenReturn(false);
@@ -213,19 +221,22 @@ class MskScramServiceTest {
             return null;
         }).when(redpanda).createUser(cluster, "alice", "rotated");
         setSecretValue(SECRET, version("alice", "rotated"));
-        when(config.services().msk().scramReconciliationIntervalMs()).thenReturn(5L);
+        when(config.services().msk().scramReconciliationIntervalMs()).thenReturn(RECONCILIATION_INTERVAL.toMillis());
 
         try {
             service.onStart(null);
+            time.advance(RECONCILIATION_INTERVAL);
             assertTrue(operationForFirstClusterStarted.await(5, TimeUnit.SECONDS));
+            // The healthy cluster's run is over, so the next scheduled one takes it up again.
+            awaitCompleted(workers, 1);
 
             // More rotations than workers expose duplicate blocked jobs exhausting the pool.
             for (int rotation = 1; rotation <= 6; rotation++) {
                 String password = "healthy-rotation-" + rotation;
                 healthyVersion.set(version("bob", password));
-                await()
-                    .atMost(Duration.ofSeconds(5))
-                    .untilAsserted(() -> verify(redpanda).createUser(healthyCluster, "bob", password));
+                time.advance(RECONCILIATION_INTERVAL);
+                awaitCompleted(workers, rotation + 1);
+                verify(redpanda).createUser(healthyCluster, "bob", password);
             }
 
             verify(redpanda, times(1)).createUser(cluster, "alice", "rotated");
@@ -241,6 +252,8 @@ class MskScramServiceTest {
 
     @Test
     void scheduledReconciliationLogsRepeatedFailuresAndRecovers() {
+        TestTime time = TestTime.create();
+        service = onTimeline(time, time.newScheduler());
         associate(SECRET, version("alice", "original"));
         setSecretValue(SECRET, version("alice", "rotated"));
         doThrow(new IllegalStateException("Broker unavailable"))
@@ -249,21 +262,46 @@ class MskScramServiceTest {
             .doNothing()
             .when(redpanda)
             .createUser(cluster, "alice", "rotated");
-        when(config.services().msk().scramReconciliationIntervalMs()).thenReturn(5L);
+        when(config.services().msk().scramReconciliationIntervalMs()).thenReturn(RECONCILIATION_INTERVAL.toMillis());
 
         try {
             List<LogRecord> logs = LogCapture.capture(MskScramSecretsService.class, () -> {
                 service.onStart(null);
-                await()
-                    .atMost(Duration.ofSeconds(5))
-                    .untilAsserted(() -> verify(redpanda, times(4)).createUser(cluster, "alice", "rotated"));
+                time.advance(RECONCILIATION_INTERVAL.multipliedBy(4));
             });
+            verify(redpanda, times(4)).createUser(cluster, "alice", "rotated");
             assertEquals(List.of("ERROR", "DEBUG", "ERROR"), logLevels(logs));
         } finally {
             service.shutdown();
         }
     }
 
+    @Test
+    void scheduledReconciliationAppliesARotationOnceTheConfiguredIntervalHasPassedAndNotBefore() {
+        TestTime time = TestTime.create();
+        service = onTimeline(time, time.newScheduler());
+        associate(SECRET, version("alice", "original"));
+        when(config.services().msk().scramReconciliationIntervalMs()).thenReturn(RECONCILIATION_INTERVAL.toMillis());
+        AtomicReference<SecretVersion> currentVersion = rotatingSecret(SECRET, version("alice", "rotated"));
+
+        try {
+            service.onStart(null);
+            time.advance(RECONCILIATION_INTERVAL.minusMillis(1));
+            verify(redpanda, never()).createUser(cluster, "alice", "rotated");
+            time.advance(Duration.ofMillis(1));
+            verify(redpanda).createUser(cluster, "alice", "rotated");
+
+            currentVersion.set(version("alice", "rotated-again"));
+            time.advance(RECONCILIATION_INTERVAL.minusMillis(1));
+            verify(redpanda, never()).createUser(cluster, "alice", "rotated-again");
+            time.advance(Duration.ofMillis(1));
+            verify(redpanda).createUser(cluster, "alice", "rotated-again");
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    // The service's own scheduler and workers, in real time: the wiring the timeline tests above stand in for.
     @Test
     void scheduledReconciliationAppliesRotationsUsingConfiguredInterval() {
         associate(SECRET, version("alice", "original"));
@@ -272,15 +310,30 @@ class MskScramServiceTest {
 
         try {
             service.onStart(null);
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            within(Duration.ofSeconds(5)).untilAsserted(() ->
                 verify(redpanda).createUser(cluster, "alice", "rotated"));
 
             currentVersion.set(version("alice", "rotated-again"));
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            within(Duration.ofSeconds(5)).untilAsserted(() ->
                 verify(redpanda).createUser(cluster, "alice", "rotated-again"));
         } finally {
             service.shutdown();
         }
+    }
+
+    // The service with its reconciliation scheduled on the timeline of time, its clusters reconciled by workers.
+    private MskScramSecretsService onTimeline(TestTime time, ExecutorService workers) {
+        return new MskScramSecretsService(storageFactory, config, clusterService, redpanda, secrets, kms, mapper,
+            time.scheduler(), workers);
+    }
+
+    // Waits for the workers to have finished count cluster reconciliations, which is not a matter of time.
+    private static void awaitCompleted(ThreadPoolExecutor workers, long count) {
+        within(Duration.ofSeconds(5)).until(() -> workers.getCompletedTaskCount() == count);
+    }
+
+    private static ConditionFactory within(Duration atMost) {
+        return await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(atMost);
     }
 
     private void associate(String arn, SecretVersion version) {
