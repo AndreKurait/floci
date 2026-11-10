@@ -62,6 +62,7 @@ class SecurityGroupFirewallPeerFixture {
     /** Every nft script installed, in order, and each helper's currently installed script. */
     final List<String[]> installs = Collections.synchronizedList(new ArrayList<>());
     final Map<String, String> installed = new ConcurrentHashMap<>();
+    final Set<String> stoppedHelpers = ConcurrentHashMap.newKeySet();
     private final Map<String, String> transportByHelper = new ConcurrentHashMap<>();
     final List<String> violations = Collections.synchronizedList(new ArrayList<>());
 
@@ -148,9 +149,10 @@ class SecurityGroupFirewallPeerFixture {
         when(inspectExec.exec()).thenReturn(exited);
         when(docker.inspectExecCmd("exec")).thenReturn(inspectExec);
         when(docker.inspectContainerCmd(anyString())).thenAnswer(invocation -> {
+            String helper = invocation.getArgument(0);
             InspectContainerCmd inspect = mock(InspectContainerCmd.class);
             InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
-            when(response.getState().getRunning()).thenReturn(true);
+            when(response.getState().getRunning()).thenReturn(!stoppedHelpers.contains(helper));
             when(inspect.exec()).thenReturn(response);
             return inspect;
         });
