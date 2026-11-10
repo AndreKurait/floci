@@ -1297,3 +1297,12 @@ an individual connection ID. Identity policies, session policies, permissions
 boundaries and SCPs use the shared caller evaluator. Policy changes apply to
 every request, and a permitted endpoint cannot access another API or stage's
 connection. IAM-disabled local connection management remains unsigned.
+
+### CloudFormation V2 authorizer update rollback
+
+CloudFormation in-place updates to standalone V2 authorizers snapshot their complete
+configuration before mutation. Failure during the update or in a later stack
+resource restores the previous authorizer ID, credentials and settings. Failed
+restoration keeps the snapshot for rollback retry; successful stack updates clear
+it. Changing the owning API, deployment activation, concurrent transaction isolation
+and process-crash recovery remain outside this rollback support.
