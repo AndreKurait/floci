@@ -42,7 +42,6 @@ import org.jboss.logging.Logger;
 
 import java.time.Clock;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -54,7 +53,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
@@ -67,6 +65,7 @@ public class CodeDeployService {
     // Lambda/ECS validation hooks must call PutLifecycleEventHookExecutionStatus within one hour.
     private static final Duration DEFAULT_HOOK_CALLBACK_TIMEOUT = Duration.ofHours(1);
     private static final Duration STOP_POLL_INTERVAL = Duration.ofMillis(200);
+    private static final Duration SSM_POLL_INTERVAL = Duration.ofMillis(500);
 
     private final LambdaService lambdaService;
     private final EcsService ecsService;
@@ -82,6 +81,7 @@ public class CodeDeployService {
     private final StorageFactory storageFactory;
     private final Duration hookCallbackTimeout;
     private final Clock clock;
+    private final CodeDeployTimer timer;
 
     public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
                              ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
@@ -118,6 +118,17 @@ public class CodeDeployService {
                       StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
                       CodeDeployAgentDeployment agentDeployment, ServiceRoleCallAuthorizer roleAuthorizer,
                       CodeDeployLaunchHooks launchHooks) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, hookCallbackTimeout, clock, agentDeployment, roleAuthorizer,
+                launchHooks, CodeDeployTimer.SYSTEM);
+    }
+
+    CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                      ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                      Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                      CodeDeployAgentDeployment agentDeployment, ServiceRoleCallAuthorizer roleAuthorizer,
+                      CodeDeployLaunchHooks launchHooks, CodeDeployTimer timer) {
         this.lambdaService = lambdaService;
         this.ecsService = ecsService;
         this.elbV2Service = elbV2Service;
@@ -132,6 +143,7 @@ public class CodeDeployService {
         this.storageFactory = storageFactory;
         this.hookCallbackTimeout = hookCallbackTimeout;
         this.clock = clock;
+        this.timer = timer;
     }
 
     // ---- Durable (persisted) ----
@@ -267,7 +279,7 @@ public class CodeDeployService {
             if (store == null) {
                 continue;
             }
-            double now = EpochSeconds.fromInstant(Instant.now());
+            double now = EpochSeconds.fromInstant(clock.instant());
             boolean changed = false;
             for (String name : BUILT_IN_CONFIG_NAMES) {
                 if (!store.containsKey(name)) {
@@ -357,7 +369,7 @@ public class CodeDeployService {
     private Map<String, DeploymentConfig> deploymentConfigsFor(String region) {
         return deploymentConfigs.computeIfAbsent(region, r -> {
             ConcurrentHashMap<String, DeploymentConfig> store = new ConcurrentHashMap<>();
-            double now = EpochSeconds.fromInstant(Instant.now());
+            double now = EpochSeconds.fromInstant(clock.instant());
             for (String name : BUILT_IN_CONFIG_NAMES) {
                 store.put(name, buildBuiltInConfig(name, now));
             }
@@ -432,7 +444,7 @@ public class CodeDeployService {
         Application app = new Application();
         app.setApplicationId(UUID.randomUUID().toString());
         app.setApplicationName(name);
-        app.setCreateTime(EpochSeconds.fromInstant(Instant.now()));
+        app.setCreateTime(EpochSeconds.fromInstant(clock.instant()));
         app.setLinkedToGitHub(false);
         app.setComputePlatform(computePlatform != null ? computePlatform : "Server");
         store.put(name, app);
@@ -747,7 +759,7 @@ public class CodeDeployService {
         cfg.setDeploymentConfigId(UUID.randomUUID().toString());
         cfg.setDeploymentConfigName(name);
         cfg.setMinimumHealthyHosts(minimumHealthyHosts);
-        cfg.setCreateTime(EpochSeconds.fromInstant(Instant.now()));
+        cfg.setCreateTime(EpochSeconds.fromInstant(clock.instant()));
         cfg.setComputePlatform(computePlatform != null ? computePlatform : "Server");
         cfg.setTrafficRoutingConfig(trafficRoutingConfig);
         cfg.setZonalConfig(zonalConfig);
@@ -843,7 +855,7 @@ public class CodeDeployService {
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
 
         String deploymentId = generateDeploymentId();
-        double now = EpochSeconds.fromInstant(Instant.now());
+        double now = EpochSeconds.fromInstant(clock.instant());
 
         Deployment deployment = new Deployment();
         deployment.setDeploymentId(deploymentId);
@@ -1012,7 +1024,7 @@ public class CodeDeployService {
                 "instance/" + instanceName).toString());
         inst.setIamSessionArn(iamSessionArn);
         inst.setIamUserArn(iamUserArn);
-        inst.setRegisterTime(EpochSeconds.fromInstant(Instant.now()));
+        inst.setRegisterTime(EpochSeconds.fromInstant(clock.instant()));
         inst.setRegistrationStatus("Registered");
         store.put(instanceName, inst);
         persistRegion(onPremisesInstances, region);
@@ -1021,7 +1033,7 @@ public class CodeDeployService {
 
     public void deregisterOnPremisesInstance(String region, String instanceName) {
         OnPremisesInstance inst = requireOnPremisesInstance(region, instanceName);
-        inst.setDeregisterTime(EpochSeconds.fromInstant(Instant.now()));
+        inst.setDeregisterTime(EpochSeconds.fromInstant(clock.instant()));
         inst.setRegistrationStatus("Deregistered");
         persistRegion(onPremisesInstances, region);
     }
@@ -1100,7 +1112,7 @@ public class CodeDeployService {
         ServerAppSpecInfo appSpec = s3Revision ? null : parseServerAppSpec(revision);
 
         String deploymentId = generateDeploymentId();
-        double now = EpochSeconds.fromInstant(Instant.now());
+        double now = EpochSeconds.fromInstant(clock.instant());
 
         Deployment deployment = new Deployment();
         deployment.setDeploymentId(deploymentId);
@@ -1284,7 +1296,7 @@ public class CodeDeployService {
         String deploymentId = deployment.getDeploymentId();
         try {
             deployment.setStatus("InProgress");
-            deployment.setStartTime(EpochSeconds.fromInstant(Instant.now()));
+            deployment.setStartTime(EpochSeconds.fromInstant(clock.instant()));
             instanceTargetMaps.forEach(m -> updateTargetStatus(m, "InProgress"));
 
             boolean anyFailed = false;
@@ -1292,7 +1304,7 @@ public class CodeDeployService {
                 if (stopFlag.get()) {
                     instanceTargetMaps.forEach(m -> updateTargetStatus(m, "Skipped"));
                     deployment.setStatus("Stopped");
-                    deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+                    deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
                     return;
                 }
                 String instanceId = instanceIds.get(i);
@@ -1312,18 +1324,18 @@ public class CodeDeployService {
             } else {
                 deployment.setStatus("Succeeded");
             }
-            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+            deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             instanceTargetMaps.forEach(m -> updateTargetStatus(m, "Skipped"));
             deployment.setStatus("Stopped");
-            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+            deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
         } catch (Exception e) {
             LOG.warnv("Server deployment {0} failed: {1}", deploymentId, e.getMessage());
             instanceTargetMaps.forEach(m -> updateTargetStatus(m, "Failed"));
             deployment.setStatus("Failed");
-            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+            deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
             deployment.setErrorInformation(Map.of("code", "DeploymentFailed",
                     "message", e.getMessage() != null ? e.getMessage() : "Unknown error"));
         } finally {
@@ -1407,7 +1419,7 @@ public class CodeDeployService {
                 long deadline = clock.millis() + timeout * 1000L;
                 String invocationStatus = "InProgress";
                 while (clock.millis() < deadline && "InProgress".equals(invocationStatus)) {
-                    Thread.sleep(500);
+                    timer.sleepNanos(SSM_POLL_INTERVAL.toNanos());
                     invocationStatus = ssmCommandService.getCommandInvocationStatus(commandId, instanceId, region);
                 }
 
@@ -1669,7 +1681,7 @@ public class CodeDeployService {
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
 
         String deploymentId = generateDeploymentId();
-        double now = EpochSeconds.fromInstant(Instant.now());
+        double now = EpochSeconds.fromInstant(clock.instant());
 
         Deployment deployment = new Deployment();
         deployment.setDeploymentId(deploymentId);
@@ -1769,7 +1781,7 @@ public class CodeDeployService {
         TaskSet blueTaskSet = null;
         try {
             deployment.setStatus("InProgress");
-            deployment.setStartTime(EpochSeconds.fromInstant(Instant.now()));
+            deployment.setStartTime(EpochSeconds.fromInstant(clock.instant()));
             updateEcsTargetStatus(ecsTargetMap, "InProgress");
 
             if (stopFlag.get()) { finishEcsStopped(deployment, ecsTargetMap); return; }
@@ -1886,7 +1898,7 @@ public class CodeDeployService {
 
             updateEcsTargetStatus(ecsTargetMap, "Succeeded");
             deployment.setStatus("Succeeded");
-            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+            deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -1914,7 +1926,7 @@ public class CodeDeployService {
                     }
                     long waitMs = Math.min(trc.intervalSeconds * 1000L, 5000L);
                     if (waitMs > 0 && !stopFlag.get()) {
-                        Thread.sleep(waitMs);
+                        timer.sleepNanos(TimeUnit.MILLISECONDS.toNanos(waitMs));
                     }
                     if (!stopFlag.get()) {
                         for (String listenerArn : listenerArns) {
@@ -1934,7 +1946,7 @@ public class CodeDeployService {
                         if (pct < 100) {
                             long waitMs = Math.min(trc.intervalSeconds * 1000L, 2000L);
                             if (waitMs > 0) {
-                                Thread.sleep(waitMs);
+                                timer.sleepNanos(TimeUnit.MILLISECONDS.toNanos(waitMs));
                             }
                         }
                     }
@@ -1977,20 +1989,20 @@ public class CodeDeployService {
 
     private void updateEcsTargetStatus(Map<String, Object> ecsTargetMap, String status) {
         ecsTargetMap.put("status", status);
-        ecsTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(Instant.now()));
+        ecsTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(clock.instant()));
     }
 
     private void finishEcsStopped(Deployment deployment, Map<String, Object> ecsTargetMap) {
         updateEcsTargetStatus(ecsTargetMap, "Skipped");
         deployment.setStatus("Stopped");
-        deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+        deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
     }
 
     private void finishEcsFailed(Deployment deployment, Map<String, Object> ecsTargetMap,
                                   String errorCode, String message) {
         updateEcsTargetStatus(ecsTargetMap, "Failed");
         deployment.setStatus("Failed");
-        deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+        deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
         deployment.setErrorInformation(Map.of("code", errorCode, "message", message != null ? message : ""));
     }
 
@@ -2030,7 +2042,7 @@ public class CodeDeployService {
         String deploymentId = deployment.getDeploymentId();
         try {
             deployment.setStatus("InProgress");
-            deployment.setStartTime(EpochSeconds.fromInstant(Instant.now()));
+            deployment.setStartTime(EpochSeconds.fromInstant(clock.instant()));
             updateTargetStatus(lambdaTargetMap, "InProgress");
 
             if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
@@ -2064,7 +2076,7 @@ public class CodeDeployService {
 
             updateTargetStatus(lambdaTargetMap, "Succeeded");
             deployment.setStatus("Succeeded");
-            deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+            deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -2159,13 +2171,13 @@ public class CodeDeployService {
     private boolean waitForTrafficInterval(int intervalSeconds, AtomicBoolean stopFlag)
             throws InterruptedException {
         long duration = TimeUnit.SECONDS.toNanos(intervalSeconds);
-        long started = System.nanoTime();
+        long started = timer.nanoTime();
         while (!stopFlag.get()) {
-            long remaining = duration - (System.nanoTime() - started);
+            long remaining = duration - (timer.nanoTime() - started);
             if (remaining <= 0) {
                 return true;
             }
-            TimeUnit.NANOSECONDS.sleep(Math.min(remaining, STOP_POLL_INTERVAL.toNanos()));
+            timer.sleepNanos(Math.min(remaining, STOP_POLL_INTERVAL.toNanos()));
         }
         return false;
     }
@@ -2202,13 +2214,13 @@ public class CodeDeployService {
             }
 
             String status = null;
-            long deadlineNanos = System.nanoTime() + hookCallbackTimeout.toNanos();
+            long deadlineNanos = timer.nanoTime() + hookCallbackTimeout.toNanos();
             while (status == null) {
                 if (stopFlag.get()) {
                     finishLifecycleEvent(event, "Skipped");
                     return false;
                 }
-                long remainingNanos = deadlineNanos - System.nanoTime();
+                long remainingNanos = deadlineNanos - timer.nanoTime();
                 if (remainingNanos <= 0) {
                     LOG.warnv("Hook {0} for lifecycle event {1} did not call PutLifecycleEventHookExecutionStatus within {2}",
                             hookFunctionName, lifecycleEventName, hookCallbackTimeout);
@@ -2219,10 +2231,11 @@ public class CodeDeployService {
                     break;
                 }
                 long sliceNanos = Math.min(remainingNanos, STOP_POLL_INTERVAL.toNanos());
-                try {
-                    status = future.get(sliceNanos, TimeUnit.NANOSECONDS);
-                } catch (TimeoutException e) {
+                if (!timer.awaitDone(future, sliceNanos)) {
                     continue;
+                }
+                try {
+                    status = future.get();
                 } catch (ExecutionException e) {
                     throw new IllegalStateException(e);
                 }
@@ -2246,18 +2259,18 @@ public class CodeDeployService {
     private Map<String, Object> addLifecycleEvent(Map<String, Object> lambdaTargetMap, String name) {
         Map<String, Object> event = new ConcurrentHashMap<>();
         event.put("lifecycleEventName", name);
-        event.put("startTime", EpochSeconds.fromInstant(Instant.now()));
+        event.put("startTime", EpochSeconds.fromInstant(clock.instant()));
         event.put("status", "InProgress");
         List<Map<String, Object>> events = (List<Map<String, Object>>) lambdaTargetMap.get("lifecycleEvents");
         if (events != null) {
             events.add(event);
         }
-        lambdaTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(Instant.now()));
+        lambdaTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(clock.instant()));
         return event;
     }
 
     private void finishLifecycleEvent(Map<String, Object> event, String status) {
-        event.put("endTime", EpochSeconds.fromInstant(Instant.now()));
+        event.put("endTime", EpochSeconds.fromInstant(clock.instant()));
         event.put("status", status);
     }
 
@@ -2269,20 +2282,20 @@ public class CodeDeployService {
 
     private void updateTargetStatus(Map<String, Object> lambdaTargetMap, String status) {
         lambdaTargetMap.put("status", status);
-        lambdaTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(Instant.now()));
+        lambdaTargetMap.put("lastUpdatedAt", EpochSeconds.fromInstant(clock.instant()));
     }
 
     private void finishStopped(Deployment deployment, Map<String, Object> lambdaTargetMap) {
         updateTargetStatus(lambdaTargetMap, "Skipped");
         deployment.setStatus("Stopped");
-        deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+        deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
     }
 
     private void finishFailed(Deployment deployment, Map<String, Object> lambdaTargetMap,
                                String errorCode, String message) {
         updateTargetStatus(lambdaTargetMap, "Failed");
         deployment.setStatus("Failed");
-        deployment.setCompleteTime(EpochSeconds.fromInstant(Instant.now()));
+        deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
         deployment.setErrorInformation(Map.of("code", errorCode, "message", message != null ? message : ""));
     }
 
