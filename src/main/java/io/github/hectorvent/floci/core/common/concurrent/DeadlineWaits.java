@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common.concurrent;
 
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -13,7 +14,7 @@ import java.util.concurrent.TimeoutException;
  */
 public interface DeadlineWaits {
 
-    /** {@link System#nanoTime()} and a real timed {@link Future#get(long, TimeUnit)}. */
+    /** {@link System#nanoTime()} and the JDK's own timed waits. */
     DeadlineWaits SYSTEM = new DeadlineWaits() {
         @Override
         public long nanoTime() {
@@ -25,6 +26,16 @@ public interface DeadlineWaits {
                 throws InterruptedException, ExecutionException, TimeoutException {
             return future.get(timeoutNanos, TimeUnit.NANOSECONDS);
         }
+
+        @Override
+        public boolean await(CountDownLatch latch, long timeoutNanos) throws InterruptedException {
+            return latch.await(timeoutNanos, TimeUnit.NANOSECONDS);
+        }
+
+        @Override
+        public void waitOn(Object monitor, long timeoutNanos) throws InterruptedException {
+            TimeUnit.NANOSECONDS.timedWait(monitor, timeoutNanos);
+        }
     };
 
     /** A monotonic reading in nanoseconds; only differences between two readings mean anything. */
@@ -33,4 +44,14 @@ public interface DeadlineWaits {
     /** The result of {@code future}, or {@link TimeoutException} when it has none within the timeout. */
     <T> T get(Future<T> future, long timeoutNanos)
             throws InterruptedException, ExecutionException, TimeoutException;
+
+    /** Whether {@code latch} reached zero within the timeout. */
+    boolean await(CountDownLatch latch, long timeoutNanos) throws InterruptedException;
+
+    /**
+     * Waits on {@code monitor}, which the caller has locked, until it is notified or the timeout
+     * passes. Like {@link Object#wait(long)} it can return early, so the caller rechecks its
+     * condition and the time left.
+     */
+    void waitOn(Object monitor, long timeoutNanos) throws InterruptedException;
 }
