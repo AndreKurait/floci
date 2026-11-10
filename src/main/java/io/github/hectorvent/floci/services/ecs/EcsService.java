@@ -281,7 +281,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 execSessions, discoveryRegistrar, cloudWatchMetricsService, Clock.systemUTC());
     }
 
-    /** With the clock for Container Insights samples and task protection deadlines. */
+    /** With the clock for Container Insights samples, task protection deadlines and deployment start times. */
     EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
                EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
                StorageFactory storageFactory, EcsEventPublisher eventPublisher,
@@ -2998,7 +2998,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             svc.setUnparsed(request.getUnparsed());
             applyServicePlatform(svc, taskDef, request.getPlatformVersion());
             svc.setStatus("ACTIVE");
-            svc.setCreatedAt(Instant.now());
+            svc.setCreatedAt(clock.instant());
             svc.setLastDeploymentAt(svc.getCreatedAt());
             svc.setDeploymentId(newDeploymentId());
             if (request.getTags() != null && !request.getTags().isEmpty()) {
@@ -3161,7 +3161,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 rollingChange |= !Objects.equals(platformVersionBefore, svc.getPlatformVersion());
                 if (taskDefChanged || forceNewDeployment || serviceConnectChanged || rollingChange) {
                     svc.setDeploymentId(newDeploymentId());
-                    svc.setLastDeploymentAt(Instant.now());
+                    svc.setLastDeploymentAt(clock.instant());
                     recordServiceDeployment(svc, svc.getTaskDefinition(), region);
                     if (eventPublisher != null) {
                         eventPublisher.emitDeploymentStateChange(svc, "SERVICE_DEPLOYMENT_STARTED",
