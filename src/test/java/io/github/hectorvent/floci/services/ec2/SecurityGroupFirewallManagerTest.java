@@ -20,6 +20,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -131,8 +132,10 @@ class SecurityGroupFirewallManagerTest {
             Future<?> retirement;
             synchronized (manager) {
                 retirement = executor.submit(manager::retireDnsOrigins);
-                await().atMost(2, TimeUnit.SECONDS).until(() -> manager.vpcForClient("172.18.0.2").isEmpty()
-                        && manager.vpcForClient("10.0.1.10").isEmpty());
+                await().atMost(2, TimeUnit.SECONDS)
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> manager.vpcForClient("172.18.0.2").isEmpty()
+                                && manager.vpcForClient("10.0.1.10").isEmpty());
             }
             retirement.get(2, TimeUnit.SECONDS);
         }
@@ -229,7 +232,9 @@ class SecurityGroupFirewallManagerTest {
             Future<?> retirement;
             synchronized (manager) {
                 retirement = executor.submit(manager::retireDnsOrigins);
-                await().atMost(2, TimeUnit.SECONDS).until(() -> manager.vpcForClient("172.18.0.2").isEmpty());
+                await().atMost(2, TimeUnit.SECONDS)
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> manager.vpcForClient("172.18.0.2").isEmpty());
                 assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
             }
             retirement.get(2, TimeUnit.SECONDS);
@@ -405,7 +410,9 @@ class SecurityGroupFirewallManagerTest {
             Future<?> retirement;
             synchronized (manager) {
                 retirement = executor.submit(manager::retireDnsOrigins);
-                await().atMost(2, TimeUnit.SECONDS).until(() -> manager.vpcForClient("172.18.0.2").isEmpty());
+                await().atMost(2, TimeUnit.SECONDS)
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> manager.vpcForClient("172.18.0.2").isEmpty());
                 registerOrigin(manager, "eni-a", "helper-new", "172.18.0.3", "vpc-a");
             }
             retirement.get(2, TimeUnit.SECONDS);

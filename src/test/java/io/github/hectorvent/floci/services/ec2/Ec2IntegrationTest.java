@@ -2987,13 +2987,15 @@ class Ec2IntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200);
-            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> given()
-                    .formParam("Action", "DescribeInstances")
-                    .formParam("InstanceId.1", launchedInstanceId)
-                    .header("Authorization", AUTH_HEADER)
-                    .post("/").then().statusCode(200)
-                    .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name",
-                            equalTo("terminated")));
+            await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> given()
+                            .formParam("Action", "DescribeInstances")
+                            .formParam("InstanceId.1", launchedInstanceId)
+                            .header("Authorization", AUTH_HEADER)
+                            .post("/").then().statusCode(200)
+                            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name",
+                                    equalTo("terminated")));
         });
         launched.response().then()
             .body("RunInstancesResponse.instancesSet.item.imageId", equalTo("ami-sample-override"))
