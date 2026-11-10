@@ -36,9 +36,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.ConnectException;
-import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -84,6 +84,8 @@ class ApiGatewayV2ExecuteTest {
     private static PrivateKey signingKey;
     private static final AtomicInteger jwksRequests = new AtomicInteger();
     private static final String VERIFIED_RESPONSE = UUID.randomUUID().toString();
+    // Per run, so a Floci that cached an earlier run's JWKS for a reused port must refetch.
+    private static final String KEY_ID = "sdk-test-" + UUID.randomUUID();
 
     @BeforeAll
     static void setup() throws Exception {
@@ -177,17 +179,6 @@ class ApiGatewayV2ExecuteTest {
         }
 
         baseUrl = TestFixtures.endpoint() + "/execute-api/" + apiId + "/" + STAGE;
-
-        try {
-            http.send(HttpRequest.newBuilder()
-                            .uri(URI.create(baseUrl + "/secure"))
-                            .timeout(Duration.ofSeconds(5))
-                            .GET()
-                            .build(),
-                    HttpResponse.BodyHandlers.ofString());
-        } catch (ConnectException e) {
-            Assumptions.assumeTrue(false, "Floci endpoint is not reachable at " + TestFixtures.endpoint());
-        }
 
         // Probe result is memoized in TestFixtures; skip warmup if dispatch is unavailable
         if (!TestFixtures.isLambdaDispatchAvailable()) {
@@ -296,8 +287,11 @@ class ApiGatewayV2ExecuteTest {
                         .GET().build(),
                 HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode())
-                .as("JWT fixture must be reachable; Floci needs FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=true: %s",
-                        response.body())
+                .as("Floci must reach the JWT fixture at %s. Start Floci with "
+                                + "FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=true; if it runs in a container or on "
+                                + "another host, set FLOCI_TEST_JWT_ISSUER_BIND_ADDRESS and "
+                                + "FLOCI_TEST_JWT_ISSUER_HOST for this suite: %s",
+                        issuer, response.body())
                 .isEqualTo(200);
         assertThat(JSON.readTree(response.body()).path("verified").asText()).isEqualTo(VERIFIED_RESPONSE);
         assertThat(jwksRequests.get()).as("Floci must fetch the fixture's public key").isPositive();
@@ -338,6 +332,33 @@ class ApiGatewayV2ExecuteTest {
 
     @Test
     @Order(6)
+    void jwtProtectedRouteRejectsUnsignedToken() throws Exception {
+        HttpResponse<String> response = http.send(HttpRequest.newBuilder()
+                        .uri(URI.create(baseUrl + "/verify"))
+                        .timeout(Duration.ofSeconds(10))
+                        .header("Authorization", "Bearer " + unsignedJwt(issuer, "my-audience",
+                                Instant.now().plusSeconds(300).getEpochSecond()))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).as("alg none token: %s", response.body()).isEqualTo(401);
+        assertThat(response.body()).contains("Unauthorized");
+    }
+
+    @Test
+    @Order(7)
+    void jwtProtectedRouteRejectsExpiredToken() throws Exception {
+        HttpResponse<String> response = http.send(HttpRequest.newBuilder()
+                        .uri(URI.create(baseUrl + "/verify"))
+                        .timeout(Duration.ofSeconds(10))
+                        .header("Authorization", "Bearer " + jwt(issuer, "my-audience",
+                                Instant.now().minusSeconds(300).getEpochSecond()))
+                        .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).as("expired token: %s", response.body()).isEqualTo(401);
+    }
+
+    @Test
+    @Order(8)
     void jwtProtectedRouteInvokesLambdaForValidToken() throws Exception {
         Assumptions.assumeTrue(lambdaDispatchAvailable,
                 "Lambda dispatch not available in this environment");
@@ -373,12 +394,24 @@ class ApiGatewayV2ExecuteTest {
         if (bindAddress != null && !bindAddress.isBlank()) {
             address = InetAddress.getByName(bindAddress);
         } else {
-            try (DatagramSocket route = new DatagramSocket()) {
-                route.connect(InetAddress.getByName(endpoint.getHost()), endpoint.getPort() < 0 ? 80 : endpoint.getPort());
+            int port = endpoint.getPort();
+            if (port < 0) {
+                port = "https".equalsIgnoreCase(endpoint.getScheme()) ? 443 : 80;
+            }
+            // A connected TCP socket reports the source address of the route to Floci; a UDP
+            // probe can report the wildcard address on macOS.
+            try (Socket route = new Socket()) {
+                route.connect(new InetSocketAddress(endpoint.getHost(), port), 5000);
                 address = route.getLocalAddress();
+            } catch (IOException e) {
+                throw new IllegalStateException("Floci endpoint is not reachable at " + endpoint, e);
             }
         }
-        assertThat(address.isAnyLocalAddress()).as("JWT fixture must bind one specific local address").isFalse();
+        assertThat(address.isAnyLocalAddress())
+                .as("JWT fixture must bind one specific local address, not the wildcard %s; set "
+                        + "FLOCI_TEST_JWT_ISSUER_BIND_ADDRESS to an interface Floci can reach and "
+                        + "FLOCI_TEST_JWT_ISSUER_HOST to the name Floci should call it by", address)
+                .isFalse();
         issuerServer = HttpServer.create(new InetSocketAddress(address, 0), 0);
         String advertisedHost = System.getenv("FLOCI_TEST_JWT_ISSUER_HOST");
         if (advertisedHost == null || advertisedHost.isBlank()) {
@@ -391,7 +424,7 @@ class ApiGatewayV2ExecuteTest {
         issuerServer.createContext("/jwks", exchange -> {
             jwksRequests.incrementAndGet();
             serveJson(exchange, Map.of("keys", List.of(Map.of(
-                    "kty", "RSA", "kid", "sdk-test-key", "alg", "RS256", "use", "sig",
+                    "kty", "RSA", "kid", KEY_ID, "alg", "RS256", "use", "sig",
                     "n", unsignedBase64(publicKey.getModulus()), "e", unsignedBase64(publicKey.getPublicExponent())))));
         });
         issuerServer.createContext("/verified", exchange -> serveJson(exchange, Map.of("verified", VERIFIED_RESPONSE)));
@@ -420,17 +453,27 @@ class ApiGatewayV2ExecuteTest {
     }
 
     private static String jwt(String issuer, String audience, long exp, PrivateKey key) throws Exception {
-        String header = base64Url(JSON.writeValueAsBytes(Map.of("alg", "RS256", "typ", "JWT", "kid", "sdk-test-key")));
+        String signingInput = signingInput(Map.of("alg", "RS256", "typ", "JWT", "kid", KEY_ID),
+                issuer, audience, exp);
+        Signature signature = Signature.getInstance("SHA256withRSA");
+        signature.initSign(key);
+        signature.update(signingInput.getBytes(StandardCharsets.UTF_8));
+        return signingInput + "." + base64Url(signature.sign());
+    }
+
+    // Valid claims and no signature: an authorizer that only checks claims would accept it.
+    private static String unsignedJwt(String issuer, String audience, long exp) throws Exception {
+        return signingInput(Map.of("alg", "none", "typ", "JWT"), issuer, audience, exp) + ".";
+    }
+
+    private static String signingInput(Map<String, String> header, String issuer, String audience, long exp)
+            throws Exception {
         String payload = base64Url(JSON.writeValueAsBytes(Map.of(
                 "iss", issuer,
                 "aud", audience,
                 "exp", exp
         )));
-        String signingInput = header + "." + payload;
-        Signature signature = Signature.getInstance("SHA256withRSA");
-        signature.initSign(key);
-        signature.update(signingInput.getBytes(StandardCharsets.UTF_8));
-        return signingInput + "." + base64Url(signature.sign());
+        return base64Url(JSON.writeValueAsBytes(header)) + "." + payload;
     }
 
     private static String base64Url(byte[] bytes) {
