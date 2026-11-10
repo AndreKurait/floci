@@ -177,8 +177,9 @@ public class TlsConfigSource implements ConfigSource {
 
     @Override
     public int getOrdinal() {
-        // Higher than application.yml (250) so TLS properties take precedence
-        return 300;
+        // Above system properties (400): internal listeners must stay behind the public proxy.
+        // NetworkExposureGuard.publicHost resolves the user-configured host from other sources.
+        return 500;
     }
 
     @Override
