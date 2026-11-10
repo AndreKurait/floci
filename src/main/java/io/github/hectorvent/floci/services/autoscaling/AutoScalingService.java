@@ -96,7 +96,7 @@ public class AutoScalingService implements PassedRoleLookup {
         this.groupChanges = groupChanges;
         this.elbV2Service = elbV2Service;
         this.maxCapacityReservationIds = maxCapacityReservationIds;
-        this.multipleCapacityReservationScopes = List.copyOf(multipleCapacityReservationScopes);
+        this.multipleCapacityReservationScopes = multipleCapacityReservationScopes.stream().map(String::trim).toList();
     }
 
     private void requestReconciliation(AutoScalingGroup group) {

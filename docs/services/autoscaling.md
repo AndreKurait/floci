@@ -58,8 +58,9 @@ Rejected updates preserve the group's existing configuration.
 To model a workload with a different direct-reservation limit, explicitly set
 `floci.services.autoscaling.max-capacity-reservation-ids` (environment variable
 `FLOCI_SERVICES_AUTOSCALING_MAX_CAPACITY_RESERVATION_IDS`) to a positive integer.
-The default is `1`. This emulator setting does not reproduce account or service
-allowlisting, and an increased value is not a claim of general AWS availability.
+Zero and negative values are rejected at startup. The default is `1`. This
+emulator setting does not reproduce account or service allowlisting, and an
+increased value is not a claim of general AWS availability.
 Resource-group ARN targets remain limited to one, and mixing target types is
 always rejected. For accepted direct ID lists, scale-out and instance refresh
 try the supplied reservations using EC2's zone, type, platform, tenancy and
@@ -72,8 +73,9 @@ To restrict the increased limit to selected accounts and regions, set
 `FLOCI_SERVICES_AUTOSCALING_MULTIPLE_CAPACITY_RESERVATION_SCOPES` to a
 comma-separated list of exact `account-id/region` pairs, such as
 `123456789012/us-east-1,123456789012/us-west-2`, alongside the increased limit.
-All other scopes retain the one-ID limit. With no scope list, the configured
-limit continues to apply throughout this emulator deployment. Scope selection
+Whitespace around each pair is ignored. All other scopes retain the one-ID limit.
+With no scope list, the configured limit continues to apply throughout this emulator
+deployment. Scope selection
 uses the resolved request account and operation region; it adds no request
 headers, grants no IAM permissions, and does not deploy AWS service principals.
 

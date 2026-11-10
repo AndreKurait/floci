@@ -44,7 +44,8 @@ class AutoScalingMultipleReservationsIntegrationTest {
         @Override
         public Map<String, String> getConfigOverrides() {
             return Map.of("floci.services.autoscaling.multiple-capacity-reservation-scopes",
-                    ACCOUNT + "/" + REGION, "floci.default-account-id", ACCOUNT,
+                    "753190420021/eu-west-1, " + ACCOUNT + "/" + REGION + " ",
+                    "floci.default-account-id", ACCOUNT,
                     "floci.services.autoscaling.max-capacity-reservation-ids", "6");
         }
     }

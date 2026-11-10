@@ -461,6 +461,7 @@ floci:
     autoscaling:
       enabled: true
       multiple-capacity-reservation-scopes: ""
+      max-capacity-reservation-ids: 1
     applicationautoscaling:
       enabled: true
     elasticbeanstalk:
