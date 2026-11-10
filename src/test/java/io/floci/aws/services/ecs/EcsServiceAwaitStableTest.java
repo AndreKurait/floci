@@ -12,16 +12,19 @@ import io.floci.aws.services.ecs.model.NetworkConfiguration;
 import io.floci.aws.services.ecs.model.NetworkMode;
 import io.floci.aws.services.ecs.model.TaskDefinition;
 import io.floci.aws.services.ecs.model.TaskStatus;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -141,6 +144,41 @@ class EcsServiceAwaitStableTest {
 
         assertEquals("NotStabilized", error.getErrorCode());
         assertEquals("Service " + svc.getServiceArn() + " did not stabilize.", error.getMessage());
+    }
+
+    @Test
+    void awaitServiceStable_serviceThatNeverStabilizes_givesUpExactlyFiveMinutesAfterItStarted() {
+        TestTime time = TestTime.create();
+        AtomicInteger polls = new AtomicInteger();
+        // The wait runs on this thread, so each of its sleeps moves the timeline on.
+        EcsService.WaitTimer timer = new EcsService.WaitTimer() {
+            @Override
+            public long nanoTime() {
+                return time.nanoTime();
+            }
+
+            @Override
+            public void sleepMillis(long millis) throws InterruptedException {
+                polls.incrementAndGet();
+                time.sleepAdvancing(Duration.ofMillis(millis));
+            }
+        };
+        EcsContainerManager containerManager = dockerContainerManager(task -> { });
+        when(containerManager.getExitCodeIfStopped(anyString())).thenReturn(1);
+        EcsService service = dockerModeService(containerManager, timer);
+        service.createCluster("slow-cluster", REGION);
+        registerTaskDef(service, "slow-fam", "app:1");
+        EcsServiceModel svc = service.createService("slow-cluster", "slow-svc", "slow-fam", 1,
+                LaunchType.FARGATE, List.of(), null, REGION);
+        Instant started = time.now();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.awaitServiceStable(svc));
+
+        assertEquals("NotStabilized", error.getErrorCode());
+        assertEquals("Service " + svc.getServiceArn() + " did not stabilize.", error.getMessage());
+        // It polls every 50 ms, still waits at 4 min 59.95 s, and fails at the poll that reaches 5 min.
+        assertEquals(Duration.ofMinutes(5), Duration.between(started, time.now()));
+        assertEquals(6000, polls.get());
     }
 
     @Test
@@ -315,7 +353,12 @@ class EcsServiceAwaitStableTest {
     }
 
     private EcsService dockerModeService(EcsContainerManager containerManager) {
-        return track(EcsServiceFixtures.builder().containerManager(containerManager).dockerMode().build());
+        return dockerModeService(containerManager, EcsService.WaitTimer.SYSTEM);
+    }
+
+    private EcsService dockerModeService(EcsContainerManager containerManager, EcsService.WaitTimer timer) {
+        return track(EcsServiceFixtures.builder().containerManager(containerManager).dockerMode()
+                .waitTimer(timer).build());
     }
 
     private EcsService track(EcsService service) {

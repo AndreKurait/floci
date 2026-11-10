@@ -10,12 +10,14 @@ import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.EcsServiceModel;
 import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -24,7 +26,6 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -76,9 +77,10 @@ class EcsReconciliationConcurrencyServiceTest {
         try {
             assertTrue(entered.await(5, TimeUnit.SECONDS), "first pass must reach service storage");
             secondThread.start();
-            await().atMost(Duration.ofSeconds(5)).until(() ->
-                    secondThread.getState() == Thread.State.WAITING || second.isDone());
-            assertEquals(Thread.State.WAITING, secondThread.getState(),
+            Thread.State reached = ThreadStates.awaitState(secondThread,
+                    EnumSet.of(Thread.State.WAITING, Thread.State.TERMINATED), Duration.ofSeconds(5),
+                    "the second pass");
+            assertEquals(Thread.State.WAITING, reached,
                     "a direct pass must wait for the running pass instead of reconciling the same deficit");
         } finally {
             release.countDown();

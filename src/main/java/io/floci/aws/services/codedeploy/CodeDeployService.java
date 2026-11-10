@@ -46,7 +46,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -59,6 +58,7 @@ public class CodeDeployService {
     // Lambda/ECS validation hooks must call PutLifecycleEventHookExecutionStatus within one hour.
     private static final Duration DEFAULT_HOOK_CALLBACK_TIMEOUT = Duration.ofHours(1);
     private static final Duration STOP_POLL_INTERVAL = Duration.ofMillis(200);
+    private static final Duration SSM_POLL_INTERVAL = Duration.ofMillis(500);
 
     private final LambdaService lambdaService;
     private final EcsService ecsService;
@@ -71,6 +71,7 @@ public class CodeDeployService {
     private final StorageFactory storageFactory;
     private final Duration hookCallbackTimeout;
     private final Clock clock;
+    private final CodeDeployTimer timer;
 
     @Inject
     public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
@@ -85,6 +86,15 @@ public class CodeDeployService {
                       ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
                       Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
                       StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, hookCallbackTimeout, clock, CodeDeployTimer.SYSTEM);
+    }
+
+    CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                      ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                      Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                      CodeDeployTimer timer) {
         this.lambdaService = lambdaService;
         this.ecsService = ecsService;
         this.elbV2Service = elbV2Service;
@@ -96,6 +106,7 @@ public class CodeDeployService {
         this.storageFactory = storageFactory;
         this.hookCallbackTimeout = hookCallbackTimeout;
         this.clock = clock;
+        this.timer = timer;
     }
 
     // ---- Durable (persisted) ----
@@ -1024,10 +1035,11 @@ public class CodeDeployService {
                         instanceId, "AWS-RunShellScript", Map.of("commands", List.of(script)),
                         timeout, region);
 
-                long deadline = clock.millis() + timeout * 1000L;
+                long timeoutNanos = TimeUnit.SECONDS.toNanos(timeout);
+                long started = timer.nanoTime();
                 String invocationStatus = "InProgress";
-                while (clock.millis() < deadline && "InProgress".equals(invocationStatus)) {
-                    Thread.sleep(500);
+                while (timer.nanoTime() - started < timeoutNanos && "InProgress".equals(invocationStatus)) {
+                    timer.sleepNanos(SSM_POLL_INTERVAL.toNanos());
                     invocationStatus = ssmCommandService.getCommandInvocationStatus(commandId, instanceId, region);
                 }
 
@@ -1556,7 +1568,7 @@ public class CodeDeployService {
                     }
                     long waitMs = Math.min(trc.intervalSeconds * 1000L, 5000L);
                     if (waitMs > 0 && !stopFlag.get()) {
-                        Thread.sleep(waitMs);
+                        timer.sleepNanos(TimeUnit.MILLISECONDS.toNanos(waitMs));
                     }
                     if (!stopFlag.get()) {
                         for (String listenerArn : listenerArns) {
@@ -1576,7 +1588,7 @@ public class CodeDeployService {
                         if (pct < 100) {
                             long waitMs = Math.min(trc.intervalSeconds * 1000L, 2000L);
                             if (waitMs > 0) {
-                                Thread.sleep(waitMs);
+                                timer.sleepNanos(TimeUnit.MILLISECONDS.toNanos(waitMs));
                             }
                         }
                     }
@@ -1731,7 +1743,7 @@ public class CodeDeployService {
                     // Wait the canary interval (capped at 5s for emulator speed)
                     long waitMs = Math.min(trc.intervalSeconds * 1000L, 5000L);
                     if (waitMs > 0 && !stopFlag.get()) {
-                        Thread.sleep(waitMs);
+                        timer.sleepNanos(TimeUnit.MILLISECONDS.toNanos(waitMs));
                     }
                     if (stopFlag.get()) { return; }
 
@@ -1752,7 +1764,7 @@ public class CodeDeployService {
                                     appSpec.currentVersion, null, Map.of(appSpec.targetVersion, weight));
                             long waitMs = Math.min(trc.intervalSeconds * 1000L, 2000L);
                             if (waitMs > 0) {
-                                Thread.sleep(waitMs);
+                                timer.sleepNanos(TimeUnit.MILLISECONDS.toNanos(waitMs));
                             }
                         }
                     }
@@ -1802,13 +1814,13 @@ public class CodeDeployService {
             }
 
             String status = null;
-            long deadlineNanos = System.nanoTime() + hookCallbackTimeout.toNanos();
+            long deadlineNanos = timer.nanoTime() + hookCallbackTimeout.toNanos();
             while (status == null) {
                 if (stopFlag.get()) {
                     finishLifecycleEvent(event, "Skipped");
                     return false;
                 }
-                long remainingNanos = deadlineNanos - System.nanoTime();
+                long remainingNanos = deadlineNanos - timer.nanoTime();
                 if (remainingNanos <= 0) {
                     LOG.warnv("Hook {0} for lifecycle event {1} did not call PutLifecycleEventHookExecutionStatus within {2}",
                             hookFunctionName, lifecycleEventName, hookCallbackTimeout);
@@ -1819,10 +1831,11 @@ public class CodeDeployService {
                     break;
                 }
                 long sliceNanos = Math.min(remainingNanos, STOP_POLL_INTERVAL.toNanos());
-                try {
-                    status = future.get(sliceNanos, TimeUnit.NANOSECONDS);
-                } catch (TimeoutException e) {
+                if (!timer.awaitDone(future, sliceNanos)) {
                     continue;
+                }
+                try {
+                    status = future.get();
                 } catch (ExecutionException e) {
                     throw new IllegalStateException(e);
                 }

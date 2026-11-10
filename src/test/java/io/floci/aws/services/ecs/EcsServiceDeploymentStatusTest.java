@@ -1,13 +1,23 @@
 package io.floci.aws.services.ecs;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.EpochSeconds;
+import io.floci.aws.services.ecs.container.HostVolumePolicy;
 import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.EcsServiceModel;
 import io.floci.aws.services.ecs.model.EcsTask;
 import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.services.ecs.model.ServiceDeployment;
 import io.floci.aws.services.ecs.model.TaskDefinition;
+import io.floci.aws.testing.TestTime;
+import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 
@@ -17,6 +27,8 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
@@ -48,6 +60,43 @@ class EcsServiceDeploymentStatusTest {
         ServiceDeployment done = onlyDeployment(service, "dstat-svc", "dstat-cluster");
         assertEquals("SUCCESSFUL", done.getStatus());
         assertNotNull(done.getFinishedAt(), "a finished deployment reports when it finished");
+    }
+
+    /**
+     * A task-definition change mints a new deployment id, so the timestamps have to move with it.
+     * Reporting the service's creation time would contradict the new id and misrepresent when the
+     * deployment started. One millisecond is the smallest step DescribeServices can show.
+     */
+    @Test
+    void aNewDeploymentCarriesItsOwnStartTimeNotTheServiceCreationTime() {
+        TestTime time = TestTime.create();
+        EcsService service = newMockModeService(time.clock());
+        ObjectMapper mapper = new ObjectMapper();
+        EcsJsonHandler handler = new EcsJsonHandler(service, mapper,
+                new HostVolumePolicy(mock(EmulatorConfig.class, RETURNS_DEEP_STUBS)));
+        service.createCluster("dtime-cluster", REGION);
+        registerTaskDef(service, "dtime-fam-a", "app:1");
+        Instant created = time.now();
+        service.createService("dtime-cluster", "dtime-svc", "dtime-fam-a", 0,
+                LaunchType.FARGATE, List.of(), null, REGION);
+        JsonNode before = describedService(handler, mapper, "dtime-cluster", "dtime-svc");
+        assertEquals(EpochSeconds.fromInstant(created), before.path("createdAt").asDouble());
+        assertEquals(EpochSeconds.fromInstant(created),
+                before.path("deployments").path(0).path("createdAt").asDouble());
+
+        time.advance(Duration.ofMillis(1));
+        TaskDefinition next = registerTaskDef(service, "dtime-fam-b", "app:2");
+        service.updateService("dtime-cluster", "dtime-svc", next.getTaskDefinitionArn(), null, null, REGION);
+
+        JsonNode after = describedService(handler, mapper, "dtime-cluster", "dtime-svc");
+        assertEquals(1, after.path("deployments").size());
+        assertNotEquals(before.path("deployments").path(0).path("id").asText(),
+                after.path("deployments").path(0).path("id").asText());
+        assertEquals(EpochSeconds.fromInstant(created.plusMillis(1)),
+                after.path("deployments").path(0).path("createdAt").asDouble(),
+                "a new deployment carries the instant it started");
+        assertEquals(EpochSeconds.fromInstant(created), after.path("createdAt").asDouble(),
+                "the service keeps the instant it was created");
     }
 
     /** A service already at its requested count has converged, so its deployment is finished. */
@@ -479,4 +528,18 @@ class EcsServiceDeploymentStatusTest {
         return service.registerTaskDefinition(family, List.of(cd), null, null, null,
                 null, null, List.of(), REGION);
     }
+
+    private static EcsService newMockModeService(Clock clock) {
+        return EcsServiceFixtures.builder().clock(clock).build();
+    }
+
+    /** The service as DescribeServices writes it on the wire. */
+    private static JsonNode describedService(EcsJsonHandler handler, ObjectMapper mapper, String cluster,
+                                             String name) {
+        ObjectNode request = mapper.createObjectNode().put("cluster", cluster);
+        request.putArray("services").add(name);
+        Response response = handler.handle("DescribeServices", request, REGION);
+        return mapper.valueToTree(response.getEntity()).path("services").path(0);
+    }
+
 }
