@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -85,6 +86,21 @@ public final class ContainerExec {
      */
     public static Result run(DockerClient dockerClient, String containerId, String[] cmd, List<String> env,
                              int timeoutSeconds, OutputStream stdout, OutputStream stderr) {
+        return run(dockerClient, containerId, cmd, env, Duration.ofSeconds(timeoutSeconds), stdout, stderr);
+    }
+
+    /** Runs a command with a subsecond budget, writing output to the supplied streams. */
+    public static Result run(DockerClient dockerClient, String containerId, String[] cmd, Duration timeout,
+                             OutputStream stdout, OutputStream stderr) {
+        return run(dockerClient, containerId, cmd, List.of(), timeout, stdout, stderr);
+    }
+
+    private static Result run(DockerClient dockerClient, String containerId, String[] cmd, List<String> env,
+                              Duration timeout, OutputStream stdout, OutputStream stderr) {
+        long timeoutNanos = timeout.toNanos();
+        if (timeoutNanos < 0) {
+            throw new IllegalArgumentException("Container exec timeout must not be negative");
+        }
         ExecCreateCmd create = dockerClient.execCreateCmd(containerId)
                 .withCmd(cmd)
                 .withAttachStdout(true)
@@ -116,8 +132,9 @@ public final class ContainerExec {
 
         try {
             // docker-java closes the attach stream on completion, timeout, or interruption.
-            if (!callback.awaitCompletion(timeoutSeconds, TimeUnit.SECONDS)) {
-                return new Result(-1, "", "Timed out after " + timeoutSeconds + "s", true);
+            if (!callback.awaitCompletion(timeoutNanos, TimeUnit.NANOSECONDS)) {
+                String budget = timeout.getNano() == 0 ? timeout.toSeconds() + "s" : timeout.toString();
+                return new Result(-1, "", "Timed out after " + budget, true);
             }
             Long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
             return new Result(exitCode != null ? exitCode : -1, "", "", false);

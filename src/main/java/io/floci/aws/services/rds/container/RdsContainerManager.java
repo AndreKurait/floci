@@ -945,7 +945,8 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         PostgresStartupSignal startup = new PostgresStartupSignal();
         // This path receives a newly created container, so replay cannot include a prior start.
         try (Closeable observation = logStreamer.observe(containerId, startup)) {
-            execUntilSuccess(containerName, containerId, cmd, "PostgreSQL IAM role", startup.signal);
+            PostgresIamReadiness.await(lifecycleManager.getDockerClient(), containerId, cmd, startup.signal);
+            LOG.infov("Initialized PostgreSQL IAM role in RDS container {0}", containerName);
         } catch (IOException e) {
             LOG.warnv(e, "Could not close PostgreSQL startup observation for {0}", containerName);
         }
