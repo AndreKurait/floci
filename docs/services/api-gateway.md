@@ -1216,7 +1216,7 @@ assumed for this mode, and an anonymous or invalid signature cannot supply a cal
 The API owner still determines the integration configuration; the caller can belong to a different
 account. Cached responses do not invoke Lambda again.
 
-The local `test` credential has no IAM policy context and is refused in enforced caller mode.
+The verified local `test` credential represents account root and still obeys resource-policy and SCP denials.
 IAM-disabled behavior and the historical bare `*` credential spelling retain their local bypass;
 bare `*` is not the documented AWS sentinel. This check is distinct from `execute-api:Invoke`
 route authorization. Issued session identities are read from IAM, not synthesized; full forwarded

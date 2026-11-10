@@ -222,6 +222,23 @@ class RestIntegrationCallerTest {
     }
 
     @Test
+    void localRootStillObeysCurrentResourceAndScpDenials() {
+        String root = "arn:aws:iam::" + OWNER + ":root";
+        when(signature.authorize(anyString(), any(), any(), any(), any())).thenReturn(
+                new ExecuteApiSigV4Authorizer.Result(null, null,
+                        new ExecuteApiSigV4Authorizer.CallerIdentity("test", OWNER, root, "root")));
+        assertEquals(200, invoke());
+        resourcePolicy(FUNCTION, "Deny", root);
+        assertEquals(500, invoke());
+        when(provider.getResourcePolicies("lambda", FUNCTION)).thenReturn(List.of());
+        when(scps.effectiveScpLevels(OWNER)).thenReturn(List.of(List.of(ALLOW.replace("Allow", "Deny"))));
+        assertEquals(500, invoke());
+        when(scps.effectiveScpLevels(OWNER)).thenReturn(null);
+        assertEquals(200, invoke());
+        verify(lambda, times(2)).invokeTarget(eq("us-east-1"), eq(FUNCTION), any(byte[].class), any());
+    }
+
+    @Test
     void disabledIamPreservesUnsignedCallerMode() {
         when(config.services().iam().enforcementEnabled()).thenReturn(false);
         when(signature.authorize(anyString(), any(), any(), any(), any())).thenReturn(
