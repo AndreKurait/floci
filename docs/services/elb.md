@@ -178,6 +178,8 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - `CreateLoadBalancer` takes `Subnets` or `SubnetMappings` for every load balancer type, and both together are refused with `ValidationError`. An Application Load Balancer takes at least two: with one or none it returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` and creates nothing. The count comes before any subnet is looked up, as on AWS, so one subnet that does not exist gets that error too. A Network or Gateway Load Balancer with neither returns `ValidationError` `At least one subnet must be specified`. CloudFormation refuses such an `AWS::ElasticLoadBalancingV2::LoadBalancer` the same way when it creates or replaces the balancer; an update that keeps the balancer and names no subnets leaves it on its subnets.
 - `SetSubnets`, like `CreateLoadBalancer`, takes `Subnets` or `SubnetMappings`, and both together are refused with `ValidationError`. With neither it returns the same `ValidationError` as `CreateLoadBalancer` for the balancer's type, `At least two subnets in two different Availability Zones must be specified` for an Application Load Balancer and `At least one subnet must be specified` for a Network or Gateway Load Balancer, and leaves the balancer on its subnets. A `SetSubnets` that names subnets is counted as `CreateLoadBalancer` counts them, following the two-zone rule its API reference states: one subnet for an Application Load Balancer, in `Subnets` or `SubnetMappings`, returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` before any subnet is looked up, and leaves the balancer on its subnets. AWS does not document the error for this case, so Floci gives `CreateLoadBalancer`'s error, in the same order. A CloudFormation update that keeps an Application Load Balancer and names one subnet fails with that error and rolls back. A Network Load Balancer can be set onto one subnet. The `SetSubnets` API reference requires a Gateway Load Balancer's `Subnets` to include every subnet it is already on; Floci does not enforce that.
 - Single-zone Application Load Balancers (opt-in, off by default): AWS refuses an Application Load Balancer in fewer than two Availability Zones, as above. For local setups that model single-zone deployments, `floci.services.elbv2.single-zone-alb-accounts` (`FLOCI_SERVICES_ELBV2_SINGLE_ZONE_ALB_ACCOUNTS`, comma-separated 12-digit account ids; spaces around an id are ignored) lowers that minimum to one zone for the accounts it lists: for a listed account, `CreateLoadBalancer` and `SetSubnets` (including CloudFormation's) take an Application Load Balancer on one subnet, for either scheme. Neither `Subnets` nor `SubnetMappings` is still refused with the same message. Unlisted accounts, and every account while the setting is unset, keep the two-zone rule; Network and Gateway Load Balancers are unchanged. A value that is not a 12-digit account id is rejected during startup.
+- The two-zone rule above is the default regional zone policy, described under [Application Load Balancer zone policy](#application-load-balancer-zone-policy). Where that policy accepts one Availability Zone (Osaka, `ap-northeast-3`, by default, or a region set to `allow-single-zone`), `CreateLoadBalancer` and `SetSubnets` take an Application Load Balancer on one subnet for every account, and a request that names no subnets returns `ValidationError` `At least one subnet must be specified`.
+- Each subnet given to `CreateLoadBalancer` or `SetSubnets` must be in a different Availability Zone. Two subnets in the same zone return `InvalidConfigurationRequest` `A load balancer cannot be attached to multiple subnets in the same Availability Zone`, even where one zone is enough.
 - `DescribeProvisionedCapacity` is a Floci Query extension, using version `2015-12-01`
   and one `LoadBalancerArn`. Its `ProvisionedCapacity` has `MinimumLBCapacityUnits=0`,
   `Status=disabled` and `DecreasesRemaining=4`; `LastModifiedTime` is absent.
@@ -438,3 +440,36 @@ outstanding probe per target. Repeated target registration preserves probe caden
 Changing the health interval reschedules monitoring, and late results from old
 registrations or settings cannot change current health. Configured healthy and
 unhealthy thresholds still apply to real HTTP results.
+
+## Application Load Balancer zone policy
+
+One Floci instance serves multiple regions. The ALB policy uses each request's
+region, including CloudFormation provisioning, rather than the server's default region.
+By default, ordinary ALB subnets require two distinct Availability Zones, except
+in Osaka (`ap-northeast-3`), where one is accepted. Empty subnet lists remain invalid.
+Each selected subnet must belong to a different AZ, even when a single AZ is allowed.
+This applies to CreateLoadBalancer and SetSubnets; NLB and GWLB rules are unchanged.
+Local Zone and Outpost-specific placement is not implemented by this setting.
+
+To override this rule globally, set
+`FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE=allow-single-zone` or `require-two-zones`.
+The default is `aws`. Individual regions can override the global setting in YAML:
+
+```yaml
+floci:
+  services:
+    elbv2:
+      alb-zone-rule: allow-single-zone
+      alb-zone-rule-by-region:
+        us-east-1: require-two-zones
+        ap-northeast-3: aws
+```
+
+Precedence is per-region setting, global setting, then AWS behavior.
+A per-region `aws` entry restores AWS behavior even when the global rule is overridden.
+These explicit overrides intentionally change local compatibility; they do not
+change the AWS API shape or require a separate Floci process for each region.
+
+`floci.services.elbv2.single-zone-alb-accounts` is independent of this policy: an
+account it lists may use one zone in every region, including a region set to
+`require-two-zones`.

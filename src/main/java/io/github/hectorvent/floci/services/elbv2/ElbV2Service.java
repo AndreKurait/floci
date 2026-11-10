@@ -135,13 +135,41 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     }
 
     /**
-     * The fewest Availability Zones an Application Load Balancer of the calling account takes. AWS
-     * requires two; Floci lowers that to one for the accounts
+     * The fewest Availability Zones an Application Load Balancer of the calling account takes in
+     * {@code region}. The regional zone policy ({@link #requiresTwoAlbZones}) decides between one and
+     * two; Floci also lowers that to one for the accounts
      * {@code floci.services.elbv2.single-zone-alb-accounts} lists. Nothing is listed by default.
      */
-    private int minimumAlbZones() {
-        return !singleZoneAlbAccounts.isEmpty() && singleZoneAlbAccounts.contains(regionResolver.getAccountId())
-                ? 1 : 2;
+    private int minimumAlbZones(String region) {
+        if (!singleZoneAlbAccounts.isEmpty() && singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
+            return 1;
+        }
+        return requiresTwoAlbZones(region) ? 2 : 1;
+    }
+
+    /**
+     * The regional ALB zone policy: {@code floci.services.elbv2.alb-zone-rule-by-region} for the
+     * region, then {@code floci.services.elbv2.alb-zone-rule}, then AWS behavior, where one ordinary
+     * Availability Zone is accepted in Osaka and two are required elsewhere.
+     */
+    private boolean requiresTwoAlbZones(String region) {
+        EmulatorConfig.AlbZoneRule rule = EmulatorConfig.AlbZoneRule.AWS;
+        if (config != null) {
+            EmulatorConfig.ElbV2ServiceConfig settings = config.services().elbv2();
+            if (settings.albZoneRule() != null) {
+                rule = settings.albZoneRule();
+            }
+            Map<String, EmulatorConfig.AlbZoneRule> regions = settings.albZoneRuleByRegion();
+            EmulatorConfig.AlbZoneRule regional = regions == null ? null : regions.get(region);
+            if (regional != null) {
+                rule = regional;
+            }
+        }
+        return switch (rule) {
+            case AWS -> !"ap-northeast-3".equals(region); // partition-literal: verified Osaka ALB policy exception
+            case ALLOW_SINGLE_ZONE -> false;
+            case REQUIRE_TWO_ZONES -> true;
+        };
     }
 
     @PostConstruct
@@ -398,7 +426,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         String id = randomHex16();
         String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
         String dnsName = name + "-" + id + ".elb." + loadBalancerDnsSuffix();
-        requireSubnets(lbType, subnets);
+        requireSubnets(region, lbType, subnets);
         String vpcId = resolveSubnetVpcId(region, lbType, subnets);
 
         LoadBalancer lb = new LoadBalancer();
@@ -439,11 +467,13 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * balancer's type; whether the subnets span two Availability Zones is checked after they are looked
      * up. No public report shows what AWS answers a SetSubnets with one subnet, so it gets the create
      * message and order. For an account granted single-zone ALBs ({@link #minimumAlbZones}) one subnet
-     * is enough, and none still gets the Application Load Balancer message.
+     * is enough, and none still gets the Application Load Balancer message. Where the regional zone
+     * policy ({@link #requiresTwoAlbZones}) accepts one zone, one subnet is enough for every account
+     * and none gets the Network Load Balancer message.
      */
-    private void requireSubnets(String lbType, List<String> subnets) {
+    private void requireSubnets(String region, String lbType, List<String> subnets) {
         int count = subnets == null ? 0 : subnets.size();
-        if ("application".equals(lbType) && count < minimumAlbZones()) {
+        if ("application".equals(lbType) && requiresTwoAlbZones(region) && count < minimumAlbZones(region)) {
             throw new AwsException("ValidationError",
                     "At least two subnets in two different Availability Zones must be specified", 400);
         }
@@ -707,7 +737,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     void setSubnetsFromRequest(String region, String arn, List<String> subnets) {
         LoadBalancer lb = requireLoadBalancer(region, arn);
         if (subnets.isEmpty()) {
-            requireSubnets(lb.getType(), subnets);
+            requireSubnets(region, lb.getType(), subnets);
         }
         setSubnets(region, arn, subnets);
     }
@@ -756,7 +786,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             LoadBalancer lb = requireLoadBalancer(region, arn);
             // Counted as on create, before any subnet is looked up; an empty list is taken, as above.
             if (subnets != null && !subnets.isEmpty()) {
-                requireSubnets(lb.getType(), subnets);
+                requireSubnets(region, lb.getType(), subnets);
             }
             String vpcId = resolveSubnetVpcId(region, lb.getType(), subnets);
             if (vpcId != null && lb.getVpcId() != null && !lb.getVpcId().equals(vpcId)) {
@@ -1893,9 +1923,13 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     .map(Subnet::getAvailabilityZone)
                     .distinct()
                     .count();
-            if (distinctAvailabilityZones < minimumAlbZones()) {
+            if (distinctAvailabilityZones < minimumAlbZones(region)) {
                 throw new AwsException("InvalidConfigurationRequest",
                         "Application Load Balancers must be attached to subnets in at least two Availability Zones.", 400);
+            }
+            if (distinctAvailabilityZones < subnetIds.size()) {
+                throw new AwsException("InvalidConfigurationRequest",
+                        "A load balancer cannot be attached to multiple subnets in the same Availability Zone", 400);
             }
         }
 
