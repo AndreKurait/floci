@@ -8,10 +8,10 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Arrays;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
@@ -608,16 +608,10 @@ class IotTopicRuleIntegrationTest {
             .statusCode(200);
     }
 
-    private void awaitPublishedEvent(String topic, byte[] payload) throws InterruptedException {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(2));
-        while (Instant.now().isBefore(deadline)) {
-            boolean found = eventRecorder.recentEvents().stream()
-                    .anyMatch(event -> topic.equals(event.topic()) && Arrays.equals(payload, event.payload()));
-            if (found) {
-                return;
-            }
-            Thread.sleep(25);
-        }
-        throw new AssertionError("IoT publish event was not recorded for topic " + topic);
+    private void awaitPublishedEvent(String topic, byte[] payload) {
+        await("the recorded IoT publish event for topic " + topic).atMost(Duration.ofSeconds(2))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                .until(() -> eventRecorder.recentEvents().stream()
+                        .anyMatch(event -> topic.equals(event.topic()) && Arrays.equals(payload, event.payload())));
     }
 }

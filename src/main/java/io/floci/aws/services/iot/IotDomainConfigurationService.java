@@ -19,6 +19,7 @@ import io.floci.aws.services.iot.model.IotDomainConfiguration.TlsConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -57,6 +58,7 @@ public class IotDomainConfigurationService {
     private final RegionResolver regionResolver;
     private final EmulatorConfig config;
     private final TlsCertificateManager certificateManager;
+    private final Clock clock;
     /**
      * Guards every read-modify-write on the store: the duplicate check and store of a create, the
      * seeding of the AWS-managed configurations, and the update, delete and tag paths, which all
@@ -73,10 +75,16 @@ public class IotDomainConfigurationService {
 
     IotDomainConfigurationService(StorageBackend<String, IotDomainConfiguration> store, RegionResolver regionResolver,
                                   EmulatorConfig config, TlsCertificateManager certificateManager) {
+        this(store, regionResolver, config, certificateManager, Clock.systemUTC());
+    }
+
+    IotDomainConfigurationService(StorageBackend<String, IotDomainConfiguration> store, RegionResolver regionResolver,
+                                  EmulatorConfig config, TlsCertificateManager certificateManager, Clock clock) {
         this.store = store;
         this.regionResolver = regionResolver;
         this.config = config;
         this.certificateManager = certificateManager;
+        this.clock = clock;
     }
 
     public IotDomainConfiguration createDomainConfiguration(String name, JsonNode request, String region) {
@@ -113,7 +121,7 @@ public class IotDomainConfigurationService {
         configuration.setApplicationProtocol(enumValue(body, "applicationProtocol", APPLICATION_PROTOCOLS, null));
         configuration.setClientCertificateConfig(parseClientCertificateConfig(body.path("clientCertificateConfig")));
         configuration.setTags(parseTags(body.path("tags")));
-        configuration.setLastStatusChangeDate(Instant.now());
+        configuration.setLastStatusChangeDate(clock.instant());
         synchronized (lock) {
             if (store.get(key).isPresent()) {
                 throw new AwsException("ResourceAlreadyExistsException",
@@ -157,7 +165,7 @@ public class IotDomainConfigurationService {
             }
             if (status != null && !status.equals(configuration.getDomainConfigurationStatus())) {
                 configuration.setDomainConfigurationStatus(status);
-                configuration.setLastStatusChangeDate(Instant.now());
+                configuration.setLastStatusChangeDate(clock.instant());
             }
             if (tlsConfig != null) {
                 configuration.setTlsConfig(tlsConfig);
@@ -307,7 +315,7 @@ public class IotDomainConfigurationService {
         configuration.setDomainType("AWS_MANAGED");
         configuration.setTlsConfig(new TlsConfig(DEFAULT_SECURITY_POLICY));
         configuration.setServerCertificateConfig(new ServerCertificateConfig(false, null, null));
-        configuration.setLastStatusChangeDate(Instant.now());
+        configuration.setLastStatusChangeDate(clock.instant());
         return configuration;
     }
 
