@@ -7,13 +7,14 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
-import java.util.HashSet;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
-import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.hasItem;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
@@ -21,6 +22,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
  * Guards that {@code StopExecution} stops the execution instead of relabelling it: the status,
  * error and cause it writes are what {@code DescribeExecution} returns, and the worker thread that
  * is still inside the {@code Wait} does not overwrite them when it gets there.
+ *
+ * <p>These are the stops over HTTP against the shipped executor, each landing on a worker that is
+ * inside its {@code Wait}. What that worker does when the Wait is over is asserted, without waiting
+ * it out, by {@link StepFunctionsStopExecutionTest}.
  */
 @QuarkusTest
 class StepFunctionsStopExecutionIntegrationTest {
@@ -28,7 +33,7 @@ class StepFunctionsStopExecutionIntegrationTest {
     private static final String SFN_CONTENT_TYPE = "application/x-amz-json-1.0";
     private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/test-role";
 
-    /** Long enough that the stop lands mid-flight, short enough that the re-read is cheap. */
+    /** Long enough that the stop lands mid-flight. */
     private static final int WAIT_SECONDS = 3;
 
     private static final String WAITING_MACHINE = """
@@ -53,7 +58,6 @@ class StepFunctionsStopExecutionIntegrationTest {
     @Test
     void executionWithNoHistoryInMemoryIsStillStoppable() throws Exception {
         String executionArn = startWaitingExecution("stop-without-history");
-        Thread.sleep(300);
 
         stepFunctionsService.clear();
 
@@ -68,7 +72,6 @@ class StepFunctionsStopExecutionIntegrationTest {
     @Test
     void stoppedExecutionReportsTheCallersErrorAndCause() throws Exception {
         String executionArn = startWaitingExecution("stop-reports-error");
-        Thread.sleep(300);
 
         stopExecution(executionArn, "Manual", "probe");
 
@@ -79,37 +82,6 @@ class StepFunctionsStopExecutionIntegrationTest {
     }
 
     /**
-     * The worker is still inside the Wait when the stop lands. Once it comes out, it neither
-     * rewrites the outcome nor records the state it left: the history still ends at
-     * ExecutionAborted, with no event id repeated.
-     */
-    @Test
-    void stoppedExecutionStaysAbortedAfterTheWaitElapses() throws Exception {
-        String executionArn = startWaitingExecution("stop-survives-wait");
-        Thread.sleep(300);
-
-        stopExecution(executionArn, "Manual", "probe");
-        double stopDate = describeExecution(executionArn).jsonPath().getDouble("stopDate");
-
-        Thread.sleep((WAIT_SECONDS + 2) * 1000L);
-
-        Response described = describeExecution(executionArn);
-        List<Map<String, Object>> events = getExecutionHistory(executionArn).jsonPath().getList("events");
-        List<String> types = events.stream().map(event -> (String) event.get("type")).toList();
-        List<Object> ids = events.stream().map(event -> event.get("id")).toList();
-
-        assertAll(
-                () -> assertEquals("ABORTED", described.jsonPath().getString("status")),
-                () -> assertEquals("Manual", described.jsonPath().getString("error")),
-                () -> assertEquals("probe", described.jsonPath().getString("cause")),
-                () -> assertEquals(stopDate, described.jsonPath().getDouble("stopDate")),
-                () -> assertEquals("ExecutionAborted", types.get(types.size() - 1),
-                        "history continued past the terminal event: " + types),
-                () -> assertEquals(ids.size(), new HashSet<>(ids).size(),
-                        "history repeats an event id: " + ids + " for " + types));
-    }
-
-    /**
      * Measured against us-east-1: an abort with no error and no cause leaves both keys out of
      * {@code DescribeExecution} and carries an empty {@code executionAbortedEventDetails}. This is
      * the terminal write the startup sweep of abandoned executions makes as well.
@@ -117,7 +89,6 @@ class StepFunctionsStopExecutionIntegrationTest {
     @Test
     void abortWithNoReasonOmitsErrorAndCause() throws Exception {
         String executionArn = startWaitingExecution("stop-without-reason");
-        Thread.sleep(300);
 
         given()
                 .header("X-Amz-Target", "AWSStepFunctions.StopExecution")
@@ -155,7 +126,14 @@ class StepFunctionsStopExecutionIntegrationTest {
                 .when()
                 .post("/");
         response.then().statusCode(200);
-        return response.jsonPath().getString("executionArn");
+        String executionArn = response.jsonPath().getString("executionArn");
+        // The stop is to land mid-flight: on a worker that has entered the Wait.
+        await("the worker of " + executionArn + " to enter its Wait")
+                .atMost(Duration.ofSeconds(WAIT_SECONDS))
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> getExecutionHistory(executionArn).jsonPath().getList("events.type"),
+                        hasItem("WaitStateEntered"));
+        return executionArn;
     }
 
     private String createStateMachine(String name, String definition) {
