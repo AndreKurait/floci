@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.core.common.concurrent.DeadlineWaits;
 import jakarta.enterprise.inject.Instance;
 import org.jboss.logging.Logger;
 
@@ -7,11 +8,13 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
 /**
@@ -42,15 +45,29 @@ public final class ContainerTeardowns {
     }
 
     public static <T> void stopInParallel(List<T> resources, Consumer<T> stop, Logger log) {
-        stopInParallel(resources, stop, log, System.nanoTime() + TimeUnit.SECONDS.toNanos(15));
+        stopInParallel(resources, stop, log, DeadlineWaits.SYSTEM);
+    }
+
+    /** As {@link #stopInParallel(List, Consumer, Logger)}, with its fifteen seconds counted by {@code waits}. */
+    public static <T> void stopInParallel(List<T> resources, Consumer<T> stop, Logger log, DeadlineWaits waits) {
+        stopInParallel(resources, stop, log, waits.nanoTime() + TimeUnit.SECONDS.toNanos(15), waits);
     }
 
     public static <T> void stopInParallel(List<T> resources, Consumer<T> stop, Logger log,
                                          long deadlineNanos) {
+        stopInParallel(resources, stop, log, deadlineNanos, DeadlineWaits.SYSTEM);
+    }
+
+    /**
+     * @param deadlineNanos the shared deadline, as a reading of {@code waits.nanoTime()}
+     * @param waits the time source the deadline is measured on and the bounded wait for the stops
+     */
+    public static <T> void stopInParallel(List<T> resources, Consumer<T> stop, Logger log,
+                                         long deadlineNanos, DeadlineWaits waits) {
         if (resources.isEmpty()) {
             return;
         }
-        long remaining = Math.max(0, deadlineNanos - System.nanoTime());
+        long remaining = Math.max(0, deadlineNanos - waits.nanoTime());
         if (remaining == 0) {
             log.warnv("Container drain deadline expired with {0} resource(s) pending", resources.size());
             return;
@@ -60,15 +77,23 @@ public final class ContainerTeardowns {
         ExecutorService executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("container-teardown-", 0).factory());
         try {
-            List<Callable<Void>> tasks = new ArrayList<>(resources.size());
-            for (T resource : resources) {
-                tasks.add(() -> {
-                    stop.accept(resource);
-                    return null;
-                });
+            List<Future<Void>> drains = new ArrayList<>(resources.size());
+            try {
+                for (T resource : resources) {
+                    Callable<Void> drain = () -> {
+                        stop.accept(resource);
+                        return null;
+                    };
+                    drains.add(executor.submit(drain));
+                }
+                awaitUntil(drains, deadlineNanos, waits);
+            } finally {
+                // A stop still running at the deadline is interrupted; a finished one is unaffected.
+                for (Future<Void> drain : drains) {
+                    drain.cancel(true);
+                }
             }
-            for (Future<Void> task : executor.invokeAll(tasks,
-                    Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+            for (Future<Void> task : drains) {
                 if (task.isCancelled()) {
                     log.warn("Container drain did not finish before the shared deadline");
                 } else {
@@ -84,6 +109,23 @@ public final class ContainerTeardowns {
             log.warn("Container drain interrupted");
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    /** Returns once every drain is done or the deadline has passed, whichever is first. */
+    private static void awaitUntil(List<Future<Void>> drains, long deadlineNanos, DeadlineWaits waits)
+            throws InterruptedException {
+        for (Future<Void> drain : drains) {
+            if (drain.isDone()) {
+                continue;
+            }
+            try {
+                waits.get(drain, Math.max(0, deadlineNanos - waits.nanoTime()));
+            } catch (ExecutionException | CancellationException finished) {
+                // Reported with the other outcomes once the wait is over.
+            } catch (TimeoutException expired) {
+                return;
+            }
         }
     }
 }

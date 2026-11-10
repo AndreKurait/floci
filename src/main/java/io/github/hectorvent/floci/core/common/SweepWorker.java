@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -21,6 +22,7 @@ public final class SweepWorker {
     private final long intervalSeconds;
     private final boolean sweepAtStart;
     private final ScheduledExecutorService executor;
+    private final Clock clock;
     private final ReentrantLock sweepLock = new ReentrantLock();
     private volatile boolean paused;
 
@@ -33,16 +35,31 @@ public final class SweepWorker {
      */
     public SweepWorker(String name, boolean enabled, long intervalSeconds, boolean sweepAtStart,
                        Consumer<Instant> sweep) {
+        this(name, intervalSeconds, sweepAtStart, sweep,
+                enabled
+                        ? Executors.newSingleThreadScheduledExecutor(task -> {
+                            Thread thread = new Thread(task, name);
+                            thread.setDaemon(true);
+                            return thread;
+                        }) : null,
+                Clock.systemUTC());
+    }
+
+    /**
+     * A worker whose timer and clock the caller supplies, so a test can move time itself.
+     *
+     * @param executor runs the sweeps and is shut down by {@link #stop}; {@code null} means no
+     *                 background thread, as for a disabled worker
+     * @param clock read once per scheduled sweep for the instant handed to it
+     */
+    public SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
+                       ScheduledExecutorService executor, Clock clock) {
         this.name = name;
         this.sweep = sweep;
         this.intervalSeconds = Math.max(1, intervalSeconds);
         this.sweepAtStart = sweepAtStart;
-        this.executor = enabled
-                ? Executors.newSingleThreadScheduledExecutor(task -> {
-                    Thread thread = new Thread(task, name);
-                    thread.setDaemon(true);
-                    return thread;
-                }) : null;
+        this.executor = executor;
+        this.clock = clock;
     }
 
     public void start() {
@@ -101,7 +118,7 @@ public final class SweepWorker {
 
     private void tickSafely() {
         try {
-            tick(Instant.now());
+            tick(clock.instant());
         } catch (RuntimeException e) {
             LOG.warnv(e, "The {0} sweep failed", name);
         }
