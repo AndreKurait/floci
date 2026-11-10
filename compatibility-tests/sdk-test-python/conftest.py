@@ -4,7 +4,6 @@ import datetime
 import io
 import logging
 import os
-import time
 import uuid
 import zipfile
 from contextlib import ExitStack, closing

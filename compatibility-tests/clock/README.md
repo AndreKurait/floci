@@ -1,6 +1,6 @@
 # AppConfig compatibility clock
 
-Install the isolated fixture, then build the compatibility image:
+Install the isolated fixture, then package Floci with the `compat-clock` profile:
 
 ```sh
 ./mvnw -f compatibility-tests/clock/pom.xml clean install
@@ -10,13 +10,15 @@ Install the isolated fixture, then build the compatibility image:
 Add `-Dnative` for the native compatibility executable. Ordinary builds omit
 `compat-clock` and therefore have no dependency on the fixture jar. Its classes
 are compiled in the fixture's own `target` directory, never the application's
-`target/classes`, including when switching profiles without cleaning. Keep the
-fixture's Quarkus version aligned with the root POM.
+`target/classes`, including when switching profiles without cleaning.
+`CompatClockBuildTest` in the root test suite fails if the fixture's Quarkus
+version differs from the root POM, or if the fixture becomes a dependency
+outside the profile.
 
 The profile replaces the qualified clock used throughout `AppConfigService`.
-Everything
-else, including authentication and certificate clocks, retains real time. Without
-`FLOCI_TEST_APPCONFIG_CLOCK_FILE`, the compatibility build also uses real time.
+Everything else, including authentication and certificate clocks, retains real
+time. Without `FLOCI_TEST_APPCONFIG_CLOCK_FILE`, the compatibility build also
+uses real time.
 An invalid configured timestamp fails when the clock is first used; it does not
 fall back to real time. No HTTP control endpoint or AWS protocol change is involved.
 
@@ -45,7 +47,8 @@ The tests use real AWS SDK requests. They check the state just before the baking
 boundary, advance beyond it, and verify the exact scheduled completion timestamp.
 They exercise both retrieval APIs after rollback and reversion, including a
 deleted previous version in both baking and completed states. Without either
-environment variable, the suite retains its real-time path.
+environment variable, the suite retains its real-time path: one completed case
+waits out a real one-minute bake and the other three are skipped.
 
 Run clock and lifecycle unit tests with:
 

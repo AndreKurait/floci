@@ -378,8 +378,6 @@ jobs:
       - name: Start floci
         run: |
           DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
-          # sdk-test-java's HTTP Task regression calls a MOCK API on http://floci:4566; every
-          # other leg keeps the default rejection of plaintext http:invoke endpoints.
           CLOCK_ARGS=()
           if [ "${{ matrix.test }}" = "sdk-test-python" ]; then
             APPCONFIG_CLOCK_DIR=$(mktemp -d "$RUNNER_TEMP/floci-appconfig-clock.XXXXXX")
@@ -389,6 +387,8 @@ jobs:
             CLOCK_ARGS=(-v "$APPCONFIG_CLOCK_DIR:/test-clock:ro"
               -e FLOCI_TEST_APPCONFIG_CLOCK_FILE=/test-clock/instant)
           fi
+          # sdk-test-java's HTTP Task regression calls a MOCK API on http://floci:4566; every
+          # other leg keeps the default rejection of plaintext http:invoke endpoints.
           docker run -d --name floci --network compat-net \
             -p 127.0.0.1:4566:4566 \
             -v /var/run/docker.sock:/var/run/docker.sock \
@@ -651,7 +651,7 @@ jobs:
           docker start floci
           bash wait-floci.sh
           # EC2 reconciles its networks when it first starts, which is on its first request.
-          curl -s -o /dev/null -X POST http://localhost:4566/ \
+          curl -s -o /dev/null -X POST http://127.0.0.1:4566/ \
             -H 'Authorization: AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/ec2/aws4_request, SignedHeaders=host, Signature=0' \
             -d 'Action=DescribeVpcs&Version=2016-11-15'
           docker logs floci 2>&1 | grep 'Reconciled orphaned VPC network'

@@ -13,6 +13,9 @@ from botocore.exceptions import ClientError
 @pytest.mark.parametrize("delete_previous", [False, True], ids=["restore", "deleted"])
 def test_deployment_rollback_restores_both_retrieval_apis(
         aws_config, client_config, unique_name, delete_previous, zero_padded, wait_for_completion, appconfig_clock):
+    if wait_for_completion and appconfig_clock.file is None and (zero_padded or delete_previous):
+        # Version padding and the deleted version do not change timing.
+        pytest.skip("Without the manual clock only the decimal restore case waits out a real one-minute bake")
     with ExitStack() as cleanup:
         client = boto3.client("appconfig", config=client_config, **aws_config)
         data = boto3.client("appconfigdata", config=client_config, **aws_config)
