@@ -99,6 +99,12 @@ public class CloudFormationYamlParser {
         }
 
         private Object fnGetAtt(Node n) {
+            if (n instanceof SequenceNode sequence) {
+                // !GetAtt [Resource, Attribute]
+                Map<String, Object> map = new LinkedHashMap<>();
+                map.put("Fn::GetAtt", constructSequence(sequence));
+                return map;
+            }
             String raw = scalar(n);
             // !GetAtt Resource.Attribute
             int dot = raw.indexOf('.');
