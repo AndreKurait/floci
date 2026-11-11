@@ -5710,7 +5710,7 @@ public class CloudFormationService implements ResourceProvider {
             resources.add(new ExplorerResource(
                     arn, "cloudformation:stack", "cloudformation",
                     parsed.region(), parsed.accountId(),
-                    stack.getCreationTime() != null ? stack.getCreationTime() : Instant.now(),
+                    stack.getCreationTime() != null ? stack.getCreationTime() : now(),
                     stack.tagsSnapshot()));
         }
         return resources;
