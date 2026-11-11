@@ -2032,7 +2032,17 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             greenTuple.setWeight(greenWeightPct);
             action.setTargetGroups(List.of(blueTuple, greenTuple));
         }
-        defaultRule.setActions(List.of(action));
+        defaultRule.setActions(new ArrayList<>(List.of(action)));
+        Listener listener = listeners.getOrDefault(region, Map.of()).get(listenerArn);
+        if (listener != null) {
+            // The listener answers with the same default action as its default rule, and the
+            // target groups it now forwards to are in use; the ones it left are not.
+            listener.setDefaultActions(new ArrayList<>(List.of(action)));
+            linkTgToLb(action, listener.getLoadBalancerArn());
+            unlinkUnreferencedTargetGroups(region, listener.getLoadBalancerArn());
+            persistRegion(listeners, region);
+        }
+        persistRegion(rules, region);
         dataPlane.recompileRules(listenerArn, () -> getListenerRules(region, listenerArn));
     }
 
