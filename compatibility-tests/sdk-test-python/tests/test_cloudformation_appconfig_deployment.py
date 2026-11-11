@@ -131,29 +131,40 @@ def _delete_stack(cfn, scope, name):
 
 @pytest.mark.timeout(240)
 def test_cfn_deployment_waits_for_actual_rollout_and_final_bake(
-        cloudformation_client, deployment_scope, unique_name, record_property):
+        cloudformation_client, deployment_scope, unique_name, record_property, appconfig_clock):
     cfn, scope = cloudformation_client, deployment_scope
     name = "deployment-" + unique_name
     with ExitStack() as cleanup:
-        began = time.monotonic()
+        began = appconfig_clock.monotonic()
         cfn.create_stack(StackName=name, TemplateBody=json.dumps(_template(scope, "updated", "gradual")))
         cleanup.callback(_delete_stack, cfn, scope, name)
         started = _until(lambda: _starting_deployment(cfn, scope, name),
                          lambda value: value["ConfigurationVersion"] == "2")
+        appconfig_clock.assert_started(started)
         assert started["State"] == "DEPLOYING"
         assert started["DeploymentDurationInMinutes"] == started["FinalBakeTimeInMinutes"] == 1
         assert _stack(cfn, name)["StackStatus"] == "CREATE_IN_PROGRESS"
 
+        if appconfig_clock.file is not None:
+            appconfig_clock.advance(59)
+            assert _latest(scope)["State"] == "DEPLOYING"
+            assert _stack(cfn, name)["StackStatus"] == "CREATE_IN_PROGRESS"
+            appconfig_clock.advance(1)
         baking = _until(lambda: _starting_deployment(cfn, scope, name),
                         lambda value: value["State"] == "BAKING", timeout=90)
-        record_property("rollout_seconds_observed", time.monotonic() - began)
+        record_property("rollout_seconds_observed", appconfig_clock.monotonic() - began)
         assert baking["PercentageComplete"] == 100
         assert _stack(cfn, name)["StackStatus"] == "CREATE_IN_PROGRESS"
         assert cfn.describe_stack_resource(StackName=name, LogicalResourceId="Deployment")[
             "StackResourceDetail"]["ResourceStatus"] == "CREATE_IN_PROGRESS"
 
+        if appconfig_clock.file is not None:
+            appconfig_clock.advance(59)
+            assert _latest(scope)["State"] == "BAKING"
+            assert _stack(cfn, name)["StackStatus"] == "CREATE_IN_PROGRESS"
+            appconfig_clock.advance(1)
         cfn.get_waiter("stack_create_complete").wait(StackName=name, WaiterConfig=WAITER)
-        elapsed = time.monotonic() - began
+        elapsed = appconfig_clock.monotonic() - began
         completed = _latest(scope)
         record_property("rollout_and_bake_seconds_observed", elapsed)
         assert elapsed >= 119

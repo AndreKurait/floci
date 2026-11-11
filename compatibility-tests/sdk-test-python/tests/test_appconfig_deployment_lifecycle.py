@@ -2,7 +2,6 @@
 
 from contextlib import ExitStack
 from datetime import datetime, timedelta
-import time
 
 import boto3
 import pytest
@@ -11,7 +10,7 @@ from botocore.exceptions import ClientError
 
 @pytest.mark.timeout(180)
 def test_gradual_rollout_precedes_bake_and_can_be_stopped(
-        aws_config, client_config, unique_name):
+        aws_config, client_config, unique_name, appconfig_clock):
     with ExitStack() as cleanup:
         client = boto3.client("appconfig", config=client_config, **aws_config)
         cleanup.callback(client.close)
@@ -47,28 +46,29 @@ def test_gradual_rollout_precedes_bake_and_can_be_stopped(
         cancelled_target = {**scope, "DeploymentNumber": cancelled["DeploymentNumber"]}
         assert client.stop_deployment(**cancelled_target)["State"] == "ROLLED_BACK"
 
-        began = time.monotonic()
+        began = appconfig_clock.monotonic()
         started = client.start_deployment(**arguments)
+        appconfig_clock.assert_started(started)
         target = {**scope, "DeploymentNumber": started["DeploymentNumber"]}
         assert started["State"] == "DEPLOYING"
         assert "CompletedAt" not in started
         states = []
         percentages = set()
-        while time.monotonic() - began < 135:
+        while appconfig_clock.monotonic() - began < 135:
             observed = client.get_deployment(**target)
             state = observed["State"]
             if not states or states[-1] != state:
                 states.append(state)
                 if state == "BAKING":
-                    assert time.monotonic() - began >= 59
+                    assert appconfig_clock.monotonic() - began >= 59
                     assert "CompletedAt" not in observed
                     assert observed["PercentageComplete"] == 100
                 if state == "COMPLETE":
-                    assert time.monotonic() - began >= 119
+                    assert appconfig_clock.monotonic() - began >= 119
                     break
             percentages.add(observed["PercentageComplete"])
             assert state in {"DEPLOYING", "BAKING"}
-            time.sleep(1)
+            appconfig_clock.advance(1)
         else:
             pytest.fail(f"The one-minute rollout and one-minute bake did not complete: {states}")
 
@@ -86,7 +86,7 @@ def test_gradual_rollout_precedes_bake_and_can_be_stopped(
 @pytest.mark.parametrize("zero_padded", [False, True], ids=["decimal", "zero-padded"])
 @pytest.mark.parametrize("delete_previous", [False, True], ids=["restore", "deleted"])
 def test_deployment_rollback_restores_both_retrieval_apis(
-        aws_config, client_config, unique_name, delete_previous, zero_padded, wait_for_completion):
+        aws_config, client_config, unique_name, delete_previous, zero_padded, wait_for_completion, appconfig_clock):
     with ExitStack() as cleanup:
         client = boto3.client("appconfig", config=client_config, **aws_config)
         data = boto3.client("appconfigdata", config=client_config, **aws_config)
@@ -149,6 +149,7 @@ def test_deployment_rollback_restores_both_retrieval_apis(
         assert first["CompletedAt"] == first["StartedAt"]
         assert_content(previous_version, b'{"version":1}')
         second = deploy(versions[1], strategies[1])
+        appconfig_clock.assert_started(second)
         target = {**scope, "DeploymentNumber": second["DeploymentNumber"]}
         assert second["State"] == "BAKING"
         assert second["PercentageComplete"] == 100
@@ -177,13 +178,13 @@ def test_deployment_rollback_restores_both_retrieval_apis(
             return
 
         if wait_for_completion:
-            deadline = time.monotonic() + 75
-            while time.monotonic() < deadline:
+            deadline = appconfig_clock.monotonic() + 75
+            while appconfig_clock.monotonic() < deadline:
                 observed = client.get_deployment(**target)
                 if observed["State"] == "COMPLETE":
                     break
                 assert observed["State"] == "BAKING"
-                time.sleep(1)
+                appconfig_clock.advance(1)
             else:
                 pytest.fail("The one-minute final bake did not complete")
             assert observed["CompletedAt"] - observed["StartedAt"] == timedelta(minutes=1)
