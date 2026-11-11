@@ -51,6 +51,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /** Owns the protected namespace and the Floci-only nftables table for each managed ENI. */
@@ -73,6 +74,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private final Map<String, Applied> applied = new HashMap<>();
     /** Registrations that entered {@link #register} and have not installed their own policy yet. */
     private final AtomicInteger arriving = new AtomicInteger();
+    /** Retirements queued for ownership capture or namespace quarantine. */
+    private final AtomicInteger retiring = new AtomicInteger();
+    private RetirementRefresh retirementRefresh;
     private boolean peerRefreshScheduled;
     private long peerRefreshFailures;
     private RuntimeException lastPeerRefreshFailure;
@@ -188,11 +192,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 quarantine(origin.helperId());
             }
         }
-        if (peerPoliciesNeedRefresh) {
-            // A failed installation quarantines peers. Retry even when the last DNS origin is gone.
-            reconcileAll();
-            peerPoliciesNeedRefresh = false;
-        }
+        // A failed installation quarantines peers. Retry even when the last DNS origin is gone.
+        reconcileRetirements();
     }
 
     /** The observer retries removals an owning service requested but Docker has not completed. */
@@ -640,20 +641,101 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     public void unregister(String eniId) {
-        captureUnregister(eniId).run();
+        retire(retirement -> captureRetirement(eniId).accept(retirement));
     }
 
     /** Captures ownership before asynchronous teardown makes a retained ENI available again. */
-    public synchronized Runnable captureUnregister(String eniId) {
+    public Runnable captureUnregister(String eniId) {
+        Consumer<Retirement> captured = captureRetirement(eniId);
+        return () -> retire(captured);
+    }
+
+    private synchronized Consumer<Retirement> captureRetirement(String eniId) {
         ProtectedEndpoint captured = endpoints.get(eniId);
         Set<String> helpers = new HashSet<>(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
         if (captured != null) {
             helpers.add(captured.helperId());
         }
-        return () -> unregisterCaptured(eniId, captured, helpers);
+        return retirement -> unregisterCaptured(eniId, captured, helpers, retirement);
     }
 
-    private void unregisterCaptured(String eniId, ProtectedEndpoint captured, Set<String> capturedHelpers) {
+    private void retire(Consumer<Retirement> action) {
+        Retirement retirement = new Retirement();
+        retiring.incrementAndGet();
+        try {
+            action.accept(retirement);
+        } finally {
+            retirementPrepared(retirement);
+        }
+    }
+
+    private static final class Retirement {
+        private boolean prepared;
+    }
+
+    private static final class RetirementRefresh {
+        private boolean complete;
+        private Throwable failure;
+    }
+
+    private synchronized void retirementPrepared(Retirement retirement) {
+        if (!retirement.prepared) {
+            retirement.prepared = true;
+            retiring.decrementAndGet();
+            notifyAll();
+        }
+    }
+
+    /** A completed batch remains its callers' barrier even when another batch starts. */
+    private void reconcileRetirements() {
+        if (!peerPoliciesNeedRefresh) {
+            return;
+        }
+        RetirementRefresh refresh = retirementRefresh;
+        if (refresh != null) {
+            try {
+                while (!refresh.complete) {
+                    wait();
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while awaiting security-group retirement", error);
+            }
+            if (refresh.failure instanceof RuntimeException failure) {
+                throw failure;
+            }
+            if (refresh.failure instanceof Error failure) {
+                throw failure;
+            }
+            return;
+        }
+        refresh = new RetirementRefresh();
+        retirementRefresh = refresh;
+        try {
+            long deadline = System.nanoTime() + COALESCE_NANOS;
+            try {
+                long remaining;
+                while (retiring.get() > 0 && (remaining = deadline - System.nanoTime()) > 0) {
+                    TimeUnit.NANOSECONDS.timedWait(this, remaining);
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while preparing security-group retirement", error);
+            }
+            reconcileAll();
+            peerPoliciesNeedRefresh = false;
+        } catch (RuntimeException | Error failure) {
+            refresh.failure = failure;
+            throw failure;
+        } finally {
+            refresh.complete = true;
+            retirementRefresh = null;
+            notifyAll();
+        }
+    }
+
+    private void unregisterCaptured(String eniId, ProtectedEndpoint captured, Set<String> capturedHelpers,
+                                    Retirement retirement) {
         Set<String> helpers;
         synchronized (this) {
             ProtectedEndpoint current = endpoints.get(eniId);
@@ -676,10 +758,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     .anyMatch(endpoint -> endpoint.helperId().equals(helper)));
             helpers.retainAll(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
             requestedHelperCleanup.addAll(helpers);
-            if (peerPoliciesNeedRefresh) {
-                reconcileAll();
-                peerPoliciesNeedRefresh = false;
-            }
+            retirementPrepared(retirement);
+            reconcileRetirements();
         }
         for (String helper : helpers) {
             removeRequestedHelper(helper);

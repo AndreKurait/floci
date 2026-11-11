@@ -1070,8 +1070,8 @@ Privileged containers and Docker network, port, DNS or host overrides cannot be
 combined with protected VPC execution. Ordinary environment retirement removes the
 container before releasing its helper and ENI. The firewall retires the namespace
 while its helper is still present, and the ENI remains reserved until helper removal
-is confirmed; startup retires surviving owned
-helpers and their workloads.
+is confirmed. Concurrent retirements share the peer-policy refresh and wait for its
+result. Startup retires surviving owned helpers and their workloads.
 
 This currently allocates an ENI per execution environment. Hyperplane ENI sharing,
 attachment-time IAM permission checks and NACLs are not emulated by this path.

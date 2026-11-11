@@ -35,6 +35,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -65,6 +66,8 @@ class SecurityGroupFirewallPeerFixture {
     final Set<String> stoppedHelpers = ConcurrentHashMap.newKeySet();
     private final Map<String, String> transportByHelper = new ConcurrentHashMap<>();
     final List<String> violations = Collections.synchronizedList(new ArrayList<>());
+    final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+    BiConsumer<String, String> beforeInstall = (helper, script) -> {};
 
     void assertFinal(int count) {
         List<SecurityGroupNftCompiler.Endpoint> all = new ArrayList<>();
@@ -110,7 +113,7 @@ class SecurityGroupFirewallPeerFixture {
         EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
         when(dns.getServerIp()).thenReturn(Optional.empty());
         return new SecurityGroupFirewallManager(docker(), mock(ContainerBuilder.class),
-                mock(ContainerLifecycleManager.class), config, dns);
+                lifecycle, config, dns);
     }
 
     private DockerClient docker() {
@@ -168,6 +171,7 @@ class SecurityGroupFirewallPeerFixture {
     final Set<String> failNextInstall = ConcurrentHashMap.newKeySet();
 
     private void record(String helper, String script) {
+        beforeInstall.accept(helper, script);
         if (failNextInstall.remove(helper)) {
             throw new IllegalStateException("injected nft failure for " + helper);
         }
