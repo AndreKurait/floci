@@ -1,7 +1,9 @@
 package io.floci.aws.services.cloudformation;
 
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.cloudformation.model.Stack;
+import io.floci.aws.services.cloudformation.model.StackSet;
 import io.floci.aws.services.cloudformation.model.StackSetOperation;
 import io.floci.aws.testing.InMemoryStorageFactory;
 import io.floci.aws.testing.ManualClock;
@@ -15,7 +17,10 @@ import java.util.concurrent.CompletableFuture;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -48,6 +53,20 @@ class StackSetServiceTest {
         service = new StackSetService(cfnService, new InMemoryStorageFactory("000000000000"), null,
                 new RegionResolver("us-east-1", "000000000000"), clock);
         service.createStackSet(SET, TEMPLATE, null, null, null, "original");
+    }
+
+    @Test
+    void aRefusedUpdateLeavesTheStackSetAndItsOperationsUntouched() {
+        String otherTemplate = "{\"Resources\":{},\"Description\":\"changed\"}";
+
+        AwsException refused = assertThrows(AwsException.class, () -> service.updateStackSet(
+                SET, otherTemplate, null, null, null, "changed", null, Boolean.TRUE, null, null));
+
+        assertEquals("InvalidOperationException", refused.getErrorCode());
+        StackSet after = service.describeStackSet(SET);
+        assertEquals(TEMPLATE, after.getTemplateBody());
+        assertEquals("original", after.getDescription());
+        assertThat(service.listStackSetOperations(SET), is(empty()));
     }
 
     @Test
