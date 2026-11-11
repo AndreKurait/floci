@@ -866,6 +866,7 @@ public class CloudFormationService implements ResourceProvider {
             }
 
             ChangeSet cs = new ChangeSet();
+            cs.setCreationTime(now());
             cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, accountId, "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
             cs.setChangeSetName(changeSetName);
             cs.setStackName(canonicalStackName);
@@ -2983,6 +2984,9 @@ public class CloudFormationService implements ResourceProvider {
                     // Both branches return a fresh StackResource, so the policy is carried over here
                     // rather than on the instance the loop started with.
                     resource.setDeletionPolicy(deletionPolicy);
+                    // A fresh StackResource carries the model's wall-clock default; date it on the
+                    // service clock like every other time of the stack.
+                    resource.setTimestamp(now());
                     if ("AWS::CloudFormation::Stack".equals(type) || dispatcher.isCustomResourceType(type)) {
                         recordTemplateUses(resource, collectResourceDependencies(resDef, templateIds, conditions),
                                 physicalIds);
@@ -5528,6 +5532,7 @@ public class CloudFormationService implements ResourceProvider {
     private void addEvent(Stack stack, String logicalId, String physicalId,
                           String resourceType, String status, String reason) {
         StackEvent event = new StackEvent();
+        event.setTimestamp(now());
         event.setStackId(stack.getStackId());
         event.setStackName(stack.getStackName());
         event.setLogicalResourceId(logicalId);
