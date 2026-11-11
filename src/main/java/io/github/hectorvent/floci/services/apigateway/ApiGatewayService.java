@@ -1666,6 +1666,8 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         synchronized (usagePlanLock) {
             getUsagePlan(region, usagePlanId);
             usagePlanStore.delete(usagePlanKey(region, usagePlanId));
+            String keyPrefix = region + "::" + usagePlanId + "::";
+            usagePlanKeyStore.keys().stream().filter(k -> k.startsWith(keyPrefix)).forEach(usagePlanKeyStore::delete);
         }
     }
 

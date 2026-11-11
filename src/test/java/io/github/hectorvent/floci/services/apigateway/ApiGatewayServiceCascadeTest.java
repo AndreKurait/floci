@@ -18,6 +18,7 @@ import java.util.Map;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.empty;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -110,6 +111,17 @@ class ApiGatewayServiceCascadeTest {
 
         assertEquals(Map.of("keep", "1"), patched.getVariables());
         assertFalse(service.getStage(REGION, apiId, "dev").getVariables().containsKey("drop"));
+    }
+
+    @Test
+    void deletingAUsagePlanDeletesItsKeys() {
+        String planId = service.createUsagePlan(REGION, Map.of("name", "plan")).getId();
+        String keyId = service.createApiKey(REGION, Map.of("name", "key", "enabled", true)).getId();
+        service.createUsagePlanKey(REGION, planId, Map.of("keyId", keyId, "keyType", "API_KEY"));
+
+        service.deleteUsagePlan(REGION, planId);
+
+        assertThat(service.getUsagePlanKeys(REGION, planId), empty());
     }
 
     private static void assertNotFound(Runnable call) {
