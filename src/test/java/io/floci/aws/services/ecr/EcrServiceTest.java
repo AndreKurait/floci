@@ -457,6 +457,26 @@ class EcrServiceTest {
     }
 
     @Test
+    void describeRepositories_overlappingADelete_doesNotWriteTheRepositoryBack() {
+        InMemoryStorage<String, Repository> repositories = new InMemoryStorage<>();
+        EcrService racing = new EcrService(repositories, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                registryManager, Mockito.mock(EmulatorConfig.class), new RegionResolver(REGION, ACCOUNT));
+        racing.createRepository(REPO, null, null, null, null, null, null, REGION);
+        AtomicBoolean deleteDuringTheRead = new AtomicBoolean(true);
+        when(registryManager.getRepositoryUri(anyString(), anyString(), anyString())).thenAnswer(inv -> {
+            if (deleteDuringTheRead.compareAndSet(true, false)) {
+                // The delete lands after the describe read the repository and before it returns.
+                racing.deleteRepository(REPO, null, false, REGION);
+            }
+            return inv.getArgument(0) + ".dkr.ecr." + inv.getArgument(1) + ".localhost:4566/" + inv.getArgument(2);
+        });
+
+        racing.describeRepositories(List.of(REPO), null, REGION);
+
+        assertTrue(repositories.keys().isEmpty(), "the deleted repository stays deleted");
+    }
+
+    @Test
     void describeRepositoriesRefreshesStoredUrisForTheCurrentConfiguration() {
         String namedRepository = REPO + "-named";
         String listedRepository = REPO + "-listed";
