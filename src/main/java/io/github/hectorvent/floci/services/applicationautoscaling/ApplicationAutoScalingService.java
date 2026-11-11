@@ -761,8 +761,12 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
 
     /** Persists a policy after the control loop stamps a cooldown timestamp on it. */
     void savePolicy(ScalingPolicy policy, String region) {
-        policies.put(policyKey(region, policy.getServiceNamespace(), policy.getResourceId(),
-                policy.getScalableDimension(), policy.getPolicyName()), policy);
+        String key = policyKey(region, policy.getServiceNamespace(), policy.getResourceId(),
+                policy.getScalableDimension(), policy.getPolicyName());
+        // A policy deleted while the control loop was changing capacity stays deleted.
+        if (policies.get(key).isPresent()) {
+            policies.put(key, policy);
+        }
     }
 
     /** Records that the control loop changed capacity, mirroring what AWS reports through

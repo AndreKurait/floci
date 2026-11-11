@@ -131,6 +131,19 @@ class ApplicationAutoScalingServiceTest {
         assertEquals(Set.of(), alarmsInCloudWatch);
     }
 
+    @Test
+    void savePolicy_afterThePolicyWasDeleted_doesNotBringItBack() {
+        register();
+        ScalingPolicy policy = service.putScalingPolicy("cpu", "TargetTrackingScaling", NAMESPACE, RESOURCE_ID,
+                DIMENSION, targetTracking(50.0, "ECSServiceAverageCPUUtilization", null), null, REGION);
+        // The control loop read the policy, and DeleteScalingPolicy lands while it is changing capacity.
+        service.deleteScalingPolicy("cpu", NAMESPACE, RESOURCE_ID, DIMENSION, REGION);
+
+        service.savePolicy(policy, REGION);
+
+        assertEquals(List.of(), service.describeScalingPolicies(NAMESPACE, RESOURCE_ID, DIMENSION, null, REGION));
+    }
+
     private TargetTrackingConfiguration targetTracking(double value, String metricType, String resourceLabel) {
         TargetTrackingConfiguration config = new TargetTrackingConfiguration();
         config.setTargetValue(value);
