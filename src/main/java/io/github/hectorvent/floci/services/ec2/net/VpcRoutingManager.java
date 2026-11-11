@@ -706,8 +706,13 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     }
 
     @Override
-    public synchronized void stopManagedContainers() {
+    public synchronized void beginTeardown() {
         draining = true;
+    }
+
+    @Override
+    public synchronized void stopManagedContainers() {
+        beginTeardown();
         for (Map.Entry<String, NatRuntime> entry : List.copyOf(nats.entrySet())) {
             try {
                 retireNat(entry.getValue());
@@ -726,7 +731,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
 
     @Override
     public synchronized void beforeReset() {
-        draining = true;
+        beginTeardown();
     }
 
     @Override

@@ -24,8 +24,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -39,6 +41,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -51,6 +54,80 @@ import static org.mockito.Mockito.when;
 class EcsServiceTeardownTest {
 
     private static final String REGION = "us-east-1";
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shutdownStopsTasksInBoundedParallelAndWaitsBeforeReleasingNetworks(boolean interrupted) throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ecs().mock()).thenReturn(false);
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        EcsContainerManager manager = mock(EcsContainerManager.class);
+        when(manager.startTask(any(), any(), any(), anyString())).thenAnswer(invocation -> {
+            EcsTask task = invocation.getArgument(0);
+            return new EcsTaskHandle(task.getTaskArn(), Map.of("app", task.getTaskArn()), Map.of());
+        });
+        CountDownLatch firstWave = new CountDownLatch(8);
+        CountDownLatch finishStops = new CountDownLatch(1);
+        AtomicInteger active = new AtomicInteger();
+        AtomicInteger peak = new AtomicInteger();
+        Set<String> stopped = ConcurrentHashMap.newKeySet();
+        doAnswer(invocation -> {
+            EcsTaskHandle handle = invocation.getArgument(0);
+            peak.accumulateAndGet(active.incrementAndGet(), Math::max);
+            firstWave.countDown();
+            try {
+                assertTrue(finishStops.await(10, TimeUnit.SECONDS), "task stops were not released");
+                assertTrue(stopped.add(handle.getTaskArn()), "each task must be stopped once");
+            } finally {
+                active.decrementAndGet();
+            }
+            return null;
+        }).when(manager).stopTask(any());
+        EcsService service = new EcsService(new RegionResolver(REGION, "000000000000"), manager, config,
+                mock(EcsLoadBalancerRegistrar.class), new SingleUseStorageFactory(), null);
+        service.initializeStorage();
+        ContainerDefinition definition = new ContainerDefinition();
+        definition.setName("app");
+        definition.setImage("busybox:stable");
+        service.registerTaskDefinition("parallel-shutdown", List.of(definition), null, null, null,
+                null, null, List.of(), REGION);
+        service.runTask(null, "parallel-shutdown", 9, LaunchType.FARGATE, null, null,
+                List.of(), null, REGION);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicBoolean interruptionPreserved = new AtomicBoolean();
+        Thread shutdown = new Thread(() -> {
+            try {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+                service.stopManagedContainers();
+                interruptionPreserved.set(Thread.currentThread().isInterrupted());
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        });
+        shutdown.start();
+        try {
+            assertTrue(firstWave.await(5, TimeUnit.SECONDS),
+                    "slow ECS tasks must enter shutdown together, within the existing eight-task bound");
+            assertTrue(shutdown.isAlive(), "shutdown must wait for the task stops");
+            assertEquals(8, peak.get());
+            verify(manager, never()).releaseTaskNetwork(any(), anyString());
+            finishStops.countDown();
+            shutdown.join(5000);
+            assertFalse(shutdown.isAlive());
+            assertNull(failure.get());
+            assertEquals(interrupted, interruptionPreserved.get());
+            assertEquals(9, stopped.size());
+            assertEquals(8, peak.get(), "queued tasks must not increase the existing stop concurrency");
+            verify(manager, times(9)).stopTask(any());
+            verify(manager, times(9)).releaseTaskNetwork(any(), anyString());
+        } finally {
+            finishStops.countDown();
+            shutdown.join(5000);
+            assertFalse(shutdown.isAlive(), "the test must release its shutdown thread");
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})

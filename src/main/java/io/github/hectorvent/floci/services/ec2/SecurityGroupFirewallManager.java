@@ -778,6 +778,31 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         retire(retirement -> captureRetirement(eniId).accept(retirement));
     }
 
+    /**
+     * Retires a selected batch behind one peer-policy refresh. A failed batch retains per-ENI
+     * cleanup state so its owner can retry individual retirements.
+     */
+    public void unregisterAll(List<String> eniIds) {
+        retire(retirement -> {
+            Set<String> helpers = new LinkedHashSet<>();
+            synchronized (this) {
+                for (String eniId : List.copyOf(eniIds)) {
+                    ProtectedEndpoint captured = endpoints.get(eniId);
+                    Set<String> capturedHelpers = new HashSet<>(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
+                    if (captured != null) {
+                        capturedHelpers.add(captured.helperId());
+                    }
+                    helpers.addAll(prepareUnregister(eniId, captured, capturedHelpers));
+                }
+                retirementPrepared(retirement);
+                reconcileRetirements();
+            }
+            for (String helper : helpers) {
+                removeRequestedHelper(helper);
+            }
+        });
+    }
+
     /** Captures ownership before asynchronous teardown makes a retained ENI available again. */
     public Runnable captureUnregister(String eniId) {
         Consumer<Retirement> captured = captureRetirement(eniId);
@@ -872,32 +897,38 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                                     Retirement retirement) {
         Set<String> helpers;
         synchronized (this) {
-            ProtectedEndpoint current = endpoints.get(eniId);
-            boolean owned = captured != null && current != null && current.dnsOrigin() == captured.dnsOrigin();
-            if ((current == null || owned) && vpcRouting != null && !vpcRouting.isUnsatisfied()) {
-                // A replacement registered on this ENI after the capture keeps its routes.
-                vpcRouting.get().unregister(eniId);
-            }
-            if (owned) {
-                endpoints.remove(eniId);
-                applied.remove(eniId);
-                removeDnsOrigin(current);
-                pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(current.helperId());
-                peerPoliciesNeedRefresh = true;
-                quarantine(current.helperId());
-            }
-            // Retiring peer permissions must not discard the owning service's later cleanup obligation.
-            helpers = new HashSet<>(capturedHelpers);
-            helpers.removeIf(helper -> endpoints.values().stream()
-                    .anyMatch(endpoint -> endpoint.helperId().equals(helper)));
-            helpers.retainAll(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
-            requestedHelperCleanup.addAll(helpers);
+            helpers = prepareUnregister(eniId, captured, capturedHelpers);
             retirementPrepared(retirement);
             reconcileRetirements();
         }
         for (String helper : helpers) {
             removeRequestedHelper(helper);
         }
+    }
+
+    private synchronized Set<String> prepareUnregister(String eniId, ProtectedEndpoint captured,
+                                                        Set<String> capturedHelpers) {
+        ProtectedEndpoint current = endpoints.get(eniId);
+        boolean owned = captured != null && current != null && current.dnsOrigin() == captured.dnsOrigin();
+        if ((current == null || owned) && vpcRouting != null && !vpcRouting.isUnsatisfied()) {
+            // A replacement registered on this ENI after the capture keeps its routes.
+            vpcRouting.get().unregister(eniId);
+        }
+        if (owned) {
+            endpoints.remove(eniId);
+            applied.remove(eniId);
+            removeDnsOrigin(current);
+            pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(current.helperId());
+            peerPoliciesNeedRefresh = true;
+            quarantine(current.helperId());
+        }
+        // Retiring peer permissions must not discard the owning service's later cleanup obligation.
+        Set<String> helpers = new HashSet<>(capturedHelpers);
+        helpers.removeIf(helper -> endpoints.values().stream()
+                .anyMatch(endpoint -> endpoint.helperId().equals(helper)));
+        helpers.retainAll(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
+        requestedHelperCleanup.addAll(helpers);
+        return helpers;
     }
 
     public synchronized void publishPublicAddress(String eniId, String address) {
