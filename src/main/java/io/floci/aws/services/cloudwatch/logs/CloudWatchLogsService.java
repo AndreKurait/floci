@@ -768,7 +768,8 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
                     stream.setFirstEventTimestamp(minTs);
                 }
             }
-            if (maxTs != null) {
+            if (maxTs != null
+                    && (stream.getLastEventTimestamp() == null || maxTs > stream.getLastEventTimestamp())) {
                 stream.setLastEventTimestamp(maxTs);
             }
             stream.setLastIngestionTime(now);
