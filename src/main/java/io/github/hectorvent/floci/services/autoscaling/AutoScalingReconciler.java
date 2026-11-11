@@ -38,6 +38,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -89,6 +90,7 @@ public class AutoScalingReconciler {
     private final ElbClassicService elbClassicService;
     private final SsmCommandService ssmCommandService;
     private final ScheduledExecutorService scheduler;
+    private final Clock clock;
     private final KeyedWorkQueue<AutoScalingGroupChanged> changes;
     private String repairCursor;
     private final ExecutorService launchWaiters = Executors.newVirtualThreadPerTaskExecutor();
@@ -107,6 +109,15 @@ public class AutoScalingReconciler {
     AutoScalingReconciler(AutoScalingService asgService, Ec2Service ec2Service,
                           ElbV2Service elbV2Service, ElbClassicService elbClassicService,
                           SsmCommandService ssmCommandService, ScheduledExecutorService scheduler) {
+        this(asgService, ec2Service, elbV2Service, elbClassicService, ssmCommandService, scheduler,
+                Clock.systemUTC());
+    }
+
+    /** With the clock launch lifecycle actions start and time out on, the one the service was given. */
+    AutoScalingReconciler(AutoScalingService asgService, Ec2Service ec2Service,
+                          ElbV2Service elbV2Service, ElbClassicService elbClassicService,
+                          SsmCommandService ssmCommandService, ScheduledExecutorService scheduler, Clock clock) {
+        this.clock = clock;
         this.asgService = asgService;
         this.ec2Service = ec2Service;
         this.elbV2Service = elbV2Service;
@@ -217,7 +228,7 @@ public class AutoScalingReconciler {
     public void reconcile(AutoScalingGroup asg) {
         asgService.reconcileIfPresent(asg, () -> {
             settleStandbyMoves(asg);
-            asgService.settleLaunchLifecycleActions(asg, Instant.now());
+            asgService.settleLaunchLifecycleActions(asg, clock.instant());
             removeTerminatingInstances(asg);
             removeStaleInstances(asg);
             promoteReadyInstances(asg);
@@ -377,7 +388,7 @@ public class AutoScalingReconciler {
                     // An attached instance was not launched by the group, so it only waits for registration.
                     if (!returningFromStandby && !asgInst.isPendingAttachment()
                             && "Pending".equals(asgInst.getLifecycleState())
-                            && asgService.beginLaunchLifecycleActions(asg, asgInst, Instant.now())) {
+                            && asgService.beginLaunchLifecycleActions(asg, asgInst, clock.instant())) {
                         changed = true;
                         continue;
                     }
@@ -518,7 +529,7 @@ public class AutoScalingReconciler {
         asgService.cancelStandbyMoves(returning);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
-        String now = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString();
+        String now = clock.instant().truncatedTo(ChronoUnit.SECONDS).toString();
         for (String instanceId : instanceIds) {
             asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
                     "Terminating EC2 instance: " + instanceId,

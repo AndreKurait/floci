@@ -30,6 +30,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
@@ -56,6 +57,7 @@ public class AutoScalingService implements PassedRoleLookup {
     private final ElbV2Service elbV2Service;
     private final int maxCapacityReservationIds;
     private final List<String> multipleCapacityReservationScopes;
+    private final Clock clock;
 
     public AutoScalingService() {
         this((Event<AutoScalingGroupChanged>) null, null);
@@ -89,9 +91,17 @@ public class AutoScalingService implements PassedRoleLookup {
     private AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
                                int maxCapacityReservationIds, List<String> multipleCapacityReservationScopes,
                                ElbClassicService elbClassicService) {
+        this(groupChanges, elbV2Service, maxCapacityReservationIds, multipleCapacityReservationScopes,
+                elbClassicService, Clock.systemUTC());
+    }
+
+    private AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
+                               int maxCapacityReservationIds, List<String> multipleCapacityReservationScopes,
+                               ElbClassicService elbClassicService, Clock clock) {
         if (maxCapacityReservationIds < 1) {
             throw new IllegalArgumentException("floci.services.autoscaling.max-capacity-reservation-ids must be positive");
         }
+        this.clock = clock;
         this.elbClassicService = elbClassicService;
         this.groupChanges = groupChanges;
         this.elbV2Service = elbV2Service;
@@ -204,6 +214,11 @@ public class AutoScalingService implements PassedRoleLookup {
 
     public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService) {
         this(null, elbV2Service, 1, List.of(), elbClassicService);
+    }
+
+    /** With the clock every timestamp and lifecycle action deadline is read from. */
+    AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService, Clock clock) {
+        this(null, elbV2Service, 1, List.of(), elbClassicService, clock);
     }
 
     // region :: name → resource
@@ -332,7 +347,7 @@ public class AutoScalingService implements PassedRoleLookup {
         // structure from Describe, unlike AssociatePublicIpAddress whose absence is meaningful.
         lc.setInstanceMonitoringEnabled(instanceMonitoringEnabled != null ? instanceMonitoringEnabled : Boolean.TRUE);
         lc.setBlockDeviceMappings(blockDeviceMappings != null ? new ArrayList<>(blockDeviceMappings) : new ArrayList<>());
-        lc.setCreatedTime(Instant.now());
+        lc.setCreatedTime(clock.instant());
         lc.setRegion(region);
         launchConfigs.put(key, lc);
         return lc;
@@ -487,7 +502,7 @@ public class AutoScalingService implements PassedRoleLookup {
             asg.setHealthCheckType(healthCheckType != null ? healthCheckType : "EC2");
             asg.setHealthCheckGracePeriod(healthCheckGracePeriod);
             asg.setTerminationPolicies(terminationPolicies != null ? new ArrayList<>(terminationPolicies) : List.of("Default"));
-            asg.setCreatedTime(Instant.now());
+            asg.setCreatedTime(clock.instant());
             asg.setRegion(region);
             if (tags != null) {
                 asg.getTags().putAll(tags);
@@ -864,7 +879,7 @@ public class AutoScalingService implements PassedRoleLookup {
             AutoScalingGroup.SuspensionState previous = asg.suspensionState();
             Set<String> suspended = new LinkedHashSet<>(previous.processes());
             Map<String, Instant> times = new LinkedHashMap<>(previous.times());
-            Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+            Instant now = clock.instant().truncatedTo(ChronoUnit.SECONDS);
             for (String process : toSuspend) {
                 if (suspended.add(process)) {
                     times.put(process, now);
@@ -929,7 +944,7 @@ public class AutoScalingService implements PassedRoleLookup {
             if (!moving.isEmpty()) {
                 completeInstanceRefreshIfSettled(region, name, asg);
             }
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             List<ScalingActivity> started = new ArrayList<>();
             for (AsgInstance instance : moving) {
                 String cause = "At " + now.truncatedTo(ChronoUnit.SECONDS) + " instance " + instance.getInstanceId()
@@ -965,7 +980,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 requireDesiredCapacityWithinBounds(asg, newDesired,
                         "To exit standby " + moving.size() + " instances");
             }
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             List<ScalingActivity> started = new ArrayList<>();
             for (AsgInstance instance : moving) {
                 String cause = "At " + now.truncatedTo(ChronoUnit.SECONDS) + " instance " + instance.getInstanceId()
@@ -1362,7 +1377,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 int newDesired = Math.max(asg.getMinSize(), previousDesired - 1);
                 asg.setDesiredCapacity(newDesired);
             }
-            String cause = "At " + Instant.now().truncatedTo(ChronoUnit.SECONDS) + " instance " + instanceId
+            String cause = "At " + clock.instant().truncatedTo(ChronoUnit.SECONDS) + " instance " + instanceId
                     + " was taken out of service in response to a user request"
                     + (previousDesired != asg.getDesiredCapacity() ? ", shrinking the capacity from "
                     + previousDesired + " to " + asg.getDesiredCapacity() : "") + ".";
@@ -1446,7 +1461,7 @@ public class AutoScalingService implements PassedRoleLookup {
                         "An active instance refresh already exists for Auto Scaling group '" + asgName + "'.", 400);
             }
 
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             InstanceRefresh refresh = new InstanceRefresh();
             refresh.setInstanceRefreshId(UUID.randomUUID().toString());
             refresh.setAutoScalingGroupName(asgName);
@@ -1540,7 +1555,7 @@ public class AutoScalingService implements PassedRoleLookup {
             if (remaining == 0) {
                 refresh.setStatus("Successful");
                 refresh.setStatusReason("Instance refresh completed.");
-                refresh.setEndTime(Instant.now());
+                refresh.setEndTime(clock.instant());
             }
             instanceRefreshes.put(instanceRefreshKey(region, asgName, refresh.getInstanceRefreshId()), refresh);
         }
@@ -1695,7 +1710,7 @@ public class AutoScalingService implements PassedRoleLookup {
                 }
             }
             hooks.remove(hookKey(region, asgName, hookName));
-            settleLaunchLifecycleActions(group, Instant.now());
+            settleLaunchLifecycleActions(group, clock.instant());
             saveAutoScalingGroupIfPresent(group);
             requestReconciliation(group);
         }
@@ -1754,11 +1769,11 @@ public class AutoScalingService implements PassedRoleLookup {
         }
         synchronized (lockFor(asgKey(region, asgName))) {
             AutoScalingGroup group = requireGroup(region, asgName);
-            AsgInstance instance = findLaunchLifecycleAction(group, hookName, instanceId, token, Instant.now());
+            AsgInstance instance = findLaunchLifecycleAction(group, hookName, instanceId, token, clock.instant());
             LaunchLifecycleAction action = instance.getLaunchLifecycleActions().get(hookName);
             instance.getLaunchLifecycleActions().put(hookName,
                     action.complete(actionResult, "Lifecycle action completed"));
-            settleLaunchLifecycleActions(group, Instant.now());
+            settleLaunchLifecycleActions(group, clock.instant());
             saveAutoScalingGroupIfPresent(group);
             requestReconciliation(group);
         }
@@ -1768,7 +1783,7 @@ public class AutoScalingService implements PassedRoleLookup {
                                                 String instanceId, String token) {
         synchronized (lockFor(asgKey(region, asgName))) {
             AutoScalingGroup group = requireGroup(region, asgName);
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             AsgInstance instance = findLaunchLifecycleAction(group, hookName, instanceId, token, now);
             LaunchLifecycleAction action = instance.getLaunchLifecycleActions().get(hookName);
             instance.getLaunchLifecycleActions().put(hookName, action.heartbeat(now));
@@ -2069,7 +2084,7 @@ public class AutoScalingService implements PassedRoleLookup {
     public ScalingActivity recordActivity(String region, String asgName, String description,
                                            String cause, String statusCode) {
         ScalingActivity activity = newActivity(region, asgName, description, cause, statusCode,
-                "Successful".equals(statusCode) ? 100 : 0, Instant.now());
+                "Successful".equals(statusCode) ? 100 : 0, clock.instant());
         activities.put(activity.getActivityId(), activity);
         return activity;
     }
@@ -2106,7 +2121,7 @@ public class AutoScalingService implements PassedRoleLookup {
     public void completeActivity(String activityId, String statusCode, String statusMessage) {
         ScalingActivity activity = activities.get(activityId);
         if (activity != null) {
-            activity.setEndTime(Instant.now());
+            activity.setEndTime(clock.instant());
             activity.setStatusCode(statusCode);
             activity.setStatusMessage(statusMessage);
             activity.setProgress(100);
