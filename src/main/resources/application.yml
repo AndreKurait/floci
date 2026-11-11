@@ -686,6 +686,10 @@ floci:
       staging-bucket: floci-firehose-staging
     kms:
       enabled: true
+      # <account-id>=<service principal> entries, comma-separated: ListGrants and ListRetirableGrants list a
+      # grantee or retiring principal in that account as that AWS service principal
+      # (FLOCI_SERVICES_KMS_LISTED_GRANTEE_SERVICE_PRINCIPALS).
+      # listed-grantee-service-principals:
     cognito:
       enabled: true
       google-issuer: https://accounts.google.com
