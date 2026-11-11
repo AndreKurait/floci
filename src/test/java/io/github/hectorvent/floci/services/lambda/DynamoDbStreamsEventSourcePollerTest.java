@@ -1263,6 +1263,29 @@ class DynamoDbStreamsEventSourcePollerTest {
     }
 
     @Test
+    void backoffStartsWhenTheFailedInvocationEnds() throws Exception {
+        stubTrimHorizon(List.of(ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}")));
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenAnswer(invocation -> {
+                    clock.addAndGet(10_000);
+                    InvokeResult error = new InvokeResult();
+                    error.setFunctionError("Unhandled");
+                    return error;
+                });
+        EventSourceMapping esm = filterEsm();
+        DynamoDbStreamsEventSourcePoller p = pollerWith(mock(EsmStore.class));
+
+        pollOnce(p, esm);
+        clock.addAndGet(p.retryBackoffMs(1) - 1);
+        pollOnce(p, esm);
+        verify(executorService, times(1)).invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse));
+
+        clock.addAndGet(1);
+        pollOnce(p, esm);
+        verify(executorService, times(2)).invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    @Test
     void failingBatchIsNotReinvokedUntilItsBackoffElapses() throws Exception {
         stubTrimHorizon(List.of(ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}")));
         InvokeResult error = new InvokeResult();
