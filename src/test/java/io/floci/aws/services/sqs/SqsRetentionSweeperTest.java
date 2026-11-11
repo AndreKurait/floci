@@ -25,7 +25,8 @@ class SqsRetentionSweeperTest {
     void aSweepThatEndsInAnErrorDoesNotEscapeTheScheduledTask() {
         SqsService failing = mock(SqsService.class);
         doThrow(new StackOverflowError("sweep failed")).when(failing).deleteExpiredMessages();
-        SqsRetentionSweeper sweeper = new SqsRetentionSweeper(failing, true, scheduler);
+        EmulatorConfig config = mock(EmulatorConfig.class, Answers.RETURNS_DEEP_STUBS);
+        SqsRetentionSweeper sweeper = new SqsRetentionSweeper(failing, config);
 
         assertDoesNotThrow(sweeper::sweep);
         verify(failing).deleteExpiredMessages();
