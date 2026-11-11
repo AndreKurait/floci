@@ -1044,33 +1044,33 @@ public class ElbV2QueryHandler {
         XmlBuilder xml = new XmlBuilder();
         xml.elem("Field", safe(c.getField()));
         xml.start("Values");
-        for (String v : c.getValues()) xml.start("member").raw(v).end("member");
+        for (String v : c.getValues()) xml.elem("member", v);
         xml.end("Values");
         if (!c.getHostHeaderValues().isEmpty()) {
             xml.start("HostHeaderConfig").start("Values");
-            for (String v : c.getHostHeaderValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHostHeaderValues()) xml.elem("member", v);
             xml.end("Values").end("HostHeaderConfig");
         }
         if (!c.getPathPatternValues().isEmpty()) {
             xml.start("PathPatternConfig").start("Values");
-            for (String v : c.getPathPatternValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getPathPatternValues()) xml.elem("member", v);
             xml.end("Values").end("PathPatternConfig");
         }
         if (c.getHttpHeaderName() != null) {
             xml.start("HttpHeaderConfig")
                .elem("HttpHeaderName", c.getHttpHeaderName())
                .start("Values");
-            for (String v : c.getHttpHeaderValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHttpHeaderValues()) xml.elem("member", v);
             xml.end("Values").end("HttpHeaderConfig");
         }
         if (!c.getHttpMethodValues().isEmpty()) {
             xml.start("HttpRequestMethodConfig").start("Values");
-            for (String v : c.getHttpMethodValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHttpMethodValues()) xml.elem("member", v);
             xml.end("Values").end("HttpRequestMethodConfig");
         }
         if (!c.getSourceIpValues().isEmpty()) {
             xml.start("SourceIpConfig").start("Values");
-            for (String v : c.getSourceIpValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getSourceIpValues()) xml.elem("member", v);
             xml.end("Values").end("SourceIpConfig");
         }
         if (!c.getQueryStringValues().isEmpty()) {
