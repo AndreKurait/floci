@@ -33,6 +33,7 @@ import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -61,6 +62,12 @@ public class CloudControlService {
     private final ObjectMapper mapper;
     private final AccountAwareStorageBackend<PersistedRequest> requestStore;
     private final AccountAwareStorageBackend<PersistedCreatedResource> createdStore;
+    private final Clock clock;
+    /**
+     * The last order stamp handed out. Stamps are the clock's milliseconds, pushed past the previous
+     * one when the clock has not moved, so requests recorded in one millisecond keep their order.
+     */
+    private final AtomicLong lastOrderStamp = new AtomicLong();
     /** How many finished request tokens to keep before evicting the oldest. */
     private static final int MAX_RETAINED_REQUESTS = 1000;
 
@@ -134,6 +141,7 @@ public class CloudControlService {
                 .thenComparing(entry -> entry.value().event().requestToken()));
         for (AccountAwareStorageBackend.AccountEntry<PersistedRequest> entry : persistedRequests) {
             PersistedRequest persisted = entry.value();
+            lastOrderStamp.accumulateAndGet(persisted.createdAt(), Math::max);
             ProgressEvent event = persisted.event();
             String accountId = event.accountId() == null ? DEFAULT_ACCOUNT : event.accountId();
             ProgressEvent normalized = event.accountId() == null
@@ -177,6 +185,11 @@ public class CloudControlService {
         trimPersistedRequests();
     }
 
+    private long nextOrderStamp() {
+        long now = clock.millis();
+        return lastOrderStamp.updateAndGet(previous -> Math.max(previous + 1, now));
+    }
+
     private void persistRequest(PersistedRequest persisted) {
         String accountId = persisted.event().accountId() == null ? DEFAULT_ACCOUNT : persisted.event().accountId();
         requestStore.putForAccount(accountId, persisted.event().requestToken(), persisted);
@@ -217,14 +230,15 @@ public class CloudControlService {
     @Inject
     public CloudControlService(S3Service s3Service, Ec2Service ec2Service,
                                IamService iamService, CfnResourceDispatcher provisioner,
-                               ObjectMapper mapper, StorageFactory storageFactory, EmulatorConfig config) {
+                               ObjectMapper mapper, StorageFactory storageFactory, EmulatorConfig config,
+                               Clock clock) {
         this(s3Service, ec2Service, iamService, provisioner, mapper,
                 storageFactory.create("cloudcontrol", "cloudcontrol-requests.json",
                         new TypeReference<Map<String, PersistedRequest>>() {}),
                 storageFactory.create("cloudcontrol", "cloudcontrol-created.json",
                         new TypeReference<Map<String, PersistedCreatedResource>>() {}),
                 config.services().cloudcontrol().createWorkerThreads(),
-                config.services().cloudcontrol().createQueueCapacity());
+                config.services().cloudcontrol().createQueueCapacity(), clock);
     }
 
     public CloudControlService(S3Service s3Service, Ec2Service ec2Service,
@@ -250,6 +264,17 @@ public class CloudControlService {
                                 AccountAwareStorageBackend<PersistedRequest> requestStore,
                                 AccountAwareStorageBackend<PersistedCreatedResource> createdStore,
                                 int workerCount, int queueCapacity) {
+        this(s3Service, ec2Service, iamService, provisioner, mapper, requestStore, createdStore,
+                workerCount, queueCapacity, Clock.systemUTC());
+    }
+
+    CloudControlService(S3Service s3Service, Ec2Service ec2Service,
+                                IamService iamService, CfnResourceDispatcher provisioner,
+                                ObjectMapper mapper,
+                                AccountAwareStorageBackend<PersistedRequest> requestStore,
+                                AccountAwareStorageBackend<PersistedCreatedResource> createdStore,
+                                int workerCount, int queueCapacity, Clock clock) {
+        this.clock = clock;
         this.s3Service = s3Service;
         this.ec2Service = ec2Service;
         this.iamService = iamService;
@@ -315,7 +340,12 @@ public class CloudControlService {
 
     private void submitCreate(String region, String accountId, String typeName, String desiredStateJson,
                               String token, ProgressEvent pending, JsonNode props, boolean replay) {
-        persistRequest(new PersistedRequest(pending, region, desiredStateJson, System.currentTimeMillis()));
+        // A create is recorded before it is submitted, and a replayed one was recorded by an earlier
+        // run: either way it keeps the stamp it already has.
+        PersistedRequest recorded = requestStore.getForAccount(
+                accountId == null ? DEFAULT_ACCOUNT : accountId, token).orElse(null);
+        persistRequest(new PersistedRequest(pending, region, desiredStateJson,
+                recorded == null ? nextOrderStamp() : recorded.createdAt()));
         Runnable task = () -> RequestScopes.runAs(accountId, () -> {
             try {
                 StackResource resource = provisioner.provisionStandalone(typeName, props, region, accountId);
@@ -573,7 +603,7 @@ public class CloudControlService {
         persistRequest(new PersistedRequest(event,
                 previous == null ? null : previous.region(),
                 previous == null ? null : previous.desiredStateJson(),
-                previous == null ? System.currentTimeMillis() : previous.createdAt()));
+                previous == null ? nextOrderStamp() : previous.createdAt()));
         trimPersistedRequests();
         return event;
     }
