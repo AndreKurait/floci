@@ -1562,4 +1562,11 @@ class KinesisServiceTest {
         assertNotNull(kinesisService.putRecord("unsplit", new byte[]{1}, "pk", REGION));
     }
 
+    @Test
+    void createStreamRejectsAShardCountBelowOne() {
+        AwsException rejected = assertThrows(AwsException.class,
+                () -> kinesisService.createStream("no-shards", 0, REGION));
+        assertEquals("ValidationException", rejected.getErrorCode());
+        assertThrows(AwsException.class, () -> kinesisService.describeStream("no-shards", REGION));
+    }
 }
