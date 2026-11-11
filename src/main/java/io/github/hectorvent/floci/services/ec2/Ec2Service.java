@@ -4443,7 +4443,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("InvalidParameterCombination",
                         "DeleteOnTermination can only be true for a new network interface.", 400);
             }
-            if (Math.max(minCount, 1) > 1) {
+            if (Math.max(maxCount, Math.max(minCount, 1)) > 1) {
                 throw new AwsException("InvalidParameterCombination",
                         "Network interfaces may only be specified for a single instance.", 400);
             }
@@ -4506,7 +4506,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             validateHostPlacement(getRequiredAvailableHost(region, hostId), az, effectiveInstanceType, tenancy);
         }
         validateArchitectureCompatibility(region, imageId, effectiveInstanceType);
-        int count = Math.min(maxCount, Math.max(minCount, 1));
+        // EC2 launches as many instances as it can up to MaxCount, and none when it cannot launch MinCount.
+        int count = Math.max(maxCount, Math.max(minCount, 1));
         if (privateIpAddress != null) {
             privateIpAddress = validateRequestedPrivateIp(privateIpAddress, subnet, suppliedEni, maxCount);
         }
@@ -4628,7 +4629,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     getRequiredSecurityGroup(region, group.getGroupId());
                 }
                 synchronized (privateIpAllocationLock) {
-                    int admitted = !config.services().ec2().enforceVcpuQuotas() || spot || "host".equals(tenancy)
+                    int requested = !config.services().ec2().enforceVcpuQuotas() || spot || "host".equals(tenancy)
                             ? count : admittedInstanceCount(region, effectiveInstanceType, minCount, capacityMaxCount);
                     synchronized (hostLock) {
                         if (hostId != null) {
@@ -4643,9 +4644,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                 suppliedEni = REPLAY_MAPPER.convertValue(current, NetworkInterface.class);
                             }
                         }
-                        List<String> publicIps = allocateMockPublicAddresses(automaticPublicIp, admitted);
+                        List<String> publicIps = allocateMockPublicAddresses(automaticPublicIp, requested);
                         List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni,
-                                privateIpAddress, admitted);
+                                privateIpAddress, requested, Math.max(minCount, 1));
+                        // A subnet with room for fewer than were asked for, but for the minimum, launches those.
+                        int admitted = privateIps.size();
                         List<Allocation> allocations = new ArrayList<>(admitted);
                         for (int i = 0; i < admitted; i++) {
                             List<String> additionalVolumeIds = launchVolumes.stream()
@@ -5350,8 +5353,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * @param requestedPrivateIp the launch's PrivateIpAddress, already checked by
      *                           {@link #validateRequestedPrivateIp}, or null
      */
+    /**
+     * One private address per instance to launch. A subnet that runs out after {@code minimum}
+     * addresses were found yields those; one that runs out earlier yields none and keeps none.
+     */
     private List<String> allocateLaunchAddresses(String region, String subnetId, NetworkInterface suppliedEni,
-                                                 String requestedPrivateIp, int count) {
+                                                 String requestedPrivateIp, int count, int minimum) {
         List<String> addresses = new ArrayList<>(count);
         if (suppliedEni != null) {
             for (int i = 0; i < count; i++) {
@@ -5369,6 +5376,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 addresses.add(assignPrivateIp(region, subnetId, addresses));
             }
         } catch (AwsException e) {
+            if (addresses.size() >= minimum && "InsufficientFreeAddressesInSubnet".equals(e.getErrorCode())) {
+                return addresses;
+            }
             releasePrivateIps(region, subnetId, addresses);
             throw e;
         }
