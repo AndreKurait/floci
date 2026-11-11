@@ -20,12 +20,16 @@ import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.EmulatorOriginSource;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.VpcDependencyProvider;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elbv2.model.*;
 import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -45,12 +49,14 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
-public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider, VpcDependencyProvider {
+public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider, VpcDependencyProvider,
+        EmulatorOriginSource {
 
     private static final Logger LOG = Logger.getLogger(ElbV2Service.class);
     private static final String DEFAULT_SSL_POLICY = "ELBSecurityPolicy-2016-08";
     /** {@code LoadBalancerTypeEnum}, in the model's order. */
     private static final List<String> LOAD_BALANCER_TYPES = List.of("application", "network", "gateway");
+    private static final String NETWORK = "network";
     private final ElbV2VpcNetworkManager vpcNetworks;
 
     public ElbV2Service() {
@@ -87,6 +93,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      */
     @Inject
     CertificateReferenceResolver certificateResolver;
+
+    /** Left null by the unit tests, which wire this service without EC2 security-group enforcement. */
+    @Inject
+    Instance<SecurityGroupFirewallManager> securityGroupFirewall;
 
     // region → ARN → resource
     private Map<String, Map<String, LoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
@@ -451,6 +461,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (!initialTags.isEmpty()) {
             tags.put(arn, new LinkedHashMap<>(initialTags));
         }
+        emulatorOriginsChanged(lb);
         return lb;
     }
 
@@ -579,6 +590,51 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         tgToLbs.values().forEach(lbSet -> lbSet.remove(arn));
         tags.remove(arn);
         loadBalancers.put(region, regionLbs);
+        emulatorOriginsChanged(lb);
+    }
+
+    /**
+     * Every network load balancer with security groups in a VPC, in every account. Floci sends its
+     * health checks and forwarded connections from its own address, so a target's rule that admits one
+     * of these groups admits that address. An application load balancer is not one: it reaches its
+     * targets from its own VPC interfaces (ElbV2VpcNetworkManager).
+     */
+    @Override
+    public List<SecurityGroupNftCompiler.EmulatorOrigin> emulatorOrigins() {
+        if (config != null && config.services().elbv2().mock()) {
+            // A mock ELBv2 sends no traffic, so it admits nothing.
+            return List.of();
+        }
+        Collection<Map<String, LoadBalancer>> regions = loadBalancersStore != null
+                ? loadBalancersStore.scanAllAccounts() : loadBalancers.values();
+        List<SecurityGroupNftCompiler.EmulatorOrigin> origins = new ArrayList<>();
+        for (Map<String, LoadBalancer> regionLbs : regions) {
+            for (LoadBalancer lb : regionLbs.values()) {
+                AwsArnUtils.Arn arn;
+                try {
+                    arn = AwsArnUtils.looksLikeArn(lb.getLoadBalancerArn())
+                            ? AwsArnUtils.parse(lb.getLoadBalancerArn()) : null;
+                } catch (IllegalArgumentException e) {
+                    // One unreadable record must not hide every other load balancer's groups.
+                    continue;
+                }
+                String accountId = arn != null ? arn.accountId() : null;
+                String region = lb.getRegion() != null ? lb.getRegion() : arn != null ? arn.region() : null;
+                List<String> groups = lb.getSecurityGroups();
+                if (NETWORK.equals(lb.getType()) && accountId != null && region != null && lb.getVpcId() != null
+                        && groups != null && !groups.isEmpty()) {
+                    origins.add(new SecurityGroupNftCompiler.EmulatorOrigin(accountId, region,
+                            lb.getVpcId(), groups.stream().filter(Objects::nonNull).collect(Collectors.toSet())));
+                }
+            }
+        }
+        return origins;
+    }
+
+    private void emulatorOriginsChanged(LoadBalancer lb) {
+        if (NETWORK.equals(lb.getType()) && lb.getVpcId() != null && securityGroupFirewall != null && securityGroupFirewall.isResolvable()) {
+            securityGroupFirewall.get().emulatorOriginsChanged();
+        }
     }
 
     public Map<String, String> describeLoadBalancerAttributes(String region, String arn) {
@@ -617,6 +673,36 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     LoadBalancer getLoadBalancer(String region, String arn) {
         return loadBalancers.getOrDefault(region, Map.of()).get(arn);
+    }
+
+    /**
+     * The security groups of the load balancer that {@code arn} (a load balancer or listener ARN)
+     * belongs to, in any account; empty when it has none or is unknown. Floci checks a protected
+     * target's ingress against these before its NLB traffic dials it.
+     */
+    Set<String> originSecurityGroups(String arn) {
+        if (arn == null || !AwsArnUtils.isArn(arn)) {
+            return Set.of();
+        }
+        AwsArnUtils.Arn parsed;
+        try {
+            parsed = AwsArnUtils.parse(arn);
+        } catch (IllegalArgumentException e) {
+            return Set.of();
+        }
+        String resource = parsed.resource();
+        if (resource.startsWith("listener/")) {
+            String[] parts = resource.split("/");
+            if (parts.length < 5) {
+                return Set.of();
+            }
+            arn = arn.substring(0, arn.indexOf(resource)) + "loadbalancer/" + parts[1] + "/" + parts[2] + "/" + parts[3];
+        }
+        Map<String, LoadBalancer> regionLbs = loadBalancersStore == null ? loadBalancers.get(parsed.region())
+                : loadBalancersStore.getForAccount(parsed.accountId(), parsed.region()).orElse(null);
+        LoadBalancer lb = regionLbs == null ? null : regionLbs.get(arn);
+        return lb == null || lb.getSecurityGroups() == null ? Set.of()
+                : lb.getSecurityGroups().stream().filter(Objects::nonNull).collect(Collectors.toUnmodifiableSet());
     }
 
     Listener getListener(String region, String arn) {
@@ -724,6 +810,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 throw failure;
             }
         }
+        emulatorOriginsChanged(lb);
     }
 
     /**
@@ -798,6 +885,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 lb.setVpcId(vpcId);
             }
             persistRegion(loadBalancers, region);
+            emulatorOriginsChanged(lb);
         });
     }
 

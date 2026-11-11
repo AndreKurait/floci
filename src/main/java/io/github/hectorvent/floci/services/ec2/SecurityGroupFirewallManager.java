@@ -13,10 +13,12 @@ import io.github.hectorvent.floci.core.common.SweepWorker;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import io.github.hectorvent.floci.core.common.docker.LocallyBuiltHelperImage;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
@@ -34,22 +36,26 @@ import org.jboss.logging.Logger;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -64,11 +70,15 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private final ContainerLifecycleManager lifecycleManager;
     private final EmulatorConfig config;
     private final EmbeddedDnsServer embeddedDnsServer;
-    private final Map<String, ProtectedEndpoint> endpoints = new HashMap<>();
+    // Written under this monitor; concurrent so emulatorRoute can read a current identity without it.
+    private final Map<String, ProtectedEndpoint> endpoints = new ConcurrentHashMap<>();
     private final Map<String, Set<String>> pendingHelperCleanup = new HashMap<>();
     private final Set<String> requestedHelperCleanup = new HashSet<>();
     private final Map<String, CompletableFuture<Void>> helperRemovalsInProgress = new HashMap<>();
     private final ConcurrentMap<String, DnsOrigin> dnsOrigins = new ConcurrentHashMap<>();
+    /** Every address of each admitted endpoint, for {@link #emulatorRoute}; read without the monitor. */
+    private final ConcurrentMap<String, Set<DnsOrigin>> routeOrigins = new ConcurrentHashMap<>();
+    private final AtomicBoolean emulatorOriginRefreshQueued = new AtomicBoolean();
     private boolean peerPoliciesNeedRefresh;
     /** What each admitted helper's nftables table currently enforces, recorded only after it installed. */
     private final Map<String, Applied> applied = new HashMap<>();
@@ -87,6 +97,17 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private Executor peerRefresh = task -> Thread.ofVirtual().name("security-group-peer-refresh").start(task);
     @Inject
     Instance<VpcRoutingManager> vpcRouting;
+    @Inject
+    Instance<EmulatorOriginSource> emulatorOriginSources;
+    /** Null in unit tests, which model Floci in a container. */
+    @Inject
+    ContainerDetector containerDetector;
+    /** Null in unit tests, which fall back to the embedded DNS address as Floci's only address. */
+    @Inject
+    CurrentContainerNetworkResolver currentContainer;
+    private final Map<String, List<SecurityGroupNftCompiler.EmulatorOrigin>> lastEmulatorOrigins =
+            new ConcurrentHashMap<>();
+    private volatile List<SelfAddress> lastSelfAddresses = List.of();
     private final SweepWorker dnsOriginObserver = new SweepWorker(
             "protected-namespace-dns", true, 1, false, ignored -> retireDnsOrigins());
 
@@ -124,6 +145,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     void stopDnsOriginObserver() {
         dnsOriginObserver.stop();
         dnsOrigins.clear();
+        routeOrigins.clear();
+        lastEmulatorOrigins.clear();
     }
 
     /** Observe Docker outside the firewall monitor; never inspect a container on a DNS query. */
@@ -272,6 +295,114 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         origin.transportAddresses().forEach(transport ->
                 dnsOrigins.computeIfPresent(transport,
                         (address, current) -> current == origin ? null : current));
+        removeRouteOrigin(origin);
+    }
+
+    private void addRouteOrigin(DnsOrigin origin) {
+        origin.routeAddresses().forEach(address -> routeOrigins.merge(address, Set.of(origin), (holders, added) -> {
+            Set<DnsOrigin> merged = new HashSet<>(holders);
+            merged.addAll(added);
+            return Set.copyOf(merged);
+        }));
+    }
+
+    private void removeRouteOrigin(DnsOrigin origin) {
+        origin.routeAddresses().forEach(routed -> routeOrigins.computeIfPresent(routed, (address, holders) -> {
+            Set<DnsOrigin> remaining = new HashSet<>(holders);
+            remaining.removeIf(holder -> holder == origin);
+            return remaining.isEmpty() ? null : Set.copyOf(remaining);
+        }));
+    }
+
+    /**
+     * The address Floci dials for a load balancer in the given VPC to reach {@code address}. With
+     * isolated VPC address spaces a protected endpoint of that VPC is reached at its transport address
+     * on Floci's main network, since its private address lives only inside its namespace; otherwise
+     * the address named is dialled, as Floci joins the VPC network. An address that only protected
+     * endpoints of other VPCs or accounts hold, or any protected address when {@code vpcId} is null,
+     * gives null: no load balancer reaches them on AWS. Any other address is returned unchanged.
+     */
+    public String emulatorRoute(String accountId, String region, String vpcId, String address) {
+        return emulatorRoute(accountId, region, vpcId, address, -1, null);
+    }
+
+    /**
+     * As {@link #emulatorRoute(String, String, String, String)}, and a protected endpoint is also
+     * refused (null) unless its ingress admits tcp {@code port} from a peer in {@code originGroups},
+     * the dialling load balancer's own security groups, at the address Floci sends from. The firewall's
+     * rule admits Floci's shared address for every such load balancer of the VPC, so this decides per
+     * load balancer, as AWS does. {@code originGroups} null skips the check.
+     */
+    public String emulatorRoute(String accountId, String region, String vpcId, String address,
+                                int port, Set<String> originGroups) {
+        String canonical = canonicalAddress(address);
+        Set<DnsOrigin> holders = canonical == null ? null : routeOrigins.get(canonical);
+        if (holders == null || holders.isEmpty()) {
+            return address;
+        }
+        if (vpcId == null) {
+            // A target group or load balancer outside any VPC reaches no protected endpoint.
+            return null;
+        }
+        ClientVpc vpc = new ClientVpc(accountId, region, vpcId);
+        Optional<DnsOrigin> holder = holders.stream().filter(candidate -> candidate.vpc().equals(vpc))
+                .min(Comparator.comparing((DnsOrigin candidate) -> !canonical.equals(candidate.transportAddress()))
+                        .thenComparing(DnsOrigin::eniId));
+        if (holder.isEmpty()) {
+            return null;
+        }
+        if (originGroups != null && !admitsOrigin(holder.get(), accountId, vpcId, port, originGroups)) {
+            return null;
+        }
+        // Floci joins shared-address VPC networks and reaches a VPC address from its own address
+        // there; an isolated VPC address lives only inside the namespace.
+        return isolatedAddressSpaces() ? holder.get().transportAddress() : canonical;
+    }
+
+    private boolean admitsOrigin(DnsOrigin holder, String accountId, String vpcId, int port,
+                                 Set<String> originGroups) {
+        ProtectedEndpoint current = endpoints.get(holder.eniId());
+        if (current == null) {
+            return false;
+        }
+        List<String> sources = emulatorAddresses(current.endpoint(), lastSelfAddresses);
+        String source = sources.isEmpty() ? null : sources.getFirst();
+        return SecurityGroupPolicy.allows(current.endpoint().groups(), false, "tcp", port, -1,
+                new SecurityGroupPolicy.Peer(source, accountId, vpcId, Set.copyOf(originGroups)),
+                current.prefixLists());
+    }
+
+    /** One spelling per address, so an IPv4-mapped or expanded IPv6 form finds the same endpoint. */
+    private static String canonicalAddress(String address) {
+        if (address != null && address.length() > 2 && address.startsWith("[") && address.endsWith("]")) {
+            // A bracketed IPv6 literal resolves to the same address as its bare form.
+            address = address.substring(1, address.length() - 1);
+        }
+        if (address != null && address.indexOf('%') > 0 && address.indexOf(':') >= 0) {
+            // A zone-scoped IPv6 literal dials the same address without its scope.
+            address = address.substring(0, address.indexOf('%'));
+        }
+        if (address == null || address.isBlank() || address.contains("%")
+                || !address.matches("[0-9a-fA-F:.]+")) {
+            return address;
+        }
+        try {
+            return InetAddress.ofLiteral(address).getHostAddress();
+        } catch (IllegalArgumentException e) {
+            return address;
+        }
+    }
+
+    /** {@link #emulatorRoute} through a load balancer's optional manager; unchanged without enforcement. */
+    public static String emulatorRoute(Instance<SecurityGroupFirewallManager> firewall, String accountId,
+                                       String region, String vpcId, String address,
+                                       int port, Set<String> originGroups) {
+        if (firewall == null || !firewall.isResolvable()) {
+            return address;
+        }
+        SecurityGroupFirewallManager manager = firewall.get();
+        return manager.enabled()
+                ? manager.emulatorRoute(accountId, region, vpcId, address, port, originGroups) : address;
     }
 
     @PostConstruct
@@ -493,8 +624,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         ProtectedEndpoint registered = new ProtectedEndpoint(endpoint, helperId, Map.copyOf(prefixLists),
                 new DnsOrigin(endpoint.eniId(), helperId,
                         new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()),
-                        addresses, nativeNetwork));
+                        addresses, nativeNetwork, endpoint.transportAddress(), routeAddresses(endpoint)));
         ProtectedEndpoint previous = endpoints.put(endpoint.eniId(), registered);
+        // Indexed before its policy admits anyone, so no load balancer of another VPC dials it meanwhile.
+        addRouteOrigin(registered.dnsOrigin());
         try {
             admit(endpoint.eniId(), awaitPeers);
             if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
@@ -516,6 +649,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 forgetHelperCleanup(helperId);
             }
         } catch (RuntimeException e) {
+            removeRouteOrigin(registered.dnsOrigin());
             // Revert only this registration: a concurrent one for the same ENI may have replaced it.
             if (endpoints.get(endpoint.eniId()) == registered) {
                 if (previous == null) {
@@ -539,7 +673,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
      */
     void admit(String eniId, boolean awaitPeers) {
         ProtectedEndpoint target = endpoints.get(eniId);
-        install(target, peerEndpoints(), vpcResolvers(), false);
+        install(target, peerEndpoints(), vpcResolvers(), emulatorOrigins(), selfAddresses(), false);
         Arrival arrival = currentArrival;
         currentArrival = null;
         arrived(arrival);
@@ -835,6 +969,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
      */
     private void converge(boolean force) {
         List<String> vpcResolvers = vpcResolvers();
+        List<SecurityGroupNftCompiler.EmulatorOrigin> origins = emulatorOrigins();
+        List<SelfAddress> self = selfAddresses();
         try {
             for (int round = 0; round < 3; round++) {
                 List<SecurityGroupNftCompiler.Endpoint> peers = peerEndpoints();
@@ -843,7 +979,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                         .thenComparing(target -> target.endpoint().eniId()));
                 boolean changed = false;
                 for (ProtectedEndpoint target : order) {
-                    changed |= install(target, peers, vpcResolvers, force && round == 0);
+                    changed |= install(target, peers, vpcResolvers, origins, self, force && round == 0);
                 }
                 if (!changed && endpoints.values().stream().allMatch(this::complete)) {
                     return;
@@ -864,14 +1000,16 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     /** Installs {@code target}'s policy toward the peers that enforce its identity; true when Docker ran. */
     private boolean install(ProtectedEndpoint target, List<SecurityGroupNftCompiler.Endpoint> peers,
-                            List<String> vpcResolvers, boolean force) {
+                            List<String> vpcResolvers, List<SecurityGroupNftCompiler.EmulatorOrigin> origins,
+                            List<SelfAddress> self, boolean force) {
         String eniId = target.endpoint().eniId();
         Set<String> admitted = endpoints.values().stream()
                 .filter(peer -> peer != target && knows(peer, target))
                 .map(peer -> peer.endpoint().eniId())
                 .collect(Collectors.toSet());
         String rules = SecurityGroupNftCompiler.compile(target.endpoint(), peers, target.prefixLists(),
-                vpcResolvers, isolatedAddressSpaces(), peer -> admitted.contains(peer.eniId()));
+                vpcResolvers, isolatedAddressSpaces(), peer -> admitted.contains(peer.eniId()),
+                origins, emulatorAddresses(target.endpoint(), self));
         Map<String, PeerView> known = endpoints.values().stream()
                 .filter(peer -> !peer.endpoint().eniId().equals(eniId))
                 .collect(Collectors.toMap(peer -> peer.endpoint().eniId(), PeerView::of));
@@ -933,7 +1071,19 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private record Applied(String helperId, String rules, Map<String, PeerView> known, Set<String> admitted) {}
 
     private record DnsOrigin(String eniId, String helperId, ClientVpc vpc, List<String> transportAddresses,
-                             String nativeNetwork) {}
+                             String nativeNetwork, String transportAddress, List<String> routeAddresses) {}
+
+    /**
+     * Every address the endpoint really holds: its Docker addresses, including its VPC address when
+     * attached to a VPC network. A private address without a VPC network exists only on paper and
+     * stays dialable as whatever host owns it.
+     */
+    private static List<String> routeAddresses(SecurityGroupNftCompiler.Endpoint endpoint) {
+        Set<String> addresses = new LinkedHashSet<>();
+        endpoint.transportAddresses().forEach(address -> addresses.add(canonicalAddress(address)));
+        endpoint.additionalTransportAddresses().forEach(address -> addresses.add(canonicalAddress(address)));
+        return List.copyOf(addresses);
+    }
 
     /** Refreshes the caller's EC2 instances and ECS tasks after a control-plane rule change. */
     public synchronized void refreshPolicies(String accountId, String region, Map<String, SecurityGroup> groups,
@@ -962,6 +1112,107 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
         retireStoppedHelpers();
         converge(false);
+    }
+
+    /**
+     * Re-installs every policy whose load-balancer admission changed, on the peer-refresh executor,
+     * so the caller never waits on Docker or this monitor.
+     */
+    public void emulatorOriginsChanged() {
+        if (enabled() && emulatorOriginRefreshQueued.compareAndSet(false, true)) {
+            try {
+                peerRefresh.execute(() -> {
+                    // Cleared first: a change after this point queues another pass that sees it.
+                    emulatorOriginRefreshQueued.set(false);
+                    refreshPeers();
+                });
+            } catch (RuntimeException e) {
+                emulatorOriginRefreshQueued.set(false);
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Load balancers whose traffic Floci sends from {@link #emulatorAddresses()}, read once per pass.
+     * A source that fails admits nothing rather than quarantining every endpoint.
+     */
+    private List<SecurityGroupNftCompiler.EmulatorOrigin> emulatorOrigins() {
+        if (emulatorOriginSources == null || emulatorOriginSources.isUnsatisfied()) {
+            return List.of();
+        }
+        List<SecurityGroupNftCompiler.EmulatorOrigin> origins = new ArrayList<>();
+        emulatorOriginSources.stream().forEach(source -> {
+            String key = source.getClass().getName();
+            try {
+                List<SecurityGroupNftCompiler.EmulatorOrigin> read = List.copyOf(source.emulatorOrigins());
+                lastEmulatorOrigins.put(key, read);
+                origins.addAll(read);
+            } catch (RuntimeException e) {
+                // Keep what this source last reported rather than closing or opening every target.
+                LOG.warnv(e, "Could not read load-balancer security groups from {0}; keeping its last answer", key);
+                origins.addAll(lastEmulatorOrigins.getOrDefault(key, List.of()));
+            }
+        });
+        return origins.stream().distinct().toList();
+    }
+
+    /** One of Floci's own container addresses, with its network's prefix length. */
+    private record SelfAddress(String address, int prefixLength) {}
+
+    /** Floci's own container addresses, read once per pass; empty outside a container or in unit tests. */
+    private List<SelfAddress> selfAddresses() {
+        if (currentContainer == null) {
+            return List.of();
+        }
+        try {
+            Optional<String> self = currentContainer.resolveContainerId();
+            if (self.isEmpty()) {
+                return lastSelfAddresses;
+            }
+            List<SelfAddress> addresses = new ArrayList<>();
+            dockerClient.inspectContainerCmd(self.get()).exec().getNetworkSettings().getNetworks().values()
+                    .forEach(network -> {
+                        if (network.getIpAddress() != null && !network.getIpAddress().isBlank()
+                                && network.getIpPrefixLen() != null) {
+                            addresses.add(new SelfAddress(network.getIpAddress(), network.getIpPrefixLen()));
+                        }
+                    });
+            lastSelfAddresses = List.copyOf(addresses);
+            return lastSelfAddresses;
+        } catch (RuntimeException e) {
+            // A transient inspect failure must not move admission to an address Floci does not dial from.
+            LOG.warnv("Could not inspect Floci's own networks, keeping the last answer: {0}", e.getMessage());
+            return lastSelfAddresses;
+        }
+    }
+
+    /**
+     * The addresses Floci's own connections to {@code target} leave from: its address on the Docker
+     * network it shares with the target, the target's VPC network first where Floci joined it. Only
+     * that network's address is admitted, so traffic Floci sends elsewhere never matches. Floci outside
+     * Docker reaches containers from a gateway every host process shares, so it admits nothing.
+     */
+    private List<String> emulatorAddresses(SecurityGroupNftCompiler.Endpoint target, List<SelfAddress> self) {
+        if (containerDetector != null && !containerDetector.isRunningInContainer()) {
+            return List.of();
+        }
+        if (self.isEmpty()) {
+            return embeddedDnsServer.getServerIp().map(List::of).orElse(List.of());
+        }
+        List<String> preferred = isolatedAddressSpaces() ? List.of()
+                : List.copyOf(new TreeSet<>(target.additionalTransportAddresses()));
+        for (List<String> reached : List.of(preferred, target.transportAddress() == null
+                ? List.<String>of() : List.of(target.transportAddress()))) {
+            List<String> matched = self.stream()
+                    .filter(own -> reached.stream().anyMatch(address ->
+                            SecurityGroupPolicy.inCidr(address, own.address() + "/" + own.prefixLength())))
+                    .map(SelfAddress::address).sorted().toList();
+            if (!matched.isEmpty()) {
+                return matched;
+            }
+        }
+        return List.of();
     }
 
     /**

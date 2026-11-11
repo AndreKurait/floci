@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RequestHost;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elb.model.ClassicListener;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
@@ -49,6 +50,10 @@ public class ElbClassicDataPlane {
     private final Vertx vertx;
     private final HttpClient client;
     private final AtomicInteger nextTarget = new AtomicInteger();
+
+    /** Null in unit tests, which run without security-group enforcement. */
+    @Inject
+    jakarta.enterprise.inject.Instance<SecurityGroupFirewallManager> securityGroupFirewall;
 
     @Inject
     public ElbClassicDataPlane(ElbClassicService service, ElbClassicHealthChecker health,
@@ -135,7 +140,7 @@ public class ElbClassicDataPlane {
             fail(context, 502);
             return;
         }
-        List<String> targets = healthyTargets(lb);
+        List<String> targets = healthyTargets(lb, listener.getInstancePort() == null ? -1 : listener.getInstancePort());
         if (targets.isEmpty()) {
             fail(context, 503);
             return;
@@ -155,7 +160,7 @@ public class ElbClassicDataPlane {
                 .onFailure(error -> fail(context, 502));
     }
 
-    private List<String> healthyTargets(ClassicLoadBalancer lb) {
+    private List<String> healthyTargets(ClassicLoadBalancer lb, int instancePort) {
         List<String> targets = new ArrayList<>();
         for (String id : List.copyOf(lb.getInstanceIds())) {
             Instance instance = ec2.findInstanceForAccount(lb.getAccountId(), lb.getRegion(), id).orElse(null);
@@ -165,7 +170,11 @@ public class ElbClassicDataPlane {
                     || !"InService".equals(health.getHealth(lb, id).state())) {
                 continue;
             }
-            targets.add(ElbClassicHealthChecker.instanceHost(instance, id));
+            String host = ElbClassicHealthChecker.backendHost(securityGroupFirewall, lb,
+                    ElbClassicHealthChecker.instanceHost(instance, id), instancePort);
+            if (host != null) {
+                targets.add(host);
+            }
         }
         return targets;
     }
