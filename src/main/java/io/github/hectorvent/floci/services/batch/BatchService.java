@@ -198,7 +198,7 @@ public class BatchService {
                     .toList();
         }
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(envs.size(), offset + maxResults);
+        int end = (int) Math.min(envs.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(computeEnvironmentDetail(envs.get(i)));
         }
@@ -498,7 +498,7 @@ public class BatchService {
                     .toList();
         }
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(queues.size(), offset + maxResults);
+        int end = (int) Math.min(queues.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(jobQueueDetail(queues.get(i)));
         }
@@ -586,7 +586,7 @@ public class BatchService {
                         .thenComparing(BatchJobDefinition::getRevision))
                 .toList();
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(definitions.size(), offset + maxResults);
+        int end = (int) Math.min(definitions.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(jobDefinitionDetail(definitions.get(i)));
         }
@@ -953,7 +953,7 @@ public class BatchService {
                 .toList();
 
         ArrayNode summaries = objectMapper.createArrayNode();
-        int end = Math.min(jobs.size(), offset + maxResults);
+        int end = (int) Math.min(jobs.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             summaries.add(jobSummary(jobs.get(i)));
         }
@@ -980,7 +980,7 @@ public class BatchService {
                 .toList();
 
         ArrayNode summaries = objectMapper.createArrayNode();
-        int end = Math.min(children.size(), offset + maxResults);
+        int end = (int) Math.min(children.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             summaries.add(jobSummary(children.get(i)));
         }

@@ -355,6 +355,21 @@ class BatchServiceTest {
     }
 
     @Test
+    void describeComputeEnvironments_withATokenPastTheEnd_returnsAnEmptyLastPage() throws Exception {
+        BatchService service = immediateService(new InMemoryStorage<String, BatchJob>());
+        service.createComputeEnvironment(json("""
+                {"computeEnvironmentName":"only-ce","type":"MANAGED"}
+                """), REGION);
+
+        JsonNode page = service.describeComputeEnvironments(json("""
+                {"nextToken":"2147483647"}
+                """));
+
+        assertEquals(0, page.path("computeEnvironments").size());
+        assertFalse(page.has("nextToken"), "no page follows the end: " + page);
+    }
+
+    @Test
     void updateJobQueueRejectsUnknownQueue() {
         BatchService service = immediateService(new InMemoryStorage<String, BatchJob>());
         AwsException e = assertThrows(AwsException.class, () -> service.updateJobQueue(json("""
