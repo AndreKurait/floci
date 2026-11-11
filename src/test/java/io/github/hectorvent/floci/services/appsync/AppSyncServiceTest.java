@@ -761,4 +761,18 @@ class AppSyncServiceTest {
         svc.deleteGraphqlApi(merged.getApiId());
         assertTrue(svc.listSourceApiAssociations(other.getApiId(), null, null).items().isEmpty());
     }
+
+    @Test
+    void aRefusedUpdateTypeLeavesTheTypeUnchanged() {
+        AppSyncService svc = AppSyncServiceFixture.create(new AppSyncServiceFixture.MutableClock(NOW));
+        GraphqlApi api = svc.createGraphqlApi(Map.of("name", "types", "authenticationType", "API_KEY"), "us-east-1");
+        svc.createType(api.getApiId(), Map.of("name", "T", "definition", "type T { id: ID }", "format", "SDL"));
+
+        AwsException refused = assertThrows(AwsException.class, () -> svc.updateType(api.getApiId(), "T",
+                Map.of("definition", "type T { changed: ID }", "description", "changed", "format", "BOGUS")));
+
+        assertEquals("BadRequestException", refused.getErrorCode());
+        assertEquals("type T { id: ID }", svc.getType(api.getApiId(), "T").getDefinition());
+        assertEquals(null, svc.getType(api.getApiId(), "T").getDescription());
+    }
 }
