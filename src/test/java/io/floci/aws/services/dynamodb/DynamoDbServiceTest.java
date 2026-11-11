@@ -5175,4 +5175,30 @@ class DynamoDbServiceTest {
     private static List<String> userIds(DynamoDbService.PointInTimeState state) {
         return state.items().stream().map(i -> i.path("userId").path("S").asText()).sorted().toList();
     }
+
+
+    @Test
+    void queryResumesAfterAnExclusiveStartKeyWhoseItemHasBeenDeleted() {
+        createOrdersTable("us-east-1");
+        for (String order : List.of("o1", "o2", "o3", "o4")) {
+            service.putItem("Orders", item("customerId", "c1", "orderId", order), "us-east-1");
+        }
+        ObjectNode exprValues = mapper.createObjectNode();
+        exprValues.set(":pk", attributeValue("S", "c1"));
+
+        DynamoDbService.QueryResult firstPage = service.query("Orders", null, exprValues,
+                "customerId = :pk", null, 2, null, null, null, null, "us-east-1");
+        assertEquals("o2", firstPage.lastEvaluatedKey().get("orderId").get("S").asText());
+        service.deleteItem("Orders", item("customerId", "c1", "orderId", "o2"), "us-east-1");
+
+        DynamoDbService.QueryResult secondPage = service.query("Orders", null, exprValues,
+                "customerId = :pk", null, 2, null, null, firstPage.lastEvaluatedKey(), null, "us-east-1");
+        assertEquals(List.of("o3", "o4"), secondPage.items().stream()
+                .map(found -> found.get("orderId").get("S").asText()).toList());
+
+        DynamoDbService.QueryResult backwards = service.query("Orders", null, exprValues,
+                "customerId = :pk", null, 2, false, null, firstPage.lastEvaluatedKey(), null, "us-east-1");
+        assertEquals(List.of("o1"), backwards.items().stream()
+                .map(found -> found.get("orderId").get("S").asText()).toList());
+    }
 }
