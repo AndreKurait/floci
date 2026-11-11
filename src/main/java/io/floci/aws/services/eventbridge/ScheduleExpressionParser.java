@@ -49,11 +49,12 @@ public final class ScheduleExpressionParser {
         Rate rate = parseRate(expression);
         int value = rate.value();
         return switch (rate.unit()) {
-            case "minute", "minutes" -> value * 60 * 1000L;
-            case "hour", "hours" -> value * 60 * 60 * 1000L;
-            case "day", "days" -> value * 24 * 60 * 60 * 1000L;
-            case "week", "weeks" -> value * 7 * 24 * 60 * 60 * 1000L;
+            case "minute", "minutes" -> value * 60L * 1000L;
+            case "hour", "hours" -> value * 60L * 60 * 1000L;
+            case "day", "days" -> value * 24L * 60 * 60 * 1000L;
+            case "week", "weeks" -> value * 7L * 24 * 60 * 60 * 1000L;
             default -> throw new IllegalArgumentException("Unknown rate unit: " + rate.unit());
+
         };
     }
 
