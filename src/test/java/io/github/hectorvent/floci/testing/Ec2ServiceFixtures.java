@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 
+import java.time.Clock;
+
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -29,6 +31,19 @@ public final class Ec2ServiceFixtures {
 
     /** Over {@code storage}, for a test that builds a second service on the same stores. */
     public static Ec2Service mockModeService(InMemoryStorageFactory storage) {
+        return new Ec2Service(mockModeConfig(), mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                storage);
+    }
+
+    /** With every date the service stamps or decides from read from {@code clock}. */
+    public static Ec2Service mockModeService(Clock clock) {
+        return new Ec2Service(mockModeConfig(), mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(ACCOUNT), clock);
+    }
+
+    private static EmulatorConfig mockModeConfig() {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
@@ -36,8 +51,6 @@ public final class Ec2ServiceFixtures {
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
         when(ec2.mock()).thenReturn(true);
-        return new Ec2Service(config, mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
-                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
-                storage);
+        return config;
     }
 }

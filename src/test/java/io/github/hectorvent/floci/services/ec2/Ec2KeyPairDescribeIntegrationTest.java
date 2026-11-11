@@ -1,12 +1,13 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import io.github.hectorvent.floci.testing.MutableClock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -29,14 +30,17 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 @QuarkusTest
 class Ec2KeyPairDescribeIntegrationTest {
 
+    @Inject
+    MutableClock clock;
+
     @Test
     void createdAndImportedKeyPairsAreDescribedWithTheirTypeAndCreateTime() {
         String prefix = "described-" + UUID.randomUUID();
-        Instant before = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        Instant before = clock.instant();
         String created = createdKeyPairId(prefix + "-created");
         String importedRsa = importedKeyPairId(prefix + "-rsa", Ec2KeyMaterial.generateRsa().openSshPublicKey());
         String importedEd25519 = importedKeyPairId(prefix + "-ed25519", ED25519_KEY + " someone@example.com");
-        Instant after = Instant.now();
+        Instant after = clock.instant();
         try {
             for (String[] expected : new String[][] {{created, "rsa"}, {importedRsa, "rsa"}, {importedEd25519, "ed25519"}}) {
                 XmlPath item = ec2("DescribeKeyPairs").formParam("KeyPairId.1", expected[0])

@@ -126,6 +126,7 @@ import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -239,6 +240,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // A first launch may need to pull a large AMI-backed image. Keep a finite CloudFormation
     // bound, but allow enough time for that legitimate cold-start path before cancellation.
     private static final Duration CONTAINER_LAUNCH_TIMEOUT = Duration.ofMinutes(5);
+    /** How long a terminated instance stays describable before {@link #pruneTerminatedInstances} removes it. */
+    private static final Duration TERMINATED_INSTANCE_RETENTION = Duration.ofHours(1);
     private static final Set<String> VPN_GATEWAY_FILTERS = Set.of(
             "amazon-side-asn", "attachment.state", "attachment.vpc-id", "availability-zone",
             "state", "tag-key", "tag-value", "type", "vpn-gateway-id");
@@ -377,6 +380,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * delegating.
      */
     private VpcNetworkManager vpcNetworkManager;
+    /**
+     * The one source of every date this service stamps or decides from: creation and launch times,
+     * the hour after which a terminated instance is pruned, capacity reservation schedules and the
+     * spot price history window. Not final for the reason given on {@link #vpcNetworkManager}: the
+     * entry points that receive a clock assign it after delegating, and the others keep the system
+     * clock.
+     */
+    private Clock clock = Clock.systemUTC();
     private jakarta.enterprise.inject.Instance<ClusterNodeInstanceProvider> clusterNodeInstanceProviders;
     private ClusterNodeInstanceProvider testClusterNodeInstanceProvider;
     private final Ec2VolumeBlockDeviceManager volumeBlockDeviceManager;
@@ -514,6 +525,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 instanceTypeCatalog, storageFactory, (jakarta.enterprise.inject.Instance<RequestContext>) null);
     }
 
+    /** As the constructor above, with every date read from {@code clock}, for tests that own the timeline. */
+    public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
+                      Ec2PortForwardManager portForwardManager,
+                      AmiImageResolver amiImageResolver, Ec2ImageCatalog imageCatalog,
+                      Ec2InstanceTypeCatalog instanceTypeCatalog, StorageFactory storageFactory,
+                      Clock clock) {
+        this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
+                instanceTypeCatalog, storageFactory, (jakarta.enterprise.inject.Instance<RequestContext>) null);
+        this.clock = clock;
+    }
+
     // Package-private for tests that need the Docker-backed VPC networking but not a request context.
     Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
                Ec2PortForwardManager portForwardManager,
@@ -552,7 +574,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                       jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance,
                       Ec2EbsEncryptionService ebsEncryptionService,
                       jakarta.enterprise.inject.Instance<VpcDependencyProvider> vpcDependencyProviders,
-                      jakarta.enterprise.inject.Instance<ResourceGroupsService> resourceGroupsServices) {
+                      jakarta.enterprise.inject.Instance<ResourceGroupsService> resourceGroupsServices,
+                      Clock clock) {
         this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
                 instanceTypeCatalog, storageFactory, requestContextInstance, iamService, volumeBlockDeviceManager);
         this.vpcNetworkManager = vpcNetworkManager;
@@ -562,6 +585,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         this.ebsEncryptionService = ebsEncryptionService;
         this.vpcDependencyProviders = vpcDependencyProviders;
         this.resourceGroupsServices = resourceGroupsServices;
+        this.clock = clock;
     }
 
     public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
@@ -2592,7 +2616,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         gateway.setState("available");
         gateway.setOwnerId(ownerAccountId);
         gateway.setDescription(description);
-        gateway.setCreationTime(ISO_FMT.format(Instant.now()));
+        gateway.setCreationTime(ISO_FMT.format(clock.instant()));
         gateway.setRegion(region);
         gateway.setOptions(resolveTransitGatewayOptions(requested));
 
@@ -2668,7 +2692,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         routeTable.setState("available");
         routeTable.setDefaultAssociationRouteTable("enable".equals(gateway.getOptions().getDefaultRouteTableAssociation()));
         routeTable.setDefaultPropagationRouteTable("enable".equals(gateway.getOptions().getDefaultRouteTablePropagation()));
-        routeTable.setCreationTime(ISO_FMT.format(Instant.now()));
+        routeTable.setCreationTime(ISO_FMT.format(clock.instant()));
         routeTable.setRegion(region);
         transitGatewayRouteTables.put(key(region, routeTableId), routeTable);
         return routeTable;
@@ -3034,7 +3058,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // compression createTransitGateway applies.
         attachment.setState("available");
         attachment.setSubnetIds(new ArrayList<>(subnetIds));
-        attachment.setCreationTime(ISO_FMT.format(Instant.now()));
+        attachment.setCreationTime(ISO_FMT.format(clock.instant()));
         attachment.setRegion(region);
         attachment.setOptions(resolveAttachmentOptions(requested));
         // Both halves together: an association state without a table would be a shape AWS never
@@ -3310,7 +3334,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     peerTransitGatewayId, peerAccountId, peerRegion));
             attachment.setDynamicRouting(isSet(dynamicRouting) ? dynamicRouting : "disable");
             attachment.setState("pendingAcceptance");
-            attachment.setCreationTime(ISO_FMT.format(Instant.now()));
+            attachment.setCreationTime(ISO_FMT.format(clock.instant()));
             transitGatewayPeeringAttachments.put(attachmentId, attachment);
             if (attachmentTags != null && !attachmentTags.isEmpty()) {
                 putTags(region, attachmentId, new ArrayList<>(attachmentTags));
@@ -3523,7 +3547,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // A table asked for by name is never either default; only the one the gateway mints is.
             routeTable.setDefaultAssociationRouteTable(false);
             routeTable.setDefaultPropagationRouteTable(false);
-            routeTable.setCreationTime(ISO_FMT.format(Instant.now()));
+            routeTable.setCreationTime(ISO_FMT.format(clock.instant()));
             routeTable.setRegion(region);
             if (routeTableTags != null && !routeTableTags.isEmpty()) {
                 routeTable.setTags(new ArrayList<>(routeTableTags));
@@ -4685,7 +4709,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             inst.setKeyPairPublicKey(launchKeyPair == null ? null : launchKeyPair.getPublicKey());
                             inst.setSecurityGroups(new ArrayList<>(sgIdentifiers));
                             inst.setArchitecture(architecture);
-                            inst.setLaunchTime(Instant.now());
+                            inst.setLaunchTime(clock.instant());
                             inst.setAmiLaunchIndex(i);
                             inst.setClientToken(clientToken);
                             inst.setReplayProtected(attempt != null);
@@ -6065,7 +6089,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         // Termination also disassociates an Elastic IP, so nothing public is left.
                         clearPublicAddress(inst);
                     }
-                    inst.setTerminatedAt(System.currentTimeMillis());
+                    inst.setTerminatedAt(clock.millis());
                     detachAttachedVolumesOnTermination(region, inst);
                     if (afterVolumeDetach != null) {
                         afterVolumeDetach.run();
@@ -6403,7 +6427,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     /** Removes terminated instances older than 1 hour. Called periodically by lifecycle. */
     public void pruneTerminatedInstances() {
         synchronized (containerCompletionLock) {
-            long cutoff = System.currentTimeMillis() - 3_600_000L;
+            long cutoff = clock.millis() - TERMINATED_INSTANCE_RETENTION.toMillis();
             for (String storeKey : new ArrayList<>(instances.keys())) {
                 Instance inst = instances.get(storeKey).orElse(null);
                 if (inst != null && !inst.isReplayProtected()
@@ -6634,7 +6658,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         InstanceProfile profile = resolveIamInstanceProfile(null, profileArn);
         inst.setIamInstanceProfileArn(profileArn);
         inst.setIamInstanceProfileId(profile.getInstanceProfileId());
-        inst.setIamInstanceProfileAssociationTime(Instant.now());
+        inst.setIamInstanceProfileAssociationTime(clock.instant());
         instances.put(key(region, instanceId), inst);
         return association(inst, profileArn, "associating");
     }
@@ -6647,7 +6671,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         InstanceProfile profile = resolveIamInstanceProfile(null, profileArn);
         inst.setIamInstanceProfileArn(profileArn);
         inst.setIamInstanceProfileId(profile.getInstanceProfileId());
-        inst.setIamInstanceProfileAssociationTime(Instant.now());
+        inst.setIamInstanceProfileAssociationTime(clock.instant());
         instances.put(key(region, inst.getInstanceId()), inst);
         return association(inst, profileArn, "associating");
     }
@@ -9591,7 +9615,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // Without storing it, a key pair created here could never authenticate anything.
         kp.setPublicKey(generated.openSshPublicKey());
         kp.setKeyType(type);
-        kp.setCreateTime(Instant.now());
+        kp.setCreateTime(clock.instant());
         kp.setRegion(region);
         storeNewKeyPair(region, kp);
         return kp;
@@ -9713,7 +9737,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // The key as one OpenSSH line, whatever format it came in: RunInstances writes it to the
         // guest's authorized_keys, which reads neither RFC 4716 nor DER.
         kp.setPublicKey(imported.openSshPublicKey());
-        kp.setCreateTime(Instant.now());
+        kp.setCreateTime(clock.instant());
         kp.setRegion(region);
         storeNewKeyPair(region, kp);
         return kp;
@@ -10481,7 +10505,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         image.setRootDeviceType("ebs");
         image.setVirtualizationType("hvm");
         image.setHypervisor("xen");
-        image.setCreationDate(ISO_FMT.format(Instant.now()));
+        image.setCreationDate(ISO_FMT.format(clock.instant()));
         image.setRegion(region);
         image.setSourceImageId(sourceImageId);
         image.setBlockDeviceMappings(blockDeviceMappings != null ? new ArrayList<>(blockDeviceMappings) : List.of());
@@ -11117,7 +11141,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             snapshot.setRegion(region);
             snapshot.setEncrypted(volume.isEncrypted());
             snapshot.setDescription(description == null ? "" : description);
-            snapshot.setStartTime(Instant.now());
+            snapshot.setStartTime(clock.instant());
             snapshot.setState("completed");
             snapshot.setProgress("100%");
             if (snapshotTags != null) {
@@ -11210,7 +11234,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         LaunchTemplate launchTemplate = new LaunchTemplate();
         launchTemplate.setLaunchTemplateId("lt-" + randomHex(17));
         launchTemplate.setLaunchTemplateName(name);
-        launchTemplate.setCreateTime(Instant.now());
+        launchTemplate.setCreateTime(clock.instant());
         launchTemplate.setCreatedBy(
                 AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "iam", callerAccountId(), "root").toString());
         launchTemplate.setRegion(region);
@@ -12015,7 +12039,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         snapshot.setOwnerId(callerAccountId());
         snapshot.setState("completed");
         snapshot.setDescription("Created by RegisterImage for " + image.getName());
-        snapshot.setStartTime(Instant.now());
+        snapshot.setStartTime(clock.instant());
         snapshot.setVolumeSize(ebs.getVolumeSize());
         snapshot.setEncrypted(Boolean.TRUE.equals(ebs.getEncrypted()));
         snapshot.setRegion(region);
@@ -12788,7 +12812,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     Instant capacityReservationNow() {
-        return Instant.now();
+        return clock.instant();
     }
 
     private void validateCapacityReservationSchedule(Instant start, Long duration, String delivery,
@@ -13689,7 +13713,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             host.setOutpostArn(outpostArn);
             host.setAssetId(assetId);
-            host.setAllocationTime(Instant.now());
+            host.setAllocationTime(clock.instant());
             hosts.put(key(region, host.getHostId()), host);
             allocated.add(host);
         }
@@ -13794,7 +13818,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         "Dedicated host '" + hostId + "' cannot be released as it is occupied.", 400);
             }
             host.setState("released");
-            host.setReleaseTime(Instant.now());
+            host.setReleaseTime(clock.instant());
             hosts.put(key(region, hostId), host);
         }
     }
@@ -15159,7 +15183,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         endpoint.setSubnetId(subnetId);
         endpoint.setAvailabilityZone(subnet.getAvailabilityZone());
         endpoint.setAvailabilityZoneId(subnet.getAvailabilityZoneId());
-        endpoint.setCreatedAt(Instant.now());
+        endpoint.setCreatedAt(clock.instant());
         endpoint.setPreserveClientIp(Boolean.TRUE.equals(preserveClientIp));
         endpoint.setSecurityGroupIds(groups);
         endpoint.setIpAddressType(type);
@@ -16876,7 +16900,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             vol.setThroughput(throughput);
         }
         vol.setSnapshotId(snapshotId);
-        vol.setCreateTime(Instant.now());
+        vol.setCreateTime(clock.instant());
         vol.setState("available");
         vol.setRegion(region);
         return vol;
@@ -17169,7 +17193,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
 
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             VolumeModification mod = new VolumeModification();
             mod.setVolumeId(volumeId);
             mod.setTargetSize(targetSize);
@@ -17331,7 +17355,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         attachment.setInstanceId(instanceId);
         attachment.setDevice(device);
         attachment.setState("attached");
-        attachment.setAttachTime(Instant.now());
+        attachment.setAttachTime(clock.instant());
         attachment.setDeleteOnTermination(false); // Default for attached volumes
 
         volume.getAttachments().add(attachment);
@@ -17903,7 +17927,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             attachment.setStatus("attached");
             attachment.setInstanceId(instanceId);
             attachment.setInstanceOwnerId(callerAccountId());
-            attachment.setAttachTime(ISO_FMT.format(Instant.now()));
+            attachment.setAttachTime(ISO_FMT.format(clock.instant()));
             attachment.setDeleteOnTermination(false);
 
             ni.setAttachment(attachment);
@@ -18305,9 +18329,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             sir.setState("active");
             sir.setStatusCode("fulfilled");
             sir.setStatusMessage("Your Spot Instance request is fulfilled.");
-            sir.setStatusUpdateTime(Instant.now());
+            sir.setStatusUpdateTime(clock.instant());
             sir.setInstanceId(launchedInstance.getInstanceId());
-            sir.setCreateTime(Instant.now());
+            sir.setCreateTime(clock.instant());
             sir.setLaunchSpecification(spec);
             sir.setRegion(region);
             if (productDescription != null && !productDescription.isBlank()) {
@@ -18366,7 +18390,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             sir.setState("cancelled");
             sir.setStatusCode("request-canceled-and-instance-running");
             sir.setStatusMessage("Spot Instance request canceled. Associated Spot Instance is still running.");
-            sir.setStatusUpdateTime(Instant.now());
+            sir.setStatusUpdateTime(clock.instant());
             spotInstanceRequests.put(key(region, id), sir);
             result.add(sir);
         }
@@ -18443,7 +18467,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         validateSpotPriceHistory(productDescriptions, availabilityZone, availabilityZoneId, startTime, endTime, filters);
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         if (startTime != null && startTime.isAfter(now)) {
             return new SpotPriceHistoryResult(List.of(), null);
         }
@@ -18615,7 +18639,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             out.add(new ExplorerResource(
                     AwsArnUtils.Arn.of("ec2", resourceRegion, ownerAccountId, resourceType + "/" + resourceId).toString(),
                     "ec2:" + resourceType, "ec2", resourceRegion, ownerAccountId,
-                    created != null ? created : Instant.now(),
+                    created != null ? created : clock.instant(),
                     explorerTags(tags.apply(resource))));
         }
     }
