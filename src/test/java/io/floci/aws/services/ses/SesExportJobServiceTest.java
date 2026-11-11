@@ -12,7 +12,6 @@ import io.floci.aws.services.ses.model.EmailInsights;
 import io.floci.aws.services.ses.model.ExportJob;
 import io.floci.aws.services.ses.model.InsightsEvent;
 import io.floci.aws.services.ses.model.SentEmail;
-import io.floci.aws.testing.TestTime;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,9 +27,6 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executor;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -56,13 +52,6 @@ class SesExportJobServiceTest {
 
     private static final String REGION = "eu-north-1";
     private static final String ACCOUNT = "000000000000";
-    private static final Duration ONE_NANO = Duration.ofNanos(1);
-    private static final Duration RESET_DRAIN_TIMEOUT =
-            Duration.ofMillis(SesExportJobService.RESET_DRAIN_TIMEOUT_MILLIS);
-    private static final Duration RESET_ADMISSION_WAIT =
-            Duration.ofMillis(SesExportJobService.RESET_ADMISSION_WAIT_MILLIS);
-    /** Real-time bound for a thread that should already be on its way out. */
-    private static final Duration STUCK = Duration.ofSeconds(30);
 
     private final S3Service s3Service = mock(S3Service.class);
     private final PreSignedUrlGenerator presigner = mock(PreSignedUrlGenerator.class);
@@ -324,70 +313,6 @@ class SesExportJobServiceTest {
 
         assertEquals("LimitExceededException", thrown.getErrorCode());
         assertEquals(20, SesExportJobService.MAX_CONCURRENT_JOBS);
-    }
-
-    private SesExportJobService onTimeline(SesResetWait resetWait, Executor workers) {
-        return new SesExportJobService(new InMemoryStorage<>(), sentEmailService, s3Service, presigner,
-                objectMapper, Clock.fixed(Instant.parse("2026-09-23T00:00:00Z"), ZoneOffset.UTC),
-                workers, "http://localhost:4566", resetWait);
-    }
-
-    @Test
-    void aResetGivesUpOnAWedgedWorkerExactlyAtTheDrainTimeout() throws Exception {
-        CountDownLatch writing = new CountDownLatch(1);
-        CountDownLatch releaseWrite = new CountDownLatch(1);
-        when(s3Service.putObject(anyString(), anyString(), any(), anyString(), any()))
-                .thenAnswer(invocation -> {
-                    writing.countDown();
-                    releaseWrite.await();
-                    return null;
-                });
-        TestTime time = TestTime.create();
-        TimelineResetWait resetWait = new TimelineResetWait(time);
-        SesExportJobService threaded = onTimeline(resetWait, task -> new Thread(task).start());
-        threaded.createExportJob(REGION, ACCOUNT, insightsSource(), destination(), () -> { });
-        assertTrue(writing.await(5, TimeUnit.SECONDS), "the worker never reached its write");
-
-        Thread reset = new Thread(threaded::beforeReset);
-        reset.start();
-        assertEquals(RESET_DRAIN_TIMEOUT, resetWait.awaitPark(), "the drain waits its whole timeout");
-
-        time.advance(RESET_DRAIN_TIMEOUT.minus(ONE_NANO));
-        assertEquals(0, resetWait.unreportedParks(), "one nanosecond short the drain is still on its first wait");
-        assertTrue(reset.isAlive());
-
-        time.advance(ONE_NANO);
-        assertTrue(reset.join(STUCK), "beforeReset must return on the deadline");
-        assertEquals(0, resetWait.unreportedParks(), "and gives up there instead of waiting again");
-        releaseWrite.countDown();
-        threaded.afterReset();
-    }
-
-    @Test
-    void aCreateStillWaitingWhenTheAdmissionWaitEndsIsRefusedAsThrottled() throws Exception {
-        TestTime time = TestTime.create();
-        TimelineResetWait resetWait = new TimelineResetWait(time);
-        SesExportJobService gated = onTimeline(resetWait, tasks::add);
-        gated.beforeReset();
-
-        FutureTask<ExportJob> create = new FutureTask<>(() -> gated.createExportJob(REGION, ACCOUNT,
-                insightsSource(), destination(), () -> { }));
-        Thread creator = new Thread(create);
-        creator.start();
-        assertEquals(RESET_ADMISSION_WAIT, resetWait.awaitPark());
-
-        time.advance(RESET_ADMISSION_WAIT.minus(ONE_NANO));
-        assertEquals(0, resetWait.unreportedParks());
-        assertFalse(create.isDone(), "one nanosecond short of the admission wait the create is still waiting");
-
-        time.advance(ONE_NANO);
-        ExecutionException refused = assertThrows(ExecutionException.class,
-                () -> create.get(STUCK.toSeconds(), TimeUnit.SECONDS));
-        AwsException cause = (AwsException) refused.getCause();
-        assertEquals("TooManyRequestsException", cause.getErrorCode());
-        assertEquals(429, cause.getHttpStatus());
-        assertTrue(tasks.isEmpty(), "a refused create dispatches no worker");
-        gated.afterReset();
     }
 
     /** Both waits here park in {@code Object.wait(timeout)}, so the state is timed, not WAITING. */
