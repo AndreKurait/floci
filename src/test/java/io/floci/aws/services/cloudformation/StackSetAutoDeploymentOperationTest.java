@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -70,7 +71,7 @@ class StackSetAutoDeploymentOperationTest {
         stack.setStatus("CREATE_COMPLETE");
         when(cloudFormation.describeStacks(anyString(), anyString(), anyString())).thenReturn(List.of(stack));
         service = new StackSetService(cloudFormation, new InMemoryStorageFactory(MANAGEMENT), organizations,
-                new RegionResolver(REGION, MANAGEMENT));
+                new RegionResolver(REGION, MANAGEMENT), Clock.systemUTC());
         service.activateOrganizationsAccess();
         service.createStackSet(SET, "{\"Resources\":{}}", null, null, null, null,
                 "SERVICE_MANAGED", true, false, false);
