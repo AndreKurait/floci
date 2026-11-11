@@ -673,6 +673,10 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             throw new AwsException("InvalidConfigurationRequest",
                     "Connection draining timeout must be between 1 and 3600 seconds.", 400);
         }
+        if (update.idleTimeout() != null && (update.idleTimeout() < 1 || update.idleTimeout() > 4000)) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "Idle timeout must be between 1 and 4000 seconds.", 400);
+        }
         try (RuntimeWrite ignored = runtimeWrite(region, name)) {
             ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
             update.applyTo(lb.getAttributes());

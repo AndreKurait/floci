@@ -96,6 +96,30 @@ class ElbClassicRequestValidationTest {
         assertEquals(target, service.requireLoadBalancer(REGION, "web").getHealthCheck().getTarget());
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {0, -5, 4001})
+    void anIdleTimeoutOutsideOneToFourThousandSecondsIsRefused(int idleTimeout) {
+        ClassicLoadBalancer created = create("web", listener(80));
+        int inForce = created.getAttributes().getIdleTimeout();
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> service.modifyLoadBalancerAttributes(REGION, "web", idleTimeout(idleTimeout)));
+
+        assertEquals("InvalidConfigurationRequest", refused.getErrorCode());
+        assertEquals(400, refused.getHttpStatus());
+        assertEquals(inForce, service.requireLoadBalancer(REGION, "web").getAttributes().getIdleTimeout());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 4000})
+    void anIdleTimeoutOfOneToFourThousandSecondsIsStored(int idleTimeout) {
+        create("web", listener(80));
+
+        service.modifyLoadBalancerAttributes(REGION, "web", idleTimeout(idleTimeout));
+
+        assertEquals(idleTimeout, service.requireLoadBalancer(REGION, "web").getAttributes().getIdleTimeout());
+    }
+
     private ClassicLoadBalancer create(String name, ClassicListener listener) {
         return service.createLoadBalancer(REGION, name, List.of(listener), List.of(), List.of("subnet-a"),
                 List.of("sg-1"), null, Map.of());
@@ -108,5 +132,9 @@ class ElbClassicRequestValidationTest {
         listener.setInstanceProtocol("HTTP");
         listener.setInstancePort(8080);
         return listener;
+    }
+
+    private static ElbClassicService.AttributeUpdate idleTimeout(int seconds) {
+        return new ElbClassicService.AttributeUpdate(null, null, null, null, null, null, null, seconds, Map.of());
     }
 }
