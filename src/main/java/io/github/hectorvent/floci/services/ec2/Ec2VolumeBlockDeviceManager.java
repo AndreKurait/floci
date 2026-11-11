@@ -31,9 +31,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -50,24 +52,36 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
 
     private static final Logger LOG = Logger.getLogger(Ec2VolumeBlockDeviceManager.class);
     private static final int DEFAULT_TIMEOUT_SECONDS = 30;
+    /** How long one answer of the Docker daemon to a ping is reused. */
+    private static final long DOCKER_AVAILABILITY_TTL_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     private final DockerClient dockerClient;
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final EmulatorConfig config;
+    private final LongSupplier nanoTime;
 
     private volatile Boolean dockerAvailableCached;
-    private volatile long dockerAvailableCheckTime;
+    private volatile long dockerAvailableCheckNanos;
 
     @Inject
     public Ec2VolumeBlockDeviceManager(DockerClient dockerClient,
                                        ContainerBuilder containerBuilder,
                                        ContainerLifecycleManager lifecycleManager,
                                        EmulatorConfig config) {
+        this(dockerClient, containerBuilder, lifecycleManager, config, System::nanoTime);
+    }
+
+    Ec2VolumeBlockDeviceManager(DockerClient dockerClient,
+                                ContainerBuilder containerBuilder,
+                                ContainerLifecycleManager lifecycleManager,
+                                EmulatorConfig config,
+                                LongSupplier nanoTime) {
         this.dockerClient = dockerClient;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.config = config;
+        this.nanoTime = nanoTime;
     }
 
     /**
@@ -83,8 +97,8 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
         if (dockerClient == null || lifecycleManager == null) {
             return false;
         }
-        long now = System.currentTimeMillis();
-        if (dockerAvailableCached != null && (now - dockerAvailableCheckTime) < 5000) {
+        long now = nanoTime.getAsLong();
+        if (dockerAvailableCached != null && now - dockerAvailableCheckNanos < DOCKER_AVAILABILITY_TTL_NANOS) {
             return dockerAvailableCached;
         }
         try {
@@ -93,7 +107,7 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
         } catch (Exception e) {
             dockerAvailableCached = false;
         }
-        dockerAvailableCheckTime = now;
+        dockerAvailableCheckNanos = now;
         return dockerAvailableCached;
     }
 
