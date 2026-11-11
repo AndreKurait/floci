@@ -42,6 +42,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -2053,7 +2054,8 @@ class CloudFormationServiceRollbackTest {
         stack.setUpdateRollbackResourceIds(List.of("LogGroup"));
         stack.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
         when(provisioner.rollbackUpdate(eq(logGroup), any())).thenReturn(true, false);
-        clock.failNextRead("simulated clock failure");
+        clock.failFirstReadAfter(() -> reported(stack, "LogGroup", "Resource update rolled back"),
+                "simulated clock failure");
 
         resumeService.resumeUpdateRollback(stack, List.of(), false, REGION);
 
@@ -2094,7 +2096,8 @@ class CloudFormationServiceRollbackTest {
         stack.setUpdateRollbackSnapshot(previousState);
         stack.setUpdateRollbackResourceIds(List.of("Skipped"));
         stack.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
-        clock.failNextRead("simulated clock failure");
+        clock.failFirstReadAfter(() -> reported(stack, "Skipped", "Resource skipped during UpdateRollback"),
+                "simulated clock failure");
 
         resumeService.resumeUpdateRollback(stack, List.of("Skipped"), false, REGION);
 
@@ -2287,11 +2290,23 @@ class CloudFormationServiceRollbackTest {
         return mapper.readValue(mapper.writeValueAsString(stack), Stack.class);
     }
 
-    /** The system clock, except that the read after {@link #failNextRead} throws. */
+    /** Whether the stack carries an event of {@code logicalId} with this reason. */
+    private static boolean reported(Stack stack, String logicalId, String reason) {
+        return stack.getEvents().stream().anyMatch(event -> logicalId.equals(event.getLogicalResourceId())
+                && reason.equals(event.getResourceStatusReason()));
+    }
+
+    /**
+     * The system clock, except that one read throws: the first one made once the step given to
+     * {@link #failFirstReadAfter} is reached. Stack events are stamped from this clock too, so
+     * "the next read" would fail the step itself instead of the body that follows it.
+     */
     private static final class FailingClock extends Clock {
         private final AtomicReference<String> failure = new AtomicReference<>();
+        private volatile BooleanSupplier reached = () -> false;
 
-        void failNextRead(String message) {
+        void failFirstReadAfter(BooleanSupplier reached, String message) {
+            this.reached = reached;
             failure.set(message);
         }
 
@@ -2307,8 +2322,8 @@ class CloudFormationServiceRollbackTest {
 
         @Override
         public Instant instant() {
-            String message = failure.getAndSet(null);
-            if (message != null) {
+            String message = failure.get();
+            if (message != null && reached.getAsBoolean() && failure.compareAndSet(message, null)) {
                 throw new IllegalStateException(message);
             }
             return Instant.now();
