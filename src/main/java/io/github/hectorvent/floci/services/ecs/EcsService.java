@@ -3116,10 +3116,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 // changes its desired count or task definition: one whose tasks are up has finished,
                 // whether or not anything read it. recordServiceDeployment stops it if it has not.
                 currentServiceDeployment(svc);
+                if (request.getDesiredCount() != null && request.getDesiredCount() < 0) {
+                    throw new AwsException("InvalidParameterException", "desiredCount cannot be a negative number.", 400);
+                }
+                // Resolved before the first change: svc is the stored service, so a request refused for
+                // its task definition after that would have left its other members applied.
+                TaskDefinition requestedTaskDefinition = request.getTaskDefinition() != null
+                        ? resolveLaunchableTaskDefinition(request.getTaskDefinition(), region) : null;
                 if (request.getDesiredCount() != null) {
-                    if (request.getDesiredCount() < 0) {
-                        throw new AwsException("InvalidParameterException", "desiredCount cannot be a negative number.", 400);
-                    }
                     svc.setDesiredCount(request.getDesiredCount());
                 }
                 // The members whose change starts new tasks, as UpdateService documents them: the network
@@ -3183,8 +3187,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 }
                 boolean taskDefChanged = false;
                 String platformVersionBefore = svc.getPlatformVersion();
-                if (request.getTaskDefinition() != null) {
-                    TaskDefinition resolved = resolveLaunchableTaskDefinition(request.getTaskDefinition(), region);
+                if (requestedTaskDefinition != null) {
+                    TaskDefinition resolved = requestedTaskDefinition;
                     taskDefChanged = !resolved.getTaskDefinitionArn().equals(svc.getTaskDefinition());
                     svc.setTaskDefinition(resolved.getTaskDefinitionArn());
                     applyServicePlatform(svc, resolved, request.getPlatformVersion() != null
