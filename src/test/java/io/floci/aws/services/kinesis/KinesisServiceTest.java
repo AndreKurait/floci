@@ -505,6 +505,43 @@ class KinesisServiceTest {
         assertEquals(2, updated.getShards().stream().filter(KinesisShard::isClosed).count());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "340282366920938463463374607431768211455"})
+    void updateShardCountScalesAfterAnEdgeSplit(String splitKey) {
+        kinesisService.createStream("edge-split", 1, REGION);
+        KinesisStream stream = kinesisService.describeStream("edge-split", REGION);
+        String parentId = stream.getShards().getFirst().getShardId();
+        kinesisService.splitShard("edge-split", parentId, splitKey, REGION);
+        KinesisShard singleton = stream.getShards().stream()
+                .filter(s -> !s.isClosed())
+                .filter(s -> s.getHashKeyRange().startingHashKey().equals(s.getHashKeyRange().endingHashKey()))
+                .findFirst().orElseThrow();
+
+        KinesisService.UpdateShardCountResult result = assertDoesNotThrow(
+                () -> kinesisService.updateShardCount("edge-split", 4, "UNIFORM_SCALING", REGION));
+
+        assertEquals(2, result.currentShardCount());
+        assertEquals(4, result.targetShardCount());
+        assertFalse(singleton.isClosed(), "a singleton cannot be split");
+        List<KinesisShard> open = stream.getShards().stream().filter(s -> !s.isClosed())
+                .sorted(Comparator.comparing(s -> new BigInteger(s.getHashKeyRange().startingHashKey())))
+                .toList();
+        assertEquals(4, open.size());
+        assertEquals("0", open.getFirst().getHashKeyRange().startingHashKey());
+        assertEquals("340282366920938463463374607431768211455",
+                open.getLast().getHashKeyRange().endingHashKey());
+        for (int i = 1; i < open.size(); i++) {
+            assertEquals(new BigInteger(open.get(i - 1).getHashKeyRange().endingHashKey()).add(BigInteger.ONE),
+                    new BigInteger(open.get(i).getHashKeyRange().startingHashKey()));
+        }
+        assertEquals(1, stream.getShardCountUpdateTimestamps().size(), "one scaling request uses one allowance");
+        assertEquals(3, stream.getShards().stream().filter(KinesisShard::isClosed).count());
+        assertEquals(2, open.stream().filter(s -> stream.getShards().stream()
+                .anyMatch(parent -> parent.getShardId().equals(s.getParentShardId())
+                        && parent.getParentShardId() != null && !parent.getParentShardId().equals(parentId))).count(),
+                "scaling must split a newly created child to reach four open shards");
+    }
+
     @Test
     void updateShardCountScalesDownToHalf() {
         kinesisService.createStream("my-stream", 4, REGION);

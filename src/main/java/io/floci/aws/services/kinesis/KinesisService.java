@@ -641,14 +641,20 @@ public class KinesisService implements ResourceProvider {
                                       int currentOpenShardCount, int targetShardCount, String region) {
         if (targetShardCount > currentOpenShardCount) {
             int splitsNeeded = targetShardCount - currentOpenShardCount;
-            List<KinesisShard> splitCandidates = stream.getShards().stream()
-                    .filter(s -> !s.isClosed())
-                    .sorted(Comparator.comparing(KinesisService::hashRangeWidth).reversed()
-                            .thenComparing(KinesisShard::getShardId))
-                    .limit(splitsNeeded)
-                    .toList();
-            for (KinesisShard parent : splitCandidates) {
-                splitShard(streamName, parent.getShardId(), midpointHashKey(parent.getHashKeyRange()), region);
+            while (splitsNeeded > 0) {
+                List<KinesisShard> splitCandidates = stream.getShards().stream()
+                        .filter(s -> !s.isClosed() && hashRangeWidth(s).compareTo(BigInteger.ONE) > 0)
+                        .sorted(Comparator.comparing(KinesisService::hashRangeWidth).reversed()
+                                .thenComparing(KinesisShard::getShardId))
+                        .limit(splitsNeeded)
+                        .toList();
+                if (splitCandidates.isEmpty()) {
+                    throw new IllegalStateException("No splittable hash-key range remains");
+                }
+                for (KinesisShard parent : splitCandidates) {
+                    splitShard(streamName, parent.getShardId(), midpointHashKey(parent.getHashKeyRange()), region);
+                    splitsNeeded--;
+                }
             }
         } else if (targetShardCount < currentOpenShardCount) {
             int mergesNeeded = currentOpenShardCount - targetShardCount;
