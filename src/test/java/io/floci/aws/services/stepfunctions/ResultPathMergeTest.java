@@ -114,4 +114,11 @@ class ResultPathMergeTest {
 
     // Note: a $.a.b path whose $.a is a scalar (the pre-existing, documented residual) is
     // intentionally NOT asserted here; it is unchanged by this fix and remains a silent overwrite.
+
+
+    @Test
+    void anArrayIndexTooLargeForAnIntIsAResultPathMatchFailure() {
+        assertThrows(ResultPathMerge.ResultPathMatchException.class,
+                () -> ResultPathMerge.merge(n("[1,2]"), "$[99999999999]", n("1"), OM));
+    }
 }
