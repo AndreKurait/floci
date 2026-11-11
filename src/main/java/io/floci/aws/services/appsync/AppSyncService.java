@@ -254,6 +254,7 @@ public class AppSyncService {
         deleteApiKeysForApi(apiId);
         deleteChannelNamespacesForApi(apiId);
         deleteDomainAssociationsForApi(apiId);
+        deleteSourceApiAssociationsForApi(apiId);
         lambdaAuthorizerCache.evictApi(apiId);
         LOG.infov("Deleted GraphQL API {0}", apiId);
     }
@@ -1040,6 +1041,14 @@ public class AppSyncService {
         assertSchemaNotBusy(mergedApiIdentifier);
         getSourceApiAssociation(mergedApiIdentifier, associationId);
         mergedApiAssociationStore.delete(associationId);
+    }
+
+    private void deleteSourceApiAssociationsForApi(String apiId) {
+        List<String> associationIds = mergedApiAssociationStore.scan(k -> true).stream()
+                .filter(a -> apiId.equals(a.getMergedApiId()) || apiId.equals(a.getSourceApiId()))
+                .map(SourceApiAssociation::getAssociationId)
+                .toList();
+        associationIds.forEach(mergedApiAssociationStore::delete);
     }
 
     private void checkDuplicateSourceApiAssociation(String sourceApiId, String mergedApiId) {
