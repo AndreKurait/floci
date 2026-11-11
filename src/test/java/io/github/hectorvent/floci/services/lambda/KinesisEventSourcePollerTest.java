@@ -156,6 +156,28 @@ class KinesisEventSourcePollerTest {
         verify(esmStore).saveForAccount(eq(ACCOUNT), eq(mapping));
     }
 
+    @Test
+    void atTimestampMappingStartsReadingAtItsStartingPositionTimestamp() throws Exception {
+        stubFunction();
+        stubStreamWith(List.of());
+        long startingAt = Instant.parse("2026-10-20T12:00:00Z").toEpochMilli();
+        when(kinesisService.getShardIteratorForAccount(eq(ACCOUNT), anyString(), eq(SHARD), eq("AT_TIMESTAMP"),
+                isNull(), eq(startingAt), eq(REGION))).thenReturn("iter-at-timestamp");
+        when(kinesisService.getRecordsForAccount(eq(ACCOUNT), eq("iter-at-timestamp"), anyInt(), eq(REGION)))
+                .thenReturn(Map.of("Records", List.of(record("s7", "pk", "{}"))));
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult());
+        EventSourceMapping mapping = esm();
+        mapping.setStartingPosition("AT_TIMESTAMP");
+        mapping.setStartingPositionTimestamp(startingAt);
+
+        pollOnce(mapping);
+
+        assertEquals("s7", mapping.getShardSequenceNumbers().get(SHARD));
+        verify(kinesisService, never()).getShardIteratorForAccount(eq(ACCOUNT), anyString(), eq(SHARD),
+                eq("TRIM_HORIZON"), any(), eq(REGION));
+    }
+
     private EventSourceMapping esm(String... patterns) {
         EventSourceMapping esm = new EventSourceMapping();
         esm.setUuid("k-esm");
@@ -1024,6 +1046,41 @@ class KinesisEventSourcePollerTest {
 
         assertEquals(2, events.size(), "a mapping stopped during its invoke must not keep a backoff");
         verifyNoInteractions(sqsService);
+    }
+
+    @Test
+    void mappingDeletedDuringASuccessfulInvokeIsNotSavedBackIntoTheStore() {
+        stubShard("s1");
+        EventSourceMapping esm = esm();
+        recordInvocations(seqs -> {
+            // DeleteEventSourceMapping while the function runs: stop, delete from the store, drop the tombstone.
+            poller.stopPolling(esm.getUuid());
+            storedMapping.set(Optional.empty());
+            poller.mappingDeleted(esm.getUuid());
+            return new InvokeResult();
+        });
+
+        pollOnce(esm);
+
+        verify(esmStore, never()).saveForAccount(anyString(), any());
+    }
+
+    @Test
+    void startPersistedPollersSkipsAnEnabledMappingWithoutAnEventSourceArn() {
+        EventSourceMapping selfManagedKafka = new EventSourceMapping();
+        selfManagedKafka.setUuid("kafka-esm");
+        selfManagedKafka.setAccountId(ACCOUNT);
+        selfManagedKafka.setEnabled(true);
+        when(esmStore.listAll()).thenReturn(List.of(selfManagedKafka, esm()));
+        Vertx vertx = mock(Vertx.class);
+        KinesisEventSourcePoller persisted = new KinesisEventSourcePoller(vertx, kinesisService, executorService,
+                new LambdaTargetResolver(functionStore, aliasStore), esmStore, config, MAPPER,
+                new PipesFilterMatcher(MAPPER), new StreamBatchFailures(sqsService, snsService, s3Service, MAPPER, config),
+                clock::get, polls);
+
+        persisted.startPersistedPollers();
+
+        verify(vertx, times(1)).setPeriodic(eq(1000L), any());
     }
 
     @Test

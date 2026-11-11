@@ -89,4 +89,14 @@ class DynamoDbTtlServiceTest {
             Thread.onSpinWait();
         }
     }
+
+
+    @Test
+    void aSweepThatEndsInAnErrorDoesNotEscapeTheScheduledTask() {
+        DynamoDbService dynamoDbService = mock(DynamoDbService.class);
+        doThrow(new StackOverflowError("sweep failed")).when(dynamoDbService).deleteExpiredItems();
+        DynamoDbTtlService ttlService = new DynamoDbTtlService(dynamoDbService);
+
+        assertDoesNotThrow(ttlService::sweep);
+    }
 }

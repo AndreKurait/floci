@@ -383,7 +383,10 @@ public class ProvisionedConcurrencyPool implements Resettable {
             retire = failed || !current(allocation) || !healthy(handle);
             if (retire) {
                 allocation.handles.remove(handle);
-                pendingTeardown.add(handle);
+                // A reset may already have stopped and forgotten this environment while it was leased.
+                if (owned.containsKey(handle)) {
+                    pendingTeardown.add(handle);
+                }
             } else {
                 handle.setState(ContainerState.WARM);
                 allocation.idle.addLast(handle);

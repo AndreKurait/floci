@@ -79,7 +79,8 @@ public class SqsCfnProvisioner implements CfnResourceProvisioner {
     @Override
     public void delete(String resourceType, String physicalId, String region) {
         if ("AWS::SQS::Queue".equals(resourceType)) {
-            sqsService.deleteQueue(physicalId, region);
+            CfnDeletes.safeDelete("SQS queue", physicalId, () -> sqsService.deleteQueue(physicalId, region),
+                    "AWS.SimpleQueueService.NonExistentQueue");
         }
         // A QueuePolicy needs its recorded target URLs; the StackResource overload removes it.
     }

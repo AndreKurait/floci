@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.applicationautoscaling;
 
+import io.github.hectorvent.floci.core.common.EpochSeconds;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.ScalableTarget;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.ScalingPolicy;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.StepAdjustment;
@@ -246,7 +247,8 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
     private boolean withinCooldown(ScalingPolicy policy, boolean scaleOut) {
         int cooldownSeconds = cooldownSeconds(policy, scaleOut);
         double last = scaleOut ? policy.getLastScaleOutTime() : policy.getLastScaleInTime();
-        return last > 0 && (clock.instant().getEpochSecond() - last) < cooldownSeconds;
+        // Whole milliseconds on both sides: in whole seconds a cooldown stamped late in a second ended early.
+        return last > 0 && clock.millis() - Math.round(last * 1000.0) < cooldownSeconds * 1000L;
     }
 
     private static int cooldownSeconds(ScalingPolicy policy, boolean scaleOut) {
@@ -264,7 +266,7 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
     }
 
     private void stampCooldown(ScalingPolicy policy, boolean scaleOut) {
-        double now = clock.instant().getEpochSecond();
+        double now = EpochSeconds.fromMillis(clock.millis());
         if (scaleOut) {
             policy.setLastScaleOutTime(now);
         } else {

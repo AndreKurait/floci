@@ -3102,4 +3102,40 @@ class NativeDynamoDbJsonHandlerTest {
                 + "Expected: S Actual: N IndexName: TitleIndex", onlyValidationErrorMessage(response));
         assertEquals("Old", service.getItem("Movies", item("id", "m1"), "eu-west-1").get("title").get("S").asText());
     }
+
+
+    @Test
+    void describeTableReportsTheNonKeyAttributesOfALocalSecondaryIndex() throws Exception {
+        Response created = handler.handle("CreateTable", json("""
+                {
+                    "TableName": "LsiIncludeTable",
+                    "KeySchema": [
+                        {"AttributeName": "pk", "KeyType": "HASH"},
+                        {"AttributeName": "sk", "KeyType": "RANGE"}
+                    ],
+                    "AttributeDefinitions": [
+                        {"AttributeName": "pk", "AttributeType": "S"},
+                        {"AttributeName": "sk", "AttributeType": "S"},
+                        {"AttributeName": "lsiSk", "AttributeType": "S"}
+                    ],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "LocalSecondaryIndexes": [{
+                        "IndexName": "lsi1",
+                        "KeySchema": [
+                            {"AttributeName": "pk", "KeyType": "HASH"},
+                            {"AttributeName": "lsiSk", "KeyType": "RANGE"}
+                        ],
+                        "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["colour", "size"]}
+                    }]
+                }
+                """), "eu-west-1");
+        assertEquals(200, created.getStatus());
+
+        Response described = handler.handle("DescribeTable",
+                mapper.createObjectNode().put("TableName", "LsiIncludeTable"), "eu-west-1");
+        JsonNode projection = mapper.convertValue(described.getEntity(), JsonNode.class)
+                .get("Table").get("LocalSecondaryIndexes").get(0).get("Projection");
+        assertEquals("{\"ProjectionType\":\"INCLUDE\",\"NonKeyAttributes\":[\"colour\",\"size\"]}",
+                projection.toString());
+    }
 }

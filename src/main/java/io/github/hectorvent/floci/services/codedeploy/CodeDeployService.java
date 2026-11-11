@@ -1147,7 +1147,7 @@ public class CodeDeployService {
                 CodeDeployAgentDeployment.Outcome outcome = new CodeDeployAgentDeployment.Outcome(
                         "Failed", "NoInstancesReachable", "No instances found for deployment group");
                 if (agent == null) {
-                    outcome.publish(deployment);
+                    outcome.publish(deployment, clock);
                 } else {
                     completeAgentDeployment(deployment, agent, outcome);
                 }
@@ -1267,7 +1267,7 @@ public class CodeDeployService {
             } finally {
                 activeAgentDeployments.remove(scope, deployment.getDeploymentId());
                 agentDeploymentContexts.remove(deployment.getDeploymentId(), context);
-                outcome.publish(deployment);
+                outcome.publish(deployment, clock);
             }
         }
     }
@@ -1695,7 +1695,6 @@ public class CodeDeployService {
         deployment.setDescription(description);
         deployment.setCreator("user");
         deployment.setComputePlatform("ECS");
-        deploymentsFor(region).put(deploymentId, deployment);
 
         // Determine ECS cluster/service from deployment group
         String clusterName = "default";
@@ -1754,6 +1753,8 @@ public class CodeDeployService {
         targetMap.put("ecsTarget", ecsTargetMap);
         ConcurrentHashMap<String, Map<String, Object>> ecsTargets = new ConcurrentHashMap<>();
         ecsTargets.put(targetId, targetMap);
+        // Published only once the request can no longer be refused: a refused request leaves no deployment.
+        deploymentsFor(region).put(deploymentId, deployment);
         deploymentTargetsFor(region).put(deploymentId, ecsTargets);
 
         AtomicBoolean stopFlag = new AtomicBoolean(false);
@@ -1927,7 +1928,7 @@ public class CodeDeployService {
                     }
                     long waitMs = Math.min(trc.intervalSeconds * 1000L, 5000L);
                     if (waitMs > 0 && !stopFlag.get()) {
-                        timer.sleepNanos(TimeUnit.MILLISECONDS.toNanos(waitMs));
+                        waitUnlessStopped(TimeUnit.MILLISECONDS.toNanos(waitMs), stopFlag);
                     }
                     if (!stopFlag.get()) {
                         for (String listenerArn : listenerArns) {
@@ -1947,7 +1948,7 @@ public class CodeDeployService {
                         if (pct < 100) {
                             long waitMs = Math.min(trc.intervalSeconds * 1000L, 2000L);
                             if (waitMs > 0) {
-                                timer.sleepNanos(TimeUnit.MILLISECONDS.toNanos(waitMs));
+                                waitUnlessStopped(TimeUnit.MILLISECONDS.toNanos(waitMs), stopFlag);
                             }
                         }
                     }
@@ -2171,7 +2172,11 @@ public class CodeDeployService {
 
     private boolean waitForTrafficInterval(int intervalSeconds, AtomicBoolean stopFlag)
             throws InterruptedException {
-        long duration = TimeUnit.SECONDS.toNanos(intervalSeconds);
+        return waitUnlessStopped(TimeUnit.SECONDS.toNanos(intervalSeconds), stopFlag);
+    }
+
+    /** Waits {@code duration} nanoseconds, looking at the stop flag every stop poll; false once it is set. */
+    private boolean waitUnlessStopped(long duration, AtomicBoolean stopFlag) throws InterruptedException {
         long started = timer.nanoTime();
         while (!stopFlag.get()) {
             long remaining = duration - (timer.nanoTime() - started);

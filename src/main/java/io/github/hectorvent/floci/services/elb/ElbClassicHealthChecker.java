@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.concurrent.DeadlineWaits;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
@@ -90,6 +91,10 @@ public class ElbClassicHealthChecker implements Resettable {
     public ElbClassicHealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
         this(vertx, config, ec2Service, null);
     }
+
+    /** Null in unit tests, which run without security-group enforcement. */
+    @Inject
+    jakarta.enterprise.inject.Instance<SecurityGroupFirewallManager> securityGroupFirewall;
 
     @Inject
     public ElbClassicHealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
@@ -274,7 +279,8 @@ public class ElbClassicHealthChecker implements Resettable {
 
     private void probeOne(ClassicLoadBalancer lb, String instanceId, ProbeState state, Target target,
                           int timeout, int healthyThreshold, int unhealthyThreshold) {
-        String host = resolveHost(lb.getAccountId(), instanceId);
+        String host = backendHost(securityGroupFirewall, lb, resolveHost(lb.getAccountId(), instanceId),
+                target.port());
         ElbClassicFrontendManager.Probe namespace = state.probe;
         vertx.executeBlocking(() -> namespace != null
                 ? frontends.probe(namespace, target, timeout) : probe(host, target, timeout), false)
@@ -376,7 +382,28 @@ public class ElbClassicHealthChecker implements Resettable {
         return bridgeIp != null && !bridgeIp.isBlank() ? bridgeIp : instanceId;
     }
 
+    /**
+     * The address the shared edge dials for {@code host} on tcp {@code port}: under security-group
+     * enforcement a protected instance of the load balancer's VPC at its transport address when address
+     * spaces are isolated, and null for a protected endpoint of another VPC or account, or one whose
+     * ingress does not admit that port from the load balancer's own groups. A Classic load balancer
+     * outside a VPC reaches only its own account's instances, as before.
+     */
+    static String backendHost(jakarta.enterprise.inject.Instance<SecurityGroupFirewallManager> firewall,
+                              ClassicLoadBalancer lb, String host, int port) {
+        if (lb.getVpcId() == null) {
+            return host;
+        }
+        Set<String> groups = lb.getSecurityGroups() == null ? Set.of()
+                : lb.getSecurityGroups().stream().filter(Objects::nonNull).collect(Collectors.toUnmodifiableSet());
+        return SecurityGroupFirewallManager.emulatorRoute(firewall, lb.getAccountId(), lb.getRegion(),
+                lb.getVpcId(), host, port, groups);
+    }
+
     private boolean probe(String host, Target target, int timeoutSeconds) throws IOException {
+        if (host == null) {
+            return false;
+        }
         FutureTask<Boolean> attempt = new FutureTask<>(() -> probeTransport(host, target, timeoutSeconds));
         Thread.ofVirtual().name("classic-elb-health-probe").start(attempt);
         try {

@@ -16,6 +16,9 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.EmulatorOriginSource;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
@@ -27,6 +30,7 @@ import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -40,6 +44,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -59,7 +64,7 @@ import java.util.stream.Collectors;
  * inventing a result.
  */
 @ApplicationScoped
-public class ElbClassicService implements ServerCertificateReferenceProvider {
+public class ElbClassicService implements ServerCertificateReferenceProvider, EmulatorOriginSource {
 
     private static final Logger LOG = Logger.getLogger(ElbClassicService.class);
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -72,6 +77,10 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     private final CertificateReferenceResolver certificates;
     private final ElbClassicFrontendManager frontends;
     private final KeyedWriteLocks<String> runtimeWrites = new KeyedWriteLocks<>();
+
+    /** Left null by the unit tests, which wire this service without EC2 security-group enforcement. */
+    @Inject
+    Instance<SecurityGroupFirewallManager> securityGroupFirewall;
 
     // region → load balancer name → record, in the calling account
     private final Map<String, Map<String, ClassicLoadBalancer>> loadBalancers;
@@ -313,6 +322,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                 throw failure;
             }
             healthChecker.startMonitoring(lb);
+            emulatorOriginsChanged(lb);
             return lb;
         }
     }
@@ -409,6 +419,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             }
             if (removed != null) {
                 healthChecker.stopMonitoring(removed);
+                emulatorOriginsChanged(removed);
             }
         }
     }
@@ -715,6 +726,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                 populateSourceSecurityGroup(region, current);
                 persist(region, current);
             });
+            emulatorOriginsChanged(current);
             if (frontends == null || !frontends.enabled()) {
                 healthChecker.healthCheckChanged(current);
                 healthChecker.reconcileInstances(current);
@@ -754,6 +766,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             lb.setSecurityGroups(new ArrayList<>(securityGroups));
             populateSourceSecurityGroup(region, lb);
             persist(region, lb);
+            emulatorOriginsChanged(lb);
             return List.copyOf(lb.getSecurityGroups());
         }
     }
@@ -771,6 +784,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             lb.setSubnets(proposed);
             refreshZonesFromSubnets(region, lb);
             persist(region, lb);
+            emulatorOriginsChanged(lb);
             return List.copyOf(lb.getSubnets());
         }
     }
@@ -787,6 +801,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             lb.setSubnets(proposed);
             refreshZonesFromSubnets(region, lb);
             persist(region, lb);
+            emulatorOriginsChanged(lb);
             return List.copyOf(lb.getSubnets());
         }
     }
@@ -841,6 +856,37 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             result.put(name, Map.copyOf(requireLoadBalancer(region, name).getTags()));
         }
         return result;
+    }
+
+    /**
+     * Every VPC load balancer with security groups at the shared edge, in every account. That edge
+     * sends health checks and backend requests from Floci's own address; a protected frontend sends
+     * them from its own namespace, which already carries the load balancer's groups.
+     */
+    @Override
+    public List<SecurityGroupNftCompiler.EmulatorOrigin> emulatorOrigins() {
+        if (frontends != null && frontends.enabled()) {
+            return List.of();
+        }
+        List<SecurityGroupNftCompiler.EmulatorOrigin> origins = new ArrayList<>();
+        for (StoredRegion stored : storedRegions()) {
+            for (ClassicLoadBalancer lb : stored.regionLbs().values()) {
+                String accountId = lb.getAccountId() != null ? lb.getAccountId() : stored.accountId();
+                List<String> groups = lb.getSecurityGroups();
+                if (accountId != null && lb.getVpcId() != null && groups != null && !groups.isEmpty()) {
+                    origins.add(new SecurityGroupNftCompiler.EmulatorOrigin(accountId, stored.region(),
+                            lb.getVpcId(), groups.stream().filter(Objects::nonNull).collect(Collectors.toSet())));
+                }
+            }
+        }
+        return origins;
+    }
+
+    private void emulatorOriginsChanged(ClassicLoadBalancer lb) {
+        if (lb.getVpcId() != null && (frontends == null || !frontends.enabled())
+                && securityGroupFirewall != null && securityGroupFirewall.isResolvable()) {
+            securityGroupFirewall.get().emulatorOriginsChanged();
+        }
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────

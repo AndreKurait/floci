@@ -127,7 +127,8 @@ public class KinesisEventSourcePoller implements Resettable {
     public void startPersistedPollers() {
         List<EventSourceMapping> esms = esmStore.listAll();
         for (EventSourceMapping esm : esms) {
-            if (esm.isEnabled() && esm.getEventSourceArn().contains(":kinesis:")) {
+            if (esm.isEnabled() && esm.getEventSourceArn() != null
+                    && esm.getEventSourceArn().contains(":kinesis:")) {
                 startPolling(esm);
             }
         }
@@ -223,7 +224,11 @@ public class KinesisEventSourcePoller implements Resettable {
         }
 
         String iterator;
-        if (lastSeq == null) {
+        if (lastSeq == null && "AT_TIMESTAMP".equals(esm.getStartingPosition())
+                && esm.getStartingPositionTimestamp() != null) {
+            iterator = kinesisService.getShardIteratorForAccount(esm.getAccountId(),
+                    streamName, shardId, "AT_TIMESTAMP", null, esm.getStartingPositionTimestamp(), esm.getRegion());
+        } else if (lastSeq == null) {
             iterator = kinesisService.getShardIteratorForAccount(esm.getAccountId(),
                     streamName, shardId, "TRIM_HORIZON", null, esm.getRegion());
         } else {
@@ -559,6 +564,10 @@ public class KinesisEventSourcePoller implements Resettable {
 
     private void advanceCheckpoint(EventSourceMapping esm, String shardId, String newestSeq) {
         esm.getShardSequenceNumbers().put(shardId, newestSeq);
+        if (esmStore.getForAccount(esm.getAccountId(), esm.getUuid()).isEmpty()) {
+            // Deleted while its batch was with the function: saving it would bring the mapping back.
+            return;
+        }
         esmStore.saveForAccount(esm.getAccountId(), esm);
     }
 

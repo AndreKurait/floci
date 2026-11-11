@@ -17,8 +17,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -65,6 +65,7 @@ public class CodeDeployAgentDeployment {
     private final Duration startTimeout;
     private final Duration phaseTimeout;
     private final CodeDeployTimer timer;
+    private final Clock clock;
 
     @Inject
     public CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
@@ -85,6 +86,15 @@ public class CodeDeployAgentDeployment {
                               Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
                               CodeDeployClassicTraffic traffic, Duration startTimeout, Duration phaseTimeout,
                               CodeDeployTimer timer) {
+        this(commands, autoScaling, ec2, regionResolver, mapper, traffic, startTimeout, phaseTimeout, timer,
+                Clock.systemUTC());
+    }
+
+    /** With the clock every start, lifecycle event and completion time is read from. */
+    CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
+                              Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
+                              CodeDeployClassicTraffic traffic, Duration startTimeout, Duration phaseTimeout,
+                              CodeDeployTimer timer, Clock clock) {
         this.commands = commands;
         this.autoScaling = autoScaling;
         this.ec2 = ec2;
@@ -94,6 +104,7 @@ public class CodeDeployAgentDeployment {
         this.startTimeout = startTimeout;
         this.phaseTimeout = phaseTimeout;
         this.timer = timer;
+        this.clock = clock;
     }
 
     /** Resolve account-scoped resources on the request thread before starting any worker. */
@@ -253,7 +264,7 @@ public class CodeDeployAgentDeployment {
 
     public void run(Prepared prepared, CodeDeployAgentCommands.Session session, Deployment deployment,
                     List<Map<String, Object>> targets, AtomicBoolean stop) {
-        run(prepared, session, deployment, targets, stop, outcome -> outcome.publish(deployment));
+        run(prepared, session, deployment, targets, stop, outcome -> outcome.publish(deployment, clock));
     }
 
     public void run(Prepared prepared, CodeDeployAgentCommands.Session session, Deployment deployment,
@@ -459,24 +470,25 @@ public class CodeDeployAgentDeployment {
                 ignored -> new CopyOnWriteArrayList<>());
     }
 
-    private static void update(Map<String, Object> target, String status) {
+    private void update(Map<String, Object> target, String status) {
         target.put("lastUpdatedAt", now());
         target.put("status", status);
     }
 
     public record Outcome(String status, String error, String message) {
-        void publish(Deployment deployment) {
+        /** Ends the deployment at {@code clock}'s instant, the timeline its creation time was read from. */
+        void publish(Deployment deployment, Clock clock) {
             if (error != null) {
                 deployment.setErrorInformation(Map.of("code", error, "message",
                         message == null ? "A host-agent deployment failed" : message));
             }
-            deployment.setCompleteTime(now());
+            deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
             deployment.setStatus(status);
         }
     }
 
-    private static double now() {
-        return EpochSeconds.fromInstant(Instant.now());
+    private double now() {
+        return EpochSeconds.fromInstant(clock.instant());
     }
 
     private static AwsException unsupported(String message) {

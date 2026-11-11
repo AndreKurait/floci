@@ -483,6 +483,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         stageStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(stageStore::delete);
         modelStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(modelStore::delete);
         requestValidatorStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(requestValidatorStore::delete);
+        authorizerStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(authorizerStore::delete);
         gatewayResponseStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(gatewayResponseStore::delete);
         LOG.infov("Deleted REST API: {0} in {1}", apiId, region);
     }
@@ -545,7 +546,24 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
             throw new AwsException("BadRequestException",
                     "Invalid resource identifier specified: the root resource cannot be deleted", 400);
         }
-        resourceStore.delete(resourceKey(region, apiId, resourceId));
+        // Deleting a resource deletes the whole subtree below it; a child left behind would keep
+        // serving its path and could never be reached through its parent again.
+        List<ApiGatewayResource> all = getResources(region, apiId);
+        Set<String> doomed = new HashSet<>();
+        doomed.add(resourceId);
+        boolean grew = true;
+        while (grew) {
+            grew = false;
+            for (ApiGatewayResource candidate : all) {
+                if (candidate.getParentId() != null && doomed.contains(candidate.getParentId())
+                        && doomed.add(candidate.getId())) {
+                    grew = true;
+                }
+            }
+        }
+        for (String id : doomed) {
+            resourceStore.delete(resourceKey(region, apiId, id));
+        }
     }
 
     // ──────────────────────────── Method CRUD ────────────────────────────
@@ -840,7 +858,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
                 selectionPattern = value;
             }
         }
-        IntegrationResponse newResponse = new IntegrationResponse(response.statusCode(), selectionPattern, response.responseParameters(), response.responseTemplates());
+        IntegrationResponse newResponse = new IntegrationResponse(response.statusCode(), selectionPattern, response.responseParameters(), response.responseTemplates(), response.contentHandling());
         getIntegration(region, apiId, resourceId, httpMethod).getIntegrationResponses().put(statusCode, newResponse);
         resourceStore.put(resourceKey(region, apiId, resourceId), getResource(region, apiId, resourceId));
         return newResponse;
@@ -1079,6 +1097,10 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
                 if ("remove" .equals(opType) && "/accessLogSettings" .equals(path)) {
                     stage.setAccessLogSettings(null);
+                    continue;
+                }
+                if ("remove" .equals(opType) && path.startsWith("/variables/")) {
+                    stage.getVariables().remove(path.substring("/variables/" .length()));
                     continue;
                 }
                 if (!"replace" .equals(opType) && !"add" .equals(opType)) continue;
@@ -1644,6 +1666,8 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         synchronized (usagePlanLock) {
             getUsagePlan(region, usagePlanId);
             usagePlanStore.delete(usagePlanKey(region, usagePlanId));
+            String keyPrefix = region + "::" + usagePlanId + "::";
+            usagePlanKeyStore.keys().stream().filter(k -> k.startsWith(keyPrefix)).forEach(usagePlanKeyStore::delete);
         }
     }
 

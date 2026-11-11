@@ -575,6 +575,26 @@ class RamServiceTest {
     }
 
     @Test
+    void shareAndInvitationTimestampsComeFromTheInjectedClock() {
+        Instant createdAt = Instant.parse("2030-01-01T00:00:00Z");
+        RamService fixedClockService = new RamService(
+                new SharedStorageFactory(), null, Clock.fixed(createdAt, ZoneOffset.UTC));
+        fixedClockService.initializeStorage();
+
+        ResourceShare created = fixedClockService.createResourceShare(
+                "stamped", List.of(ACCEPTER), List.of(), true, "us-east-1", OWNER);
+
+        assertEquals(createdAt, created.getCreationTime());
+        assertEquals(createdAt, created.getLastUpdatedTime());
+        assertEquals(createdAt, fixedClockService.getResourceShareInvitations(
+                ACCEPTER, List.of(), List.of(), "us-east-1").get(0).invitationTimestamp());
+        // A write inside the creation tick moves exactly one millisecond past it.
+        ResourceShare updated = fixedClockService.updateResourceShare(
+                created.getResourceShareArn(), "renamed", null, OWNER, "us-east-1");
+        assertEquals(createdAt.plusMillis(1), updated.getLastUpdatedTime());
+    }
+
+    @Test
     void updateOfLegacyUnprefixedShareAdvancesLastUpdatedTime() {
         TestStorageFactory storage = new TestStorageFactory(false);
         Instant creationTime = Instant.parse("2029-01-01T00:00:00Z");

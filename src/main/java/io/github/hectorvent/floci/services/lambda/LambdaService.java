@@ -1335,6 +1335,16 @@ public class LambdaService implements ResourceProvider {
             versionCounters.remove(versionCounterKey(region, fn));
             versionCounters.remove(legacyVersionCounterKey(region, functionName));
             failedReactiveSyncs.remove(arn);
+            // Asynchronous invocation settings belong to the function: a function created later under
+            // the same name must not inherit them.
+            String eventInvokePrefix = region + ":" + arn + ":";
+            List<String> eventInvokeKeys = new ArrayList<>();
+            for (Map.Entry<String, FunctionEventInvokeConfig> entry : eventInvokeConfigs.entrySet()) {
+                if (entry.getKey().startsWith(eventInvokePrefix)) {
+                    eventInvokeKeys.add(entry.getKey());
+                }
+            }
+            eventInvokeKeys.forEach(eventInvokeConfigs::remove);
             if (aliasStore != null) {
                 for (LambdaAlias alias : aliasStore.list(region, functionName)) {
                     aliasStore.delete(region, functionName, alias.getName());

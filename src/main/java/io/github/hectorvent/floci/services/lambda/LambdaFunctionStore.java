@@ -65,6 +65,15 @@ public class LambdaFunctionStore implements Resettable {
         }
     }
 
+    /**
+     * Drops every URL id that still points at {@code fn}. A backend that hands out the stored instance
+     * itself gives callers the object they then change and save, so by the time of the save the stored
+     * copy no longer says which URL it used to have.
+     */
+    private void deindexInstance(LambdaFunction fn) {
+        urlIdIndex.values().removeIf(indexed -> indexed == fn);
+    }
+
     private void deindexFunction(LambdaFunction fn) {
         if (fn.getUrlConfig() != null && fn.getUrlConfig().getFunctionUrl() != null) {
             String urlId = extractUrlId(fn.getUrlConfig().getFunctionUrl());
@@ -86,6 +95,7 @@ public class LambdaFunctionStore implements Resettable {
     public void save(String region, LambdaFunction fn) {
         // Remove old index entry if URL changed or was removed
         get(region, fn.getFunctionName(), fn.getVersion()).ifPresent(this::deindexFunction);
+        deindexInstance(fn);
 
         backend.put(regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);
         indexFunction(fn);
@@ -98,6 +108,7 @@ public class LambdaFunctionStore implements Resettable {
      */
     public void saveForAccount(String accountId, String region, LambdaFunction fn) {
         getForAccount(accountId, region, fn.getFunctionName(), fn.getVersion()).ifPresent(this::deindexFunction);
+        deindexInstance(fn);
 
         if (backend instanceof AccountAwareStorageBackend<LambdaFunction> aware) {
             aware.putForAccount(accountId, regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);

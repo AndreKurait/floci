@@ -388,6 +388,8 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                     esm.getUuid());
             return;
         }
+        // The backoff and the record age are measured from the end of the invocation, not its start.
+        now = clock.getAsLong();
 
         CheckpointOutcome outcome = invokeResult.getFunctionError() == null
                 ? successfulInvocationCheckpoint(esm, invokeResult, lastSeq, records, matched)

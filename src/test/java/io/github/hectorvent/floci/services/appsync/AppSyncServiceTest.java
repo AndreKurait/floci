@@ -7,10 +7,12 @@ import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizer
 import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizerResult;
 import io.github.hectorvent.floci.services.appsync.model.ApiKey;
 import io.github.hectorvent.floci.services.appsync.model.AuthenticationType;
+import io.github.hectorvent.floci.services.appsync.model.ChannelNamespace;
 import io.github.hectorvent.floci.services.appsync.model.DomainName;
 import io.github.hectorvent.floci.services.appsync.model.FunctionConfiguration;
 import io.github.hectorvent.floci.services.appsync.model.GraphqlApi;
 import io.github.hectorvent.floci.services.appsync.model.SchemaCreationStatusType;
+import io.github.hectorvent.floci.services.appsync.model.SourceApiAssociation;
 import io.github.hectorvent.floci.testing.ParkingStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -704,5 +706,74 @@ class AppSyncServiceTest {
         assertEquals("kept", svc.getGraphqlApi(api.getApiId()).getName());
         assertEquals(SchemaCreationStatusType.PROCESSING,
                 svc.getSchemaCreationStatus(api.getApiId()).getStatus());
+    }
+
+    @Test
+    void channelNamespaceTimestampsComeFromTheInjectedClock() {
+        AppSyncServiceFixture.MutableClock clock = new AppSyncServiceFixture.MutableClock(NOW);
+        AppSyncService svc = AppSyncServiceFixture.create(clock);
+        GraphqlApi api = svc.createGraphqlApi(Map.of("name", "events", "authenticationType", "API_KEY"), "us-east-1");
+
+        ChannelNamespace created = svc.createChannelNamespace(api.getApiId(), Map.of("name", "ns"));
+        // The wire shape is a timestamp, which the REST JSON protocol carries as epoch seconds.
+        assertEquals(NOW.getEpochSecond(), created.getCreated());
+        assertEquals(NOW.getEpochSecond(), created.getLastModified());
+
+        clock.set(NOW.plus(Duration.ofMinutes(5)));
+        ChannelNamespace updated = svc.updateChannelNamespace(api.getApiId(), "ns", Map.of("description", "d"));
+        assertEquals(NOW.getEpochSecond(), updated.getCreated());
+        assertEquals(NOW.plus(Duration.ofMinutes(5)).getEpochSecond(), updated.getLastModified());
+    }
+
+    @Test
+    void aSourceApiAssociationArnNamesItsOwnAssociationId() {
+        AppSyncService svc = AppSyncServiceFixture.create(new AppSyncServiceFixture.MutableClock(NOW));
+        GraphqlApi source = svc.createGraphqlApi(Map.of("name", "source", "authenticationType", "API_KEY"), "us-east-1");
+        GraphqlApi merged = svc.createGraphqlApi(Map.of("name", "merged", "authenticationType", "API_KEY"), "us-east-1");
+
+        SourceApiAssociation fromSource = svc.createMergedApiAssociation(
+                source.getApiId(), Map.of("mergedApiIdentifier", merged.getApiId()), "us-east-1");
+        assertTrue(fromSource.getAssociationArn().endsWith("/mergedApiAssociations/" + fromSource.getAssociationId()),
+                fromSource.getAssociationArn() + " does not name " + fromSource.getAssociationId());
+
+        svc.deleteMergedApiAssociation(source.getApiId(), fromSource.getAssociationId());
+        SourceApiAssociation fromMerged = svc.createSourceApiAssociation(
+                merged.getApiId(), Map.of("sourceApiId", source.getApiId()), "us-east-1");
+        assertTrue(fromMerged.getAssociationArn().endsWith("/sourceApiAssociations/" + fromMerged.getAssociationId()),
+                fromMerged.getAssociationArn() + " does not name " + fromMerged.getAssociationId());
+    }
+
+    @Test
+    void deletingAnApiRemovesTheAssociationsItTakesPartIn() {
+        AppSyncService svc = AppSyncServiceFixture.create(new AppSyncServiceFixture.MutableClock(NOW));
+        GraphqlApi source = svc.createGraphqlApi(Map.of("name", "source", "authenticationType", "API_KEY"), "us-east-1");
+        GraphqlApi merged = svc.createGraphqlApi(Map.of("name", "merged", "authenticationType", "API_KEY"), "us-east-1");
+        GraphqlApi other = svc.createGraphqlApi(Map.of("name", "other", "authenticationType", "API_KEY"), "us-east-1");
+        svc.createMergedApiAssociation(source.getApiId(), Map.of("mergedApiIdentifier", merged.getApiId()), "us-east-1");
+        svc.createMergedApiAssociation(other.getApiId(), Map.of("mergedApiIdentifier", merged.getApiId()), "us-east-1");
+
+        svc.deleteGraphqlApi(source.getApiId());
+
+        List<String> remainingSources = svc.listSourceApiAssociations(merged.getApiId(), null, null).items().stream()
+                .map(summary -> svc.getSourceApiAssociation(merged.getApiId(), summary.getAssociationId()).getSourceApiId())
+                .toList();
+        assertEquals(List.of(other.getApiId()), remainingSources);
+
+        svc.deleteGraphqlApi(merged.getApiId());
+        assertTrue(svc.listSourceApiAssociations(other.getApiId(), null, null).items().isEmpty());
+    }
+
+    @Test
+    void aRefusedUpdateTypeLeavesTheTypeUnchanged() {
+        AppSyncService svc = AppSyncServiceFixture.create(new AppSyncServiceFixture.MutableClock(NOW));
+        GraphqlApi api = svc.createGraphqlApi(Map.of("name", "types", "authenticationType", "API_KEY"), "us-east-1");
+        svc.createType(api.getApiId(), Map.of("name", "T", "definition", "type T { id: ID }", "format", "SDL"));
+
+        AwsException refused = assertThrows(AwsException.class, () -> svc.updateType(api.getApiId(), "T",
+                Map.of("definition", "type T { changed: ID }", "description", "changed", "format", "BOGUS")));
+
+        assertEquals("BadRequestException", refused.getErrorCode());
+        assertEquals("type T { id: ID }", svc.getType(api.getApiId(), "T").getDefinition());
+        assertEquals(null, svc.getType(api.getApiId(), "T").getDescription());
     }
 }

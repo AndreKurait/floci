@@ -333,6 +333,46 @@ class SqsDeliveryTimingTest {
         assertEquals(2, sqs.listMessageMoveTasks(dlqArn, REGION).size());
     }
 
+    /** CloudWatch reports a queue that holds nothing for six hours after the last call on it. */
+    @Test
+    void anEmptyQueueIsReportedToCloudWatchUntilSixHoursAfterItsLastAction() {
+        String url = sqs.createQueue("idle", null, REGION).getQueueUrl();
+        time.advance(Duration.ofMinutes(10));
+        attribute(url, "QueueArn");
+
+        time.advance(Duration.ofHours(6));
+        assertEquals(List.of("idle"), queuesReportedAt(time.clock().instant()));
+
+        time.advance(ONE_NANO);
+        assertEquals(List.of(), queuesReportedAt(time.clock().instant()));
+    }
+
+    @Test
+    void aQueueIsStampedWhenItIsCreatedAndEachTimeItIsChanged() {
+        time.advance(Duration.ofSeconds(5));
+        long created = time.clock().instant().getEpochSecond();
+        String url = sqs.createQueue("stamped", null, REGION).getQueueUrl();
+        assertEquals(String.valueOf(created), attribute(url, "CreatedTimestamp"));
+        assertEquals(String.valueOf(created), attribute(url, "LastModifiedTimestamp"));
+
+        time.advance(Duration.ofSeconds(60));
+        sqs.setQueueAttributes(url, Map.of("VisibilityTimeout", "45"), REGION);
+        assertEquals(String.valueOf(created + 60), attribute(url, "LastModifiedTimestamp"));
+
+        time.advance(Duration.ofSeconds(60));
+        sqs.addPermission(url, "share", List.of("111111111111"), List.of("SendMessage"), REGION);
+        assertEquals(String.valueOf(created + 120), attribute(url, "LastModifiedTimestamp"));
+
+        time.advance(Duration.ofSeconds(60));
+        sqs.removePermission(url, "share", REGION);
+        assertEquals(String.valueOf(created + 180), attribute(url, "LastModifiedTimestamp"));
+        assertEquals(String.valueOf(created), attribute(url, "CreatedTimestamp"));
+    }
+
+    private List<String> queuesReportedAt(Instant now) {
+        return sqs.collectQueueMetrics(now).stream().map(SqsService.QueueMetrics::queueName).toList();
+    }
+
     private CompletableFuture<List<Message>> receive(String url, int waitTimeSeconds) {
         CompletableFuture<List<Message>> received = new CompletableFuture<>();
         Thread.ofVirtual().start(() -> {

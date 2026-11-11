@@ -125,4 +125,15 @@ class SqsRetentionSweeperTest {
     private int stored() {
         return messageStore.get(STORAGE_KEY).orElseThrow().size();
     }
+
+
+    @Test
+    void aSweepThatEndsInAnErrorDoesNotEscapeTheScheduledTask() {
+        SqsService failing = mock(SqsService.class);
+        doThrow(new StackOverflowError("sweep failed")).when(failing).deleteExpiredMessages();
+        SqsRetentionSweeper sweeper = new SqsRetentionSweeper(failing, true, scheduler);
+
+        assertDoesNotThrow(sweeper::sweep);
+        verify(failing).deleteExpiredMessages();
+    }
 }

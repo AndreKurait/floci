@@ -20,6 +20,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -64,6 +65,7 @@ public class SsmCommandService implements Resettable {
     private final ExecutorService directExecutionExecutor;
     private final SsmService documents;
     private final boolean directCommandExecutionEnabled;
+    private final Clock clock;
 
     // In-memory queues are owned by the issuing account, region and instance. Lost on restart.
     private final ConcurrentHashMap<MessageOwner, Queue<PendingMessage>> messageQueues = new ConcurrentHashMap<>();
@@ -86,6 +88,13 @@ public class SsmCommandService implements Resettable {
     SsmCommandService(StorageFactory storageFactory, ObjectMapper objectMapper, RegionResolver regionResolver,
                       SsmDirectCommandExecutor directCommandExecutor, SsmService documents,
                       boolean directCommandExecutionEnabled) {
+        this(storageFactory, objectMapper, regionResolver, directCommandExecutor, documents,
+                directCommandExecutionEnabled, Clock.systemUTC());
+    }
+
+    SsmCommandService(StorageFactory storageFactory, ObjectMapper objectMapper, RegionResolver regionResolver,
+                      SsmDirectCommandExecutor directCommandExecutor, SsmService documents,
+                      boolean directCommandExecutionEnabled, Clock clock) {
         this.instanceStore = storageFactory.create("ssm", "ssm-instances.json", new TypeReference<>() {});
         this.commandStore = storageFactory.create("ssm", "ssm-commands.json", new TypeReference<>() {});
         this.invocationStore = storageFactory.create("ssm", "ssm-invocations.json", new TypeReference<>() {});
@@ -94,6 +103,7 @@ public class SsmCommandService implements Resettable {
         this.directCommandExecutor = directCommandExecutor;
         this.documents = documents;
         this.directCommandExecutionEnabled = directCommandExecutionEnabled;
+        this.clock = clock;
         // Each direct execution blocks for the whole container exec, up to its execution budget, so every
         // target gets its own virtual thread instead of a platform thread.
         this.directExecutionExecutor = Executors.newThreadPerTaskExecutor(
@@ -129,7 +139,7 @@ public class SsmCommandService implements Resettable {
         info.setAgentName(request.path("AgentName").asText("amazon-ssm-agent"));
         info.setAgentVersion(request.path("AgentVersion").asText("3.0.0.0"));
         info.setPingStatus("Online");
-        info.setLastPingDateTime(Instant.now());
+        info.setLastPingDateTime(clock.instant());
         info.setPlatformType(request.path("PlatformType").asText("Linux"));
         info.setPlatformName(request.path("PlatformName").asText(""));
         info.setPlatformVersion(request.path("PlatformVersion").asText(""));
@@ -139,7 +149,7 @@ public class SsmCommandService implements Resettable {
 
         boolean firstRegistration = info.getRegistrationDate() == null;
         if (firstRegistration) {
-            info.setRegistrationDate(Instant.now());
+            info.setRegistrationDate(clock.instant());
         }
 
         instanceStore.put(instanceKey(region, instanceId), info);
@@ -205,7 +215,7 @@ public class SsmCommandService implements Resettable {
         String outputS3Prefix = request.path("OutputS3KeyPrefix").asText("");
 
         String commandId = UUID.randomUUID().toString();
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         List<DirectExecutionRequest> directExecutionRequests = new ArrayList<>();
 
         Command command = new Command();
@@ -390,7 +400,7 @@ public class SsmCommandService implements Resettable {
                         if ("Cancelling".equals(status)) {
                             inv.setCancellationJobId(agentJobId(UUID.randomUUID().toString(), instanceId));
                         } else {
-                            inv.setExecutionEndDateTime(Instant.now());
+                            inv.setExecutionEndDateTime(clock.instant());
                             terminateActivePlugins(inv, status, status);
                         }
                         invocationStore.put(invKey, inv);
@@ -401,7 +411,7 @@ public class SsmCommandService implements Resettable {
                     }
                     if ("Cancelling".equals(inv.getStatus()) && !inv.isCancellationAcknowledged()) {
                         messageQueues.computeIfAbsent(messageOwner(region, instanceId), key -> new ConcurrentLinkedQueue<>())
-                                .add(new PendingMessage(inv.getCancellationJobId(), commandId, region, Instant.now()));
+                                .add(new PendingMessage(inv.getCancellationJobId(), commandId, region, clock.instant()));
                     }
                 }
             });
@@ -420,7 +430,7 @@ public class SsmCommandService implements Resettable {
             return 0;
         }
         String prefix = region + "::";
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Set<String> commandIds = new LinkedHashSet<>();
         int failed = 0;
 
@@ -564,7 +574,7 @@ public class SsmCommandService implements Resettable {
                 return false;
             }
             if (invocation.getDeliveryAttemptTime() == null && "aws.ssm.sendCommand".equals(current.topic())) {
-                invocation.setDeliveryAttemptTime(Instant.now());
+                invocation.setDeliveryAttemptTime(clock.instant());
                 invocationStore.put(invocationKey(region, invocation.getCommandId(), instanceId), invocation);
             }
             deliver.accept(current);
@@ -581,7 +591,7 @@ public class SsmCommandService implements Resettable {
             } else if ("Pending".equals(invocation.getStatus())) {
                 invocation.setStatus("InProgress");
                 invocation.setStatusDetails(statusDetails("InProgress"));
-                invocation.setExecutionStartDateTime(Instant.now());
+                invocation.setExecutionStartDateTime(clock.instant());
                 invocationStore.put(invocationKey(region, invocation.getCommandId(), instanceId), invocation);
             }
         }
@@ -637,7 +647,7 @@ public class SsmCommandService implements Resettable {
             invocation.setStatus(status);
             invocation.setStatusDetails(statusDetails(status));
             if (invocation.getExecutionStartDateTime() == null) {
-                invocation.setExecutionStartDateTime(Instant.now());
+                invocation.setExecutionStartDateTime(clock.instant());
             }
             if (!invocation.getPluginResults().isEmpty()) {
                 JsonNode plugin = invocation.getPluginResults().values().iterator().next();
@@ -648,7 +658,7 @@ public class SsmCommandService implements Resettable {
                 invocation.setResponseCode(plugin.path("code").asInt(plugin.path("returnCode").asInt(-1)));
             }
             if (!finished && !isActiveInvocation(status)) {
-                invocation.setExecutionEndDateTime(Instant.now());
+                invocation.setExecutionEndDateTime(clock.instant());
                 invocation.setAgentTerminalResponse(true);
             }
             invocationStore.put(invocationKey(region, invocation.getCommandId(), instanceId), invocation);
@@ -685,10 +695,10 @@ public class SsmCommandService implements Resettable {
             Command command = commandStore.get(commandKey(region, invocation.getCommandId())).orElse(null);
             if (!invocation.isDirectExecution() && isActiveInvocation(invocation.getStatus())
                     && command != null && command.getExpiresAfter() != null
-                    && !Instant.now().isBefore(command.getExpiresAfter())) {
+                    && !clock.instant().isBefore(command.getExpiresAfter())) {
                 invocation.setStatus("TimedOut");
                 invocation.setStatusDetails("Delivery Timed Out");
-                invocation.setExecutionEndDateTime(Instant.now());
+                invocation.setExecutionEndDateTime(clock.instant());
                 terminateActivePlugins(invocation, "TimedOut", "Delivery Timed Out");
                 invocationStore.put(invocationKey(region, invocation.getCommandId(), invocation.getInstanceId()), invocation);
                 expired = true;
@@ -738,7 +748,7 @@ public class SsmCommandService implements Resettable {
                 }
                 inv.setStatus("Failed");
                 inv.setStatusDetails("Failed: " + failureType);
-                inv.setExecutionEndDateTime(Instant.now());
+                inv.setExecutionEndDateTime(clock.instant());
                 terminateActivePlugins(inv, "Failed", inv.getStatusDetails());
                 invocationStore.put(invKey, inv);
             }
@@ -774,7 +784,7 @@ public class SsmCommandService implements Resettable {
                                         Map<String, List<String>> parameters,
                                         int timeoutSeconds, String region) {
         String commandId = UUID.randomUUID().toString();
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         SsmCommandDocument selected = SsmCommandDocument.resolve(
                 documents, objectMapper, documentName, "$DEFAULT", region);
         Map<String, List<String>> effectiveParameters = new LinkedHashMap<>(parameters);
@@ -890,7 +900,7 @@ public class SsmCommandService implements Resettable {
 
     private void queueMessage(String commandId, String instanceId, String region) {
         String messageId = agentJobId(commandId, instanceId);
-        PendingMessage msg = new PendingMessage(messageId, commandId, region, Instant.now());
+        PendingMessage msg = new PendingMessage(messageId, commandId, region, clock.instant());
         messageQueues.computeIfAbsent(messageOwner(region, instanceId), k -> new ConcurrentLinkedQueue<>()).add(msg);
     }
 

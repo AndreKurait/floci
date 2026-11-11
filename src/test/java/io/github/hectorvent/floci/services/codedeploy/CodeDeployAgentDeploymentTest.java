@@ -266,7 +266,7 @@ class CodeDeployAgentDeploymentTest {
     private CodeDeployAgentDeployment timelineRunner() {
         return new CodeDeployAgentDeployment(commands, autoScaling, mock(Ec2Service.class),
                 new RegionResolver(REGION, ACCOUNT), new ObjectMapper(), traffic, START_DEADLINE, PHASE_LIMIT,
-                new TimelineTimer(time));
+                new TimelineTimer(time), time.clock());
     }
 
     /** Returns once the agent has taken the instance's command, so its worker now waits on the phase limit. */
@@ -317,6 +317,32 @@ class CodeDeployAgentDeploymentTest {
         assertEquals("Failed", run.deployment().getStatus());
         assertTrue(events(run, FIRST).getFirst().get("diagnostics").toString().contains("did not complete"));
         assertThrows(AwsException.class, () -> commands.complete(ACCOUNT, REGION, id, "Succeeded", "{}"));
+    }
+
+    /** Deadlines run on the timer; the times the deployment reports must sit on the same timeline. */
+    @Test
+    void startEventAndCompleteTimes_areReadFromTheClockTheDeadlinesRunOn() throws Exception {
+        useTimeline();
+        double began = time.now().toEpochMilli() / 1000.0;
+        Running run = start(prepare(null));
+        String id = pending(FIRST, "ApplicationStop");
+        time.awaitSleepers(1);
+        time.advance(Duration.ofMinutes(4));
+        commands.acknowledge(ACCOUNT, REGION, id);
+        awaitPhaseRunning(run, FIRST);
+        time.awaitSleepers(1);
+        time.advance(PHASE_LIMIT);
+        done(run);
+
+        double acknowledged = began + Duration.ofMinutes(4).toSeconds();
+        double timedOut = acknowledged + PHASE_LIMIT.toSeconds();
+        assertEquals(began, run.deployment().getStartTime());
+        assertEquals(timedOut, run.deployment().getCompleteTime());
+        Map<String, Object> event = events(run, FIRST).getFirst();
+        assertEquals("Failed", event.get("status"));
+        assertEquals(acknowledged, event.get("startTime"));
+        assertEquals(timedOut, event.get("endTime"));
+        assertEquals(timedOut, target(run, FIRST).get("lastUpdatedAt"));
     }
 
     @ParameterizedTest

@@ -6,10 +6,15 @@ import io.github.hectorvent.floci.services.ses.model.Contact;
 import io.github.hectorvent.floci.services.ses.model.ContactList;
 import io.github.hectorvent.floci.services.ses.model.ListManagementOptions;
 import io.github.hectorvent.floci.services.ses.model.Topic;
+import io.github.hectorvent.floci.testing.ManualClock;
+import io.github.hectorvent.floci.testing.ParkingStore;
+import io.github.hectorvent.floci.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -92,5 +97,44 @@ class SesContactServiceTest {
 
         assertTrue(service.collectListManagementOptOuts(
                 List.of("alice@example.com"), null, REGION, address -> address).isEmpty());
+    }
+
+    @Test
+    void contactListTimestampsComeFromTheInjectedClock() {
+        Instant createdAt = Instant.parse("2031-03-04T05:06:07Z");
+        ManualClock clock = new ManualClock(createdAt);
+        SesContactService timed = new SesContactService(new InMemoryStorage<>(), new InMemoryStorage<>(), clock);
+
+        ContactList created = timed.createContactList(LIST, "desc", List.of(), List.of(), REGION);
+        assertEquals(createdAt, created.getCreatedTimestamp());
+        assertEquals(createdAt, created.getLastUpdatedTimestamp());
+
+        clock.advance(Duration.ofHours(36));
+        ContactList updated = timed.updateContactList(LIST, "changed", true, null, REGION);
+        assertEquals(createdAt, updated.getCreatedTimestamp());
+        assertEquals(createdAt.plus(Duration.ofHours(36)), updated.getLastUpdatedTimestamp());
+    }
+
+    @Test
+    void anUpdateRacingADeleteDoesNotResurrectTheContactList() throws Exception {
+        ParkingStore<ContactList> lists = new ParkingStore<>();
+        SesContactService racing = new SesContactService(lists, new InMemoryStorage<>(), Clock.systemUTC());
+        racing.createContactList(LIST, "desc", List.of(), List.of(), REGION);
+
+        // The update has read the list and is about to write it back.
+        lists.parkNextRead();
+        Thread update = new Thread(() -> racing.updateContactList(LIST, "changed", true, null, REGION));
+        update.start();
+        assertTrue(lists.awaitParked(), "the update never reached its read");
+        Thread delete = new Thread(() -> racing.deleteContactList(LIST, REGION));
+        delete.start();
+        // Serialized, the delete is blocked behind the update; unserialized, it has already finished.
+        ThreadStates.awaitBlockedOrDone(delete);
+        lists.release();
+        update.join(5_000);
+        delete.join(5_000);
+
+        AwsException gone = assertThrows(AwsException.class, () -> racing.getContactList(LIST, REGION));
+        assertEquals("NotFoundException", gone.getErrorCode());
     }
 }

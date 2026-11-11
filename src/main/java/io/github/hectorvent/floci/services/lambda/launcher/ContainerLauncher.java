@@ -72,6 +72,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -139,6 +140,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
     private final LambdaFunctionStore functionStore;
     private final LambdaVpcNetworkManager vpcNetworkManager;
+    /** Monotonic nanoseconds: every elapsed-time measurement in this class reads it. */
+    private final LongSupplier nanoTime;
     private final AtomicBoolean engineWarningLogged = new AtomicBoolean();
     private volatile ContainerEngine containerEngine;
 
@@ -189,6 +192,25 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LambdaExecutionRoleCredentials executionRoleCredentials,
                              LambdaFunctionStore functionStore,
                              LambdaVpcNetworkManager vpcNetworkManager) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, functionStore, vpcNetworkManager, System::nanoTime);
+    }
+
+    ContainerLauncher(ContainerBuilder containerBuilder,
+                      ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer,
+                      ImageResolver imageResolver,
+                      RuntimeApiServerFactory runtimeApiServerFactory,
+                      DockerHostResolver dockerHostResolver,
+                      EmulatorConfig config,
+                      EcrRegistryManager ecrRegistryManager,
+                      LambdaLayerService layerService,
+                      LaunchedContainerAwsEnv awsEnv,
+                      LambdaExecutionRoleCredentials executionRoleCredentials,
+                      LambdaFunctionStore functionStore,
+                      LambdaVpcNetworkManager vpcNetworkManager,
+                      LongSupplier nanoTime) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.dnsResolver = new LambdaDnsResolver(containerBuilder, lifecycleManager, config);
@@ -203,6 +225,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.executionRoleCredentials = executionRoleCredentials;
         this.functionStore = functionStore;
         this.vpcNetworkManager = vpcNetworkManager;
+        this.nanoTime = nanoTime;
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
     }
 
@@ -529,13 +552,13 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         logStreamer.ensureLogGroupAndStreamForAccount(
                 lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
         Duration readinessBudget = Duration.ofSeconds(config.docker().connectionRequestTimeoutSeconds());
-        long readinessDeadline = System.nanoTime() + readinessBudget.toNanos();
+        long readinessDeadline = nanoTime.getAsLong() + readinessBudget.toNanos();
         exitWatcher = LambdaExitWatcher.watchBeforeStart(
                 dockerClient, containerId, runtimeApiServer::handleRuntimeProcessExited, readinessBudget);
         logHandle = logStreamer.attachBeforeStartForAccount(
                 lambdaAccountId, containerId, cwLogGroup, cwLogStream, lambdaRegion,
                 "lambda:" + fn.getFunctionName(),
-                Duration.ofNanos(Math.max(0, readinessDeadline - System.nanoTime())));
+                Duration.ofNanos(Math.max(0, readinessDeadline - nanoTime.getAsLong())));
         Objects.requireNonNull(logHandle, "Lambda output stream was not attached before start");
         exitWatcher.requireHealthy();
 
@@ -1032,8 +1055,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             new ConcurrentHashMap<>();
 
     /**
-     * Superseded code volumes queued for cleanup, mapped to the time they were superseded (millis
-     * since epoch). Deletion is deferred rather than immediate: Docker auto-creates an empty named
+     * Superseded code volumes queued for cleanup, mapped to the {@link #nanoTime} reading at which
+     * they were superseded. Deletion is deferred rather than immediate: Docker auto-creates an empty named
      * volume for a container mount that doesn't reference an existing one rather than failing, so a
      * launch that resolved the old volume name just before a redeploy, but hasn't created its
      * container yet, could otherwise be handed an empty /var/task by an immediate delete. Waiting
@@ -1056,9 +1079,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      */
     private final ConcurrentHashMap<String, AtomicInteger> volumesInFlight =
             new ConcurrentHashMap<>();
-    /** Non-final and package-private, like {@link #CODE_VOLUME_MIN_BYTES}, so tests can shrink it
-     *  instead of waiting out a real 60s window (restore it in a finally). */
-    static long VOLUME_CLEANUP_GRACE_MS = 60_000L;
+    /** How long a superseded code volume is kept before a sweep may remove it. */
+    static final long VOLUME_CLEANUP_GRACE_MS = 60_000L;
+    private static final long VOLUME_CLEANUP_GRACE_NANOS =
+            TimeUnit.MILLISECONDS.toNanos(VOLUME_CLEANUP_GRACE_MS);
     private final ScheduledExecutorService volumeCleanupScheduler =
             Executors.newSingleThreadScheduledExecutor(
                     r -> { Thread t = new Thread(r, "floci-code-volume-cleanup"); t.setDaemon(true); return t; });
@@ -1092,13 +1116,13 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     LOG.infov("Reusing code volume {0} populated by a previous run (marker present)",
                             volName);
                 } else {
-                    long t0 = System.currentTimeMillis();
+                    long t0 = nanoTime.getAsLong();
                     LOG.infov("Populating code volume {0} for function {1} (one-time per code version)",
                             volName, fn.getFunctionName());
                     populateCodeVolume(volName, fn, image);
                     writeCodeVolumeMarkerAndPruneOrphans(volName);
                     LOG.infov("Populated code volume {0} in {1}ms; future cold starts mount it instead of copying",
-                            volName, System.currentTimeMillis() - t0);
+                            volName, TimeUnit.NANOSECONDS.toMillis(nanoTime.getAsLong() - t0));
                 }
                 populatedCodeVolumes.add(volName);
             }
@@ -1119,7 +1143,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 }
                 String previous = functionCurrentVolume.put(fn.getFunctionName(), volName);
                 if (previous != null && !previous.equals(volName)) {
-                    volumesPendingCleanup.put(previous, System.currentTimeMillis());
+                    volumesPendingCleanup.put(previous, nanoTime.getAsLong());
                 }
             }
             // Mark this volume as having an unconfirmed reference before releasing the lock: the
@@ -1169,7 +1193,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                         fn.getFunctionName(), ignored -> new Object());
                 synchronized (functionLock) {
                     functionCurrentVolume.remove(fn.getFunctionName(), volName);
-                    volumesPendingCleanup.put(volName, System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS);
+                    // Queued as already due: a deleted function's volume has no grace period.
+                    volumesPendingCleanup.put(volName, nanoTime.getAsLong() - VOLUME_CLEANUP_GRACE_NANOS);
                 }
             }
         }
@@ -1204,10 +1229,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (functionStore == null) {
             return;
         }
-        long cutoff = System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS;
+        long now = nanoTime.getAsLong();
         for (String volName : new ArrayList<>(volumesPendingCleanup.keySet())) {
             Long queuedAt = volumesPendingCleanup.get(volName);
-            if (queuedAt == null || queuedAt > cutoff) {
+            if (queuedAt == null || !graceElapsed(queuedAt, now)) {
                 continue;
             }
             // Same lock ensureCodeVolume holds for this volume name: claiming and deleting it here
@@ -1218,7 +1243,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 // volume (removed it from volumesPendingCleanup) or requeued it with a fresher
                 // timestamp between the check above and acquiring this lock.
                 Long stillQueuedAt = volumesPendingCleanup.get(volName);
-                if (stillQueuedAt == null || stillQueuedAt > cutoff) {
+                if (stillQueuedAt == null || !graceElapsed(stillQueuedAt, now)) {
                     continue;
                 }
                 if (codeVolumeStillReferenced(volName)) {
@@ -1231,7 +1256,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     // to catch. The grace period alone isn't a safe upper bound on that launch's
                     // duration (create() has been observed taking ~80s under daemon load), so requeue
                     // for a later sweep instead of trusting elapsed time here.
-                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                    volumesPendingCleanup.put(volName, nanoTime.getAsLong());
                     continue;
                 }
                 try {
@@ -1256,7 +1281,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                         LOG.debugv("Removed superseded code volume {0}", volName);
                     } else {
                         // Still in use or unconfirmed: retain the populated cache and retry later.
-                        volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                        volumesPendingCleanup.put(volName, nanoTime.getAsLong());
                     }
                 } catch (RuntimeException e) {
                     // One transport failure must neither forget this candidate nor cancel periodic cleanup.
@@ -1264,6 +1289,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 }
             }
         }
+    }
+
+    /** Whether the grace period has passed since {@code queuedAt}; a difference, so it survives wraparound. */
+    private static boolean graceElapsed(long queuedAt, long now) {
+        return now - queuedAt >= VOLUME_CLEANUP_GRACE_NANOS;
     }
 
     /** Test-only: whether a per-volume lock object has ever been created for this volume name. */

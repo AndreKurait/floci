@@ -224,4 +224,13 @@ class ScheduleExpressionParserTest {
 
         assertTrue(delay >= 1000);
     }
+
+
+    @Test
+    void aLongRateIsNotCutToThirtyTwoBits() {
+        assertEquals(3551L * 7 * 24 * 60 * 60 * 1000, ScheduleExpressionParser.parseRateToMillis("rate(3551 weeks)"));
+        assertEquals(24856L * 24 * 60 * 60 * 1000, ScheduleExpressionParser.parseRateToMillis("rate(24856 days)"));
+        assertEquals(596524L * 60 * 60 * 1000, ScheduleExpressionParser.parseRateToMillis("rate(596524 hours)"));
+        assertEquals(35791395L * 60 * 1000, ScheduleExpressionParser.parseRateToMillis("rate(35791395 minutes)"));
+    }
 }
