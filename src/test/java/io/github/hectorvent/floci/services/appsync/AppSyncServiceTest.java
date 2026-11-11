@@ -715,13 +715,14 @@ class AppSyncServiceTest {
         GraphqlApi api = svc.createGraphqlApi(Map.of("name", "events", "authenticationType", "API_KEY"), "us-east-1");
 
         ChannelNamespace created = svc.createChannelNamespace(api.getApiId(), Map.of("name", "ns"));
-        assertEquals(NOW.toEpochMilli(), created.getCreated());
-        assertEquals(NOW.toEpochMilli(), created.getLastModified());
+        // The wire shape is a timestamp, which the REST JSON protocol carries as epoch seconds.
+        assertEquals(NOW.getEpochSecond(), created.getCreated());
+        assertEquals(NOW.getEpochSecond(), created.getLastModified());
 
         clock.set(NOW.plus(Duration.ofMinutes(5)));
         ChannelNamespace updated = svc.updateChannelNamespace(api.getApiId(), "ns", Map.of("description", "d"));
-        assertEquals(NOW.toEpochMilli(), updated.getCreated());
-        assertEquals(NOW.plus(Duration.ofMinutes(5)).toEpochMilli(), updated.getLastModified());
+        assertEquals(NOW.getEpochSecond(), updated.getCreated());
+        assertEquals(NOW.plus(Duration.ofMinutes(5)).getEpochSecond(), updated.getLastModified());
     }
 
     @Test
