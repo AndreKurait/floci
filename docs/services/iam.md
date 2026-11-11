@@ -3004,6 +3004,19 @@ once it carries `MaxSessionDuration`, and then writes neither field. `TagRole` a
 allowed, as on AWS. Within the IAM API `DeleteServiceLinkedRole` is the only way to remove such a
 role — the emulator's own `/_floci/state/reset` still clears it along with everything else.
 
+IAM attaches the linked service's AWS managed permissions policy to the role it creates, and so
+does the emulator for the services whose policy is known. Amazon OpenSearch Service's
+`opensearchservice.amazonaws.com` role carries `AmazonOpenSearchServiceRolePolicy`, as the OpenSearch
+Service developer guide's service-linked role page documents. The policy is under
+`arn:<partition>:iam::aws:policy/aws-service-role/` and is read from the bundled managed policy
+catalog, so `ListAttachedRolePolicies` lists it and a session on the role is authorized by it under
+IAM enforcement. Most EC2 actions are checked on `*`
+(EC2 is not read by the request resources table, and only a few of its actions build their ARNs by
+hand), so the statements the policy scopes to EC2 resource ARNs
+(`ec2:CreateNetworkInterface`, `ec2:DeleteNetworkInterface`, `ec2:CreateTags` on
+`network-interface/*`) do not match there; its `Resource: "*"` statements do. A role for any other
+service is created with its trust policy alone.
+
 Four deviations to be aware of:
 
 - **The role name comes from a table of AWS evidence, and is derived only where that table does
