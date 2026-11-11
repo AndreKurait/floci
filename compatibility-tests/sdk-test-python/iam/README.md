@@ -13,3 +13,8 @@ FLOCI_ENDPOINT=http://localhost:4566 pytest -q iam/test_dynamodb_select_defaults
 The DynamoDB selection cases create disposable tables and roles, use scoped STS
 sessions, and delete their resources in reverse dependency order. They verify
 Query/Scan table and index defaults and explicit projection policies.
+
+`test_sns_lambda_permissions.py` runs a Python 3.12 Lambda handler with both an
+unqualified subscription and an alias. It observes actual handler logs, revokes
+and restores the topic's permission, and verifies that an SQS sibling continues
+receiving messages during denial. It requires Docker for the Lambda runtime.
