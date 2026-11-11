@@ -330,7 +330,12 @@ public class SsmService implements ResourceProvider {
 
         long version = (existing != null) ? existing.getVersion() + 1 : 1;
 
-        Parameter parameter = new Parameter(name, value, type != null ? type : "String");
+        String effectiveType = type;
+        if (effectiveType == null) {
+            // Type is not needed on an overwrite: the parameter keeps the type it has.
+            effectiveType = existing != null ? existing.getType() : "String";
+        }
+        Parameter parameter = new Parameter(name, value, effectiveType);
         parameter.setVersion(version);
         parameter.setDescription(description);
         parameter.setKeyId(keyIdOf(parameter.getType(), keyId));

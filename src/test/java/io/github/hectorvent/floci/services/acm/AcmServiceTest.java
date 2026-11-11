@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.acm.model.DomainValidation;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.github.hectorvent.floci.services.acm.model.RevocationReason;
 import io.github.hectorvent.floci.services.acm.model.ValidationMethod;
+import io.github.hectorvent.floci.testing.ManualClock;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,7 @@ import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -56,6 +58,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -657,5 +660,81 @@ class AcmServiceTest {
         assertEquals(leaf.getNotAfter().toInstant(), cert.getNotAfter());
         assertEquals("SHA512WITHRSA", cert.getSignatureAlgorithm(), "the RSA CA's signature, whatever the leaf key");
         return leaf;
+    }
+
+    @Test
+    void reimportKeepsTheTagsOfTheCertificate() {
+        CertificateGenerator.GeneratedCertificate original = generator.generateSelfSignedCertificate(
+                "tagged.example.test", List.of(), KeyAlgorithm.EC_prime256v1);
+        Certificate existing = service.importCertificate(original.certificatePem(), original.privateKeyPem(),
+                null, null, Map.of("team", "payments"), REGION);
+        CertificateGenerator.GeneratedCertificate replacement = generator.generateSelfSignedCertificate(
+                "tagged.example.test", List.of(), KeyAlgorithm.EC_prime256v1);
+
+        service.importCertificate(replacement.certificatePem(), replacement.privateKeyPem(),
+                null, existing.getArn(), null, REGION);
+
+        assertEquals(Map.of("team", "payments"), service.getCertificate(existing.getArn(), REGION).getTags());
+    }
+
+    @Test
+    void aPendingCertificateIsIssuedExactlyWhenTheValidationWaitEnds() {
+        Instant start = Instant.parse("2031-05-06T07:08:09Z");
+        ManualClock clock = new ManualClock(start);
+        AcmService waiting = newService(30, clock);
+        Certificate requested = waiting.requestCertificate("wait.example.test", List.of(), ValidationMethod.DNS,
+                null, KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+        assertEquals(start, requested.getCreatedAt());
+
+        clock.advance(Duration.ofSeconds(30).minusNanos(1));
+        Certificate before = waiting.getCertificate(requested.getArn(), REGION);
+        assertEquals(CertificateStatus.PENDING_VALIDATION, before.getStatus());
+        assertNull(before.getIssuedAt());
+
+        clock.advance(Duration.ofNanos(1));
+        Certificate after = waiting.getCertificate(requested.getArn(), REGION);
+        assertEquals(CertificateStatus.ISSUED, after.getStatus());
+        assertEquals(start.plusSeconds(30), after.getIssuedAt());
+    }
+
+    @Test
+    void anIdempotencyTokenIsHonouredUpToOneHourAndNotAfter() {
+        Instant start = Instant.parse("2031-05-06T07:08:09Z");
+        ManualClock clock = new ManualClock(start);
+        AcmService tokens = newService(0, clock);
+        Certificate first = tokens.requestCertificate("token.example.test", List.of(), ValidationMethod.DNS,
+                "token-1", KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+
+        clock.advance(Duration.ofHours(1));
+        Certificate atTheHour = tokens.requestCertificate("token.example.test", List.of(), ValidationMethod.DNS,
+                "token-1", KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+        assertEquals(first.getArn(), atTheHour.getArn());
+
+        clock.advance(Duration.ofNanos(1));
+        Certificate pastTheHour = tokens.requestCertificate("token.example.test", List.of(), ValidationMethod.DNS,
+                "token-1", KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+        assertNotEquals(first.getArn(), pastTheHour.getArn());
+    }
+
+    @Test
+    void aCertificateIsReportedExpiredOnlyAfterItsNotAfterInstant() {
+        // The leaf's validity is stamped by the certificate generator, so start before it ends.
+        ManualClock clock = new ManualClock(Instant.parse("2020-01-01T00:00:00Z"));
+        AcmService expiring = newService(0, clock);
+        Certificate requested = expiring.requestCertificate("expiry.example.test", List.of(), ValidationMethod.DNS,
+                null, KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+        Instant notAfter = requested.getNotAfter();
+
+        clock.advance(Duration.between(clock.instant(), notAfter));
+        assertEquals(CertificateStatus.ISSUED, expiring.describeCertificate(requested.getArn(), REGION).getStatus());
+
+        clock.advance(Duration.ofNanos(1));
+        assertEquals(CertificateStatus.EXPIRED, expiring.describeCertificate(requested.getArn(), REGION).getStatus());
+    }
+
+    private AcmService newService(int validationWaitSeconds, ManualClock clock) {
+        RegionResolver regionResolver = mock(RegionResolver.class);
+        when(regionResolver.getAccountId()).thenReturn("000000000000");
+        return new AcmService(new InMemoryStorage<>(), generator, ca, regionResolver, validationWaitSeconds, clock);
     }
 }
