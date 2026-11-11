@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisShard;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisStream;
 import io.github.hectorvent.floci.testing.LockWaits;
+import io.github.hectorvent.floci.testing.ManualClock;
 import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
@@ -1475,5 +1476,51 @@ class KinesisServiceTest {
 
     private static List<String> recordData(List<KinesisRecord> records) {
         return records.stream().map(r -> new String(r.getData(), StandardCharsets.UTF_8)).toList();
+    }
+
+    @Test
+    void updateShardCountLimitCoversTheTwentyFourHoursBeforeTheCallOnTheServiceClock() {
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        ManualClock clock = new ManualClock(start);
+        KinesisService service = new KinesisService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver(REGION, "000000000000"), clock);
+        service.createStream("scaled", 128, REGION);
+
+        service.updateShardCount("scaled", 129, "UNIFORM_SCALING", REGION);
+        clock.advance(Duration.ofHours(1));
+        for (int i = 1; i < 10; i++) {
+            service.updateShardCount("scaled", 128 + (i % 2 == 0 ? 1 : -1), "UNIFORM_SCALING", REGION);
+        }
+
+        clock.advance(Duration.ofHours(23).minusMillis(1));
+        AwsException tooSoon = assertThrows(AwsException.class,
+                () -> service.updateShardCount("scaled", 129, "UNIFORM_SCALING", REGION));
+        assertEquals("LimitExceededException", tooSoon.getErrorCode());
+
+        // Exactly 24 hours after the first update it is no longer inside the window, so one more fits.
+        clock.advance(Duration.ofMillis(1));
+        service.updateShardCount("scaled", 129, "UNIFORM_SCALING", REGION);
+        AwsException fullAgain = assertThrows(AwsException.class,
+                () -> service.updateShardCount("scaled", 127, "UNIFORM_SCALING", REGION));
+        assertEquals("LimitExceededException", fullAgain.getErrorCode());
+    }
+
+    @Test
+    void aStreamAndItsConsumerAreDatedOnTheServiceClock() {
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        ManualClock clock = new ManualClock(start);
+        KinesisService service = new KinesisService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver(REGION, "000000000000"), clock);
+
+        service.createStream("dated", 1, REGION);
+        KinesisStream stream = service.describeStream("dated", REGION);
+        assertEquals(start, stream.getStreamCreationTimestamp());
+
+        clock.advance(Duration.ofMinutes(5));
+        KinesisConsumer consumer = service.registerStreamConsumer(stream.getStreamArn(), "reader", REGION);
+        Instant registered = start.plus(Duration.ofMinutes(5));
+        assertEquals(registered, consumer.getConsumerCreationTimestamp());
+        assertEquals(stream.getStreamArn() + "/consumer/reader:" + registered.toEpochMilli(),
+                consumer.getConsumerArn());
     }
 }
