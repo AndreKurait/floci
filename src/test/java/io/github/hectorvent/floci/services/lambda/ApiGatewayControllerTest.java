@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
+import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -46,11 +47,41 @@ class ApiGatewayControllerTest {
         assertTrue(eventNode.get("body").isNull());
     }
 
+    @Test
+    void aLowerCaseContentTypeHeaderFromTheFunctionSetsTheResponseContentType() {
+        LambdaService lambdaService = mock(LambdaService.class);
+        Response response = invokeDelete(lambdaService, new byte[0],
+                "{\"statusCode\":200,\"headers\":{\"content-type\":\"text/html\"},\"body\":\"<p>hi</p>\"}");
+
+        assertEquals(200, response.getStatus());
+        assertEquals("text/html", response.getMediaType().toString());
+    }
+
+    @Test
+    void aResponseWithoutAContentTypeHeaderDefaultsToJson() {
+        LambdaService lambdaService = mock(LambdaService.class);
+        Response response = invokeDelete(lambdaService, new byte[0], "{\"statusCode\":200,\"body\":\"{}\"}");
+
+        assertEquals("application/json", response.getMediaType().toString());
+    }
+
     private JsonNode deleteEventFor(byte[] body) {
         LambdaService lambdaService = mock(LambdaService.class);
+        invokeDelete(lambdaService, body, "{\"statusCode\":204}");
+
+        ArgumentCaptor<byte[]> event = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService).invoke(eq(REGION), eq(FUNCTION), event.capture(), eq(InvocationType.RequestResponse));
+        try {
+            return new ObjectMapper().readTree(event.getValue());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private Response invokeDelete(LambdaService lambdaService, byte[] body, String functionPayload) {
         InvokeResult invokeResult = new InvokeResult();
         invokeResult.setStatusCode(200);
-        invokeResult.setPayload("{\"statusCode\":204}".getBytes(StandardCharsets.UTF_8));
+        invokeResult.setPayload(functionPayload.getBytes(StandardCharsets.UTF_8));
         when(lambdaService.invoke(eq(REGION), eq(FUNCTION), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(invokeResult);
 
@@ -67,14 +98,6 @@ class ApiGatewayControllerTest {
 
         ApiGatewayController controller = new ApiGatewayController(
                 lambdaService, regionResolver, new ObjectMapper(), mock(CloudWatchLogsService.class));
-        controller.handleDelete(headers, uriInfo, FUNCTION, "items", body);
-
-        ArgumentCaptor<byte[]> event = ArgumentCaptor.forClass(byte[].class);
-        verify(lambdaService).invoke(eq(REGION), eq(FUNCTION), event.capture(), eq(InvocationType.RequestResponse));
-        try {
-            return new ObjectMapper().readTree(event.getValue());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        return controller.handleDelete(headers, uriInfo, FUNCTION, "items", body);
     }
 }
