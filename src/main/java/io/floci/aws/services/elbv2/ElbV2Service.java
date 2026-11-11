@@ -5,6 +5,7 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegionFacts;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.CertificateReferenceResolver;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
@@ -117,10 +118,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         this.rules = new StorageBackedMap<>(ruleStore);
         this.tags = storageBacked("elbv2-tags.json",
                 new TypeReference<Map<String, Map<String, String>>>() {});
-        normalizeRegionMaps(loadBalancers);
-        normalizeRegionMaps(targetGroups);
-        normalizeRegionMaps(listeners);
-        normalizeRegionMaps(rules);
+        normalizeStoredRegions(loadBalancers, loadBalancerStore);
+        normalizeStoredRegions(targetGroups, targetGroupStore);
+        normalizeStoredRegions(listeners, listenerStore);
+        normalizeStoredRegions(rules, ruleStore);
         normalizeRegionMaps(tags);
         rebuildIndexes();
     }
@@ -135,6 +136,41 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             if (!(entry.getValue() instanceof ConcurrentHashMap)) {
                 resources.put(entry.getKey(), new ConcurrentHashMap<>(entry.getValue()));
             }
+        }
+    }
+
+    private record StoredRegion<V>(String accountId, String region, Map<String, V> resources) {}
+
+    private <V> List<StoredRegion<V>> storedRegions(Map<String, Map<String, V>> resources,
+                                                  AccountAwareStorageBackend<Map<String, V>> store) {
+        List<StoredRegion<V>> stored = new ArrayList<>();
+        if (store == null) {
+            resources.forEach((region, values) -> stored.add(new StoredRegion<>(null, region, values)));
+            return stored;
+        }
+        store.scanAllAccountsWithRawKeys().forEach((rawKey, values) -> {
+            int slash = rawKey.indexOf('/');
+            if (slash < 0 && store.getForAccount((config == null ? regionResolver.getDefaultAccountId() : config.defaultAccountId()), rawKey).isPresent()) {
+                return;
+            }
+            String accountId = slash < 0 ? (config == null ? regionResolver.getDefaultAccountId() : config.defaultAccountId()) : rawKey.substring(0, slash);
+            String region = slash < 0 ? rawKey : rawKey.substring(slash + 1);
+            stored.add(new StoredRegion<>(accountId, region, values));
+        });
+        return stored;
+    }
+
+    private <V> void normalizeStoredRegions(Map<String, Map<String, V>> resources,
+                                           AccountAwareStorageBackend<Map<String, V>> store) {
+        if (store == null) {
+            normalizeRegionMaps(resources);
+            return;
+        }
+        for (StoredRegion<V> stored : storedRegions(resources, store)) {
+            Map<String, V> concurrent = stored.resources() instanceof ConcurrentHashMap
+                    ? stored.resources() : new ConcurrentHashMap<>(stored.resources());
+            store.putForAccount(stored.accountId(), stored.region(), concurrent);
+            store.deleteRaw(stored.region());
         }
     }
 
@@ -204,38 +240,25 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      */
     public void restorePersistedRuntime()
     {
-        if (loadBalancerStore == null) {
-            restoreAccountRuntime();
-            return;
-        }
-        Set<String> accountIds = new TreeSet<>();
-        for (AccountAwareStorageBackend<?> store : List.of(loadBalancerStore, targetGroupStore, listenerStore, ruleStore)) {
-            store.scanAllAccountEntries(key -> true).forEach(entry -> accountIds.add(entry.accountId()));
-        }
-        for (String accountId : accountIds) {
-            RequestScopes.runAs(accountId, this::restoreAccountRuntime);
-        }
-    }
-
-    private void restoreAccountRuntime()
-    {
         refreshCanonicalHostedZones();
         if (healthChecker != null) {
-            for (Map<String, TargetGroup> regionTargetGroups : targetGroups.values()) {
-                for (TargetGroup targetGroup : regionTargetGroups.values()) {
-                    healthChecker.startMonitoring(targetGroup);
-                    if (!targetGroup.getTargets().isEmpty()) {
-                        healthChecker.addTargets(targetGroup.getTargetGroupArn(), targetGroup.getTargets(), targetGroup);
+            for (StoredRegion<TargetGroup> stored : storedRegions(targetGroups, targetGroupStore)) {
+                RequestScopes.runAs(stored.accountId(), stored.region(), () -> {
+                    for (TargetGroup targetGroup : stored.resources().values()) {
+                        healthChecker.startMonitoring(targetGroup);
+                        if (!targetGroup.getTargets().isEmpty()) {
+                            healthChecker.addTargets(targetGroup.getTargetGroupArn(), targetGroup.getTargets(), targetGroup);
+                        }
                     }
-                }
+                });
             }
         }
         if (dataPlane != null) {
-            for (Map.Entry<String, Map<String, Listener>> regionEntry : listeners.entrySet()) {
-                String region = regionEntry.getKey();
-                for (Listener listener : regionEntry.getValue().values()) {
+            for (StoredRegion<Listener> stored : storedRegions(listeners, listenerStore)) {
+                for (Listener listener : stored.resources().values()) {
                     try {
-                        restoreListener(region, listener.getListenerArn());
+                        RequestScopes.runAs(stored.accountId(), stored.region(),
+                                () -> restoreListener(stored.region(), listener.getListenerArn()));
                     } catch (RuntimeException failure) {
                         LOG.warnv("ELBv2 saved listener {0} could not be restored ({1}: {2}); its configuration is retained",
                                 listener.getListenerArn(), failure.getClass().getSimpleName(), failure.getMessage());
@@ -452,6 +475,38 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     Listener getListener(String region, String arn) {
         return listeners.getOrDefault(region, Map.of()).get(arn);
+    }
+
+    TargetGroup getTargetGroupForListener(String region, String listenerArn, String targetGroupArn) {
+        return dataPlaneResource(targetGroups, targetGroupStore, region, listenerArn, targetGroupArn);
+    }
+
+    LoadBalancer getLoadBalancerForListener(String region, String listenerArn, String loadBalancerArn) {
+        return dataPlaneResource(loadBalancers, loadBalancerStore, region, listenerArn, loadBalancerArn);
+    }
+
+    Listener getDataPlaneListener(String region, String listenerArn) {
+        return dataPlaneResource(listeners, listenerStore, region, listenerArn, listenerArn);
+    }
+
+    private <V> V dataPlaneResource(Map<String, Map<String, V>> resources,
+                                   AccountAwareStorageBackend<Map<String, V>> store,
+                                   String region, String listenerArn, String resourceArn) {
+        if (!AwsArnUtils.isArn(listenerArn) || !AwsArnUtils.isArn(resourceArn)) {
+            return null;
+        }
+        AwsArnUtils.Arn owner = AwsArnUtils.parse(listenerArn);
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        if (!"elasticloadbalancing".equals(owner.service()) || !owner.service().equals(resource.service())
+                || !region.equals(owner.region()) || !region.equals(resource.region())
+                || !owner.partition().equals(resource.partition())
+                || !owner.partition().equals(AwsRegions.partitionFor(region))
+                || owner.accountId().isBlank() || !owner.accountId().equals(resource.accountId())) {
+            return null;
+        }
+        Map<String, V> regionResources = store == null ? resources.get(region)
+                : store.getForAccount(owner.accountId(), region).orElse(null);
+        return regionResources == null ? null : regionResources.get(resourceArn);
     }
 
     /** Capacity reservation status for a load balancer. All fields are {@code null} when no
@@ -1779,16 +1834,18 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * zone of their region and type again, written back so the stored copy agrees.
      */
     private void refreshCanonicalHostedZones() {
-        for (String region : List.copyOf(loadBalancers.keySet())) {
-            Map<String, LoadBalancer> regionLoadBalancers = loadBalancers.get(region);
-            if (regionLoadBalancers == null) {
-                continue;
-            }
+        for (StoredRegion<LoadBalancer> stored : storedRegions(loadBalancers, loadBalancerStore)) {
+            String region = stored.region();
+            Map<String, LoadBalancer> regionLoadBalancers = stored.resources();
             for (LoadBalancer lb : regionLoadBalancers.values()) {
                 String lbType = lb.getType() != null ? lb.getType() : "application";
                 lb.setCanonicalHostedZoneId(canonicalHostedZoneId(lbType, region));
             }
-            loadBalancers.put(region, regionLoadBalancers);
+            if (loadBalancerStore == null) {
+                loadBalancers.put(region, regionLoadBalancers);
+            } else {
+                loadBalancerStore.putForAccount(stored.accountId(), region, regionLoadBalancers);
+            }
         }
     }
 

@@ -1428,10 +1428,10 @@ class ElbV2ServiceTest {
         }
     }
 
-    private static final class SharedStorageFactory extends StorageFactory {
+    static final class SharedStorageFactory extends StorageFactory {
         private final Map<String, StorageBackend<String, ?>> stores = new HashMap<>();
 
-        private SharedStorageFactory() {
+        SharedStorageFactory() {
             super(null, null);
         }
 
