@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.codedeploy;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
 import io.github.hectorvent.floci.services.codedeploy.model.Deployment;
@@ -22,6 +23,7 @@ import java.util.Map;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -154,13 +156,29 @@ class CodeDeployEcsTrafficShiftTest {
                 anyInt());
     }
 
+    @Test
+    void ecsDeployment_refusedForAGroupWithoutAService_leavesNoDeploymentBehind() {
+        service.createDeploymentGroup(REGION, "ecs-app", "bare-group", "CodeDeployDefault.ECSAllAtOnce", ROLE,
+                Map.of());
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> deploy("bare-group", "CodeDeployDefault.ECSAllAtOnce"));
+
+        assertEquals("InvalidDeploymentConfigException", refused.getErrorCode());
+        assertEquals(List.of(), service.listDeployments(REGION, "ecs-app", "bare-group", List.of()));
+    }
+
     private String deploy(String configName) {
+        return deploy("ecs-group", configName);
+    }
+
+    private String deploy(String groupName, String configName) {
         String appSpec = """
                 {"version": 0.0, "Resources": [{"TargetService": {"Type": "AWS::ECS::Service",
                   "Properties": {"TaskDefinition": "web:2",
                     "LoadBalancerInfo": {"ContainerName": "web", "ContainerPort": 80}}}}]}
                 """;
-        return service.createDeployment(REGION, "ecs-app", "ecs-group", configName,
+        return service.createDeployment(REGION, "ecs-app", groupName, configName,
                 Map.of("revisionType", "AppSpecContent", "appSpecContent", Map.of("content", appSpec)), "shift");
     }
 
