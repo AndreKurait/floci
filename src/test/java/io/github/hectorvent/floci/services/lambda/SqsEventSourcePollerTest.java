@@ -130,6 +130,21 @@ class SqsEventSourcePollerTest {
     }
 
     @Test
+    void firstReceiveTimestampOfAMessageWithoutOneIsReadFromThePollerClock() throws Exception {
+        Message msg = new Message();
+        msg.setBody("{}");
+        msg.setSentTimestamp(Instant.parse("2026-01-15T10:30:00Z"));
+        EventSourceMapping esm = esm();
+        poller.setClockForTest(() -> Instant.parse("2026-01-15T10:31:00.123Z").toEpochMilli());
+
+        JsonNode attrs = OBJECT_MAPPER.readTree(poller.buildSqsEvent(List.of(msg), esm))
+                .get("Records").get(0).get("attributes");
+
+        assertEquals(String.valueOf(Instant.parse("2026-01-15T10:31:00.123Z").toEpochMilli()),
+                attrs.get("ApproximateFirstReceiveTimestamp").asText());
+    }
+
+    @Test
     void buildSqsEventPopulatesStringMessageAttribute() throws Exception {
         Message msg = new Message();
         msg.setBody("hello");
