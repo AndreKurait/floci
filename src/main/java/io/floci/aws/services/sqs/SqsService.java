@@ -90,7 +90,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
     private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> queueLocks = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, RedrivePolicy> redrivePolicyCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CachedRedrivePolicy> redrivePolicyCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Instant>> deduplicationCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, DeduplicationIdentity>> deduplicationIdentityCache =
             new ConcurrentHashMap<>();
@@ -112,6 +112,9 @@ public class SqsService implements Resettable, ResourceProvider {
     private final AtomicLong sequenceCounter = new AtomicLong(0);
 
     private record RedrivePolicy(int maxReceiveCount, String deadLetterTargetArn) {
+    }
+
+    private record CachedRedrivePolicy(String rawPolicy, RedrivePolicy policy) {
     }
 
     private record DeduplicationIdentity(String messageId, long sequenceNumber) {
@@ -1526,18 +1529,22 @@ public class SqsService implements Resettable, ResourceProvider {
             return null;
         }
 
-        return redrivePolicyCache.computeIfAbsent(storageKey, k -> {
+        CachedRedrivePolicy cached = redrivePolicyCache.compute(storageKey, (key, existing) -> {
+            if (existing != null && rawPolicy.equals(existing.rawPolicy())) {
+                return existing;
+            }
             try {
                 JsonNode rp = new ObjectMapper().readTree(rawPolicy);
-                return new RedrivePolicy(
+                return new CachedRedrivePolicy(rawPolicy, new RedrivePolicy(
                         rp.has("maxReceiveCount") ? rp.get("maxReceiveCount").asInt() : -1,
                         rp.has("deadLetterTargetArn") ? rp.get("deadLetterTargetArn").asText() : null
-                );
+                ));
             } catch (Exception e) {
                 LOG.warnv("Failed to parse RedrivePolicy for queue {0}", queue.getQueueUrl());
                 return null;
             }
         });
+        return cached != null ? cached.policy() : null;
     }
 
     private List<Message> doReceiveMessage(String storageKey, String queueUrl, int maxMessages, int visibilityTimeout, String region) {
