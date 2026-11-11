@@ -182,6 +182,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     private AccountAwareStorageBackend<TaskDefinition> taskDefinitionsStore;
     // region::family → latest revision number
     private Map<String, Integer> latestRevisions = new ConcurrentHashMap<>();
+    // Held to allocate a revision: the storage-backed map's compute() is a read followed by a write.
+    private final Object revisionAllocationLock = new Object();
     // taskArn → EcsTask
     private final Map<String, EcsTask> tasks = new ConcurrentHashMap<>();
     // taskArn → EcsTaskHandle (running containers or pending resource cleanup)
@@ -1059,8 +1061,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         }
         EcsLinuxParameters.normalize(containerDefs);
         String family = request.getFamily();
-        int revision = latestRevisions.compute(familyKey(region, family),
-                (key, latest) -> (latest != null ? latest : latestRevision(region, family)) + 1);
+        int revision;
+        synchronized (revisionAllocationLock) {
+            revision = latestRevisions.compute(familyKey(region, family),
+                    (key, latest) -> (latest != null ? latest : latestRevision(region, family)) + 1);
+        }
 
         TaskDefinition td = new TaskDefinition();
         td.setFamily(family);
