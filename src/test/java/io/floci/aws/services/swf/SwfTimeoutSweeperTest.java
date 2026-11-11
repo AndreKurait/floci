@@ -6,12 +6,20 @@ import io.floci.aws.config.EmulatorConfig.SwfServiceConfig;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 /**
  * The sweep interval reaches {@code scheduleWithFixedDelay}, which rejects a non-positive
@@ -65,17 +73,19 @@ class SwfTimeoutSweeperTest {
         });
     }
 
-
     @Test
     void aSweepThatEndsInAnErrorDoesNotStopTheOnesAfterIt() {
-        TestTime time = TestTime.create();
         SwfService service = mock(SwfService.class);
         doThrow(new StackOverflowError("history too deep")).doNothing().when(service).sweep();
-        new SwfTimeoutSweeper(service, configWithInterval(1L), time.scheduler()).onStart(new StartupEvent());
+        ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+        new SwfTimeoutSweeper(service, configWithInterval(1L), scheduler).onStart(new StartupEvent());
+        ArgumentCaptor<Runnable> tick = ArgumentCaptor.forClass(Runnable.class);
+        verify(scheduler).scheduleWithFixedDelay(tick.capture(), eq(1L), eq(1L), eq(TimeUnit.SECONDS));
 
-        time.advance(Duration.ofSeconds(1));
+        // A periodic task that throws is cancelled by its executor, so the Error must not leave the tick.
+        assertDoesNotThrow(() -> tick.getValue().run());
         verify(service, times(1)).sweep();
-        time.advance(Duration.ofSeconds(1));
+        assertDoesNotThrow(() -> tick.getValue().run());
         verify(service, times(2)).sweep();
     }
 }
