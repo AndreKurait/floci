@@ -582,6 +582,20 @@ class ApplicationAutoScalingServiceTest {
     }
 
     @Test
+    void putScalingPolicy_replacingATargetTrackingPolicyWithStepScaling_deletesItsAlarms() {
+        register();
+        service.putScalingPolicy("cpu", "TargetTrackingScaling", NAMESPACE, RESOURCE_ID, DIMENSION,
+                targetTracking(50.0, "ECSServiceAverageCPUUtilization", null), null, REGION);
+        assertEquals(2, alarmsInCloudWatch.size());
+
+        ScalingPolicy replaced = service.putScalingPolicy("cpu", "StepScaling", NAMESPACE, RESOURCE_ID,
+                DIMENSION, null, null, REGION);
+
+        assertEquals(List.of(), replaced.getAlarms());
+        assertEquals(Set.of(), alarmsInCloudWatch);
+    }
+
+    @Test
     void tagLifecycleIsDrivenByTheScalableTargetArn() {
         ScalableTarget target = register();
         String arn = target.getScalableTargetArn();
