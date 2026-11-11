@@ -194,6 +194,7 @@ public class Ec2ContainerManager {
     private final Ec2MetadataNamespace metadataNamespaces;
     private final Ec2SystemdV1Runtime systemdV1;
     private final Ec2GuestReboots guestReboots;
+    private final Ec2Ipv6VpcRouter ipv6Router;
     private SecurityGroupFirewallManager firewallManager;
     private final ExecutorService executor;
     private final Semaphore metadataSetupSlots = new Semaphore(METADATA_SETUP_CONCURRENCY);
@@ -574,6 +575,7 @@ public class Ec2ContainerManager {
         this.instanceTypeCatalog = instanceTypeCatalog != null ? instanceTypeCatalog : new Ec2InstanceTypeCatalog();
         this.metadataNamespaces = new Ec2MetadataNamespace(dockerClient, containerBuilder, lifecycleManager, config);
         this.systemdV1 = new Ec2SystemdV1Runtime(dockerClient, containerBuilder, lifecycleManager, config);
+        this.ipv6Router = new Ec2Ipv6VpcRouter(dockerClient, containerBuilder, lifecycleManager, config, vpcNetworkManager);
         this.executor = executor;
         this.serviceNetworkRetryExecutor = serviceNetworkRetryExecutor;
         this.userDataExecutionTimeout = userDataExecutionTimeout;
@@ -651,6 +653,11 @@ public class Ec2ContainerManager {
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             LOG.warn("EC2 launch worker drain interrupted");
+        }
+        try {
+            ipv6Router.retire();
+        } catch (RuntimeException failure) {
+            LOG.warnv(failure, "IPv6 VPC router was not removed at shutdown");
         }
     }
 
@@ -896,11 +903,13 @@ public class Ec2ContainerManager {
                             Map.of(), metadataNamespaces.sshHostBindAddress());
                     helperId = namespace.helperId();
                 } else {
-                    helperId = metadataNamespaces.create(instanceId, regionResolver.getAccountId(), region, sshHostPort);
+                    helperId = metadataNamespaces.create(instanceId, regionResolver.getAccountId(), region, sshHostPort,
+                            guestIpv6(instance) != null);
                 }
                 networkHelpers.put(instanceId, helperId);
-                String vpcAddress = vpcNetworkManager.attach(region, instance.getVpcId(), instance.getSubnetId(),
-                        helperId, leasedPrivateIp).map(network -> leasedPrivateIp).orElse(null);
+                Optional<String> vpcNetwork = vpcNetworkManager.attach(region, instance.getVpcId(),
+                        instance.getSubnetId(), helperId, leasedPrivateIp);
+                String vpcAddress = vpcNetwork.map(network -> leasedPrivateIp).orElse(null);
                 if (namespace != null && vpcNetworkManager.enabled() && vpcAddress == null) {
                     throw new IllegalStateException("Protected EC2 namespace could not attach to its VPC");
                 }
@@ -925,6 +934,9 @@ public class Ec2ContainerManager {
                             vpcAddress == null ? Set.of() : Set.of(vpcAddress),
                             List.of(), nativePeerDependencies.dependencies()),
                             helperId, prefixLists);
+                }
+                if (vpcAddress != null && namespace == null) {
+                    configureGuestIpv6(helperId, instance, region, vpcNetwork.get(), vpcAddress);
                 }
                 instance.setContainerBridgeIp(containerIp);
                 metadataServer.registerContainer(containerIp, instanceId, instance);
@@ -2821,6 +2833,58 @@ public class Ec2ContainerManager {
         BoundedOutput(int capacity) {
             super(capacity);
         }
+    }
+
+    /** The primary interface when guest IPv6 is enabled and it holds an IPv6 address, else null. */
+    private InstanceNetworkInterface guestIpv6(Instance instance) {
+        if (!config.services().ec2().guestIpv6() || instance.getNetworkInterfaces() == null) {
+            return null;
+        }
+        for (InstanceNetworkInterface eni : instance.getNetworkInterfaces()) {
+            if (eni.getDeviceIndex() == 0 && !eni.getIpv6Addresses().isEmpty() && !eni.getVpcIpv6CidrBlocks().isEmpty()) {
+                return eni;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Puts the primary interface's IPv6 address on the namespace's VPC interface (the one holding its private IPv4),
+     * routes the VPC's IPv6 block on it with a default route to the VPC router's link-local fe80:ec2::1, and leaves
+     * every other interface without IPv6, so IPv6 leaves the guest only through its VPC.
+     */
+    private void configureGuestIpv6(String helperId, Instance instance, String region, String vpcNetwork,
+                                    String vpcAddress) {
+        InstanceNetworkInterface eni = guestIpv6(instance);
+        if (eni == null) {
+            return;
+        }
+        ipv6Router.join(region, instance.getSubnetId(), vpcNetwork, eni.getVpcIpv6CidrBlocks().get(0));
+        ContainerExec.Result result = execInContainerForResult(helperId,
+                guestIpv6Command(vpcAddress, eni.getIpv6Addresses().get(0), eni.getVpcIpv6CidrBlocks().get(0)), 30);
+        if (result.exitCode() != 0) {
+            throw new IllegalStateException("Cannot configure guest IPv6 for " + instance.getInstanceId() + ": "
+                    + result.summary());
+        }
+        LOG.infov("Configured IPv6 {0} for EC2 instance {1}", eni.getIpv6Addresses().get(0), instance.getInstanceId());
+    }
+
+    static String[] guestIpv6Command(String vpcAddress, String ipv6Address, String vpcIpv6Block) {
+        String script = String.join("\n",
+                "set -eu",
+                "vpc=$(ip -o -4 addr show | awk -v a=\"$1\" '{split($4, p, \"/\"); sub(/@.*/, \"\", $2); if (p[1] == a) print $2}' | head -n1)",
+                "[ -n \"$vpc\" ] || { echo \"no interface holds $1\" >&2; exit 3; }",
+                "for dev in $(ls /sys/class/net); do",
+                "  [ \"$dev\" = lo ] && continue",
+                "  [ \"$dev\" = \"$vpc\" ] && continue",
+                "  ip link set dev \"$dev\" addrgenmode none 2>/dev/null || true",
+                "  ip -6 addr flush dev \"$dev\" scope global 2>/dev/null || true",
+                "  ip -6 addr flush dev \"$dev\" scope link 2>/dev/null || true",
+                "done",
+                "ip -6 addr replace \"$2/64\" dev \"$vpc\" nodad",
+                "ip -6 route replace \"$3\" dev \"$vpc\"",
+                "ip -6 route replace default via fe80:ec2::1 dev \"$vpc\"");
+        return new String[] {"sh", "-c", script, "guest-ipv6", vpcAddress, ipv6Address, vpcIpv6Block};
     }
 
     private void configureLinkLocalMetadataEndpoint(String containerId, Instance instance, String flociHost, int imdsPort) {

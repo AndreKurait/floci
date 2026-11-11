@@ -2415,6 +2415,25 @@ five AWS-reserved addresses. `DescribeSubnets` subtracts addresses currently hel
 by instances, network interfaces, NAT gateways and interface endpoints. ASG
 scale-out uses this count when selecting among subnets in the same zone.
 
+### Guest IPv6
+
+Set `FLOCI_SERVICES_EC2_GUEST_IPV6=true` to carry IPv6 between instances whose primary interface holds an
+IPv6 address (see RunInstances). It applies to shared address spaces without security-group enforcement;
+isolated address spaces keep their IPv4-only native interface. With it, Floci:
+
+- creates the instance's network namespace with IPv6 enabled;
+- puts the interface's address on its VPC interface (the one holding its private IPv4), routes the VPC's IPv6
+  block on that interface and sets the default IPv6 route to `fe80:ec2::1`;
+- removes IPv6 from the namespace's other interfaces;
+- runs one IPv6 VPC router per deployment. It joins each VPC network a dual-stack instance attaches to at the
+  subnet's reserved base + 3 address, drops its IPv4 there, holds `fe80:ec2::1`, the link-local address the VPC User Guide lists as reserved for the VPC router ("The link-local IPv6 address FE80:ec2::1", "Subnet CIDR blocks"), and routes that VPC's IPv6 block.
+  IPv6 therefore reaches instances in other dual-stack VPCs and nothing else: the router has no default route,
+  and the host gets no IPv6 address or route.
+
+Docker networks stay IPv4-only, and the Docker daemon needs no IPv6 setting. Not modelled: the router joins a VPC
+without checking for an internet gateway or a `::/0` route, and security groups do not filter this IPv6 traffic.
+With the setting off (the default), addresses are assigned and reported, and no namespace changes.
+
 ## Requirements
 
 EC2 requires the Docker socket to be accessible (same as Lambda, ECS, and other container services):

@@ -15,7 +15,7 @@ import java.util.Optional;
 /** Keeps the guest image stopped while Floci prepares its link-local metadata route. */
 final class Ec2MetadataNamespace {
     static final String HELPER_LABEL = "io.floci.ec2.metadata-helper";
-    private static final String DEFAULT_IMAGE = "floci/network-helper:local";
+    static final String DEFAULT_IMAGE = "floci/network-helper:local";
 
     private final DockerClient dockerClient;
     private final ContainerBuilder containerBuilder;
@@ -31,10 +31,20 @@ final class Ec2MetadataNamespace {
     }
 
     String create(String instanceId, String accountId, String region, int sshHostPort) {
+        return create(instanceId, accountId, region, sshHostPort, false);
+    }
+
+    /** With {@code ipv6}, the namespace starts with IPv6 enabled, so interfaces connected later carry it too. */
+    String create(String instanceId, String accountId, String region, int sshHostPort, boolean ipv6) {
         String image = config.services().ec2().metadataHelperImage();
         LocallyBuiltHelperImage.ensureBuilt(dockerClient, containerBuilder, image, DEFAULT_IMAGE,
                 "/docker/network-helper.Dockerfile");
-        ContainerSpec spec = containerBuilder.newContainer(image)
+        ContainerBuilder.Builder builder = containerBuilder.newContainer(image);
+        if (ipv6) {
+            builder.withNetworkSysctl("net.ipv6.conf.all.disable_ipv6", "0")
+                    .withNetworkSysctl("net.ipv6.conf.default.disable_ipv6", "0");
+        }
+        ContainerSpec spec = builder
                 .withName(ContainerStorageHelper.resourceName(config, "ec2-imds", null, instanceId))
                 .withDockerNetwork(Optional.empty())
                 .withEmbeddedDns()

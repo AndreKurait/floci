@@ -1028,9 +1028,29 @@ public class VpcNetworkManager {
         }
     }
 
+    /**
+     * The address the IPv6 VPC router takes on a VPC network: the subnet's base + 3, one of the four addresses AWS
+     * reserves at the start of every subnet, so it never collides with an address this manager leases.
+     */
+    public Optional<String> ipv6RouterAddress(String region, String subnetId) {
+        SubnetBinding subnet = subnetBinding(region, subnetId);
+        return subnet == null || subnet.effective == null ? Optional.empty() : subnet.effective.addressAt(3);
+    }
+
+    /** The container the guest IPv6 router runs in; removing a VPC network first disconnects it. */
+    public void setIpv6RouterContainer(String containerId) {
+        ipv6RouterContainerId = containerId;
+    }
+
+    private volatile String ipv6RouterContainerId;
+
     private void removeNetworkWithRetry(String networkName, String flociContainerId, int attempt) {
         if (flociContainerId != null) {
             disconnect(networkName, flociContainerId);
+        }
+        String router = ipv6RouterContainerId;
+        if (router != null) {
+            disconnect(networkName, router);
         }
         try {
             dockerClient.removeNetworkCmd(networkName).exec();
