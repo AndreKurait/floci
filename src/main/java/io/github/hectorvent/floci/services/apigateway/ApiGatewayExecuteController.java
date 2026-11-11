@@ -899,7 +899,7 @@ public class ApiGatewayExecuteController {
     /** AWS's default integration cache TTL when a method enables caching without naming one. */
     private static final int DEFAULT_CACHE_TTL_SECONDS = 300;
 
-    private record CachedResponse(int status, Object entity, Map<String, String> headers, long expiresAt) {}
+    private record CachedResponse(int status, Object entity, Map<String, List<String>> headers, long expiresAt) {}
 
     private final Map<String, CachedResponse> responseCache = new ConcurrentHashMap<>();
 
@@ -970,9 +970,9 @@ public class ApiGatewayExecuteController {
     }
 
     private static CachedResponse snapshotForCache(Response response, int ttlSeconds, long nowMillis) {
-        Map<String, String> headers = new LinkedHashMap<>();
+        Map<String, List<String>> headers = new LinkedHashMap<>();
         response.getStringHeaders().forEach((name, values) -> {
-            if (!values.isEmpty()) headers.put(name, values.get(0));
+            if (!values.isEmpty()) headers.put(name, List.copyOf(values));
         });
         return new CachedResponse(response.getStatus(), response.getEntity(), headers,
                 nowMillis + ttlSeconds * 1000L);
@@ -980,7 +980,7 @@ public class ApiGatewayExecuteController {
 
     private static Response fromCache(CachedResponse cached) {
         Response.ResponseBuilder rb = Response.status(cached.status()).entity(cached.entity());
-        cached.headers().forEach(rb::header);
+        cached.headers().forEach((name, values) -> values.forEach(value -> rb.header(name, value)));
         return rb.build();
     }
 

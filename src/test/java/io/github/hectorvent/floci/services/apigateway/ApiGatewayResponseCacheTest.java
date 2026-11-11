@@ -153,6 +153,21 @@ class ApiGatewayResponseCacheTest {
     }
 
     @Test
+    void aCachedResponseKeepsEveryValueOfARepeatedHeader() {
+        when(lambda.invokeTarget(anyString(), anyString(), any(byte[].class), any())).thenReturn(
+                new InvokeResult(200, null, ("{\"statusCode\":200,\"multiValueHeaders\":{\"X-Trace\":[\"a\",\"b\"]},"
+                        + "\"body\":\"ok\"}").getBytes(StandardCharsets.UTF_8), null, "request"));
+        api("api", "root", null, "prod");
+
+        List<String> fromBackend = traceHeaderOfGet("api", "prod");
+        List<String> fromCache = traceHeaderOfGet("api", "prod");
+
+        assertEquals(List.of("a", "b"), fromBackend);
+        assertEquals(fromBackend, fromCache);
+        verifyBackendCalls(1);
+    }
+
+    @Test
     void anHttpApiProxyEventCarriesOneReadingOfTheControllerClock() throws Exception {
         String event = controller.buildV2ProxyEvent("GET", "/orders", "GET /orders", "api", REGION, "prod",
                 headers, uri, new byte[0], "request-1");
@@ -193,6 +208,12 @@ class ApiGatewayResponseCacheTest {
     private int get(String apiId, String stageName) {
         try (Response response = controller.dispatch("GET", apiId, stageName, "", headers, uri, new byte[0])) {
             return response.getStatus();
+        }
+    }
+
+    private List<String> traceHeaderOfGet(String apiId, String stageName) {
+        try (Response response = controller.dispatch("GET", apiId, stageName, "", headers, uri, new byte[0])) {
+            return response.getStringHeaders().get("X-Trace");
         }
     }
 
