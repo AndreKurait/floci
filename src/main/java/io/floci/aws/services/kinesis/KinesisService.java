@@ -690,6 +690,7 @@ public class KinesisService implements ResourceProvider {
             KinesisStream stream = resolveStream(streamName, region);
             requireActive(stream);
             splitShardOnStream(stream, shardId, newStartingHashKey, () -> beginStatusUpdate(stream));
+
             store.put(key, stream);
             LOG.infov("Split shard {0} in stream {1}", shardId, streamName);
         }
@@ -712,6 +713,7 @@ public class KinesisService implements ResourceProvider {
 
         List<KinesisShard> legacyOpenShards = legacyOpenShardsToNormalize(stream);
         KinesisShard.HashKeyRange parentRange = effectiveOpenShardRange(parent, legacyOpenShards);
+        requireHashKeyInsideShard(newStartingHashKey, parentRange, parent.getShardId());
         BigInteger splitPoint = new BigInteger(newStartingHashKey);
         BigInteger parentStart = new BigInteger(parentRange.startingHashKey());
         BigInteger parentEnd = new BigInteger(parentRange.endingHashKey());
@@ -809,6 +811,25 @@ public class KinesisService implements ResourceProvider {
 
     private String nextShardId(KinesisStream stream) {
         return String.format("shardId-%012d", stream.getShards().size());
+    }
+
+    /** A split leaves both children a hash key: the new start lies after the parent's start, up to its end. */
+    private static void requireHashKeyInsideShard(String newStartingHashKey,
+                                                 KinesisShard.HashKeyRange range, String shardId) {
+        BigInteger newStart;
+        try {
+            newStart = new BigInteger(newStartingHashKey);
+        } catch (NumberFormatException | NullPointerException e) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " is not a valid hash key", 400);
+        }
+        if (newStart.compareTo(new BigInteger(range.startingHashKey())) <= 0
+                || newStart.compareTo(new BigInteger(range.endingHashKey())) > 0) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " used in SplitShard() on shard "
+                            + shardId + " is not both greater than the beginning hash key and "
+                            + "no greater than the ending hash key of the shard", 400);
+        }
     }
 
     private String subtractOne(String val) {

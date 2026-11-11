@@ -594,6 +594,7 @@ class KinesisServiceTest {
                 .divide(BigInteger.TWO).toString();
         kinesisService.splitShard("my-stream", shardId, splitPoint, REGION);
 
+
         // A plain ArrayList iterator throws ConcurrentModificationException here; COWAL keeps reading
         // its fixed pre-split snapshot.
         assertDoesNotThrow(reader::next);
@@ -2154,4 +2155,23 @@ class KinesisServiceTest {
                 consumer.getConsumerArn());
 
     }
+
+
+    @Test
+    void splitShardWithAStartingHashKeyItCannotUseLeavesTheShardOpen() {
+        kinesisService.createStream("unsplit", 1, REGION);
+        String shardId = "shardId-000000000000";
+
+        for (String unusable : List.of("not-a-number", "0", "340282366920938463463374607431768211456")) {
+            AwsException rejected = assertThrows(AwsException.class,
+                    () -> kinesisService.splitShard("unsplit", shardId, unusable, REGION), unusable);
+            assertEquals("InvalidArgumentException", rejected.getErrorCode(), unusable);
+        }
+
+        KinesisStream stream = kinesisService.describeStream("unsplit", REGION);
+        assertEquals(1, stream.getShards().size());
+        assertFalse(stream.getShards().getFirst().isClosed());
+        assertNotNull(kinesisService.putRecord("unsplit", new byte[]{1}, "pk", REGION));
+    }
+
 }
