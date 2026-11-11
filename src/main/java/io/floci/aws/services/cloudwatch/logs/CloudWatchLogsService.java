@@ -305,7 +305,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             LogGroup group = new LogGroup();
             group.setLogGroupName(name);
             group.setLogGroupClass(logGroupClass == null ? "STANDARD" : logGroupClass);
-            group.setCreatedTime(System.currentTimeMillis());
+            group.setCreatedTime(clock.getAsLong());
             group.setRetentionInDays(retentionInDays);
             group.setDeletionProtectionEnabled(deletionProtectionEnabled);
             if (kmsKeyId != null && !kmsKeyId.isBlank()) {
@@ -546,7 +546,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
         LogStream stream = new LogStream();
         stream.setLogGroupName(groupName);
         stream.setLogStreamName(streamName);
-        stream.setCreatedTime(System.currentTimeMillis());
+        stream.setCreatedTime(clock.getAsLong());
         stream.setUploadSequenceToken(UUID.randomUUID().toString());
         putForAccount(streamStore, accountId, streamKey, stream);
         LOG.infov("Created log stream: {0}/{1}", groupName, streamName);
@@ -1335,7 +1335,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             filter.setFilterPattern(normalizedPattern);
             filter.setDestinationArn(destinationArn);
             filter.setDistribution(distribution != null ? distribution : "ByLogStream");
-            filter.setCreationTime(System.currentTimeMillis());
+            filter.setCreationTime(clock.getAsLong());
 
             String filterKey = subscriptionFilterKey(region, logGroupName, filterName);
             subscriptionFilterStore.put(filterKey, filter);
@@ -1393,7 +1393,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
         ResourcePolicy policy = new ResourcePolicy();
         policy.setPolicyName(policyName);
         policy.setPolicyDocument(policyDocument);
-        policy.setLastUpdatedTime(System.currentTimeMillis());
+        policy.setLastUpdatedTime(clock.getAsLong());
         resourcePolicyStore.put(resourcePolicyKey(region, policyName), policy);
         return policy;
     }
@@ -1545,7 +1545,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
                             "log-group:" + group.getLogGroupName() + ":*").toString(),
                     "logs:log-group", "logs",
                     region, regionResolver.getAccountId(),
-                    group.getCreatedTime() > 0 ? Instant.ofEpochMilli(group.getCreatedTime()) : Instant.now(),
+                    group.getCreatedTime() > 0 ? Instant.ofEpochMilli(group.getCreatedTime()) : Instant.ofEpochMilli(clock.getAsLong()),
                     group.getTags() != null ? group.getTags() : Map.of()));
         }
         return resources;
