@@ -1884,14 +1884,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         defaultSg.setOwnerId(callerAccountId());
         defaultSg.setRegion(region);
 
+        IpPermission ingressSelf = new IpPermission();
+        ingressSelf.setIpProtocol("-1");
+        UserIdGroupPair self = new UserIdGroupPair();
+        self.setGroupId(securityGroupId);
+        self.setUserId(defaultSg.getOwnerId());
+        ingressSelf.getUserIdGroupPairs().add(self);
+        defaultSg.getIpPermissions().add(ingressSelf);
+
         // Default egress: all traffic
         IpPermission egressAll = new IpPermission();
         egressAll.setIpProtocol("-1");
         egressAll.getIpRanges().add(new IpRange("0.0.0.0/0"));
         defaultSg.getIpPermissionsEgress().add(egressAll);
         securityGroups.put(key(region, securityGroupId), defaultSg);
-        // Persist the default egress rule as a SecurityGroupRule so that
-        // DescribeSecurityGroupRules can find it immediately (#1093).
+        // DescribeSecurityGroupRules must expose the same default permissions.
+        createRules(region, securityGroupId, ingressSelf, false);
         createRules(region, securityGroupId, egressAll, true);
     }
 

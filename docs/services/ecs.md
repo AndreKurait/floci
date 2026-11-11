@@ -881,6 +881,11 @@ with `maxResults` (1 to 100) and `nextToken`.
 
 Every `awsvpc` task receives an ENI in its subnet. With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, a Docker-backed task's containers additionally share one protected network namespace built around that ENI, and packets are filtered against its security groups. A task without explicit security groups uses its subnet VPC's default group. Containers in the same task can communicate over localhost. Bridge and host task networking do not attach task-level `awsvpc` security groups. Mock mode reports control-plane state, including the ENI, and does not enforce packet filtering.
 
+With native VPC networking enabled, Floci attaches that protected namespace to the
+task ENI's subnet and private address before registering its security-group policy.
+A failed attachment stops the task before any workload container starts. This lets
+VPC peers reach the task at the private address reported by `DescribeTasks`.
+
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_ECS_ENABLED` | `true` | Enable or disable the ECS service |

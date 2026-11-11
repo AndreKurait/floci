@@ -40,6 +40,7 @@ import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.EcsAgentLabels;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
@@ -154,6 +155,7 @@ public class EcsContainerManager {
     private final HostVolumePolicy hostVolumePolicy;
     private final Ec2Service ec2Service;
     private final SecurityGroupFirewallManager firewallManager;
+    private final VpcNetworkManager vpcNetworks;
     private final EcsTaskRoleCredentials taskRoleCredentials;
     private final EcsCredentialsProxy credentialsProxy;
     private final EcsTaskLinkLocalAddresses linkLocalAddresses;
@@ -185,7 +187,8 @@ public class EcsContainerManager {
                                EcsTaskRoleCredentials taskRoleCredentials,
                                EcsCredentialsProxy credentialsProxy,
                                EcsTaskLinkLocalAddresses linkLocalAddresses,
-                               EfsService efsService) {
+                               EfsService efsService,
+                               VpcNetworkManager vpcNetworks) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -200,11 +203,36 @@ public class EcsContainerManager {
         this.ecrRegistryManager = ecrRegistryManager;
         this.ec2Service = ec2Service;
         this.firewallManager = firewallManager;
+        this.vpcNetworks = vpcNetworks;
         this.taskRoleCredentials = taskRoleCredentials;
         this.credentialsProxy = credentialsProxy;
         this.linkLocalAddresses = linkLocalAddresses;
         this.efsService = efsService;
         this.hostAlias = new EcsHostAlias(lifecycleManager::getDockerClient, EcsContainerManager::linuxJvm);
+    }
+
+    public EcsContainerManager(ContainerBuilder containerBuilder,
+                               ContainerLifecycleManager lifecycleManager,
+                               ContainerLogStreamer logStreamer,
+                               ContainerDetector containerDetector,
+                               EmulatorConfig config,
+                               RegionResolver regionResolver,
+                               LaunchedContainerAwsEnv awsEnv,
+                               SsmService ssmService,
+                               SecretsManagerService secretsManagerService,
+                               S3Service s3Service,
+                               EcrRegistryManager ecrRegistryManager,
+                               HostVolumePolicy hostVolumePolicy,
+                               Ec2Service ec2Service,
+                               SecurityGroupFirewallManager firewallManager,
+                               EcsTaskRoleCredentials taskRoleCredentials,
+                               EcsCredentialsProxy credentialsProxy,
+                               EcsTaskLinkLocalAddresses linkLocalAddresses,
+                               EfsService efsService) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config, regionResolver,
+                awsEnv, ssmService, secretsManagerService, s3Service, ecrRegistryManager, hostVolumePolicy,
+                ec2Service, firewallManager, taskRoleCredentials, credentialsProxy, linkLocalAddresses,
+                efsService, null);
     }
 
     /** Replaces how a task's containers reach a Floci URL naming host.docker.internal. */
@@ -1433,6 +1461,12 @@ public class EcsContainerManager {
             namespace = firewallManager.createNamespace("ecs", taskId, regionResolver.getAccountId(),
                     region, config.services().ecs().dockerNetwork(), bindings, Map.of(RUN_LABEL, runId),
                     hostPortBindAddress(), namespaceHosts(flociAccess));
+            boolean attached = vpcNetworks != null && vpcNetworks.attach(region, eni.getVpcId(),
+                    eni.getSubnetId(), namespace.helperId(), eni.getPrivateIpAddress()).isPresent();
+            if (vpcNetworks != null && vpcNetworks.enabled() && !attached) {
+                throw new IllegalStateException("Protected ECS namespace could not attach to its VPC");
+            }
+            Set<String> privateAddresses = attached ? Set.of(eni.getPrivateIpAddress()) : Set.of();
             List<String> groupIds = eni.getGroups().stream().map(g -> g.getGroupId()).toList();
             List<SecurityGroup> groups = ec2Service.describeSecurityGroups(region, groupIds, List.of(), Map.of());
             if (groups.size() != groupIds.size()) {
@@ -1450,7 +1484,8 @@ public class EcsContainerManager {
             }
             firewallManager.register(new SecurityGroupNftCompiler.Endpoint(regionResolver.getAccountId(),
                     region, eni.getVpcId(), eniId, eni.getPrivateIpAddress(),
-                    namespace.transportAddress(), Set.copyOf(groupIds), groups), namespace.helperId(), prefixLists);
+                    namespace.transportAddress(), Set.copyOf(groupIds), groups,
+                    List.of(), false, privateAddresses), namespace.helperId(), prefixLists);
             task.setNetworkInterfaceId(eniId);
             task.setPrivateIpAddress(eni.getPrivateIpAddress());
             return new PreparedNetwork(eni, namespace);
