@@ -319,13 +319,14 @@ public class AslExecutor {
                        ServiceRegistry serviceRegistry, NestedTaskCredentials nestedTaskCredentials,
                        LambdaTaskAuthorizer lambdaTaskAuthorizer, ApiGatewayTaskInvoker apiGatewayTaskInvoker,
                        EmrTaskInvoker emrTaskInvoker, EmrServerlessTaskInvoker emrServerlessTaskInvoker,
-                       SdkManagementTaskInvoker sdkManagementTaskInvoker, EventBridgeInvoker eventBridgeInvoker) {
+                       SdkManagementTaskInvoker sdkManagementTaskInvoker, EventBridgeInvoker eventBridgeInvoker,
+                       Clock clock) {
         this(lambdaExecutor, targetResolver, dynamoDb, dynamoDbJsonHandler,
                 sqsJsonHandler, snsJsonHandler, cloudFormationHandler,
                 ec2Service, s3Service, ecsService, ecsJsonHandler,
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
-                Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
+                clock, TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
                 nestedTaskCredentials, lambdaTaskAuthorizer, null, null, apiGatewayTaskInvoker, emrTaskInvoker,
                 emrServerlessTaskInvoker, sdkManagementTaskInvoker, null, eventBridgeInvoker);
     }
@@ -573,7 +574,7 @@ public class AslExecutor {
             if (hasEnded(exec)) {
                 return;
             }
-            exec.setStopDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+            exec.setStopDate(EpochSeconds.fromMillis(clock.millis()));
             exec.setStatus("TIMED_OUT");
         }
         onUpdate.accept(exec, history);
@@ -623,7 +624,7 @@ public class AslExecutor {
 
     private void doExecute(StateMachine sm, Execution exec, List<HistoryEvent> history,
                            BiConsumer<Execution, List<HistoryEvent>> onUpdate, long maxExecutionDeadlineNanos) {
-        HistoryChain chain = HistoryChain.of(history);
+        HistoryChain chain = HistoryChain.of(history, clock);
         long executionDeadlineNanos = maxExecutionDeadlineNanos;
         try {
             JsonNode definition = objectMapper.readTree(sm.getDefinition());
@@ -3056,11 +3057,17 @@ public class AslExecutor {
         } catch (DateTimeParseException e) {
             throw new FailStateException("States.Runtime", "Invalid Timestamp: " + timestamp);
         }
-        long remainingNanos = Duration.between(clock.instant(), target).toNanos();
-        if (remainingNanos <= 0) {
+        Instant now = clock.instant();
+        if (!target.isAfter(now)) {
             return 0;
         }
-        return Math.min(remainingNanos, TimeUnit.SECONDS.toNanos(maxWaitSeconds()));
+        // Compared as durations: a target centuries away does not fit in a long of nanoseconds.
+        Duration remaining = Duration.between(now, target);
+        long maxWaitNanos = TimeUnit.SECONDS.toNanos(maxWaitSeconds());
+        if (remaining.compareTo(Duration.ofNanos(maxWaitNanos)) >= 0) {
+            return maxWaitNanos;
+        }
+        return remaining.toNanos();
     }
 
     /**
@@ -3391,7 +3398,7 @@ public class AslExecutor {
                     ? ((ObjectNode) context).deepCopy()
                     : mapItemContext(context, resolvedItems, items.get(i), i);
 
-            long startMs = hasResultWriter ? System.currentTimeMillis() : 0L;
+            long startMs = hasResultWriter ? clock.millis() : 0L;
             JsonNode branchOutput;
             // AWS evaluates ItemSelector before it records MapIterationStarted, so a failing
             // expression fails the Map state without any event for that iteration.
@@ -3439,7 +3446,7 @@ public class AslExecutor {
                 }
                 if (hasResultWriter) {
                     failedByIndex[i] = new FailedChild(childInputsByIndex[i],
-                            new long[]{startMs, System.currentTimeMillis()}, e.error, e.cause);
+                            new long[]{startMs, clock.millis()}, e.error, e.cause);
                 }
                 return null;
             }
@@ -3449,7 +3456,7 @@ public class AslExecutor {
                 iterationChain.publishIterationEnd("MapIterationSucceeded", Map.of("name", name, "index", i));
             }
             if (hasResultWriter) {
-                childTimingsByIndex[i] = new long[]{startMs, System.currentTimeMillis()};
+                childTimingsByIndex[i] = new long[]{startMs, clock.millis()};
             }
             return branchOutput;
         };
@@ -3612,12 +3619,12 @@ public class AslExecutor {
      * a Map run's window on the export rather than on the last item. A run over no items starts and
      * stops at that same instant.
      */
-    private static MapRun newMapRun(MapRunIdentity identity, JsonNode context, int itemCount,
+    private MapRun newMapRun(MapRunIdentity identity, JsonNode context, int itemCount,
                                     int executionCount, int requestedConcurrency) {
         MapRun mapRun = new MapRun();
         mapRun.setMapRunArn(identity.arn());
         mapRun.setExecutionArn(context.path("Execution").path("Id").asText(null));
-        mapRun.setStartDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+        mapRun.setStartDate(EpochSeconds.fromMillis(clock.millis()));
         mapRun.setItemCount(itemCount);
         mapRun.setExecutionCount(executionCount);
         // ASL spells an unbounded Map as MaxConcurrency 0, or by omitting it; DescribeMapRun
@@ -3630,7 +3637,7 @@ public class AslExecutor {
     /** Kept for every Distributed Map, so the mapRunArn in the history resolves through DescribeMapRun. */
     private void recordMapRun(MapRun mapRun, String status, int succeededItems, int failedItems,
                               int succeededExecutions, int failedExecutions) {
-        mapRun.setStopDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+        mapRun.setStopDate(EpochSeconds.fromMillis(clock.millis()));
         mapRun.setStatus(status);
         mapRun.setSucceededCount(succeededItems);
         mapRun.setFailedCount(failedItems);
@@ -4450,7 +4457,7 @@ public class AslExecutor {
         ObjectNode context = (ObjectNode) execContext;
         ObjectNode state = objectMapper.createObjectNode();
         state.put("Name", stateName);
-        state.put("EnteredTime", Instant.now().toString());
+        state.put("EnteredTime", clock.instant().toString());
         state.put("RetryCount", 0);
         context.set("State", state);
     }
@@ -5140,7 +5147,7 @@ public class AslExecutor {
                 return projected;
             }
             if (current.isArray() && isArrayIndex(part)) {
-                current = current.path(Integer.parseInt(part));
+                current = current.path(parseArrayIndex(part));
             } else {
                 current = current.path(part);
             }
@@ -6278,7 +6285,7 @@ public class AslExecutor {
             }
             exec.setError(error);
             exec.setCause(cause);
-            exec.setStopDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+            exec.setStopDate(EpochSeconds.fromMillis(clock.millis()));
             exec.setStatus("FAILED");
         }
         chain.end("ExecutionFailed", failureDetails(error, cause));
@@ -6318,7 +6325,7 @@ public class AslExecutor {
                 if (hasEnded(exec)) {
                     return;
                 }
-                exec.setStopDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+                exec.setStopDate(EpochSeconds.fromMillis(clock.millis()));
                 exec.setStatus("TIMED_OUT");
             }
         }
@@ -6338,7 +6345,7 @@ public class AslExecutor {
                 return;
             }
             exec.setOutput(output.toString());
-            exec.setStopDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+            exec.setStopDate(EpochSeconds.fromMillis(clock.millis()));
             exec.setStatus("SUCCEEDED");
         }
         chain.end("ExecutionSucceeded",

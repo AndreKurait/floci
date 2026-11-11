@@ -1,5 +1,6 @@
 package io.floci.aws.services.pipes;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
@@ -7,12 +8,17 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.dynamodb.backend.DynamoDbStreamReader;
 import io.floci.aws.services.kinesis.KinesisService;
+import io.floci.aws.services.kinesis.model.KinesisRecord;
 import io.floci.aws.services.pipes.model.Pipe;
 import io.floci.aws.services.sqs.SqsService;
 import io.vertx.core.Vertx;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.mockito.ArgumentCaptor;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -91,6 +97,52 @@ class PipesKinesisTerminalTest {
             verify(sqs, times("dlq".equals(outcome) || "drop".equals(outcome) ? recordCount : 0))
                     .sendMessage(anyString(), anyString(), eq(0), eq("eu-west-1"));
             assertEquals(recordCount == 0 ? 0 : 1, terminalRecordPages.get(), "the terminal record page must be consumed once");
+        } finally {
+            poller.shutdown();
+        }
+    }
+
+    @Test
+    void aKinesisRecordReachesTheTargetWithItsKeySequenceNumberArrivalTimeAndData() throws Exception {
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        StorageFactory factory = mock(StorageFactory.class);
+        Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
+        when(factory.create(anyString(), anyString(), any())).thenAnswer(inv -> stores.computeIfAbsent(
+                inv.getArgument(1), key -> AccountAwareStorageBackend.inMemory("111111111111")));
+        KinesisService kinesis = new KinesisService(factory, new RegionResolver("eu-west-1", "111111111111"));
+        kinesis.createStream("s", 1, "eu-west-1");
+        String sequenceNumber = kinesis.putRecord("s", "hello".getBytes(StandardCharsets.UTF_8), "pk-1", "eu-west-1");
+        String iterator = kinesis.getShardIterator("s", "shardId-000000000000", "TRIM_HORIZON", null, null,
+                "eu-west-1");
+        KinesisRecord stored = (KinesisRecord) ((List<?>) kinesis.getRecords(iterator, 10, "eu-west-1")
+                .get("Records")).getFirst();
+        Pipe pipe = new Pipe();
+        pipe.setName("fields");
+        pipe.setArn("arn:aws:pipes:eu-west-1:111111111111:pipe/fields");
+        pipe.setSource("arn:aws:kinesis:eu-west-1:111111111111:stream/s");
+        pipe.setTarget("arn:aws:sqs:eu-west-1:111111111111:out");
+        pipe.setSourceParameters(mapper.readTree("""
+                {"KinesisStreamParameters":{"BatchSize":1}}
+                """));
+        PipesTargetInvoker target = mock(PipesTargetInvoker.class);
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        PipesPoller poller = new PipesPoller(mock(Vertx.class), mock(SqsService.class), kinesis,
+                mock(DynamoDbStreamReader.class), mock(PipesKafkaConsumerManager.class), target,
+                new PipesFilterMatcher(mapper), mapper, config);
+        try {
+            poller.pollKinesis(pipe, "eu-west-1");
+
+            ArgumentCaptor<String> event = ArgumentCaptor.forClass(String.class);
+            verify(target).invoke(eq(pipe), event.capture(), eq("eu-west-1"));
+            JsonNode delivered = mapper.readTree(event.getValue());
+            assertEquals("shardId-000000000000:" + sequenceNumber, delivered.path("eventID").asText());
+            assertEquals("pk-1", delivered.path("partitionKey").asText());
+            assertEquals(sequenceNumber, delivered.path("sequenceNumber").asText());
+            assertEquals(Base64.getEncoder().encodeToString("hello".getBytes(StandardCharsets.UTF_8)),
+                    delivered.path("data").asText());
+            assertEquals(stored.getApproximateArrivalTimestamp().toEpochMilli() / 1000.0,
+                    delivered.path("approximateArrivalTimestamp").asDouble());
         } finally {
             poller.shutdown();
         }

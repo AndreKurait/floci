@@ -2956,4 +2956,49 @@ class SqsServiceTest {
 
         assertEquals("sns.amazonaws.com", message.getSenderId());
     }
+
+
+    @Test
+    void aChangedRedrivePolicyAppliesToTheNextReceive() {
+        String region = "eu-west-1";
+        String firstDlq = sqsService.createQueue("redrive-changed-dlq-a", null, region).getQueueUrl();
+        String secondDlq = sqsService.createQueue("redrive-changed-dlq-b", null, region).getQueueUrl();
+        String source = sqsService.createQueue("redrive-changed-source",
+                Map.of("RedrivePolicy", redrivePolicy(firstDlq, 5, region)), region).getQueueUrl();
+        sqsService.sendMessage(source, "m", null, region);
+        assertEquals(1, sqsService.receiveMessage(source, 10, 0, 0, region).size());
+
+        sqsService.setQueueAttributes(source, Map.of("RedrivePolicy", redrivePolicy(secondDlq, 1, region)), region);
+
+        // Received once already, so the new maxReceiveCount of 1 moves it on the next receive.
+        assertEquals(0, sqsService.receiveMessage(source, 10, 0, 0, region).size());
+        assertEquals(1, sqsService.receiveMessage(secondDlq, 10, 0, 0, region).size());
+        assertEquals(0, sqsService.receiveMessage(firstDlq, 10, 0, 0, region).size());
+    }
+
+    @Test
+    void aRecreatedQueueUsesItsOwnRedrivePolicy() {
+        String region = "eu-west-1";
+        String firstDlq = sqsService.createQueue("redrive-recreated-dlq-a", null, region).getQueueUrl();
+        String secondDlq = sqsService.createQueue("redrive-recreated-dlq-b", null, region).getQueueUrl();
+        String source = sqsService.createQueue("redrive-recreated-source",
+                Map.of("RedrivePolicy", redrivePolicy(firstDlq, 5, region)), region).getQueueUrl();
+        sqsService.sendMessage(source, "old", null, region);
+        assertEquals(1, sqsService.receiveMessage(source, 10, 0, 0, region).size());
+        sqsService.deleteQueue(source, region);
+
+        String recreated = sqsService.createQueue("redrive-recreated-source",
+                Map.of("RedrivePolicy", redrivePolicy(secondDlq, 1, region)), region).getQueueUrl();
+        sqsService.sendMessage(recreated, "new", null, region);
+        assertEquals(1, sqsService.receiveMessage(recreated, 10, 0, 0, region).size());
+
+        assertEquals(0, sqsService.receiveMessage(recreated, 10, 0, 0, region).size());
+        assertEquals(1, sqsService.receiveMessage(secondDlq, 10, 0, 0, region).size());
+        assertEquals(0, sqsService.receiveMessage(firstDlq, 10, 0, 0, region).size());
+    }
+
+    private String redrivePolicy(String dlqUrl, int maxReceiveCount, String region) {
+        String dlqArn = sqsService.getQueueAttributes(dlqUrl, List.of("QueueArn"), region).get("QueueArn");
+        return "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":" + maxReceiveCount + "}";
+    }
 }

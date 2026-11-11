@@ -11,6 +11,7 @@ import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.eventbridge.model.ApiDestination;
 import io.floci.aws.services.eventbridge.model.ApiDestinationState;
 import io.floci.aws.services.eventbridge.model.Archive;
+import io.floci.aws.services.eventbridge.model.ArchivedEvent;
 import io.floci.aws.services.eventbridge.model.Connection;
 import io.floci.aws.services.eventbridge.model.EventBus;
 import io.floci.aws.services.eventbridge.model.Replay;
@@ -19,6 +20,7 @@ import io.floci.aws.services.eventbridge.model.Rule;
 import io.floci.aws.services.eventbridge.model.RuleState;
 import io.floci.aws.services.eventbridge.model.Target;
 import io.floci.aws.services.resourcegroupstagging.ResourceGroupsTaggingService;
+import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.PartitionMatrix;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,6 +33,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -1920,5 +1924,41 @@ class EventBridgeServiceTest {
                 entry);
         assertEquals(0, ((ArrayNode) EventBridgeService.serviceEventEntry("s", "d", "{}", null).get("Resources")).size());
         assertEquals(0, ((ArrayNode) EventBridgeService.serviceEventEntry("s", "d", "{}", " ").get("Resources")).size());
+    }
+
+
+    // The instant an event is archived decides whether a replay window covers it, so it is read
+    // from the same clock as the dates of the bus, the archive and the replay.
+    @Test
+    @SuppressWarnings("unchecked")
+    void busesArchivesArchivedEventsAndReplaysAreDatedOnTheServiceClock() {
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        ManualClock clock = new ManualClock(start);
+        ReplayDispatcher replays = mock(ReplayDispatcher.class);
+        EventBridgeService timed = new EventBridgeService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"),
+                new ObjectMapper(), null, mock(TargetDispatcher.class), replays,
+                new ResourceGroupsTaggingService(null), mock(AppSyncTargetValidator.class), clock);
+
+        EventBus bus = timed.createEventBus("orders", null, null, REGION);
+        Archive archive = timed.createArchive("kept", bus.getArn(), null, null, 0, REGION);
+        assertEquals(start, bus.getCreatedTime());
+        assertEquals(start, archive.getCreationTime());
+
+        clock.advance(Duration.ofSeconds(90));
+        Map<String, Object> entry = Map.of("Source", "app", "DetailType", "placed", "Detail", "{}",
+                "EventBusName", "orders");
+        assertEquals(0, timed.putEvents(List.of(entry), REGION).failedCount());
+
+        clock.advance(Duration.ofSeconds(30));
+        Replay replay = timed.startReplay("again", null, archive.getArchiveArn(), start, start.plusSeconds(120),
+                bus.getArn(), REGION);
+
+        assertEquals(start.plusSeconds(120), replay.getReplayStartTime());
+        ArgumentCaptor<List<ArchivedEvent>> archived = ArgumentCaptor.forClass(List.class);
+        verify(replays).dispatch(any(), archived.capture(), any(), any(), any());
+        assertEquals(List.of(start.plusSeconds(90)),
+                archived.getValue().stream().map(ArchivedEvent::getEventTime).toList());
     }
 }

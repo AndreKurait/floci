@@ -732,6 +732,7 @@ class CloudFormationDeletionPolicyIntegrationTest {
 
         String parentStackId = createStack(stackName, template);
         try {
+            awaitStackStatus(parentStackId, "ROLLBACK_COMPLETE");
             assertThat(describeStacks(parentStackId), containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
             assertBucketDeleted(bucketName);
         } finally {

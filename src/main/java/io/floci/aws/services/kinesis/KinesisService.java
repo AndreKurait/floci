@@ -132,6 +132,11 @@ public class KinesisService implements ResourceProvider {
      */
     public KinesisStream createStream(String streamName, int shardCount, String streamMode,
                                       Integer maxRecordSizeInKiB, String region) {
+        if (shardCount < 1) {
+            throw new AwsException("ValidationException", "1 validation error detected: Value '" + shardCount
+                    + "' at 'shardCount' failed to satisfy constraint: "
+                    + "Member must have value greater than or equal to 1", 400);
+        }
         String resolvedMode = streamMode != null ? streamMode : DEFAULT_STREAM_MODE;
         if (!VALID_STREAM_MODES.contains(resolvedMode)) {
             throw new AwsException("InvalidArgumentException",
@@ -148,6 +153,7 @@ public class KinesisService implements ResourceProvider {
 
         String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
         KinesisStream stream = new KinesisStream(streamName, arn);
+        stream.setStreamCreationTimestamp(clock.instant());
         stream.setAccountId(regionResolver.getAccountId());
         stream.setStreamMode(resolvedMode);
         if (maxRecordSizeInKiB != null) {
@@ -221,8 +227,9 @@ public class KinesisService implements ResourceProvider {
     }
 
     public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName, String region) {
-        String consumerArn = streamArn + "/consumer/" + consumerName + ":" + System.currentTimeMillis();
+        String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
         KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
+        consumer.setConsumerCreationTimestamp(clock.instant());
         consumerStore.put(region + "::" + consumerArn, consumer);
         LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);
         return consumer;
@@ -424,6 +431,7 @@ public class KinesisService implements ResourceProvider {
             if (parent.isClosed()) {
                 throw new AwsException("InvalidArgumentException", "Shard " + shardId + " is already closed", 400);
             }
+            requireHashKeyInsideShard(newStartingHashKey, parent);
 
             parent.setClosed(true);
             parent.setSequenceNumberRange(new KinesisShard.SequenceNumberRange(
@@ -498,6 +506,31 @@ public class KinesisService implements ResourceProvider {
 
     private String nextShardId(KinesisStream stream) {
         return String.format("shardId-%012d", stream.getShards().size());
+    }
+
+    /** A split leaves both children a hash key: the new start lies after the parent's start, up to its end. */
+    private static void requireHashKeyInsideShard(String newStartingHashKey, KinesisShard parent) {
+        if (newStartingHashKey == null || newStartingHashKey.isEmpty()
+                || newStartingHashKey.length() > 39
+                || !newStartingHashKey.chars().allMatch(c -> c >= '0' && c <= '9')
+                || (newStartingHashKey.length() > 1 && newStartingHashKey.charAt(0) == '0')) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " is not a valid hash key", 400);
+        }
+        BigInteger newStart;
+        try {
+            newStart = new BigInteger(newStartingHashKey);
+        } catch (NumberFormatException | NullPointerException e) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " is not a valid hash key", 400);
+        }
+        if (newStart.compareTo(new BigInteger(parent.getHashKeyRange().startingHashKey())) <= 0
+                || newStart.compareTo(new BigInteger(parent.getHashKeyRange().endingHashKey())) > 0) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " used in SplitShard() on shard "
+                            + parent.getShardId() + " is not both greater than the beginning hash key and "
+                            + "no greater than the ending hash key of the shard", 400);
+        }
     }
 
     private String subtractOne(String val) {
@@ -584,7 +617,7 @@ public class KinesisService implements ResourceProvider {
 
     /** Enforces the "no more than ten UpdateShardCount calls per rolling 24 hours" default limit. */
     private void recordShardCountUpdate(KinesisStream stream, String storageKey) {
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Instant windowStart = now.minus(SHARD_COUNT_UPDATE_WINDOW);
         List<Instant> recent = new ArrayList<>(stream.getShardCountUpdateTimestamps().stream()
                 .filter(t -> t.isAfter(windowStart))
@@ -608,14 +641,20 @@ public class KinesisService implements ResourceProvider {
                                       int currentOpenShardCount, int targetShardCount, String region) {
         if (targetShardCount > currentOpenShardCount) {
             int splitsNeeded = targetShardCount - currentOpenShardCount;
-            List<KinesisShard> splitCandidates = stream.getShards().stream()
-                    .filter(s -> !s.isClosed())
-                    .sorted(Comparator.comparing(KinesisService::hashRangeWidth).reversed()
-                            .thenComparing(KinesisShard::getShardId))
-                    .limit(splitsNeeded)
-                    .toList();
-            for (KinesisShard parent : splitCandidates) {
-                splitShard(streamName, parent.getShardId(), midpointHashKey(parent.getHashKeyRange()), region);
+            while (splitsNeeded > 0) {
+                List<KinesisShard> splitCandidates = stream.getShards().stream()
+                        .filter(s -> !s.isClosed() && hashRangeWidth(s).compareTo(BigInteger.ONE) > 0)
+                        .sorted(Comparator.comparing(KinesisService::hashRangeWidth).reversed()
+                                .thenComparing(KinesisShard::getShardId))
+                        .limit(splitsNeeded)
+                        .toList();
+                if (splitCandidates.isEmpty()) {
+                    throw new IllegalStateException("No splittable hash-key range remains");
+                }
+                for (KinesisShard parent : splitCandidates) {
+                    splitShard(streamName, parent.getShardId(), midpointHashKey(parent.getHashKeyRange()), region);
+                    splitsNeeded--;
+                }
             }
         } else if (targetShardCount < currentOpenShardCount) {
             int mergesNeeded = currentOpenShardCount - targetShardCount;
@@ -1402,7 +1441,7 @@ public class KinesisService implements ResourceProvider {
                     arn, "kinesis:stream", "kinesis",
                     parsed.region(), parsed.accountId(),
                     stream.getStreamCreationTimestamp() != null
-                            ? stream.getStreamCreationTimestamp() : Instant.now(),
+                            ? stream.getStreamCreationTimestamp() : clock.instant(),
                     stream.getTags() != null ? stream.getTags() : Map.of()));
         }
         return resources;

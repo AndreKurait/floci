@@ -61,6 +61,39 @@ class KinesisJsonHandlerTest {
         handler = new KinesisJsonHandler(service, MAPPER, 300_000);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"+1", "01", "0001", "\u0661", " 1", "1 ", "-1"})
+    void splitShardRejectsNonCanonicalDecimalWithoutChangingTopology(String key) {
+        createStream("test-stream");
+        ObjectNode request = MAPPER.createObjectNode()
+                .put("StreamName", "test-stream")
+                .put("ShardToSplit", FIRST_SHARD_ID)
+                .put("NewStartingHashKey", key);
+
+        AwsException rejected = assertThrows(AwsException.class,
+                () -> handler.handle("SplitShard", request, REGION));
+        assertEquals("InvalidArgumentException", rejected.getErrorCode());
+        KinesisStream stream = service.describeStream("test-stream", REGION);
+        assertEquals(1, stream.getShards().size());
+        assertFalse(stream.getShards().getFirst().isClosed());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", MAX_HASH_KEY})
+    void splitShardAcceptsCanonicalDecimalAtRangeBoundaries(String key) {
+        createStream("test-stream");
+        ObjectNode request = MAPPER.createObjectNode()
+                .put("StreamName", "test-stream")
+                .put("ShardToSplit", FIRST_SHARD_ID)
+                .put("NewStartingHashKey", key);
+
+        assertEquals(200, handler.handle("SplitShard", request, REGION).getStatus());
+        KinesisStream stream = service.describeStream("test-stream", REGION);
+        assertEquals(3, stream.getShards().size());
+        assertTrue(stream.getShards().getFirst().isClosed());
+        assertEquals(key, stream.getShards().get(2).getHashKeyRange().startingHashKey());
+    }
+
     @Test
     void terminalGetRecordsIsJsonNullWithExactChildMetadata() throws Exception {
         createStream("test-stream");

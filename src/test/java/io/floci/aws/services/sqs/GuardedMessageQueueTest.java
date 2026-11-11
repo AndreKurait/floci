@@ -80,6 +80,22 @@ class GuardedMessageQueueTest {
         assertTrue(result.dlqCandidates().isEmpty());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void closedIncarnationCannotClaimOrRedrive(boolean exhausted) {
+        Message message = new Message("old payload");
+        message.setReceiveCount(exhausted ? 1 : 0);
+        queue.addMessage(message);
+        queue.close();
+
+        ClaimResult result = queue.claimVisibleMessages(1, 30, false, 1, "dead-letter-target");
+
+        assertTrue(result.claimed().isEmpty());
+        assertTrue(result.dlqCandidates().isEmpty());
+        assertEquals(exhausted ? 1 : 0, message.getReceiveCount());
+        assertNull(message.getReceiptHandle());
+    }
+
     @Test
     void claimEmptyQueueReturnsEmpty() {
         ClaimResult result = queue.claimVisibleMessages(1, 30, false, -1, null);

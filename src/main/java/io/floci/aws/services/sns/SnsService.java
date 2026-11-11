@@ -53,6 +53,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -179,6 +180,7 @@ public class SnsService implements Resettable, ResourceProvider {
     private final ObjectMapper objectMapper;
     private final HttpClient httpClient;
     private final SnsMessageSigner messageSigner;
+    private final Clock clock;
     private final Map<String, Instant> fifoDeduplicationCache = new ConcurrentHashMap<>();
     private static final HexFormat HEX = HexFormat.of();
     
@@ -257,6 +259,18 @@ public class SnsService implements Resettable, ResourceProvider {
                RegionResolver regionResolver, SqsService sqsService,
                LambdaService lambdaService,
                FirehoseService firehoseService) {
+        this(topicStore, subscriptionStore, platformAppStore, platformEndpointStore,
+                regionResolver, sqsService, lambdaService, firehoseService, Clock.systemUTC());
+    }
+
+    /** As above, with the clock that dates messages and measures the FIFO deduplication window. */
+    SnsService(StorageBackend<String, Topic> topicStore,
+               StorageBackend<String, Subscription> subscriptionStore,
+               StorageBackend<String, PlatformApplication> platformAppStore,
+               StorageBackend<String, PlatformEndpoint> platformEndpointStore,
+               RegionResolver regionResolver, SqsService sqsService,
+               LambdaService lambdaService,
+               FirehoseService firehoseService, Clock clock) {
         this.topicStore = topicStore;
         this.subscriptionStore = subscriptionStore;
         this.platformAppStore = platformAppStore;
@@ -272,6 +286,7 @@ public class SnsService implements Resettable, ResourceProvider {
         this.objectMapper = new ObjectMapper();
         this.httpClient = null;
         this.messageSigner = SnsMessageSigner.inMemory(baseUrl);
+        this.clock = clock;
     }
 
     SnsService(StorageBackend<String, Topic> topicStore,
@@ -336,6 +351,23 @@ public class SnsService implements Resettable, ResourceProvider {
                RegionResolver regionResolver, SqsService sqsService,
                LambdaService lambdaService, FirehoseService firehoseService,
                String baseUrl, ObjectMapper objectMapper, SnsMessageSigner messageSigner) {
+        this(topicStore, subscriptionStore, platformAppStore, platformEndpointStore, smsStore,
+                smsAttributesStore, smsSandboxStore, regionResolver, sqsService, lambdaService,
+                firehoseService, baseUrl, objectMapper, messageSigner, Clock.systemUTC());
+    }
+
+    /** As above, with the clock that dates messages and measures the FIFO deduplication window. */
+    SnsService(StorageBackend<String, Topic> topicStore,
+               StorageBackend<String, Subscription> subscriptionStore,
+               StorageBackend<String, PlatformApplication> platformAppStore,
+               StorageBackend<String, PlatformEndpoint> platformEndpointStore,
+               StorageBackend<String, SentSms> smsStore,
+               StorageBackend<String, Map<String, String>> smsAttributesStore,
+               StorageBackend<String, SmsSandboxPhoneNumber> smsSandboxStore,
+               RegionResolver regionResolver, SqsService sqsService,
+               LambdaService lambdaService, FirehoseService firehoseService,
+               String baseUrl, ObjectMapper objectMapper, SnsMessageSigner messageSigner,
+               Clock clock) {
         this.topicStore = topicStore;
         this.subscriptionStore = subscriptionStore;
         this.platformAppStore = platformAppStore;
@@ -355,6 +387,7 @@ public class SnsService implements Resettable, ResourceProvider {
                 .connectTimeout(Duration.ofSeconds(5))
                 .build();
         this.messageSigner = messageSigner;
+        this.clock = clock;
     }
 
     public void clear() {
@@ -1120,7 +1153,7 @@ public class SnsService implements Resettable, ResourceProvider {
 
         String messageId = UUID.randomUUID().toString();
         Notification notification = new Notification(messageId,
-                MESSAGE_TIMESTAMP.format(Instant.now()), signatureVersion(topic), new HashMap<>());
+                MESSAGE_TIMESTAMP.format(clock.instant()), signatureVersion(topic), new HashMap<>());
         JsonNode parsedBody = null;
         boolean bodyParseAttempted = false;
         for (Subscription sub : subscriptionsByTopic(effectiveArn, region)) {
@@ -1345,7 +1378,7 @@ public class SnsService implements Resettable, ResourceProvider {
         String messageId = UUID.randomUUID().toString();
         recordPushNotification(new PushNotification(
                 endpoint.getArn(), app.getArn(), app.getPlatform(), endpoint.getToken(),
-                payload, subject, messageAttributes, messageId, Instant.now()));
+                payload, subject, messageAttributes, messageId, clock.instant()));
         LOG.debugv("Captured push notification {0} -> {1} ({2})", messageId, endpoint.getArn(), app.getPlatform());
         return messageId;
     }
@@ -1579,7 +1612,7 @@ public class SnsService implements Resettable, ResourceProvider {
         boolean groupScopedDedup = isGroupScopedDeduplication(topic);
         List<String[]> successful = new ArrayList<>();
         List<String[]> failed = new ArrayList<>();
-        String timestamp = MESSAGE_TIMESTAMP.format(Instant.now());
+        String timestamp = MESSAGE_TIMESTAMP.format(clock.instant());
         String version = signatureVersion(topic);
         List<Subscription> subscriptions = subscriptionsByTopic(topicArn, region);
         for (Map<String, Object> entry : entries) {
@@ -1677,7 +1710,7 @@ public class SnsService implements Resettable, ResourceProvider {
             resources.add(new ExplorerResource(
                     arn, "sns:topic", "sns",
                     parsed.region(), parsed.accountId(),
-                    topic.getCreatedAt() != null ? topic.getCreatedAt() : Instant.now(),
+                    topic.getCreatedAt() != null ? topic.getCreatedAt() : clock.instant(),
                     topic.getTags() != null ? topic.getTags() : Map.of()));
         }
         return resources;
@@ -2440,7 +2473,7 @@ public class SnsService implements Resettable, ResourceProvider {
                 ? "group:" + messageGroupId.length() + ":" + messageGroupId + deduplicationId
                 : "topic:" + deduplicationId;
         String cacheKey = topicArn + ":" + scopedId;
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Instant existing = fifoDeduplicationCache.get(cacheKey);
         if (existing != null && existing.plus(FIFO_DEDUP_WINDOW).isAfter(now)) {
             return true;
@@ -2889,7 +2922,7 @@ public class SnsService implements Resettable, ResourceProvider {
         try {
             String token = subscription.getAttributes().get("ConfirmationToken");
             String subscribeUrl = baseUrl + "/?Action=ConfirmSubscription&TopicArn=" + topicArn + "&Token=" + token;
-            String timestamp = MESSAGE_TIMESTAMP.format(Instant.now());
+            String timestamp = MESSAGE_TIMESTAMP.format(clock.instant());
             ObjectNode node = objectMapper.createObjectNode();
             node.put("Type", "SubscriptionConfirmation");
             node.put("MessageId", UUID.randomUUID().toString());
@@ -3047,7 +3080,7 @@ public class SnsService implements Resettable, ResourceProvider {
     private String recordSms(String phoneNumber, String message, String subject, String region) {
         String messageId = UUID.randomUUID().toString();
         String effectiveRegion = region != null ? region : regionResolver.getDefaultRegion();
-        SentSms sms = new SentSms(messageId, effectiveRegion, phoneNumber, message, subject, Instant.now());
+        SentSms sms = new SentSms(messageId, effectiveRegion, phoneNumber, message, subject, clock.instant());
         smsStore.put("sms::" + effectiveRegion + "::" + messageId, sms);
         LOG.debugv("SNS SMS published: messageId={0} phone={1}", messageId, phoneNumber);
         return messageId;

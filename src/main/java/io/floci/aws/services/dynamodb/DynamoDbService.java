@@ -636,6 +636,7 @@ public class DynamoDbService {
 
         TableDefinition table = new TableDefinition(tableName, keySchema, attributeDefinitions,
                 region, regionResolver.getAccountId());
+        table.setCreationDateTime(clock.instant());
         if ("PAY_PER_REQUEST".equals(billingMode)) {
             table.setBillingMode(billingMode);
             table.getProvisionedThroughput().setReadCapacityUnits(0L);
@@ -853,7 +854,7 @@ public class DynamoDbService {
         if (indexes.isEmpty()) {
             return;
         }
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         boolean changed = false;
         boolean anySettling = false;
         boolean anyAllocating = false;
@@ -888,7 +889,7 @@ public class DynamoDbService {
      * where AWS reports {@code Backfilling} at all. A settle must have run first.
      */
     public boolean isVectorIndexBackfilling(VectorIndex index) {
-        return reportsVectorIndexBackfilling(index) && !Instant.now().isBefore(
+        return reportsVectorIndexBackfilling(index) && !clock.instant().isBefore(
                 index.getCreationStartedAt().plusSeconds(vectorIndexAllocationSeconds));
     }
 
@@ -2576,7 +2577,7 @@ public class DynamoDbService {
             VectorIndex vectorIndex = create.index();
             vectorIndex.setIndexArn(table.getTableArn() + "/index/" + vectorIndex.getIndexName());
             vectorIndex.setIndexStatus("CREATING");
-            vectorIndex.setCreationStartedAt(Instant.now());
+            vectorIndex.setCreationStartedAt(clock.instant());
             table.getVectorIndexes().add(vectorIndex);
         }
         if (!vectorIndexCreates.isEmpty()) {
@@ -3188,12 +3189,12 @@ public class DynamoDbService {
                 .orElseThrow(() -> new AwsException("TableNotFoundException", "Table not found: " + tableName, 400));
     }
 
-    static boolean isExpired(JsonNode item, TableDefinition table) {
+    private boolean isExpired(JsonNode item, TableDefinition table) {
         if (!table.isTtlEnabled() || table.getTtlAttributeName() == null) return false;
         JsonNode attr = item.get(table.getTtlAttributeName());
         if (attr == null || !attr.has("N")) return false;
         try {
-            return Long.parseLong(attr.get("N").asText()) < Instant.now().getEpochSecond();
+            return Long.parseLong(attr.get("N").asText()) < clock.instant().getEpochSecond();
         } catch (NumberFormatException e) {
             return false;
         }
@@ -5515,8 +5516,8 @@ public class DynamoDbService {
         return new Page<>(sorted.subList(startIdx, end), newNextToken);
     }
 
-    private static String newJobId() {
-        return System.currentTimeMillis() + "-" + UUID.randomUUID().toString().replace("-", "");
+    private String newJobId() {
+        return clock.millis() + "-" + UUID.randomUUID().toString().replace("-", "");
     }
 
     // --- Backup Operations ---
@@ -5818,7 +5819,7 @@ public class DynamoDbService {
         desc.setTableCreationParameters(request.get("TableCreationParameters"));
         desc.setCloudWatchLogGroupArn(AwsArnUtils.Arn.of("logs", region, accountId,
                 "log-group:/aws-dynamodb/imports:*").toString());
-        desc.setStartTime(Instant.now().getEpochSecond());
+        desc.setStartTime(clock.instant().getEpochSecond());
         if (importStore != null) {
             importStore.put(importArn, desc);
         }
@@ -5869,7 +5870,7 @@ public class DynamoDbService {
             failImport(desc, "UNKNOWN", e.getMessage());
         }
         persistItems(regionKey(region, tableName));
-        desc.setEndTime(Instant.now().getEpochSecond());
+        desc.setEndTime(clock.instant().getEpochSecond());
         activateTable(tableName, region);
         if (importStore != null) {
             importStore.put(desc.getImportArn(), desc);
@@ -5938,7 +5939,7 @@ public class DynamoDbService {
      * worker survives the process. An import also leaves its table stuck in CREATING.
      */
     private void recoverInterruptedJobs() {
-        long now = Instant.now().getEpochSecond();
+        long now = clock.instant().getEpochSecond();
         if (exportStore instanceof AccountAwareStorageBackend<ExportDescription> exports) {
             for (AccountAwareStorageBackend.AccountEntry<ExportDescription> entry : exports.scanAllAccountEntries(k -> true)) {
                 ExportDescription desc = entry.value();
@@ -6007,7 +6008,7 @@ public class DynamoDbService {
             resources.add(new ExplorerResource(
                     table.getTableArn(), "dynamodb:table", "dynamodb",
                     parsed.region(), parsed.accountId(),
-                    table.getCreationDateTime() != null ? table.getCreationDateTime() : Instant.now(),
+                    table.getCreationDateTime() != null ? table.getCreationDateTime() : clock.instant(),
                     table.getTags() != null ? table.getTags() : Map.of()));
         }
         return resources;

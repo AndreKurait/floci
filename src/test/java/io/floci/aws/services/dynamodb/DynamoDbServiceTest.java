@@ -24,6 +24,7 @@ import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.s3.model.MultipartUpload;
 import io.floci.aws.services.s3.model.S3Object;
+import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -4995,9 +4996,8 @@ class DynamoDbServiceTest {
         return svc;
     }
 
-    /** Tables take their creation time from the system clock, so this clock starts after it. */
+    /** A table is created at the service clock's instant, so an export period can start there. */
     private DynamoDbService incrementalExportService(S3Service s3) {
-        clock.advance(Duration.between(clock.instant(), Instant.now()).plusSeconds(1));
         return inlineExportService(s3);
     }
 
@@ -5098,13 +5098,41 @@ class DynamoDbServiceTest {
         exportDesc.setExportStatus("IN_PROGRESS");
         exports.put(exportDesc.getExportArn(), exportDesc);
 
+        ManualClock restartedAt = new ManualClock(Instant.parse("2026-03-04T05:06:07.890Z"));
         DynamoDbService restarted = new DynamoDbService(tables, new InMemoryStorage<>(), exports, imports,
-                resolver, null, null, mock(S3Service.class), mapper);
+                new InMemoryStorage<>(), new InMemoryStorage<>(), resolver, null, null, mock(S3Service.class), mapper,
+                0, 0, 0, restartedAt);
 
+        long restartSecond = restartedAt.instant().getEpochSecond();
         assertEquals("ACTIVE", restarted.describeTable("Users", "us-east-1").getTableStatus());
         assertEquals("FAILED", restarted.describeImport(importDesc.getImportArn()).getImportStatus());
         assertEquals("InterruptedByRestart", restarted.describeImport(importDesc.getImportArn()).getFailureCode());
+        assertEquals(restartSecond, restarted.describeImport(importDesc.getImportArn()).getEndTime());
         assertEquals("FAILED", restarted.describeExport(exportDesc.getExportArn()).getExportStatus());
+        assertEquals(BigDecimal.valueOf(restartSecond), restarted.describeExport(exportDesc.getExportArn()).getEndTime());
+    }
+
+    @Test
+    void aTableAndItsImportAreDatedOnTheServiceClock() {
+        Instant start = Instant.parse("2026-03-04T05:06:07.890Z");
+        ManualClock at = new ManualClock(start);
+        DynamoDbService svc = new DynamoDbService(new InMemoryStorage<>(), new InMemoryStorage<>(), null,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), null, null, mock(S3Service.class), mapper, 0, 0, 0, at);
+
+        TableDefinition table = svc.createTable("Users", List.of(new KeySchemaElement("userId", "HASH")),
+                List.of(new AttributeDefinition("userId", "S")), 5L, 5L, "us-east-1");
+        assertEquals(start, table.getCreationDateTime());
+
+        at.advance(Duration.ofSeconds(90));
+        ImportTableDescription finished = importDescription("bucket", "imp/", "NONE");
+        svc.runImport(finished, "Users", "us-east-1");
+        assertEquals(start.plusSeconds(90).getEpochSecond(), finished.getEndTime());
+
+        ImportTableDescription started = svc.startImport(importRequest("Users", "DYNAMODB_JSON"), table, "us-east-1");
+        assertEquals(start.plusSeconds(90).getEpochSecond(), started.getStartTime());
+        assertTrue(started.getImportArn().startsWith("arn:aws:dynamodb:us-east-1:000000000000:table/Users/import/"
+                + start.plusSeconds(90).toEpochMilli() + "-"), started.getImportArn());
     }
 
     @Test
@@ -5135,6 +5163,54 @@ class DynamoDbServiceTest {
         assertEquals(List.of("u1"), reloaded.getItems().stream().map(i -> i.path("userId").path("S").asText()).toList());
         assertEquals(1, reloaded.getTable().getItemCount());
         assertFalse(reloaded.getTable().isTtlEnabled());
+    }
+
+    @Test
+    void ttlExpirationFollowsTheServiceClock() {
+        ManualClock at = new ManualClock(Instant.parse("2000-01-01T00:00:00Z"));
+        DynamoDbService svc = ttlClockService(at);
+        ObjectNode expiring = item("userId", "u1");
+        expiring.set("expiresAt", attributeValue("N", Long.toString(at.instant().plusSeconds(60).getEpochSecond())));
+        svc.putItem("Users", expiring, null, null, null, "us-east-1", null);
+
+        svc.deleteExpiredItems();
+        assertNotNull(svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+        at.advance(Duration.ofSeconds(60));
+        svc.deleteExpiredItems();
+        assertNotNull(svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+        at.advance(Duration.ofSeconds(1));
+        svc.deleteExpiredItems();
+        assertNull(svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+    }
+
+    @Test
+    void ttlDeletionRechecksUpdatedExpirationOnTheServiceClock() {
+        ManualClock at = new ManualClock(Instant.parse("2000-01-01T00:00:00Z"));
+        DynamoDbService svc = ttlClockService(at);
+        ObjectNode expiring = item("userId", "u1");
+        expiring.set("expiresAt", attributeValue("N", Long.toString(at.instant().minusSeconds(1).getEpochSecond())));
+        svc.putItem("Users", expiring, null, null, null, "us-east-1", null);
+        List<DynamoDbService.ExpiredTableScan> scanned = svc.scanExpiredItems();
+        assertEquals(1, scanned.size());
+
+        ObjectNode renewed = item("userId", "u1");
+        renewed.set("expiresAt", attributeValue("N", Long.toString(at.instant().plusSeconds(60).getEpochSecond())));
+        svc.putItem("Users", renewed, null, null, null, "us-east-1", null);
+        svc.deleteScannedItems(scanned);
+        assertEquals(renewed, svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+        at.advance(Duration.ofSeconds(61));
+        svc.deleteExpiredItems();
+        assertNull(svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+    }
+
+    private DynamoDbService ttlClockService(ManualClock at) {
+        DynamoDbService svc = new DynamoDbService(new InMemoryStorage<>(), new InMemoryStorage<>(), null,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), null, null, mock(S3Service.class), mapper, 0, 0, 0, at);
+        svc.createTable("Users", List.of(new KeySchemaElement("userId", "HASH")),
+                List.of(new AttributeDefinition("userId", "S")), 5L, 5L, "us-east-1");
+        svc.updateTimeToLive("Users", "expiresAt", true, "us-east-1");
+        return svc;
     }
 
     @Test
@@ -5280,5 +5356,31 @@ class DynamoDbServiceTest {
 
     private static List<String> userIds(DynamoDbService.PointInTimeState state) {
         return state.items().stream().map(i -> i.path("userId").path("S").asText()).sorted().toList();
+    }
+
+
+    @Test
+    void queryResumesAfterAnExclusiveStartKeyWhoseItemHasBeenDeleted() {
+        createOrdersTable("us-east-1");
+        for (String order : List.of("o1", "o2", "o3", "o4")) {
+            service.putItem("Orders", item("customerId", "c1", "orderId", order), "us-east-1");
+        }
+        ObjectNode exprValues = mapper.createObjectNode();
+        exprValues.set(":pk", attributeValue("S", "c1"));
+
+        DynamoDbService.QueryResult firstPage = service.query("Orders", null, exprValues,
+                "customerId = :pk", null, 2, null, null, null, null, "us-east-1");
+        assertEquals("o2", firstPage.lastEvaluatedKey().get("orderId").get("S").asText());
+        service.deleteItem("Orders", item("customerId", "c1", "orderId", "o2"), "us-east-1");
+
+        DynamoDbService.QueryResult secondPage = service.query("Orders", null, exprValues,
+                "customerId = :pk", null, 2, null, null, firstPage.lastEvaluatedKey(), null, "us-east-1");
+        assertEquals(List.of("o3", "o4"), secondPage.items().stream()
+                .map(found -> found.get("orderId").get("S").asText()).toList());
+
+        DynamoDbService.QueryResult backwards = service.query("Orders", null, exprValues,
+                "customerId = :pk", null, 2, false, null, firstPage.lastEvaluatedKey(), null, "us-east-1");
+        assertEquals(List.of("o1"), backwards.items().stream()
+                .map(found -> found.get("orderId").get("S").asText()).toList());
     }
 }

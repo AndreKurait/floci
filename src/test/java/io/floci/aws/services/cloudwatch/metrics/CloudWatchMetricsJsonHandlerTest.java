@@ -59,6 +59,40 @@ class CloudWatchMetricsJsonHandlerTest {
         handler = new CloudWatchMetricsJsonHandler(service, dashboardsService, metricStreamsService, MAPPER);
     }
 
+    @Test
+    void listMetricsDimensionFilterMatchesAllValuesWhenValueIsOmitted() throws Exception {
+        ObjectNode put = (ObjectNode) MAPPER.readTree("""
+                {"Namespace":"Filters","MetricData":[
+                  {"MetricName":"First","Value":1,"Dimensions":[{"Name":"Host","Value":"one"}]},
+                  {"MetricName":"Second","Value":1,"Dimensions":[{"Name":"Host","Value":"two"}]},
+                  {"MetricName":"Other","Value":1,"Dimensions":[{"Name":"Zone","Value":"one"}]}]}
+                """);
+        handler.handle("PutMetricData", put, REGION);
+        ObjectNode request = MAPPER.createObjectNode().put("Namespace", "Filters");
+        ObjectNode filter = request.putArray("Dimensions").addObject().put("Name", "Host");
+        JsonNode allValues = (JsonNode) handler.handle("ListMetrics", request, REGION).getEntity();
+        assertEquals(2, allValues.path("Metrics").size());
+        filter.put("Value", "one");
+        JsonNode exact = (JsonNode) handler.handle("ListMetrics", request, REGION).getEntity();
+        assertEquals("First", exact.path("Metrics").get(0).path("MetricName").asText());
+        assertEquals(1, exact.path("Metrics").size());
+        filter.put("Value", "absent");
+        JsonNode missing = (JsonNode) handler.handle("ListMetrics", request, REGION).getEntity();
+        assertEquals(0, missing.path("Metrics").size());
+    }
+
+    @Test
+    void metricDatumOmittedDimensionValueRetainsEmptyString() throws Exception {
+        JsonNode put = MAPPER.readTree("""
+                {"Namespace":"Datum","MetricData":[
+                  {"MetricName":"Requests","Value":1,"Dimensions":[{"Name":"Host"}]}]}
+                """);
+        handler.handle("PutMetricData", put, REGION);
+        JsonNode result = (JsonNode) handler.handle("ListMetrics",
+                MAPPER.createObjectNode().put("Namespace", "Datum"), REGION).getEntity();
+        assertEquals("", result.path("Metrics").get(0).path("Dimensions").get(0).path("Value").asText());
+    }
+
     /**
      * Mimics DateUtils.formatUnixTimestampInstant: epoch millis as a decimal BigDecimal
      * (epoch seconds with millisecond precision). Using BigDecimal avoids the scientific-

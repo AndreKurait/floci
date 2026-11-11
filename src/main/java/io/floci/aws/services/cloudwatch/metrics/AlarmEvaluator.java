@@ -85,7 +85,7 @@ public class AlarmEvaluator {
                     LOG.warnv("Alarm evaluation failed for {0}: {1}", alarm.getAlarmName(), e.getMessage());
                 }
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
             LOG.warnv(e, "Alarm evaluation tick failed: {0}", e.getMessage());
         }
     }
