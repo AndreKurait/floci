@@ -113,7 +113,7 @@ public class SqsEventSourcePoller implements Resettable {
     public void startPersistedPollers() {
         List<EventSourceMapping> esms = esmStore.listAll();
         for (EventSourceMapping esm : esms) {
-            if (esm.isEnabled() && esm.getEventSourceArn().contains(":sqs:")) {
+            if (esm.isEnabled() && esm.getEventSourceArn() != null && esm.getEventSourceArn().contains(":sqs:")) {
                 startPolling(esm);
             }
         }

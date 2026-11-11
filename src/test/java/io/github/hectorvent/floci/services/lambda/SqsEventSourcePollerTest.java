@@ -1022,4 +1022,24 @@ class SqsEventSourcePollerTest {
 
         verify(executorService, never()).invoke(any(), any(), any());
     }
+
+    @Test
+    void startPersistedPollersSkipsAnEnabledMappingWithoutAnEventSourceArn() {
+        EventSourceMapping selfManagedKafka = new EventSourceMapping();
+        selfManagedKafka.setUuid("kafka-esm");
+        selfManagedKafka.setAccountId("000000000000");
+        selfManagedKafka.setEnabled(true);
+        EventSourceMapping queueMapping = esm();
+        queueMapping.setEnabled(true);
+        EsmStore store = mock(EsmStore.class);
+        when(store.listAll()).thenReturn(List.of(selfManagedKafka, queueMapping));
+        Vertx vertx = mock(Vertx.class);
+        SqsEventSourcePoller persisted = new SqsEventSourcePoller(vertx, sqsService, executorService,
+                new LambdaTargetResolver(functionStore, aliasStore), store, emulatorConfig, OBJECT_MAPPER,
+                new PipesFilterMatcher(OBJECT_MAPPER), polls);
+
+        persisted.startPersistedPollers();
+
+        verify(vertx, times(1)).setPeriodic(eq(1000L), any());
+    }
 }

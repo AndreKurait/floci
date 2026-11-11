@@ -1027,6 +1027,24 @@ class KinesisEventSourcePollerTest {
     }
 
     @Test
+    void startPersistedPollersSkipsAnEnabledMappingWithoutAnEventSourceArn() {
+        EventSourceMapping selfManagedKafka = new EventSourceMapping();
+        selfManagedKafka.setUuid("kafka-esm");
+        selfManagedKafka.setAccountId(ACCOUNT);
+        selfManagedKafka.setEnabled(true);
+        when(esmStore.listAll()).thenReturn(List.of(selfManagedKafka, esm()));
+        Vertx vertx = mock(Vertx.class);
+        KinesisEventSourcePoller persisted = new KinesisEventSourcePoller(vertx, kinesisService, executorService,
+                new LambdaTargetResolver(functionStore, aliasStore), esmStore, config, MAPPER,
+                new PipesFilterMatcher(MAPPER), new StreamBatchFailures(sqsService, snsService, s3Service, MAPPER, config),
+                clock::get, polls);
+
+        persisted.startPersistedPollers();
+
+        verify(vertx, times(1)).setPeriodic(eq(1000L), any());
+    }
+
+    @Test
     void mappingDeletedReleasesItsStopTombstone() {
         poller.stopPolling("k-esm-gone");
 

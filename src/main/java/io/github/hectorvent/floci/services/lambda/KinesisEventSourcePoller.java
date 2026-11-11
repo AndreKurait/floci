@@ -127,7 +127,8 @@ public class KinesisEventSourcePoller implements Resettable {
     public void startPersistedPollers() {
         List<EventSourceMapping> esms = esmStore.listAll();
         for (EventSourceMapping esm : esms) {
-            if (esm.isEnabled() && esm.getEventSourceArn().contains(":kinesis:")) {
+            if (esm.isEnabled() && esm.getEventSourceArn() != null
+                    && esm.getEventSourceArn().contains(":kinesis:")) {
                 startPolling(esm);
             }
         }
