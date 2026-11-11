@@ -2828,11 +2828,17 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         if (nextToken == null || nextToken.isBlank()) {
             return 0;
         }
+        int offset;
         try {
-            return Integer.parseInt(Base64Url.decode(nextToken));
+            offset = Integer.parseInt(Base64Url.decode(nextToken));
         } catch (IllegalArgumentException e) {
             throw new AwsException("InvalidParameterException", "The nextToken is not valid.", 400);
         }
+        if (offset < 0) {
+            // No listing hands out a negative offset, and a sublist from one is an internal error.
+            throw new AwsException("InvalidParameterException", "The nextToken is not valid.", 400);
+        }
+        return offset;
     }
 
     // ── Task Protection ───────────────────────────────────────────────────────
