@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.concurrent.DeadlineWaits;
 import io.github.hectorvent.floci.core.common.concurrent.KeyedWorkQueue;
 import io.github.hectorvent.floci.core.common.concurrent.SocketDeadline;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -50,6 +51,7 @@ public class ElbV2HealthChecker implements Resettable {
     private final ElbV2VpcNetworkManager vpcNetworks;
     private final long maxHealthCheckIntervalMillis;
     private final LongSupplier nanoTime;
+    private final DeadlineWaits probeDeadline;
     private final SSLSocketFactory backendTls = backendTls();
     private final Set<ProbeIdentity> activeProbes = new HashSet<>();
 
@@ -61,26 +63,33 @@ public class ElbV2HealthChecker implements Resettable {
             "elb-health-probe", MAX_CONCURRENT_PROBES, 4096, this::runProbe);
 
     public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
-        this(vertx, config, ec2Service, null, System::nanoTime);
+        this(vertx, config, ec2Service, null, System::nanoTime, DeadlineWaits.SYSTEM);
     }
 
     @Inject
     public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
                              ElbV2VpcNetworkManager vpcNetworks) {
-        this(vertx, config, ec2Service, vpcNetworks, System::nanoTime);
+        this(vertx, config, ec2Service, vpcNetworks, System::nanoTime, DeadlineWaits.SYSTEM);
     }
 
     ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service, LongSupplier nanoTime) {
-        this(vertx, config, ec2Service, null, nanoTime);
+        this(vertx, config, ec2Service, null, nanoTime, DeadlineWaits.SYSTEM);
+    }
+
+    /** The probe cadence and each probe's timeout are both counted on {@code waits}. */
+    ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service, DeadlineWaits waits) {
+        this(vertx, config, ec2Service, null, waits::nanoTime, waits);
     }
 
     private ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
-                               ElbV2VpcNetworkManager vpcNetworks, LongSupplier nanoTime) {
+                               ElbV2VpcNetworkManager vpcNetworks, LongSupplier nanoTime,
+                               DeadlineWaits probeDeadline) {
         this.vertx = vertx;
         this.config = config;
         this.ec2Service = ec2Service;
         this.vpcNetworks = vpcNetworks;
         this.nanoTime = nanoTime;
+        this.probeDeadline = probeDeadline;
         maxHealthCheckIntervalMillis = config.services().elbv2().maxHealthCheckIntervalMillis();
         if (maxHealthCheckIntervalMillis < 0) {
             throw new IllegalArgumentException(
@@ -305,7 +314,7 @@ public class ElbV2HealthChecker implements Resettable {
                                     Map.of(work.key(), replacement), true);
                         }
                     }
-                });
+                }, probeDeadline);
             } catch (IOException | RuntimeException error) {
                 failure = error;
             }

@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.github.hectorvent.floci.testing.TestTime;
+import io.github.hectorvent.floci.testing.TimelineDeadlineWaits;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
@@ -49,6 +50,8 @@ import static org.mockito.Mockito.when;
 class ElbV2HealthCheckerTest {
     private static final Duration REGISTRATION_PROBE_DELAY = Duration.ofMillis(1);
     private static final Duration TICK = Duration.ofMillis(1);
+    /** The health-check timeout every target group of this class is created with. */
+    private static final Duration PROBE_TIMEOUT = Duration.ofSeconds(1);
 
     private final Vertx vertx = Vertx.vertx();
     private final List<ElbV2HealthChecker> checkers = new ArrayList<>();
@@ -259,28 +262,30 @@ class ElbV2HealthCheckerTest {
             release.join();
             return instance;
         });
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, ec2);
-        checkers.add(checker);
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        ElbV2HealthChecker checker = timelineDeadlineChecker(ec2, waits);
         TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
         group.setTargetType("instance");
         TargetDescription blocked = target("i-blocked", server.actualPort());
         try {
             checker.addTargets(group.getTargetGroupArn(), List.of(blocked), group);
             entered.get(2, TimeUnit.SECONDS);
-            await().atMost(Duration.ofSeconds(3))
-                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
-                    .untilAsserted(() -> assertEquals("Target.Timeout",
-                            checker.getHealth(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()).reason()));
+            waits.awaitWaiting(1);
+            time.advance(PROBE_TIMEOUT.minusNanos(1));
+            assertEquals("Elb.RegistrationInProgress",
+                    checker.getHealth(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()).reason(),
+                    "The lookup has its whole health-check timeout");
+            time.advance(Duration.ofNanos(1));
+            assertEquals("Target.Timeout",
+                    checker.getHealth(group.getTargetGroupArn(), blocked.getId(), blocked.getPort()).reason());
+            awaitCompletedProbes(checker, 1);
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
-            await().atMost(Duration.ofSeconds(2))
-                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
-                    .untilAsserted(() -> assertEquals("healthy",
-                            checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort())));
-            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
-                checker.probeAll(group.getTargetGroupArn(), group);
-                assertEquals(1, lookups.get(), "A timed-out lookup still owns its target's probe");
-            });
+            awaitCompletedProbes(checker, 2);
+            assertEquals("healthy", checker.getState(group.getTargetGroupArn(), "127.0.0.1", server.actualPort()));
+            // Only the reachable target is probed again: three probes ran and the lookup was entered once.
+            checker.probeAll(group.getTargetGroupArn(), group);
+            awaitCompletedProbes(checker, 3);
+            assertEquals(1, lookups.get(), "A timed-out lookup still owns its target's probe");
             release.complete(null);
             await().atMost(Duration.ofSeconds(3))
                     .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
@@ -616,9 +621,8 @@ class ElbV2HealthCheckerTest {
             }
             return instance;
         });
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, ec2);
-        checkers.add(checker);
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        ElbV2HealthChecker checker = timelineDeadlineChecker(ec2, waits);
         TargetGroup group = targetGroup(server.actualPort(), "200", 1, 1);
         group.setTargetType("instance");
         List<TargetDescription> held = new ArrayList<>();
@@ -630,19 +634,27 @@ class ElbV2HealthCheckerTest {
             await().atMost(Duration.ofSeconds(3))
                     .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                     .until(() -> lookups.get() == 32);
-            await().atMost(Duration.ofSeconds(3))
-                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
-                    .until(() -> held.stream().allMatch(target ->
-                            "Target.Timeout".equals(checker.getHealth(
-                                    group.getTargetGroupArn(), target.getId(), target.getPort()).reason())));
+            waits.awaitWaiting(32);
+            time.advance(PROBE_TIMEOUT.minusNanos(1));
+            for (TargetDescription target : held) {
+                assertEquals("Elb.RegistrationInProgress", checker.getHealth(
+                        group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
+            }
+            time.advance(Duration.ofNanos(1));
+            awaitCompletedProbes(checker, 32);
+            for (TargetDescription target : held) {
+                assertEquals("Target.Timeout", checker.getHealth(
+                        group.getTargetGroupArn(), target.getId(), target.getPort()).reason());
+            }
+            // The registration probe of the reachable target, then one more pass, both find no free slot.
             checker.addTargets(group.getTargetGroupArn(), List.of(target("127.0.0.1", server.actualPort())), group);
-            await().during(Duration.ofMillis(250)).atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
-                checker.probeAll(group.getTargetGroupArn(), group);
-                assertEquals(32, lookups.get());
-                assertEquals("initial", checker.getState(
-                        group.getTargetGroupArn(), "127.0.0.1", server.actualPort()),
-                        "An expired caller deadline must not release a still-running worker's slot");
-            });
+            awaitCompletedProbes(checker, 33);
+            checker.probeAll(group.getTargetGroupArn(), group);
+            awaitCompletedProbes(checker, 34);
+            assertEquals(32, lookups.get());
+            assertEquals("initial", checker.getState(
+                    group.getTargetGroupArn(), "127.0.0.1", server.actualPort()),
+                    "An expired caller deadline must not release a still-running worker's slot");
             release.complete(null);
             await().atMost(Duration.ofSeconds(3))
                     .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
@@ -939,6 +951,14 @@ class ElbV2HealthCheckerTest {
         return checker;
     }
 
+    /** A checker on the real event loop whose probe timeout is reached by advancing the timeline. */
+    private ElbV2HealthChecker timelineDeadlineChecker(Ec2Service ec2, TimelineDeadlineWaits waits) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        ElbV2HealthChecker checker = new ElbV2HealthChecker(vertx, config, ec2, waits);
+        checkers.add(checker);
+        return checker;
+    }
+
     private ElbV2HealthChecker timedHealthChecker() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().elbv2().mock()).thenReturn(false);
@@ -1013,7 +1033,7 @@ class ElbV2HealthCheckerTest {
         targetGroup.setHealthCheckEnabled(true);
         targetGroup.setHealthCheckPath("/");
         targetGroup.setMatcher(matcher);
-        targetGroup.setHealthCheckTimeoutSeconds(1);
+        targetGroup.setHealthCheckTimeoutSeconds((int) PROBE_TIMEOUT.toSeconds());
         targetGroup.setHealthyThresholdCount(healthyThreshold);
         targetGroup.setUnhealthyThresholdCount(unhealthyThreshold);
         return targetGroup;
