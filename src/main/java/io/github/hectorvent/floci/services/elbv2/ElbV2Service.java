@@ -1145,7 +1145,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 Map<String, Rule> regionRules = rules.computeIfAbsent(region, ignored -> new ConcurrentHashMap<>());
                 List<String> ruleArns = listenerToRules.remove(listenerArn);
                 if (ruleArns != null) {
-                    ruleArns.forEach(regionRules::remove);
+                    for (String ruleArn : ruleArns) {
+                        regionRules.remove(ruleArn);
+                        tags.remove(ruleArn);
+                    }
                 }
                 listeners.put(region, regionListeners);
                 rules.put(region, regionRules);
