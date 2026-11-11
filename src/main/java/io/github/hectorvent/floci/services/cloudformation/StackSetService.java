@@ -221,6 +221,10 @@ public class StackSetService implements PassedRoleLookup {
         requireValidTemplate(keptTemplate);
         cfnService.requireParameterValues(keptTemplate,
                 parameters != null && !parameters.isEmpty() ? parameters : ss.getParameters());
+        if (autoDeploymentEnabled != null && !"SERVICE_MANAGED".equals(ss.getPermissionModel())) {
+            throw new AwsException("InvalidOperationException",
+                    "AutoDeployment is valid only for SERVICE_MANAGED StackSets.", 400);
+        }
         String operationId = reserveOperation(name, "UPDATE", requestedOperationId).getOperationId();
         if (templateBody != null && !templateBody.isBlank()) {
             ss.setTemplateBody(templateBody);
@@ -239,11 +243,6 @@ public class StackSetService implements PassedRoleLookup {
             ss.setDescription(description);
         }
         if (autoDeploymentEnabled != null) {
-            if (!"SERVICE_MANAGED".equals(ss.getPermissionModel())) {
-                completeOperation(name, operationId, "FAILED");
-                throw new AwsException("InvalidOperationException",
-                        "AutoDeployment is valid only for SERVICE_MANAGED StackSets.", 400);
-            }
             ss.setAutoDeploymentEnabled(autoDeploymentEnabled);
         }
         if (retainStacksOnAccountRemoval != null) ss.setRetainStacksOnAccountRemoval(retainStacksOnAccountRemoval);
