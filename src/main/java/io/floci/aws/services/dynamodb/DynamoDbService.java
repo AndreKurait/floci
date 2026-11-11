@@ -1733,6 +1733,7 @@ public class DynamoDbService {
             results = results.stream()
                     .filter(item -> direction * keyOrder.compare(item, exclusiveStartKey) > 0)
                     .toList();
+
         }
 
         List<JsonNode> evaluatedItems = results;
