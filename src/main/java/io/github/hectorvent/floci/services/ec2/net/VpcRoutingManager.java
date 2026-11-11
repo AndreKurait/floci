@@ -465,7 +465,9 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                     address.device());
         }
         if (!script.equals(endpoint.applied)) {
-            run(endpoint.helper, VpcRoutingCommands.endpointGuard());
+            // Resolver access is independent of VPC routes. Keep it available while
+            // withdrawing peer traffic before changing kernel routes and source NAT.
+            run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
             endpoint.applied = null;
             run(endpoint.helper, script);
             endpoint.applied = script;

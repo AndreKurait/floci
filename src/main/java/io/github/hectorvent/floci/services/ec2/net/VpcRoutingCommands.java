@@ -22,16 +22,41 @@ final class VpcRoutingCommands {
     record LocalRoute(Cidr4 destination, boolean allowed) {}
 
     static String endpointGuard() {
-        return """
-                set -eu
-                nft add table inet floci_vpc_routes
-                nft 'add chain inet floci_vpc_routes ingress { type filter hook input priority -5; policy drop; }'
-                nft 'add chain inet floci_vpc_routes egress { type filter hook output priority -5; policy drop; }'
-                nft -f - <<'FLOCI_RULES'
+        return endpointGuard(List.of());
+    }
+
+    static String endpointGuard(List<String> resolvers) {
+        StringBuilder rules = new StringBuilder("""
+                add table inet floci_vpc_routes
+                add chain inet floci_vpc_routes ingress { type filter hook input priority -5; policy drop; }
+                add chain inet floci_vpc_routes egress { type filter hook output priority -5; policy drop; }
                 flush chain inet floci_vpc_routes ingress
                 flush chain inet floci_vpc_routes egress
-                FLOCI_RULES
-                """;
+                """);
+        appendResolverEgress(rules, resolvers);
+        for (String resolver : resolvers) {
+            if (!resolver.contains(":")) {
+                String address = VpcRouteSelection.ipv4(resolver);
+                for (String protocol : List.of("udp", "tcp")) {
+                    rules.append("add rule inet floci_vpc_routes ingress ip saddr ").append(address)
+                            .append(' ').append(protocol).append(" sport 53")
+                            .append(" ct state established ct direction reply counter accept\n");
+                }
+            }
+        }
+        return "set -eu\n" + nft(rules.toString());
+    }
+
+    private static void appendResolverEgress(StringBuilder rules, List<String> resolvers) {
+        for (String resolver : resolvers) {
+            if (!resolver.contains(":")) {
+                String address = VpcRouteSelection.ipv4(resolver);
+                rules.append("add rule inet floci_vpc_routes egress ip daddr ").append(address)
+                        .append(" udp dport 53 counter accept\n")
+                        .append("add rule inet floci_vpc_routes egress ip daddr ").append(address)
+                        .append(" tcp dport 53 counter accept\n");
+            }
+        }
     }
 
     static String endpoint(String privateAddress, String privateDevice, List<LocalRoute> localRoutes, List<Hop> hops,
@@ -77,15 +102,7 @@ final class VpcRoutingCommands {
             rules.append("add rule inet floci_vpc_routes egress meta l4proto tcp"
                     + " ct original ip daddr 169.254.169.254 ct original proto-dst 80 counter accept\n");
         }
-        for (String resolver : resolvers) {
-            if (!resolver.contains(":")) {
-                String address = VpcRouteSelection.ipv4(resolver);
-                rules.append("add rule inet floci_vpc_routes egress ip daddr ").append(address)
-                        .append(" udp dport 53 counter accept\n")
-                        .append("add rule inet floci_vpc_routes egress ip daddr ").append(address)
-                        .append(" tcp dport 53 counter accept\n");
-            }
-        }
+        appendResolverEgress(rules, resolvers);
         for (ControlConnection control : controls) {
             if (!control.address().contains(":")) {
                 rules.append("add rule inet floci_vpc_routes egress ip daddr ")

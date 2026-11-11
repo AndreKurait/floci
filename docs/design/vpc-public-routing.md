@@ -125,6 +125,11 @@ changes and stop/start, and repeats the private frontend and public NAT cases wi
 enabled. The bounded test client waits on dropped packets; no server delay is injected.
 
 Floci installs routing and translation rules inside owned container namespaces.
+During route replacement, the temporary default-deny guard preserves UDP and TCP
+port 53 only to the endpoint's declared resolvers, with connection-tracked replies.
+The guard and its resolver permits are installed in one nftables transaction.
+Peer traffic remains withdrawn until the new routes and policy are installed;
+initial admission and failure quarantine still deny all traffic.
 Docker manages its host bridge configuration. Removing a NAT
 gateway retires forwarding before releasing its addresses. A namespace still
 used by a container retains its reservation and makes deletion retryable.
