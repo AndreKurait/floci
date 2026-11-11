@@ -320,7 +320,7 @@ public class EmrHandler {
         boolean terminated = EmrClusterLifecycle.isTerminated(cluster.getState());
         List<String> states = stringList(request.path("InstanceStates"));
         if ((!states.isEmpty() && !states.contains(terminated ? "TERMINATED" : "RUNNING"))
-                || (terminated && !withinTerminatedInstanceRetention(cluster.getEndDateTime(), Instant.now()))) {
+                || (terminated && !withinTerminatedInstanceRetention(cluster.getEndDateTime(), service.now()))) {
             return Response.ok(response).build();
         }
         // Listed in their groups' order, the first MASTER group's instances numbered first, so the primary node keeps
