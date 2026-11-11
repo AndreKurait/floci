@@ -90,7 +90,7 @@ public class SesContactService implements SesTaggable {
         list.setDescription(description);
         list.setTopics(topics);
         list.setTags(tags);
-        Instant now = Instant.now();
+        Instant now = Instant.now(clock);
         list.setCreatedTimestamp(now);
         list.setLastUpdatedTimestamp(now);
         // AWS allows at most one contact list per account per region (verified against real AWS).
@@ -182,7 +182,7 @@ public class SesContactService implements SesTaggable {
         if (descriptionPresent) {
             existing.setDescription(description);
         }
-        existing.setLastUpdatedTimestamp(Instant.now());
+        existing.setLastUpdatedTimestamp(Instant.now(clock));
         contactListStore.put(key, existing);
         LOG.infov("Updated SES contact list: {0} in region {1}", name, region);
         return existing;

@@ -6,10 +6,13 @@ import io.floci.aws.services.ses.model.Contact;
 import io.floci.aws.services.ses.model.ContactList;
 import io.floci.aws.services.ses.model.ListManagementOptions;
 import io.floci.aws.services.ses.model.Topic;
+import io.floci.aws.testing.ManualClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -92,5 +95,21 @@ class SesContactServiceTest {
 
         assertTrue(service.collectListManagementOptOuts(
                 List.of("alice@example.com"), null, REGION, address -> address).isEmpty());
+    }
+
+    @Test
+    void contactListTimestampsComeFromTheInjectedClock() {
+        Instant createdAt = Instant.parse("2031-03-04T05:06:07Z");
+        ManualClock clock = new ManualClock(createdAt);
+        SesContactService timed = new SesContactService(new InMemoryStorage<>(), new InMemoryStorage<>(), clock);
+
+        ContactList created = timed.createContactList(LIST, "desc", List.of(), List.of(), REGION);
+        assertEquals(createdAt, created.getCreatedTimestamp());
+        assertEquals(createdAt, created.getLastUpdatedTimestamp());
+
+        clock.advance(Duration.ofHours(36));
+        ContactList updated = timed.updateContactList(LIST, "changed", true, null, REGION);
+        assertEquals(createdAt, updated.getCreatedTimestamp());
+        assertEquals(createdAt.plus(Duration.ofHours(36)), updated.getLastUpdatedTimestamp());
     }
 }
