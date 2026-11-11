@@ -1,11 +1,11 @@
 AWS::ApiGatewayV2::Authorizer	ApiId	create-only	a drop fails: the authorizer is not found
-AWS::ApiGatewayV2::Authorizer	AuthorizerPayloadFormatVersion	clear	a create without it accepts the authorizer
+AWS::ApiGatewayV2::Authorizer	AuthorizerPayloadFormatVersion	clear	kept for an HTTP API REQUEST authorizer; otherwise reads back absent
 AWS::ApiGatewayV2::Authorizer	AuthorizerResultTtlInSeconds	clear	the field reads back absent
 AWS::ApiGatewayV2::Authorizer	AuthorizerType	keep:required by AWS
-AWS::ApiGatewayV2::Authorizer	AuthorizerUri	clear	a create without it accepts the authorizer
+AWS::ApiGatewayV2::Authorizer	AuthorizerUri	clear	kept for a REQUEST authorizer; otherwise reads back absent
 AWS::ApiGatewayV2::Authorizer	EnableSimpleResponses	clear	the field reads back absent
 AWS::ApiGatewayV2::Authorizer	IdentitySource	clear	an update also clears it when the stack never declared it, so a value set outside the stack is lost
-AWS::ApiGatewayV2::Authorizer	JwtConfiguration	clear	a create without it accepts the authorizer
+AWS::ApiGatewayV2::Authorizer	JwtConfiguration	clear	kept for a JWT authorizer; otherwise reads back absent
 AWS::ApiGatewayV2::Authorizer	Name	keep:required by AWS
 AWS::ApiGatewayV2::Route	ApiId	create-only	a drop fails: the route is not found
 AWS::ApiGatewayV2::Route	AuthorizationScopes	clear	an update also clears it when the stack never declared it, so a value set outside the stack is lost

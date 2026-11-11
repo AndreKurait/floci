@@ -783,7 +783,11 @@ the service did not have goes back to none. A `Stage`'s dropped `StageVariables`
 dropped `Target` and `AuthorizerId`, and an `Authorizer`'s dropped `AuthorizerUri`,
 `AuthorizerPayloadFormatVersion`, `JwtConfiguration`, `AuthorizerResultTtlInSeconds` and
 `EnableSimpleResponses`, read back absent, as on a create without them. A dropped `AuthorizerId` is kept
-while the route's authorization type stays `JWT` or `CUSTOM`. An `Instance`'s dropped `UserData` is
+while the route's authorization type stays `JWT` or `CUSTOM`. An authorizer keeps its
+`JwtConfiguration` while its type is `JWT`, and its `AuthorizerUri` while its type is `REQUEST`.
+An HTTP API `REQUEST` authorizer also keeps `AuthorizerPayloadFormatVersion`. These required settings
+are retained after `AWS::NoValue` removes them from the template; optional settings still clear, and
+settings no longer required after an authorizer type change clear as usual. An `Instance`'s dropped `UserData` is
 cleared: a running instance is stopped for the rewrite and started again, and a stopped one stays stopped.
 An `Alias`'s, a `Secret`'s and a `UserPoolGroup`'s dropped `Description` and a `Trail`'s dropped
 `S3KeyPrefix` are cleared. A dropped `RoutingConfig` removes the alias weights. The other members of
