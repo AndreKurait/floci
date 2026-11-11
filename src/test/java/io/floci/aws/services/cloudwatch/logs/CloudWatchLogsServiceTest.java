@@ -8,6 +8,7 @@ import io.floci.aws.services.cloudwatch.logs.model.LogEvent;
 import io.floci.aws.services.cloudwatch.logs.model.LogGroup;
 import io.floci.aws.services.cloudwatch.logs.model.LogStream;
 import io.floci.aws.services.cloudwatch.logs.model.SubscriptionFilter;
+import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -17,6 +18,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -2284,11 +2286,11 @@ class CloudWatchLogsServiceTest {
 
     @Test
     void groupsStreamsSubscriptionFiltersAndResourcePoliciesAreDatedOnTheServiceClock() {
-        TestTime time = TestTime.create();
+        ManualClock time = new ManualClock(Instant.parse("2026-01-01T00:00:00Z"));
         CloudWatchLogsService timed = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 10000,
-                new RegionResolver("us-east-1", "000000000000"), 0L, time::currentTimeMillis);
-        long start = time.currentTimeMillis();
+                new RegionResolver("us-east-1", "000000000000"), 0L, time::millis);
+        long start = time.millis();
 
         timed.createLogGroup("/app/logs", null, null, REGION);
         assertEquals(start, timed.describeLogGroups("/app/logs", REGION).getFirst().getCreatedTime());
