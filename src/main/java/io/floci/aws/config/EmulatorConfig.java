@@ -875,6 +875,7 @@ public interface EmulatorConfig {
         AppIntegrationsServiceConfig appintegrations();
         DlmServiceConfig dlm();
         SignerServiceConfig signer();
+        XrayServiceConfig xray();
         CognitoIdentityServiceConfig cognitoidentity();
         GlobalAcceleratorServiceConfig globalaccelerator();
         DataSyncServiceConfig datasync();
@@ -963,6 +964,11 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean mockSigningJobs();
+    }
+
+    interface XrayServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
     }
 
     interface CognitoIdentityServiceConfig {
@@ -2105,6 +2111,23 @@ public interface EmulatorConfig {
          * clusters run their HDFS in emr-7.5.0's.
          */
         Optional<String> hiveImageTemplate();
+
+        /**
+         * The memory, in MB, a {@code docker} cluster's NodeManager offers the YARN containers its steps' Spark
+         * executors run in. EMR sizes it by the instance type; Floci's node shares the machine it runs on.
+         *
+         * Env var: FLOCI_SERVICES_EMR_YARN_NODE_MEMORY_MB
+         */
+        @WithDefault("4096")
+        int yarnNodeMemoryMb();
+
+        /**
+         * The virtual cores a {@code docker} cluster's NodeManager offers YARN's containers.
+         *
+         * Env var: FLOCI_SERVICES_EMR_YARN_NODE_VCORES
+         */
+        @WithDefault("4")
+        int yarnNodeVcores();
 
         /**
          * When true, Floci removes, in the {@code docker} runner mode, every EMR step driver and bootstrap
