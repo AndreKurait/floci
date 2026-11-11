@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.elb;
 
+import io.github.hectorvent.floci.testing.TestTime;
+import io.github.hectorvent.floci.testing.TimelineDeadlineWaits;
 import org.junit.jupiter.api.Test;
 
 import java.io.BufferedReader;
@@ -11,6 +13,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -20,6 +23,8 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ElbClassicProbeDeadlineTest {
+
+    private static final Duration PROBE_TIMEOUT = Duration.ofSeconds(1);
 
     @Test
     void complete200ResponseSucceeds() throws Exception {
@@ -65,16 +70,23 @@ class ElbClassicProbeDeadlineTest {
                     throw new IllegalStateException(e);
                 }
             }, executor);
+            TestTime time = TestTime.create();
+            TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+            ElbClassicHealthChecker checker = new ElbClassicHealthChecker(null, null, null, null, waits);
             CompletableFuture<Boolean> probe = CompletableFuture.supplyAsync(() -> {
                 try {
-                    return probe(server.getLocalPort());
+                    return probe(checker, server.getLocalPort());
                 } catch (Exception e) {
                     throw new IllegalStateException(e);
                 }
             }, executor);
             try {
                 assertTrue(responseStarted.await(5, TimeUnit.SECONDS));
-                assertFalse(assertDoesNotThrow(() -> probe.get(1500, TimeUnit.MILLISECONDS)),
+                waits.awaitWaiting(1);
+                time.advance(PROBE_TIMEOUT.minusNanos(1));
+                assertFalse(probe.isDone(), "The probe has its whole one-second timeout");
+                time.advance(Duration.ofNanos(1));
+                assertFalse(assertDoesNotThrow(() -> probe.get(5, TimeUnit.SECONDS)),
                         "Continuous response progress must not extend the one-second deadline");
                 finishResponse.countDown();
                 peer.get(5, TimeUnit.SECONDS);
@@ -98,17 +110,16 @@ class ElbClassicProbeDeadlineTest {
                     throw new IllegalStateException(e);
                 }
             }, executor);
-            assertEquals(expected, probe(server.getLocalPort()));
+            assertEquals(expected, probe(new ElbClassicHealthChecker(null, null, null), server.getLocalPort()));
             peer.get(5, TimeUnit.SECONDS);
         }
     }
 
-    private boolean probe(int port) throws Exception {
-        ElbClassicHealthChecker checker = new ElbClassicHealthChecker(null, null, null);
+    private static boolean probe(ElbClassicHealthChecker checker, int port) throws Exception {
         Method method = ElbClassicHealthChecker.class.getDeclaredMethod("probe", String.class,
                 ElbClassicHealthChecker.Target.class, int.class);
         method.setAccessible(true);
         return (Boolean) method.invoke(checker, "127.0.0.1",
-                new ElbClassicHealthChecker.Target("http", port, "/health"), 1);
+                new ElbClassicHealthChecker.Target("http", port, "/health"), (int) PROBE_TIMEOUT.toSeconds());
     }
 }
