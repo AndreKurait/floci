@@ -259,6 +259,37 @@ class BatchServiceTest {
     }
 
     @Test
+    void updateJobQueue_refusedForAnUnknownComputeEnvironment_leavesTheQueueAsItWas() throws Exception {
+        BatchService service = immediateService(new InMemoryStorage<String, BatchJob>());
+        String computeArn = service.createComputeEnvironment(json("""
+                {"computeEnvironmentName":"kept-ce","type":"MANAGED"}
+                """), REGION).path("computeEnvironmentArn").asText();
+        String queueArn = service.createJobQueue(json("""
+                {
+                  "jobQueueName":"kept-queue",
+                  "priority":1,
+                  "computeEnvironmentOrder":[{"order":1,"computeEnvironment":"%s"}]
+                }
+                """.formatted(computeArn)), REGION).path("jobQueueArn").asText();
+
+        AwsException refused = assertThrows(AwsException.class, () -> service.updateJobQueue(json("""
+                {
+                  "jobQueue":"kept-queue",
+                  "state":"DISABLED",
+                  "priority":9,
+                  "computeEnvironmentOrder":[{"order":1,"computeEnvironment":"no-such-ce"}]
+                }
+                """)));
+
+        assertEquals("ClientException", refused.getErrorCode());
+        JsonNode detail = service.describeJobQueues(json("""
+                {"jobQueues":["%s"]}
+                """.formatted(queueArn))).path("jobQueues").get(0);
+        assertEquals("ENABLED", detail.path("state").asText());
+        assertEquals(1, detail.path("priority").asInt());
+    }
+
+    @Test
     void updateJobQueueRejectsUnknownQueue() {
         BatchService service = immediateService(new InMemoryStorage<String, BatchJob>());
         AwsException e = assertThrows(AwsException.class, () -> service.updateJobQueue(json("""
