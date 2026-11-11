@@ -1657,6 +1657,21 @@ public class DynamoDbService {
             }
             if (startIdx >= 0) {
                 results = new ArrayList<>(results.subList(startIdx + 1, results.size()));
+            } else if (!accessPath.isIndex() && tableSkName != null && exclusiveStartKey.has(tableSkName)) {
+                // The item the last page ended on is gone: resume after the place its sort key
+                // holds in the order of this query. A table's sort key is unique in a partition.
+                JsonNode startSortKey = exclusiveStartKey.get(tableSkName);
+                int direction = Boolean.FALSE.equals(scanIndexForward) ? -1 : 1;
+                int resumeIdx = results.size();
+                for (int i = 0; i < results.size(); i++) {
+                    JsonNode sortKey = results.get(i).get(tableSkName);
+                    if (sortKey != null
+                            && direction * ExpressionEvaluator.compareAttributeValues(sortKey, startSortKey) > 0) {
+                        resumeIdx = i;
+                        break;
+                    }
+                }
+                results = new ArrayList<>(results.subList(resumeIdx, results.size()));
             }
         }
 
