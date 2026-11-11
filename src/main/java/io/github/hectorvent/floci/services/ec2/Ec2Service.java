@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.core.common.concurrent.DeadlineWaits;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
@@ -155,7 +156,6 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
@@ -388,6 +388,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * clock.
      */
     private Clock clock = Clock.systemUTC();
+    /**
+     * The elapsed time and the timed wait behind the launch timeout of {@link #awaitContainerLaunch}.
+     * Not final for the reason given on {@link #clock}.
+     */
+    private DeadlineWaits launchDeadline = DeadlineWaits.SYSTEM;
     private jakarta.enterprise.inject.Instance<ClusterNodeInstanceProvider> clusterNodeInstanceProviders;
     private ClusterNodeInstanceProvider testClusterNodeInstanceProvider;
     private final Ec2VolumeBlockDeviceManager volumeBlockDeviceManager;
@@ -534,6 +539,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
                 instanceTypeCatalog, storageFactory, (jakarta.enterprise.inject.Instance<RequestContext>) null);
         this.clock = clock;
+    }
+
+    /** As the constructor above, with the container launch timeout counted on {@code launchDeadline}. */
+    Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
+               Ec2PortForwardManager portForwardManager,
+               AmiImageResolver amiImageResolver, Ec2ImageCatalog imageCatalog,
+               Ec2InstanceTypeCatalog instanceTypeCatalog, StorageFactory storageFactory,
+               Clock clock, DeadlineWaits launchDeadline) {
+        this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
+                instanceTypeCatalog, storageFactory, clock);
+        this.launchDeadline = launchDeadline;
     }
 
     // Package-private for tests that need the Docker-backed VPC networking but not a request context.
@@ -5157,7 +5173,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return;
         }
 
-        long deadline = System.nanoTime() + timeout.toNanos();
+        long deadline = launchDeadline.nanoTime() + timeout.toNanos();
         while (true) {
             synchronized (instance) {
                 String state = instance.getState() != null ? instance.getState().getName() : null;
@@ -5167,10 +5183,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 if ("terminated".equals(state)) {
                     throw launchFailure(instance, "its container terminated during launch");
                 }
-                long remaining = deadline - System.nanoTime();
+                long remaining = deadline - launchDeadline.nanoTime();
                 if (remaining > 0) {
                     try {
-                        TimeUnit.NANOSECONDS.timedWait(instance, remaining);
+                        launchDeadline.waitOn(instance, remaining);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         throw new AwsException("InternalError", "Interrupted while waiting for EC2 instance "
