@@ -253,7 +253,7 @@ public class SesTemplateService implements SesTaggable {
         String subject = applyTemplateData(template.getSubject(), templateData);
         String text = applyTemplateData(template.getTextPart(), templateData);
         String html = applyTemplateData(template.getHtmlPart(), templateData);
-        return buildTestRenderMime(subject, text, html, ZonedDateTime.now(ZoneOffset.UTC), nextBoundary());
+        return buildTestRenderMime(subject, text, html, clock.instant().atZone(ZoneOffset.UTC), nextBoundary());
     }
 
     static JsonNode parseRenderingData(ObjectMapper mapper, String raw) {
