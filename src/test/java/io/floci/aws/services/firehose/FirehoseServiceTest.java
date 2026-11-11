@@ -1173,4 +1173,18 @@ class FirehoseServiceTest {
                 "updated at " + updated + ", between " + beforeUpdate + " and " + afterUpdate);
         assertEquals(created, described.getCreateTimestamp());
     }
+
+
+    @Test
+    void aRecordWithoutDataIsRejectedAndLeavesTheBufferUsable() {
+        firehoseService.createDeliveryStream("no-data", destination("arn:aws:s3:::sink", null));
+
+        AwsException rejected = assertThrows(AwsException.class,
+                () -> firehoseService.putRecord("no-data", new Record()));
+        assertEquals(400, rejected.getHttpStatus());
+
+        firehoseService.putRecord("no-data", new Record("kept".getBytes(StandardCharsets.UTF_8)));
+        firehoseService.flush("no-data");
+        assertEquals("kept\n", delivered("sink").text());
+    }
 }

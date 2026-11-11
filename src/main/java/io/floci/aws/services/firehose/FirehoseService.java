@@ -1073,6 +1073,11 @@ public class FirehoseService implements ResourceProvider {
      *                          or null for records that are not read from a source stream.
      */
     private void putRecordBatch(String streamKey, String streamName, List<Record> records, Runnable checkpointAdvance) {
+        for (Record r : records) {
+            if (r.getData() == null) {
+                throw new AwsException("InvalidArgumentException", "Record data must not be null.", 400);
+            }
+        }
         DeliveryStreamDescription stream = describeDeliveryStreamByKey(streamKey);
         List<byte[]> buffer = buffers.computeIfAbsent(
                 streamKey, k -> Collections.synchronizedList(new ArrayList<>()));
