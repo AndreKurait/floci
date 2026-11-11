@@ -1365,7 +1365,17 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         Rule rule = requireRule(region, ruleArn);
         String listenerArn = rule.getListenerArn();
         if (conditions != null) rule.setConditions(new ArrayList<>(conditions));
-        if (actions != null)    rule.setActions(new ArrayList<>(actions));
+        if (actions != null) {
+            rule.setActions(new ArrayList<>(actions));
+            Listener listener = listeners.getOrDefault(region, Map.of()).get(listenerArn);
+            if (listener != null) {
+                // The target groups the rule now forwards to are in use; the ones it left are not.
+                for (Action action : rule.getActions()) {
+                    linkTgToLb(action, listener.getLoadBalancerArn());
+                }
+                unlinkUnreferencedTargetGroups(region, listener.getLoadBalancerArn());
+            }
+        }
         persistRegion(rules, region);
         dataPlane.recompileRules(listenerArn, () -> getListenerRules(region, listenerArn));
         return rule;
