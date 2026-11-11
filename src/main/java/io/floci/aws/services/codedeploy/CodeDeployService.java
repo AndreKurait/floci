@@ -1260,7 +1260,6 @@ public class CodeDeployService {
         deployment.setDescription(description);
         deployment.setCreator("user");
         deployment.setComputePlatform("ECS");
-        deploymentsFor(region).put(deploymentId, deployment);
 
         // Determine ECS cluster/service from deployment group
         String clusterName = "default";
@@ -1319,6 +1318,8 @@ public class CodeDeployService {
         targetMap.put("ecsTarget", ecsTargetMap);
         ConcurrentHashMap<String, Map<String, Object>> ecsTargets = new ConcurrentHashMap<>();
         ecsTargets.put(targetId, targetMap);
+        // Published only once the request can no longer be refused: a refused request leaves no deployment.
+        deploymentsFor(region).put(deploymentId, deployment);
         deploymentTargetsFor(region).put(deploymentId, ecsTargets);
 
         AtomicBoolean stopFlag = new AtomicBoolean(false);
