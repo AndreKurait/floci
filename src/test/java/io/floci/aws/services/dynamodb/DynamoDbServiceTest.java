@@ -5166,6 +5166,54 @@ class DynamoDbServiceTest {
     }
 
     @Test
+    void ttlExpirationFollowsTheServiceClock() {
+        ManualClock at = new ManualClock(Instant.parse("2000-01-01T00:00:00Z"));
+        DynamoDbService svc = ttlClockService(at);
+        ObjectNode expiring = item("userId", "u1");
+        expiring.set("expiresAt", attributeValue("N", Long.toString(at.instant().plusSeconds(60).getEpochSecond())));
+        svc.putItem("Users", expiring, null, null, null, "us-east-1", null);
+
+        svc.deleteExpiredItems();
+        assertNotNull(svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+        at.advance(Duration.ofSeconds(60));
+        svc.deleteExpiredItems();
+        assertNotNull(svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+        at.advance(Duration.ofSeconds(1));
+        svc.deleteExpiredItems();
+        assertNull(svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+    }
+
+    @Test
+    void ttlDeletionRechecksUpdatedExpirationOnTheServiceClock() {
+        ManualClock at = new ManualClock(Instant.parse("2000-01-01T00:00:00Z"));
+        DynamoDbService svc = ttlClockService(at);
+        ObjectNode expiring = item("userId", "u1");
+        expiring.set("expiresAt", attributeValue("N", Long.toString(at.instant().minusSeconds(1).getEpochSecond())));
+        svc.putItem("Users", expiring, null, null, null, "us-east-1", null);
+        List<DynamoDbService.ExpiredTableScan> scanned = svc.scanExpiredItems();
+        assertEquals(1, scanned.size());
+
+        ObjectNode renewed = item("userId", "u1");
+        renewed.set("expiresAt", attributeValue("N", Long.toString(at.instant().plusSeconds(60).getEpochSecond())));
+        svc.putItem("Users", renewed, null, null, null, "us-east-1", null);
+        svc.deleteScannedItems(scanned);
+        assertEquals(renewed, svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+        at.advance(Duration.ofSeconds(61));
+        svc.deleteExpiredItems();
+        assertNull(svc.getItem("Users", item("userId", "u1"), "us-east-1"));
+    }
+
+    private DynamoDbService ttlClockService(ManualClock at) {
+        DynamoDbService svc = new DynamoDbService(new InMemoryStorage<>(), new InMemoryStorage<>(), null,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), null, null, mock(S3Service.class), mapper, 0, 0, 0, at);
+        svc.createTable("Users", List.of(new KeySchemaElement("userId", "HASH")),
+                List.of(new AttributeDefinition("userId", "S")), 5L, 5L, "us-east-1");
+        svc.updateTimeToLive("Users", "expiresAt", true, "us-east-1");
+        return svc;
+    }
+
+    @Test
     void pointInTimeStateUndoesATtlDeletionAfterTheRestoreTime() {
         String region = "us-east-1";
         DynamoDbService pitr = pointInTimeService(new InMemoryStorage<>(), new InMemoryStorage<>(),
