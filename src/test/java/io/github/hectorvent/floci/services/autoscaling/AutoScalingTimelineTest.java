@@ -116,9 +116,11 @@ class AutoScalingTimelineTest {
         LaunchLifecycleAction action = member.getLaunchLifecycleActions().get(HOOK);
         assertEquals("ABANDON", action.result());
         assertEquals("Heartbeat Timeout", action.reason());
-        ScalingActivity failed = service.describeScalingActivities(REGION, FLEET).getFirst();
-        assertEquals("Failed", failed.getStatusCode());
-        assertEquals(START.plus(HEARTBEAT_TIMEOUT), failed.getStartTime());
+        // Every activity of this pass starts at the same instant, so their listing order is not fixed.
+        List<ScalingActivity> failed = service.describeScalingActivities(REGION, FLEET).stream()
+                .filter(activity -> "Failed".equals(activity.getStatusCode())).toList();
+        assertEquals(1, failed.size());
+        assertEquals(START.plus(HEARTBEAT_TIMEOUT), failed.getFirst().getStartTime());
     }
 
     @Test
