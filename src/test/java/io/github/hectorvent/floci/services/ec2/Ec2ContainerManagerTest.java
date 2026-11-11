@@ -1775,6 +1775,20 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void anInstanceWhoseLaunchFailedCarriesItsTerminationTime() throws Exception {
+        LaunchHarness harness = launchHarness();
+        when(harness.builder.build()).thenThrow(new IllegalStateException("daemon went away"));
+        Instance instance = leasedInstance("i-failed-launch");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        // The retention of a terminated instance is counted from this stamp; without it the
+        // instance is never old enough to be pruned.
+        assertEquals(harness.time.clock().millis(), instance.getTerminatedAt());
+    }
+
+    @Test
     void launchReturnsTheLeaseWhenTheLaunchThrows() throws Exception {
         LaunchHarness harness = launchHarness();
         when(harness.builder.build()).thenThrow(new IllegalStateException("daemon went away"));

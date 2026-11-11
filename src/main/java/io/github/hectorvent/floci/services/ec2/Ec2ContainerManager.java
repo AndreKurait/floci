@@ -1213,6 +1213,10 @@ public class Ec2ContainerManager {
                         && instance.getDockerContainerId() == null
                         && instance.getSshHostPort() <= 0
                         && (instance.getContainerBridgeIp() == null || instance.getContainerBridgeIp().isBlank());
+                if (instance.getTerminatedAt() <= 0) {
+                    // Stamped before the state so nobody sees a terminated instance without it.
+                    instance.setTerminatedAt(clock.millis());
+                }
                 instance.setState(InstanceState.terminated());
                 if (alreadyCleaned) {
                     return;
