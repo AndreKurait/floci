@@ -2368,4 +2368,15 @@ class CloudWatchLogsServiceTest {
                 .subscriptionFilters().size());
     }
 
+    @Test
+    void lastEventTimestampStaysAtTheNewestEventWhenAnOlderOneArrivesLater() {
+        service.createLogGroup("/app/logs", null, null, REGION);
+        service.createLogStream("/app/logs", "stream-1", REGION);
+        service.putLogEvents("/app/logs", "stream-1", eventsAt(2000), REGION);
+        service.putLogEvents("/app/logs", "stream-1", eventsAt(1000), REGION);
+
+        LogStream stream = service.describeLogStreams("/app/logs", null, REGION).getFirst();
+        assertEquals(1000L, stream.getFirstEventTimestamp());
+        assertEquals(2000L, stream.getLastEventTimestamp());
+    }
 }
