@@ -156,6 +156,28 @@ class KinesisEventSourcePollerTest {
         verify(esmStore).saveForAccount(eq(ACCOUNT), eq(mapping));
     }
 
+    @Test
+    void atTimestampMappingStartsReadingAtItsStartingPositionTimestamp() throws Exception {
+        stubFunction();
+        stubStreamWith(List.of());
+        long startingAt = Instant.parse("2026-10-20T12:00:00Z").toEpochMilli();
+        when(kinesisService.getShardIteratorForAccount(eq(ACCOUNT), anyString(), eq(SHARD), eq("AT_TIMESTAMP"),
+                isNull(), eq(startingAt), eq(REGION))).thenReturn("iter-at-timestamp");
+        when(kinesisService.getRecordsForAccount(eq(ACCOUNT), eq("iter-at-timestamp"), anyInt(), eq(REGION)))
+                .thenReturn(Map.of("Records", List.of(record("s7", "pk", "{}"))));
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult());
+        EventSourceMapping mapping = esm();
+        mapping.setStartingPosition("AT_TIMESTAMP");
+        mapping.setStartingPositionTimestamp(startingAt);
+
+        pollOnce(mapping);
+
+        assertEquals("s7", mapping.getShardSequenceNumbers().get(SHARD));
+        verify(kinesisService, never()).getShardIteratorForAccount(eq(ACCOUNT), anyString(), eq(SHARD),
+                eq("TRIM_HORIZON"), any(), eq(REGION));
+    }
+
     private EventSourceMapping esm(String... patterns) {
         EventSourceMapping esm = new EventSourceMapping();
         esm.setUuid("k-esm");

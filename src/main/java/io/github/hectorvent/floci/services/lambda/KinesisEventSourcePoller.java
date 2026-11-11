@@ -224,7 +224,11 @@ public class KinesisEventSourcePoller implements Resettable {
         }
 
         String iterator;
-        if (lastSeq == null) {
+        if (lastSeq == null && "AT_TIMESTAMP".equals(esm.getStartingPosition())
+                && esm.getStartingPositionTimestamp() != null) {
+            iterator = kinesisService.getShardIteratorForAccount(esm.getAccountId(),
+                    streamName, shardId, "AT_TIMESTAMP", null, esm.getStartingPositionTimestamp(), esm.getRegion());
+        } else if (lastSeq == null) {
             iterator = kinesisService.getShardIteratorForAccount(esm.getAccountId(),
                     streamName, shardId, "TRIM_HORIZON", null, esm.getRegion());
         } else {
