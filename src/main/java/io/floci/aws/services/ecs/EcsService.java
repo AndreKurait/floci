@@ -533,10 +533,20 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     @Override
     public void clear() {
-        // The stores hold the ECS state and afterReset() restarts the reconciler. The reset also
-        // wipes CloudWatch, so the Container Insights samples it held must be written again.
+        // The stores hold the durable ECS state and afterReset() restarts the reconciler. The reset
+        // also wipes CloudWatch, so the Container Insights samples it held must be written again.
         launchFailures.clear();
         publishedInsights.clear();
+        // Kept in memory only, so the storage wipe does not reach them: left here, a cluster or
+        // service created again under its old name would list what the reset was to remove. The
+        // teardown before this has stopped the containers; the handles it kept for volume cleanup
+        // stay, and the reconciler finishes them without the task record.
+        tasks.clear();
+        containerInstances.clear();
+        taskSets.clear();
+        serviceDeployments.clear();
+        serviceRevisions.clear();
+        inProgressEmitted.clear();
     }
 
     /**
