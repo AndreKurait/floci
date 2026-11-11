@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.apigateway;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -15,6 +16,7 @@ import io.github.hectorvent.floci.services.apigateway.model.Stage;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.github.hectorvent.floci.testing.ManualClock;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
@@ -24,6 +26,8 @@ import org.junit.jupiter.api.Test;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -38,7 +42,8 @@ import static org.mockito.Mockito.when;
 
 /**
  * The stage response cache of the REST execute path. A backend call is a Lambda invocation here, so a
- * response served from the cache shows as an invocation that did not happen.
+ * response served from the cache shows as an invocation that did not happen. The controller runs on a
+ * clock that moves only when the test advances it, so a TTL boundary is an exact instant.
  */
 class ApiGatewayResponseCacheTest {
 
@@ -48,6 +53,7 @@ class ApiGatewayResponseCacheTest {
 
     private ApiGatewayService gateway;
     private LambdaService lambda;
+    private ManualClock clock;
     private ApiGatewayExecuteController controller;
     private HttpHeaders headers;
     private UriInfo uri;
@@ -70,10 +76,11 @@ class ApiGatewayResponseCacheTest {
         uri = mock(UriInfo.class);
         when(uri.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
         when(uri.getRequestUri()).thenReturn(URI.create("http://localhost/execute-api/api/prod/"));
+        clock = new ManualClock(Instant.parse("2026-03-04T05:06:07.890Z"));
         controller = new ApiGatewayExecuteController(gateway, null, null, lambda,
                 new RegionResolver(REGION, OWNER), new ObjectMapper(), null, null, null, null, null,
                 new ApiGatewayExecuteRouteContext(), null, new RequestContext(), null, null, null, direct,
-                mock(ServiceRoleCallAuthorizer.class), callers, null);
+                mock(ServiceRoleCallAuthorizer.class), callers, null, clock);
     }
 
     @Test
@@ -105,6 +112,54 @@ class ApiGatewayResponseCacheTest {
         assertEquals(200, get("other", "prod"));
 
         verifyBackendCalls(2);
+    }
+
+    @Test
+    void aCachedResponseIsStillServedOneMillisecondBeforeItsTtlEnds() {
+        api("api", "root", null, "prod");
+        assertEquals(200, get("api", "prod"));
+
+        clock.advance(Duration.ofSeconds(TTL_SECONDS).minusMillis(1));
+
+        assertEquals(200, get("api", "prod"));
+        verifyBackendCalls(1);
+    }
+
+    @Test
+    void aCachedResponseIsNoLongerServedOnceItsTtlHasElapsed() {
+        api("api", "root", null, "prod");
+        assertEquals(200, get("api", "prod"));
+
+        clock.advance(Duration.ofSeconds(TTL_SECONDS));
+
+        assertEquals(200, get("api", "prod"));
+        verifyBackendCalls(2);
+    }
+
+    @Test
+    void aResponseCachedAfterAnExpiryLivesForAFullTtlFromThatRequest() {
+        api("api", "root", null, "prod");
+        assertEquals(200, get("api", "prod"));
+        clock.advance(Duration.ofSeconds(TTL_SECONDS));
+        assertEquals(200, get("api", "prod"));
+
+        clock.advance(Duration.ofSeconds(TTL_SECONDS).minusMillis(1));
+        assertEquals(200, get("api", "prod"));
+        verifyBackendCalls(2);
+
+        clock.advance(Duration.ofMillis(1));
+        assertEquals(200, get("api", "prod"));
+        verifyBackendCalls(3);
+    }
+
+    @Test
+    void anHttpApiProxyEventCarriesOneReadingOfTheControllerClock() throws Exception {
+        String event = controller.buildV2ProxyEvent("GET", "/orders", "GET /orders", "api", REGION, "prod",
+                headers, uri, new byte[0], "request-1");
+
+        JsonNode context = new ObjectMapper().readTree(event).path("requestContext");
+        assertEquals(clock.instant().toEpochMilli(), context.path("timeEpoch").asLong());
+        assertEquals("04/Mar/2026:05:06:07 +0000", context.path("time").asText());
     }
 
     /** A REST API whose GET / proxies to a function, deployed to cache-enabled stages. */
