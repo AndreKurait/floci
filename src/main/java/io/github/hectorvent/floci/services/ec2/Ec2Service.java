@@ -8770,6 +8770,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             requireNoProviderDependency(provider -> provider.hasSubnetDependency(region, subnetId),
                     "The subnet '" + subnetId + "' has dependencies and cannot be deleted.");
             subnets.delete(key(region, subnetId));
+            removeTags(region, subnetId);
         }
         if (vpcNetworkManager != null) {
             vpcNetworkManager.forgetSubnet(region, subnetId);
@@ -12783,6 +12784,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new AwsException("InvalidInternetGatewayID.NotFound", "The internet gateway '" + igwId + "' does not exist", 400);
         }
         internetGateways.delete(key(region, igwId));
+        removeTags(region, igwId);
     }
 
     public void attachInternetGateway(String region, String igwId, String vpcId) {
@@ -13936,6 +13938,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         "The route table '" + routeTableId + "' does not exist", 400);
             }
             routeTables.delete(key(region, routeTableId));
+            removeTags(region, routeTableId);
         }
         notifyRouteTableUpdated(region, rt);
     }
@@ -16013,6 +16016,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 disassociateAddress(region, address.getAssociationId());
             }
             addresses.delete(key(region, allocationId));
+            removeTags(region, allocationId);
         }
     }
 
