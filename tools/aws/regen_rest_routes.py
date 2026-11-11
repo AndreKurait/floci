@@ -58,9 +58,12 @@ MODELS: dict[str, str] = {
     "dsql": "dsql",
     "eks": "eks",
     "es": "es",
+    "inspector2": "inspector2",
+    "lakeformation": "lakeformation",
     "lambda": "lambda",
     "lambda-core": "lambda",
     "lambda-microvms": "lambda",
+    "macie2": "macie2",
     "opensearch": "es",
     # The data plane is signed for the service, which is one scope for both of its planes.
     "payment-cryptography-data": "payment-cryptography",
@@ -70,6 +73,7 @@ MODELS: dict[str, str] = {
     "s3control": "s3",
     "scheduler": "scheduler",
     "signer": "signer",
+    "xray": "xray",
 }
 
 # The models whose routes are rewritten onto an internal prefix, and the prefix they are rewritten
@@ -84,8 +88,10 @@ INTERNAL_ROUTES: dict[str, tuple[str, bool]] = {
     # filter owns, so its routes are vendored as the rewritten path: the action and the request's
     # resource labels both resolve from it.
     "signer": ("/_signer", False),
+    # X-Ray's routes collide with S3's path-style ones too, for the same reason and with the same
+    # fix: the vendored route is the path its filter rewrites the request onto.
+    "xray": ("/_xray", False),
 }
-
 
 # Operations a model does not serve itself, so their path is not rewritten onto its internal prefix.
 # The shared tags controller serves /tags/{resourceArn} for every service that is a TagHandler, and
@@ -157,6 +163,7 @@ def build(models: dict[str, dict], provenance: str) -> dict:
                 raise SystemExit(f"error: REST models of {scope} have conflicting access-denied HTTP statuses")
             denial_statuses[scope] = status
             routes[name]["accessDeniedStatus"] = status
+    routes = dict(sorted(routes.items()))
     shared = shared_routes(routes)
     if shared:
         raise SystemExit("error: one route names more than one operation in a scope the rules do not route alone: "
