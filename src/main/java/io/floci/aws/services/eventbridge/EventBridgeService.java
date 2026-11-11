@@ -50,6 +50,7 @@ import org.jboss.logging.Logger;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -87,6 +88,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     private final ResourceGroupsTaggingService resourceGroupsTaggingService;
     private final ReplayDispatcher replayDispatcher;
     private final AppSyncTargetValidator appSyncTargetValidator;
+    private final Clock clock;
 
     @Inject
     public EventBridgeService(StorageFactory storageFactory,
@@ -135,6 +137,29 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                        ReplayDispatcher replayDispatcher,
                        ResourceGroupsTaggingService resourceGroupsTaggingService,
                        AppSyncTargetValidator appSyncTargetValidator) {
+        this(busStore, ruleStore, targetStore, archiveStore, archivedEventStore, replayStore, connectionStore,
+                apiDestinationStore, regionResolver, objectMapper, ruleScheduler, dispatcher, replayDispatcher,
+                resourceGroupsTaggingService, appSyncTargetValidator, Clock.systemUTC());
+    }
+
+    /** As above, with the clock that dates buses, rules, archives, archived events and replays. */
+    EventBridgeService(StorageBackend<String, EventBus> busStore,
+                       StorageBackend<String, Rule> ruleStore,
+                       StorageBackend<String, List<Target>> targetStore,
+                       StorageBackend<String, Archive> archiveStore,
+                       StorageBackend<String, List<ArchivedEvent>> archivedEventStore,
+                       StorageBackend<String, Replay> replayStore,
+                       StorageBackend<String, Connection> connectionStore,
+                       StorageBackend<String, ApiDestination> apiDestinationStore,
+                       RegionResolver regionResolver,
+                       ObjectMapper objectMapper,
+                       RuleScheduler ruleScheduler,
+                       TargetDispatcher dispatcher,
+                       ReplayDispatcher replayDispatcher,
+                       ResourceGroupsTaggingService resourceGroupsTaggingService,
+                       AppSyncTargetValidator appSyncTargetValidator,
+                       Clock clock) {
+        this.clock = clock;
         this.busStore = busStore;
         this.ruleStore = ruleStore;
         this.targetStore = targetStore;
@@ -172,7 +197,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                     "default",
                     regionResolver.buildArn("events", region, "event-bus/default"),
                     null,
-                    Instant.now()
+                    clock.instant()
             );
             busStore.put(key, bus);
             return bus;
@@ -203,7 +228,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                 name,
                 regionResolver.buildArn("events", region, "event-bus/" + name),
                 description,
-                Instant.now()
+                clock.instant()
         );
         if (kmsKeyIdentifier != null && !kmsKeyIdentifier.isBlank()) {
             bus.setKmsKeyIdentifier(kmsKeyIdentifier);
@@ -380,7 +405,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             rule.getTags().putAll(tags);
         }
         if (rule.getCreatedAt() == null) {
-            rule.setCreatedAt(Instant.now());
+            rule.setCreatedAt(clock.instant());
         }
         ruleStore.put(key, rule);
 
@@ -1490,7 +1515,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             node.put("source", source);
             node.put("detail-type", detailType);
             node.put("account", envelopeAccount);
-            node.put("time", Instant.now().toString());
+            node.put("time", clock.instant().toString());
             node.put("region", envelopeRegion);
             node.putArray("resources").addAll(resources);
             node.set("detail", objectMapper.readTree(detail));
@@ -1632,7 +1657,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         archive.setEventPattern(eventPattern);
         archive.setRetentionDays(retentionDays);
         archive.setState(ArchiveState.ENABLED);
-        archive.setCreationTime(Instant.now());
+        archive.setCreationTime(clock.instant());
         archiveStore.put(key, archive);
         LOG.infov("Created archive: {0} for source {1}", archiveName, eventSourceArn);
         return archive;
@@ -1772,7 +1797,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                     "Connection " + name + " already exists.", 400);
         }
         String connectionId = UUID.randomUUID().toString();
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Connection connection = new Connection();
         connection.setName(name);
         connection.setConnectionArn(regionResolver.buildArn("events", region,
@@ -1848,7 +1873,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         if (kmsKeyIdentifier != null) {
             connection.setKmsKeyIdentifier(kmsKeyIdentifier);
         }
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         connection.setConnectionState(ConnectionState.AUTHORIZED);
         connection.setLastModifiedTime(now);
         connection.setLastAuthorizedTime(now);
@@ -1944,7 +1969,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         }
 
         String destinationId = UUID.randomUUID().toString();
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         ApiDestination destination = new ApiDestination();
         destination.setName(name);
         destination.setArn(regionResolver.buildArn("events", region,
@@ -2007,7 +2032,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         if (invocationRateLimitPerSecond != null) {
             destination.setInvocationRateLimitPerSecond(invocationRateLimitPerSecond);
         }
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         destination.setLastModifiedTime(now);
         apiDestinationStore.put(key, destination);
         LOG.infov("Updated API Destination: {0}", name);
@@ -2027,7 +2052,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         destination.setInvocationEndpoint(invocationEndpoint);
         destination.setHttpMethod(httpMethod);
         destination.setInvocationRateLimitPerSecond(invocationRateLimitPerSecond);
-        destination.setLastModifiedTime(Instant.now());
+        destination.setLastModifiedTime(clock.instant());
         apiDestinationStore.put(key, destination);
         LOG.infov("Restored API Destination: {0}", name);
         return destination;
@@ -2182,7 +2207,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                         accountGet(archivedEventStore, accountId, evKey).orElse(new ArrayList<>()));
                 ArchivedEvent ae = new ArchivedEvent(
                         eventId,
-                        Instant.now(),
+                        clock.instant(),
                         (String) entry.get("Source"),
                         (String) entry.get("DetailType"),
                         (String) entry.get("Detail"),
@@ -2231,7 +2256,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         replay.setEventStartTime(eventStartTime);
         replay.setEventEndTime(eventEndTime);
         replay.setState(ReplayState.STARTING);
-        replay.setReplayStartTime(Instant.now());
+        replay.setReplayStartTime(clock.instant());
         replay.setAccountId(capturedAccountId);
         replayStore.put(key, replay);
 
@@ -2307,7 +2332,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             r.setState(state);
             if (state == ReplayState.COMPLETED || state == ReplayState.CANCELLED
                     || state == ReplayState.FAILED) {
-                r.setReplayEndTime(Instant.now());
+                r.setReplayEndTime(clock.instant());
             }
             accountPut(replayStore, accountId, key, r);
             LOG.debugv("Replay {0} transitioned to {1}", replayName, state);
@@ -2421,15 +2446,15 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                 new SupportedResourceType("events:rule", "events", true));
     }
 
-    private static void addExplorerResource(List<ExplorerResource> out, String arn, String resourceType,
-                                            Instant createdAt, Map<String, String> tags) {
+    private void addExplorerResource(List<ExplorerResource> out, String arn, String resourceType,
+                                     Instant createdAt, Map<String, String> tags) {
         if (arn == null) {
             return;
         }
         AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
         out.add(new ExplorerResource(arn, resourceType, "events",
                 parsed.region(), parsed.accountId(),
-                createdAt != null ? createdAt : Instant.now(),
+                createdAt != null ? createdAt : clock.instant(),
                 tags != null ? tags : Map.of()));
     }
 }
