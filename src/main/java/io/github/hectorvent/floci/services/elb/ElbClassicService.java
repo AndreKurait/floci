@@ -1085,6 +1085,10 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             throw new AwsException("ValidationError",
                     "InstancePort must be between 1 and 65535.", 400);
         }
+        if (listener.getLoadBalancerPort() < 1 || listener.getLoadBalancerPort() > 65535) {
+            throw new AwsException("ValidationError",
+                    "LoadBalancerPort must be between 1 and 65535.", 400);
+        }
     }
 
     /**
