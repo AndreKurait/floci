@@ -695,6 +695,14 @@ public class Ec2IpamService {
                         "CIDR " + cidr + " is not within the provisioned CIDRs of source pool "
                                 + pool.getSourceIpamPoolId() + ".", 400);
             }
+            // Space the source already gave away, to an allocation or to any pool drawing on it,
+            // cannot be given a second time.
+            boolean taken = occupiedSpace(source).stream().anyMatch(occupied -> Ipv4Cidrs.overlaps(occupied, cidr));
+            if (taken) {
+                throw new AwsException("InvalidParameterValue",
+                        "CIDR " + cidr + " overlaps space already in use in source pool "
+                                + pool.getSourceIpamPoolId() + ".", 400);
+            }
         } else {
             Ipv4Cidrs.contains(cidr, cidr); // validate syntax for top-level pools
         }
