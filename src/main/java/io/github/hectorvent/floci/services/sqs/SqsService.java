@@ -813,7 +813,7 @@ public class SqsService implements Resettable, ResourceProvider {
             resources.add(new ExplorerResource(
                     arn, "sqs:queue", "sqs",
                     region, account,
-                    queue.getCreatedTimestamp() != null ? queue.getCreatedTimestamp() : Instant.now(),
+                    queue.getCreatedTimestamp() != null ? queue.getCreatedTimestamp() : timing.clock().instant(),
                     queue.getTags() != null ? queue.getTags() : Map.of()));
         }
         return resources;
@@ -888,6 +888,9 @@ public class SqsService implements Resettable, ResourceProvider {
                 }
 
                 Queue queue = new Queue(queueName, queueUrl);
+                Instant createdAt = timing.clock().instant();
+                queue.setCreatedTimestamp(createdAt);
+                queue.setLastModifiedTimestamp(createdAt);
                 queue.setAccountId(regionResolver.getAccountId());
                 if (attributes != null) {
                     queue.getAttributes().putAll(attributes);
@@ -1900,7 +1903,7 @@ public class SqsService implements Resettable, ResourceProvider {
                     }
                 }
             }
-            queue.setLastModifiedTimestamp(Instant.now());
+            queue.setLastModifiedTimestamp(timing.clock().instant());
             queueStore.put(storageKey, queue);
             getOrCreateQueue(storageKey).activity().accessed();
             LOG.infov("Updated attributes for queue: {0}", queueUrl);
@@ -2285,7 +2288,7 @@ public class SqsService implements Resettable, ResourceProvider {
             statements.add(statement);
 
             queue.getAttributes().put("Policy", policy.toString());
-            queue.setLastModifiedTimestamp(Instant.now());
+            queue.setLastModifiedTimestamp(timing.clock().instant());
             queueStore.put(storageKey, queue);
             LOG.infov("Added permission {0} to queue {1}", label, queueUrl);
         }
@@ -2324,7 +2327,7 @@ public class SqsService implements Resettable, ResourceProvider {
             } else {
                 queue.getAttributes().put("Policy", policy.toString());
             }
-            queue.setLastModifiedTimestamp(Instant.now());
+            queue.setLastModifiedTimestamp(timing.clock().instant());
             queueStore.put(storageKey, queue);
             LOG.infov("Removed permission {0} from queue {1}", label, queueUrl);
         }

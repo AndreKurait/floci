@@ -36,7 +36,7 @@ class GuardedMessageQueue {
     private final Object persistenceLock;
     private final BooleanSupplier currentGeneration;
     private final boolean detachedSnapshots;
-    private final SqsQueueActivity activity = new SqsQueueActivity();
+    private final SqsQueueActivity activity;
     /** Reads the time a visibility deadline is set from and checked against. */
     private final Clock clock;
     private volatile boolean closed;
@@ -75,6 +75,7 @@ class GuardedMessageQueue {
                         String receiptHandleSecret, Object persistenceLock, BooleanSupplier currentGeneration,
                         Clock clock) {
         this.clock = clock;
+        this.activity = new SqsQueueActivity(clock);
         this.persistenceLock = persistenceLock;
         this.currentGeneration = currentGeneration;
         this.detachedSnapshots = messageStore != null
