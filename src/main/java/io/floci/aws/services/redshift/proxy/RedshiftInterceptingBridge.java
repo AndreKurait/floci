@@ -540,6 +540,9 @@ public class RedshiftInterceptingBridge {
 
     private void runExtendedSpectrumWithBackendOwned(SpectrumInterceptor.Plan plan, String portalName, int maxRows,
             BackendResponseCoordinator.Ticket ticket) throws IOException {
+        if (!coordinator.canOwnExtendedExecute(ticket)) {
+            write(backend.getOutputStream(), backendFrame('H', EMPTY_BODY));
+        }
         BackendResponseCoordinator.GateResult gate;
         try {
             gate = coordinator.awaitExtendedExecuteTurn(ticket);
