@@ -7,6 +7,7 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.floci.ui.UiPages;
+import io.floci.aws.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.s3.model.MultipartUpload;
 import io.floci.aws.services.s3.model.Part;
@@ -95,6 +96,9 @@ class S3ControllerClockTest {
         when(s3Service.uploadPartCopy(anyString(), anyString(), anyString(), anyInt(), anyString(), anyString(),
                 any(), any(), any(), any(), any())).thenReturn(new Part(1, "\"etag\"", 5L));
         when(s3Service.listParts(bucket, key, "upload-1")).thenReturn(new MultipartUpload(bucket, key, null));
+        // What the service answers for an unsigned request: the bucket policy says nothing about it.
+        when(s3Service.signedPrincipalResourcePolicyDecision(any(), any(), any(), any())).thenReturn(
+                new S3Service.SignedPrincipalResourcePolicyEvaluation(ResourcePolicyDecision.NEUTRAL, null));
 
         CurrentVertxRequest currentVertxRequest = mock(CurrentVertxRequest.class, RETURNS_DEEP_STUBS);
         when(currentVertxRequest.getCurrent().request().path()).thenReturn("/" + bucket + "/" + key);
