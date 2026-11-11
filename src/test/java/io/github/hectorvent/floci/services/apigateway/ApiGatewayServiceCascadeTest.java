@@ -82,6 +82,18 @@ class ApiGatewayServiceCascadeTest {
                 service.getIntegrationResponse(REGION, apiId, rootId, "GET", "200").contentHandling());
     }
 
+    @Test
+    void deletingARestApiDeletesItsAuthorizers() {
+        String authorizerId = service.createAuthorizer(REGION, apiId, Map.of(
+                "name", "tokens", "type", "TOKEN", "identitySource", "method.request.header.Authorization",
+                "authorizerUri", "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                        + "arn:aws:lambda:us-east-1:000000000000:function:auth/invocations")).getId();
+
+        service.deleteRestApi(REGION, apiId);
+
+        assertNotFound(() -> service.getAuthorizer(REGION, apiId, authorizerId));
+    }
+
     private static void assertNotFound(Runnable call) {
         AwsException thrown = assertThrows(AwsException.class, call::run);
         assertEquals("NotFoundException", thrown.getErrorCode());

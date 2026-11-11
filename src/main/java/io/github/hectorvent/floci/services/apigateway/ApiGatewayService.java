@@ -483,6 +483,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         stageStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(stageStore::delete);
         modelStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(modelStore::delete);
         requestValidatorStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(requestValidatorStore::delete);
+        authorizerStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(authorizerStore::delete);
         gatewayResponseStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(gatewayResponseStore::delete);
         LOG.infov("Deleted REST API: {0} in {1}", apiId, region);
     }
