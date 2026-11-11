@@ -1421,7 +1421,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * reservations, so re-planning first would read a dead run's own bridges as collisions and
      * quietly substitute a CIDR for every VPC that used to work.
      */
-    private void restoreVpcNetworks() {
+    public void restoreVpcNetworks() {
         if (vpcNetworkManager == null || !vpcNetworkManager.enabled()) {
             return;
         }

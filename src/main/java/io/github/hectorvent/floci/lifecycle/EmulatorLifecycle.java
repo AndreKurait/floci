@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbRuntime;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.ecs.container.EcsTaskRoleCredentialsServer;
@@ -110,6 +111,7 @@ public class EmulatorLifecycle {
     private final DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
     private final PipesService pipesService;
     private final Ec2MetadataServer ec2MetadataServer;
+    private final Ec2Service ec2Service;
     private final EcsTaskRoleCredentialsServer ecsTaskRoleCredentialsServer;
     private final EcrRegistryManager ecrRegistryManager;
     private final FlociUiManager flociUiManager;
@@ -155,6 +157,7 @@ public class EmulatorLifecycle {
                              DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
                              PipesService pipesService,
                              Ec2MetadataServer ec2MetadataServer,
+                             Ec2Service ec2Service,
                              EcsTaskRoleCredentialsServer ecsTaskRoleCredentialsServer,
                              EcrRegistryManager ecrRegistryManager,
                              FlociUiManager flociUiManager,
@@ -197,6 +200,7 @@ public class EmulatorLifecycle {
         this.dynamodbStreamsPoller = dynamodbStreamsPoller;
         this.pipesService = pipesService;
         this.ec2MetadataServer = ec2MetadataServer;
+        this.ec2Service = ec2Service;
         this.ecsTaskRoleCredentialsServer = ecsTaskRoleCredentialsServer;
         this.ecrRegistryManager = ecrRegistryManager;
         this.flociUiManager = flociUiManager;
@@ -238,6 +242,10 @@ public class EmulatorLifecycle {
 
         serviceRegistry.logEnabledServices();
         storageFactory.loadAll();
+        if (config.services().ec2().enabled() && !config.services().ec2().mock()) {
+            // ALB and ECS runtime restoration needs the persisted VPC and subnet address plans.
+            ec2Service.restoreVpcNetworks();
+        }
         int sweptSessions = iamService.sweepOrphanedLambdaExecutionRoleSessions();
         if (sweptSessions > 0) {
             LOG.infov("Removed {0} orphaned Lambda execution-role session(s)", sweptSessions);
