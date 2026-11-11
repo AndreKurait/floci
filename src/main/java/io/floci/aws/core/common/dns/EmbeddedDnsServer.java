@@ -122,6 +122,18 @@ public class EmbeddedDnsServer {
         return address.isPresent() ? address.get() : InetAddress.getLocalHost().getHostAddress();
     }
 
+    static String ownAddress(EmulatorConfig config, CurrentContainerNetworkResolver currentContainer)
+            throws UnknownHostException {
+        Optional<String> address = currentContainer.resolveContainerIp();
+        if (address.isPresent()) {
+            return address.get();
+        }
+        if (config.services().dockerNetwork().isPresent()) {
+            throw new IllegalStateException("Cannot resolve the configured services Docker network for DNS");
+        }
+        return InetAddress.getLocalHost().getHostAddress();
+    }
+
     /**
      * The certificate generator cannot read application.yml, so DNS spoofing without AWS SANs on
      * the certificate only happens when the flag and TLS are on but the flag is not visible to it.
@@ -165,7 +177,7 @@ public class EmbeddedDnsServer {
             return;
         }
         try {
-            String myIp = ownAddress(currentContainer);
+            String myIp = ownAddress(config, currentContainer);
             upstreamDnsServers = composeUpstreams(readResolvConfNameservers(),
                     config.dns().containerFallbackServers());
 
