@@ -6079,13 +6079,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // would silently fall back to the default account.
         String owner = callerAccountId();
         boolean reconcileCapacity = false;
+        // Every id is checked before any instance is touched: a request naming one instance that
+        // cannot be terminated terminates none of them.
+        for (String id : instanceIds) {
+            getRequiredInstance(region, id);
+            if (isExternalInstance(region, id)) {
+                throw new AwsException("OperationNotPermitted",
+                        "The instance '" + id + "' is a cluster node and cannot be terminated through EC2", 400);
+            }
+        }
         try {
             for (String id : instanceIds) {
                 Instance inst = getRequiredInstance(region, id);
-                if (isExternalInstance(region, id)) {
-                    throw new AwsException("OperationNotPermitted",
-                            "The instance '" + id + "' is a cluster node and cannot be terminated through EC2", 400);
-                }
 
                 if (config.services().ec2().mock() && "pending".equals(inst.getState().getName())) {
                     inst.setState(InstanceState.running());
