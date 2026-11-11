@@ -2307,4 +2307,22 @@ class CloudWatchLogsServiceTest {
         time.advance(Duration.ofMinutes(1));
         assertEquals(start + 180_000, timed.putResourcePolicy("policy", "{}", REGION).getLastUpdatedTime());
     }
+
+
+    @Test
+    void describeSubscriptionFiltersRejectsATokenOutsideTheList() {
+        service.createLogGroup("/app/logs", null, null, REGION);
+        service.putSubscriptionFilter("/app/logs", "my-filter", "ERROR",
+                "arn:aws:lambda:us-east-1:000000000000:function:test", null, REGION);
+
+        for (String token : List.of("5", "-1", "not-a-token")) {
+            AwsException rejected = assertThrows(AwsException.class,
+                    () -> service.describeSubscriptionFilters("/app/logs", null, token, 50, REGION), token);
+            assertEquals("InvalidParameterException", rejected.getErrorCode(), token);
+            assertEquals("The specified nextToken is invalid.", rejected.getMessage(), token);
+        }
+        assertEquals(0, service.describeSubscriptionFilters("/app/logs", null, "1", 50, REGION)
+                .subscriptionFilters().size());
+    }
+
 }
