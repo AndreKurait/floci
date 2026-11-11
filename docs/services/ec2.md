@@ -298,6 +298,25 @@ and volume helpers retain their own privileges. Security-group enforcement
 always disables guest privileged mode and drops `NET_ADMIN` and `NET_RAW`;
 configuration can add restrictions but cannot remove those mandatory ones.
 
+An unprivileged guest gets Docker's default capability set. An image whose own
+startup grants a file capability outside that set (for example
+`setcap cap_syslog+ep` on an agent binary, which a root user on an EC2 instance
+can do) cannot exec that file as another user. Add the capabilities such an
+image needs:
+
+```yaml
+floci:
+  services:
+    ec2:
+      privileged: false
+      cap-add: [SYSLOG]
+```
+
+The equivalent environment variable is `FLOCI_SERVICES_EC2_CAP_ADD=SYSLOG`, with
+the same name rules. A capability listed in both `cap-add` and `cap-drop`
+refuses launch. Security-group enforcement still removes `NET_ADMIN` and
+`NET_RAW` from the added set.
+
 Choose settings the guest image can run with. Disabling privileged mode does
 not grant the permissions needed by systemd or physical block-device mounts.
 Floci does not escalate privileges to make those operations succeed.
@@ -2054,6 +2073,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 |---|---|---|
 | `FLOCI_SERVICES_EC2_PRIVILEGED` | `true` | Docker privileged mode for guest containers; security-group enforcement always disables it |
 | `FLOCI_SERVICES_EC2_CAP_DROP` | unset | Comma-separated Linux capabilities to drop from unprivileged guest containers, in addition to mandatory security-group restrictions |
+| `FLOCI_SERVICES_EC2_CAP_ADD` | unset | Comma-separated Linux capabilities to add to unprivileged guest containers; security-group enforcement still removes `NET_ADMIN` and `NET_RAW`; overlap with `CAP_DROP` refuses launch |
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Host port for the IMDS server |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | Start of SSH host port range |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | End of SSH host port range |

@@ -772,6 +772,7 @@ floci:
       ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       privileged: true
       cap-drop: ${FLOCI_SERVICES_EC2_CAP_DROP:}
+      cap-add: ${FLOCI_SERVICES_EC2_CAP_ADD:}
       # read-only-binds:               # Paths belong to the Docker daemon host.
       #   - source: /srv/guest-inputs/ca.pem
       #     target: /etc/guest-ca.pem
