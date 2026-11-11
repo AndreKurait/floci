@@ -269,6 +269,27 @@ class ScalingPolicyAlarmActionHandlerTest {
         assertEquals(time.now().getEpochSecond(), policy.getLastScaleInTime());
     }
 
+    /** A cooldown is elapsed time, so the fraction of a second it started in counts. */
+    @Test
+    void aScaleInThatStartedLateInASecondStillWaitsOutTheWholeCooldown() {
+        time.advance(Duration.ofMillis(999));
+        ScalingPolicy policy = targetTrackingPolicy(50.0, null);
+        policy.getTargetTrackingConfiguration().setScaleInCooldown(300);
+        stub(policy, target(1, 10), 8);
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
+        verify(adjuster).setCapacity(RESOURCE_ID, 4, REGION);
+        assertEquals(time.now().toEpochMilli() / 1000.0, policy.getLastScaleInTime());
+        when(adjuster.getCurrentCapacity(RESOURCE_ID, REGION)).thenReturn(4);
+
+        time.advance(Duration.ofSeconds(300).minusMillis(1));
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
+        verify(adjuster, times(1)).setCapacity(anyString(), anyInt(), anyString());
+
+        time.advance(Duration.ofMillis(1));
+        handler.handle(POLICY_ARN, alarm("LessThanThreshold", 50.0), 20.0, REGION);
+        verify(adjuster).setCapacity(RESOURCE_ID, 2, REGION);
+    }
+
     @Test
     void aPolicyNamingNoCooldownWaitsTheDefaultOneBetweenScaleIns() {
         ScalingPolicy policy = targetTrackingPolicy(50.0, null);
