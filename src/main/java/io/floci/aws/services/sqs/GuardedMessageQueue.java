@@ -80,6 +80,9 @@ class GuardedMessageQueue {
                                      boolean fifo, int maxReceiveCount,
                                      String deadLetterTargetArn) {
         try (Guard _ = hold()) {
+            if (closed) {
+                return new ClaimResult(List.of(), List.of());
+            }
             List<Message> claimed = new ArrayList<>();
             List<Message> dlqCandidates = new ArrayList<>();
 
@@ -373,7 +376,9 @@ class GuardedMessageQueue {
     }
 
     void close() {
-        closed = true;
+        try (Guard _ = hold()) {
+            closed = true;
+        }
     }
 
     private void commit(MessageList candidate) {

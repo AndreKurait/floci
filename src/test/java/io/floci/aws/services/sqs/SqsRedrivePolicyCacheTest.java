@@ -53,6 +53,7 @@ class SqsRedrivePolicyCacheTest {
                 if (recreate) {
                     service.deleteQueue(source.getQueueUrl(), REGION);
                     service.createQueue("source", Map.of("RedrivePolicy", policy(newDlq)), REGION);
+                    service.sendMessage(source.getQueueUrl(), "replacement", 0, REGION);
                 } else {
                     service.setQueueAttributes(source.getQueueUrl(),
                             Map.of("RedrivePolicy", policy(newDlq)), REGION);
@@ -63,11 +64,15 @@ class SqsRedrivePolicyCacheTest {
             assertTrue(receive.get(10, TimeUnit.SECONDS).isEmpty());
         }
 
-        service.sendMessage(source.getQueueUrl(), "payload", 0, REGION);
-        assertEquals(1, receive(source).size());
+        if (!recreate) {
+            service.sendMessage(source.getQueueUrl(), "payload", 0, REGION);
+        }
+        Message delivered = receive(source).getFirst();
+        assertEquals(recreate ? "replacement" : "payload", delivered.getBody());
+        assertEquals(1, delivered.getReceiveCount(), "old receive must not consume replacement delivery budget");
         assertTrue(receive(source).isEmpty());
         assertTrue(receive(oldDlq).isEmpty(), "later receives must not use the stale cached target");
-        assertEquals("payload", receive(newDlq).getFirst().getBody());
+        assertEquals(delivered.getBody(), receive(newDlq).getFirst().getBody());
     }
 
     @Test
