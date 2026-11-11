@@ -148,6 +148,7 @@ public class KinesisService implements ResourceProvider {
 
         String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
         KinesisStream stream = new KinesisStream(streamName, arn);
+        stream.setStreamCreationTimestamp(clock.instant());
         stream.setAccountId(regionResolver.getAccountId());
         stream.setStreamMode(resolvedMode);
         if (maxRecordSizeInKiB != null) {
@@ -221,8 +222,9 @@ public class KinesisService implements ResourceProvider {
     }
 
     public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName, String region) {
-        String consumerArn = streamArn + "/consumer/" + consumerName + ":" + System.currentTimeMillis();
+        String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
         KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
+        consumer.setConsumerCreationTimestamp(clock.instant());
         consumerStore.put(region + "::" + consumerArn, consumer);
         LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);
         return consumer;
@@ -584,7 +586,7 @@ public class KinesisService implements ResourceProvider {
 
     /** Enforces the "no more than ten UpdateShardCount calls per rolling 24 hours" default limit. */
     private void recordShardCountUpdate(KinesisStream stream, String storageKey) {
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Instant windowStart = now.minus(SHARD_COUNT_UPDATE_WINDOW);
         List<Instant> recent = new ArrayList<>(stream.getShardCountUpdateTimestamps().stream()
                 .filter(t -> t.isAfter(windowStart))
@@ -1402,7 +1404,7 @@ public class KinesisService implements ResourceProvider {
                     arn, "kinesis:stream", "kinesis",
                     parsed.region(), parsed.accountId(),
                     stream.getStreamCreationTimestamp() != null
-                            ? stream.getStreamCreationTimestamp() : Instant.now(),
+                            ? stream.getStreamCreationTimestamp() : clock.instant(),
                     stream.getTags() != null ? stream.getTags() : Map.of()));
         }
         return resources;
