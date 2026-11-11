@@ -7731,9 +7731,35 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * fourth group folds into the "::".
      */
     private VpcIpv6CidrBlockAssociation amazonProvidedIpv6Association(String region) {
-        String block = CidrCanonicalizer.canonicalize(
-                "2600:1f18:" + randomHex(4) + ":" + randomHex(2) + "00::/56").orElseThrow();
+        // AWS gives each VPC its own Amazon-provided block, so a block another VPC holds, in any account of this
+        // deployment, is drawn again.
+        Set<String> held = new HashSet<>();
+        for (Vpc vpc : vpcs instanceof AccountAwareStorageBackend<Vpc> aware
+                ? aware.scanAllAccounts() : vpcs.scan(k -> true)) {
+            if (vpc.getIpv6CidrBlockAssociationSet() == null) {
+                continue;
+            }
+            for (VpcIpv6CidrBlockAssociation association : vpc.getIpv6CidrBlockAssociationSet()) {
+                held.add(association.getIpv6CidrBlock());
+            }
+        }
+        String block = unusedAmazonProvidedIpv6Block(held, () -> CidrCanonicalizer.canonicalize(
+                "2600:1f18:" + randomHex(4) + ":" + randomHex(2) + "00::/56").orElseThrow());
         return new VpcIpv6CidrBlockAssociation("vpc-cidr-assoc-" + randomHex(8), block, region);
+    }
+
+    /**
+     * The first drawn block no VPC holds. After 64 draws that are all held, the request is refused with
+     * InsufficientCidrBlocks rather than handing out a block twice.
+     */
+    static String unusedAmazonProvidedIpv6Block(Set<String> held, Supplier<String> draw) {
+        for (int attempt = 0; attempt < 64; attempt++) {
+            String block = draw.get();
+            if (!held.contains(block)) {
+                return block;
+            }
+        }
+        throw new AwsException("InsufficientCidrBlocks", "No Amazon-provided IPv6 CIDR block is available.", 400);
     }
 
     private boolean vpcHasAssociatedIpv6CidrBlock(Vpc vpc) {
