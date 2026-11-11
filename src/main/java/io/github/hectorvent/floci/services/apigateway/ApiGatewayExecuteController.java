@@ -624,7 +624,8 @@ public class ApiGatewayExecuteController {
         Response vpcLinkError = validateVpcLink(scope, region, integration);
         if (vpcLinkError != null) return vpcLinkError;
 
-        String cacheKey = cacheKeyFor(stage, matched, httpMethod, path, integration, headers, uriInfo);
+        String cacheKey = cacheKeyFor(region, apiId, stageName, stage, matched, httpMethod, path, integration,
+                headers, uriInfo);
         if (cacheKey != null) {
             CachedResponse cached = responseCache.get(cacheKey);
             if (cached != null && cached.expiresAt() > System.currentTimeMillis()) {
@@ -884,14 +885,19 @@ public class ApiGatewayExecuteController {
      * can return the same cached data; mixing the method and request path back in would mean two
      * resources could never share an entry, which is the setting's whole purpose. The namespace
      * defaults to the resource id, so resources that did not opt into sharing stay separate.
+     *
+     * <p>A cache belongs to one stage of one API: the key starts with the region, API id and stage
+     * name, so a namespace is shared between the resources of a stage and never beyond it.
      */
-    private String cacheKeyFor(Stage stage, ApiGatewayResource resource, String httpMethod,
+    private String cacheKeyFor(String region, String apiId, String stageName, Stage stage,
+                               ApiGatewayResource resource, String httpMethod,
                                String path, Integration integration, HttpHeaders headers, UriInfo uriInfo) {
         if (stage == null || !stage.isCacheClusterEnabled()) return null;
         MethodSetting setting = methodSettingFor(stage, resource.getPath(), httpMethod);
         if (setting == null || !setting.isCachingEnabled()) return null;
 
         StringBuilder key = new StringBuilder();
+        key.append(region).append('|').append(apiId).append('|').append(stageName).append('|');
         key.append(integration.getCacheNamespace() != null
                 ? integration.getCacheNamespace() : resource.getId());
         for (String param : integration.getCacheKeyParameters()) {
