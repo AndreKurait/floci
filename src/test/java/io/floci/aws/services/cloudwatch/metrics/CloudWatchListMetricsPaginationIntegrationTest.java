@@ -11,6 +11,8 @@ import io.restassured.http.ContentType;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
 import java.util.HashSet;
@@ -91,6 +93,45 @@ class CloudWatchListMetricsPaginationIntegrationTest {
                 query(namespace, "Other", queryToken, ACCOUNT, REGION),
                 query(namespace, "Requests", "not-a-token", ACCOUNT, REGION)}) {
             invalid.then().statusCode(400).body("ErrorResponse.Error.Code", equalTo("InvalidParameterValue"));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {CURRENT_TARGET, CONSOLE_TARGET, "Query"})
+    void dimensionFiltersMatchByNameAndOptionalValue(String protocol) throws Exception {
+        String namespace = "DimensionFilters/" + UUID.randomUUID();
+        ObjectNode put = MAPPER.createObjectNode().put("Namespace", namespace);
+        ArrayNode data = put.putArray("MetricData");
+        for (String host : new String[]{"one", "two"}) {
+            data.addObject().put("MetricName", "Requests").put("Value", 1)
+                    .putArray("Dimensions").addObject().put("Name", "Host").put("Value", host);
+        }
+        data.addObject().put("MetricName", "Requests").put("Value", 1)
+                .putArray("Dimensions").addObject().put("Name", "Zone").put("Value", "one");
+        json(CURRENT_TARGET + "PutMetricData", put, ACCOUNT, REGION).then().statusCode(200);
+        for (String value : new String[]{null, "one", "absent"}) {
+            int expected = value == null ? 2 : "one".equals(value) ? 1 : 0;
+            if ("Query".equals(protocol)) {
+                RequestSpecification request = given().header("Authorization", authorization(ACCOUNT, REGION))
+                        .contentType("application/x-www-form-urlencoded")
+                        .formParam("Action", "ListMetrics").formParam("Namespace", namespace)
+                        .formParam("Dimensions.member.1.Name", "Host");
+                if (value != null) {
+                    request.formParam("Dimensions.member.1.Value", value);
+                }
+                Response response = request.post("/").then().statusCode(200).extract().response();
+                assertEquals(expected,
+                        response.xmlPath().getList("ListMetricsResponse.ListMetricsResult.Metrics.member").size());
+            } else {
+                ObjectNode request = MAPPER.createObjectNode().put("Namespace", namespace);
+                ObjectNode filter = request.putArray("Dimensions").addObject().put("Name", "Host");
+                if (value != null) {
+                    filter.put("Value", value);
+                }
+                JsonNode response = MAPPER.readTree(json(protocol + "ListMetrics", request, ACCOUNT, REGION)
+                        .then().statusCode(200).extract().asString());
+                assertEquals(expected, response.path("Metrics").size());
+            }
         }
     }
 
