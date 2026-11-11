@@ -143,6 +143,7 @@ public class ElbV2DataPlane {
     ObjectMapper objectMapper;
 
     private final Map<Integer, HttpServer> servers = new ConcurrentHashMap<>();
+    private final Map<Integer, HttpServer> sharedTlsServers = new ConcurrentHashMap<>();
     private final Map<Integer, NetServer> tcpServers = new ConcurrentHashMap<>();
     private final Map<Integer, PortState> portStates = new ConcurrentHashMap<>();
     private volatile boolean stopping;
@@ -264,6 +265,7 @@ public class ElbV2DataPlane {
                 cancelBindRetry(entry.getValue());
                 HttpServer server = servers.remove(entry.getKey());
                 if (server != null) {
+                    releaseSharedTlsServer(entry.getKey(), server);
                     server.close();
                 }
                 NetServer tcpServer = tcpServers.remove(entry.getKey());
@@ -467,11 +469,8 @@ public class ElbV2DataPlane {
      * {@code cfn-response} callback hardcodes {@code https://} and ignores the port in the
      * ResponseURL, so it always lands on 443.
      *
-     * <p>Without this the two raced: whichever started first won. A stack restored from
-     * persistence could hand 443 to an ALB listener, which then answered CDK's callback in plain
-     * HTTP and hung every {@code Custom::} resource - and the reverse on a fresh start. Yielding
-     * here makes the outcome deterministic and keeps the emulator's own control path working. To
-     * give 443 to load balancers instead, set {@code floci.tls.aws-https-port=0} or disable TLS.
+     * <p>HTTPS ALBs share the proxy's socket through SNI routing to a loopback listener.
+     * HTTP and TCP listeners must still yield, so they cannot replace the callback transport.
      */
     // Package-private for ElbV2ReservedPortTest.
     boolean isReservedByFloci(int port) {
@@ -541,7 +540,11 @@ public class ElbV2DataPlane {
         if (state != null) {
             onCurrentPort(port, state, () -> {
                 if (listenersByHostAndPort.containsKey(port)) {
-                    ensurePortServer(port);
+                    if (sharedTlsServers.containsKey(port)) {
+                        restartPortServer(port);
+                    } else {
+                        ensurePortServer(port);
+                    }
                 }
             });
         }
@@ -574,7 +577,10 @@ public class ElbV2DataPlane {
     }
 
     private void startPortServer(int port, PortState state) {
-        if (isReservedByFloci(port)) {
+        boolean reserved = isReservedByFloci(port);
+        boolean sharedTls = reserved && port != config.port() && portIsSecure(port)
+                && servedBindings(port).noneMatch(ListenerBinding::tcp);
+        if (reserved && !sharedTls) {
             // Returning null leaves `servers` untouched: computeIfAbsent skips a null mapping.
             // The emulator's own port cannot be handed over, so the two cases need different
             // advice: freeing floci.tls.aws-https-port is only meaningful for the TLS proxy.
@@ -591,8 +597,9 @@ public class ElbV2DataPlane {
         }
         boolean secure = portIsSecure(port);
         HttpServerOptions options = new HttpServerOptions()
-                .setHost("0.0.0.0")
-                .setPort(port)
+                .setHost(sharedTls ? "127.0.0.1" : "0.0.0.0")
+                .setPort(sharedTls ? 0 : port)
+                .setUseProxyProtocol(sharedTls)
                 .setMaxHeaderSize(MAX_REQUEST_HEADER_SIZE)
                 .setMaxInitialLineLength(MAX_REQUEST_LINE_LENGTH);
         if (secure) {
@@ -604,10 +611,13 @@ public class ElbV2DataPlane {
         HttpServer server = vertx.createHttpServer(options);
         long generation = ++state.generation;
         servers.put(port, server);
+        if (sharedTls) {
+            sharedTlsServers.put(port, server);
+        }
         try {
             server.requestHandler(req -> handleRequest(req, port));
             server.listen()
-                    .onSuccess(s -> portStarted(port, state, generation, secure ? "HTTPS" : "HTTP"))
+                    .onSuccess(s -> httpPortStarted(port, state, generation, server, sharedTls, secure))
                     .onFailure(err -> onCurrentPort(port, state, () -> {
                         if (state.generation == generation && servers.remove(port, server)) {
                             scheduleBindRetry(port, state);
@@ -628,6 +638,25 @@ public class ElbV2DataPlane {
                 }
             }
             throw failure;
+        }
+    }
+
+    private void httpPortStarted(int port, PortState state, long generation,
+                                 HttpServer server, boolean sharedTls, boolean secure) {
+        synchronized (state) {
+            if (stopping || portStates.get(port) != state
+                    || state.generation != generation || servers.get(port) != server) {
+                releaseSharedTlsServer(port, server);
+                server.close();
+                return;
+            }
+            if (sharedTls && !tlsProxyServer.registerTlsRoute(port, server, host ->
+                    !stopping && servers.get(port) == server
+                            && resolveListener(state.routing, host, false) != null ? server.actualPort() : 0)) {
+                restartPortServer(port);
+                return;
+            }
+            portStarted(port, state, generation, secure ? "HTTPS" : "HTTP");
         }
     }
 
@@ -706,8 +735,7 @@ public class ElbV2DataPlane {
                 .filter(candidate -> candidate != null && "forward".equals(candidate.getType()))
                 .findFirst().orElse(null);
         String tgArn = action == null ? null : resolveTgArn(action);
-        TargetGroup tg = tgArn == null ? null
-                : asOwner(listener.arn(), () -> elbV2Service.getTargetGroup(listener.region(), tgArn));
+        TargetGroup tg = tgArn == null ? null : elbV2Service.getTargetGroupForListener(listener.region(), listener.arn(), tgArn);
         if (tg == null || "lambda".equals(tg.getTargetType())) {
             socket.close();
             return;
@@ -816,7 +844,7 @@ public class ElbV2DataPlane {
     }
 
     private ListenerBinding binding(Listener listener, String region) {
-        LoadBalancer loadBalancer = elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn());
+        LoadBalancer loadBalancer = elbV2Service.getLoadBalancerForListener(region, listener.getListenerArn(), listener.getLoadBalancerArn());
         String host = loadBalancer != null ? normalizeHost(loadBalancer.getDnsName()) : listener.getLoadBalancerArn();
         boolean secure = "HTTPS".equalsIgnoreCase(listener.getProtocol());
         Set<String> hosts = new LinkedHashSet<>();
@@ -918,7 +946,14 @@ public class ElbV2DataPlane {
     }
 
     private void closeOwnedServer(int port, PortState state, HttpServer server) {
+        releaseSharedTlsServer(port, server);
         closeOwnedServer(port, state, server::close);
+    }
+
+    private void releaseSharedTlsServer(int port, HttpServer server) {
+        if (sharedTlsServers.remove(port, server)) {
+            tlsProxyServer.unregisterTlsRoute(port, server);
+        }
     }
 
     private void closeOwnedServer(int port, PortState state, Supplier<Future<Void>> close) {
@@ -1052,6 +1087,10 @@ public class ElbV2DataPlane {
 
     /** Floci's shared socket first uses load-balancer DNS, then unique rule or certificate hosts. */
     private RoutedListener resolveListener(RoutingView routing, String hostHeader) {
+        return resolveListener(routing, hostHeader, true);
+    }
+
+    private RoutedListener resolveListener(RoutingView routing, String hostHeader, boolean allowSingleListener) {
         String host = normalizeHost(hostHeader);
         String direct = routing.hosts().get(host);
         if (direct != null) {
@@ -1070,7 +1109,7 @@ public class ElbV2DataPlane {
         if (!certificates.isEmpty()) {
             return certificates.size() == 1 ? certificates.getFirst() : null;
         }
-        return routing.hosts().size() == 1
+        return allowSingleListener && routing.hosts().size() == 1
                 ? routing.listeners().get(routing.hosts().values().iterator().next()) : null;
     }
 
@@ -1114,7 +1153,7 @@ public class ElbV2DataPlane {
             req.response().setStatusCode(502).end("No target group");
             return;
         }
-        TargetGroup tg = asOwner(listenerArn, () -> elbV2Service.getTargetGroup(region, tgArn));
+        TargetGroup tg = elbV2Service.getTargetGroupForListener(region, listenerArn, tgArn);
         if (tg == null) {
             req.response().setStatusCode(502).end("Target group not found");
             return;
@@ -1176,8 +1215,7 @@ public class ElbV2DataPlane {
         if (binding == null) {
             return null;
         }
-        LoadBalancer loadBalancer = asOwner(listenerArn,
-                () -> elbV2Service.getLoadBalancer(region, binding.loadBalancerArn()));
+        LoadBalancer loadBalancer = elbV2Service.getLoadBalancerForListener(region, listenerArn, binding.loadBalancerArn());
         if (loadBalancer == null || loadBalancer.getAttributes() == null) {
             return null;
         }
@@ -1207,7 +1245,7 @@ public class ElbV2DataPlane {
     }
 
     private String listenerAttribute(String listenerArn, String region, String key) {
-        Listener listener = asOwner(listenerArn, () -> elbV2Service.getListener(region, listenerArn));
+        Listener listener = elbV2Service.getDataPlaneListener(region, listenerArn);
         if (listener == null || listener.getAttributes() == null) {
             return null;
         }
