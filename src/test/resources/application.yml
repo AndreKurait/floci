@@ -362,6 +362,7 @@ floci:
       ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       privileged: true
       cap-drop: ${FLOCI_SERVICES_EC2_CAP_DROP:}
+      cap-add: ${FLOCI_SERVICES_EC2_CAP_ADD:}
       enabled: true
       imds-port: 9169
       metadata-helper-image: floci/network-helper:local

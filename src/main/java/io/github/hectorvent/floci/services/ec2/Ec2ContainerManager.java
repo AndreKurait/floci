@@ -57,6 +57,7 @@ import java.util.Base64;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -917,7 +918,11 @@ public class Ec2ContainerManager {
                 .withNetworkMode("container:" + helperId)
                 .withPrivileged(config.services().ec2().privileged() && !enforceSecurityGroups
                         && mounts.isEmpty() && !image.systemdV1());
-        config.services().ec2().capDrop().orElse(List.of()).forEach(specBuilder::withCapDrop);
+        List<String> capDrop = config.services().ec2().capDrop().orElse(List.of());
+        List<String> capAdd = config.services().ec2().capAdd().orElse(List.of());
+        requireDisjointCapabilities(capAdd, capDrop);
+        capDrop.forEach(specBuilder::withCapDrop);
+        capAdd.forEach(specBuilder::withCapAdd);
         options.ulimits().forEach((name, limit) -> specBuilder.withUlimit(name, limit.soft(), limit.hard()));
         options.mounts().forEach(specBuilder::withMount);
         if (!mounts.isEmpty()) {
@@ -969,6 +974,25 @@ public class Ec2ContainerManager {
                     .withBind("/sys/fs/cgroup", "/sys/fs/cgroup");
         }
         return specBuilder.build();
+    }
+
+    /**
+     * Docker applies a named add over a drop, so a capability configured in both lists would
+     * silently be granted. Refuse that configuration instead of guessing which one was meant.
+     */
+    static void requireDisjointCapabilities(List<String> capAdd, List<String> capDrop) {
+        Set<String> dropped = capDrop.stream().map(Ec2ContainerManager::capabilityName)
+                .collect(Collectors.toSet());
+        List<String> both = capAdd.stream().map(Ec2ContainerManager::capabilityName)
+                .filter(dropped::contains).distinct().sorted().toList();
+        if (!both.isEmpty()) {
+            throw new IllegalStateException("EC2 guest capabilities both added and dropped: " + both);
+        }
+    }
+
+    private static String capabilityName(String capability) {
+        String name = capability.trim().toUpperCase(Locale.ROOT);
+        return name.startsWith("CAP_") ? name.substring(4) : name;
     }
 
     private void validateMountOptions(ResolvedAmiImage image, GuestOptions options) {
