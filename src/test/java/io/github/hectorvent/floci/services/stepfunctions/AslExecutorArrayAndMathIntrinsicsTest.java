@@ -466,4 +466,12 @@ class AslExecutorArrayAndMathIntrinsicsTest {
         });
         return exec;
     }
+
+
+    @Test
+    void anArrayIndexTooLargeForAnIntResolvesToNothing() throws Exception {
+        JsonNode root = mapper.readTree("{\"a\":[1,2]}");
+        assertTrue(executor.resolvePathNode("$.a[99999999999]", root).isMissingNode());
+        assertEquals(2, executor.resolvePathNode("$.a[1]", root).asInt());
+    }
 }

@@ -5154,7 +5154,7 @@ public class AslExecutor {
                 return projected;
             }
             if (current.isArray() && isArrayIndex(part)) {
-                current = current.path(Integer.parseInt(part));
+                current = current.path(parseArrayIndex(part));
             } else {
                 current = current.path(part);
             }
