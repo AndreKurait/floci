@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -487,5 +488,15 @@ class SqsCfnProvisionerTest {
                 argThat(keys -> keys.size() == 2 && keys.containsAll(List.of("env", "owner"))),
                 eq("us-east-1"));
         verify(sqs, never()).tagQueue(anyString(), any(), anyString());
+    }
+
+    @Test
+    void deletingAQueueThatIsAlreadyGoneIsNotAFailure() {
+        doThrow(new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                "The specified queue does not exist.", 400))
+                .when(sqs).deleteQueue("http://localhost:4566/000000000000/gone", "us-east-1");
+
+        assertDoesNotThrow(() ->
+                provisioner.delete("AWS::SQS::Queue", "http://localhost:4566/000000000000/gone", "us-east-1"));
     }
 }
