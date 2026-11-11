@@ -150,6 +150,15 @@ public final class SecurityGroupNftCompiler {
                                   Map<String, List<String>> prefixLists, List<String> vpcResolvers,
                                   boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
                                   Collection<EmulatorOrigin> emulatorOrigins, List<String> emulatorAddresses) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, admitted,
+                emulatorOrigins, emulatorAddresses, Set.of());
+    }
+
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
+                                  Collection<EmulatorOrigin> emulatorOrigins, List<String> emulatorAddresses,
+                                  Set<String> routedPublicAddresses) {
         if (target == null || target.groups() == null || target.groups().isEmpty()) {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
@@ -241,6 +250,10 @@ public final class SecurityGroupNftCompiler {
                 List<String> visible = isolatedAddressSpaces && !target.sameVpc(peer)
                         ? List.of(peer.transportAddress()) : peer.transportAddresses();
                 for (String address : visible) {
+                    if (egress && admitted.test(peer) && routedPublicAddresses.contains(address)) {
+                        // The native route policy controls its NAT/IGW path; evaluate public egress CIDRs below.
+                        continue;
+                    }
                     appendRule(rules, chain, addressField, address, "drop");
                 }
             }

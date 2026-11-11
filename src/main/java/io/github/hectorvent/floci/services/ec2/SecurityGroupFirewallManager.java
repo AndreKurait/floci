@@ -940,7 +940,12 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             throw new IllegalStateException("Public address has no admitted security-group endpoint");
         }
         if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
-            vpcRouting.get().attachPublicInstance(current.endpoint(), current.helperId(), address);
+            VpcRoutingManager routing = vpcRouting.get();
+            Set<String> previous = routing.publicInstanceAddresses();
+            routing.attachPublicInstance(current.endpoint(), current.helperId(), address);
+            if (!previous.equals(routing.publicInstanceAddresses())) {
+                converge(false);
+            }
         }
     }
 
@@ -1040,7 +1045,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 .collect(Collectors.toSet());
         String rules = SecurityGroupNftCompiler.compile(target.endpoint(), peers, target.prefixLists(),
                 vpcResolvers, isolatedAddressSpaces(), peer -> admitted.contains(peer.eniId()),
-                origins, emulatorAddresses(target.endpoint(), self));
+                origins, emulatorAddresses(target.endpoint(), self),
+                vpcRouting == null || vpcRouting.isUnsatisfied()
+                        ? Set.of() : vpcRouting.get().publicInstanceAddresses());
         Map<String, PeerView> known = endpoints.values().stream()
                 .filter(peer -> !peer.endpoint().eniId().equals(eniId))
                 .collect(Collectors.toMap(peer -> peer.endpoint().eniId(), PeerView::of));

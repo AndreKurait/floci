@@ -156,16 +156,24 @@ final class VpcRoutingCommands {
     }
 
     static String publicInstanceSource(String privateAddress, String publicAddress, String publicDevice) {
+        return publicInstanceSource(privateAddress, publicAddress, publicDevice,
+                List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS));
+    }
+
+    static String publicInstanceSource(String privateAddress, String publicAddress, String publicDevice,
+                                       List<String> destinations) {
         String rules = """
                 add table ip floci_instance_api
                 add chain ip floci_instance_api outgoing { type nat hook postrouting priority srcnat; }
                 flush chain ip floci_instance_api outgoing
                 """;
         if (publicAddress != null) {
-            rules += "add rule ip floci_instance_api outgoing oifname \"" + device(publicDevice)
-                    + "\" ip saddr " + VpcRouteSelection.ipv4(privateAddress) + " ip daddr "
-                    + EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS
-                    + " snat to " + VpcRouteSelection.ipv4(publicAddress) + "\n";
+            for (String destination : destinations.stream().distinct().sorted().toList()) {
+                rules += "add rule ip floci_instance_api outgoing oifname \"" + device(publicDevice)
+                        + "\" ip saddr " + VpcRouteSelection.ipv4(privateAddress) + " ip daddr "
+                        + VpcRouteSelection.ipv4(destination)
+                        + " snat to " + VpcRouteSelection.ipv4(publicAddress) + "\n";
+            }
         }
         return nft(rules);
     }

@@ -105,17 +105,26 @@ selected upstream listener. It neither routes general internet traffic nor adds 
 workload control-network exemption.
 
 An EC2 instance with a native public IPv4 address can instead use its subnet's
-attached internet-gateway route. The bridge joins that instance's existing public
-Docker network and installs a return route for its public address. The instance's
-existing public-address translation supplies the source; it does not cross the
-separate NAT transport bridge, where Docker would masquerade that source again.
-Only the public API destination is admitted through this route, subject to the
-instance's security-group egress. A private neighbor cannot borrow it. Removing
+attached internet-gateway route. Its protected namespace joins the owned public
+transport bridge, preserving its public source address without Docker masquerading.
+Managed public EC2 peers and the optional public API bridge use this route,
+subject to the instance's security-group egress. A private neighbor cannot borrow it. Removing
 an Elastic IP or stopping the instance withdraws its admission; reassociation or
 start restores it when the declared public address and internet route exist.
 Removing the last NAT and public caller retires the bridge.
 The TCP bridge opens a new upstream connection after accepting a caller socket,
 so this path does not qualify IAM `aws:SourceIp` behavior.
+
+A private workload can reach an EC2 peer's automatically assigned public IPv4
+address through its NAT gateway. The caller's NAT route, the NAT subnet's
+internet-gateway route and the server's internet-gateway return route must all
+exist. The server observes the allocated NAT Elastic IP; allowing only the
+caller's private address does not admit the request. Direct private traffic
+between these VPCs remains blocked. Egress CIDRs apply to the published public
+destination only after both peers enforce their security-group policies.
+Publishing a public address creates no security-group grant, and withdrawing
+it restores the private transport restriction. `Ec2PublicPeerPacketIntegrationTest` covers
+the observed source, route withdrawal and security-group denial and recovery.
 
 `VpcPublicAwsApiPacketIntegrationTest` covers normal AWS DNS, signed EC2 requests
 over HTTP and verified HTTPS, observed NAT peers, workload egress denial, private
@@ -184,7 +193,7 @@ instance metadata for namespaces with identical private addresses.
 
 This milestone does not implement arbitrary internet forwarding, VPC endpoints,
 peering, transit gateways, IPv6/NAT64, regional or multi-address NAT gateways,
-network ACLs, public EC2 addresses, multiple
+network ACLs, arbitrary public EC2 address allocation, multiple
 frontend subnets, or Application Load Balancer frontends.
 Platform DNS and service-owned Runtime API connections retain their existing
 narrow exemptions. Direct public-instance API routes, VPC endpoints, IAM source-IP
