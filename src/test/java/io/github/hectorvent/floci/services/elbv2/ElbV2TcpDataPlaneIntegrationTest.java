@@ -149,10 +149,13 @@ class ElbV2TcpDataPlaneIntegrationTest {
 
         await().atMost(Duration.ofSeconds(15))
                 .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
-                .untilAsserted(() -> assertEquals(
-                        TargetHealthStateEnum.HEALTHY,
-                        client.describeTargetHealth(request -> request.targetGroupArn(targetGroupArn))
-                                .targetHealthDescriptions().getFirst().targetHealth().state()));
+                .untilAsserted(() -> {
+                    probeNow();
+                    assertEquals(
+                            TargetHealthStateEnum.HEALTHY,
+                            client.describeTargetHealth(request -> request.targetGroupArn(targetGroupArn))
+                                    .targetHealthDescriptions().getFirst().targetHealth().state());
+                });
 
         try (ServerSocket reservation = new ServerSocket(0)) {
             listenerPort = reservation.getLocalPort();
@@ -500,6 +503,7 @@ class ElbV2TcpDataPlaneIntegrationTest {
             await().atMost(Duration.ofSeconds(15))
                     .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                     .untilAsserted(() -> {
+                        probeNow();
                         List<TargetHealthStateEnum> states = client.describeTargetHealth(request -> request
                                         .targetGroupArn(targetGroupArn)).targetHealthDescriptions().stream()
                                 .map(description -> description.targetHealth().state()).toList();
@@ -639,10 +643,13 @@ class ElbV2TcpDataPlaneIntegrationTest {
         completeInitialHealthChecks(1);
         await().atMost(Duration.ofSeconds(15))
                 .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
-                .untilAsserted(() -> assertEquals(
-                        TargetHealthStateEnum.HEALTHY,
-                        client.describeTargetHealth(request -> request.targetGroupArn(targetGroupArn))
-                                .targetHealthDescriptions().getFirst().targetHealth().state()));
+                .untilAsserted(() -> {
+                    probeNow();
+                    assertEquals(
+                            TargetHealthStateEnum.HEALTHY,
+                            client.describeTargetHealth(request -> request.targetGroupArn(targetGroupArn))
+                                    .targetHealthDescriptions().getFirst().targetHealth().state());
+                });
     }
 
     private static Socket connect(int port) throws IOException {

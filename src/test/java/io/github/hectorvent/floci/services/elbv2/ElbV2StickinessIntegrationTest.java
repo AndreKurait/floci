@@ -34,11 +34,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestProfile(RealElbV2DataPlaneProfile.class)
 class ElbV2StickinessIntegrationTest {
 
+    private static final String REGION = "us-east-1";
+
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20261019/us-east-1/elasticloadbalancing/aws4_request";
 
     @Inject
     Vertx vertx;
+
+    @Inject
+    ElbV2HealthChecker healthChecker;
+
+    @Inject
+    ElbV2Service service;
 
     private HttpServer first;
     private HttpServer second;
@@ -128,10 +136,11 @@ class ElbV2StickinessIntegrationTest {
         enableStickiness(true);
         Response initial = request(null);
         unhealthy.set(initial.asString());
-        // The admission probe can defer the next check past the first five-second group tick.
+        // Probes outside the five-second cadence instead of waiting it out; the probes stay real.
         await().atMost(Duration.ofSeconds(15))
                 .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .untilAsserted(() -> {
+                    healthChecker.probeAll(targetGroupArn, service.getTargetGroup(REGION, targetGroupArn));
                     List<String> states = query("DescribeTargetHealth", "TargetGroupArn", targetGroupArn).xmlPath()
                             .getList("DescribeTargetHealthResponse.DescribeTargetHealthResult"
                                     + ".TargetHealthDescriptions.member.TargetHealth.State");
