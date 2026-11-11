@@ -1099,6 +1099,10 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
                     stage.setAccessLogSettings(null);
                     continue;
                 }
+                if ("remove" .equals(opType) && path.startsWith("/variables/")) {
+                    stage.getVariables().remove(path.substring("/variables/" .length()));
+                    continue;
+                }
                 if (!"replace" .equals(opType) && !"add" .equals(opType)) continue;
 
                 if ("/description" .equals(path)) {

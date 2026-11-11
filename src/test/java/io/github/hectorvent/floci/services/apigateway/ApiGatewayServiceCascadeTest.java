@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.IntegrationResponse;
+import io.github.hectorvent.floci.services.apigateway.model.Stage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -18,6 +19,7 @@ import java.util.Map;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -92,6 +94,22 @@ class ApiGatewayServiceCascadeTest {
         service.deleteRestApi(REGION, apiId);
 
         assertNotFound(() -> service.getAuthorizer(REGION, apiId, authorizerId));
+    }
+
+    @Test
+    void removePatchDeletesAStageVariable() {
+        String deploymentId = service.createDeployment(REGION, apiId, new HashMap<>()).id();
+        Map<String, Object> request = new HashMap<>();
+        request.put("stageName", "dev");
+        request.put("deploymentId", deploymentId);
+        request.put("variables", new HashMap<>(Map.of("keep", "1", "drop", "2")));
+        service.createStage(REGION, apiId, request);
+
+        Stage patched = service.updateStage(REGION, apiId, "dev",
+                List.of(Map.of("op", "remove", "path", "/variables/drop")));
+
+        assertEquals(Map.of("keep", "1"), patched.getVariables());
+        assertFalse(service.getStage(REGION, apiId, "dev").getVariables().containsKey("drop"));
     }
 
     private static void assertNotFound(Runnable call) {
