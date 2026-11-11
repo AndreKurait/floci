@@ -831,6 +831,24 @@ class ProvisionedConcurrencyPoolTest {
         ready();
     }
 
+    @Test
+    void releaseAfterAResetStoppedTheLeasedEnvironmentLeavesThePoolUsable() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertSame(first.handle, pool.acquire(version, "live"));
+        // A state reset while the invocation is in flight stops the leased environment and reopens the pool.
+        pool.clear();
+        assertFalse(first.alive);
+
+        assertTrue(pool.release(first.handle, true), "the invocation returns its lease after the reset");
+
+        assertEquals(1, first.stops.get(), "the environment the reset stopped is not stopped again");
+        pool.deleteFunction(version);
+        assertEquals(1, put(1).requested());
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void lateReleaseCleansUpAfterFailedOrExpiredShutdown(boolean expiredDeadline) throws Exception {
