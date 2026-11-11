@@ -53,8 +53,9 @@ class KinesisListShardsConcurrencyTest {
         // A concurrent split closes the parent and atomically appends two children, mutating the
         // live backing list the pre-fix sub-list page still points at.
         String firstShardId = stream.getShards().getFirst().getShardId();
+        // A quarter of the hash space: inside the first of the three shards, which ends below a third.
         service.splitShard("reshard-stream", firstShardId,
-                "170141183460469231731687303715884105728", REGION);
+                "85070591730234615865843651857942052864", REGION);
 
         // Pre-fix: iterating/sizing the live sub-list here throws ConcurrentModificationException.
         assertDoesNotThrow(() -> {
