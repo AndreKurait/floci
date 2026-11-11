@@ -510,6 +510,13 @@ public class KinesisService implements ResourceProvider {
 
     /** A split leaves both children a hash key: the new start lies after the parent's start, up to its end. */
     private static void requireHashKeyInsideShard(String newStartingHashKey, KinesisShard parent) {
+        if (newStartingHashKey == null || newStartingHashKey.isEmpty()
+                || newStartingHashKey.length() > 39
+                || !newStartingHashKey.chars().allMatch(c -> c >= '0' && c <= '9')
+                || (newStartingHashKey.length() > 1 && newStartingHashKey.charAt(0) == '0')) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " is not a valid hash key", 400);
+        }
         BigInteger newStart;
         try {
             newStart = new BigInteger(newStartingHashKey);
