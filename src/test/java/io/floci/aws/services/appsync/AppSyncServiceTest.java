@@ -12,6 +12,7 @@ import io.floci.aws.services.appsync.model.DomainName;
 import io.floci.aws.services.appsync.model.FunctionConfiguration;
 import io.floci.aws.services.appsync.model.GraphqlApi;
 import io.floci.aws.services.appsync.model.SchemaCreationStatusType;
+import io.floci.aws.services.appsync.model.SourceApiAssociation;
 import io.floci.aws.testing.ParkingStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -721,5 +722,23 @@ class AppSyncServiceTest {
         ChannelNamespace updated = svc.updateChannelNamespace(api.getApiId(), "ns", Map.of("description", "d"));
         assertEquals(NOW.toEpochMilli(), updated.getCreated());
         assertEquals(NOW.plus(Duration.ofMinutes(5)).toEpochMilli(), updated.getLastModified());
+    }
+
+    @Test
+    void aSourceApiAssociationArnNamesItsOwnAssociationId() {
+        AppSyncService svc = AppSyncServiceFixture.create(new AppSyncServiceFixture.MutableClock(NOW));
+        GraphqlApi source = svc.createGraphqlApi(Map.of("name", "source", "authenticationType", "API_KEY"), "us-east-1");
+        GraphqlApi merged = svc.createGraphqlApi(Map.of("name", "merged", "authenticationType", "API_KEY"), "us-east-1");
+
+        SourceApiAssociation fromSource = svc.createMergedApiAssociation(
+                source.getApiId(), Map.of("mergedApiIdentifier", merged.getApiId()), "us-east-1");
+        assertTrue(fromSource.getAssociationArn().endsWith("/mergedApiAssociations/" + fromSource.getAssociationId()),
+                fromSource.getAssociationArn() + " does not name " + fromSource.getAssociationId());
+
+        svc.deleteMergedApiAssociation(source.getApiId(), fromSource.getAssociationId());
+        SourceApiAssociation fromMerged = svc.createSourceApiAssociation(
+                merged.getApiId(), Map.of("sourceApiId", source.getApiId()), "us-east-1");
+        assertTrue(fromMerged.getAssociationArn().endsWith("/sourceApiAssociations/" + fromMerged.getAssociationId()),
+                fromMerged.getAssociationArn() + " does not name " + fromMerged.getAssociationId());
     }
 }
