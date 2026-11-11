@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.elb;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
+import io.github.hectorvent.floci.services.elb.model.ClassicHealthCheck;
 import io.github.hectorvent.floci.services.elb.model.ClassicListener;
 import io.github.hectorvent.floci.services.elb.model.ClassicLoadBalancer;
 import org.junit.jupiter.api.BeforeEach;
@@ -64,6 +65,35 @@ class ElbClassicRequestValidationTest {
         ClassicLoadBalancer created = create("web", listener(loadBalancerPort));
 
         assertEquals(loadBalancerPort, created.getListeners().getFirst().getLoadBalancerPort());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"8080", "FTP:21", "HTTP:eighty/", "TCP:", "TCP:0", "SSL:65536"})
+    void aHealthCheckTargetTheCheckerCannotReadIsRefused(String target) {
+        create("web", listener(80));
+        ClassicHealthCheck check = ClassicHealthCheck.defaults();
+        check.setTarget(target);
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> service.configureHealthCheck(REGION, "web", check));
+
+        assertEquals("ValidationError", refused.getErrorCode());
+        assertEquals(400, refused.getHttpStatus());
+        assertEquals(ClassicHealthCheck.defaults().getTarget(),
+                service.requireLoadBalancer(REGION, "web").getHealthCheck().getTarget(),
+                "the health check in force is unchanged");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HTTP:8080/health", "https:443/", "TCP:1", "SSL:65535"})
+    void aHealthCheckTargetTheCheckerCanReadIsAccepted(String target) {
+        create("web", listener(80));
+        ClassicHealthCheck check = ClassicHealthCheck.defaults();
+        check.setTarget(target);
+
+        service.configureHealthCheck(REGION, "web", check);
+
+        assertEquals(target, service.requireLoadBalancer(REGION, "web").getHealthCheck().getTarget());
     }
 
     private ClassicLoadBalancer create(String name, ClassicListener listener) {

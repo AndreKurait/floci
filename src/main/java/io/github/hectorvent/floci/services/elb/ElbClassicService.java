@@ -1101,6 +1101,13 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             throw new AwsException("ValidationError",
                     "HealthCheck.Target is required.", 400);
         }
+        ElbClassicHealthChecker.Target target = ElbClassicHealthChecker.Target.parse(hc.getTarget());
+        if (target == null || target.port() < 1 || target.port() > 65535) {
+            // A target the checker cannot read is never probed.
+            throw new AwsException("ValidationError",
+                    "HealthCheck.Target must be HTTP, HTTPS, TCP or SSL, a colon and a port between 1 and 65535,"
+                            + " for example HTTP:80/health.", 400);
+        }
         requireRange("HealthCheck.Interval", hc.getInterval(), 5, 300);
         requireRange("HealthCheck.Timeout", hc.getTimeout(), 2, 60);
         requireRange("HealthCheck.UnhealthyThreshold", hc.getUnhealthyThreshold(), 2, 10);
