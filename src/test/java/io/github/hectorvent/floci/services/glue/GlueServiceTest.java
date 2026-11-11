@@ -450,6 +450,20 @@ class GlueServiceTest {
     }
 
     @Test
+    void deleteDatabaseDeletesItsUserDefinedFunctions() {
+        UserDefinedFunction function = new UserDefinedFunction();
+        function.setFunctionName("fn");
+        glueService.createUserDefinedFunction("db1", function);
+
+        glueService.deleteDatabase("db1");
+        glueService.createDatabase(new Database("db1"));
+
+        AwsException missing = assertThrows(AwsException.class,
+                () -> glueService.getUserDefinedFunction("db1", "fn"));
+        assertEquals("EntityNotFoundException", missing.getErrorCode());
+    }
+
+    @Test
     void partitionsCanBeFetchedFilteredAndDeleted() {
         Table table = new Table();
         table.setName("plain");
