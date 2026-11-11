@@ -3896,6 +3896,13 @@ public class NativeDynamoDbJsonHandler {
                 ObjectNode projection = objectMapper.createObjectNode();
                 projection.put("ProjectionType",
                         lsi.getProjectionType() != null ? lsi.getProjectionType() : "ALL");
+                if ("INCLUDE".equals(lsi.getProjectionType())) {
+                    ArrayNode nonKeyAttributes = objectMapper.createArrayNode();
+                    for (String attr : lsi.getNonKeyAttributes()) {
+                        nonKeyAttributes.add(attr);
+                    }
+                    projection.set("NonKeyAttributes", nonKeyAttributes);
+                }
                 lsiNode.set("Projection", projection);
 
                 lsiNode.put("IndexSizeBytes", lsi.getIndexSizeBytes());
