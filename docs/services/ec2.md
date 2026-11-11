@@ -837,6 +837,11 @@ private gateway lifecycles are not modelled.
 
 ### Security Groups
 
+Each VPC's default security group starts with inbound access from members of
+that same group on all protocols and ports, plus outbound IPv4 access.
+`DescribeSecurityGroupRules` exposes both rules. Revoking the inbound rule
+keeps it removed; ordinary named security groups start with no inbound rules.
+
 With IAM enforcement enabled, ingress and egress authorization and revocation
 requests carrying `GroupId` check that group's ARN, including its account,
 region and partition. Referenced peer groups and prefix lists do not replace
