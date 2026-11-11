@@ -175,15 +175,20 @@ public class SesContactService implements SesTaggable {
                                          List<Topic> topics, String region) {
         validateContactListInput(name, description, topics);
         String key = contactListKey(region, name);
-        ContactList existing = contactListStore.get(key).orElseThrow(() -> contactListNotFound(name));
-        if (topics != null) {
-            existing.setTopics(topics);
+        ContactList existing;
+        // Read and write under the lock deletion takes, so an update cannot put back a list a
+        // concurrent delete has just removed.
+        synchronized (contactMutationLock) {
+            existing = contactListStore.get(key).orElseThrow(() -> contactListNotFound(name));
+            if (topics != null) {
+                existing.setTopics(topics);
+            }
+            if (descriptionPresent) {
+                existing.setDescription(description);
+            }
+            existing.setLastUpdatedTimestamp(Instant.now(clock));
+            contactListStore.put(key, existing);
         }
-        if (descriptionPresent) {
-            existing.setDescription(description);
-        }
-        existing.setLastUpdatedTimestamp(Instant.now(clock));
-        contactListStore.put(key, existing);
         LOG.infov("Updated SES contact list: {0} in region {1}", name, region);
         return existing;
     }
