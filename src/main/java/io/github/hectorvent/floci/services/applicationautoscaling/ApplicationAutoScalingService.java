@@ -278,10 +278,10 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             policy.setPolicyArn(buildPolicyArn(region, serviceNamespace, resourceId, policyName));
         }
 
+        if (existing != null) {
+            deleteAlarms(existing, region);
+        }
         if ("TargetTrackingScaling".equals(policy.getPolicyType())) {
-            if (existing != null) {
-                deleteAlarms(existing, region);
-            }
             policy.setAlarms(createTargetTrackingAlarms(policy, region));
         } else {
             policy.setAlarms(new ArrayList<>());

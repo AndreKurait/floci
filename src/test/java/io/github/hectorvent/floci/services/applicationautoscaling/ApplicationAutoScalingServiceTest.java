@@ -117,6 +117,20 @@ class ApplicationAutoScalingServiceTest {
                 null, null, REGION));
     }
 
+    @Test
+    void putScalingPolicy_replacingATargetTrackingPolicyWithStepScaling_deletesItsAlarms() {
+        register();
+        service.putScalingPolicy("cpu", "TargetTrackingScaling", NAMESPACE, RESOURCE_ID, DIMENSION,
+                targetTracking(50.0, "ECSServiceAverageCPUUtilization", null), null, REGION);
+        assertEquals(2, alarmsInCloudWatch.size());
+
+        ScalingPolicy replaced = service.putScalingPolicy("cpu", "StepScaling", NAMESPACE, RESOURCE_ID,
+                DIMENSION, null, null, REGION);
+
+        assertEquals(List.of(), replaced.getAlarms());
+        assertEquals(Set.of(), alarmsInCloudWatch);
+    }
+
     private TargetTrackingConfiguration targetTracking(double value, String metricType, String resourceLabel) {
         TargetTrackingConfiguration config = new TargetTrackingConfiguration();
         config.setTargetValue(value);
