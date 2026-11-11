@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
@@ -23,6 +24,35 @@ import static org.mockito.Mockito.when;
 /** The address the embedded DNS server gives the containers Floci launches. */
 class EmbeddedDnsServerAddressTest {
 
+    @Test
+    void usesReachableContainerAddressInsteadOfSystemHostname() throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+        when(resolver.resolveContainerIp()).thenReturn(Optional.of("172.26.0.2"));
+
+        assertEquals("172.26.0.2", EmbeddedDnsServer.ownAddress(config, resolver));
+    }
+
+    @Test
+    void explicitNetworkCannotSilentlyFallBackToAnotherHostInterface() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dockerNetwork()).thenReturn(Optional.of("services-network"));
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+        when(resolver.resolveContainerIp()).thenReturn(Optional.empty());
+
+        assertThrows(IllegalStateException.class, () -> EmbeddedDnsServer.ownAddress(config, resolver));
+    }
+
+    @Test
+    void unconfiguredStandaloneContainerRetainsHostnameFallback() throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dockerNetwork()).thenReturn(Optional.empty());
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+        when(resolver.resolveContainerIp()).thenReturn(Optional.empty());
+
+        assertEquals(InetAddress.getLocalHost().getHostAddress(),
+                EmbeddedDnsServer.ownAddress(config, resolver));
+    }
     @Test
     void ownAddressIsThisContainersOnTheNetworkItsContainersJoin() throws Exception {
         CurrentContainerNetworkResolver currentContainer = mock(CurrentContainerNetworkResolver.class);

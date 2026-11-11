@@ -81,6 +81,8 @@ The longest matching public zone answers. Missing names return NXDOMAIN; existin
 
 Public address routing, aliases, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary; TCP fallback is not implemented.
 
+For a Floci container attached to multiple Docker networks, set `FLOCI_SERVICES_DOCKER_NETWORK` to the network name or ID shared with its service containers. Embedded DNS advertises Floci's address on that network, including the default Route53 nameserver names. Private CNAMEs targeting emulator names use the same address. An explicitly configured network that cannot be inspected or is not attached prevents DNS initialization instead of advertising an unrelated interface. Without an explicit network, Floci uses its detected container network, retaining the system-hostname fallback when Docker inspection is unavailable.
+
 ## Default Nameservers
 
 By default, new public zones without a reusable delegation set and new standalone reusable sets receive four nameservers shaped like `ns-2048.awsdns-64.com`. Floci derives their numbers from each resource ID and uses the `org`, `net`, `com`, and `co.uk` TLDs. An occasional server name can overlap between resources, as with Route 53. With no explicit nameserver overrides, private zones keep these names:
