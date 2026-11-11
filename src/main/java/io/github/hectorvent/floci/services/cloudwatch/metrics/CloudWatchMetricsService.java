@@ -34,6 +34,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -89,6 +90,7 @@ public class CloudWatchMetricsService {
     private final RegionResolver regionResolver;
     private final AlarmSnsNotifier alarmSnsNotifier;
     private final ServiceQuotasService serviceQuotas;
+    private final Clock clock;
     private long lastHistorySequence;
     private Instant nextHistoryPrune = Instant.MIN;
 
@@ -115,6 +117,7 @@ public class CloudWatchMetricsService {
         this.regionResolver = regionResolver;
         this.alarmSnsNotifier = alarmSnsNotifier;
         this.serviceQuotas = serviceQuotas;
+        this.clock = Clock.systemUTC();
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
@@ -133,6 +136,15 @@ public class CloudWatchMetricsService {
                              StorageBackend<String, Alarm> alarmStore,
                              StorageBackend<String, AlarmHistoryItem> historyStore,
                              RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier) {
+        this(metricStore, alarmStore, historyStore, regionResolver, alarmSnsNotifier, Clock.systemUTC());
+    }
+
+    /** As above, with the clock that dates datums, alarms and alarm history and measures its retention. */
+    CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
+                             StorageBackend<String, Alarm> alarmStore,
+                             StorageBackend<String, AlarmHistoryItem> historyStore,
+                             RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier, Clock clock) {
+        this.clock = clock;
         this.metricStore = metricStore;
         this.alarmStore = alarmStore;
         this.historyStore = historyStore;
@@ -151,7 +163,7 @@ public class CloudWatchMetricsService {
      * streamed on another account's behalf. A null account is the caller's own.
      */
     public void putMetricDataForAccount(String accountId, String namespace, List<MetricDatum> datums, String region) {
-        long nowSeconds = Instant.now().getEpochSecond();
+        long nowSeconds = clock.instant().getEpochSecond();
         for (MetricDatum datum : datums) {
             datum.setNamespace(namespace);
             if (datum.getTimestamp() == 0) {
@@ -600,7 +612,7 @@ public class CloudWatchMetricsService {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + name));
         }
         alarm.setRegion(region);
-        alarm.setAlarmConfigurationUpdatedTimestamp(Instant.now().getEpochSecond());
+        alarm.setAlarmConfigurationUpdatedTimestamp(clock.instant().getEpochSecond());
         alarmStore.put(region + "::" + name, alarm);
         ObjectNode after = snapshot(alarm);
         ObjectNode data = MAPPER.createObjectNode().put("version", "1.0");
@@ -1052,7 +1064,7 @@ public class CloudWatchMetricsService {
         ObjectNode data = MAPPER.createObjectNode().put("version", "1.0");
         data.set("oldState", stateNode(oldState, alarm.getStateReason(), alarm.getStateReasonData()));
         data.set("newState", stateNode(state, reason, reasonData));
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         alarm.setStateValue(state);
         alarm.setStateReason(reason);
         alarm.setStateReasonData(reasonData);
@@ -1087,7 +1099,7 @@ public class CloudWatchMetricsService {
 
     /** Called only under this service's monitor, which also guards the sequence and the prune deadline. */
     private void recordHistory(Alarm alarm, String region, String type, String summary, ObjectNode data) {
-        recordHistory(alarm, region, type, summary, data, Instant.now());
+        recordHistory(alarm, region, type, summary, data, clock.instant());
     }
 
     /** As above, stamped with {@code now}: a state change passes the instant it gave the alarm. */
@@ -1137,7 +1149,7 @@ public class CloudWatchMetricsService {
             return new PaginatedResult<>(List.of(), null);
         }
         List<String> types = alarmTypes == null || alarmTypes.isEmpty() ? List.of("MetricAlarm") : alarmTypes;
-        long retained = Instant.now().minus(HISTORY_RETENTION).toEpochMilli();
+        long retained = clock.instant().minus(HISTORY_RETENTION).toEpochMilli();
         long start = startDate == null ? retained : Math.max(retained, startDate.toEpochMilli());
         long end = endDate == null ? Long.MAX_VALUE : endDate.toEpochMilli();
         List<AlarmHistoryItem> matching = historyStore.scan(k -> k.startsWith(region + "::")).stream()
