@@ -426,6 +426,7 @@ public class KinesisService implements ResourceProvider {
             if (parent.isClosed()) {
                 throw new AwsException("InvalidArgumentException", "Shard " + shardId + " is already closed", 400);
             }
+            requireHashKeyInsideShard(newStartingHashKey, parent);
 
             parent.setClosed(true);
             parent.setSequenceNumberRange(new KinesisShard.SequenceNumberRange(
@@ -500,6 +501,24 @@ public class KinesisService implements ResourceProvider {
 
     private String nextShardId(KinesisStream stream) {
         return String.format("shardId-%012d", stream.getShards().size());
+    }
+
+    /** A split leaves both children a hash key: the new start lies after the parent's start, up to its end. */
+    private static void requireHashKeyInsideShard(String newStartingHashKey, KinesisShard parent) {
+        BigInteger newStart;
+        try {
+            newStart = new BigInteger(newStartingHashKey);
+        } catch (NumberFormatException | NullPointerException e) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " is not a valid hash key", 400);
+        }
+        if (newStart.compareTo(new BigInteger(parent.getHashKeyRange().startingHashKey())) <= 0
+                || newStart.compareTo(new BigInteger(parent.getHashKeyRange().endingHashKey())) > 0) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " used in SplitShard() on shard "
+                            + parent.getShardId() + " is not both greater than the beginning hash key and "
+                            + "no greater than the ending hash key of the shard", 400);
+        }
     }
 
     private String subtractOne(String val) {
