@@ -52,6 +52,7 @@ class ElbV2HealthCheckerTest {
     private static final Duration TICK = Duration.ofMillis(1);
     /** The health-check timeout every target group of this class is created with. */
     private static final Duration PROBE_TIMEOUT = Duration.ofSeconds(1);
+    private static final Duration LONGEST_PROBE_TIMEOUT = Duration.ofSeconds(120);
 
     private final Vertx vertx = Vertx.vertx();
     private final List<ElbV2HealthChecker> checkers = new ArrayList<>();
@@ -225,22 +226,29 @@ class ElbV2HealthCheckerTest {
     @Test
     void timedOutProbeTransitionsTargetToUnhealthyWithAwsReason() throws Exception {
         HttpServer server = startHangingServer();
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
         try {
-            ElbV2HealthChecker checker = healthChecker();
+            ElbV2HealthChecker checker = timelineDeadlineChecker(mock(Ec2Service.class), waits);
             TargetGroup targetGroup = targetGroup(server.actualPort(), "200", 1, 1);
+            // The longest timeout a target group takes, so the socket's own real-time timeout
+            // cannot fire while the timeline is still short of the deadline.
+            targetGroup.setHealthCheckTimeoutSeconds((int) LONGEST_PROBE_TIMEOUT.toSeconds());
             TargetDescription target = target("127.0.0.1", server.actualPort());
 
             checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
+            waits.awaitWaiting(1);
+            time.advance(LONGEST_PROBE_TIMEOUT.minusNanos(1));
+            assertEquals("Elb.RegistrationInProgress", checker.getHealth(
+                    targetGroup.getTargetGroupArn(), target.getId(), target.getPort()).reason(),
+                    "The probe has its whole health-check timeout");
+            time.advance(Duration.ofNanos(1));
 
-            await().atMost(Duration.ofSeconds(3))
-                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
-                    .untilAsserted(() -> {
-                        ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
-                                targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
-                        assertEquals("unhealthy", health.state());
-                        assertEquals("Target.Timeout", health.reason());
-                        assertEquals("Request timed out", health.description());
-                    });
+            ElbV2HealthChecker.TargetHealthStatus health = checker.getHealth(
+                    targetGroup.getTargetGroupArn(), target.getId(), target.getPort());
+            assertEquals("unhealthy", health.state());
+            assertEquals("Target.Timeout", health.reason());
+            assertEquals("Request timed out", health.description());
         } finally {
             close(server);
         }
