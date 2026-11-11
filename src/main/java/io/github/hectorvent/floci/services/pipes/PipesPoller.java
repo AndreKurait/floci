@@ -768,19 +768,18 @@ public class PipesPoller implements Resettable {
     private List<ObjectNode> buildKinesisRecordNodes(List<?> records, Pipe pipe, String region) {
         List<ObjectNode> nodes = new ArrayList<>();
         for (Object record : records) {
-            ObjectNode node = objectMapper.valueToTree(record);
+            KinesisRecord source = (KinesisRecord) record;
             ObjectNode eventRecord = objectMapper.createObjectNode();
             eventRecord.put("eventSource", "aws:kinesis");
             eventRecord.put("eventSourceARN", pipe.getSource());
             eventRecord.put("awsRegion", region);
-            eventRecord.put("eventID", pipe.getSource() + ":" +
-                    node.path("SequenceNumber").asText());
+            eventRecord.put("eventID", pipe.getSource() + ":" + source.getSequenceNumber());
             ObjectNode kinesis = eventRecord.putObject("kinesis");
-            kinesis.put("partitionKey", node.path("PartitionKey").asText());
-            kinesis.put("sequenceNumber", node.path("SequenceNumber").asText());
+            kinesis.put("partitionKey", source.getPartitionKey());
+            kinesis.put("sequenceNumber", source.getSequenceNumber());
             kinesis.put("approximateArrivalTimestamp",
-                    node.path("ApproximateArrivalTimestamp").asDouble());
-            kinesis.put("data", node.path("Data").asText());
+                    source.getApproximateArrivalTimestamp().toEpochMilli() / 1000.0);
+            kinesis.put("data", Base64.getEncoder().encodeToString(source.getData()));
             nodes.add(eventRecord);
         }
         return nodes;

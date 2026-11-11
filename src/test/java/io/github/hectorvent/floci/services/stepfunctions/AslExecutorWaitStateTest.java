@@ -329,4 +329,22 @@ class AslExecutorWaitStateTest {
             return sleeps.getFirst();
         }
     }
+
+
+    @Test
+    void timestampCenturiesAwayWaitsTheCappedTimeAndOneCenturiesAgoDoesNotWait() {
+        RecordingSleeper farFuture = new RecordingSleeper();
+        Execution future = run(newExecutor(farFuture, 120), """
+                {"StartAt":"W","States":{"W":{"Type":"Wait","Timestamp":"2400-01-01T00:00:00Z","End":true}}}
+                """, "{}");
+        assertEquals("SUCCEEDED", future.getStatus());
+        assertEquals(TimeUnit.SECONDS.toNanos(120), farFuture.singleSleep());
+
+        RecordingSleeper farPast = new RecordingSleeper();
+        Execution past = run(newExecutor(farPast, 120), """
+                {"StartAt":"W","States":{"W":{"Type":"Wait","Timestamp":"1700-01-01T00:00:00Z","End":true}}}
+                """, "{}");
+        assertEquals("SUCCEEDED", past.getStatus());
+        assertTrue(farPast.sleeps().isEmpty());
+    }
 }

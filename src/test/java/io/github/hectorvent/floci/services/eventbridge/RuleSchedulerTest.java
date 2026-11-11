@@ -173,6 +173,28 @@ class RuleSchedulerTest {
     }
 
     @SuppressWarnings("unchecked")
+    @Test
+    void aScheduledEventCarriesTheTimeOfTheSchedulerClock() throws Exception {
+        Vertx vertx = mock(Vertx.class);
+        ArgumentCaptor<Handler<Long>> fire = timerHandlerCaptor();
+        when(vertx.setTimer(anyLong(), fire.capture())).thenReturn(1L, 2L);
+        AtomicReference<String> delivered = new AtomicReference<>();
+        EventBridgeInvoker invoker = new EventBridgeInvoker(null, null, null, new ObjectMapper(), testConfig()) {
+            @Override
+            public void invokeTarget(Target target, String eventJson, String region, String ruleArn) {
+                delivered.set(eventJson);
+            }
+        };
+        Rule rule = enabledRule();
+        RuleScheduler scheduler = newScheduler(vertx, invoker);
+        scheduler.startScheduler(RULE_ARN, EVERY_MINUTE_CRON, () -> toScheduleData(rule));
+
+        fire.getValue().handle(1L);
+
+        assertEquals(JUST_BEFORE_MINUTE_BOUNDARY.toString(),
+                new ObjectMapper().readTree(delivered.get()).path("time").asText());
+    }
+
     private static ArgumentCaptor<Handler<Long>> timerHandlerCaptor() {
         return ArgumentCaptor.forClass(Handler.class);
     }

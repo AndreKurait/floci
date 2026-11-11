@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisShard;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisStream;
 import io.github.hectorvent.floci.testing.LockWaits;
+import io.github.hectorvent.floci.testing.ManualClock;
 import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
@@ -451,7 +452,8 @@ class KinesisServiceTest {
         Iterator<KinesisShard> reader = stream.getShards().iterator();
         reader.next();
 
-        kinesisService.splitShard("my-stream", shardId, "170141183460469231731687303715884105728", REGION);
+        // A quarter of the hash space: inside the first of the two shards, which ends below the half.
+        kinesisService.splitShard("my-stream", shardId, "85070591730234615865843651857942052864", REGION);
 
         // A plain ArrayList iterator throws ConcurrentModificationException here; COWAL keeps reading
         // its fixed pre-split snapshot.
@@ -1475,5 +1477,77 @@ class KinesisServiceTest {
 
     private static List<String> recordData(List<KinesisRecord> records) {
         return records.stream().map(r -> new String(r.getData(), StandardCharsets.UTF_8)).toList();
+    }
+
+    @Test
+    void updateShardCountLimitCoversTheTwentyFourHoursBeforeTheCallOnTheServiceClock() {
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        ManualClock clock = new ManualClock(start);
+        KinesisService service = new KinesisService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver(REGION, "000000000000"), clock);
+        service.createStream("scaled", 128, REGION);
+
+        service.updateShardCount("scaled", 129, "UNIFORM_SCALING", REGION);
+        clock.advance(Duration.ofHours(1));
+        for (int i = 1; i < 10; i++) {
+            service.updateShardCount("scaled", 128 + (i % 2 == 0 ? 1 : -1), "UNIFORM_SCALING", REGION);
+        }
+
+        clock.advance(Duration.ofHours(23).minusMillis(1));
+        AwsException tooSoon = assertThrows(AwsException.class,
+                () -> service.updateShardCount("scaled", 129, "UNIFORM_SCALING", REGION));
+        assertEquals("LimitExceededException", tooSoon.getErrorCode());
+
+        // Exactly 24 hours after the first update it is no longer inside the window, so one more fits.
+        clock.advance(Duration.ofMillis(1));
+        service.updateShardCount("scaled", 129, "UNIFORM_SCALING", REGION);
+        AwsException fullAgain = assertThrows(AwsException.class,
+                () -> service.updateShardCount("scaled", 127, "UNIFORM_SCALING", REGION));
+        assertEquals("LimitExceededException", fullAgain.getErrorCode());
+    }
+
+    @Test
+    void aStreamAndItsConsumerAreDatedOnTheServiceClock() {
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        ManualClock clock = new ManualClock(start);
+        KinesisService service = new KinesisService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver(REGION, "000000000000"), clock);
+
+        service.createStream("dated", 1, REGION);
+        KinesisStream stream = service.describeStream("dated", REGION);
+        assertEquals(start, stream.getStreamCreationTimestamp());
+
+        clock.advance(Duration.ofMinutes(5));
+        KinesisConsumer consumer = service.registerStreamConsumer(stream.getStreamArn(), "reader", REGION);
+        Instant registered = start.plus(Duration.ofMinutes(5));
+        assertEquals(registered, consumer.getConsumerCreationTimestamp());
+        assertEquals(stream.getStreamArn() + "/consumer/reader:" + registered.toEpochMilli(),
+                consumer.getConsumerArn());
+    }
+
+
+    @Test
+    void splitShardWithAStartingHashKeyItCannotUseLeavesTheShardOpen() {
+        kinesisService.createStream("unsplit", 1, REGION);
+        String shardId = "shardId-000000000000";
+
+        for (String unusable : List.of("not-a-number", "0", "340282366920938463463374607431768211456")) {
+            AwsException rejected = assertThrows(AwsException.class,
+                    () -> kinesisService.splitShard("unsplit", shardId, unusable, REGION), unusable);
+            assertEquals("InvalidArgumentException", rejected.getErrorCode(), unusable);
+        }
+
+        KinesisStream stream = kinesisService.describeStream("unsplit", REGION);
+        assertEquals(1, stream.getShards().size());
+        assertFalse(stream.getShards().getFirst().isClosed());
+        assertNotNull(kinesisService.putRecord("unsplit", new byte[]{1}, "pk", REGION));
+    }
+
+    @Test
+    void createStreamRejectsAShardCountBelowOne() {
+        AwsException rejected = assertThrows(AwsException.class,
+                () -> kinesisService.createStream("no-shards", 0, REGION));
+        assertEquals("ValidationException", rejected.getErrorCode());
+        assertThrows(AwsException.class, () -> kinesisService.describeStream("no-shards", REGION));
     }
 }

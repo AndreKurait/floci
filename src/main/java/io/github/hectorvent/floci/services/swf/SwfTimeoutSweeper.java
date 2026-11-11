@@ -86,7 +86,7 @@ public class SwfTimeoutSweeper {
     private void tick() {
         try {
             swfService.sweep();
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
             // A sweep failure must not kill the scheduled task; the next tick retries.
             LOG.error("SWF timeout sweep failed", e);
         }

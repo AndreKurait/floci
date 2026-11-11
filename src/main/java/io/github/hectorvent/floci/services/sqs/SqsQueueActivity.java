@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.sqs;
 
+import java.time.Clock;
 import java.time.Instant;
 
 /**
@@ -32,9 +33,15 @@ final class SqsQueueActivity {
     private Samples emptyReceives = Samples.NONE;
     private Samples deleted = Samples.NONE;
     private Instant lastActivity;
+    private final Clock clock;
+
+    /** Stamps each action on {@code clock}, the one the queue's messages are timed on. */
+    SqsQueueActivity(Clock clock) {
+        this.clock = clock;
+    }
 
     synchronized void accessed() {
-        lastActivity = Instant.now();
+        lastActivity = clock.instant();
     }
 
     /** A FIFO send that was deduplicated still counts as sent, as on AWS. */
@@ -42,7 +49,7 @@ final class SqsQueueActivity {
         sent = sent.add(1);
         sentSize = sentSize.add(size);
         deduplicated = deduplicated.add(wasDeduplicated ? 1 : 0);
-        lastActivity = Instant.now();
+        lastActivity = clock.instant();
     }
 
     synchronized void received(int messages) {
@@ -51,12 +58,12 @@ final class SqsQueueActivity {
         } else {
             received = received.add(messages);
         }
-        lastActivity = Instant.now();
+        lastActivity = clock.instant();
     }
 
     synchronized void deleted() {
         deleted = deleted.add(1);
-        lastActivity = Instant.now();
+        lastActivity = clock.instant();
     }
 
     /** Hands over the samples gathered since the previous call and starts the next tick empty. */

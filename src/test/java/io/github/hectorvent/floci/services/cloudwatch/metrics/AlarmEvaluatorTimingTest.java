@@ -262,4 +262,25 @@ class AlarmEvaluatorTimingTest {
         when(instance.iterator()).thenAnswer(invocation -> List.of(recording).iterator());
         return instance;
     }
+
+
+    @Test
+    void aTickThatEndsInAnErrorDoesNotStopTheNextOne() {
+        CloudWatchMetricsService failing = mock(CloudWatchMetricsService.class);
+        when(failing.allOwnedAlarms())
+                .thenThrow(new StackOverflowError("storage hiccup"))
+                .thenAnswer(invocation -> service.allOwnedAlarms());
+        ScheduledExecutorService ownScheduler = time.newScheduler();
+        AlarmEvaluator subject = new AlarmEvaluator(failing, handlers(), time.clock(), ownScheduler);
+        subject.start();
+        try {
+            time.advance(Duration.ofSeconds(5));
+            assertEquals(1, time.pendingTasks(), "the periodic tick is still scheduled after it failed");
+
+            time.advance(Duration.ofSeconds(10));
+            verify(failing, times(2)).allOwnedAlarms();
+        } finally {
+            subject.stop();
+        }
+    }
 }

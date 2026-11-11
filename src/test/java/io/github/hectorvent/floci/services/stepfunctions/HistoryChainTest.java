@@ -40,7 +40,7 @@ class HistoryChainTest {
         StepFunctionsService.ExecutionHistory history = new StepFunctionsService.ExecutionHistory();
         HistoryChain chain = HistoryChain.of(history);
         HistoryChain branch = chain.fork();
-        history.sealWith("ExecutionAborted", Map.of());
+        history.sealWith("ExecutionAborted", Map.of(), 0.0);
 
         assertDoesNotThrow(() -> {
             for (int i = 0; i < MAX_HISTORY_EVENTS; i++) {

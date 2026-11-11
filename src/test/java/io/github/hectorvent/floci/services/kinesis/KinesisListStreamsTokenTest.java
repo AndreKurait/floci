@@ -1,16 +1,20 @@
 package io.github.hectorvent.floci.services.kinesis;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.testing.ManualClock;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -162,5 +166,54 @@ class KinesisListStreamsTokenTest {
     private List<String> names(ObjectNode response) {
         return mapper.convertValue(response.path("StreamNames"),
                 mapper.getTypeFactory().constructCollectionType(List.class, String.class));
+    }
+
+
+    // The token is good for the configured five minutes, measured on the handler's clock: one
+    // millisecond before they are up it still pages, at the instant they are up it has expired.
+    @ParameterizedTest
+    @ValueSource(strings = {"ListStreams", "ListShards"})
+    void aNextTokenExpiresAtTheInstantItsConfiguredLifetimeIsUp(String operation) {
+        service.createStream("a", 3, REGION);
+        service.createStream("b", 1, REGION);
+        ManualClock clock = new ManualClock(Instant.parse("2026-01-01T00:00:00Z"));
+        KinesisJsonHandler timedHandler = new KinesisJsonHandler(service, mapper, 300_000, clock);
+        Map<String, ?> firstRequest = "ListStreams".equals(operation)
+                ? Map.of("Limit", 1) : Map.of("StreamName", "a", "MaxResults", 1);
+        String token;
+        try (Response first = timedHandler.handle(operation, mapper.valueToTree(firstRequest), REGION)) {
+            token = ((ObjectNode) first.getEntity()).path("NextToken").asText();
+        }
+        JsonNode nextPage = mapper.valueToTree(Map.of("NextToken", token));
+
+        clock.advance(Duration.ofMillis(299_999));
+        try (Response stillValid = timedHandler.handle(operation, nextPage, REGION)) {
+            assertEquals(200, stillValid.getStatus());
+        }
+
+        clock.advance(Duration.ofMillis(1));
+        AwsException error = assertThrows(AwsException.class, () -> timedHandler.handle(operation, nextPage, REGION));
+        assertEquals("ExpiredNextTokenException", error.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ListStreams", "ListShards"})
+    void aNextTokenIssuedAfterTheHandlersClockIsInvalid(String operation) {
+        service.createStream("a", 3, REGION);
+        service.createStream("b", 1, REGION);
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        KinesisJsonHandler issuer = new KinesisJsonHandler(service, mapper, 300_000,
+                new ManualClock(start.plusMillis(1)));
+        KinesisJsonHandler reader = new KinesisJsonHandler(service, mapper, 300_000, new ManualClock(start));
+        Map<String, ?> firstRequest = "ListStreams".equals(operation)
+                ? Map.of("Limit", 1) : Map.of("StreamName", "a", "MaxResults", 1);
+        String token;
+        try (Response first = issuer.handle(operation, mapper.valueToTree(firstRequest), REGION)) {
+            token = ((ObjectNode) first.getEntity()).path("NextToken").asText();
+        }
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> reader.handle(operation, mapper.valueToTree(Map.of("NextToken", token)), REGION));
+        assertEquals("InvalidArgumentException", error.getErrorCode());
     }
 }

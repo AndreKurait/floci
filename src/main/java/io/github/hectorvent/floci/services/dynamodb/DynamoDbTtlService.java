@@ -44,7 +44,7 @@ public class DynamoDbTtlService {
         }
         try {
             dynamoDbService.deleteExpiredItems();
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
             LOG.warnv(e, "DynamoDB TTL sweep failed; retrying on the next run");
         }
     }

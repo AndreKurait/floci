@@ -53,7 +53,7 @@ public class SqsRetentionSweeper {
     void sweep() {
         try {
             sqsService.deleteExpiredMessages();
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
             LOG.warnv(e, "SQS retention sweep failed; retrying on the next run");
         }
     }

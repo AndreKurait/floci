@@ -49,10 +49,10 @@ public final class ScheduleExpressionParser {
         String unit = rateMatcher.group(2).toLowerCase();
 
         return switch (unit) {
-            case "minute", "minutes" -> value * 60 * 1000L;
-            case "hour", "hours" -> value * 60 * 60 * 1000L;
-            case "day", "days" -> value * 24 * 60 * 60 * 1000L;
-            case "week", "weeks" -> value * 7 * 24 * 60 * 60 * 1000L;
+            case "minute", "minutes" -> value * 60L * 1000L;
+            case "hour", "hours" -> value * 60L * 60 * 1000L;
+            case "day", "days" -> value * 24L * 60 * 60 * 1000L;
+            case "week", "weeks" -> value * 7L * 24 * 60 * 60 * 1000L;
             default -> throw new IllegalArgumentException("Unknown rate unit: " + unit);
         };
     }

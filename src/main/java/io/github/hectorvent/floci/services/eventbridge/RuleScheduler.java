@@ -14,7 +14,6 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Clock;
-import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.UUID;
@@ -187,7 +186,7 @@ public class RuleScheduler implements Resettable {
 
     private String buildScheduledEvent(Rule rule, String region) {
         try {
-            ZonedDateTime now = ZonedDateTime.now(ZoneOffset.UTC);
+            ZonedDateTime now = ZonedDateTime.now(clock);
             ObjectNode node = objectMapper.createObjectNode();
             node.put("version", "0");
             node.put("id", UUID.randomUUID().toString());
