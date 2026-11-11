@@ -4,6 +4,13 @@
 
 Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB) through the ELBv2 management API. The control plane is AWS SDK / CLI / Terraform compatible. HTTP, HTTPS, and TCP listeners can forward to registered instance and IP targets using the target's reachable local address.
 
+Shutdown retires this emulator's ALB backend network helpers before shared VPC
+routing stops. Stored load balancers and their network interfaces remain available
+for runtime restoration on restart. Reset also retires those helpers; a failed
+removal stays visible and does not prevent cleanup of the other owned helpers.
+Startup restores the persisted VPC and subnet address plans before reconnecting
+the load balancers and starting dependent ECS tasks.
+
 ### Route 53 aliases
 
 A public Route 53 `A` alias to an existing Application Load Balancer resolves to

@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbRuntime;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.ecs.container.EcsTaskRoleCredentialsServer;
@@ -125,6 +126,7 @@ class EmulatorLifecycleTest {
     @Mock private DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
     @Mock private PipesService pipesService;
     @Mock private Ec2MetadataServer ec2MetadataServer;
+    @Mock private Ec2Service ec2Service;
     @Mock private EcsTaskRoleCredentialsServer ecsTaskRoleCredentialsServer;
     @Mock private EcrRegistryManager ecrRegistryManager;
     @Mock private FlociUiManager flociUiManager;
@@ -179,7 +181,8 @@ class EmulatorLifecycleTest {
                 rabbitMqManager, flinkContainerManager, rdsService, timestreamInfluxDbService,
                 elbV2Service, elbClassicService, ecsService,
                 initializationHooksRunner, sqsPoller, kinesisPoller, dynamodbStreamsPoller,
-                pipesService, ec2MetadataServer, ecsTaskRoleCredentialsServer, ecrRegistryManager, flociUiManager, initLifecycleState,
+                pipesService, ec2MetadataServer, ec2Service, ecsTaskRoleCredentialsServer,
+                ecrRegistryManager, flociUiManager, initLifecycleState,
                 schemaCreationWorker, stepFunctionsService, durableExecutionService, containerTeardowns,
                 persistentPathValidator,
                 dynamoDbRuntime, redshiftZeroEtlConsumer, eksService);
@@ -210,6 +213,24 @@ class EmulatorLifecycleTest {
         inOrder.verify(iamService).sweepOrphanedLambdaExecutionRoleSessions();
         inOrder.verify(iamService).sweepOrphanedEc2InstanceSessions();
         inOrder.verify(rdsService).restorePersistedRuntime();
+        verify(ec2Service, never()).restoreVpcNetworks();
+    }
+
+    @Test
+    void restoresNativeVpcPlansAfterStorageAndBeforeLoadBalancersAndTasks() {
+        stubStorageConfig();
+        when(ec2ServiceConfig.enabled()).thenReturn(true);
+        when(elbv2ServiceConfig.enabled()).thenReturn(true);
+        when(ecsServiceConfig.enabled()).thenReturn(true);
+        when(ec2MetadataServer.start()).thenReturn(CompletableFuture.completedFuture(null));
+
+        emulatorLifecycle.onStart(new StartupEvent());
+
+        InOrder order = Mockito.inOrder(storageFactory, ec2Service, elbV2Service, ecsService);
+        order.verify(storageFactory).loadAll();
+        order.verify(ec2Service).restoreVpcNetworks();
+        order.verify(elbV2Service).restorePersistedRuntime();
+        order.verify(ecsService).restorePersistedRuntime();
     }
 
     @Test

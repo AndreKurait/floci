@@ -4,7 +4,9 @@ import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
@@ -40,7 +42,7 @@ import java.util.stream.Stream;
 
 /** Owns the ALB's backend connections in its VPC, including its health-check traffic. */
 @ApplicationScoped
-public class ElbV2VpcNetworkManager {
+public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
     static final int PROXY_PORT = 1080;
     static final String ENI_LABEL = "io.floci.elbv2.network-interface";
     static final String BALANCER_LABEL = "io.floci.elbv2.load-balancer";
@@ -51,6 +53,7 @@ public class ElbV2VpcNetworkManager {
     private final VpcNetworkManager vpcNetworks;
     private final Map<String, List<Attachment>> attachments = new ConcurrentHashMap<>();
     private final AtomicInteger selection = new AtomicInteger();
+    private boolean draining;
 
     public ElbV2VpcNetworkManager(EmulatorConfig config, Ec2Service ec2,
                                 SecurityGroupFirewallManager firewall, ContainerLifecycleManager lifecycle,
@@ -70,6 +73,9 @@ public class ElbV2VpcNetworkManager {
     synchronized void reconcile(LoadBalancer balancer, Runnable persist) {
         if (!enabled() || !"application".equals(balancer.getType())) {
             return;
+        }
+        if (draining) {
+            throw new IllegalStateException("ALB backend networking is shutting down or resetting");
         }
         String account = AwsArnUtils.parse(balancer.getLoadBalancerArn()).accountId();
         RequestScopes.callAs(account, balancer.getRegion(), () -> {
@@ -234,6 +240,76 @@ public class ElbV2VpcNetworkManager {
                 .withLabelFilter(labels).exec()) {
             lifecycle.removeIfExistsStrict(helper.getId());
         }
+    }
+
+    /** Retire runtime helpers while preserving the stored load balancers and their ENIs for restart. */
+    @Override
+    public synchronized void stopManagedContainers() {
+        draining = true;
+        if (!enabled()) {
+            return;
+        }
+        Map<String, String> selection = Map.of(ContainerStorageHelper.OWNER_LABEL,
+                ContainerStorageHelper.ownerIdentity(config), ContainerStorageHelper.SERVICE_LABEL, "elbv2",
+                ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true");
+        RuntimeException failure = null;
+        for (Container helper : lifecycle.getDockerClient().listContainersCmd().withShowAll(true)
+                .withLabelFilter(selection).exec()) {
+            Map<String, String> labels = helper.getLabels();
+            if (labels == null || !labels.entrySet().containsAll(selection.entrySet())) {
+                continue;
+            }
+            try {
+                String eniId = labels.get(ENI_LABEL);
+                if (eniId == null || eniId.isBlank() || !labels.containsKey(BALANCER_LABEL)) {
+                    throw new IllegalStateException("ALB helper has no confirmed resource ownership");
+                }
+                try {
+                    firewall.unregister(eniId);
+                } catch (RuntimeException error) {
+                    try {
+                        lifecycle.removeIfExistsStrict(helper.getId());
+                    } catch (RuntimeException cleanupFailure) {
+                        error.addSuppressed(cleanupFailure);
+                    }
+                    throw error;
+                }
+                lifecycle.removeIfExistsStrict(helper.getId());
+                attachments.replaceAll((arn, current) -> current.stream()
+                        .filter(attachment -> !helper.getId().equals(attachment.helperId())).toList());
+                attachments.entrySet().removeIf(entry -> entry.getValue().isEmpty());
+            } catch (RuntimeException error) {
+                if (failure == null) {
+                    failure = new IllegalStateException("ALB backend helpers remain pending retirement");
+                }
+                failure.addSuppressed(error);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    @Override
+    public int teardownOrder() {
+        // Unregister ALB endpoints before the shared VPC routing teardown.
+        return -10;
+    }
+
+    @Override
+    public synchronized void beforeReset() {
+        draining = true;
+    }
+
+    @Override
+    public synchronized void clear() {
+        stopManagedContainers();
+        attachments.clear();
+    }
+
+    @Override
+    public synchronized void afterReset() {
+        draining = false;
     }
 
     BackendProxy proxy(String loadBalancerArn) {
