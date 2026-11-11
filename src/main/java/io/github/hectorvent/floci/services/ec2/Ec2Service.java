@@ -17352,69 +17352,73 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new AwsException("InvalidParameterValue",
                     "Value '" + device + "' for parameter device is invalid.", 400);
         }
-        Volume volume = getRequiredVolume(region, volumeId);
-        Instance inst = getRequiredInstance(region, instanceId);
-        if (volume.getManagedFilesystem() != null && volumeBlockDeviceManager == null) {
-            throw new AwsException("InternalError", "Managed volume support is unavailable", 500);
-        }
-        if (!List.of("running", "stopped").contains(inst.getState().getName())) {
-            throw new AwsException("IncorrectInstanceState",
-                    "The instance '" + inst.getInstanceId() + "' is not in a state from which it can be attached", 400);
-        }
-        if (!inst.getPlacement().getAvailabilityZone().equals(volume.getAvailabilityZone())) {
-            throw new AwsException(
-                    "InvalidParameterValue",
-                    "The volume '" + volume.getVolumeId() +
-                            "' and instance '" + inst.getInstanceId() +
-                            "' must be in the same Availability Zone", 400);
-        }
-        if (!"available".equals(volume.getState())) {
-            throw new AwsException("VolumeInUse",
-                    "Volume '" + volumeId + "' is already attached", 400);
-        }
-        // Check if instance already has an attached volume using this device name
-        String normalizedReqDev = device.startsWith("/") ? device : "/dev/" + device;
-        for (String k : volumes.keys()) {
-            Volume v = volumes.get(k).orElse(null);
-            if (v == null || !region.equals(v.getRegion()) || v.getAttachments().isEmpty()) {
-                continue;
+        // Under the volume's lock, as DeleteVolume and ModifyVolume are: the checks and the write are
+        // one step, so the volume cannot be deleted or attached elsewhere in between.
+        return withVolumeLock(volumeId, () -> {
+            Volume volume = getRequiredVolume(region, volumeId);
+            Instance inst = getRequiredInstance(region, instanceId);
+            if (volume.getManagedFilesystem() != null && volumeBlockDeviceManager == null) {
+                throw new AwsException("InternalError", "Managed volume support is unavailable", 500);
             }
-            for (VolumeAttachment existingAtt : v.getAttachments()) {
-                if (inst.getInstanceId().equals(existingAtt.getInstanceId())) {
-                    String existingDev = existingAtt.getDevice() != null && existingAtt.getDevice().startsWith("/")
-                            ? existingAtt.getDevice() : "/dev/" + existingAtt.getDevice();
-                    if (normalizedReqDev.equals(existingDev)) {
-                        throw new AwsException("InvalidParameterValue",
-                                "The device '" + device + "' is already in use by volume '" + v.getVolumeId() + "'", 400);
+            if (!List.of("running", "stopped").contains(inst.getState().getName())) {
+                throw new AwsException("IncorrectInstanceState",
+                        "The instance '" + inst.getInstanceId() + "' is not in a state from which it can be attached", 400);
+            }
+            if (!inst.getPlacement().getAvailabilityZone().equals(volume.getAvailabilityZone())) {
+                throw new AwsException(
+                        "InvalidParameterValue",
+                        "The volume '" + volume.getVolumeId() +
+                                "' and instance '" + inst.getInstanceId() +
+                                "' must be in the same Availability Zone", 400);
+            }
+            if (!"available".equals(volume.getState())) {
+                throw new AwsException("VolumeInUse",
+                        "Volume '" + volumeId + "' is already attached", 400);
+            }
+            // Check if instance already has an attached volume using this device name
+            String normalizedReqDev = device.startsWith("/") ? device : "/dev/" + device;
+            for (String k : volumes.keys()) {
+                Volume v = volumes.get(k).orElse(null);
+                if (v == null || !region.equals(v.getRegion()) || v.getAttachments().isEmpty()) {
+                    continue;
+                }
+                for (VolumeAttachment existingAtt : v.getAttachments()) {
+                    if (inst.getInstanceId().equals(existingAtt.getInstanceId())) {
+                        String existingDev = existingAtt.getDevice() != null && existingAtt.getDevice().startsWith("/")
+                                ? existingAtt.getDevice() : "/dev/" + existingAtt.getDevice();
+                        if (normalizedReqDev.equals(existingDev)) {
+                            throw new AwsException("InvalidParameterValue",
+                                    "The device '" + device + "' is already in use by volume '" + v.getVolumeId() + "'", 400);
+                        }
                     }
                 }
             }
-        }
 
-        VolumeAttachment attachment = new VolumeAttachment();
-        attachment.setVolumeId(volumeId);
-        attachment.setInstanceId(instanceId);
-        attachment.setDevice(device);
-        attachment.setState("attached");
-        attachment.setAttachTime(clock.instant());
-        attachment.setDeleteOnTermination(false); // Default for attached volumes
+            VolumeAttachment attachment = new VolumeAttachment();
+            attachment.setVolumeId(volumeId);
+            attachment.setInstanceId(instanceId);
+            attachment.setDevice(device);
+            attachment.setState("attached");
+            attachment.setAttachTime(clock.instant());
+            attachment.setDeleteOnTermination(false); // Default for attached volumes
 
-        volume.getAttachments().add(attachment);
-        volume.setState("in-use");
-        volumes.put(key(region, volumeId), volume);
+            volume.getAttachments().add(attachment);
+            volume.setState("in-use");
+            volumes.put(key(region, volumeId), volume);
 
-        if (volumeBlockDeviceManager != null) {
-            try {
-                volumeBlockDeviceManager.attachVolume(volume, inst, device);
-            } catch (RuntimeException failure) {
-                volume.getAttachments().remove(attachment);
-                volume.setState(volume.getAttachments().isEmpty() ? "available" : "in-use");
-                volumes.put(key(region, volumeId), volume);
-                throw failure;
+            if (volumeBlockDeviceManager != null) {
+                try {
+                    volumeBlockDeviceManager.attachVolume(volume, inst, device);
+                } catch (RuntimeException failure) {
+                    volume.getAttachments().remove(attachment);
+                    volume.setState(volume.getAttachments().isEmpty() ? "available" : "in-use");
+                    volumes.put(key(region, volumeId), volume);
+                    throw failure;
+                }
             }
-        }
 
-        return attachment;
+            return attachment;
+        });
     }
 
     public VolumeAttachment detachVolume(String region, String volumeId, String instanceId, String device, boolean force) {
@@ -17422,44 +17426,47 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new AwsException("MissingParameter", "The parameter VolumeId is missing", 400);
         }
         ensureDefaultResources(region);
-        Volume volume = getRequiredVolume(region, volumeId);
+        // Under the volume's lock, for the reason AttachVolume holds it.
+        return withVolumeLock(volumeId, () -> {
+            Volume volume = getRequiredVolume(region, volumeId);
 
-        if ("available".equals(volume.getState()) || volume.getAttachments().isEmpty()) {
-            throw new AwsException("InvalidVolume.NotAttached",
-                    "Volume '" + volumeId + "' is not attached", 400);
-        }
-        VolumeAttachment target = volume.getAttachments().getFirst();
-        if (instanceId != null && !target.getInstanceId().equals(instanceId)) {
-            throw new AwsException("InvalidAttachment.NotFound",
-                    "Volume '" + volumeId + "' is not attached to instance '" + instanceId + "'", 400);
-        }
-        if (device != null && !target.getDevice().equals(device)) {
-            throw new AwsException("InvalidAttachment.NotFound",
-                    "Volume '" + volumeId + "' is not attached with device '" + device + "'", 400);
-        }
-        Instance inst = getRequiredInstance(region, target.getInstanceId());
-        if (volume.getManagedFilesystem() != null && volumeBlockDeviceManager == null) {
-            throw new AwsException("InternalError", "Managed volume support is unavailable", 500);
-        }
-        if (!inst.getState().getName().equals("stopped") && target.getDevice().equals(inst.getRootDeviceName())) {
-            throw new AwsException("OperationNotPermitted",
-                    "The root volume of an instance cannot be detached while the instance is running", 400);
-        }
-        if (!force && target.getDevice().equals(inst.getRootDeviceName())) {
-            throw new AwsException("InvalidParameterCombination",
-                    "Device " + inst.getRootDeviceName() + " has the root partition on it. Detaching it will damage the " +
-                            "filesystem/partition tables. To force detachment, use the force parameter", 400);
-        }
-        if (volumeBlockDeviceManager != null) {
-            volumeBlockDeviceManager.detachVolume(volume, inst, target.getDevice());
-        }
+            if ("available".equals(volume.getState()) || volume.getAttachments().isEmpty()) {
+                throw new AwsException("InvalidVolume.NotAttached",
+                        "Volume '" + volumeId + "' is not attached", 400);
+            }
+            VolumeAttachment target = volume.getAttachments().getFirst();
+            if (instanceId != null && !target.getInstanceId().equals(instanceId)) {
+                throw new AwsException("InvalidAttachment.NotFound",
+                        "Volume '" + volumeId + "' is not attached to instance '" + instanceId + "'", 400);
+            }
+            if (device != null && !target.getDevice().equals(device)) {
+                throw new AwsException("InvalidAttachment.NotFound",
+                        "Volume '" + volumeId + "' is not attached with device '" + device + "'", 400);
+            }
+            Instance inst = getRequiredInstance(region, target.getInstanceId());
+            if (volume.getManagedFilesystem() != null && volumeBlockDeviceManager == null) {
+                throw new AwsException("InternalError", "Managed volume support is unavailable", 500);
+            }
+            if (!inst.getState().getName().equals("stopped") && target.getDevice().equals(inst.getRootDeviceName())) {
+                throw new AwsException("OperationNotPermitted",
+                        "The root volume of an instance cannot be detached while the instance is running", 400);
+            }
+            if (!force && target.getDevice().equals(inst.getRootDeviceName())) {
+                throw new AwsException("InvalidParameterCombination",
+                        "Device " + inst.getRootDeviceName() + " has the root partition on it. Detaching it will damage the " +
+                                "filesystem/partition tables. To force detachment, use the force parameter", 400);
+            }
+            if (volumeBlockDeviceManager != null) {
+                volumeBlockDeviceManager.detachVolume(volume, inst, target.getDevice());
+            }
 
-        target.setState("detached");
-        volume.getAttachments().clear();
-        volume.setState("available");
-        volumes.put(key(region, volumeId), volume);
+            target.setState("detached");
+            volume.getAttachments().clear();
+            volume.setState("available");
+            volumes.put(key(region, volumeId), volume);
 
-        return target;
+            return target;
+        });
     }
 
     private Volume getRequiredVolume(String region, String volumeId) {
