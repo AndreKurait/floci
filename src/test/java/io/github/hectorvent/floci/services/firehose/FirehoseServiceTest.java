@@ -1134,4 +1134,30 @@ class FirehoseServiceTest {
 
         assertEquals("hello\n", delivered("sink").text());
     }
+
+    @Test
+    void aDeliveryStreamIsCreatedAndUpdatedAtTheServiceClocksTime() {
+        S3Destination s3 = new S3Destination();
+        s3.setBucketArn("arn:aws:s3:::dated-bucket");
+        Instant beforeCreate = clock.instant();
+        firehoseService.createDeliveryStream("dated", s3);
+        Instant afterCreate = clock.instant();
+
+        Instant created = firehoseService.describeDeliveryStream("dated").getCreateTimestamp();
+        assertTrue(created.isAfter(beforeCreate) && created.isBefore(afterCreate),
+                "created at " + created + ", between " + beforeCreate + " and " + afterCreate);
+
+        clock.advance(Duration.ofHours(1));
+        S3Destination prefixOnly = new S3Destination();
+        prefixOnly.setPrefix("events/");
+        Instant beforeUpdate = clock.instant();
+        firehoseService.updateDestination("dated", "1", "destinationId-000000000001", prefixOnly);
+        Instant afterUpdate = clock.instant();
+
+        DeliveryStreamDescription described = firehoseService.describeDeliveryStream("dated");
+        Instant updated = described.getLastUpdateTimestamp();
+        assertTrue(updated.isAfter(beforeUpdate) && updated.isBefore(afterUpdate),
+                "updated at " + updated + ", between " + beforeUpdate + " and " + afterUpdate);
+        assertEquals(created, described.getCreateTimestamp());
+    }
 }
