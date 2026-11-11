@@ -79,4 +79,21 @@ class CloudFormationYamlParserTest {
         JsonNode shorthand = parse("Value: !GetAtt [Vpc, !Ref AttributeName]\n");
         assertEquals("AttributeName", shorthand.get("Value").get("Fn::GetAtt").get(1).get("Ref").asText());
     }
+
+    @Test
+    void unquotedDatesStayText() throws Exception {
+        JsonNode node = parse("""
+            AWSTemplateFormatVersion: 2010-09-09
+            Resources:
+              Policy:
+                Properties:
+                  PolicyDocument:
+                    Version: 2012-10-17
+            """);
+        assertTrue(node.get("AWSTemplateFormatVersion").isTextual());
+        assertEquals("2010-09-09", node.get("AWSTemplateFormatVersion").asText());
+        JsonNode version = node.get("Resources").get("Policy").get("Properties").get("PolicyDocument").get("Version");
+        assertTrue(version.isTextual());
+        assertEquals("2012-10-17", version.asText());
+    }
 }
