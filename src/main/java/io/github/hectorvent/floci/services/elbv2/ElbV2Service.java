@@ -1504,7 +1504,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 return th;
             }
             int port = ElbV2HealthChecker.effectivePort(t, tg);
-            th.setHealthCheckPort(String.valueOf(port));
+            th.setHealthCheckPort(String.valueOf(ElbV2HealthChecker.healthCheckPort(tg, port)));
             if (hasFilterTargets && !isRegisteredTarget(tg, t, port)) {
                 th.setState("unused");
                 th.setReason("Target.NotRegistered");
