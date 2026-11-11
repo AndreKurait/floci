@@ -175,7 +175,7 @@ public class CloudWatchMetricsJsonHandler {
     private Response handleListMetrics(JsonNode request, String region) {
         String namespace = request.has("Namespace") ? request.path("Namespace").asText() : null;
         String metricName = request.has("MetricName") ? request.path("MetricName").asText() : null;
-        List<Dimension> dimensions = parseDimensionsJson(request.path("Dimensions"));
+        List<Dimension> dimensions = parseDimensionFiltersJson(request.path("Dimensions"));
 
         JsonNode tokenNode = request.get("NextToken");
         if (tokenNode != null && !tokenNode.isNull() && !tokenNode.isTextual()) {
@@ -836,6 +836,18 @@ public class CloudWatchMetricsJsonHandler {
             datums.add(datum);
         }
         return datums;
+    }
+
+    private List<Dimension> parseDimensionFiltersJson(JsonNode node) {
+        List<Dimension> filters = new ArrayList<>();
+        if (!node.isArray()) {
+            return filters;
+        }
+        for (JsonNode dimension : node) {
+            String value = dimension.has("Value") ? dimension.path("Value").asText() : null;
+            filters.add(new Dimension(dimension.path("Name").asText(), value));
+        }
+        return filters;
     }
 
     private List<Dimension> parseDimensionsJson(JsonNode node) {
