@@ -1147,7 +1147,7 @@ public class CodeDeployService {
                 CodeDeployAgentDeployment.Outcome outcome = new CodeDeployAgentDeployment.Outcome(
                         "Failed", "NoInstancesReachable", "No instances found for deployment group");
                 if (agent == null) {
-                    outcome.publish(deployment);
+                    outcome.publish(deployment, clock);
                 } else {
                     completeAgentDeployment(deployment, agent, outcome);
                 }
@@ -1267,7 +1267,7 @@ public class CodeDeployService {
             } finally {
                 activeAgentDeployments.remove(scope, deployment.getDeploymentId());
                 agentDeploymentContexts.remove(deployment.getDeploymentId(), context);
-                outcome.publish(deployment);
+                outcome.publish(deployment, clock);
             }
         }
     }
