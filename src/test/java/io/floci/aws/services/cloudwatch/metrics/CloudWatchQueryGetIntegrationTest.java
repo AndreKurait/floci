@@ -17,6 +17,8 @@ import static org.hamcrest.Matchers.equalTo;
 @QuarkusTest
 class CloudWatchQueryGetIntegrationTest {
 
+    private static final String OWN_ALARM_PREFIX = "cw-query-get-own-";
+
     private static String authorization(String service) {
         return "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/" + service + "/aws4_request";
     }
@@ -108,15 +110,24 @@ class CloudWatchQueryGetIntegrationTest {
     }, nullValues = "OMITTED")
     void versionSelectsTheCurrentOrLegacyOperations(String method, String action, String version, int status) {
         RequestSpecification request = given().header("Authorization", authorization("monitoring"));
+        // The app is shared with other test classes. The legacy DescribeAlarms refuses any returned alarm
+        // that is defined with Metrics, so the request names this class's own prefix and never sees theirs.
+        boolean describeAlarms = "DescribeAlarms".equals(action);
         if ("POST".equals(method)) {
             request.contentType("application/x-www-form-urlencoded").formParam("Action", action);
             if (version != null) {
                 request.formParam("Version", version);
             }
+            if (describeAlarms) {
+                request.formParam("AlarmNamePrefix", OWN_ALARM_PREFIX);
+            }
         } else {
             request.queryParam("Action", action);
             if (version != null) {
                 request.queryParam("Version", version);
+            }
+            if (describeAlarms) {
+                request.queryParam("AlarmNamePrefix", OWN_ALARM_PREFIX);
             }
         }
         if (status == 200) {
