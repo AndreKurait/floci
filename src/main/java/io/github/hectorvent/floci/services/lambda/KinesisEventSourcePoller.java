@@ -560,6 +560,10 @@ public class KinesisEventSourcePoller implements Resettable {
 
     private void advanceCheckpoint(EventSourceMapping esm, String shardId, String newestSeq) {
         esm.getShardSequenceNumbers().put(shardId, newestSeq);
+        if (esmStore.getForAccount(esm.getAccountId(), esm.getUuid()).isEmpty()) {
+            // Deleted while its batch was with the function: saving it would bring the mapping back.
+            return;
+        }
         esmStore.saveForAccount(esm.getAccountId(), esm);
     }
 

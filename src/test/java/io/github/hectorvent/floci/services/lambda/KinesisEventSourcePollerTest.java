@@ -1027,6 +1027,23 @@ class KinesisEventSourcePollerTest {
     }
 
     @Test
+    void mappingDeletedDuringASuccessfulInvokeIsNotSavedBackIntoTheStore() {
+        stubShard("s1");
+        EventSourceMapping esm = esm();
+        recordInvocations(seqs -> {
+            // DeleteEventSourceMapping while the function runs: stop, delete from the store, drop the tombstone.
+            poller.stopPolling(esm.getUuid());
+            storedMapping.set(Optional.empty());
+            poller.mappingDeleted(esm.getUuid());
+            return new InvokeResult();
+        });
+
+        pollOnce(esm);
+
+        verify(esmStore, never()).saveForAccount(anyString(), any());
+    }
+
+    @Test
     void startPersistedPollersSkipsAnEnabledMappingWithoutAnEventSourceArn() {
         EventSourceMapping selfManagedKafka = new EventSourceMapping();
         selfManagedKafka.setUuid("kafka-esm");
