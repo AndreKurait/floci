@@ -64,4 +64,18 @@ class SwfTimeoutSweeperTest {
             throw new AssertionError("Unexpected configuration access: " + invocation.getMethod());
         });
     }
+
+
+    @Test
+    void aSweepThatEndsInAnErrorDoesNotStopTheOnesAfterIt() {
+        TestTime time = TestTime.create();
+        SwfService service = mock(SwfService.class);
+        doThrow(new StackOverflowError("history too deep")).doNothing().when(service).sweep();
+        new SwfTimeoutSweeper(service, configWithInterval(1L), time.scheduler()).onStart(new StartupEvent());
+
+        time.advance(Duration.ofSeconds(1));
+        verify(service, times(1)).sweep();
+        time.advance(Duration.ofSeconds(1));
+        verify(service, times(2)).sweep();
+    }
 }
