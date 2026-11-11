@@ -857,8 +857,9 @@ public class AppSyncService {
         ns.setChannelNamespaceArn(regionResolver.buildArn("appsync", apiRegion(api),
             "apis/" + apiId + "/channelNamespaces/" + name));
         ns.setCodeHandlers((String) request.get("codeHandlers"));
-        ns.setCreated(System.currentTimeMillis());
-        ns.setLastModified(System.currentTimeMillis());
+        long createdMillis = clock.millis();
+        ns.setCreated(createdMillis);
+        ns.setLastModified(createdMillis);
         channelNamespaceStore.put(nsKey, ns);
         return ns;
     }
@@ -874,7 +875,7 @@ public class AppSyncService {
         ChannelNamespace existing = getChannelNamespace(apiId, name);
         if (request.containsKey("description")) existing.setDescription((String) request.get("description"));
         if (request.containsKey("codeHandlers")) existing.setCodeHandlers((String) request.get("codeHandlers"));
-        existing.setLastModified(System.currentTimeMillis());
+        existing.setLastModified(clock.millis());
         channelNamespaceStore.put(apiKey(apiId, name), existing);
         return existing;
     }

@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizer
 import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizerResult;
 import io.github.hectorvent.floci.services.appsync.model.ApiKey;
 import io.github.hectorvent.floci.services.appsync.model.AuthenticationType;
+import io.github.hectorvent.floci.services.appsync.model.ChannelNamespace;
 import io.github.hectorvent.floci.services.appsync.model.DomainName;
 import io.github.hectorvent.floci.services.appsync.model.FunctionConfiguration;
 import io.github.hectorvent.floci.services.appsync.model.GraphqlApi;
@@ -704,5 +705,21 @@ class AppSyncServiceTest {
         assertEquals("kept", svc.getGraphqlApi(api.getApiId()).getName());
         assertEquals(SchemaCreationStatusType.PROCESSING,
                 svc.getSchemaCreationStatus(api.getApiId()).getStatus());
+    }
+
+    @Test
+    void channelNamespaceTimestampsComeFromTheInjectedClock() {
+        AppSyncServiceFixture.MutableClock clock = new AppSyncServiceFixture.MutableClock(NOW);
+        AppSyncService svc = AppSyncServiceFixture.create(clock);
+        GraphqlApi api = svc.createGraphqlApi(Map.of("name", "events", "authenticationType", "API_KEY"), "us-east-1");
+
+        ChannelNamespace created = svc.createChannelNamespace(api.getApiId(), Map.of("name", "ns"));
+        assertEquals(NOW.toEpochMilli(), created.getCreated());
+        assertEquals(NOW.toEpochMilli(), created.getLastModified());
+
+        clock.set(NOW.plus(Duration.ofMinutes(5)));
+        ChannelNamespace updated = svc.updateChannelNamespace(api.getApiId(), "ns", Map.of("description", "d"));
+        assertEquals(NOW.toEpochMilli(), updated.getCreated());
+        assertEquals(NOW.plus(Duration.ofMinutes(5)).toEpochMilli(), updated.getLastModified());
     }
 }
