@@ -70,6 +70,22 @@ class StackSetServiceTest {
     }
 
     @Test
+    void deletingAStackSetRemovesItsOperations() {
+        String operationId = "11111111-2222-3333-4444-555555555555";
+        service.createStackInstances(SET, List.of(ACCOUNT), List.of(REGION), List.of(), operationId);
+        service.deleteStackInstances(SET, List.of(ACCOUNT), List.of(REGION), false);
+        service.deleteStackSet(SET);
+
+        service.createStackSet(SET, TEMPLATE, null, null, null, null);
+
+        assertThat(service.listStackSetOperations(SET), is(empty()));
+        // The new stack set has never seen this operation id.
+        StackSetOperation reused =
+                service.createStackInstances(SET, List.of(ACCOUNT), List.of(REGION), List.of(), operationId);
+        assertEquals(operationId, reused.getOperationId());
+    }
+
+    @Test
     void operationTimestampsComeFromTheInjectedClock() {
         StackSetOperation create = service.createStackInstances(SET, List.of(ACCOUNT), List.of(REGION));
         assertEquals(START, create.getCreationTimestamp());
