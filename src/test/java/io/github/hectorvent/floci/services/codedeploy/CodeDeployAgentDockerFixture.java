@@ -1,7 +1,6 @@
 package io.github.hectorvent.floci.services.codedeploy;
 
 import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.command.BuildImageResultCallback;
 import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.services.ec2.AmiImageResolver;
@@ -113,7 +112,7 @@ abstract class CodeDeployAgentDockerFixture {
     @TempDir Path imageContext;
 
     @BeforeEach
-    @Timeout(value = 5, unit = TimeUnit.MINUTES)
+    @Timeout(value = 5, unit = TimeUnit.MINUTES) // Allows the 90-second download and 180-second cold image build.
     void prepareOfficialAgentImage() throws Exception {
         assumeTrue(DockerAvailability.isAvailable(), "Docker is required for the AWS CodeDeploy agent");
         if (agentImage != null) {
@@ -154,8 +153,9 @@ abstract class CodeDeployAgentDockerFixture {
         long buildStarted = System.nanoTime();
         LOG.infof("Building CodeDeploy fixture image under owned tag %s", agentImageTag);
         imageBuildStarted = true;
-        try (BuildImageResultCallback build = docker.buildImageCmd(imageContext.toFile()).withTags(Set.of(agentImageTag))
-                .withBuildArg("BASE_IMAGE", TestImages.UBUNTU_NOBLE).start()) {
+        try (CodeDeployImageBuild build = new CodeDeployImageBuild()) {
+            docker.buildImageCmd(imageContext.toFile()).withTags(Set.of(agentImageTag))
+                    .withBuildArg("BASE_IMAGE", TestImages.UBUNTU_NOBLE).exec(build);
             agentImage = build.awaitImageId(180, TimeUnit.SECONDS);
             LOG.infof("CodeDeploy fixture image build completed in %d ms",
                     TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - buildStarted));

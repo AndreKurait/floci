@@ -1,40 +1,61 @@
 # AppConfig compatibility clock
 
-Build the compatibility image with `./mvnw clean package -Pcompat-clock -DskipTests`.
-Add `-Dnative` when building the native compatibility executable. Release builds
-must omit `compat-clock`; the file clock is an additional source directory that
-ordinary builds do not compile. Use `clean` when switching build profiles so a
-previous compatibility build cannot leave test classes in the output directory.
+Install the isolated fixture, then package Floci with the `compat-clock` profile:
 
-The profile replaces only the qualified AppConfig deployment clock. Everything
-else, including authentication and certificate clocks, retains real time. Without
-`FLOCI_TEST_APPCONFIG_CLOCK_FILE`, the compatibility build also uses real time.
-No HTTP control endpoint or AWS protocol change is involved.
+```sh
+./mvnw -f compatibility-tests/clock/pom.xml clean install
+./mvnw clean package -Pcompat-clock -DskipTests
+```
+
+Add `-Dnative` for the native compatibility executable. Ordinary builds omit
+`compat-clock` and therefore have no dependency on the fixture jar. Its classes
+are compiled in the fixture's own `target` directory, never the application's
+`target/classes`, including when switching profiles without cleaning.
+`CompatClockBuildTest` in the root test suite fails if the fixture's Quarkus
+version differs from the root POM, or if the fixture becomes a dependency
+outside the profile.
+
+The profile replaces the qualified clock used throughout `AppConfigService`.
+Everything else, including authentication and certificate clocks, retains real
+time. Without `FLOCI_TEST_APPCONFIG_CLOCK_FILE`, the compatibility build also
+uses real time.
+An invalid configured timestamp fails when the clock is first used; it does not
+fall back to real time. No HTTP control endpoint or AWS protocol change is involved.
 
 To run the Python SDK suite without rollout and bake sleeps:
 
-1. Run `mkdir -p /tmp/floci-appconfig-clock`, then initialize `instant` in UTC:
-   `date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/floci-appconfig-clock/instant`.
+1. Create a private test directory with `clock_dir=$(mktemp -d)`, make it readable
+   by the Floci container with `chmod 755 "$clock_dir"`, and initialize `instant`:
+   `date -u +%Y-%m-%dT%H:%M:%SZ > "$clock_dir/instant"`.
 2. Mount that directory at `/test-clock` in both Floci and the Python SDK client,
    read-only in Floci and writable in the client.
 3. Set `FLOCI_TEST_APPCONFIG_CLOCK_FILE=/test-clock/instant` in both containers.
-4. Run the existing SDK suite normally. The compatibility workflow does this
+4. Set `FLOCI_TEST_REQUIRE_APPCONFIG_CLOCK=true` in the SDK client to fail immediately
+   if the clock path is missing.
+5. Run the existing SDK suite normally. The compatibility workflow does this
    automatically for its Python jobs.
 
 Mount the directory, not the file: tests atomically replace `instant` to ensure
 background readers never observe a partially written timestamp. The fixture
 advances time monotonically and verifies Floci's deployment timestamps before
-using it. Do not run tests sharing this clock in parallel, or attach unrelated
-clients to this test Floci instance.
+using it. The fixture rejects xdist workers and concurrent processes sharing the
+clock, using a separate lock file that survives atomic timestamp replacement.
+Use a dedicated Floci instance and clock directory for each suite; unrelated
+clients must not share this test instance.
 
-The tests still use real AWS SDK requests. They check intermediate rollout
-percentages, the pre-deadline states, exact completion timestamps, both retrieval
-APIs after rollback, and CloudFormation's asynchronous resource/stack transitions.
-Without the environment variable they retain the real-time path.
+The tests use real AWS SDK requests. They check the state just before the baking
+boundary, advance beyond it, and verify the exact scheduled completion timestamp.
+They exercise both retrieval APIs after rollback and reversion, including a
+deleted previous version in both baking and completed states. Without either
+environment variable, the suite retains its real-time path: one completed case
+waits out a real one-minute bake and the other three are skipped.
 
 Run clock and lifecycle unit tests with:
 
 ```sh
-./mvnw test -Pcompat-clock \
-  -Dtest=FileClockTest,AppConfigDeploymentLifecycleTest,CloudFormationAppConfigDeploymentLifecycleTest
+./mvnw -f compatibility-tests/clock/pom.xml test
+./mvnw test -Dtest=AppConfigDeploymentLifecycleTest
 ```
+
+The compatibility workflow runs the fixture unit tests before building its native
+image. Release builds do not need to install the fixture.

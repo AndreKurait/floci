@@ -14,7 +14,10 @@ public class AppConfigTestClockProducer {
     @Produces
     @Identifier("appconfig")
     public Clock appConfigClock() {
-        String file = System.getenv("FLOCI_TEST_APPCONFIG_CLOCK_FILE");
+        return configuredClock(System.getenv("FLOCI_TEST_APPCONFIG_CLOCK_FILE"));
+    }
+
+    static Clock configuredClock(String file) {
         if (file == null || file.isBlank()) {
             return Clock.systemUTC();
         }
