@@ -468,29 +468,13 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             Thread.currentThread().interrupt();
         }
         drainTaskStopper();
-        for (String taskArn : new ArrayList<>(taskHandles.keySet())) {
-            if (taskStops.containsKey(taskArn)) {
-                // Only after an interrupted drain: stopping its containers beside that stop would race it.
-                LOG.warnv("Leaving ECS task {0} to the stop still running for it", taskArn);
-                continue;
+        try (ExecutorService shutdownStopper = newTaskStopper()) {
+            List<CompletableFuture<Void>> stops = new ArrayList<>();
+            for (String taskArn : new ArrayList<>(taskHandles.keySet())) {
+                stops.add(CompletableFuture.runAsync(() -> RequestScopes.runAs(taskAccountId(taskArn),
+                        () -> stopTaskOnShutdown(taskArn)), shutdownStopper));
             }
-            EcsTaskHandle claimed = taskHandles.remove(taskArn);
-            if (claimed == null) {
-                continue;
-            }
-            try {
-                containerManager.stopTask(claimed);
-                for (int attempt = 0; attempt < 2 && claimed.hasTaskVolumes(); attempt++) {
-                    containerManager.cleanupStoppedTask(claimed);
-                }
-            } catch (Exception e) {
-                LOG.warnv("Failed to stop ECS task {0} on shutdown: {1}", taskArn, e.getMessage());
-            } finally {
-                if (claimed.hasTaskVolumes()) {
-                    taskHandles.put(taskArn, claimed);
-                    shutdownCleanupTasks.add(taskArn);
-                }
-            }
+            CompletableFuture.allOf(stops.toArray(CompletableFuture[]::new)).join();
         }
         // Task state is memory-only, so an ENI left behind here would outlive every task that
         // could claim it and reload from EC2's store as an orphan on the next start.
@@ -500,6 +484,31 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             } catch (Exception e) {
                 LOG.warnv("Failed to release the ENI of ECS task {0} on shutdown: {1}",
                         task.getTaskArn(), e.getMessage());
+            }
+        }
+    }
+
+    private void stopTaskOnShutdown(String taskArn) {
+        if (taskStops.containsKey(taskArn)) {
+            // Only after an interrupted drain: stopping its containers beside that stop would race it.
+            LOG.warnv("Leaving ECS task {0} to the stop still running for it", taskArn);
+            return;
+        }
+        EcsTaskHandle claimed = taskHandles.remove(taskArn);
+        if (claimed == null) {
+            return;
+        }
+        try {
+            containerManager.stopTask(claimed);
+            for (int attempt = 0; attempt < 2 && claimed.hasTaskVolumes(); attempt++) {
+                containerManager.cleanupStoppedTask(claimed);
+            }
+        } catch (Exception e) {
+            LOG.warnv("Failed to stop ECS task {0} on shutdown: {1}", taskArn, e.getMessage());
+        } finally {
+            if (claimed.hasTaskVolumes()) {
+                taskHandles.put(taskArn, claimed);
+                shutdownCleanupTasks.add(taskArn);
             }
         }
     }
