@@ -50,6 +50,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -69,6 +70,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -76,6 +78,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiPredicate;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -107,6 +110,10 @@ public class Ec2ContainerManager {
     static final int SSH_HOST_KEYS_MAX_BYTES = 16 * 1024;
     private static final int SSH_HOST_KEYS_STDERR_BYTES = 1024;
     private static final long USER_DATA_EXECUTION_TIMEOUT_MINUTES = 30;
+    /** How often failed teardowns are checked for a backoff that has passed. */
+    private static final long TERMINATION_RETRY_SWEEP_SECONDS = 1;
+    /** The teardown backoff doubles from one second up to this. */
+    private static final int TERMINATION_RETRY_MAX_DELAY_SECONDS = 30;
     private static final Pattern ENVIRONMENT_KEY = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
     private static final Pattern PROCESS_LIMIT = Pattern.compile("([a-z][a-z0-9]*)=(-1|[0-9]+)(?::(-1|[0-9]+))?");
     private static final Set<String> RESERVED_GUEST_ENVIRONMENT = Set.of(
@@ -192,8 +199,11 @@ public class Ec2ContainerManager {
     private final Map<String, PendingTermination> pendingTerminations = new ConcurrentHashMap<>();
     private final Map<String, FailedLaunchCleanup> failedLaunchCleanups = new ConcurrentHashMap<>();
     private final AtomicBoolean terminationRetriesStarted = new AtomicBoolean();
-    private final SweepWorker terminationRetries = new SweepWorker(
-            "ec2-termination-retry", true, 1, false, this::retryPendingTerminations);
+    private final SweepWorker terminationRetries;
+    /** Stamps the instant an instance reached terminated, which pruning later measures from. */
+    private final Clock clock;
+    /** Measures the backoff between teardown retries, which is elapsed time and not a date. */
+    private final LongSupplier nanoTime;
     /** Instances whose service-network lookup failed and is retried on the next address read. */
     private final Set<String> serviceNetworkRetries = ConcurrentHashMap.newKeySet();
     private final Set<String> serviceNetworkRetriesRunning = ConcurrentHashMap.newKeySet();
@@ -310,10 +320,68 @@ public class Ec2ContainerManager {
                                VpcNetworkManager vpcNetworkManager,
                                ContainerReachableEndpoint reachableEndpoint,
                                SecurityGroupFirewallManager firewallManager,
+                               Ec2InstanceTypeCatalog instanceTypeCatalog,
+                               Clock clock) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver, dockerClient,
+                portAllocator, config, metadataServer, portForwardManager, regionResolver,
+                containerNetworkReachability, vpcNetworkManager, reachableEndpoint, firewallManager,
+                instanceTypeCatalog, Ec2ContainerPause.THREAD_SLEEP, createTerminationRetryScheduler(),
+                System::nanoTime, clock);
+    }
+
+    public Ec2ContainerManager(ContainerBuilder containerBuilder,
+                               ContainerLifecycleManager lifecycleManager,
+                               ContainerLogStreamer logStreamer,
+                               ContainerDetector containerDetector,
+                               DockerHostResolver dockerHostResolver,
+                               DockerClient dockerClient,
+                               PortAllocator portAllocator,
+                               EmulatorConfig config,
+                               Ec2MetadataServer metadataServer,
+                               Ec2PortForwardManager portForwardManager,
+                               RegionResolver regionResolver,
+                               ContainerNetworkReachability containerNetworkReachability,
+                               VpcNetworkManager vpcNetworkManager,
+                               ContainerReachableEndpoint reachableEndpoint,
+                               SecurityGroupFirewallManager firewallManager,
                                Ec2InstanceTypeCatalog instanceTypeCatalog) {
         this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver,
                 dockerClient, portAllocator, config, metadataServer, portForwardManager, regionResolver,
                 containerNetworkReachability, vpcNetworkManager, reachableEndpoint, instanceTypeCatalog);
+        this.firewallManager = firewallManager;
+    }
+
+    /**
+     * The injected wiring with every time source supplied, for tests that own the timeline: the
+     * pauses, the timer that retries a failed teardown, the monotonic reading its backoff is measured
+     * on, and the clock that stamps a termination.
+     */
+    Ec2ContainerManager(ContainerBuilder containerBuilder,
+                        ContainerLifecycleManager lifecycleManager,
+                        ContainerLogStreamer logStreamer,
+                        ContainerDetector containerDetector,
+                        DockerHostResolver dockerHostResolver,
+                        DockerClient dockerClient,
+                        PortAllocator portAllocator,
+                        EmulatorConfig config,
+                        Ec2MetadataServer metadataServer,
+                        Ec2PortForwardManager portForwardManager,
+                        RegionResolver regionResolver,
+                        ContainerNetworkReachability containerNetworkReachability,
+                        VpcNetworkManager vpcNetworkManager,
+                        ContainerReachableEndpoint reachableEndpoint,
+                        SecurityGroupFirewallManager firewallManager,
+                        Ec2InstanceTypeCatalog instanceTypeCatalog,
+                        Ec2ContainerPause pause,
+                        ScheduledExecutorService terminationRetryScheduler,
+                        LongSupplier nanoTime,
+                        Clock clock) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver, dockerClient,
+                portAllocator, config, metadataServer, portForwardManager, regionResolver,
+                containerNetworkReachability, vpcNetworkManager, reachableEndpoint, instanceTypeCatalog,
+                createLaunchExecutor(), createServiceNetworkRetryExecutor(),
+                Duration.ofMinutes(USER_DATA_EXECUTION_TIMEOUT_MINUTES), pause, terminationRetryScheduler,
+                nanoTime, clock);
         this.firewallManager = firewallManager;
     }
 
@@ -448,7 +516,40 @@ public class Ec2ContainerManager {
                         ExecutorService serviceNetworkRetryExecutor,
                         Duration userDataExecutionTimeout,
                         Ec2ContainerPause pause) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver, dockerClient,
+                portAllocator, config, metadataServer, portForwardManager, regionResolver,
+                containerNetworkReachability, vpcNetworkManager, reachableEndpoint, instanceTypeCatalog,
+                executor, serviceNetworkRetryExecutor, userDataExecutionTimeout, pause,
+                createTerminationRetryScheduler(), System::nanoTime, Clock.systemUTC());
+    }
+
+    Ec2ContainerManager(ContainerBuilder containerBuilder,
+                        ContainerLifecycleManager lifecycleManager,
+                        ContainerLogStreamer logStreamer,
+                        ContainerDetector containerDetector,
+                        DockerHostResolver dockerHostResolver,
+                        DockerClient dockerClient,
+                        PortAllocator portAllocator,
+                        EmulatorConfig config,
+                        Ec2MetadataServer metadataServer,
+                        Ec2PortForwardManager portForwardManager,
+                        RegionResolver regionResolver,
+                        ContainerNetworkReachability containerNetworkReachability,
+                        VpcNetworkManager vpcNetworkManager,
+                        ContainerReachableEndpoint reachableEndpoint,
+                        Ec2InstanceTypeCatalog instanceTypeCatalog,
+                        ExecutorService executor,
+                        ExecutorService serviceNetworkRetryExecutor,
+                        Duration userDataExecutionTimeout,
+                        Ec2ContainerPause pause,
+                        ScheduledExecutorService terminationRetryScheduler,
+                        LongSupplier nanoTime,
+                        Clock clock) {
         this.pause = pause;
+        this.clock = clock;
+        this.nanoTime = nanoTime;
+        this.terminationRetries = new SweepWorker("ec2-termination-retry", TERMINATION_RETRY_SWEEP_SECONDS, false,
+                this::retryPendingTerminations, terminationRetryScheduler, clock);
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -502,6 +603,15 @@ public class Ec2ContainerManager {
      */
     static ExecutorService createServiceNetworkRetryExecutor() {
         return Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("ec2-service-network-retry-", 0).factory());
+    }
+
+    /** The daemon timer thread that re-submits teardowns whose backoff has passed. */
+    static ScheduledExecutorService createTerminationRetryScheduler() {
+        return Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread thread = new Thread(task, "ec2-termination-retry");
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     static ExecutorService createLaunchExecutor() {
@@ -1127,6 +1237,10 @@ public class Ec2ContainerManager {
                         && instance.getDockerContainerId() == null
                         && instance.getSshHostPort() <= 0
                         && (instance.getContainerBridgeIp() == null || instance.getContainerBridgeIp().isBlank());
+                if (instance.getTerminatedAt() <= 0) {
+                    // Stamped before the state so nobody sees a terminated instance without it.
+                    instance.setTerminatedAt(clock.millis());
+                }
                 instance.setState(InstanceState.terminated());
                 if (alreadyCleaned) {
                     return;
@@ -2081,9 +2195,10 @@ public class Ec2ContainerManager {
         }
     }
 
-    private void retryPendingTerminations(Instant now) {
+    private void retryPendingTerminations(Instant ignored) {
+        long now = nanoTime.getAsLong();
         pendingTerminations.values().stream()
-                .filter(pending -> !now.isBefore(pending.retryAt))
+                .filter(pending -> pending.retryArmed && now - pending.retryAtNanos >= 0)
                 .forEach(this::submitTermination);
         failedLaunchCleanups.values().forEach(this::submitFailedLaunchCleanup);
     }
@@ -2133,8 +2248,11 @@ public class Ec2ContainerManager {
                         if ("terminated".equals(pending.instance.getState().getName())) {
                             pendingTerminations.remove(instanceId, pending);
                         } else {
-                            pending.retryAt = Instant.now().plusSeconds(pending.retryDelaySeconds);
-                            pending.retryDelaySeconds = Math.min(30, pending.retryDelaySeconds * 2);
+                            pending.retryAtNanos = nanoTime.getAsLong()
+                                    + TimeUnit.SECONDS.toNanos(pending.retryDelaySeconds);
+                            pending.retryArmed = true;
+                            pending.retryDelaySeconds = Math.min(
+                                    TERMINATION_RETRY_MAX_DELAY_SECONDS, pending.retryDelaySeconds * 2);
                             startTerminationRetries();
                         }
                     } finally {
@@ -2152,7 +2270,9 @@ public class Ec2ContainerManager {
         private final Instance instance;
         private final Runnable operation;
         private final AtomicBoolean executing = new AtomicBoolean();
-        private volatile Instant retryAt = Instant.MAX;
+        /** Whether an attempt has failed, so that {@link #retryAtNanos} holds a deadline. */
+        private volatile boolean retryArmed;
+        private volatile long retryAtNanos;
         private int retryDelaySeconds = 1;
 
         private PendingTermination(Instance instance, Runnable operation) {
@@ -2248,7 +2368,7 @@ public class Ec2ContainerManager {
                 vpcNetworkManager.releasePrivateIp(instance.getRegion(), instance.getSubnetId(),
                         instance.getPrivateIpAddress());
                 instance.setState(InstanceState.terminated());
-                instance.setTerminatedAt(System.currentTimeMillis());
+                instance.setTerminatedAt(clock.millis());
             } finally {
                 if (afterTeardown != null && containerGone && notified.compareAndSet(false, true)) {
                     try {

@@ -1233,7 +1233,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 Map<String, Rule> regionRules = rules.computeIfAbsent(region, ignored -> new ConcurrentHashMap<>());
                 List<String> ruleArns = listenerToRules.remove(listenerArn);
                 if (ruleArns != null) {
-                    ruleArns.forEach(regionRules::remove);
+                    for (String ruleArn : ruleArns) {
+                        regionRules.remove(ruleArn);
+                        tags.remove(ruleArn);
+                    }
                 }
                 listeners.put(region, regionListeners);
                 rules.put(region, regionRules);
@@ -1453,7 +1456,17 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         Rule rule = requireRule(region, ruleArn);
         String listenerArn = rule.getListenerArn();
         if (conditions != null) rule.setConditions(new ArrayList<>(conditions));
-        if (actions != null)    rule.setActions(new ArrayList<>(actions));
+        if (actions != null) {
+            rule.setActions(new ArrayList<>(actions));
+            Listener listener = listeners.getOrDefault(region, Map.of()).get(listenerArn);
+            if (listener != null) {
+                // The target groups the rule now forwards to are in use; the ones it left are not.
+                for (Action action : rule.getActions()) {
+                    linkTgToLb(action, listener.getLoadBalancerArn());
+                }
+                unlinkUnreferencedTargetGroups(region, listener.getLoadBalancerArn());
+            }
+        }
         persistRegion(rules, region);
         dataPlane.recompileRules(listenerArn, () -> getListenerRules(region, listenerArn));
         return rule;
@@ -1579,7 +1592,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 return th;
             }
             int port = ElbV2HealthChecker.effectivePort(t, tg);
-            th.setHealthCheckPort(String.valueOf(port));
+            th.setHealthCheckPort(String.valueOf(ElbV2HealthChecker.healthCheckPort(tg, port)));
             if (hasFilterTargets && !isRegisteredTarget(tg, t, port)) {
                 th.setState("unused");
                 th.setReason("Target.NotRegistered");
@@ -2107,7 +2120,17 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             greenTuple.setWeight(greenWeightPct);
             action.setTargetGroups(List.of(blueTuple, greenTuple));
         }
-        defaultRule.setActions(List.of(action));
+        defaultRule.setActions(new ArrayList<>(List.of(action)));
+        Listener listener = listeners.getOrDefault(region, Map.of()).get(listenerArn);
+        if (listener != null) {
+            // The listener answers with the same default action as its default rule, and the
+            // target groups it now forwards to are in use; the ones it left are not.
+            listener.setDefaultActions(new ArrayList<>(List.of(action)));
+            linkTgToLb(action, listener.getLoadBalancerArn());
+            unlinkUnreferencedTargetGroups(region, listener.getLoadBalancerArn());
+            persistRegion(listeners, region);
+        }
+        persistRegion(rules, region);
         dataPlane.recompileRules(listenerArn, () -> getListenerRules(region, listenerArn));
     }
 

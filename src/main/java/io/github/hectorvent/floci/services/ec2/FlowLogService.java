@@ -566,8 +566,8 @@ public class FlowLogService {
         String ts = FILE_TS_FMT.format(when);
         String file = fl.getAccountId() + "_vpcflowlogs_" + fl.getRegion() + "_" + fl.getFlowLogId()
                 + "_" + ts + "_" + randomHex(8) + ".log.gz";
-        return String.format("AWSLogs/%s/vpcflowlogs/%s/%s/%s",
-                fl.getAccountId(), fl.getRegion(), datePath, file);
+        return String.format("%sAWSLogs/%s/vpcflowlogs/%s/%s/%s",
+                keyPrefixFromArn(fl.getLogDestination()), fl.getAccountId(), fl.getRegion(), datePath, file);
     }
 
     private static byte[] gzip(String content) {
@@ -619,6 +619,23 @@ public class FlowLogService {
         String name = AwsArnUtils.resourceIfArnFor(arn, "s3").orElse(arn);
         int slash = name.indexOf('/');
         return slash >= 0 ? name.substring(0, slash) : name;
+    }
+
+    /**
+     * The folder a destination names after its bucket, ending in {@code /}, or the empty string
+     * when it names the bucket alone. The files go under it, ahead of {@code AWSLogs/}.
+     */
+    static String keyPrefixFromArn(String arn) {
+        if (arn == null) {
+            return "";
+        }
+        String name = AwsArnUtils.resourceIfArnFor(arn, "s3").orElse(arn);
+        int slash = name.indexOf('/');
+        String folder = slash >= 0 ? name.substring(slash + 1) : "";
+        while (folder.endsWith("/")) {
+            folder = folder.substring(0, folder.length() - 1);
+        }
+        return folder.isEmpty() ? "" : folder + "/";
     }
 
     /** Random peer IP: ~half inside the same /16 (intra-VPC), half "external". */

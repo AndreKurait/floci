@@ -642,7 +642,11 @@ public class ElbV2QueryHandler {
             String arn = p.getFirst("RulePriorities.member." + i + ".RuleArn");
             String priorityStr = p.getFirst("RulePriorities.member." + i + ".Priority");
             if (arn == null) break;
-            arnToPriority.put(arn, Integer.parseInt(priorityStr));
+            if (priorityStr == null) {
+                throw new AwsException("ValidationError",
+                        "RulePriorities.member." + i + ".Priority is required.", 400);
+            }
+            arnToPriority.put(arn, parseInt(priorityStr));
             i++;
         }
         service.setRulePriorities(region, arnToPriority);
@@ -1044,33 +1048,33 @@ public class ElbV2QueryHandler {
         XmlBuilder xml = new XmlBuilder();
         xml.elem("Field", safe(c.getField()));
         xml.start("Values");
-        for (String v : c.getValues()) xml.start("member").raw(v).end("member");
+        for (String v : c.getValues()) xml.elem("member", v);
         xml.end("Values");
         if (!c.getHostHeaderValues().isEmpty()) {
             xml.start("HostHeaderConfig").start("Values");
-            for (String v : c.getHostHeaderValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHostHeaderValues()) xml.elem("member", v);
             xml.end("Values").end("HostHeaderConfig");
         }
         if (!c.getPathPatternValues().isEmpty()) {
             xml.start("PathPatternConfig").start("Values");
-            for (String v : c.getPathPatternValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getPathPatternValues()) xml.elem("member", v);
             xml.end("Values").end("PathPatternConfig");
         }
         if (c.getHttpHeaderName() != null) {
             xml.start("HttpHeaderConfig")
                .elem("HttpHeaderName", c.getHttpHeaderName())
                .start("Values");
-            for (String v : c.getHttpHeaderValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHttpHeaderValues()) xml.elem("member", v);
             xml.end("Values").end("HttpHeaderConfig");
         }
         if (!c.getHttpMethodValues().isEmpty()) {
             xml.start("HttpRequestMethodConfig").start("Values");
-            for (String v : c.getHttpMethodValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHttpMethodValues()) xml.elem("member", v);
             xml.end("Values").end("HttpRequestMethodConfig");
         }
         if (!c.getSourceIpValues().isEmpty()) {
             xml.start("SourceIpConfig").start("Values");
-            for (String v : c.getSourceIpValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getSourceIpValues()) xml.elem("member", v);
             xml.end("Values").end("SourceIpConfig");
         }
         if (!c.getQueryStringValues().isEmpty()) {
@@ -1188,7 +1192,7 @@ public class ElbV2QueryHandler {
             Action a = new Action();
             a.setType(type);
             String orderStr = p.getFirst(prefix + ".member." + i + ".Order");
-            if (orderStr != null) a.setOrder(Integer.parseInt(orderStr));
+            if (orderStr != null) a.setOrder(parseInt(orderStr));
 
             switch (type) {
                 case "forward" -> {
@@ -1203,7 +1207,7 @@ public class ElbV2QueryHandler {
                         Action.TargetGroupTuple t = new Action.TargetGroupTuple();
                         t.setTargetGroupArn(tgArnW);
                         String wStr = p.getFirst(prefix + ".member." + i + ".ForwardConfig.TargetGroups.member." + j + ".Weight");
-                        if (wStr != null) t.setWeight(Integer.parseInt(wStr));
+                        if (wStr != null) t.setWeight(parseInt(wStr));
                         tuples.add(t);
                         j++;
                     }
@@ -1211,7 +1215,7 @@ public class ElbV2QueryHandler {
                     String stickyEnabled = p.getFirst(prefix + ".member." + i + ".ForwardConfig.TargetGroupStickinessConfig.Enabled");
                     if (stickyEnabled != null) a.setStickinessEnabled(Boolean.parseBoolean(stickyEnabled));
                     String stickyDuration = p.getFirst(prefix + ".member." + i + ".ForwardConfig.TargetGroupStickinessConfig.DurationSeconds");
-                    if (stickyDuration != null) a.setStickinessDurationSeconds(Integer.parseInt(stickyDuration));
+                    if (stickyDuration != null) a.setStickinessDurationSeconds(parseInt(stickyDuration));
                 }
                 case "redirect" -> {
                     a.setRedirectProtocol(p.getFirst(prefix + ".member." + i + ".RedirectConfig.Protocol"));
@@ -1452,7 +1456,7 @@ public class ElbV2QueryHandler {
             TargetDescription t = new TargetDescription();
             t.setId(id);
             String portStr = p.getFirst("Targets.member." + i + ".Port");
-            if (portStr != null) t.setPort(Integer.parseInt(portStr));
+            if (portStr != null) t.setPort(parseInt(portStr));
             t.setAvailabilityZone(p.getFirst("Targets.member." + i + ".AvailabilityZone"));
             result.add(t);
             i++;
@@ -1493,7 +1497,15 @@ public class ElbV2QueryHandler {
 
     private static Integer parseIntOrNull(String s) {
         if (s == null || s.isEmpty()) return null;
-        return Integer.parseInt(s);
+        return parseInt(s);
+    }
+
+    private static int parseInt(String s) {
+        try {
+            return Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationError", "'" + s + "' is not a valid integer.", 400);
+        }
     }
 
     private static Boolean parseBoolOrNull(String s) {

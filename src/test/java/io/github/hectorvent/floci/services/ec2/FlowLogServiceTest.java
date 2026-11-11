@@ -279,6 +279,33 @@ class FlowLogServiceTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void theFilesGoUnderTheFolderTheDestinationNames() {
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        when(ec2Service.callerAccountId()).thenReturn("000000000000");
+        when(ec2Service.describeInstances(any(), any(), anyMap()))
+                .thenReturn(List.of(reservation("us-east-1")));
+        when(ec2Service.endpointNetworkInterfaces(any())).thenReturn(List.of());
+        S3Service s3Service = mock(S3Service.class);
+        FlowLogService service = new FlowLogService(ec2Service, s3Service, new InMemoryStorage<>());
+
+        service.createFlowLog("us-east-1", "vpc-123", "VPC", "ALL", "s3",
+                "arn:aws:s3:::bkt/network/flows/", null, null, 600);
+        service.createFlowLog("us-east-1", "vpc-123", "VPC", "ALL", "s3",
+                "arn:aws:s3:::plain", null, null, 600);
+
+        ArgumentCaptor<String> inFolder = ArgumentCaptor.forClass(String.class);
+        verify(s3Service).putObject(eq("bkt"), inFolder.capture(), any(byte[].class), anyString(), any(Map.class));
+        assertTrue(inFolder.getValue().startsWith("network/flows/AWSLogs/000000000000/vpcflowlogs/us-east-1/"),
+                inFolder.getValue());
+        ArgumentCaptor<String> atTheRoot = ArgumentCaptor.forClass(String.class);
+        verify(s3Service).putObject(eq("plain"), atTheRoot.capture(), any(byte[].class), anyString(),
+                any(Map.class));
+        assertTrue(atTheRoot.getValue().startsWith("AWSLogs/000000000000/vpcflowlogs/us-east-1/"),
+                atTheRoot.getValue());
+    }
+
+    @Test
     void aLogsArnNamesItsLogGroup() {
         assertEquals("/aws/flows", FlowLogService.logGroupFromArn("arn:aws:logs:us-east-1:000000000000:log-group:/aws/flows:*"));
         assertEquals("flows", FlowLogService.logGroupFromArn("arn:aws-cn:logs:cn-north-1:000000000000:log-group:flows"));

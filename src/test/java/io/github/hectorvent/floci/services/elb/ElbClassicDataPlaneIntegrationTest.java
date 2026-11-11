@@ -79,6 +79,9 @@ class ElbClassicDataPlaneIntegrationTest {
     ElbClassicService elb;
 
     @Inject
+    ElbClassicHealthChecker health;
+
+    @Inject
     Vertx vertx;
 
     @BeforeEach
@@ -378,13 +381,16 @@ class ElbClassicDataPlaneIntegrationTest {
                 .formParam("Instances.member.1.InstanceId", instanceId).post("/").then().statusCode(200);
     }
 
+    /** Runs the armed checks instead of waiting out the five-second interval; the probes stay real. */
     private void awaitHealth(String state) {
         await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100))
                 .pollDelay(Duration.ZERO)
-                .untilAsserted(() ->
-                        elb("DescribeInstanceHealth").formParam("LoadBalancerName", name).post("/").then().statusCode(200)
-                                .body("DescribeInstanceHealthResponse.DescribeInstanceHealthResult.InstanceStates.member.State",
-                                        equalTo(state)));
+                .untilAsserted(() -> {
+                    health.runArmedChecks();
+                    elb("DescribeInstanceHealth").formParam("LoadBalancerName", name).post("/").then().statusCode(200)
+                            .body("DescribeInstanceHealthResponse.DescribeInstanceHealthResult.InstanceStates.member.State",
+                                    equalTo(state));
+                });
     }
 
     private String createZone(String account) {

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.elb;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.concurrent.DeadlineWaits;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
@@ -76,6 +77,7 @@ public class ElbClassicHealthChecker implements Resettable {
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
     private final ElbClassicFrontendManager frontends;
+    private final DeadlineWaits probeDeadline;
     private final SSLSocketFactory backendTls = backendTls();
 
     // "account|region|lbName" → instanceId → state
@@ -97,10 +99,17 @@ public class ElbClassicHealthChecker implements Resettable {
     @Inject
     public ElbClassicHealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
                                   ElbClassicFrontendManager frontends) {
+        this(vertx, config, ec2Service, frontends, DeadlineWaits.SYSTEM);
+    }
+
+    /** The timeout of a direct probe is counted on {@code probeDeadline}. */
+    ElbClassicHealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
+                            ElbClassicFrontendManager frontends, DeadlineWaits probeDeadline) {
         this.vertx = vertx;
         this.config = config;
         this.ec2Service = ec2Service;
         this.frontends = frontends;
+        this.probeDeadline = probeDeadline;
     }
 
     /**
@@ -395,11 +404,10 @@ public class ElbClassicHealthChecker implements Resettable {
         if (host == null) {
             return false;
         }
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
         FutureTask<Boolean> attempt = new FutureTask<>(() -> probeTransport(host, target, timeoutSeconds));
         Thread.ofVirtual().name("classic-elb-health-probe").start(attempt);
         try {
-            return attempt.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+            return probeDeadline.get(attempt, TimeUnit.SECONDS.toNanos(timeoutSeconds));
         } catch (TimeoutException e) {
             return false;
         } catch (InterruptedException e) {

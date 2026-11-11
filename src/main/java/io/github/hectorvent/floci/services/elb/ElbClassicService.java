@@ -684,6 +684,10 @@ public class ElbClassicService implements ServerCertificateReferenceProvider, Em
             throw new AwsException("InvalidConfigurationRequest",
                     "Connection draining timeout must be between 1 and 3600 seconds.", 400);
         }
+        if (update.idleTimeout() != null && (update.idleTimeout() < 1 || update.idleTimeout() > 4000)) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "Idle timeout must be between 1 and 4000 seconds.", 400);
+        }
         try (RuntimeWrite ignored = runtimeWrite(region, name)) {
             ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
             update.applyTo(lb.getAttributes());
@@ -1131,6 +1135,10 @@ public class ElbClassicService implements ServerCertificateReferenceProvider, Em
             throw new AwsException("ValidationError",
                     "InstancePort must be between 1 and 65535.", 400);
         }
+        if (listener.getLoadBalancerPort() < 1 || listener.getLoadBalancerPort() > 65535) {
+            throw new AwsException("ValidationError",
+                    "LoadBalancerPort must be between 1 and 65535.", 400);
+        }
     }
 
     /**
@@ -1142,6 +1150,13 @@ public class ElbClassicService implements ServerCertificateReferenceProvider, Em
         if (hc.getTarget() == null || hc.getTarget().isBlank()) {
             throw new AwsException("ValidationError",
                     "HealthCheck.Target is required.", 400);
+        }
+        ElbClassicHealthChecker.Target target = ElbClassicHealthChecker.Target.parse(hc.getTarget());
+        if (target == null || target.port() < 1 || target.port() > 65535) {
+            // A target the checker cannot read is never probed.
+            throw new AwsException("ValidationError",
+                    "HealthCheck.Target must be HTTP, HTTPS, TCP or SSL, a colon and a port between 1 and 65535,"
+                            + " for example HTTP:80/health.", 400);
         }
         requireRange("HealthCheck.Interval", hc.getInterval(), 5, 300);
         requireRange("HealthCheck.Timeout", hc.getTimeout(), 2, 60);

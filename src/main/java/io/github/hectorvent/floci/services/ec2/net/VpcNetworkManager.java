@@ -17,6 +17,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -70,6 +71,10 @@ public class VpcNetworkManager {
     static final String ADDRESS_SPACE_LABEL = "io.floci.vpc.address-space";
     static final String CIDR_LABEL = "io.floci.vpc.cidr";
     private static final String NATIVE_IPV4 = "native-ipv4";
+    /** How often the removal of a network is tried before it is left to the next startup. */
+    private static final int NETWORK_REMOVAL_ATTEMPTS = 5;
+    /** How long a refused network removal waits before it is tried again. */
+    private static final Duration NETWORK_REMOVAL_RETRY_DELAY = Duration.ofSeconds(2);
 
     /**
      * Instance addresses start here inside each subnet slice. AWS reserves the first four
@@ -111,20 +116,30 @@ public class VpcNetworkManager {
     private final AtomicBoolean warnedPrefixClamp =
             new AtomicBoolean();
 
-    private final ScheduledExecutorService retries = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "ec2-vpc-network-teardown");
-        t.setDaemon(true);
-        return t;
-    });
+    /** Runs the retries of a network removal that Docker refused, each NETWORK_REMOVAL_RETRY_DELAY after the last. */
+    private final ScheduledExecutorService retries;
 
     @Inject
     public VpcNetworkManager(EmulatorConfig config, DockerClient dockerClient,
                              CurrentContainerNetworkResolver currentContainerNetworkResolver,
                              RegionResolver regionResolver) {
+        this(config, dockerClient, currentContainerNetworkResolver, regionResolver,
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "ec2-vpc-network-teardown");
+                    t.setDaemon(true);
+                    return t;
+                }));
+    }
+
+    /** As the constructor above, with the retries of a refused network removal run on {@code retries}. */
+    VpcNetworkManager(EmulatorConfig config, DockerClient dockerClient,
+                      CurrentContainerNetworkResolver currentContainerNetworkResolver,
+                      RegionResolver regionResolver, ScheduledExecutorService retries) {
         this.config = config;
         this.dockerClient = dockerClient;
         this.currentContainerNetworkResolver = currentContainerNetworkResolver;
         this.regionResolver = regionResolver;
+        this.retries = retries;
     }
 
     public VpcNetworkManager(EmulatorConfig config, DockerClient dockerClient,
@@ -1024,9 +1039,9 @@ public class VpcNetworkManager {
             // nothing to do
         } catch (Exception e) {
             // Containers terminated moments earlier still hold endpoints for a beat.
-            if (attempt < 5 && !retries.isShutdown()) {
+            if (attempt < NETWORK_REMOVAL_ATTEMPTS && !retries.isShutdown()) {
                 retries.schedule(() -> removeNetworkWithRetry(networkName, flociContainerId, attempt + 1),
-                        2, TimeUnit.SECONDS);
+                        NETWORK_REMOVAL_RETRY_DELAY.toNanos(), TimeUnit.NANOSECONDS);
                 return;
             }
             LOG.warnv("Could not remove Docker network {0} after {1} attempts: {2}. It will be reconciled "

@@ -71,6 +71,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -192,7 +193,7 @@ class Ec2ContainerManagerTest {
                 mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
                 mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 mock(ContainerReachableEndpoint.class), firewall, new Ec2InstanceTypeCatalog(),
-                timelinePause(time));
+                timelinePause(time), time.newScheduler(), time::nanoTime, time.clock());
         Instance instance = instance("i-firewall-teardown");
         instance.setDockerContainerId(TEST_CONTAINER_ID);
         InstanceNetworkInterface eni = new InstanceNetworkInterface();
@@ -245,14 +246,28 @@ class Ec2ContainerManagerTest {
         CountDownLatch completed = new CountDownLatch(1);
         try {
             manager.terminate(instance, completed::countDown);
+            boolean retried = transientFailure || peerRefreshFailure;
+            if (retried) {
+                // The failed attempt arms the retry timer as its last act, on the teardown worker.
+                awaitUntil(() -> time.pendingTasks() == 1, Duration.ofSeconds(5));
+                // A removal that succeeded was followed by the half second the network teardown lags it.
+                Instant failedAt = TestTime.DEFAULT_START.plusMillis(peerRefreshFailure ? 500 : 0);
+                assertEquals(failedAt, time.now());
+                time.advance(Duration.ofMillis(999));
+                assertEquals(1, removals.get(), "The first retry waits a full second");
+                assertEquals(1, completed.getCount());
+                time.advance(Duration.ofMillis(1));
+            }
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             assertEquals("terminated", instance.getState().getName());
             assertTrue(helperRemoved.get());
             verify(firewall).captureUnregister("eni-firewall-teardown");
             verify(firewallCleanup, times(peerRefreshFailure ? 2 : 1)).run();
-            assertEquals(transientFailure || peerRefreshFailure ? 2 : 1, removals.get());
-            // Every removal that succeeds is followed by the half second the network teardown lags it.
-            assertEquals(TestTime.DEFAULT_START.plusMillis(peerRefreshFailure ? 1_000 : 500), time.now());
+            assertEquals(retried ? 2 : 1, removals.get());
+            // The retry comes one second after the failure, and each successful removal adds its lag.
+            assertEquals(TestTime.DEFAULT_START.plusMillis(
+                    peerRefreshFailure ? 2_000 : transientFailure ? 1_500 : 500), time.now());
+            assertEquals(time.clock().millis(), instance.getTerminatedAt());
         } finally {
             manager.stop();
         }
@@ -1760,6 +1775,20 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void anInstanceWhoseLaunchFailedCarriesItsTerminationTime() throws Exception {
+        LaunchHarness harness = launchHarness();
+        when(harness.builder.build()).thenThrow(new IllegalStateException("daemon went away"));
+        Instance instance = leasedInstance("i-failed-launch");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        // The retention of a terminated instance is counted from this stamp; without it the
+        // instance is never old enough to be pruned.
+        assertEquals(harness.time.clock().millis(), instance.getTerminatedAt());
+    }
+
+    @Test
     void launchReturnsTheLeaseWhenTheLaunchThrows() throws Exception {
         LaunchHarness harness = launchHarness();
         when(harness.builder.build()).thenThrow(new IllegalStateException("daemon went away"));
@@ -2229,6 +2258,10 @@ class Ec2ContainerManagerTest {
             verify(harness.vpcNetworkManager, never()).releasePrivateIp(any(), any(), any());
 
             dockerRecovered.set(true);
+            harness.time().advance(Duration.ofMillis(999));
+            verify(harness.lifecycleManager).removeIfExistsStrict(TEST_CONTAINER_ID);
+            assertEquals(1, reclaimed.getCount(), "The retry sweep runs once a second");
+            harness.time().advance(Duration.ofMillis(1));
             assertTrue(reclaimed.await(5, TimeUnit.SECONDS),
                     "Cleanup must resume after Docker recovers without another cancel request");
             verify(harness.lifecycleManager).removeIfExistsStrict(TEST_INIT_HELPER_ID);
@@ -2616,7 +2649,14 @@ class Ec2ContainerManagerTest {
             assertEquals(0, completed.get());
             verify(harness.portAllocator, never()).release(2201);
 
-            awaitUntil(() -> completed.get() == 1, Duration.ofSeconds(5));
+            harness.time().advance(Duration.ofMillis(999));
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+            assertEquals("shutting-down", instance.getState().getName(), "The retry waits a full second");
+            assertEquals(0, completed.get());
+            verify(harness.lifecycleManager).removeIfExistsStrict(TEST_HELPER_ID);
+
+            harness.time().advance(Duration.ofMillis(1));
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
 
             assertEquals("terminated", instance.getState().getName());
             assertEquals(1, completed.get());
@@ -3524,7 +3564,7 @@ class Ec2ContainerManagerTest {
                 executor != null ? executor : Ec2ContainerManager.createLaunchExecutor(),
                 Ec2ContainerManager.createServiceNetworkRetryExecutor(),
                 userDataTimeout,
-                timelinePause(time));
+                timelinePause(time), time.newScheduler(), time::nanoTime, time.clock());
         ContainerLifecycleManager.ContainerInfo helper = new ContainerLifecycleManager.ContainerInfo(TEST_HELPER_ID, Map.of());
         when(lifecycleManager.createAndStart(any(ContainerSpec.class))).thenReturn(helper);
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
@@ -3876,6 +3916,45 @@ class Ec2ContainerManagerTest {
         awaitUntil(ran::get, Duration.ofSeconds(2));
     }
 
+    @Test
+    void failedTeardownIsRetriedWithABackoffThatDoublesFromOneSecondUpToThirty() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        try {
+            stubDockerPing(harness.dockerClient(), false);
+            Instance instance = leasedInstance("i-teardown-backoff");
+            harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+            instance.setDockerContainerId(TEST_CONTAINER_ID);
+            RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+            when(harness.dockerClient().removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+            AtomicInteger attempts = new AtomicInteger();
+            doAnswer(invocation -> {
+                attempts.incrementAndGet();
+                throw new DockerException("daemon is still refusing the removal", 500);
+            }).when(remove).exec();
+
+            harness.manager().terminate(instance);
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+            assertEquals(1, attempts.get());
+
+            int expected = 1;
+            for (int delaySeconds : new int[] {1, 2, 4, 8, 16, 30, 30}) {
+                harness.time().advance(Duration.ofSeconds(delaySeconds).minusMillis(1));
+                executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+                assertEquals(expected, attempts.get(),
+                        "No retry before " + delaySeconds + " seconds have passed since the last failure");
+
+                harness.time().advance(Duration.ofMillis(1));
+                executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+                expected++;
+                assertEquals(expected, attempts.get(), "A retry once " + delaySeconds + " seconds have passed");
+            }
+            assertEquals("shutting-down", instance.getState().getName());
+        } finally {
+            harness.manager().stop();
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void transientRemovalFailureCompletesWithoutAnotherTerminationRequest(boolean alreadyAbsent) throws Exception {
@@ -3914,9 +3993,17 @@ class Ec2ContainerManagerTest {
             verify(harness.vpcNetworkManager(), never())
                     .releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
             allowRemoval.countDown();
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
 
-            awaitUntil(() -> callbacks.get() == 1, Duration.ofSeconds(5));
+            harness.time().advance(Duration.ofMillis(999));
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+            assertEquals(1, attempts.get(), "The retry waits a full second");
+            assertEquals(0, callbacks.get());
 
+            harness.time().advance(Duration.ofMillis(1));
+            executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
+
+            assertEquals(1, callbacks.get());
             assertEquals("terminated", instance.getState().getName());
             assertEquals(2, attempts.get());
             verify(harness.portAllocator()).release(2201);

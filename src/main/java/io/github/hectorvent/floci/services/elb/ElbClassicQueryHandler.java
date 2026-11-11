@@ -187,7 +187,11 @@ public class ElbClassicQueryHandler {
     private Response deleteListeners(MultivaluedMap<String, String> p, String region) {
         List<Integer> ports = new ArrayList<>();
         for (String port : memberList(p, "LoadBalancerPorts")) {
-            ports.add(Integer.parseInt(port));
+            try {
+                ports.add(Integer.valueOf(port));
+            } catch (NumberFormatException e) {
+                throw new AwsException("ValidationError", "'" + port + "' is not a valid integer.", 400);
+            }
         }
         service.deleteLoadBalancerListeners(region, requireName(p), ports);
         return emptyResult("DeleteLoadBalancerListeners");

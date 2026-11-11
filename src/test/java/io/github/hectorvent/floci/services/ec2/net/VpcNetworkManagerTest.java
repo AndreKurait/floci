@@ -19,6 +19,7 @@ import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
+import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -64,6 +65,7 @@ import static org.mockito.Mockito.when;
 class VpcNetworkManagerTest {
 
     private static final String REGION = "us-east-1";
+    private static final Duration NETWORK_REMOVAL_RETRY_DELAY = Duration.ofSeconds(2);
 
     private DockerClient docker;
     private EmulatorConfig config;
@@ -997,7 +999,11 @@ class VpcNetworkManagerTest {
 
     @Test
     void deletingVpcRetriesATransientFlociDisconnectFailure() throws Exception {
-        VpcNetworkManager dockerHostedManager = dockerHostedManager("floci-container");
+        TestTime time = TestTime.create();
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+        when(resolver.resolveContainerId()).thenReturn(Optional.of("floci-container"));
+        VpcNetworkManager dockerHostedManager = new VpcNetworkManager(config, docker, resolver, null,
+                time.newScheduler());
         NetworkLifecycle network = new NetworkLifecycle(dockerHostedManager, "floci-container");
         try {
             dockerHostedManager.declareVpc(REGION, "vpc-1", "10.0.0.0/16");
@@ -1009,7 +1015,12 @@ class VpcNetworkManagerTest {
 
             dockerHostedManager.deleteVpcNetwork(REGION, "vpc-1");
 
-            assertTrue(network.removed.await(5, TimeUnit.SECONDS),
+            time.advance(NETWORK_REMOVAL_RETRY_DELAY.minusNanos(1));
+            assertEquals(1, network.removed.getCount(), "the removal is not retried before its two seconds are up");
+            assertFalse(existingNetworks.isEmpty());
+
+            time.advance(Duration.ofNanos(1));
+            assertEquals(0, network.removed.getCount(),
                     "teardown must retry disconnecting Floci before retrying network removal");
             assertTrue(network.endpoints.isEmpty());
             assertTrue(existingNetworks.isEmpty());

@@ -268,6 +268,45 @@ class Ec2IpamServiceTest {
     }
 
     @Test
+    void spaceOfTheSourcePoolIsProvisionedToOneChildOnly() {
+        IpamPool parent = poolWith("10.0.0.0/8");
+        String scopeId = service.describeIpamPools(REGION, List.of(parent.getIpamPoolId()), List.of())
+                .get(0).getIpamScopeId();
+        IpamPool first = service.createIpamPool(REGION, scopeId, REGION, parent.getIpamPoolId(), "ipv4", "first");
+        IpamPool second = service.createIpamPool(REGION, scopeId, REGION, parent.getIpamPoolId(), "ipv4", "second");
+        service.provisionIpamPoolCidr(REGION, first.getIpamPoolId(), "10.0.0.0/16");
+
+        AwsException sameBlock = assertThrows(AwsException.class,
+                () -> service.provisionIpamPoolCidr(REGION, second.getIpamPoolId(), "10.0.0.0/16"));
+        AwsException insideIt = assertThrows(AwsException.class,
+                () -> service.provisionIpamPoolCidr(REGION, second.getIpamPoolId(), "10.0.4.0/24"));
+
+        assertEquals("InvalidParameterValue", sameBlock.getErrorCode());
+        assertEquals("InvalidParameterValue", insideIt.getErrorCode());
+        assertTrue(service.getIpamPoolCidrs(REGION, second.getIpamPoolId()).isEmpty());
+        service.provisionIpamPoolCidr(REGION, second.getIpamPoolId(), "10.1.0.0/16");
+        assertEquals("10.0.0.0/24",
+                service.allocateIpamPoolCidr(REGION, first.getIpamPoolId(), 24, null, null).getCidr());
+        assertEquals("10.1.0.0/24",
+                service.allocateIpamPoolCidr(REGION, second.getIpamPoolId(), 24, null, null).getCidr());
+    }
+
+    @Test
+    void spaceAllocatedFromTheSourcePoolIsNotProvisionedToAChild() {
+        IpamPool parent = poolWith("10.0.0.0/8");
+        String scopeId = service.describeIpamPools(REGION, List.of(parent.getIpamPoolId()), List.of())
+                .get(0).getIpamScopeId();
+        IpamPool child = service.createIpamPool(REGION, scopeId, REGION, parent.getIpamPoolId(), "ipv4", "child");
+        service.allocateIpamPoolCidr(REGION, parent.getIpamPoolId(), null, "10.0.0.0/24", null);
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> service.provisionIpamPoolCidr(REGION, child.getIpamPoolId(), "10.0.0.0/16"));
+
+        assertEquals("InvalidParameterValue", refused.getErrorCode());
+        assertTrue(service.getIpamPoolCidrs(REGION, child.getIpamPoolId()).isEmpty());
+    }
+
+    @Test
     void describeIpamPoolsFiltersById() {
         Ipam ipam = service.createIpam(REGION, null, List.of(REGION));
         IpamPool pool = service.createIpamPool(REGION, ipam.getPrivateDefaultScopeId(),
