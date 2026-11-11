@@ -545,7 +545,24 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
             throw new AwsException("BadRequestException",
                     "Invalid resource identifier specified: the root resource cannot be deleted", 400);
         }
-        resourceStore.delete(resourceKey(region, apiId, resourceId));
+        // Deleting a resource deletes the whole subtree below it; a child left behind would keep
+        // serving its path and could never be reached through its parent again.
+        List<ApiGatewayResource> all = getResources(region, apiId);
+        Set<String> doomed = new HashSet<>();
+        doomed.add(resourceId);
+        boolean grew = true;
+        while (grew) {
+            grew = false;
+            for (ApiGatewayResource candidate : all) {
+                if (candidate.getParentId() != null && doomed.contains(candidate.getParentId())
+                        && doomed.add(candidate.getId())) {
+                    grew = true;
+                }
+            }
+        }
+        for (String id : doomed) {
+            resourceStore.delete(resourceKey(region, apiId, id));
+        }
     }
 
     // ──────────────────────────── Method CRUD ────────────────────────────
