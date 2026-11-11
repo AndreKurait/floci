@@ -24,22 +24,24 @@ public record IdempotencyTokenEntry(
     private static final Duration TTL = Duration.ofHours(1);
 
     /**
-     * Creates a new idempotency token entry with 1-hour TTL from current time.
+     * Creates a new idempotency token entry with 1-hour TTL from the given time.
      *
      * @param arn The certificate ARN
      * @param requestHash Hash of the request parameters
-     * @return New entry with expiration set to current time + 1 hour
+     * @param now The current time on the owning service's clock
+     * @return New entry with expiration set to {@code now} + 1 hour
      */
-    public static IdempotencyTokenEntry create(String arn, int requestHash) {
-        return new IdempotencyTokenEntry(arn, Instant.now().plus(TTL), requestHash);
+    public static IdempotencyTokenEntry create(String arn, int requestHash, Instant now) {
+        return new IdempotencyTokenEntry(arn, now.plus(TTL), requestHash);
     }
 
     /**
      * Checks if this token entry has expired.
      *
-     * @return true if the current time is after the expiration instant
+     * @param now The current time on the owning service's clock
+     * @return true if {@code now} is after the expiration instant
      */
-    public boolean isExpired() {
-        return Instant.now().isAfter(expires);
+    public boolean isExpired(Instant now) {
+        return now.isAfter(expires);
     }
 }
