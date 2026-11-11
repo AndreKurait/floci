@@ -8,6 +8,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.config.EncoderConfig;
 import io.restassured.http.ContentType;
+import io.restassured.parsing.Parser;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
@@ -84,7 +85,7 @@ class CloudWatchListMetricsPaginationIntegrationTest {
             assertEquals(501, hosts.size());
             listRequest.put("NextToken", 123);
             json(target + "ListMetrics", listRequest, ACCOUNT, REGION).then().statusCode(400)
-                    .body("__type", equalTo("InvalidParameterValueException"));
+                    .defaultParser(Parser.JSON).body("__type", equalTo("InvalidParameterValueException"));
         }
 
         for (Response invalid : new Response[]{
@@ -133,6 +134,35 @@ class CloudWatchListMetricsPaginationIntegrationTest {
                 assertEquals(expected, response.path("Metrics").size());
             }
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {CURRENT_TARGET, CONSOLE_TARGET})
+    void nullDimensionFilterValueIsOmittedButLiteralNullMatchesExactly(String target) throws Exception {
+        String namespace = "NullDimensionFilter/" + UUID.randomUUID();
+        ObjectNode put = MAPPER.createObjectNode().put("Namespace", namespace);
+        ArrayNode data = put.putArray("MetricData");
+        for (String host : new String[]{"one", "null"}) {
+            data.addObject().put("MetricName", "Requests").put("Value", 1)
+                    .putArray("Dimensions").addObject().put("Name", "Host").put("Value", host);
+        }
+        data.addObject().put("MetricName", "Requests").put("Value", 1)
+                .putArray("Dimensions").addObject().put("Name", "Zone").put("Value", "null");
+        json(CURRENT_TARGET + "PutMetricData", put, ACCOUNT, REGION).then().statusCode(200);
+        ObjectNode request = MAPPER.createObjectNode().put("Namespace", namespace);
+        ObjectNode filter = request.putArray("Dimensions").addObject().put("Name", "Host");
+        JsonNode omitted = MAPPER.readTree(json(target + "ListMetrics", request, ACCOUNT, REGION)
+                .then().statusCode(200).extract().asString());
+        assertEquals(2, omitted.path("Metrics").size());
+        filter.put("Value", "null");
+        JsonNode literal = MAPPER.readTree(json(target + "ListMetrics", request, ACCOUNT, REGION)
+                .then().statusCode(200).extract().asString());
+        assertEquals(1, literal.path("Metrics").size());
+        assertEquals("null", literal.path("Metrics").get(0).path("Dimensions").get(0).path("Value").asText());
+        filter.putNull("Value");
+        JsonNode explicitNull = MAPPER.readTree(json(target + "ListMetrics", request, ACCOUNT, REGION)
+                .then().statusCode(200).extract().asString());
+        assertEquals(2, explicitNull.path("Metrics").size());
     }
 
     private static Response query(String namespace, String metricName, String token, String account, String region) {

@@ -844,7 +844,7 @@ public class CloudWatchMetricsJsonHandler {
             return filters;
         }
         for (JsonNode dimension : node) {
-            String value = dimension.has("Value") ? dimension.path("Value").asText() : null;
+            String value = dimension.path("Value").asText(null);
             filters.add(new Dimension(dimension.path("Name").asText(), value));
         }
         return filters;
