@@ -73,6 +73,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -151,6 +152,7 @@ public class ApiGatewayExecuteController {
     private final RestLambdaAuthorizer restLambdaAuthorizer;
     private final AuthorizerPolicyEvaluator authorizerPolicyEvaluator;
     private final CloudMapInstanceResolver cloudMapInstanceResolver;
+    private final Clock clock;
 
     @Inject
     public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, CognitoUserPoolAuthorizer cognitoAuthorizer,
@@ -169,7 +171,8 @@ public class ApiGatewayExecuteController {
                                        ServiceCallAuthorizer serviceCallAuthorizer,
                                        ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
                                        CallerCallAuthorizer callerCallAuthorizer,
-                                       CloudMapInstanceResolver cloudMapInstanceResolver) {
+                                       CloudMapInstanceResolver cloudMapInstanceResolver,
+                                       Clock clock) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
@@ -195,6 +198,32 @@ public class ApiGatewayExecuteController {
         this.restLambdaAuthorizer = restLambdaAuthorizer;
         this.authorizerPolicyEvaluator = authorizerPolicyEvaluator;
         this.cloudMapInstanceResolver = cloudMapInstanceResolver;
+        this.clock = clock;
+    }
+
+    /** Runs on the system clock; the constructor above takes the clock the response cache expires on. */
+    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, CognitoUserPoolAuthorizer cognitoAuthorizer,
+                                       ApiGatewayV2Service apiGatewayV2Service,
+                                       LambdaService lambdaService, RegionResolver regionResolver,
+                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
+                                       AwsServiceRouter serviceRouter,
+                                       WebSocketConnectionManager webSocketConnectionManager,
+                                       ElbV2Service elbV2Service,
+                                       SqsQueryHandler sqsQueryHandler,
+                                       ApiGatewayExecuteRouteContext routeContext,
+                                       JwtSignatureVerifier jwtSignatureVerifier,
+                                       RequestContext requestContext,
+                                       ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
+                                       AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer,
+                                       CloudMapInstanceResolver cloudMapInstanceResolver) {
+        this(apiGatewayService, cognitoAuthorizer, apiGatewayV2Service, lambdaService, regionResolver, objectMapper,
+                vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service, sqsQueryHandler, routeContext,
+                jwtSignatureVerifier, requestContext, sigV4Authorizer, restLambdaAuthorizer, authorizerPolicyEvaluator,
+                serviceCallAuthorizer, serviceRoleCallAuthorizer, callerCallAuthorizer, cloudMapInstanceResolver,
+                Clock.systemUTC());
     }
 
     /** Matches an ELBv2 listener ARN (ALB {@code app/} or NLB {@code net/}); group 1 = region. */
@@ -624,10 +653,11 @@ public class ApiGatewayExecuteController {
         Response vpcLinkError = validateVpcLink(scope, region, integration);
         if (vpcLinkError != null) return vpcLinkError;
 
-        String cacheKey = cacheKeyFor(stage, matched, httpMethod, path, integration, headers, uriInfo);
+        String cacheKey = cacheKeyFor(region, apiId, stageName, stage, matched, httpMethod, path, integration,
+                headers, uriInfo);
         if (cacheKey != null) {
             CachedResponse cached = responseCache.get(cacheKey);
-            if (cached != null && cached.expiresAt() > System.currentTimeMillis()) {
+            if (cached != null && cached.expiresAt() > clock.millis()) {
                 LOG.debugv("execute-api: cache hit for {0} {1}/{2}{3}", httpMethod, apiId, stageName, path);
                 return fromCache(cached);
             }
@@ -653,7 +683,8 @@ public class ApiGatewayExecuteController {
         // Only successful responses are cached — AWS does not serve an error from the cache.
         if (cacheKey != null && response.getStatus() < 400) {
             responseCache.put(cacheKey,
-                    snapshotForCache(response, cacheTtlSeconds(methodSettingFor(stage, matched.getPath(), httpMethod))));
+                    snapshotForCache(response, cacheTtlSeconds(methodSettingFor(stage, matched.getPath(), httpMethod)),
+                            clock.millis()));
         }
         return response;
     }
@@ -868,7 +899,7 @@ public class ApiGatewayExecuteController {
     /** AWS's default integration cache TTL when a method enables caching without naming one. */
     private static final int DEFAULT_CACHE_TTL_SECONDS = 300;
 
-    private record CachedResponse(int status, Object entity, Map<String, String> headers, long expiresAt) {}
+    private record CachedResponse(int status, Object entity, Map<String, List<String>> headers, long expiresAt) {}
 
     private final Map<String, CachedResponse> responseCache = new ConcurrentHashMap<>();
 
@@ -884,14 +915,19 @@ public class ApiGatewayExecuteController {
      * can return the same cached data; mixing the method and request path back in would mean two
      * resources could never share an entry, which is the setting's whole purpose. The namespace
      * defaults to the resource id, so resources that did not opt into sharing stay separate.
+     *
+     * <p>A cache belongs to one stage of one API: the key starts with the region, API id and stage
+     * name, so a namespace is shared between the resources of a stage and never beyond it.
      */
-    private String cacheKeyFor(Stage stage, ApiGatewayResource resource, String httpMethod,
+    private String cacheKeyFor(String region, String apiId, String stageName, Stage stage,
+                               ApiGatewayResource resource, String httpMethod,
                                String path, Integration integration, HttpHeaders headers, UriInfo uriInfo) {
         if (stage == null || !stage.isCacheClusterEnabled()) return null;
         MethodSetting setting = methodSettingFor(stage, resource.getPath(), httpMethod);
         if (setting == null || !setting.isCachingEnabled()) return null;
 
         StringBuilder key = new StringBuilder();
+        key.append(region).append('|').append(apiId).append('|').append(stageName).append('|');
         key.append(integration.getCacheNamespace() != null
                 ? integration.getCacheNamespace() : resource.getId());
         for (String param : integration.getCacheKeyParameters()) {
@@ -933,18 +969,18 @@ public class ApiGatewayExecuteController {
         return ttl > 0 ? ttl : DEFAULT_CACHE_TTL_SECONDS;
     }
 
-    private static CachedResponse snapshotForCache(Response response, int ttlSeconds) {
-        Map<String, String> headers = new LinkedHashMap<>();
+    private static CachedResponse snapshotForCache(Response response, int ttlSeconds, long nowMillis) {
+        Map<String, List<String>> headers = new LinkedHashMap<>();
         response.getStringHeaders().forEach((name, values) -> {
-            if (!values.isEmpty()) headers.put(name, values.get(0));
+            if (!values.isEmpty()) headers.put(name, List.copyOf(values));
         });
         return new CachedResponse(response.getStatus(), response.getEntity(), headers,
-                System.currentTimeMillis() + ttlSeconds * 1000L);
+                nowMillis + ttlSeconds * 1000L);
     }
 
     private static Response fromCache(CachedResponse cached) {
         Response.ResponseBuilder rb = Response.status(cached.status()).entity(cached.entity());
-        cached.headers().forEach(rb::header);
+        cached.headers().forEach((name, values) -> values.forEach(value -> rb.header(name, value)));
         return rb.build();
     }
 
@@ -2106,6 +2142,7 @@ public class ApiGatewayExecuteController {
         String backendStatusMatchString = null;
         String errorType = null;
         String errorMessage = null;
+        String functionErrorMessage = null;
         try {
             if ("lambda".equals(target.service())) {
                 String functionName = functionNameFromUri(integration.getUri());
@@ -2127,6 +2164,7 @@ public class ApiGatewayExecuteController {
                 if (invokeResult.getFunctionError() != null) {
                     errorType = invokeResult.getFunctionError();
                     errorMessage = lambdaResponseBody;
+                    functionErrorMessage = functionErrorMessage(lambdaResponseBody);
                 }
                 serviceResponse = Response.status(lambdaStatus)
                         .entity(lambdaResponseBody)
@@ -2203,8 +2241,11 @@ public class ApiGatewayExecuteController {
         String errorMatchString = errorType != null
                 ? errorType + (errorMessage != null ? ": " + errorMessage : "")
                 : errorMessage;
+        // A function error is selected by its errorMessage alone, as API Gateway does; a payload
+        // without one falls back to the error type and the whole payload.
         String selectionMatchString = "lambda".equals(target.service())
-                ? errorMatchString : backendStatusMatchString;
+                ? (functionErrorMessage != null ? functionErrorMessage : errorMatchString)
+                : backendStatusMatchString;
 
         // Case-insensitive: an integration.response.header.X-Foo mapping must resolve regardless of
         // the casing the backend or client library used for the header name.
@@ -2296,6 +2337,17 @@ public class ApiGatewayExecuteController {
                                             String defaultContentType) {
         return mapIntegrationResponse(integration, selectionMatchString, responseBodyStr, null,
                 fallbackStatus, integrationResponseHeaders, responseMappingCtx, defaultContentType);
+    }
+
+    /** The {@code errorMessage} of a Lambda error payload, or null when the payload does not carry one. */
+    private String functionErrorMessage(String payload) {
+        try {
+            JsonNode message = objectMapper.readTree(payload).path("errorMessage");
+            return message.isTextual() ? message.asText() : null;
+        } catch (IOException e) {
+            LOG.debugv("execute-api: function error payload is not JSON: {0}", e.getMessage());
+            return null;
+        }
     }
 
     private Response mapIntegrationResponse(Integration integration, String selectionMatchString,
@@ -3795,7 +3847,7 @@ public class ApiGatewayExecuteController {
         ctx.put("stage", stageName);
         ctx.put("requestId", UUID.randomUUID().toString());
         ctx.put("protocol", "HTTP/1.1");
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         ctx.put("requestTime", GATEWAY_REQUEST_TIME.format(now.atZone(ZoneOffset.UTC)));
         ctx.put("requestTimeEpoch", now.toEpochMilli());
         String arnRegion = region != null ? region : regionResolver.getDefaultRegion();
@@ -3845,8 +3897,9 @@ public class ApiGatewayExecuteController {
         ctx.put("requestId", UUID.randomUUID().toString());
         ctx.put("routeKey", routeKey != null ? routeKey : "$default");
         ctx.put("stage", stageName);
-        ctx.put("time", GATEWAY_REQUEST_TIME.format(Instant.now().atZone(ZoneOffset.UTC)));
-        ctx.put("timeEpoch", System.currentTimeMillis());
+        Instant now = clock.instant();
+        ctx.put("time", GATEWAY_REQUEST_TIME.format(now.atZone(ZoneOffset.UTC)));
+        ctx.put("timeEpoch", now.toEpochMilli());
 
         ObjectNode http = ctx.putObject("http");
         http.put("method", httpMethod);
@@ -4178,8 +4231,9 @@ public class ApiGatewayExecuteController {
         ctx.put("requestId", requestId);
         ctx.put("routeKey", routeKey != null ? routeKey : "$default");
         ctx.put("stage", stageName);
-        ctx.put("time", GATEWAY_REQUEST_TIME.format(Instant.now().atZone(ZoneOffset.UTC)));
-        ctx.put("timeEpoch", System.currentTimeMillis());
+        Instant now = clock.instant();
+        ctx.put("time", GATEWAY_REQUEST_TIME.format(now.atZone(ZoneOffset.UTC)));
+        ctx.put("timeEpoch", now.toEpochMilli());
 
         ObjectNode http = ctx.putObject("http");
         http.put("method", httpMethod);

@@ -29,6 +29,7 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -260,9 +261,15 @@ public class ApiGatewayController {
 
                 // Determine content type from headers or default to JSON
                 String contentType = MediaType.APPLICATION_JSON;
-                JsonNode ct = responseNode.path("headers").path("Content-Type");
-                if (!ct.isMissingNode() && !ct.isNull()) {
-                    contentType = ct.asText();
+                // Header names are case-insensitive, and functions commonly answer with "content-type".
+                if (responseHeaders != null && responseHeaders.isObject()) {
+                    Iterator<Map.Entry<String, JsonNode>> headerFields = responseHeaders.fields();
+                    while (headerFields.hasNext()) {
+                        Map.Entry<String, JsonNode> header = headerFields.next();
+                        if (HttpHeaders.CONTENT_TYPE.equalsIgnoreCase(header.getKey()) && !header.getValue().isNull()) {
+                            contentType = header.getValue().asText();
+                        }
+                    }
                 }
                 builder.entity(bodyBytes).type(contentType);
             }
