@@ -2142,6 +2142,7 @@ public class ApiGatewayExecuteController {
         String backendStatusMatchString = null;
         String errorType = null;
         String errorMessage = null;
+        String functionErrorMessage = null;
         try {
             if ("lambda".equals(target.service())) {
                 String functionName = functionNameFromUri(integration.getUri());
@@ -2163,6 +2164,7 @@ public class ApiGatewayExecuteController {
                 if (invokeResult.getFunctionError() != null) {
                     errorType = invokeResult.getFunctionError();
                     errorMessage = lambdaResponseBody;
+                    functionErrorMessage = functionErrorMessage(lambdaResponseBody);
                 }
                 serviceResponse = Response.status(lambdaStatus)
                         .entity(lambdaResponseBody)
@@ -2239,8 +2241,11 @@ public class ApiGatewayExecuteController {
         String errorMatchString = errorType != null
                 ? errorType + (errorMessage != null ? ": " + errorMessage : "")
                 : errorMessage;
+        // A function error is selected by its errorMessage alone, as API Gateway does; a payload
+        // without one falls back to the error type and the whole payload.
         String selectionMatchString = "lambda".equals(target.service())
-                ? errorMatchString : backendStatusMatchString;
+                ? (functionErrorMessage != null ? functionErrorMessage : errorMatchString)
+                : backendStatusMatchString;
 
         // Case-insensitive: an integration.response.header.X-Foo mapping must resolve regardless of
         // the casing the backend or client library used for the header name.
@@ -2332,6 +2337,17 @@ public class ApiGatewayExecuteController {
                                             String defaultContentType) {
         return mapIntegrationResponse(integration, selectionMatchString, responseBodyStr, null,
                 fallbackStatus, integrationResponseHeaders, responseMappingCtx, defaultContentType);
+    }
+
+    /** The {@code errorMessage} of a Lambda error payload, or null when the payload does not carry one. */
+    private String functionErrorMessage(String payload) {
+        try {
+            JsonNode message = objectMapper.readTree(payload).path("errorMessage");
+            return message.isTextual() ? message.asText() : null;
+        } catch (IOException e) {
+            LOG.debugv("execute-api: function error payload is not JSON: {0}", e.getMessage());
+            return null;
+        }
     }
 
     private Response mapIntegrationResponse(Integration integration, String selectionMatchString,
