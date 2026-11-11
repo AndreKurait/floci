@@ -363,6 +363,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // a concurrent allocation, which reads persisted resources to see what is taken, cannot pick
     // the same address in between. Taken after imageRegistryLock where a caller holds both.
     private final Object privateIpAllocationLock = new Object();
+    private final Object amazonProvidedIpv6AllocationLock = new Object();
     /** Host part (1-254) of the last 203.0.113.0/24 address handed out; guarded by the allocation lock. */
     private int documentationHost;
     private final Cidr4 mockPublicAddressPool;
@@ -7267,9 +7268,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         vpc.getCidrBlockAssociationSet().add(
                 new VpcCidrBlockAssociation("vpc-cidr-assoc-" + randomHex(8), cidrBlock));
         if (amazonProvidedIpv6CidrBlock) {
-            vpc.getIpv6CidrBlockAssociationSet().add(amazonProvidedIpv6Association(region));
+            synchronized (amazonProvidedIpv6AllocationLock) {
+                vpc.getIpv6CidrBlockAssociationSet().add(amazonProvidedIpv6Association(region));
+                vpcs.put(key(region, vpcId), vpc);
+            }
+        } else {
+            vpcs.put(key(region, vpcId), vpc);
         }
-        vpcs.put(key(region, vpcId), vpc);
         declareVpcNetwork(region, vpcId, cidrBlock);
 
         createDefaultSecurityGroup(region, vpcId, "sg-" + randomHex(17));
@@ -7714,10 +7719,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         synchronized (attachmentTopologyLock(region)) {
             synchronized (lockFor(key(region, vpcId))) {
                 Vpc vpc = getRequiredVpc(region, vpcId);
-                VpcIpv6CidrBlockAssociation assoc = amazonProvidedIpv6Association(region);
-                vpc.getIpv6CidrBlockAssociationSet().add(assoc);
-                vpcs.put(key(region, vpcId), vpc);
-                return assoc;
+                synchronized (amazonProvidedIpv6AllocationLock) {
+                    VpcIpv6CidrBlockAssociation assoc = amazonProvidedIpv6Association(region);
+                    vpc.getIpv6CidrBlockAssociationSet().add(assoc);
+                    vpcs.put(key(region, vpcId), vpc);
+                    return assoc;
+                }
             }
         }
     }
@@ -7776,8 +7783,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         vpc.getCidrBlockAssociationSet().removeIf(a -> a.getAssociationId().equals(associationId));
                         // The same operation disassociates either family; AWS takes one association id and
                         // does not ask which set it belongs to.
-                        vpc.getIpv6CidrBlockAssociationSet().removeIf(a -> a.getAssociationId().equals(associationId));
-                        vpcs.put(key(region, vpc.getVpcId()), vpc);
+                        synchronized (amazonProvidedIpv6AllocationLock) {
+                            vpc.getIpv6CidrBlockAssociationSet().removeIf(a -> a.getAssociationId().equals(associationId));
+                            vpcs.put(key(region, vpc.getVpcId()), vpc);
+                        }
                     }
                 }
             }

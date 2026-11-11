@@ -1185,6 +1185,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public IamRole createRole(String roleName, String path, String assumeRolePolicyDocument,
                               String description, int maxSessionDuration, Map<String, String> tags,
                               String permissionsBoundaryArn) {
+        return createRole(roleName, path, assumeRolePolicyDocument, description, maxSessionDuration,
+                tags, permissionsBoundaryArn, false, null);
+    }
+
+    private IamRole createRole(String roleName, String path, String assumeRolePolicyDocument,
+                              String description, int maxSessionDuration, Map<String, String> tags,
+                              String permissionsBoundaryArn, boolean serviceLinkedRole, String attachedPolicyArn) {
         validateRoleName(roleName);
         validateRoleDescription(description);
         if (permissionsBoundaryArn != null) {
@@ -1201,6 +1208,10 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             IamRole role = new IamRole(roleId, roleName, normalizedPath, arn, assumeRolePolicyDocument);
             role.setDescription(description);
             role.setPermissionsBoundaryArn(permissionsBoundaryArn);
+            role.setServiceLinkedRole(serviceLinkedRole);
+            if (attachedPolicyArn != null) {
+                role.getAttachedPolicyArns().add(attachedPolicyArn);
+            }
             if (maxSessionDuration > 0) {
                 role.setMaxSessionDuration(maxSessionDuration);
             }
@@ -1485,14 +1496,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             String principal = ServicePrincipals.canonical(awsServiceName);
             String trustPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
                     + "\"Principal\":{\"Service\":\"" + principal + "\"},\"Action\":\"sts:AssumeRole\"}]}";
-            IamRole role = createRole(roleName, ServiceLinkedRoles.PATH + principal + "/",
-                    trustPolicy, description, 0, Map.of());
-            role.setServiceLinkedRole(true);
-            ServiceLinkedRoles.managedPolicyName(awsServiceName)
-                    .map(name -> linkedServicePolicyArn(role, name))
-                    .ifPresent(policyArn -> role.getAttachedPolicyArns().add(policyArn));
-            roles.put(roleName, role);
-            return role;
+            String policyArn = ServiceLinkedRoles.managedPolicyName(awsServiceName)
+                    .map(this::linkedServicePolicyArn)
+                    .orElse(null);
+            return createRole(roleName, ServiceLinkedRoles.PATH + principal + "/",
+                    trustPolicy, description, 0, Map.of(), null, true, policyArn);
         }
     }
 
@@ -1503,8 +1511,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * to, so a miss is a data defect and fails the create loudly instead of leaving a role with no
      * permissions that the linked service would then be denied with.
      */
-    private String linkedServicePolicyArn(IamRole role, String policyName) {
-        String partition = AwsArnUtils.parse(role.getArn()).partition();
+    private String linkedServicePolicyArn(String policyName) {
+        String partition = regionResolver.getPartition();
         return awsManagedPolicies(partition).values().stream()
                 .filter(policy -> policyName.equals(policy.getPolicyName()))
                 .map(IamPolicy::getArn)
