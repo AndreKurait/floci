@@ -37,6 +37,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.floci.aws.services.ses.SesV2Json.intMemberOrAbsent;
@@ -68,7 +69,7 @@ public class SesExportJobService implements Resettable {
     static final int MAX_CONCURRENT_JOBS = 20;
     static final int MAX_RESULTS = 10_000;
     static final long RESET_DRAIN_TIMEOUT_MILLIS = 5_000L;
-    private static final long RESET_ADMISSION_WAIT_MILLIS = 30_000L;
+    static final long RESET_ADMISSION_WAIT_MILLIS = 30_000L;
     static final String RESTART_FAILURE_MESSAGE = "The emulator restarted before the export finished";
     static final String EXPORT_BUCKET_SUFFIX = "-ses-export-files";
 
@@ -90,6 +91,7 @@ public class SesExportJobService implements Resettable {
     private final Clock clock;
     private final Executor workers;
     private final String baseUrl;
+    private final SesResetWait resetWait;
     private final Object createLock = new Object();
     // Reset support, following SesImportJobService: beforeReset bumps the generation so a running
     // worker stops before it writes its object, then waits for the workers already inside one. The
@@ -113,6 +115,16 @@ public class SesExportJobService implements Resettable {
                         SesSentEmailService sentEmailService, S3Service s3Service,
                         PreSignedUrlGenerator preSignedUrlGenerator, ObjectMapper objectMapper,
                         Clock clock, Executor workers, String baseUrl) {
+        this(exportJobStore, sentEmailService, s3Service, preSignedUrlGenerator, objectMapper, clock,
+                workers, baseUrl, SesResetWait.SYSTEM);
+    }
+
+    /** {@code resetWait} carries the two bounded reset waits; production runs on {@link SesResetWait#SYSTEM}. */
+    SesExportJobService(StorageBackend<String, ExportJob> exportJobStore,
+                        SesSentEmailService sentEmailService, S3Service s3Service,
+                        PreSignedUrlGenerator preSignedUrlGenerator, ObjectMapper objectMapper,
+                        Clock clock, Executor workers, String baseUrl, SesResetWait resetWait) {
+        this.resetWait = resetWait;
         this.exportJobStore = exportJobStore;
         this.sentEmailService = sentEmailService;
         this.s3Service = s3Service;
@@ -215,14 +227,14 @@ public class SesExportJobService implements Resettable {
     // Holds createLock. A create arriving while a reset drains would capture the already-bumped
     // generation, so its worker would write an object after the wipe. It waits for afterReset.
     private void awaitResetFinished() {
-        long deadline = System.currentTimeMillis() + RESET_ADMISSION_WAIT_MILLIS;
+        long deadline = resetWait.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESET_ADMISSION_WAIT_MILLIS);
         while (resetting) {
-            long remaining = deadline - System.currentTimeMillis();
+            long remaining = deadline - resetWait.nanoTime();
             if (remaining <= 0) {
                 throw resettingNow();
             }
             try {
-                createLock.wait(remaining);
+                resetWait.timedWait(createLock, remaining);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw resettingNow();
@@ -460,17 +472,17 @@ public class SesExportJobService implements Resettable {
             generation.incrementAndGet();
         }
         boolean interrupted = false;
-        long deadline = System.currentTimeMillis() + RESET_DRAIN_TIMEOUT_MILLIS;
+        long deadline = resetWait.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESET_DRAIN_TIMEOUT_MILLIS);
         synchronized (workerMonitor) {
             while (activeWorkers > 0) {
-                long remaining = deadline - System.currentTimeMillis();
+                long remaining = deadline - resetWait.nanoTime();
                 if (remaining <= 0) {
                     LOG.warnv("{0} SES export worker(s) still running after {1}ms; one object may "
                             + "be written after the reset", activeWorkers, RESET_DRAIN_TIMEOUT_MILLIS);
                     break;
                 }
                 try {
-                    workerMonitor.wait(remaining);
+                    resetWait.timedWait(workerMonitor, remaining);
                 } catch (InterruptedException e) {
                     // Keep draining to the deadline; the interrupt is re-asserted on the way out.
                     interrupted = true;
