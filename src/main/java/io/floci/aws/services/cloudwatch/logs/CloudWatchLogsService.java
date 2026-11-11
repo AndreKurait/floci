@@ -1364,7 +1364,10 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             try {
                 offset = Integer.parseInt(nextToken);
             } catch (NumberFormatException e) {
-                offset = 0;
+                throw invalidNextToken();
+            }
+            if (offset < 0 || offset > all.size()) {
+                throw invalidNextToken();
             }
         }
 
