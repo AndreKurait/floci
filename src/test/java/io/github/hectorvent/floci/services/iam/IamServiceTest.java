@@ -1692,6 +1692,28 @@ class IamServiceTest {
     }
 
     @Test
+    void createServiceLinkedRoleAttachesTheOpenSearchManagedPolicy() {
+        IamRole role = iamService.createServiceLinkedRole("opensearchservice.amazonaws.com", null, null);
+
+        assertEquals(List.of("arn:aws:iam::aws:policy/aws-service-role/AmazonOpenSearchServiceRolePolicy"),
+                role.getAttachedPolicyArns());
+        List<IamPolicy> attached = iamService.listAttachedRolePolicies(role.getRoleName(), null);
+        assertEquals(1, attached.size());
+        assertEquals("AmazonOpenSearchServiceRolePolicy", attached.getFirst().getPolicyName());
+        assertEquals("/aws-service-role/", attached.getFirst().getPath());
+        assertTrue(attached.getFirst().getDefaultDocument().contains("ec2:CreateNetworkInterface"),
+                "the attached document is the bundled one");
+    }
+
+    @Test
+    void createServiceLinkedRoleForAServiceWithNoKnownPolicyAttachesNone() {
+        IamRole role = iamService.createServiceLinkedRole("autoscaling.amazonaws.com", null, null);
+
+        assertTrue(role.getAttachedPolicyArns().isEmpty());
+        assertTrue(iamService.listAttachedRolePolicies(role.getRoleName(), null).isEmpty());
+    }
+
+    @Test
     void createServiceLinkedRoleForCloud9UsesAwsCanonicalName() {
         IamRole role = iamService.createServiceLinkedRole(
                 "cloud9.amazonaws.com", null, "Cloud9 SLR");
