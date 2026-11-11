@@ -1493,6 +1493,30 @@ class EmrClusterStorageTest {
     }
 
     @Test
+    void aResetSweepRemovesTheNetworksListedAfterOneThatCarriesNoClusterLabel() {
+        ListContainersCmd list = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(docker.listContainersCmd()).thenReturn(list);
+        when(list.exec()).thenReturn(List.of());
+        Network unlabelled = mock(Network.class);
+        when(unlabelled.getLabels()).thenReturn(Map.of());
+        when(unlabelled.getName()).thenReturn("unlabelled-net");
+        Network labelled = mock(Network.class);
+        when(labelled.getLabels()).thenReturn(Map.of(ContainerStorageHelper.RESOURCE_ID_LABEL, "j-ended"));
+        when(labelled.getName()).thenReturn("labelled-net");
+        ListNetworksCmd networks = mock(ListNetworksCmd.class, RETURNS_SELF);
+        when(docker.listNetworksCmd()).thenReturn(networks);
+        when(networks.exec()).thenReturn(List.of(unlabelled, labelled));
+        ListVolumesCmd volumes = mock(ListVolumesCmd.class, RETURNS_SELF);
+        when(docker.listVolumesCmd()).thenReturn(volumes);
+        when(volumes.exec()).thenReturn(mock(ListVolumesResponse.class));
+
+        storage.removeAllBut(Set.of());
+
+        verify(lifecycle).removeNetwork("unlabelled-net");
+        verify(lifecycle).removeNetwork("labelled-net");
+    }
+
+    @Test
     void theSweepHasFlocisContainerLeaveTheNetworksItRemoves() {
         when(currentContainer.resolveContainerId()).thenReturn(Optional.of("floci-container"));
         ListContainersCmd list = mock(ListContainersCmd.class, RETURNS_SELF);
