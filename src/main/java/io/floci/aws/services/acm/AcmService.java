@@ -32,6 +32,7 @@ import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.security.cert.X509Certificate;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -83,6 +84,7 @@ public class AcmService implements ResourceProvider {
     private final FlociCertificateAuthority certificateAuthority;
     private final RegionResolver regionResolver;
     private final int validationWaitSeconds;
+    private final Clock clock;
     private final AtomicInteger accountDaysBeforeExpiry = new AtomicInteger(45);
     private final AtomicBoolean securityWarningLogged = new AtomicBoolean(false);
 
@@ -113,11 +115,19 @@ public class AcmService implements ResourceProvider {
     AcmService(StorageBackend<String, Certificate> store, CertificateGenerator certificateGenerator,
                FlociCertificateAuthority certificateAuthority, RegionResolver regionResolver,
                int validationWaitSeconds) {
+        this(store, certificateGenerator, certificateAuthority, regionResolver, validationWaitSeconds,
+                Clock.systemUTC());
+    }
+
+    AcmService(StorageBackend<String, Certificate> store, CertificateGenerator certificateGenerator,
+               FlociCertificateAuthority certificateAuthority, RegionResolver regionResolver,
+               int validationWaitSeconds, Clock clock) {
         this.store = store;
         this.certificateGenerator = certificateGenerator;
         this.certificateAuthority = certificateAuthority;
         this.regionResolver = regionResolver;
         this.validationWaitSeconds = validationWaitSeconds;
+        this.clock = clock;
     }
 
     /**
@@ -192,7 +202,7 @@ public class AcmService implements ResourceProvider {
         CertificateGenerator.GeneratedCertificate generated = certificateAuthority.issueServerCertificate(
             domainName, sans, alg, null);
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
 
         Certificate cert = new Certificate();
         cert.setArn(arn);
@@ -231,7 +241,7 @@ public class AcmService implements ResourceProvider {
         if (idempotencyToken != null && !idempotencyToken.isEmpty()) {
             int requestHash = computeRequestHash(domainName, sans, alg);
             idempotencyTokenIndex.put(region + "::" + idempotencyToken,
-                IdempotencyTokenEntry.create(arn, requestHash));
+                IdempotencyTokenEntry.create(arn, requestHash, now));
         }
 
         LOG.infov("Created certificate: {0} in region {1}", arn, region);
@@ -244,7 +254,7 @@ public class AcmService implements ResourceProvider {
         Certificate cert = getCertificateByArn(certificateArn, region);
 
         // Check for expiration
-        if (cert.isExpired() && cert.getStatus() != CertificateStatus.EXPIRED) {
+        if (cert.isExpired(clock.instant()) && cert.getStatus() != CertificateStatus.EXPIRED) {
             cert.setStatus(CertificateStatus.EXPIRED);
             store.put(regionKey(region, cert.extractCertificateId()), cert);
         }
@@ -457,7 +467,7 @@ public class AcmService implements ResourceProvider {
             String certId = existing == null ? UUID.randomUUID().toString() : existing.extractCertificateId();
             String arn = existing == null ? buildCertificateArn(region, certId) : existingArn;
 
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             KeyAlgorithm keyAlg = certificateGenerator.detectKeyAlgorithm(x509Cert.getPublicKey());
 
             cert = new Certificate();
@@ -603,7 +613,7 @@ public class AcmService implements ResourceProvider {
             resources.add(new ExplorerResource(
                     arn, "acm:certificate", "acm",
                     parsed.region(), parsed.accountId(),
-                    cert.getCreatedAt() != null ? cert.getCreatedAt() : Instant.now(),
+                    cert.getCreatedAt() != null ? cert.getCreatedAt() : clock.instant(),
                     cert.getTags() != null ? cert.getTags() : Map.of()));
         }
         return resources;
@@ -663,7 +673,7 @@ public class AcmService implements ResourceProvider {
             renewed.setValidationMethod(cert.getValidationMethod());
             renewed.setCreatedAt(cert.getCreatedAt());
             renewed.setImportedAt(cert.getImportedAt());
-            renewed.setIssuedAt(Instant.now());
+            renewed.setIssuedAt(clock.instant());
             applyIssuedMaterial(renewed, alg, generated);
             renewed.setCertOptions(cert.getCertOptions());
             renewed.setCertAuthorityArn(cert.getCertAuthorityArn());
@@ -749,10 +759,11 @@ public class AcmService implements ResourceProvider {
         }
         cert = current;
         boolean changed = false;
+        Instant now = clock.instant();
         if (cert.getStatus() == CertificateStatus.PENDING_VALIDATION && cert.getCreatedAt() != null
-                && !Instant.now().isBefore(cert.getCreatedAt().plusSeconds(validationWaitSeconds))) {
+                && !now.isBefore(cert.getCreatedAt().plusSeconds(validationWaitSeconds))) {
             cert.setStatus(CertificateStatus.ISSUED);
-            cert.setIssuedAt(Instant.now());
+            cert.setIssuedAt(now);
             LOG.debugv("Certificate {0} issued after the validation wait", cert.getArn());
             changed = true;
         }
@@ -793,7 +804,7 @@ public class AcmService implements ResourceProvider {
         }
 
         // Lazy expiration: remove expired entries on lookup
-        if (entry.isExpired()) {
+        if (entry.isExpired(clock.instant())) {
             idempotencyTokenIndex.remove(indexKey);
             return Optional.empty();
         }

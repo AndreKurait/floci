@@ -253,9 +253,8 @@ public class Certificate {
         this.idempotencyToken = idempotencyToken;
     }
 
-    @JsonIgnore
-    public boolean isExpired() {
-        return notAfter != null && Instant.now().isAfter(notAfter);
+    public boolean isExpired(Instant now) {
+        return notAfter != null && now.isAfter(notAfter);
     }
 
     @JsonIgnore
