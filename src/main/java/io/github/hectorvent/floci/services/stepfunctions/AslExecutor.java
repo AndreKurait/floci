@@ -3063,11 +3063,17 @@ public class AslExecutor {
         } catch (DateTimeParseException e) {
             throw new FailStateException("States.Runtime", "Invalid Timestamp: " + timestamp);
         }
-        long remainingNanos = Duration.between(clock.instant(), target).toNanos();
-        if (remainingNanos <= 0) {
+        Instant now = clock.instant();
+        if (!target.isAfter(now)) {
             return 0;
         }
-        return Math.min(remainingNanos, maxWaitNanos());
+        // Compared as durations: a target centuries away does not fit in a long of nanoseconds.
+        Duration remaining = Duration.between(now, target);
+        long maxWaitNanos = maxWaitNanos();
+        if (remaining.compareTo(Duration.ofNanos(maxWaitNanos)) >= 0) {
+            return maxWaitNanos;
+        }
+        return remaining.toNanos();
     }
 
     /**
