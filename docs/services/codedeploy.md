@@ -201,6 +201,7 @@ For `computePlatform: ECS`, `CreateDeployment` performs a full blue/green traffi
    - `ECSAllAtOnce`: immediately shifts 100% of traffic to the green target group
    - `ECSCanary*`: shifts the canary percentage first, waits a short interval (capped at 5 s in emulator), then shifts to 100%
    - `ECSLinear*`: shifts traffic in equal increments (capped at 2 s per step in emulator)
+   - A stop request is observed during either wait and leaves the later shifts unexecuted
 5. Promotes the green task set to **PRIMARY** on the ECS service and deletes the original blue task set
 6. Marks the deployment `Succeeded`; if any lifecycle hook reports `Failed`, the deployment is marked `Failed`
 
