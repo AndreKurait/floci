@@ -284,23 +284,38 @@ class Ec2SharedCapacityReservationServiceTest {
         }
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void partialLifecycleBatchStillReleasesMembership(boolean terminate) throws Exception {
+    @Test
+    void partialStopBatchStillReleasesMembership() throws Exception {
         try (Fixture f = new Fixture("memory", directory)) {
             CapacityReservation reservation = f.create();
             f.shared.set(true);
             f.account.set(RECIPIENT);
             Instance first = f.launch(reservation.getCapacityReservationId());
             List<String> ids = List.of(first.getInstanceId(), "i-missing");
-            AwsException failure = assertThrows(AwsException.class, () -> {
-                if (terminate) {
-                    f.service.terminateInstances(REGION, ids);
-                } else {
-                    f.service.stopInstances(REGION, ids);
-                }
-            });
+            AwsException failure = assertThrows(AwsException.class, () -> f.service.stopInstances(REGION, ids));
             assertEquals("InvalidInstanceID.NotFound", failure.getErrorCode());
+            assertEquals(1, f.store.getForAccount(OWNER, REGION + "::"
+                    + reservation.getCapacityReservationId()).orElseThrow().getAvailableInstanceCount());
+        }
+    }
+
+    /** TerminateInstances terminates nothing when one id is refused, so the capacity stays taken until it does. */
+    @Test
+    void refusedTerminateBatchKeepsMembershipUntilTheInstanceIsTerminated() throws Exception {
+        try (Fixture f = new Fixture("memory", directory)) {
+            CapacityReservation reservation = f.create();
+            f.shared.set(true);
+            f.account.set(RECIPIENT);
+            Instance first = f.launch(reservation.getCapacityReservationId());
+            List<String> ids = List.of(first.getInstanceId(), "i-missing");
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> f.service.terminateInstances(REGION, ids));
+            assertEquals("InvalidInstanceID.NotFound", failure.getErrorCode());
+            assertEquals(0, f.store.getForAccount(OWNER, REGION + "::"
+                    + reservation.getCapacityReservationId()).orElseThrow().getAvailableInstanceCount());
+
+            f.service.terminateInstances(REGION, List.of(first.getInstanceId()));
+
             assertEquals(1, f.store.getForAccount(OWNER, REGION + "::"
                     + reservation.getCapacityReservationId()).orElseThrow().getAvailableInstanceCount());
         }
