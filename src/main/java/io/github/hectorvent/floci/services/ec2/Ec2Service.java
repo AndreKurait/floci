@@ -3507,9 +3507,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 ? attachment.getAccepterTgwInfo() : attachment.getRequesterTgwInfo();
     }
 
+    /** A copy, so the tags one side reads never reach the stored attachment the other side reads. */
     private TransitGatewayPeeringAttachment withStoredTags(TransitGatewayPeeringAttachment attachment, String region) {
-        attachment.setTags(new ArrayList<>(tagsOf(region, attachment.getTransitGatewayAttachmentId()).orElse(List.of())));
-        return attachment;
+        TransitGatewayPeeringAttachment view = new TransitGatewayPeeringAttachment();
+        view.setTransitGatewayAttachmentId(attachment.getTransitGatewayAttachmentId());
+        view.setRequesterTgwInfo(attachment.getRequesterTgwInfo());
+        view.setAccepterTgwInfo(attachment.getAccepterTgwInfo());
+        view.setDynamicRouting(attachment.getDynamicRouting());
+        view.setState(attachment.getState());
+        view.setCreationTime(attachment.getCreationTime());
+        view.setTags(new ArrayList<>(tagsOf(region, attachment.getTransitGatewayAttachmentId()).orElse(List.of())));
+        return view;
     }
 
     private static AwsException peeringAttachmentNotFound(String attachmentId) {
