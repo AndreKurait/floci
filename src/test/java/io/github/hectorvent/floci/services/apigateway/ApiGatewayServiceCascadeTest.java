@@ -7,10 +7,12 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
+import io.github.hectorvent.floci.services.apigateway.model.IntegrationResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -62,6 +64,22 @@ class ApiGatewayServiceCascadeTest {
         assertNotFound(() -> service.getResource(REGION, apiId, user.getId()));
         assertNotFound(() -> service.getResource(REGION, apiId, orders.getId()));
         assertEquals("/health", service.getResource(REGION, apiId, health.getId()).getPath());
+    }
+
+    @Test
+    void patchingAnIntegrationResponseKeepsItsContentHandling() {
+        service.putMethod(REGION, apiId, rootId, "GET", Map.of("authorizationType", "NONE"));
+        service.putIntegration(REGION, apiId, rootId, "GET", Map.of("type", "MOCK"));
+        service.putIntegrationResponse(REGION, apiId, rootId, "GET", "200",
+                Map.of("selectionPattern", "", "contentHandling", "CONVERT_TO_BINARY"));
+
+        IntegrationResponse patched = service.updateIntegrationResponse(REGION, apiId, rootId, "GET", "200",
+                List.of(Map.of("op", "replace", "path", "/selectionPattern", "value", "2\\d{2}")));
+
+        assertEquals("2\\d{2}", patched.selectionPattern());
+        assertEquals("CONVERT_TO_BINARY", patched.contentHandling());
+        assertEquals("CONVERT_TO_BINARY",
+                service.getIntegrationResponse(REGION, apiId, rootId, "GET", "200").contentHandling());
     }
 
     private static void assertNotFound(Runnable call) {
