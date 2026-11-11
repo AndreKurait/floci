@@ -905,7 +905,7 @@ public class AppSyncService {
         SourceApiAssociation assoc = new SourceApiAssociation();
         assoc.setAssociationId(generateShortId());
         assoc.setAssociationArn(regionResolver.buildArn("appsync", region,
-            "sourceApis/" + sourceApiIdentifier + "/mergedApiAssociations/" + generateShortId()));
+            "sourceApis/" + sourceApiIdentifier + "/mergedApiAssociations/" + assoc.getAssociationId()));
         assoc.setMergedApiId(mergedApiIdentifier);
         assoc.setMergedApiArn(regionResolver.buildArn("appsync", region, "apis/" + mergedApiIdentifier));
         assoc.setSourceApiId(sourceApiIdentifier);
@@ -933,7 +933,7 @@ public class AppSyncService {
         SourceApiAssociation assoc = new SourceApiAssociation();
         assoc.setAssociationId(generateShortId());
         assoc.setAssociationArn(regionResolver.buildArn("appsync", region,
-            "mergedApis/" + mergedApiIdentifier + "/sourceApiAssociations/" + generateShortId()));
+            "mergedApis/" + mergedApiIdentifier + "/sourceApiAssociations/" + assoc.getAssociationId()));
         assoc.setMergedApiId(mergedApiIdentifier);
         assoc.setMergedApiArn(regionResolver.buildArn("appsync", region, "apis/" + mergedApiIdentifier));
         assoc.setSourceApiId(sourceApiId);
