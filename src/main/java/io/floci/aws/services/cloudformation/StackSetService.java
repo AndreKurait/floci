@@ -341,6 +341,11 @@ public class StackSetService implements PassedRoleLookup, AccountPlacementListen
                     "StackSet is not empty. Delete all stack instances first.", 409);
         }
         stackSets.delete(name);
+        for (String operationKey : new ArrayList<>(operations.keys())) {
+            if (operationKey.startsWith(name + ":")) {
+                operations.delete(operationKey);
+            }
+        }
         LOG.infov("Deleted StackSet: {0}", name);
     }
 
