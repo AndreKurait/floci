@@ -5305,7 +5305,12 @@ public class Ec2QueryHandler {
 
     private Response handleDescribeAddresses(MultivaluedMap<String, String> p, String region) {
         List<String> allocationIds = getList(p, "AllocationId");
-        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
+        List<Map.Entry<String, List<String>>> filters = new ArrayList<>(getFiltersList(p));
+        List<String> publicIps = getList(p, "PublicIp");
+        if (!publicIps.isEmpty()) {
+            // The addresses named by PublicIp.N are the only ones the answer may carry.
+            filters.add(Map.entry("public-ip", publicIps));
+        }
         List<Address> addrs = service.describeAddresses(region, allocationIds, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeAddressesResponse", AwsNamespaces.EC2)
