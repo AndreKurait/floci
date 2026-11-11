@@ -61,6 +61,15 @@ protocols are retained when the server certificate is reloaded.
 
 With TLS enabled, the proxy that accepts HTTP and HTTPS on Floci's ports listens on `QUARKUS_HTTP_HOST` (`127.0.0.1` by default). As without TLS, any address outside loopback also needs `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`; see [Network Exposure](./environment-variables.md#network-exposure).
 
+The proxy preserves the original client address and port for both protocols using
+a PROXY protocol preface on its connection to Quarkus. The internal HTTP and HTTPS
+listeners remain on loopback and require that preface. Their loopback address,
+internal ports, and PROXY protocol setting take precedence over system-property
+overrides; the public proxy still uses the configured host. Clients should use the
+public Floci port. Client-supplied `Forwarded` and `X-Forwarded-For` headers remain
+subject to the configured forwarding policy; the TCP proxy does not use them to
+choose the client's address.
+
 ## Local CA and Server Certificate
 
 When `FLOCI_TLS_ENABLED=true` and no custom certificate is provided, Floci keeps a local root CA at `{persistent-path}/tls/floci-root-ca.crt` (key `floci-root-ca.key`, owner-only) and issues its server certificate `floci-server.crt` from it at startup. The server certificate:
