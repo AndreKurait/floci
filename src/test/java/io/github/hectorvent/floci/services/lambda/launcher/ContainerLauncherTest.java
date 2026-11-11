@@ -69,6 +69,7 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactor
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import io.github.hectorvent.floci.testing.LockWaits;
+import io.github.hectorvent.floci.testing.TestTime;
 import io.github.hectorvent.floci.testing.ThreadStates;
 import io.smallrye.config.EnvConfigSource;
 import io.smallrye.config.SmallRyeConfig;
@@ -102,6 +103,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -153,6 +155,11 @@ class ContainerLauncherTest {
     Path tempDir;
 
     ContainerLauncher launcher;
+
+    /** The timeline the launcher under test measures elapsed time on; it moves only when a test advances it. */
+    private final TestTime time = TestTime.create();
+    private static final Duration VOLUME_GRACE = Duration.ofMillis(ContainerLauncher.VOLUME_CLEANUP_GRACE_MS);
+    private static final Duration ONE_TICK = Duration.ofNanos(1);
     /** Collects remote paths passed to withRemotePath across all copy mocks. */
     final List<String> capturedRemotePaths = new ArrayList<>();
     String capturedRuntimeBootstrap;
@@ -729,7 +736,7 @@ class ContainerLauncherTest {
         return new ContainerLauncher(builder, lifecycleManager, logStreamer, selectedResolver,
                 runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
                 layerService, new LaunchedContainerAwsEnv(endpoint),
-                executionRoleCredentials, codeVolumeFunctionStore(), vpcNetworkManager);
+                executionRoleCredentials, codeVolumeFunctionStore(), vpcNetworkManager, time::nanoTime);
     }
 
     @Test
@@ -2526,14 +2533,13 @@ class ContainerLauncherTest {
     @Test
     void cachedLaunchForADeletedFunctionDoesNotCancelItsVolumeRetirementRetry() throws Exception {
         LambdaFunctionStore store = codeVolumeFunctionStore();
-        useInjectedLauncher(store);
+        useTimelineLauncher(store);
         LambdaFunction fn = codeVolumeFunction("stale-deleted-cache", "$LATEST", "stale-deleted-sha");
         store.save("us-east-1", fn);
         String volume = ContainerLauncher.codeVolumeName(config, fn);
         when(lifecycleManager.volumeExists(volume)).thenReturn(true);
         when(lifecycleManager.removeVolume(volume)).thenReturn(false, true);
         long minimum = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
-        long grace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
         try {
             ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
             ContainerHandle original = launcher.launch(fn);
@@ -2547,13 +2553,17 @@ class ContainerLauncherTest {
                     "the captured old function must take the cached-volume path");
             assertEquals(0, launcher.inFlightCount(volume));
             launcher.stop(stale);
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-            launcher.cleanupSupersededVolumes();
 
+            // The refused removal requeued the volume for one full grace period.
+            time.advance(VOLUME_GRACE.minus(ONE_TICK));
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(1)).removeVolume(volume);
+
+            time.advance(ONE_TICK);
+            launcher.cleanupSupersededVolumes();
             verify(lifecycleManager, times(2)).removeVolume(volume);
         } finally {
             ContainerLauncher.CODE_VOLUME_MIN_BYTES = minimum;
-            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = grace;
         }
     }
 
@@ -2793,6 +2803,16 @@ class ContainerLauncherTest {
         launcher = (ContainerLauncher) injected.newInstance(arguments);
     }
 
+    /** The collaborators of {@link #useInjectedLauncher}, with elapsed time read from {@link #time}. */
+    private void useTimelineLauncher(LambdaFunctionStore store) {
+        ContainerBuilder builder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
+        LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, 4566));
+        launcher = new ContainerLauncher(builder, lifecycleManager, logStreamer, imageResolver,
+                runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, store, null, time::nanoTime);
+    }
+
     private LambdaService normalDeleteService(LambdaFunctionStore store) {
         lenient().when(config.services().lambda().containerDrainTimeoutSeconds()).thenReturn(15);
         WarmPool pool = new WarmPool(launcher, config, Clock.systemUTC());
@@ -2828,24 +2848,24 @@ class ContainerLauncherTest {
         String volumeV2 = ContainerLauncher.codeVolumeName(v2);
 
         withLoweredCodeVolumeThreshold(() -> {
-            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-            try {
-                launcher.launch(v1);
-                launcher.launch(v2);
+            launcher.launch(v1);
+            launcher.launch(v2);
 
-                // The v1 volume is superseded but not yet cleaned up: the grace period hasn't elapsed.
-                launcher.cleanupSupersededVolumes();
-                verify(lifecycleManager, never()).removeVolume(volumeV1);
+            // The v1 volume is superseded but not yet cleaned up: the grace period hasn't elapsed.
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
 
-                // Once the grace period has (trivially) elapsed, the sweep removes exactly the
-                // superseded v1 volume, not the current v2 one.
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-                launcher.cleanupSupersededVolumes();
-                verify(lifecycleManager, times(1)).removeVolume(volumeV1);
-                verify(lifecycleManager, never()).removeVolume(volumeV2);
-            } finally {
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-            }
+            // One tick short of the grace period is still too early.
+            time.advance(VOLUME_GRACE.minus(ONE_TICK));
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
+
+            // At the instant the grace period has elapsed, the sweep removes exactly the
+            // superseded v1 volume, not the current v2 one.
+            time.advance(ONE_TICK);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+            verify(lifecycleManager, never()).removeVolume(volumeV2);
         });
     }
 
@@ -2854,7 +2874,7 @@ class ContainerLauncherTest {
         // A rollback resolves v1's already populated volume. Persist each live code change so the
         // sweep must protect the rolled-back reference while retiring the now-unreferenced v2.
         LambdaFunctionStore store = codeVolumeFunctionStore();
-        useInjectedLauncher(store);
+        useTimelineLauncher(store);
         Path codePath = Files.createDirectory(tempDir.resolve("rollback-code"));
         Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
 
@@ -2879,22 +2899,17 @@ class ContainerLauncherTest {
         when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
 
         withLoweredCodeVolumeThreshold(() -> {
-            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-            try {
-                store.save("us-east-1", v1);
-                launcher.launch(v1);
-                store.save("us-east-1", v2);
-                launcher.launch(v2);
-                store.save("us-east-1", v1);
-                launcher.launch(v1); // roll back
+            store.save("us-east-1", v1);
+            launcher.launch(v1);
+            store.save("us-east-1", v2);
+            launcher.launch(v2);
+            store.save("us-east-1", v1);
+            launcher.launch(v1); // roll back
 
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-                launcher.cleanupSupersededVolumes();
-                verify(lifecycleManager, never()).removeVolume(volumeV1);
-                verify(lifecycleManager, times(1)).removeVolume(volumeV2);
-            } finally {
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-            }
+            time.advance(VOLUME_GRACE);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
+            verify(lifecycleManager, times(1)).removeVolume(volumeV2);
         });
     }
 
@@ -2923,20 +2938,16 @@ class ContainerLauncherTest {
                 .thenReturn(Optional.of(Map.of("floci_namespace", "someone-else")));
 
         withLoweredCodeVolumeThreshold(() -> {
-            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-            try {
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-                launcher.launch(v1);
-                launcher.launch(v2);
+            launcher.launch(v1);
+            launcher.launch(v2);
+            time.advance(VOLUME_GRACE);
 
-                launcher.cleanupSupersededVolumes();
-                launcher.cleanupSupersededVolumes();
+            launcher.cleanupSupersededVolumes();
+            time.advance(VOLUME_GRACE);
+            launcher.cleanupSupersededVolumes();
 
-                verify(lifecycleManager, never()).removeVolume(volumeV1);
-                verify(lifecycleManager, times(1)).tryVolumeLabels(volumeV1);
-            } finally {
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-            }
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
+            verify(lifecycleManager, times(1)).tryVolumeLabels(volumeV1);
         });
     }
 
@@ -2968,22 +2979,23 @@ class ContainerLauncherTest {
         when(lifecycleManager.removeVolume(volumeV1)).thenReturn(false);
 
         withLoweredCodeVolumeThreshold(() -> {
-            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-            try {
-                launcher.launch(v1);
-                launcher.launch(v2);
+            launcher.launch(v1);
+            launcher.launch(v2);
 
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-                launcher.cleanupSupersededVolumes();
-                verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+            time.advance(VOLUME_GRACE);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
 
-                // A later sweep must still retry it, not have silently dropped it after the first
-                // no-op'd attempt.
-                launcher.cleanupSupersededVolumes();
-                verify(lifecycleManager, times(2)).removeVolume(volumeV1);
-            } finally {
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-            }
+            // The refused removal starts a fresh grace period: one tick short of it, no retry yet.
+            time.advance(VOLUME_GRACE.minus(ONE_TICK));
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+
+            // A later sweep must still retry it, not have silently dropped it after the first
+            // no-op'd attempt.
+            time.advance(ONE_TICK);
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(2)).removeVolume(volumeV1);
         });
     }
 
@@ -3027,11 +3039,10 @@ class ContainerLauncherTest {
         }).when(lifecycleManager).removeVolume(volumeV1);
 
         withLoweredCodeVolumeThreshold(() -> {
-            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
             try {
                 launcher.launch(v1);
                 launcher.launch(v2);
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+                time.advance(VOLUME_GRACE);
 
                 Thread cleanupThread = new Thread(launcher::cleanupSupersededVolumes);
                 cleanupThread.start();
@@ -3057,7 +3068,7 @@ class ContainerLauncherTest {
                 rollbackThread.join(5000);
                 assertTrue(rollbackReturned.get(), "rollback should complete once cleanup releases the lock");
             } finally {
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+                releaseCleanup.countDown();
             }
         });
     }
@@ -3095,7 +3106,7 @@ class ContainerLauncherTest {
         when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
 
         withLoweredCodeVolumeThreshold(() -> {
-            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+            CountDownLatch releaseLaunch = new CountDownLatch(1);
             try {
 
                 // Pre-populate v1's volume with an ordinary launch, before installing the create()
@@ -3104,7 +3115,6 @@ class ContainerLauncherTest {
                 launcher.launch(v1);
 
                 CountDownLatch launchReachedCreate = new CountDownLatch(1);
-                CountDownLatch releaseLaunch = new CountDownLatch(1);
                 AtomicBoolean blockedOnce = new AtomicBoolean(false);
                 doAnswer(inv -> {
                     if (blockedOnce.compareAndSet(false, true)) {
@@ -3128,7 +3138,7 @@ class ContainerLauncherTest {
 
                 // A redeploy resolves v2 and supersedes v1's volume while v1's own launch is still stuck.
                 launcher.launch(v2);
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1; // grace period elapses instantly
+                time.advance(VOLUME_GRACE); // the grace period has elapsed
 
                 launcher.cleanupSupersededVolumes();
                 verify(lifecycleManager, never()).removeVolume(volumeV1);
@@ -3139,11 +3149,17 @@ class ContainerLauncherTest {
                 assertEquals(0, launcher.inFlightCount(volumeV1),
                         "in-flight count must be released once create() succeeds");
 
-                // Nothing is in flight anymore, so a later sweep is free to actually delete it.
+                // The in-flight skip requeued the volume, so it gets a fresh grace period first.
+                time.advance(VOLUME_GRACE.minus(ONE_TICK));
+                launcher.cleanupSupersededVolumes();
+                verify(lifecycleManager, never()).removeVolume(volumeV1);
+
+                // Nothing is in flight anymore, so the sweep after that is free to actually delete it.
+                time.advance(ONE_TICK);
                 launcher.cleanupSupersededVolumes();
                 verify(lifecycleManager, times(1)).removeVolume(volumeV1);
             } finally {
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+                releaseLaunch.countDown();
             }
         });
     }
@@ -3242,21 +3258,17 @@ class ContainerLauncherTest {
         v2.setCodeSha256("lock-persist-fn-sha-v2");
 
         withLoweredCodeVolumeThreshold(() -> {
-            long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
-            try {
-                launcher.launch(v1);
-                assertTrue(launcher.hasCodeVolumeLock(volumeV1), "lock must exist right after populate");
+            launcher.launch(v1);
+            assertTrue(launcher.hasCodeVolumeLock(volumeV1), "lock must exist right after populate");
 
-                launcher.launch(v2); // supersedes v1's volume, queues it for cleanup
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
-                launcher.cleanupSupersededVolumes(); // deletes v1's volume for real
+            launcher.launch(v2); // supersedes v1's volume, queues it for cleanup
+            time.advance(VOLUME_GRACE);
+            launcher.cleanupSupersededVolumes(); // deletes v1's volume for real
+            verify(lifecycleManager).removeVolume(volumeV1);
 
-                assertTrue(launcher.hasCodeVolumeLock(volumeV1),
-                        "lock must still exist even after the volume itself was deleted - "
-                                + "pruning it here is exactly the bug this test guards against");
-            } finally {
-                ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
-            }
+            assertTrue(launcher.hasCodeVolumeLock(volumeV1),
+                    "lock must still exist even after the volume itself was deleted - "
+                            + "pruning it here is exactly the bug this test guards against");
         });
     }
 
