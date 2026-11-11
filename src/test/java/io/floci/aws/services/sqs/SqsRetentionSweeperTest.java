@@ -19,4 +19,15 @@ class SqsRetentionSweeperTest {
         assertDoesNotThrow(sweeper::sweep);
         verify(sqsService).deleteExpiredMessages();
     }
+
+
+    @Test
+    void aSweepThatEndsInAnErrorDoesNotEscapeTheScheduledTask() {
+        SqsService failing = mock(SqsService.class);
+        doThrow(new StackOverflowError("sweep failed")).when(failing).deleteExpiredMessages();
+        SqsRetentionSweeper sweeper = new SqsRetentionSweeper(failing, true, scheduler);
+
+        assertDoesNotThrow(sweeper::sweep);
+        verify(failing).deleteExpiredMessages();
+    }
 }
