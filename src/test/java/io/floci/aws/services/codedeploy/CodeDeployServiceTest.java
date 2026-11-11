@@ -22,6 +22,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
@@ -83,6 +84,51 @@ class CodeDeployServiceTest {
                 new RegionResolver(REGION, ACCOUNT_ID), null);
         svc.initializeStorage();
         return svc;
+    }
+
+    @Test
+    void onPremisesTagFilterTypesMatchOnlyRequestedTags() {
+        for (String name : List.of("red-team", "blue-team", "red-env", "untagged")) {
+            service.registerOnPremisesInstance(REGION, name, null, null);
+        }
+        service.addTagsToOnPremisesInstances(REGION, List.of("red-team"),
+                List.of(Map.of("Key", "team", "Value", "red")));
+        service.addTagsToOnPremisesInstances(REGION, List.of("blue-team"),
+                List.of(Map.of("Key", "team", "Value", "blue")));
+        service.addTagsToOnPremisesInstances(REGION, List.of("red-env"),
+                List.of(Map.of("Key", "env", "Value", "red")));
+
+        assertEquals(Set.of("red-team", "red-env"), Set.copyOf(service.listOnPremisesInstances(REGION, null,
+                List.of(Map.of("Value", "red", "Type", "VALUE_ONLY")))));
+        assertEquals(Set.of("red-team", "red-env"), Set.copyOf(service.listOnPremisesInstances(REGION, null,
+                List.of(Map.of("Key", "ignored", "Value", "red", "Type", "VALUE_ONLY")))));
+        assertEquals(Set.of("red-team", "blue-team"), Set.copyOf(service.listOnPremisesInstances(REGION, null,
+                List.of(Map.of("Key", "team", "Value", "ignored", "Type", "KEY_ONLY")))));
+        assertEquals(List.of("red-team"), service.listOnPremisesInstances(REGION, null,
+                List.of(Map.of("Key", "team", "Value", "red", "Type", "KEY_AND_VALUE"))));
+        assertEquals(List.of(), service.listOnPremisesInstances(REGION, null,
+                List.of(Map.of("Key", "team", "Type", "KEY_AND_VALUE"))));
+        assertEquals(List.of(), service.listOnPremisesInstances(REGION, null,
+                List.of(Map.of("Value", "red", "Type", "KEY_AND_VALUE"))));
+        assertEquals(List.of("red-team"), service.listOnPremisesInstances(REGION, null,
+                List.of(Map.of("Key", "team", "Value", "red"))));
+    }
+
+    @Test
+    void keylessUntypedOnPremisesFilterStillSelectsRegisteredDeploymentTargets() {
+        service.registerOnPremisesInstance(REGION, "matching-onprem", null, null);
+        service.registerOnPremisesInstance(REGION, "untagged-onprem", null, null);
+        service.addTagsToOnPremisesInstances(REGION, List.of("matching-onprem"),
+                List.of(Map.of("Key", "team", "Value", "red")));
+        service.createApplication(REGION, "keyless-filter-app", "Server", null);
+        service.createDeploymentGroup(REGION, "keyless-filter-app", "group", null, ROLE_ARN,
+                Map.of("onPremisesInstanceTagFilters", List.of(Map.of("Value", "red"))), null);
+
+        String deploymentId = service.createDeployment(REGION, "keyless-filter-app", "group", null,
+                Map.of("appSpecContent", Map.of("content", "os: linux")), null);
+
+        assertEquals(Set.of("matching-onprem", "untagged-onprem"),
+                Set.copyOf(service.listDeploymentTargets(REGION, deploymentId)));
     }
 
     // ---- Server platform (SSM) hooks ---------------------------------------------------
@@ -518,7 +564,7 @@ class CodeDeployServiceTest {
     private String createServerDeployment(CodeDeployService target, String appName, String groupName,
                                           int timeoutSeconds) {
         target.createApplication(REGION, appName, "Server", null);
-        target.createDeploymentGroup(REGION, appName, groupName, "CodeDeployDefault.AllAtOnce", ROLE_ARN, null);
+        target.createDeploymentGroup(REGION, appName, groupName, "CodeDeployDefault.AllAtOnce", ROLE_ARN, null, null);
         String appSpec = """
                 os: linux
                 hooks:
@@ -534,7 +580,7 @@ class CodeDeployServiceTest {
     private void createLambdaAppAndGroup(String appName, String groupName) {
         service.createApplication(REGION, appName, "Lambda", null);
         service.createDeploymentGroup(REGION, appName, groupName,
-                "CodeDeployDefault.LambdaAllAtOnce", ROLE_ARN, null);
+                "CodeDeployDefault.LambdaAllAtOnce", ROLE_ARN, null, null);
     }
 
     private String createLambdaDeployment(String appName, String groupName, String beforeHook, String afterHook) {
