@@ -1810,6 +1810,11 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             String deletedPrefix = deletedFargatePrefix(cluster);
             deletedFargateArns.keys().stream().filter(key -> key.startsWith(deletedPrefix))
                     .toList().forEach(deletedFargateArns::delete);
+            String childPrefix = clusterKey(cluster) + "/";
+            nodeGroupStorage.keys().stream().filter(key -> key.startsWith(childPrefix)).toList()
+                    .forEach(nodeGroupStorage::delete);
+            fargateProfileStorage.keys().stream().filter(key -> key.startsWith(childPrefix)).toList()
+                    .forEach(fargateProfileStorage::delete);
             synchronized (clustersBeingDeleted) {
                 // Under the lock ensureAutoModeNodeEntry takes, so an entry it makes meanwhile goes too, and before
                 // the record, so a delete whose entry cleanup fails can be retried.
