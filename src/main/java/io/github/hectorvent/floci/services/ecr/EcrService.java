@@ -47,6 +47,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -1809,8 +1810,11 @@ public class EcrService implements ResourceProvider {
     }
 
     private Repository refreshRepositoryUri(Repository repo, String region) {
-        repo.setRepositoryUri(registryManager.getRepositoryUri(repo.getRegistryId(), region, repo.getRepositoryName()));
-        repoStore.put(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
+        String uri = registryManager.getRepositoryUri(repo.getRegistryId(), region, repo.getRepositoryName());
+        if (!Objects.equals(uri, repo.getRepositoryUri())) {
+            repo.setRepositoryUri(uri);
+            repoStore.put(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
+        }
         return repo;
     }
 
