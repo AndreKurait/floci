@@ -196,6 +196,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         this.clock = clock;
     }
 
+    private double nowEpochSeconds() {
+        return EpochSeconds.fromMillis(clock.millis());
+    }
+
     public void clear() {
         if (aslExecutor != null) {
             aslExecutor.clearNestedExecutionWaits();
@@ -239,7 +243,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             resources.add(new ExplorerResource(
                     arn, "states:stateMachine", "states",
                     parsed.region(), parsed.accountId(),
-                    sm.getCreationDate() > 0 ? Instant.ofEpochMilli((long) (sm.getCreationDate() * 1000)) : Instant.now(),
+                    sm.getCreationDate() > 0 ? Instant.ofEpochMilli((long) (sm.getCreationDate() * 1000)) : clock.instant(),
                     sm.getTags() != null ? sm.getTags() : Map.of()));
         }
         return resources;
@@ -394,6 +398,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
 
         StateMachine sm = new StateMachine();
+        sm.setCreationDate(nowEpochSeconds());
         sm.setStateMachineArn(arn);
         sm.setName(name);
         sm.setDefinition(definition);
@@ -488,7 +493,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
 
         updated.setRevisionId(UUID.randomUUID().toString());
-        updated.setUpdateDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+        updated.setUpdateDate(nowEpochSeconds());
         StateMachineVersion version = request.publish()
                 ? addVersion(updated, request.versionDescription())
                 : null;
@@ -644,6 +649,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
 
         StateMachineAlias alias = new StateMachineAlias();
+        double createdAt = nowEpochSeconds();
+        alias.setCreationDate(createdAt);
+        alias.setUpdateDate(createdAt);
         alias.setStateMachineAliasArn(aliasArn);
         alias.setStateMachineArn(stateMachineArn);
         alias.setName(name);
@@ -732,7 +740,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         if (routingConfiguration != null) {
             updated.setRoutingConfiguration(copyRoutingConfiguration(routingConfiguration));
         }
-        updated.setUpdateDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+        updated.setUpdateDate(nowEpochSeconds());
         stateMachineAliasStore.put(aliasArn, updated);
         return copyAlias(updated);
     }
@@ -837,6 +845,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             }
 
             exec = new Execution();
+            double startedAt = nowEpochSeconds();
+            exec.setStartDate(startedAt);
             exec.setExecutionArn(arn);
             exec.setStateMachineArn(resolved.baseArn());
             exec.setStateMachineVersionArn(resolved.versionArn());
@@ -850,6 +860,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                 }
             });
             HistoryEvent startEvent = new HistoryEvent();
+            startEvent.setTimestamp(startedAt);
             startEvent.setId(1L);
             startEvent.setPreviousEventId(0L);
             startEvent.setType("ExecutionStarted");
@@ -901,13 +912,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         String execName = (name != null && !name.isBlank()) ? name : UUID.randomUUID().toString();
         // Real AWS express execution ARN format: express:<smName>:<startDate>:<execName>
         // where startDate is ISO-8601 UTC, e.g. 2024-01-15T10:30:00.123Z
+        Instant startedAt = clock.instant();
         String startDate = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
                 .withZone(ZoneOffset.UTC)
-                .format(Instant.now());
+                .format(startedAt);
         String arn = regionResolver.buildArn("states", region,
                 "express:" + sm.getName() + ":" + startDate + ":" + execName);
 
         Execution exec = new Execution();
+        exec.setStartDate(EpochSeconds.fromMillis(startedAt.toEpochMilli()));
         exec.setExecutionArn(arn);
         exec.setStateMachineArn(resolved.baseArn());
         exec.setStateMachineVersionArn(resolved.versionArn());
@@ -918,6 +931,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
 
         ArrayList<HistoryEvent> history = new ArrayList<>();
         HistoryEvent startEvent = new HistoryEvent();
+        startEvent.setTimestamp(exec.getStartDate());
         startEvent.setId(1L);
         startEvent.setPreviousEventId(0L);
         startEvent.setType("ExecutionStarted");
@@ -1073,17 +1087,19 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
      * Aborts a running execution. The caller's {@code error} and {@code cause} land on the
      * Execution itself, not only on the history event, so DescribeExecution reports them.
      * {@link #markAborted} carries the terminal write and the reasons it is made under the
-     * Execution's own monitor.
+     * Execution's own monitor. Returns the execution, whose stop date is the one the caller is
+     * told: the instant of this abort, or of the outcome that was already published.
      */
-    public void stopExecution(String arn, String cause, String error) {
+    public Execution stopExecution(String arn, String cause, String error) {
         Execution exec = describeExecution(arn);
         if (!markAborted(arn, exec, error, cause)) {
-            return;
+            return exec;
         }
         executionStore.put(arn, exec);
         if (StepFunctionsEventPublisher.isStandard(exec)) {
             eventPublisher.emitStatusChange(exec);
         }
+        return exec;
     }
 
     /**
@@ -1132,13 +1148,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
      * told is finished.
      */
     private boolean markAborted(String arn, Execution exec, String error, String cause) {
+        double stoppedAt;
         synchronized (exec) {
             if (!"RUNNING".equals(exec.getStatus())) {
                 return false;
             }
             exec.setError(error);
             exec.setCause(cause);
-            exec.setStopDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+            stoppedAt = nowEpochSeconds();
+            exec.setStopDate(stoppedAt);
             exec.setStatus("ABORTED");
         }
 
@@ -1154,7 +1172,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         ExecutionHistory history = historyCache.computeIfAbsent(arn,
                 key -> new ExecutionHistory(exec.getHistory(), () -> { }, false));
         exec.setHistory(history);
-        history.sealWith("ExecutionAborted", details);
+        history.sealWith("ExecutionAborted", details, stoppedAt);
         return true;
     }
 
@@ -1215,8 +1233,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
 
         /** Appends the terminal event, numbered from the end of the history, and takes no more. */
-        synchronized void sealWith(String terminalEventType, Map<String, Object> details) {
+        synchronized void sealWith(String terminalEventType, Map<String, Object> details, double timestamp) {
             HistoryEvent terminalEvent = new HistoryEvent();
+            terminalEvent.setTimestamp(timestamp);
             terminalEvent.setId(size() + 1L);
             terminalEvent.setPreviousEventId((long) size());
             terminalEvent.setType(terminalEventType);
@@ -1234,6 +1253,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             throw new AwsException("ActivityAlreadyExists", "Activity already exists: " + arn, 400);
         }
         Activity activity = new Activity();
+        activity.setCreationDate(nowEpochSeconds());
         activity.setActivityArn(arn);
         activity.setName(name);
         if (tags != null && !tags.isEmpty()) {
@@ -1567,7 +1587,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         StateMachineVersion version = new StateMachineVersion(
                 stateMachine.getStateMachineArn() + ":" + next,
                 next,
-                EpochSeconds.fromMillis(System.currentTimeMillis()));
+                nowEpochSeconds());
         version.setDescription(description);
         version.setName(stateMachine.getName());
         version.setDefinition(stateMachine.getDefinition());
