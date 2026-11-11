@@ -18344,18 +18344,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         String finalType = type != null ? type : "one-time";
 
         List<SpotInstanceRequest> requests = new ArrayList<>();
+        if (count <= 0) {
+            return requests;
+        }
 
-        for (int i = 0; i < count; i++) {
+        // One launch for the whole request, so it is all or nothing: launching one instance at a
+        // time left the earlier instances and their requests behind when a later launch failed,
+        // while the caller was answered with the error and never learned their ids.
+        Reservation reservation = runInstances(region, imageId, instanceType, count, count, keyName,
+                securityGroupIds, subnetId, null, instanceTags, userData, iamInstanceProfileArn,
+                /* associatePublicIp */ null, /* networkInterfaceId */ null,
+                /* networkInterfaceDeviceIndex */ 0, /* availabilityZone */ null,
+                /* metadataOptions */ null, /* creditSpecificationCpuCredits */ null, encodedUserData,
+                false, null, null, null, true);
+        Instant requestedAt = clock.instant();
+
+        for (Instance launchedInstance : reservation.getInstances()) {
             String spotRequestId = "sir-" + randomHex(8);
-
-            Reservation reservation = runInstances(region, imageId, instanceType, 1, 1, keyName,
-                    securityGroupIds, subnetId, null, instanceTags, userData, iamInstanceProfileArn,
-                    /* associatePublicIp */ null, /* networkInterfaceId */ null,
-                    /* networkInterfaceDeviceIndex */ 0, /* availabilityZone */ null,
-                    /* metadataOptions */ null, /* creditSpecificationCpuCredits */ null, encodedUserData,
-                    false, null, null, null, true);
-
-            Instance launchedInstance = reservation.getInstances().get(0);
 
             LaunchSpecification spec = new LaunchSpecification();
             spec.setImageId(launchedInstance.getImageId());
@@ -18377,9 +18382,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             sir.setState("active");
             sir.setStatusCode("fulfilled");
             sir.setStatusMessage("Your Spot Instance request is fulfilled.");
-            sir.setStatusUpdateTime(clock.instant());
+            sir.setStatusUpdateTime(requestedAt);
             sir.setInstanceId(launchedInstance.getInstanceId());
-            sir.setCreateTime(clock.instant());
+            sir.setCreateTime(requestedAt);
             sir.setLaunchSpecification(spec);
             sir.setRegion(region);
             if (productDescription != null && !productDescription.isBlank()) {
