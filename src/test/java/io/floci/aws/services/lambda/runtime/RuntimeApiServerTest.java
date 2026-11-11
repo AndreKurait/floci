@@ -31,6 +31,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -1743,6 +1744,20 @@ class RuntimeApiServerTest {
         // Both init/error and exit/error are fatal to the execution environment in real AWS, so
         // the server is marked faulted for WarmPool to retire the container rather than reuse it.
         assertTrue(server.isFaulted(), "init/error must condemn the execution environment");
+    }
+
+    @Test
+    @Timeout(30)
+    void extensionShutdownSnapshotIncludesOnlySubscribedNamesAndIsIndependent() throws Exception {
+        registerExtension("invoke-only", "INVOKE");
+        registerExtension("none");
+        registerExtension("shutdown", "SHUTDOWN");
+        Map<String, Boolean> snapshot = server.extensionShutdownSubscriptions();
+        assertEquals(Map.of("invoke-only", false, "none", false, "shutdown", true), snapshot);
+
+        registerExtension("invoke-only", "SHUTDOWN");
+        assertFalse(snapshot.get("invoke-only"), "Existing snapshots must not change during registration");
+        assertTrue(server.extensionShutdownSubscriptions().get("invoke-only"));
     }
 
     @Test

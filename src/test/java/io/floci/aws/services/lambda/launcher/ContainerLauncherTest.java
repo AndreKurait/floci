@@ -7,6 +7,10 @@ import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectExecCmd;
+import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
@@ -33,6 +37,7 @@ import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.iam.model.SessionCreds;
 import io.floci.aws.services.lambda.LambdaLayerFixtures;
 import io.floci.aws.services.lambda.LambdaLayerService;
+import io.floci.aws.services.lambda.launcher.ExtensionShutdownWait.ExtensionExec;
 import io.floci.aws.services.lambda.model.LambdaFileSystemConfig;
 import io.floci.aws.services.lambda.model.LambdaFunction;
 import io.floci.aws.services.lambda.model.LambdaLayerVersion;
@@ -46,6 +51,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -64,7 +70,9 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,12 +81,19 @@ import java.util.OptionalInt;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static io.floci.aws.testing.DockerDaemonVersionFixtures.stubDaemonVersion;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -86,6 +101,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -95,6 +111,10 @@ import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class ContainerLauncherTest {
+
+    private static final Duration PATIENT_EXTENSION_BUDGET = Duration.ofMinutes(10);
+    /** Fails a stop that waits for extensions it must not wait for, well before that budget. */
+    private static final Duration HANG_GUARD = Duration.ofSeconds(20);
 
     @Mock ContainerLifecycleManager lifecycleManager;
     @Mock ContainerLogStreamer logStreamer;
@@ -511,6 +531,19 @@ class ContainerLauncherTest {
                 executionRoleCredentials, ec2Service);
     }
 
+    /**
+     * A launcher whose extension shutdown budget is long enough that it cannot run out during a
+     * test: a stop that waits when it should not then hangs instead of passing two seconds late.
+     */
+    private ContainerLauncher patientLauncher(LongSupplier nanoClock) {
+        ContainerReachableEndpoint endpoint =
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, null, 4566);
+        return new ContainerLauncher(new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer),
+                lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory, dockerHostResolver,
+                config, ecrRegistryManager, layerService, new LaunchedContainerAwsEnv(endpoint),
+                executionRoleCredentials, ec2Service, PATIENT_EXTENSION_BUDGET, nanoClock);
+    }
+
     @ParameterizedTest
     @CsvSource({
             "arm64, true, , linux/arm64, arm64",
@@ -687,6 +720,7 @@ class ContainerLauncherTest {
         launcher.launch(fn);
 
         assertEquals(javaTrustStore, captureRealContainerSpec().javaTrustStore());
+        assertTrue(captureRealContainerSpec().init(), "Runtime must receive normal Unix shutdown signals");
     }
 
     @Test
@@ -694,6 +728,7 @@ class ContainerLauncherTest {
         launcher.launch(imageFunction());
 
         assertTrue(captureRealContainerSpec().javaTrustStore());
+        assertTrue(captureRealContainerSpec().init(), "Custom images also need signal forwarding and reaping");
     }
 
     @Test
@@ -1430,9 +1465,8 @@ class ContainerLauncherTest {
         verify(executionRoleCredentials).unregister("222233334444", "ASIASTOPSESSION");
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void stopRevokesCredentialsOnFailureAndRetainsRuntimeUntilRemovalSucceeds(boolean extensions) throws Exception {
+    @Test
+    void stopRevokesCredentialsOnFailureAndRetainsRuntimeUntilRemovalSucceeds() throws Exception {
         Path codePath = Files.createDirectory(tempDir.resolve("role-session-stop-retry"));
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("role-session-stop-retry-fn");
@@ -1442,9 +1476,8 @@ class ContainerLauncherTest {
         fn.setCodeLocalPath(codePath.toString());
         when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
                 new SessionCreds("ASIARETRYSESSION", "role-secret", "role-token")));
-        when(runtimeApiServer.hasRegisteredExtensions()).thenReturn(extensions);
         ContainerHandle handle = launcher.launch(fn);
-        int timeout = extensions ? 2 : 1;
+        int timeout = 1;
         IllegalStateException failure = new IllegalStateException("Docker removal failed");
         doThrow(failure).doNothing().when(lifecycleManager)
                 .stopAndRemoveStrict("container-123", null, timeout);
@@ -2450,6 +2483,280 @@ class ContainerLauncherTest {
         inOrder.verify(lifecycleManager).startCreated(eq("container-123"), any());
         inOrder.verify(dockerClient).copyArchiveFromContainerCmd("container-123", "/opt/extensions");
         inOrder.verify(dockerClient, atLeastOnce()).execCreateCmd("container-123");
+    }
+
+    @Test
+    void launchTracksSubscribedExecCompletionAndStopRetainsRuntimeGrace() throws Exception {
+        List<ExecCreateCmd> launches = stubExtensionDiscovery("shutdown", "invoke-only");
+        List<ResultCallback<Frame>> callbacks = new ArrayList<>();
+        when(logStreamer.execLogCallbackForAccount(anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenAnswer(invocation -> new ResultCallback.Adapter<Frame>() { });
+        when(dockerClient.execStartCmd(argThat(id -> id != null && id.startsWith("exec-launch-"))))
+                .thenAnswer(invocation -> {
+                    ExecStartCmd start = mock(ExecStartCmd.class);
+                    when(start.exec(any())).thenAnswer(startInvocation -> {
+                        ResultCallback<Frame> callback = startInvocation.getArgument(0);
+                        callbacks.add(callback);
+                        return callback;
+                    });
+                    return start;
+                });
+        when(runtimeApiServer.extensionShutdownSubscriptions())
+                .thenReturn(Map.of("shutdown", true, "invoke-only", false));
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("shutdown-order");
+        fn.setPackageType("Image");
+        fn.setImageUri("example:latest");
+        ContainerHandle handle = launcher.launch(fn);
+        ExtensionShutdownWait wait = handle.extensionShutdownWait(execId -> false);
+        assertFalse(wait.isComplete());
+        callbacks.get(capturedLaunchPaths(launches).indexOf("/opt/extensions/shutdown")).onComplete();
+        assertTrue(wait.isComplete(), "INVOKE-only exec must not hold shutdown open");
+
+        launcher.stop(handle);
+
+        InOrder order = inOrder(runtimeApiServer, lifecycleManager);
+        order.verify(runtimeApiServer).quiesce();
+        order.verify(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+        order.verify(runtimeApiServer).close();
+    }
+
+    @Test
+    void stopRestoresInterruptAfterCompletingCleanup() {
+        ContainerHandle handle = launcher.launch(imageFunction());
+        doAnswer(invocation -> {
+            assertFalse(Thread.currentThread().isInterrupted(), "Daemon cleanup must be allowed to run");
+            return null;
+        }).when(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+        Thread.currentThread().interrupt();
+        try {
+            launcher.stop(handle);
+            assertTrue(Thread.currentThread().isInterrupted());
+            verify(runtimeApiServer).close();
+            verify(runtimeApiServerFactory).release(runtimeApiServer);
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void stopWaitsForSubscribedExitAndAllowsInterruptDuringTheWait(boolean interrupt) throws Exception {
+        // The real two seconds could run out while a loaded machine stalls this thread.
+        ContainerLauncher patient = patientLauncher(System::nanoTime);
+        ContainerHandle handle = patient.launch(imageFunction());
+        CompletableFuture<Void> exit = new CompletableFuture<>();
+        handle.setExtensionExecs(Map.of("shutdown", new ExtensionExec("exec-shutdown", exit)));
+        CountDownLatch selectingExits = new CountDownLatch(1);
+        when(runtimeApiServer.extensionShutdownSubscriptions()).thenAnswer(invocation -> {
+            selectingExits.countDown();
+            return Map.of("shutdown", true);
+        });
+        doAnswer(invocation -> {
+            assertFalse(Thread.currentThread().isInterrupted());
+            return null;
+        }).when(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+        AtomicReference<Thread> worker = new AtomicReference<>();
+        try (ExecutorService cleanup = Executors.newSingleThreadExecutor()) {
+            Future<Boolean> stopped = cleanup.submit(() -> {
+                worker.set(Thread.currentThread());
+                patient.stop(handle);
+                return Thread.currentThread().isInterrupted();
+            });
+            try {
+                assertTrue(selectingExits.await(5, TimeUnit.SECONDS));
+                await().atMost(5, TimeUnit.SECONDS).until(() ->
+                        stopped.isDone() || worker.get().getState() == Thread.State.TIMED_WAITING);
+                assertFalse(stopped.isDone(), "A subscribed exec must hold cleanup until exit or interruption");
+                verify(lifecycleManager, never()).stopAndRemoveStrict(anyString(), any(), anyInt());
+                if (interrupt) {
+                    worker.get().interrupt();
+                } else {
+                    exit.complete(null);
+                }
+                assertEquals(interrupt, stopped.get(5, TimeUnit.SECONDS));
+                verify(runtimeApiServer).close();
+            } finally {
+                exit.complete(null);
+            }
+        }
+    }
+
+    static Stream<Arguments> extensionsWithoutAShutdownSubscription() {
+        return Stream.of(
+                Arguments.of("no extension", Map.of(), List.of()),
+                Arguments.of("INVOKE only or no events", Map.of("extension", false), List.of("extension")),
+                Arguments.of("never registered", Map.of(), List.of("extension")));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("extensionsWithoutAShutdownSubscription")
+    void stopDoesNotWaitWithoutAShutdownSubscribedExtension(
+            String name, Map<String, Boolean> subscriptions, List<String> running) {
+        ContainerLauncher patient = patientLauncher(System::nanoTime);
+        ContainerHandle handle = patient.launch(imageFunction());
+        Map<String, ExtensionExec> execs = new HashMap<>();
+        running.forEach(extension -> execs.put(extension,
+                new ExtensionExec("exec-" + extension, new CompletableFuture<>())));
+        handle.setExtensionExecs(execs);
+        when(runtimeApiServer.extensionShutdownSubscriptions()).thenReturn(subscriptions);
+
+        // None of these processes ever exits, so a stop that waited for one would hang here.
+        assertTimeoutPreemptively(HANG_GUARD, () -> patient.stop(handle));
+
+        verify(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+        verify(dockerClient, never()).inspectExecCmd(anyString());
+    }
+
+    @Test
+    void cleanupRetryAfterTheExtensionDeadlineDoesNotWaitAgain() {
+        AtomicLong now = new AtomicLong();
+        ContainerLauncher patient = patientLauncher(now::get);
+        ContainerHandle handle = patient.launch(imageFunction());
+        handle.setExtensionExecs(Map.of("shutdown", new ExtensionExec("exec-shutdown", new CompletableFuture<>())));
+        when(runtimeApiServer.extensionShutdownSubscriptions()).thenReturn(Map.of("shutdown", true));
+        // The first stop uses up the budget; the clock stands still afterwards.
+        doAnswer(invocation -> {
+            now.addAndGet(PATIENT_EXTENSION_BUDGET.toNanos());
+            return null;
+        }).doNothing().when(runtimeApiServer).quiesce();
+        IllegalStateException failure = new IllegalStateException("Docker removal failed");
+        doThrow(failure).doNothing().when(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+
+        assertSame(failure, assertThrows(IllegalStateException.class, () -> patient.stop(handle)));
+        // The extension never exits: a retry that started a new deadline would wait out a whole budget.
+        assertTimeoutPreemptively(HANG_GUARD, () -> patient.stop(handle));
+
+        verify(lifecycleManager, times(2)).stopAndRemoveStrict("container-123", null, 1);
+        verify(runtimeApiServer).close();
+    }
+
+    /**
+     * A start that fails on the client may still have started the process in the daemon. Its
+     * entry is kept, and a stop asks the daemon about it: it waits while the process runs and
+     * stops waiting once it does not, rather than assuming either.
+     */
+    @Test
+    void failedExtensionExecStartIsKeptAndResolvedByInspectingTheExec() throws Exception {
+        stubExtensionDiscovery("shutdown");
+        when(dockerClient.execStartCmd(argThat(id -> id != null && id.startsWith("exec-launch-"))))
+                .thenAnswer(invocation -> {
+                    ExecStartCmd start = mock(ExecStartCmd.class);
+                    when(start.exec(any())).thenThrow(new IllegalStateException("connection reset"));
+                    return start;
+                });
+        when(runtimeApiServer.extensionShutdownSubscriptions()).thenReturn(Map.of("shutdown", true));
+        AtomicBoolean running = new AtomicBoolean(true);
+        InspectExecResponse exec = mock(InspectExecResponse.class);
+        when(exec.isRunning()).thenAnswer(invocation -> running.get());
+        stubExecInspection(exec);
+        stubContainerRunning(true);
+        ContainerLauncher patient = patientLauncher(System::nanoTime);
+        ContainerHandle handle = patient.launch(imageFunction());
+
+        try (ExecutorService cleanup = Executors.newSingleThreadExecutor()) {
+            Future<?> stopped = cleanup.submit(() -> patient.stop(handle));
+            try {
+                verify(exec, timeout(5000).atLeast(2)).isRunning();
+                assertFalse(stopped.isDone(), "A process the daemon reports as running keeps its grace");
+                verify(lifecycleManager, never()).stopAndRemoveStrict(anyString(), any(), anyInt());
+            } finally {
+                running.set(false);
+            }
+            stopped.get(5, TimeUnit.SECONDS);
+        }
+        verify(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+    }
+
+    @Test
+    void failedExtensionExecStartFailsAProvisionedLaunch() throws Exception {
+        stubExtensionDiscovery("shutdown");
+        IllegalStateException failure = new IllegalStateException("connection reset");
+        when(dockerClient.execStartCmd(argThat(id -> id != null && id.startsWith("exec-launch-"))))
+                .thenAnswer(invocation -> {
+                    ExecStartCmd start = mock(ExecStartCmd.class);
+                    when(start.exec(any())).thenThrow(failure);
+                    return start;
+                });
+
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> launcher.launchProvisioned(imageFunction()));
+
+        assertSame(failure, thrown.getCause());
+    }
+
+    /**
+     * docker-java reports a failed read of an exec stream as {@code onError} followed by
+     * {@code onComplete}, so the stream never completes normally. The stop must then learn from
+     * the daemon that the process is gone instead of waiting out the budget.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"exec exited", "exec forgotten", "container stopped", "container removed"})
+    void stopAsksTheDaemonAboutAnExtensionWhoseOutputStreamFailed(String daemonState) throws Exception {
+        stubExtensionDiscovery("shutdown");
+        List<ResultCallback<Frame>> callbacks = new ArrayList<>();
+        when(logStreamer.execLogCallbackForAccount(anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenAnswer(invocation -> new ResultCallback.Adapter<Frame>() { });
+        when(dockerClient.execStartCmd(argThat(id -> id != null && id.startsWith("exec-launch-"))))
+                .thenAnswer(invocation -> {
+                    ExecStartCmd start = mock(ExecStartCmd.class);
+                    when(start.exec(any())).thenAnswer(startInvocation -> {
+                        ResultCallback<Frame> callback = startInvocation.getArgument(0);
+                        callbacks.add(callback);
+                        return callback;
+                    });
+                    return start;
+                });
+        when(runtimeApiServer.extensionShutdownSubscriptions()).thenReturn(Map.of("shutdown", true));
+        ContainerLauncher patient = patientLauncher(System::nanoTime);
+        ContainerHandle handle = patient.launch(imageFunction());
+        callbacks.getFirst().onError(new IOException("stream reset"));
+        callbacks.getFirst().onComplete();
+        InspectExecResponse exec = mock(InspectExecResponse.class);
+        switch (daemonState) {
+            case "exec exited" -> {
+                when(exec.isRunning()).thenReturn(false);
+                stubExecInspection(exec);
+            }
+            case "exec forgotten" -> stubExecInspection(new NotFoundException("no such exec"));
+            case "container stopped" -> {
+                when(exec.isRunning()).thenReturn(true);
+                stubExecInspection(exec);
+                stubContainerRunning(false);
+            }
+            default -> {
+                stubExecInspection(new IllegalStateException("daemon error"));
+                InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+                when(inspect.exec()).thenThrow(new NotFoundException("no such container"));
+                when(dockerClient.inspectContainerCmd("container-123")).thenReturn(inspect);
+            }
+        }
+
+        assertTimeoutPreemptively(HANG_GUARD, () -> patient.stop(handle));
+
+        verify(lifecycleManager).stopAndRemoveStrict("container-123", null, 1);
+    }
+
+    /** Stubs the inspection of a launched extension exec to return a response or throw. */
+    private void stubExecInspection(Object outcome) {
+        InspectExecCmd inspect = mock(InspectExecCmd.class);
+        if (outcome instanceof RuntimeException failure) {
+            when(inspect.exec()).thenThrow(failure);
+        } else {
+            when(inspect.exec()).thenReturn((InspectExecResponse) outcome);
+        }
+        when(dockerClient.inspectExecCmd(argThat(id -> id != null && id.startsWith("exec-launch-"))))
+                .thenReturn(inspect);
+    }
+
+    private void stubContainerRunning(boolean running) {
+        InspectContainerResponse.ContainerState state = mock(InspectContainerResponse.ContainerState.class);
+        when(state.getRunning()).thenReturn(running);
+        InspectContainerResponse container = mock(InspectContainerResponse.class);
+        when(container.getState()).thenReturn(state);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(inspect.exec()).thenReturn(container);
+        when(dockerClient.inspectContainerCmd("container-123")).thenReturn(inspect);
     }
 
     /**

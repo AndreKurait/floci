@@ -1,9 +1,12 @@
 package io.floci.aws.services.lambda.launcher;
 
+import io.floci.aws.services.lambda.launcher.ExtensionShutdownWait.ExtensionExec;
 import io.floci.aws.services.lambda.model.ContainerState;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 
 import java.io.Closeable;
+import java.util.Map;
+import java.util.function.Predicate;
 
 /**
  * Wraps a running Lambda Docker container and its associated Runtime API server.
@@ -20,6 +23,9 @@ public class ContainerHandle {
     private volatile ContainerState state;
     private volatile long lastUsedMs;
     private Closeable logStream;
+    private Map<String, ExtensionExec> extensionExecs = Map.of();
+    private Long extensionShutdownStartedNanos;
+    private ExtensionShutdownWait extensionShutdownWait;
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -59,6 +65,28 @@ public class ContainerHandle {
 
     public Closeable getLogStream() { return logStream; }
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
+    void setExtensionExecs(Map<String, ExtensionExec> extensionExecs) {
+        this.extensionExecs = Map.copyOf(extensionExecs);
+    }
+
+    synchronized long beginExtensionShutdown(long nowNanos) {
+        if (extensionShutdownStartedNanos == null) {
+            extensionShutdownStartedNanos = nowNanos;
+        }
+        return extensionShutdownStartedNanos;
+    }
+
+    /**
+     * The extension processes a stop of this container waits for. Selected by the first stop,
+     * before it sends SHUTDOWN, and kept for cleanup retries like the deadline.
+     */
+    synchronized ExtensionShutdownWait extensionShutdownWait(Predicate<String> execExited) {
+        if (extensionShutdownWait == null) {
+            extensionShutdownWait = new ExtensionShutdownWait(
+                    runtimeApiServer.extensionShutdownSubscriptions(), extensionExecs, execExited);
+        }
+        return extensionShutdownWait;
+    }
 
     /**
      * True once an extension in this container reported an init or exit error. Real AWS treats

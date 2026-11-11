@@ -2,6 +2,7 @@ package io.floci.aws.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
@@ -20,6 +21,7 @@ import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.iam.model.SessionCreds;
 import io.floci.aws.services.lambda.LambdaLayerService;
 import io.floci.aws.services.lambda.LambdaLogDestinations;
+import io.floci.aws.services.lambda.launcher.ExtensionShutdownWait.ExtensionExec;
 import io.floci.aws.services.lambda.model.ContainerState;
 import io.floci.aws.services.lambda.model.LambdaFunction;
 import io.floci.aws.services.lambda.model.LambdaLayerVersion;
@@ -45,9 +47,11 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -64,6 +68,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -115,6 +120,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
     private static final DateTimeFormatter LOG_STREAM_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
+    /** How long a stop waits for SHUTDOWN-subscribed extensions, matching AWS's 2000 ms budget. */
+    static final Duration EXTENSION_SHUTDOWN_BUDGET = Duration.ofSeconds(2);
+
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final ContainerLogStreamer logStreamer;
@@ -128,6 +136,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
     private final Ec2Service ec2Service;
     private final LambdaContainerReconciler containerReconciler;
+    private final Duration extensionShutdownBudget;
+    private final LongSupplier nanoClock;
     /** The VPC address each VpcConfig function's container holds, returned once it is removed. */
     private final Map<String, VpcLease> vpcLeases = new ConcurrentHashMap<>();
 
@@ -144,6 +154,26 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LaunchedContainerAwsEnv awsEnv,
                              LambdaExecutionRoleCredentials executionRoleCredentials,
                              Ec2Service ec2Service) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, ec2Service, EXTENSION_SHUTDOWN_BUDGET, System::nanoTime);
+    }
+
+    /** Lets tests set the extension shutdown budget and the clock that measures it. */
+    ContainerLauncher(ContainerBuilder containerBuilder,
+                      ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer,
+                      ImageResolver imageResolver,
+                      RuntimeApiServerFactory runtimeApiServerFactory,
+                      DockerHostResolver dockerHostResolver,
+                      EmulatorConfig config,
+                      EcrRegistryManager ecrRegistryManager,
+                      LambdaLayerService layerService,
+                      LaunchedContainerAwsEnv awsEnv,
+                      LambdaExecutionRoleCredentials executionRoleCredentials,
+                      Ec2Service ec2Service,
+                      Duration extensionShutdownBudget,
+                      LongSupplier nanoClock) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -157,6 +187,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.executionRoleCredentials = executionRoleCredentials;
         this.ec2Service = ec2Service;
         this.containerReconciler = new LambdaContainerReconciler(config, lifecycleManager);
+        this.extensionShutdownBudget = extensionShutdownBudget;
+        this.nanoClock = nanoClock;
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
     }
 
@@ -307,6 +339,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withEnv(env)
                 .withMemoryBytes(memoryBytes)
                 .withMemorySwapBytes(memoryBytes)
+                .withInit()
                 .withDockerNetwork(config.services().lambda().dockerNetwork())
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
@@ -480,7 +513,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // (e.g. aws-lambda-web-adapter) never start without this. Best-effort: an extension
         // launch failure shouldn't fail the whole container launch, since a function with no
         // extensions is the common case and this must be a no-op for it.
-        launchExtensions(dockerClient, containerId, fn.getFunctionName(), runtimeApiServer, logDestination, provisioned);
+        Map<String, ExtensionExec> extensionExecs = launchExtensions(
+                dockerClient, containerId, fn.getFunctionName(), runtimeApiServer, logDestination, provisioned);
 
         // Init-readiness barrier: the execs above are detached, so without waiting here the caller
         // could enqueue the first invocation before an extension is ready to receive it — the
@@ -503,6 +537,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 lambdaAccountId, containerId, cwLogGroup, cwLogStream,
                 lambdaRegion, "lambda:" + fn.getFunctionName());
         handle.setLogStream(logHandle);
+        handle.setExtensionExecs(extensionExecs);
 
         return handle;
         } catch (RuntimeException e) {
@@ -648,53 +683,51 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     public void stop(ContainerHandle handle) {
         LOG.infov("Stopping container {0}", handle.getContainerId());
         handle.setState(ContainerState.STOPPED);
-
         RuntimeApiServer server = handle.getRuntimeApiServer();
-
-        // Quiesce first: stop accepting new work, notify extensions, complete pending
-        // invocations. Existing runtime pollers on /invocation/next stay parked.
-        server.quiesce();
-
-        // Then SIGTERM the container. The runtime library's default SIGTERM handler exits
-        // the process while the runtime API socket is still up, matching real AWS Lambda's
-        // shutdown flow.
-        //
-        // stopTimeoutSeconds is the ceiling docker waits for PID 1 to exit before SIGKILL,
-        // not a grace floor: the runtime typically exits promptly, so `docker stop`
-        // returns shortly after and this value rarely matters end-to-end. Sized against
-        // AWS's documented Shutdown-phase tiers as a defensive upper bound only — 2s
-        // when at least one extension is registered (matching AWS's 2000ms
-        // external-extensions budget), else 1s. NOTE: extensions run as sibling
-        // `docker exec`s (not children of PID 1) and are killed when the container
-        // exits; the 2s ceiling does not provide a guaranteed grace window for
-        // extension shutdown work — only that we will not preempt PID 1 for at least
-        // that long if it happens to be slow.
-        int stopTimeoutSeconds = server.hasRegisteredExtensions() ? 2 : 1;
+        boolean interrupted = Thread.interrupted();
         try {
-            lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
-                    stopTimeoutSeconds);
-        } finally {
-            executionRoleCredentials.unregister(
-                    handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
-        }
-        // Only once the container is gone: a failed removal is retried, and until then Docker
-        // still holds the address.
-        releaseVpcLease(handle.getContainerId());
+            long shutdownStarted = handle.beginExtensionShutdown(nanoClock.getAsLong());
+            ExtensionShutdownWait extensionWait = handle.extensionShutdownWait(
+                    execId -> extensionExecExited(handle.getContainerId(), execId));
+            server.quiesce();
+            // A cleanup retry after the deadline does not wait again.
+            long remainingNanos = extensionShutdownBudget.toNanos() - (nanoClock.getAsLong() - shutdownStarted);
+            if (!interrupted && remainingNanos > 0) {
+                try {
+                    if (!extensionWait.await(remainingNanos)) {
+                        LOG.debugv("Extensions of container {0} outlived their shutdown budget",
+                                handle.getContainerId());
+                    }
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
 
-        // Only now close the runtime API socket. Any pollers that were still parked when
-        // the container exited get terminated by their end of the connection closing;
-        // this call releases the port for reuse.
-        try {
-            server.close().get(5, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } catch (ExecutionException | TimeoutException | CancellationException e) {
-            // CancellationException is unchecked; catch it so a cancelled close future
-            // is logged here instead of propagating out of stop().
-            LOG.warnv(e, "RuntimeApiServer did not close cleanly for container {0}",
-                    handle.getContainerId());
+            // The init forwards SIGTERM. Always give the runtime its own bounded
+            // chance to flush, even when extensions consumed their entire budget.
+            try {
+                lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(), 1);
+            } finally {
+                executionRoleCredentials.unregister(
+                        handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
+            }
+            // A failed removal is retried; Docker holds the address until it succeeds.
+            releaseVpcLease(handle.getContainerId());
+
+            try {
+                server.close().get(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                interrupted = true;
+            } catch (ExecutionException | TimeoutException | CancellationException e) {
+                LOG.warnv(e, "RuntimeApiServer did not close cleanly for container {0}",
+                        handle.getContainerId());
+            } finally {
+                runtimeApiServerFactory.release(server);
+            }
         } finally {
-            runtimeApiServerFactory.release(server);
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -727,6 +760,35 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         VpcLease lease = vpcLeases.remove(containerId);
         if (lease != null) {
             ec2Service.releaseVpcPrivateIp(lease.region(), lease.subnetId(), lease.address());
+        }
+    }
+
+    /**
+     * Whether the daemon reports an extension's process as gone. Asked only when its output
+     * stream failed. A question the daemon does not answer leaves the process its grace.
+     */
+    private boolean extensionExecExited(String containerId, String execId) {
+        DockerClient dockerClient = lifecycleManager.getDockerClient();
+        try {
+            if (Boolean.FALSE.equals(dockerClient.inspectExecCmd(execId).exec().isRunning())) {
+                return true;
+            }
+        } catch (NotFoundException e) {
+            // The daemon forgets an exec once it exited or its container was removed.
+            return true;
+        } catch (RuntimeException e) {
+            LOG.debugv(e, "Could not inspect extension exec {0} of container {1}", execId, containerId);
+        }
+        try {
+            // No process outlives its container, whatever the exec reported.
+            InspectContainerResponse.ContainerState state =
+                    dockerClient.inspectContainerCmd(containerId).exec().getState();
+            return state != null && Boolean.FALSE.equals(state.getRunning());
+        } catch (NotFoundException e) {
+            return true;
+        } catch (RuntimeException e) {
+            LOG.debugv(e, "Could not inspect container {0} for its extension exec {1}", containerId, execId);
+            return false;
         }
     }
 
@@ -1466,13 +1528,15 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         LambdaExitWatcher.watch(dockerClient, containerId, runtimeApiServer::handleRuntimeProcessExited);
     }
 
-    private void launchExtensions(DockerClient dockerClient, String containerId, String functionName,
+    private Map<String, ExtensionExec> launchExtensions(DockerClient dockerClient,
+                                  String containerId, String functionName,
                                   RuntimeApiServer runtimeApiServer, LogDestination logDestination, boolean strict) {
         List<String> extensionNames = listExtensionBinaries(dockerClient, containerId, functionName, strict);
         // Arm the readiness barrier before starting any extension process, so the latch already
         // exists when the first one starts polling /extension/event/next — otherwise a
         // fast-starting extension could become ready before there is anything to count it down.
         runtimeApiServer.expectExtensions(extensionNames.size());
+        Map<String, ExtensionExec> execs = new HashMap<>();
         for (String name : extensionNames) {
             try {
                 String path = EXTENSIONS_DIR + "/" + name;
@@ -1490,10 +1554,20 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 // the container log and an observability extension's output would vanish entirely.
                 // Draining is also required in its own right — an unread exec pipe fills up and
                 // stalls the extension process.
-                dockerClient.execStartCmd(execId).exec(logStreamer.execLogCallbackForAccount(
+                ExtensionLogCallback callback = new ExtensionLogCallback(logStreamer.execLogCallbackForAccount(
                         logDestination.accountId(), logDestination.logGroup(), logDestination.logStream(),
                         logDestination.region(),
                         "lambda:" + functionName + ":" + name));
+                // A synchronous connection error may occur after the daemon starts the exec.
+                // Keep the entry with a failed stream, so that shutdown asks the daemon
+                // whether the process runs instead of assuming either answer.
+                execs.put(name, new ExtensionExec(execId, callback.completion()));
+                try {
+                    dockerClient.execStartCmd(execId).exec(callback);
+                } catch (RuntimeException e) {
+                    callback.completion().completeExceptionally(e);
+                    throw e;
+                }
                 LOG.infov("Launched extension {0} for function {1} (container {2})",
                         name, functionName, containerId);
             } catch (Exception e) {
@@ -1504,6 +1578,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                         name, functionName);
             }
         }
+        return execs;
     }
 
     /**

@@ -287,15 +287,15 @@ public class RuntimeApiServer {
         return port;
     }
 
-    /**
-     * True if at least one extension has completed registration via
-     * {@code /extension/register}. Callers use this to pick the Shutdown-phase grace tier
-     * (see AWS's documented 0/500/2000ms limits): a container with a registered extension
-     * gets the 2s external-extensions budget, otherwise the runtime-only sub-budget.
-     */
-    public boolean hasRegisteredExtensions() {
+    /** Registration names and whether they receive SHUTDOWN, captured under the lifecycle lock. */
+    public Map<String, Boolean> extensionShutdownSubscriptions() {
         synchronized (lock) {
-            return !extensions.isEmpty();
+            Map<String, Boolean> subscriptions = new HashMap<>();
+            for (RegisteredExtension extension : extensions.values()) {
+                subscriptions.merge(extension.getName(),
+                        extension.isSubscribedTo(ExtensionEvent.Type.SHUTDOWN), Boolean::logicalOr);
+            }
+            return subscriptions;
         }
     }
 
