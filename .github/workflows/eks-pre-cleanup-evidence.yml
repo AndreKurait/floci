@@ -1,0 +1,86 @@
+name: EKS pre-cleanup failure evidence
+'on':
+  push:
+    branches:
+    - ci/eks-pre-cleanup-evidence-20261111
+    paths:
+    - .github/workflows/eks-pre-cleanup-evidence.yml
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  SHARD_TOTAL: 5
+jobs:
+  test:
+    name: Build and Test (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    if: github.repository == 'AndreKurait/floci'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+        - 4
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+      with:
+        java-version: '25'
+        distribution: temurin
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ~/.m2/repository
+        key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+        restore-keys: 'maven-${{ runner.os }}-
+
+          '
+    - name: Compute shard include list
+      run: "cd src/test/java\nfind . \\( -name '*Test.java' -o -name 'Test*.java' \\\n          -o -name '*Tests.java' -o\
+        \ -name '*TestCase.java' \\) \\\n  | sed 's|^\\./||; s|\\.java$||' | LC_ALL=C sort \\\n  > \"$GITHUB_WORKSPACE/all-classes.txt\"\
+        \ncd \"$GITHUB_WORKSPACE\"\npython3 -m unittest discover -s .github/ci -p test_partition.py\n.github/ci/partition.sh\
+        \ all-classes.txt \"$SHARD_TOTAL\" \"${{ matrix.shard }}\" > shard.txt\n# An empty includesFile makes surefire fall\
+        \ back to its default includes\n# and run the ENTIRE suite into this shard's timeout.\ntest -s shard.txt\necho \"\
+        shard ${{ matrix.shard }}/$SHARD_TOTAL: $(wc -l < shard.txt) classes\"\n"
+    - name: Prefetch this shard's Docker images (background)
+      run: .github/ci/prefetch-images.sh shard.txt || true
+    - name: Compile
+      run: ./mvnw test-compile -B
+    - name: Verify shard list matches compiled test classes
+      run: "cd target/test-classes\nfind . \\( -name '*Test.class' -o -name 'Test*.class' \\\n          -o -name '*Tests.class'\
+        \ -o -name '*TestCase.class' \\) \\\n        ! -name '*$*' \\\n  | sed 's|^\\./||; s|\\.class$||' | LC_ALL=C sort\
+        \ \\\n  > \"$RUNNER_TEMP/compiled-classes.txt\"\ncd \"$GITHUB_WORKSPACE\"\ncmp -s all-classes.txt \"$RUNNER_TEMP/compiled-classes.txt\"\
+        \ \\\n  || { echo \"::error::test class list from src/test/java differs from target/test-classes:\"; diff all-classes.txt\
+        \ \"$RUNNER_TEMP/compiled-classes.txt\" | head -50; exit 1; }\n"
+    - name: Run tests
+      run: './mvnw surefire:test -B -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt" -Dsurefire.failIfNoTests=true -Dsurefire.timeout=1500
+
+        '
+    - name: Image prefetch results
+      if: always()
+      run: "cat prefetch-images.log 2>/dev/null || echo \"no prefetch log\"\npgrep -af 'docker pull' | sed 's/^/still running:\
+        \ /' || true\ngrep -E 'stale prefetch key|prefetch skipped' prefetch-images.log 2>/dev/null \\\n  | sed 's/^/::warning\
+        \ title=prefetch-images.sh::/' || true\ngrep -E '(prefetched|prefetch failed) public\\.ecr\\.aws/' prefetch-images.log\
+        \ 2>/dev/null \\\n  | grep -vE 'public\\.ecr\\.aws/(lambda|emr-serverless)/' \\\n  | sed 's/^/::warning title=prefetch-images.sh::pull\
+        \ it from Docker Hub, not ECR Public: /' || true\n"
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      if: always() && matrix.shard == 1 && github.event_name == 'push'
+      with:
+        path: ~/.m2/repository
+        key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+    - name: Upload shard manifest and results
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: shard-${{ matrix.shard }}
+        path: 'shard.txt
+
+          all-classes.txt
+
+          prefetch-images.log
+
+          target/surefire-reports/
+
+          '
+        if-no-files-found: error
