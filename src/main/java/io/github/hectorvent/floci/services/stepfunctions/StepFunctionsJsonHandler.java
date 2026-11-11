@@ -544,13 +544,14 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleStopExecution(JsonNode request) {
-        service.stopExecution(
+        Execution stopped = service.stopExecution(
                 request.path("executionArn").asText(),
                 request.path("cause").asText(null),
                 request.path("error").asText(null)
         );
+        Double stopDate = stopped.getStopDate();
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("stopDate", EpochSeconds.fromMillis(System.currentTimeMillis()));
+        response.put("stopDate", stopDate != null ? stopDate : EpochSeconds.fromMillis(clock.millis()));
         return Response.ok(response).build();
     }
 
