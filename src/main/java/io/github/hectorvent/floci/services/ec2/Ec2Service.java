@@ -6315,8 +6315,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         "The instance '" + id + "' is not in a state from which it can be started.", 400);
             }
             InstanceState prev = inst.getState();
+            // Only a stopped instance is started. One that is running, or still launching, is left
+            // as it is: starting its container again would end with a live instance marked stopped.
+            boolean startable = "stopped".equals(prev.getName()) || "stopping".equals(prev.getName());
             synchronized (capacityReservationLock) {
-                if ("stopped".equals(prev.getName()) || "stopping".equals(prev.getName())) {
+                if (startable) {
                     inst.setState(InstanceState.pending());
                     try {
                         instances.put(key(region, id), inst);
@@ -6340,18 +6343,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     }
                 }
                 restoreInstanceFirewall(inst);
-                String accountId = callerAccountId();
-                containerManager.start(inst, () ->
-                        RequestScopes.runAs(accountId, region, () -> verifyInstanceMounts(region, inst)), () ->
-                        RequestScopes.runAs(accountId, region, () -> completeContainerStart(region, inst)));
+                if (startable) {
+                    String accountId = callerAccountId();
+                    containerManager.start(inst, () ->
+                            RequestScopes.runAs(accountId, region, () -> verifyInstanceMounts(region, inst)), () ->
+                            RequestScopes.runAs(accountId, region, () -> completeContainerStart(region, inst)));
+                }
             }
             instances.put(key(region, id), inst);
+            InstanceState current = startable ? InstanceState.pending() : prev;
             Map<String, String> entry = new LinkedHashMap<>();
             entry.put("instanceId", id);
             entry.put("previousState", prev.getName());
             entry.put("previousCode", String.valueOf(prev.getCode()));
-            entry.put("currentState", "pending");
-            entry.put("currentCode", "0");
+            entry.put("currentState", current.getName());
+            entry.put("currentCode", String.valueOf(current.getCode()));
             result.add(entry);
         }
         return result;
