@@ -9997,6 +9997,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new AwsException("MissingParameter", "The request must contain the parameter InstanceId", 400);
         }
         Instance source = getRequiredInstance(region, instanceId);
+        // Checked before the reboot: a request that is going to be refused for its name must not
+        // have restarted the instance first. RegisterImage below repeats the check under its lock.
+        requireUsableImageName(region, name);
 
         // AWS reboots the source instance by default so the image is captured from a quiesced
         // file system; NoReboot=true opts out and accepts the integrity risk.
@@ -10481,6 +10484,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return current;
     }
 
+    /** An AMI name must be given and must not be the name of an AMI the caller has in the region. */
+    private void requireUsableImageName(String region, String name) {
+        if (name == null || name.isBlank()) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter Name", 400);
+        }
+        boolean duplicateName = registeredImages.scan(k -> true).stream()
+                .filter(img -> region.equals(img.getRegion()))
+                // Deregistered AMIs release their names immediately in Floci.
+                .filter(img -> !DEREGISTERED_STATE.equals(img.getState()))
+                .anyMatch(img -> name.equals(img.getName()));
+        if (duplicateName) {
+            throw new AwsException("InvalidAMIName.Duplicate",
+                    "AMI name '" + name + "' is already in use.", 400);
+        }
+    }
+
     public Image registerImage(String region, String name, String description, String architecture,
                                String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings) {
         return registerImage(region, name, description, architecture, rootDeviceName, blockDeviceMappings, true);
@@ -10489,24 +10508,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private Image registerImage(String region, String name, String description, String architecture,
                                 String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings,
                                 boolean bindRegistrationName) {
-        if (name == null || name.isBlank()) {
-            throw new AwsException("MissingParameter", "The request must contain the parameter Name", 400);
-        }
         // The duplicate-name check is a read-modify-write over the whole image store, so two
         // registrations of the same name racing each other would both see no duplicate and both
         // insert. Registration also publishes this image's snapshot references, which is what
         // DeregisterImage scans before deleting a snapshot; both run under the registry lock so
         // a registration cannot slip between that scan and the delete.
         synchronized (imageRegistryLock) {
-            boolean duplicateName = registeredImages.scan(k -> true).stream()
-                    .filter(img -> region.equals(img.getRegion()))
-                    // Deregistered AMIs release their names immediately in Floci.
-                    .filter(img -> !DEREGISTERED_STATE.equals(img.getState()))
-                    .anyMatch(img -> name.equals(img.getName()));
-            if (duplicateName) {
-                throw new AwsException("InvalidAMIName.Duplicate",
-                        "AMI name '" + name + "' is already in use.", 400);
-            }
+            requireUsableImageName(region, name);
             Ec2ImageCatalog.CatalogImage source = bindRegistrationName
                     ? imageCatalog.findByRegistrationName(name).orElse(null) : null;
             if (source != null && architecture != null && !source.architecture.equals(architecture)) {
