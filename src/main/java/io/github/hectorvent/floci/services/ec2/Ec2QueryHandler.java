@@ -1604,6 +1604,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleTerminateInstances(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> ids = getList(p, "InstanceId");
         List<Map<String, String>> changes = service.terminateInstances(region, ids);
         return xmlResponse(buildInstanceStateChangeXml("TerminateInstancesResponse", changes));
@@ -1664,12 +1665,14 @@ public class Ec2QueryHandler {
     }
 
     private Response handleStartInstances(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> ids = getList(p, "InstanceId");
         List<Map<String, String>> changes = service.startInstances(region, ids);
         return xmlResponse(buildInstanceStateChangeXml("StartInstancesResponse", changes));
     }
 
     private Response handleStopInstances(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> ids = getList(p, "InstanceId");
         List<Map<String, String>> changes = service.stopInstances(region, ids);
         return xmlResponse(buildInstanceStateChangeXml("StopInstancesResponse", changes));
@@ -1696,6 +1699,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleRebootInstances(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> ids = getList(p, "InstanceId");
         service.rebootInstances(region, ids);
         return booleanResponse("RebootInstances");
@@ -1914,6 +1918,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteVpc(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.deleteVpc(region, p.getFirst("VpcId"));
         return booleanResponse("DeleteVpc");
     }
@@ -3687,6 +3692,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteSubnet(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.deleteSubnet(region, p.getFirst("SubnetId"));
         return booleanResponse("DeleteSubnet");
     }
@@ -4265,6 +4271,7 @@ public class Ec2QueryHandler {
      * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeregisterImage.html">DeregisterImage</a>
      */
     private Response handleDeregisterImage(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<Ec2Service.SnapshotDeletion> deletions = service.deregisterImage(
                 region,
                 p.getFirst("ImageId"),
@@ -4476,6 +4483,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> resourceIds = getList(p, "ResourceId");
         List<Tag> tagList = new ArrayList<>();
         for (int i = 1; ; i++) {
@@ -4542,6 +4550,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteInternetGateway(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.deleteInternetGateway(region, p.getFirst("InternetGatewayId"));
         return booleanResponse("DeleteInternetGateway");
     }
@@ -4592,6 +4601,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteRouteTable(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.deleteRouteTable(region, p.getFirst("RouteTableId"));
         return booleanResponse("DeleteRouteTable");
     }
@@ -4673,6 +4683,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteRoute(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         String rtId = p.getFirst("RouteTableId");
         String dest = p.getFirst("DestinationCidrBlock");
         String destIpv6 = p.getFirst("DestinationIpv6CidrBlock");
@@ -5287,6 +5298,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleReleaseAddress(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.releaseAddress(region, p.getFirst("AllocationId"));
         return booleanResponse("ReleaseAddress");
     }
@@ -5563,6 +5575,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteLaunchTemplate(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         LaunchTemplate launchTemplate = service.deleteLaunchTemplate(
                 region, p.getFirst("LaunchTemplateId"), p.getFirst("LaunchTemplateName"));
         XmlBuilder xml = new XmlBuilder()
@@ -5748,6 +5761,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteNetworkInterface(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.deleteNetworkInterface(region, p.getFirst("NetworkInterfaceId"));
         return booleanResponse("DeleteNetworkInterface");
     }
@@ -7082,6 +7096,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteVolume(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.deleteVolume(region, p.getFirst("VolumeId"));
         return booleanResponse("DeleteVolume");
     }
@@ -7184,6 +7199,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDetachVolume(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         String volumeId = p.getFirst("VolumeId");
         String instanceId = p.getFirst("InstanceId");
         String device = p.getFirst("Device");
@@ -7348,6 +7364,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleCancelSpotInstanceRequests(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> ids = getList(p, "SpotInstanceRequestId");
         List<SpotInstanceRequest> requests = service.cancelSpotInstanceRequests(region, ids);
 
