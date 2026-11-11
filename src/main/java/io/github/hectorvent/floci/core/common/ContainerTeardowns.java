@@ -36,6 +36,14 @@ public final class ContainerTeardowns {
         ordered.sort(Comparator.comparingInt(ContainerTeardown::teardownOrder));
         for (ContainerTeardown teardown : ordered) {
             try {
+                teardown.beginTeardown();
+            } catch (Exception e) {
+                log.warnv("Container teardown preparation failed for {0}: {1}",
+                        teardown.getClass().getSimpleName(), e.getMessage());
+            }
+        }
+        for (ContainerTeardown teardown : ordered) {
+            try {
                 teardown.stopManagedContainers();
             } catch (Exception e) {
                 log.warnv("Container teardown failed for {0}: {1}",

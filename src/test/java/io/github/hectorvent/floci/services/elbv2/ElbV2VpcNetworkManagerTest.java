@@ -22,7 +22,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -109,8 +111,8 @@ class ElbV2VpcNetworkManagerTest {
         verify(lifecycle).removeIfExistsStrict("second");
         verify(lifecycle, never()).removeIfExistsStrict("foreign");
         verify(lifecycle, never()).removeIfExistsStrict("ec2");
-        verify(firewall).unregister("eni-first");
-        verify(firewall).unregister("eni-second");
+        verify(firewall).unregisterAll(List.of("eni-first", "eni-second"));
+        verify(firewall, never()).unregister(anyString());
         verifyNoInteractions(ec2);
         assertTrue(manager.teardownOrder() < 0);
     }
@@ -126,9 +128,8 @@ class ElbV2VpcNetworkManagerTest {
 
         assertThrows(IllegalStateException.class, manager::stopManagedContainers);
 
-        verify(firewall).unregister("eni-first");
+        verify(firewall).unregisterAll(List.of("eni-first", "eni-second"));
         verify(lifecycle).removeIfExistsStrict("second");
-        verify(firewall).unregister("eni-second");
         verifyNoInteractions(ec2);
     }
 
@@ -139,15 +140,43 @@ class ElbV2VpcNetworkManagerTest {
         Container second = helper("second", "this-run/4566", "elbv2");
         when(docker.listContainersCmd().withShowAll(true).withLabelFilter(anyMap()).exec())
                 .thenReturn(List.of(first, second));
+        doThrow(new IllegalStateException("Batch refresh failed")).when(firewall)
+                .unregisterAll(List.of("eni-first", "eni-second"));
         doThrow(new IllegalStateException("Peer refresh failed")).when(firewall).unregister("eni-first");
 
         assertThrows(IllegalStateException.class, manager::stopManagedContainers);
 
         InOrder ordered = inOrder(firewall, lifecycle);
+        ordered.verify(firewall).unregisterAll(List.of("eni-first", "eni-second"));
         ordered.verify(firewall).unregister("eni-first");
         ordered.verify(lifecycle).removeIfExistsStrict("first");
         ordered.verify(firewall).unregister("eni-second");
         ordered.verify(lifecycle).removeIfExistsStrict("second");
+        verifyNoInteractions(ec2);
+    }
+
+    @Test
+    void malformedOwnedHelperDoesNotPreventRetirementOfTheOtherOwnedHelpers() {
+        DockerClient docker = nativeDocker();
+        Container first = helper("first", "this-run/4566", "elbv2");
+        Container malformed = helper("malformed", "this-run/4566", "elbv2");
+        when(malformed.getLabels()).thenReturn(Map.of(ContainerStorageHelper.OWNER_LABEL, "this-run/4566",
+                ContainerStorageHelper.SERVICE_LABEL, "elbv2",
+                ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true",
+                ElbV2VpcNetworkManager.ENI_LABEL, "",
+                ElbV2VpcNetworkManager.BALANCER_LABEL, "balancer"));
+        Container second = helper("second", "this-run/4566", "elbv2");
+        when(docker.listContainersCmd().withShowAll(true).withLabelFilter(anyMap()).exec())
+                .thenReturn(List.of(first, malformed, second));
+
+        assertThrows(IllegalStateException.class, manager::stopManagedContainers);
+
+        verify(firewall, never()).unregisterAll(anyList());
+        verify(firewall).unregister("eni-first");
+        verify(firewall).unregister("eni-second");
+        verify(lifecycle).removeIfExistsStrict("first");
+        verify(lifecycle).removeIfExistsStrict("second");
+        verify(lifecycle, never()).removeIfExistsStrict("malformed");
         verifyNoInteractions(ec2);
     }
 

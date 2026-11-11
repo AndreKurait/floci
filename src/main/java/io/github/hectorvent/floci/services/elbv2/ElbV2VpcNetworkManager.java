@@ -252,27 +252,36 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
         Map<String, String> selection = Map.of(ContainerStorageHelper.OWNER_LABEL,
                 ContainerStorageHelper.ownerIdentity(config), ContainerStorageHelper.SERVICE_LABEL, "elbv2",
                 ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true");
+        List<Container> helpers = lifecycle.getDockerClient().listContainersCmd().withShowAll(true)
+                .withLabelFilter(selection).exec().stream()
+                .filter(helper -> helper.getLabels() != null
+                        && helper.getLabels().entrySet().containsAll(selection.entrySet())).toList();
+        if (helpers.isEmpty()) {
+            return;
+        }
         RuntimeException failure = null;
-        for (Container helper : lifecycle.getDockerClient().listContainersCmd().withShowAll(true)
-                .withLabelFilter(selection).exec()) {
-            Map<String, String> labels = helper.getLabels();
-            if (labels == null || !labels.entrySet().containsAll(selection.entrySet())) {
-                continue;
-            }
+        boolean batchRetired = false;
+        try {
+            firewall.unregisterAll(helpers.stream().map(ElbV2VpcNetworkManager::retirementEni).toList());
+            batchRetired = true;
+        } catch (RuntimeException error) {
+            failure = new IllegalStateException("ALB backend helpers remain pending retirement");
+            failure.addSuppressed(error);
+        }
+        for (Container helper : helpers) {
             try {
-                String eniId = labels.get(ENI_LABEL);
-                if (eniId == null || eniId.isBlank() || !labels.containsKey(BALANCER_LABEL)) {
-                    throw new IllegalStateException("ALB helper has no confirmed resource ownership");
-                }
-                try {
-                    firewall.unregister(eniId);
-                } catch (RuntimeException error) {
+                String eniId = retirementEni(helper);
+                if (!batchRetired) {
                     try {
-                        lifecycle.removeIfExistsStrict(helper.getId());
-                    } catch (RuntimeException cleanupFailure) {
-                        error.addSuppressed(cleanupFailure);
+                        firewall.unregister(eniId);
+                    } catch (RuntimeException error) {
+                        try {
+                            lifecycle.removeIfExistsStrict(helper.getId());
+                        } catch (RuntimeException cleanupFailure) {
+                            error.addSuppressed(cleanupFailure);
+                        }
+                        throw error;
                     }
-                    throw error;
                 }
                 lifecycle.removeIfExistsStrict(helper.getId());
                 attachments.replaceAll((arn, current) -> current.stream()
@@ -288,6 +297,15 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
         if (failure != null) {
             throw failure;
         }
+    }
+
+    private static String retirementEni(Container helper) {
+        Map<String, String> labels = helper.getLabels();
+        String eniId = labels.get(ENI_LABEL);
+        if (eniId == null || eniId.isBlank() || !labels.containsKey(BALANCER_LABEL)) {
+            throw new IllegalStateException("ALB helper has no confirmed resource ownership");
+        }
+        return eniId;
     }
 
     @Override

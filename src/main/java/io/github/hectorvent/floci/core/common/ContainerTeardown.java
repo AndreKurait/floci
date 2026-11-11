@@ -23,6 +23,15 @@ package io.github.hectorvent.floci.core.common;
  */
 public interface ContainerTeardown {
 
+    /**
+     * Stop accepting or reconciling new runtime work before any owner removes its containers.
+     * This must retain shared resources until {@link #stopManagedContainers()}, since earlier
+     * owners may still need them to retire their workloads. {@link ContainerTeardowns#stopAll}
+     * calls this on every implementation before running the ordered stops.
+     */
+    default void beginTeardown() {
+    }
+
     void stopManagedContainers();
 
     /**

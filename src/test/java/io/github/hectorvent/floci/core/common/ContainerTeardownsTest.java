@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -32,6 +33,61 @@ import static org.mockito.Mockito.when;
 class ContainerTeardownsTest {
 
     private static final Logger LOG = Logger.getLogger(ContainerTeardownsTest.class);
+
+    @Test
+    void preparesEveryOwnerBeforeStoppingAnyContainersInDependencyOrder() {
+        List<String> events = new ArrayList<>();
+        ContainerTeardown storage = new ContainerTeardown() {
+            @Override
+            public void beginTeardown() {
+                events.add("prepare storage");
+            }
+
+            @Override
+            public void stopManagedContainers() {
+                events.add("stop storage");
+            }
+
+            @Override
+            public int teardownOrder() {
+                return 1;
+            }
+        };
+        ContainerTeardown drivers = new ContainerTeardown() {
+            @Override
+            public void beginTeardown() {
+                events.add("prepare drivers");
+            }
+
+            @Override
+            public void stopManagedContainers() {
+                events.add("stop drivers");
+            }
+        };
+        @SuppressWarnings("unchecked")
+        Instance<ContainerTeardown> teardowns = mock(Instance.class);
+        when(teardowns.iterator()).thenAnswer(invocation -> List.of(storage, drivers).iterator());
+
+        ContainerTeardowns.stopAll(teardowns, LOG);
+
+        assertEquals(List.of("prepare drivers", "prepare storage", "stop drivers", "stop storage"), events);
+    }
+
+    @Test
+    void failedPreparationStillPreparesAndStopsEveryOwner() {
+        ContainerTeardown failed = mock(ContainerTeardown.class);
+        ContainerTeardown following = mock(ContainerTeardown.class);
+        doThrow(new IllegalStateException("Could not stop admissions")).when(failed).beginTeardown();
+        @SuppressWarnings("unchecked")
+        Instance<ContainerTeardown> teardowns = mock(Instance.class);
+        when(teardowns.iterator()).thenAnswer(invocation -> List.of(failed, following).iterator());
+
+        ContainerTeardowns.stopAll(teardowns, LOG);
+
+        verify(failed).stopManagedContainers();
+        verify(following).beginTeardown();
+        verify(following).stopManagedContainers();
+    }
 
     @Test
     void stopAllRunsATeardownWhoseContainersOthersUseAfterTheirs() {
