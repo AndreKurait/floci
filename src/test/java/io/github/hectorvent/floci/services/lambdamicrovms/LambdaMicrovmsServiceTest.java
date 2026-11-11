@@ -66,6 +66,23 @@ class LambdaMicrovmsServiceTest {
     }
 
     @Test
+    void aVersionBuiltAfterAnOlderOneWasDeletedGetsANumberOfItsOwn() {
+        RegionResolver regionResolver = mock(RegionResolver.class);
+        when(regionResolver.getAccountId()).thenReturn(ACCOUNT_ID);
+        LambdaMicrovmsService service = new LambdaMicrovmsService(regionResolver, mock(StorageFactory.class));
+        String baseImage = "arn:aws:lambda:us-east-1:aws:microvm-image:al2023-1";
+        String buildRole = "arn:aws:iam::000000000000:role/build";
+        service.createImage(REGION, ACCOUNT_ID, "rebuilt", baseImage, buildRole, "s3://artifacts/app.zip", null);
+        service.updateImage(REGION, "rebuilt", baseImage, buildRole, "s3://artifacts/app-2.zip", null);
+        service.deleteVersion(REGION, "rebuilt", "1.0");
+
+        LambdaMicrovmsService.MicrovmImage image =
+                service.updateImage(REGION, "rebuilt", baseImage, buildRole, "s3://artifacts/app-3.zip", null);
+
+        assertEquals(List.of("2.0", "3.0"), image.versions.stream().map(version -> version.imageVersion).toList());
+    }
+
+    @Test
     void listsTaggedImagesAndConnectorsAsResources() {
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn(ACCOUNT_ID);

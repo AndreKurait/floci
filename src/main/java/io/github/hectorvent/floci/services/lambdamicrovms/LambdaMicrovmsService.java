@@ -180,10 +180,21 @@ public class LambdaMicrovmsService implements ResourceProvider {
     /** The Graviton generations every version is built for, newest first. */
     private static final List<String> CHIPSET_GENERATIONS = List.of("4", "3");
 
+    /** The number of the newest version an image still has; a deleted version leaves the count behind it. */
+    private static int highestVersionNumber(MicrovmImage image) {
+        int highest = 0;
+        for (MicrovmImageVersion existing : image.versions) {
+            int dot = existing.imageVersion.indexOf('.');
+            String number = dot < 0 ? existing.imageVersion : existing.imageVersion.substring(0, dot);
+            highest = Math.max(highest, Integer.parseInt(number));
+        }
+        return highest;
+    }
+
     /** Adds a converged version+builds and settles the image to CREATED. */
     private MicrovmImage addVersion(MicrovmImage image) {
         MicrovmImageVersion version = new MicrovmImageVersion();
-        version.imageVersion = (image.versions.size() + 1) + ".0";
+        version.imageVersion = (highestVersionNumber(image) + 1) + ".0";
         version.state = "SUCCESSFUL";
         version.status = "ACTIVE";
         version.createdAt = Instant.now();
