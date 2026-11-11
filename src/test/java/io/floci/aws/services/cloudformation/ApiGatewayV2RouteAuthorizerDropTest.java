@@ -20,6 +20,7 @@ import java.util.Map;
 
 import static io.floci.aws.services.cloudformation.CfnProvisionerFixture.engine;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -325,7 +326,7 @@ class ApiGatewayV2RouteAuthorizerDropTest {
     }
 
     @Test
-    void authorizerUriAndPayloadFormatVersionDroppedFromTheTemplateReadBackAbsent() throws Exception {
+    void authorizerUriAndPayloadFormatVersionDroppedWhileRequestAreKept() throws Exception {
         StackResource created = createAuthorizer("");
         assertEquals(LAMBDA_URI, authorizer(created).getAuthorizerUri());
 
@@ -333,18 +334,65 @@ class ApiGatewayV2RouteAuthorizerDropTest {
                 "{\"ApiId\":\"" + apiId + "\",\"Name\":\"auth\",\"AuthorizerType\":\"REQUEST\"}");
 
         Authorizer authorizer = authorizer(created);
-        assertNull(authorizer.getAuthorizerUri());
-        assertNull(authorizer.getAuthorizerPayloadFormatVersion());
+        assertEquals(LAMBDA_URI, authorizer.getAuthorizerUri());
+        assertEquals("2.0", authorizer.getAuthorizerPayloadFormatVersion());
     }
 
     @Test
-    void authorizerJwtConfigurationDroppedFromTheTemplateReadsBackAbsent() throws Exception {
+    void authorizerJwtConfigurationDroppedWhileJwtIsKept() throws Exception {
         StackResource created = createJwtAuthorizer(JWT_CONFIGURATION);
+        assertNotNull(authorizer(created).getJwtConfiguration());
         assertEquals("https://issuer.example", authorizer(created).getJwtConfiguration().issuer());
 
         updateAuthorizerFrom(created, jwtAuthorizer(JWT_CONFIGURATION), jwtAuthorizer(""));
 
-        assertNull(authorizer(created).getJwtConfiguration());
+        assertNotNull(authorizer(created).getJwtConfiguration());
+        assertEquals("https://issuer.example", authorizer(created).getJwtConfiguration().issuer());
+        assertEquals(List.of("aud"), authorizer(created).getJwtConfiguration().audience());
+    }
+
+    @Test
+    void requestRequiredSettingsMadeNoValueRemainWhileOptionalSettingsClear() throws Exception {
+        String before = "{" + AUTHORIZER_BASE.formatted(apiId) + ",\"EnableSimpleResponses\":true}";
+        StackResource created = createAuthorizer(",\"EnableSimpleResponses\":true");
+
+        updateAuthorizerFrom(created, before,
+                "{\"ApiId\":\"" + apiId + "\",\"Name\":\"auth\","
+                        + "\"AuthorizerUri\":{\"Ref\":\"AWS::NoValue\"},"
+                        + "\"AuthorizerPayloadFormatVersion\":{\"Fn::If\":[\"Off\","
+                        + "{\"Ref\":\"AWS::NoValue\"},\"2.0\"]}}");
+
+        Authorizer updated = authorizer(created);
+        assertEquals("REQUEST", updated.getAuthorizerType());
+        assertEquals(LAMBDA_URI, updated.getAuthorizerUri());
+        assertEquals("2.0", updated.getAuthorizerPayloadFormatVersion());
+        assertNull(updated.getEnableSimpleResponses());
+    }
+
+    @Test
+    void jwtConfigurationMadeNoValueIsKeptWhenTheTypeIsOmitted() throws Exception {
+        StackResource created = createJwtAuthorizer(JWT_CONFIGURATION);
+
+        updateAuthorizerFrom(created, jwtAuthorizer(JWT_CONFIGURATION),
+                "{\"ApiId\":\"" + apiId + "\",\"Name\":\"jwt\","
+                        + "\"JwtConfiguration\":{\"Ref\":\"AWS::NoValue\"}}");
+
+        assertEquals("JWT", authorizer(created).getAuthorizerType());
+        assertNotNull(authorizer(created).getJwtConfiguration());
+        assertEquals("https://issuer.example", authorizer(created).getJwtConfiguration().issuer());
+    }
+
+    @Test
+    void websocketRequestKeepsUriButClearsTheOptionalPayloadVersion() throws Exception {
+        apiId = service.createApi(REGION, Map.of("name", "ws-drop-api", "protocolType", "WEBSOCKET",
+                "routeSelectionExpression", "$request.body.action")).getApiId();
+        StackResource created = createAuthorizer("");
+
+        updateAuthorizerFrom(created, "{" + AUTHORIZER_BASE.formatted(apiId) + "}",
+                "{\"ApiId\":\"" + apiId + "\",\"Name\":\"auth\",\"AuthorizerType\":\"REQUEST\"}");
+
+        assertEquals(LAMBDA_URI, authorizer(created).getAuthorizerUri());
+        assertNull(authorizer(created).getAuthorizerPayloadFormatVersion());
     }
 
     @Test
