@@ -1268,8 +1268,21 @@ public class CloudWatchMetricsService implements Resettable {
     }
 
     private boolean matchesDimensions(List<Dimension> actual, List<Dimension> required) {
-        String requiredKey = buildDimKey(required);
-        String actualKey = buildDimKey(actual);
-        return actualKey.contains(requiredKey);
+        for (Dimension wanted : required) {
+            boolean present = false;
+            if (actual != null) {
+                for (Dimension candidate : actual) {
+                    if (candidate.name().equals(wanted.name())
+                            && (wanted.value() == null || wanted.value().equals(candidate.value()))) {
+                        present = true;
+                        break;
+                    }
+                }
+            }
+            if (!present) {
+                return false;
+            }
+        }
+        return true;
     }
 }
