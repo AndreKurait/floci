@@ -741,4 +741,24 @@ class AppSyncServiceTest {
         assertTrue(fromMerged.getAssociationArn().endsWith("/sourceApiAssociations/" + fromMerged.getAssociationId()),
                 fromMerged.getAssociationArn() + " does not name " + fromMerged.getAssociationId());
     }
+
+    @Test
+    void deletingAnApiRemovesTheAssociationsItTakesPartIn() {
+        AppSyncService svc = AppSyncServiceFixture.create(new AppSyncServiceFixture.MutableClock(NOW));
+        GraphqlApi source = svc.createGraphqlApi(Map.of("name", "source", "authenticationType", "API_KEY"), "us-east-1");
+        GraphqlApi merged = svc.createGraphqlApi(Map.of("name", "merged", "authenticationType", "API_KEY"), "us-east-1");
+        GraphqlApi other = svc.createGraphqlApi(Map.of("name", "other", "authenticationType", "API_KEY"), "us-east-1");
+        svc.createMergedApiAssociation(source.getApiId(), Map.of("mergedApiIdentifier", merged.getApiId()), "us-east-1");
+        svc.createMergedApiAssociation(other.getApiId(), Map.of("mergedApiIdentifier", merged.getApiId()), "us-east-1");
+
+        svc.deleteGraphqlApi(source.getApiId());
+
+        List<String> remainingSources = svc.listSourceApiAssociations(merged.getApiId(), null, null).items().stream()
+                .map(summary -> svc.getSourceApiAssociation(merged.getApiId(), summary.getAssociationId()).getSourceApiId())
+                .toList();
+        assertEquals(List.of(other.getApiId()), remainingSources);
+
+        svc.deleteGraphqlApi(merged.getApiId());
+        assertTrue(svc.listSourceApiAssociations(other.getApiId(), null, null).items().isEmpty());
+    }
 }
