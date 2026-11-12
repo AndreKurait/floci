@@ -27,6 +27,7 @@ import java.io.OutputStream;
 import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -539,7 +540,7 @@ class FlociUiManagerTest {
                 new ObjectMapper());
 
         manager.ensureStartedAsync();
-        await().atMost(2, TimeUnit.SECONDS)
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(2, TimeUnit.SECONDS)
                 .untilAsserted(() -> verify(lifecycleManager, times(1)).adopt("abc123", List.of(4500), Optional.empty()));
 
         // The sidecar is gone (ABSENT) and unreachable (nothing listens on localhost:4500), so
@@ -547,7 +548,7 @@ class FlociUiManagerTest {
         // container, so the kick is observed by the start running a second time at all.
         manager.status();
 
-        await().atMost(2, TimeUnit.SECONDS)
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(2, TimeUnit.SECONDS)
                 .untilAsserted(() -> verify(lifecycleManager, times(2)).findByName("floci-ui"));
     }
 
