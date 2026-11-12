@@ -24,7 +24,13 @@ public final class SocketDeadline {
      * until it actually finishes, even when it ignores interruption.
      */
     public static <T> T call(int timeoutSeconds, Callable<T> operation, Runnable onWorkerExit) throws IOException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        return call(timeoutSeconds, operation, onWorkerExit, DeadlineWaits.SYSTEM);
+    }
+
+    /** As {@link #call(int, Callable, Runnable)}, with the deadline counted and waited for by {@code waits}. */
+    public static <T> T call(int timeoutSeconds, Callable<T> operation, Runnable onWorkerExit,
+                             DeadlineWaits waits) throws IOException {
+        long deadline = waits.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
         AtomicBoolean exited = new AtomicBoolean();
         Runnable finish = () -> {
             if (exited.compareAndSet(false, true)) {
@@ -53,7 +59,7 @@ public final class SocketDeadline {
             throw failure;
         }
         try {
-            return result.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+            return waits.get(result, Math.max(0, deadline - waits.nanoTime()));
         } catch (TimeoutException timeout) {
             throw new SocketTimeoutException("Socket operation exceeded " + timeoutSeconds + " seconds");
         } catch (InterruptedException interrupted) {

@@ -1,5 +1,6 @@
 package io.floci.aws.core.common.concurrent;
 
+import org.awaitility.core.ConditionFactory;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -18,6 +19,11 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 class KeyedWorkQueueTest {
+
+    /** Looks at once and then every 10 ms, so a queue that has already drained costs no wait. */
+    private static ConditionFactory within(Duration atMost) {
+        return await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(atMost);
+    }
     @Test
     void concurrentProducersConvergeToEveryLatestValueWithoutOverlappingAKey() throws Exception {
         AtomicIntegerArray versions = new AtomicIntegerArray(32);
@@ -46,7 +52,7 @@ class KeyedWorkQueueTest {
                     submission.get();
                 }
             }
-            await().atMost(Duration.ofSeconds(5)).until(() -> queue.snapshot().keys() == 0);
+            within(Duration.ofSeconds(5)).until(() -> queue.snapshot().keys() == 0);
             assertEquals(0, overlaps.get());
             assertEquals(0, queue.snapshot().rejected());
             for (int key = 0; key < 32; key++) {
@@ -74,7 +80,7 @@ class KeyedWorkQueueTest {
             assertEquals(1, runs.get());
             assertEquals(1, queue.snapshot().keys());
             release.countDown();
-            await().atMost(Duration.ofSeconds(2)).until(() -> queue.snapshot().keys() == 0);
+            within(Duration.ofSeconds(2)).until(() -> queue.snapshot().keys() == 0);
             assertEquals(2, runs.get());
             assertEquals(10_000, queue.snapshot().coalesced());
         } finally {
@@ -100,11 +106,11 @@ class KeyedWorkQueueTest {
             assertEquals(2, queue.snapshot().active());
             assertEquals(3, queue.snapshot().keys());
             release.countDown();
-            await().atMost(Duration.ofSeconds(2)).until(() -> queue.snapshot().keys() == 0);
+            within(Duration.ofSeconds(2)).until(() -> queue.snapshot().keys() == 0);
             assertEquals(3, runs.size());
             // A later authoritative repair pass can retry the rejected key.
             assertTrue(queue.submit("d"));
-            await().atMost(Duration.ofSeconds(2)).until(() -> runs.contains("d"));
+            within(Duration.ofSeconds(2)).until(() -> runs.contains("d"));
         } finally {
             release.countDown();
         }
@@ -127,7 +133,7 @@ class KeyedWorkQueueTest {
             queue.submit("hot");
             queue.submit("cold");
             release.countDown();
-            await().atMost(Duration.ofSeconds(2)).until(() -> queue.snapshot().completed() == 3);
+            within(Duration.ofSeconds(2)).until(() -> queue.snapshot().completed() == 3);
             assertEquals(List.of("hot", "cold", "hot"), runs);
         } finally {
             release.countDown();
@@ -144,7 +150,7 @@ class KeyedWorkQueueTest {
         })) {
             queue.submit("first");
             queue.submit("second");
-            await().atMost(Duration.ofSeconds(2)).until(() -> queue.snapshot().completed() == 2);
+            within(Duration.ofSeconds(2)).until(() -> queue.snapshot().completed() == 2);
             assertEquals(1, queue.snapshot().failures());
             assertEquals(0, queue.snapshot().keys());
         }
@@ -172,7 +178,7 @@ class KeyedWorkQueueTest {
             queue.close();
             assertTrue(interrupted.await(2, TimeUnit.SECONDS));
             assertFalse(queue.submit("late"));
-            await().atMost(Duration.ofSeconds(2)).until(() -> queue.snapshot().active() == 0);
+            within(Duration.ofSeconds(2)).until(() -> queue.snapshot().active() == 0);
             assertEquals(1, runs.get());
             assertEquals(0, queue.snapshot().keys());
         } finally {
