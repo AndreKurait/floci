@@ -6,6 +6,7 @@ import com.github.dockerjava.api.command.LogContainerCmd;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
+import io.floci.aws.testing.TestTime;
 import io.floci.aws.testutil.LogCapture;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -18,6 +19,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -658,18 +660,38 @@ class ContainerLogStreamerTest {
 
     @Test
     void lifecycleHandleFlushesTailWhenDockerNeverSignalsTerminal() throws Exception {
-        List<String> emitted = Collections.synchronizedList(new ArrayList<>());
+        TestTime time = TestTime.create();
+        List<String> emitted = new ArrayList<>();
         ContainerLogStreamer.LogReassemblyCallback cb =
-                new ContainerLogStreamer.LogReassemblyCallback(emitted::add, 10);
+                new ContainerLogStreamer.LogReassemblyCallback(emitted::add, time.scheduler());
         Closeable handle = new ContainerLogStreamer.ContainerLogHandle(cb);
 
         cb.onNext(new Frame(StreamType.STDOUT, utf8("unterminated-tail")));
         handle.close();
 
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-        while (emitted.isEmpty() && System.nanoTime() < deadline) {
-            Thread.sleep(5);
-        }
+        time.advance(Duration.ofMillis(1_999));
+        assertEquals(List.of(), emitted, "the tail was flushed before Docker's two seconds to finish were up");
+
+        time.advance(Duration.ofMillis(1));
+        assertEquals(List.of("unterminated-tail"), emitted);
+    }
+
+    @Test
+    void aTerminalCallbackWithinTheCloseGraceFlushesTheTailAndCancelsTheFallback() throws Exception {
+        TestTime time = TestTime.create();
+        List<String> emitted = new ArrayList<>();
+        ContainerLogStreamer.LogReassemblyCallback cb =
+                new ContainerLogStreamer.LogReassemblyCallback(emitted::add, time.scheduler());
+        Closeable handle = new ContainerLogStreamer.ContainerLogHandle(cb);
+
+        cb.onNext(new Frame(StreamType.STDOUT, utf8("unterminated-tail")));
+        handle.close();
+        time.advance(Duration.ofMillis(1_999));
+        cb.onComplete();
+
+        assertEquals(List.of("unterminated-tail"), emitted);
+        assertEquals(0, time.pendingTasks(), "the terminal callback must cancel the fallback close");
+        time.advance(Duration.ofMillis(1));
         assertEquals(List.of("unterminated-tail"), emitted);
     }
 

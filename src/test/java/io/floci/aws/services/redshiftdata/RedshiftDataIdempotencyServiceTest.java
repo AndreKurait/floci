@@ -136,7 +136,7 @@ class RedshiftDataIdempotencyServiceTest {
             ObjectNode retry = fixture.service.batchExecuteStatement(request, "us-east-1");
             assertEquals(first.path("Id"), retry.path("Id"));
             assertEquals(2, fixture.count());
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                     verify(fixture.publisher, times(1)).publish(any()));
             verify(fixture.factory, times(1)).open(any());
         }
@@ -201,9 +201,9 @@ class RedshiftDataIdempotencyServiceTest {
             } finally {
                 release.countDown();
             }
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(1, fixture.count()));
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(1, fixture.count()));
             verify(fixture.factory, times(1)).open(any());
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> verify(fixture.publisher, times(1)).publish(any()));
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> verify(fixture.publisher, times(1)).publish(any()));
         }
     }
 
@@ -334,7 +334,7 @@ class RedshiftDataIdempotencyServiceTest {
             } finally {
                 release.countDown();
             }
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(17, fixture.count()));
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(17, fixture.count()));
             fixture.service.executeStatement(fixture.single("rejected", "INSERT INTO mutations VALUES (3)"), "us-east-1");
             assertEquals(18, fixture.count());
         }
@@ -472,7 +472,7 @@ class RedshiftDataIdempotencyServiceTest {
             } finally {
                 release.countDown();
             }
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(2, fixture.count()));
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(2, fixture.count()));
             assertEquals(replacement, fixture.service.executeStatement(request, "us-east-1").path("Id").asText());
             verify(fixture.factory, times(2)).open(any());
         }

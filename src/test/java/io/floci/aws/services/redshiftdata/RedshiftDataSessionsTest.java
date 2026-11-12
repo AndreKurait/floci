@@ -304,7 +304,7 @@ class RedshiftDataSessionsTest {
             first.connection(factory);
             clock.advance(Duration.ofHours(24));
             sessions.sweep();
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> verify(connection).close());
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(2)).untilAsserted(() -> verify(connection).close());
             execution.completed();
             assertThrows(AwsException.class, () -> sessions.find(OWNER, first.id()));
         }

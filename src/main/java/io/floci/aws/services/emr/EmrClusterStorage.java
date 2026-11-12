@@ -113,7 +113,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
     private static final String FLOCI_ALIAS = "floci";
     // How long a cluster's HDFS and metastore may take to start, the NameNode formatted the first time, before a step
     // gives up.
-    private static final Duration HDFS_START_TIMEOUT = Duration.ofSeconds(120);
+    static final Duration HDFS_START_TIMEOUT = Duration.ofSeconds(120);
     private static final Duration HDFS_POLL_INTERVAL = Duration.ofMillis(500);
     // How much of a node's output is logged when it does not become ready, and how long reading it may take.
     private static final int NODE_LOG_LINES = 40;
@@ -263,6 +263,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
     private final S3Service s3Service;
     private final Duration hdfsStartTimeout;
     private final LongSupplier nanoTime;
+    private final Pause pause;
     // How many teardowns, by a reset or a shutdown, have run: a step waiting for its cluster's HDFS through one stops.
     private final AtomicLong teardowns = new AtomicLong();
 
@@ -279,6 +280,14 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                       LaunchedContainerAwsEnv awsEnv, LambdaExecutionRoleCredentials roleCredentials,
                       CurrentContainerNetworkResolver currentContainer, EmulatorConfig config, S3Service s3Service,
                       Duration hdfsStartTimeout, LongSupplier nanoTime) {
+        this(lifecycleManager, containerBuilder, awsEnv, roleCredentials, currentContainer, config, s3Service,
+                hdfsStartTimeout, nanoTime, interval -> Thread.sleep(interval.toMillis()));
+    }
+
+    EmrClusterStorage(ContainerLifecycleManager lifecycleManager, ContainerBuilder containerBuilder,
+                      LaunchedContainerAwsEnv awsEnv, LambdaExecutionRoleCredentials roleCredentials,
+                      CurrentContainerNetworkResolver currentContainer, EmulatorConfig config, S3Service s3Service,
+                      Duration hdfsStartTimeout, LongSupplier nanoTime, Pause pause) {
         this.lifecycleManager = lifecycleManager;
         this.containerBuilder = containerBuilder;
         this.awsEnv = awsEnv;
@@ -288,6 +297,13 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
         this.s3Service = s3Service;
         this.hdfsStartTimeout = hdfsStartTimeout;
         this.nanoTime = nanoTime;
+        this.pause = pause;
+    }
+
+    /** The wait between two looks at a starting HDFS: {@link Thread#sleep} outside tests. */
+    @FunctionalInterface
+    interface Pause {
+        void between(Duration interval) throws InterruptedException;
     }
 
     @Override
@@ -689,7 +705,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                         + hdfsStartTimeout.toSeconds() + " seconds");
             }
             try {
-                Thread.sleep(HDFS_POLL_INTERVAL.toMillis());
+                pause.between(HDFS_POLL_INTERVAL);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Stopped waiting for the HDFS of EMR cluster " + clusterId, e);
