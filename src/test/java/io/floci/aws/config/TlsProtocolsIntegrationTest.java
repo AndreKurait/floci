@@ -20,7 +20,9 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.X509Certificate;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -36,8 +38,18 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 @QuarkusTest
-@TestProfile(SelfSignedTlsProfile.class)
+@TestProfile(TlsProtocolsIntegrationTest.ProxyProfile.class)
 class TlsProtocolsIntegrationTest {
+
+    /** Match the production backend reached through TlsProxyServer's PROXY preface. */
+    public static class ProxyProfile extends SelfSignedTlsProfile {
+        @Override
+        public Map<String, String> getConfigOverrides() {
+            Map<String, String> overrides = new HashMap<>(super.getConfigOverrides());
+            overrides.put("quarkus.http.proxy.use-proxy-protocol", "true");
+            return overrides;
+        }
+    }
 
     @ConfigProperty(name = "quarkus.http.test-port", defaultValue = "0")
     int httpPort;

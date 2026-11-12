@@ -63,6 +63,12 @@ class TlsCertificateHostnameTest {
     // ==================== Custom Hostname Tests ====================
 
     @Test
+    void tlsDisabledDoesNotRequireProxyProtocol() {
+        System.setProperty("floci.tls.enabled", "false");
+        assertNull(new TlsConfigSource().getValue("quarkus.http.proxy.use-proxy-protocol"));
+    }
+
+    @Test
     void testFlociHostnameIncludedInCertificateSans() throws Exception {
         // Arrange
         System.setProperty("floci.hostname", "floci");
@@ -71,7 +77,9 @@ class TlsCertificateHostnameTest {
         System.setProperty("floci.storage.persistent-path", tempDir.toString());
 
         // Act
-        new TlsConfigSource();
+        TlsConfigSource source = new TlsConfigSource();
+        assertEquals("true", source.getValue("quarkus.http.proxy.use-proxy-protocol"));
+        assertEquals("127.0.0.1", source.getValue("quarkus.http.host"));
 
         // Assert
         Path certFile = tempDir.resolve("tls/floci-server.crt");

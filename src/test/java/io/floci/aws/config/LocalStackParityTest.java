@@ -179,7 +179,7 @@ class LocalStackParityTest {
 
     @Test
     void ordinalSitsBelowEnvironmentAndTlsButAboveTheConfigFiles() {
-        // .env is 295, config/application.yml 265; environment variables and TlsConfigSource are 300.
+        // .env is 295, config/application.yml 265; environment variables are 300 and TlsConfigSource is 500.
         assertThat(new LocalStackParityConfigSource(Map.of()).getOrdinal(), allOf(greaterThan(295), lessThan(300)));
         assertThat(new TlsConfigSource().getOrdinal(), greaterThan(new LocalStackParityConfigSource(Map.of()).getOrdinal()));
     }
