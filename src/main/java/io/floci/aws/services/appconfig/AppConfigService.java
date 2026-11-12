@@ -19,6 +19,7 @@ import io.floci.aws.services.appconfig.model.Environment;
 import io.floci.aws.services.appconfig.model.HostedConfigurationVersion;
 import io.floci.aws.services.appconfig.model.HostedConfigurationVersionSummary;
 import io.floci.aws.services.appconfig.model.Monitor;
+import io.smallrye.common.annotation.Identifier;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -58,12 +59,13 @@ public class AppConfigService {
     private static final ObjectMapper COPIER = new ObjectMapper();
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
-    @Inject
     public AppConfigService(StorageFactory storageFactory, RegionResolver regions) {
         this(storageFactory, regions, Clock.systemUTC());
     }
 
-    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock) {
+    @Inject
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions,
+                     @Identifier("appconfig") Clock clock) {
         this.clock = clock;
         this.regions = regions;
         this.applicationStore = new AppConfigStorage<>(storageFactory, regions,

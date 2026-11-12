@@ -132,7 +132,8 @@ const { ApiGatewayManagementApiClient, PostToConnectionCommand } = require('@aws
 exports.handler = async (event) => {
   const apiId = event.requestContext.apiId;
   const stage = event.requestContext.stage;
-  const endpoint = process.env.FLOCI_ENDPOINT + '/execute-api/' + apiId + '/' + stage;
+  // Floci injects its container-reachable http URL; the same port serves TLS.
+  const endpoint = process.env.FLOCI_ENDPOINT.replace(/^http:/, 'https:') + '/execute-api/' + apiId + '/' + stage;
   const client = new ApiGatewayManagementApiClient({ endpoint, region: 'us-east-1' });
   const body = JSON.parse(event.body);
   for (const connId of body.targets) {
@@ -295,7 +296,6 @@ describe('WebSocket over TLS (WSS)', () => {
 
     beforeAll(async () => {
       const broadcastFn = await createLambda('tls-broadcast', BROADCAST_HANDLER, {
-        FLOCI_ENDPOINT: 'https://host.docker.internal:4566',
         NODE_TLS_REJECT_UNAUTHORIZED: '0',
       }, true);
       const echoFn = await createLambda('tls-bc-echo', ECHO_HANDLER);
