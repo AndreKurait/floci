@@ -67,6 +67,20 @@ Use this only when the socket's permissions require root. Without the option, Fl
 
 The entrypoint needs to start as root to read the socket's group and to honour this option. A container started as a non-root user, with `--user 1001` or a Kubernetes `runAsUser`, skips both, so give it the socket's group yourself: `--group-add "$(stat -c '%g' /var/run/docker.sock)"`.
 
+## DNS on Internal Bridges
+
+A managed container on an internal Docker bridge keeps Docker peer DNS first,
+followed by its explicitly configured DNS servers. The resolver file is mounted
+read-only before the native entrypoint starts, so non-root users, read-only root
+filesystems and container restarts do not need a startup wrapper.
+
+Containers with an explicit resolver mount, inherited volumes, a special network
+mode, or a security-group namespace helper keep their existing resolver.
+Unused resolver volumes are reclaimed during ordered teardown; Docker references
+and an in-flight container creation prevent early removal. Failed resolver
+preparation stops workload creation, and a cleanup failure preserves the original
+preparation error.
+
 ## Connection Pool
 
 Every Docker call Floci makes goes through one shared client with a bounded connection pool. Some of those connections stay open for as long as a container runs: each Lambda container holds one (the watcher that notices its runtime exiting) plus one per Lambda extension. Log-follow streams use a second pool, described below. When those long-lived connections fill the pool, every other Docker call (create, start, stop, remove) waits for one to free up, and Floci stops making progress.

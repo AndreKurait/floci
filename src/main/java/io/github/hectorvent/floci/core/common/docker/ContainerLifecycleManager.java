@@ -29,6 +29,7 @@ import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig.EcsServiceConfig.ImagePullBehavior;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.quarkus.runtime.annotations.RegisterForReflection;
@@ -60,7 +61,7 @@ import java.util.regex.Pattern;
  * Consolidates common container management patterns used across Floci services.
  */
 @ApplicationScoped
-public class ContainerLifecycleManager {
+public class ContainerLifecycleManager implements ContainerTeardown {
 
     private static final Logger LOG = Logger.getLogger(ContainerLifecycleManager.class);
 
@@ -93,6 +94,7 @@ public class ContainerLifecycleManager {
     private final EmulatorConfig config;
     private final long archiveRetryBackoffMillis;
     private final RemovalWait removalWait;
+    private final ContainerInternalDns internalDns;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -130,6 +132,7 @@ public class ContainerLifecycleManager {
         this.config = config;
         this.archiveRetryBackoffMillis = archiveRetryBackoffMillis;
         this.removalWait = removalWait;
+        this.internalDns = new ContainerInternalDns(dockerClient, config, archiveRetryBackoffMillis);
     }
 
     /**
@@ -140,6 +143,16 @@ public class ContainerLifecycleManager {
     interface RemovalWait {
         /** Whether the wait completed within the timeout. */
         boolean await(WaitContainerResultCallback callback, long timeout, TimeUnit unit) throws InterruptedException;
+    }
+
+    @Override
+    public int teardownOrder() {
+        return 100;
+    }
+
+    @Override
+    public void stopManagedContainers() {
+        internalDns.removeUnusedVolumes();
     }
 
     /**
@@ -271,6 +284,13 @@ public class ContainerLifecycleManager {
 
         // Built once: a dynamic port binding allocates its host port here.
         HostConfig hostConfig = buildHostConfig(spec);
+        try (ContainerInternalDns.Lease lease = internalDns.configure(spec, resolvedImage, hostConfig)) {
+            return createWithCaBundle(spec, resolvedImage, platform, removeAnonymousVolumes, hostConfig);
+        }
+    }
+
+    private String createWithCaBundle(ContainerSpec spec, String resolvedImage, String platform,
+                                     boolean removeAnonymousVolumes, HostConfig hostConfig) {
         Optional<Path> caBundle = ContainerCaBundle.hostPath(config);
         if (caBundle.isEmpty()) {
             return createContainer(spec, resolvedImage, platform, hostConfig, spec.env());
