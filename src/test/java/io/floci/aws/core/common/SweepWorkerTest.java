@@ -1,7 +1,9 @@
 package io.floci.aws.core.common;
 
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +25,11 @@ class SweepWorkerTest {
 
     private SweepWorker worker(boolean enabled, Consumer<Instant> sweep) {
         return new SweepWorker("test-sweep", enabled, 60, false, sweep);
+    }
+
+    private static SweepWorker timed(TestTime time, long intervalSeconds, boolean sweepAtStart,
+                                     Consumer<Instant> sweep) {
+        return new SweepWorker("test-sweep", intervalSeconds, sweepAtStart, sweep, time.scheduler(), time.clock());
     }
 
     private static void awaitQueuedSweeps(SweepWorker worker, int expected) {
@@ -156,15 +163,116 @@ class SweepWorkerTest {
     }
 
     @Test
-    void startWaitsOneIntervalBeforeTheFirstSweepByDefault() throws Exception {
-        CountDownLatch first = new CountDownLatch(1);
-        SweepWorker worker = new SweepWorker("test-sweep", true, 3600, false, now -> first.countDown());
-        try {
-            worker.start();
-            assertEquals(1, first.getCount());
-        } finally {
-            worker.stop();
-        }
+    void startWaitsOneIntervalBeforeTheFirstSweepByDefault() {
+        TestTime time = TestTime.create();
+        SweepWorker worker = timed(time, 3600, false, swept::add);
+        Instant started = time.now();
+        worker.start();
+
+        time.advance(Duration.ofSeconds(3599));
+        assertTrue(swept.isEmpty(), "the first sweep ran before one interval had passed");
+
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(List.of(started.plusSeconds(3600)), swept);
+    }
+
+    @Test
+    void aWorkerAskedToSweepAtStartStillWaitsAFullIntervalForTheSecondSweep() {
+        TestTime time = TestTime.create();
+        SweepWorker worker = timed(time, 3600, true, swept::add);
+        Instant started = time.now();
+        worker.start();
+
+        time.runDue();
+        assertEquals(List.of(started), swept);
+
+        time.advance(Duration.ofSeconds(3599));
+        assertEquals(List.of(started), swept);
+
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(List.of(started, started.plusSeconds(3600)), swept);
+    }
+
+    @Test
+    void sweepsRepeatEveryIntervalAtTheInstantTheClockShows() {
+        TestTime time = TestTime.create();
+        SweepWorker worker = timed(time, 60, false, swept::add);
+        Instant started = time.now();
+        worker.start();
+
+        time.advance(Duration.ofSeconds(179));
+        assertEquals(List.of(started.plusSeconds(60), started.plusSeconds(120)), swept);
+
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(List.of(started.plusSeconds(60), started.plusSeconds(120), started.plusSeconds(180)), swept);
+    }
+
+    @Test
+    void anIntervalBelowOneSecondIsRaisedToOneSecond() {
+        TestTime time = TestTime.create();
+        SweepWorker worker = timed(time, 0, false, swept::add);
+        Instant started = time.now();
+        worker.start();
+
+        time.advance(Duration.ofMillis(999));
+        assertTrue(swept.isEmpty(), "a zero interval must not sweep faster than once a second");
+
+        time.advance(Duration.ofMillis(1));
+        assertEquals(List.of(started.plusSeconds(1)), swept);
+    }
+
+    @Test
+    void aFailedScheduledSweepDoesNotStopTheLaterOnes() {
+        TestTime time = TestTime.create();
+        List<Instant> attempts = new ArrayList<>();
+        SweepWorker worker = timed(time, 60, false, now -> {
+            attempts.add(now);
+            if (attempts.size() == 1) {
+                throw new IllegalStateException("boom");
+            }
+        });
+        Instant started = time.now();
+        worker.start();
+
+        time.advance(Duration.ofSeconds(60));
+        assertEquals(List.of(started.plusSeconds(60)), attempts);
+
+        time.advance(Duration.ofSeconds(60));
+        assertEquals(List.of(started.plusSeconds(60), started.plusSeconds(120)), attempts);
+    }
+
+    @Test
+    void scheduledSweepsAreSkippedBetweenPauseAndResume() {
+        TestTime time = TestTime.create();
+        SweepWorker worker = timed(time, 60, false, swept::add);
+        Instant started = time.now();
+        worker.start();
+
+        worker.pause();
+        time.advance(Duration.ofSeconds(120));
+        assertTrue(swept.isEmpty());
+
+        worker.resume();
+        time.advance(Duration.ofSeconds(59));
+        assertTrue(swept.isEmpty(), "resuming must not run a sweep before the next interval ends");
+
+        time.advance(Duration.ofSeconds(1));
+        assertEquals(List.of(started.plusSeconds(180)), swept);
+    }
+
+    @Test
+    void stopCancelsTheSweepsStillToCome() {
+        TestTime time = TestTime.create();
+        SweepWorker worker = timed(time, 60, false, swept::add);
+        Instant started = time.now();
+        worker.start();
+        time.advance(Duration.ofSeconds(60));
+
+        worker.stop();
+        time.advance(Duration.ofSeconds(3600));
+
+        assertEquals(List.of(started.plusSeconds(60)), swept);
+        assertEquals(0, time.pendingTasks());
     }
 
     @Test

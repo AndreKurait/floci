@@ -5,13 +5,32 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.EnumSet;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ThreadStatesTest {
+
+    @Test
+    void awaitBlockedOrDoneGivesUpAfterFiveSecondsWhenFutureWorkerNeverStarts() throws Exception {
+        TestTime time = TestTime.create();
+        FutureTask<Void> task = new FutureTask<>(() -> null);
+        try {
+            ThreadStates.awaitBlockedOrDone(new AtomicReference<>(), task, time::nanoTime,
+                    millis -> time.sleepAdvancing(Duration.ofMillis(millis)));
+
+            assertFalse(task.isDone());
+            assertEquals(TestTime.DEFAULT_START.plusSeconds(5), time.now(),
+                    "the wait gives up exactly when its five seconds are over");
+        } finally {
+            task.cancel(false);
+        }
+    }
 
     @Test
     void awaitStateReturnsTheStateTheThreadReached() throws Exception {
