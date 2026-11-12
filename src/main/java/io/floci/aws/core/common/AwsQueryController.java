@@ -38,6 +38,7 @@ import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -63,6 +64,8 @@ public class AwsQueryController {
     static final String QUERY_GET_PATH = "/_query";
 
     private static final Logger LOG = Logger.getLogger(AwsQueryController.class);
+    /** In-flight creates share one identifier space, including before a backend has finished starting. */
+    private static final Set<String> FAMILY_CREATES = ConcurrentHashMap.newKeySet();
 
     private final CloudFormationQueryHandler cloudFormationQueryHandler;
     private final ElastiCacheQueryHandler elastiCacheQueryHandler;
@@ -183,6 +186,41 @@ public class AwsQueryController {
     private Response dispatchToHandler(String service, String action,
                                        MultivaluedMap<String, String> formParams,
                                        String authorization, String region) {
+        if (Set.of("rds", "docdb", "neptune").contains(service)) {
+            String member = switch (action) {
+                case "CreateDBClusterSnapshot" -> "DBClusterSnapshotIdentifier";
+                case "CreateDBCluster", "RestoreDBClusterFromSnapshot", "RestoreDBClusterToPointInTime" ->
+                        "DBClusterIdentifier";
+                default -> null;
+            };
+            String identifier = member == null ? null : formParams.getFirst(member);
+            if (identifier != null && !identifier.isBlank()) {
+                String identity = regionResolver.getAccountId() + "/" + region + "/"
+                        + member + "/" + identifier.toLowerCase(Locale.ROOT);
+                if (!FAMILY_CREATES.add(identity)) {
+                    return xmlErrorResponse("DBClusterSnapshotIdentifier".equals(member)
+                            ? "DBClusterSnapshotAlreadyExistsFault" : "DBClusterAlreadyExistsFault",
+                            "The identifier is already being created.", 400);
+                }
+                try {
+                    return dispatchOwnedIdentifier(service, action, formParams, authorization, region);
+                } finally {
+                    FAMILY_CREATES.remove(identity);
+                }
+            }
+        }
+        return dispatchOwnedIdentifier(service, action, formParams, authorization, region);
+    }
+
+    private Response dispatchOwnedIdentifier(String service, String action,
+                                             MultivaluedMap<String, String> formParams,
+                                             String authorization, String region) {
+        if (Set.of("rds", "docdb", "neptune").contains(service)) {
+            Response ambiguity = ambiguousSnapshotFamily(action, formParams, region);
+            if (ambiguity != null) {
+                return ambiguity;
+            }
+        }
         return switch (service) {
             case "sqs" -> sqsQueryHandler.handle(action, formParams, region);
             case "sns" -> snsQueryHandler.handle(action, formParams, region);
@@ -206,6 +244,12 @@ public class AwsQueryController {
                 if ("neptune".equalsIgnoreCase(engine)
                         || neptuneService.hasCluster(clusterId)
                         || neptuneService.hasInstance(instanceId)
+                        || ("CreateDBClusterSnapshot".equals(action)
+                                && clusterId != null && !clusterId.isBlank()
+                                && !neptuneService.listDbClusters(clusterId).isEmpty())
+                        || (!"CreateDBClusterSnapshot".equals(action)
+                                && neptuneService.hasClusterSnapshot(formParams.getFirst("DBClusterSnapshotIdentifier")))
+                        || neptuneService.hasClusterSnapshot(formParams.getFirst("SnapshotIdentifier"))
                         || neptuneService.hasResourceWithArn(formParams.getFirst("ResourceName"))) {
                     yield neptuneQueryHandler.handle(action, formParams);
                 }
@@ -223,9 +267,15 @@ public class AwsQueryController {
                 }
                 yield rdsQueryHandler.handle(action, formParams, region);
             }
-            case "neptune" -> isFamilyListing(action, formParams)
-                    ? rdsQueryHandler.handle(action, formParams, region)
-                    : neptuneQueryHandler.handle(action, formParams);
+            case "neptune" -> {
+                Response clash = rdsAlreadyHoldsIdentifier(action, formParams, region);
+                if (clash != null) {
+                    yield clash;
+                }
+                yield isFamilyListing(action, formParams)
+                        ? rdsQueryHandler.handle(action, formParams, region)
+                        : neptuneQueryHandler.handle(action, formParams);
+            }
             case "docdb" -> {
                 // The same check as on the rds scope: DocumentDB is reachable under either, and a
                 // create that skipped it here would put a second record under an ARN RDS owns.
@@ -324,15 +374,51 @@ public class AwsQueryController {
         }
         if ("RestoreDBClusterFromSnapshot".equals(action) || "RestoreDBClusterToPointInTime".equals(action)) {
             String clusterId = formParams.getFirst("DBClusterIdentifier");
-            if (rdsService.hasClusterOrInstance(clusterId, null, region) || docDbService.hasCluster(clusterId, region)) {
+            if (rdsService.hasClusterOrInstance(clusterId, null, region) || docDbService.hasCluster(clusterId, region)
+                    || neptuneService.hasCluster(clusterId)) {
                 return xmlErrorResponse("DBClusterAlreadyExistsFault", "DB Cluster already exists", 400);
             }
         }
         if ("CreateDBClusterSnapshot".equals(action)) {
             String snapshotId = formParams.getFirst("DBClusterSnapshotIdentifier");
-            if (rdsService.hasClusterSnapshot(snapshotId, region) || docDbService.hasClusterSnapshot(snapshotId, region)) {
+            if (rdsService.hasClusterSnapshot(snapshotId, region) || docDbService.hasClusterSnapshot(snapshotId, region)
+                    || neptuneService.hasClusterSnapshot(snapshotId)) {
                 return xmlErrorResponse("DBClusterSnapshotAlreadyExistsFault",
                         "DB cluster snapshot " + snapshotId + " already exists.", 400);
+            }
+        }
+        return null;
+    }
+
+    /** A shared RDS ARN cannot select a family when legacy stores contain the same snapshot. */
+    private Response ambiguousSnapshotFamily(String action, MultivaluedMap<String, String> params, String region) {
+        String identifier = switch (action) {
+            case "DeleteDBClusterSnapshot", "DescribeDBClusterSnapshots" ->
+                    params.getFirst("DBClusterSnapshotIdentifier");
+            case "RestoreDBClusterFromSnapshot" -> params.getFirst("SnapshotIdentifier");
+            case "ListTagsForResource", "AddTagsToResource", "RemoveTagsFromResource" ->
+                    params.getFirst("ResourceName");
+            default -> null;
+        };
+        if (identifier != null && !identifier.isBlank()) {
+            int owners = (rdsService.hasClusterSnapshot(identifier, region) ? 1 : 0)
+                    + (docDbService.hasClusterSnapshot(identifier, region) ? 1 : 0)
+                    + (neptuneService.hasClusterSnapshot(identifier) ? 1 : 0);
+            if (owners > 1) {
+                return xmlErrorResponse("InvalidParameterCombination",
+                        "The snapshot identifier is ambiguous across RDS-family stores.", 400);
+            }
+        }
+        if ("CreateDBClusterSnapshot".equals(action)) {
+            String source = params.getFirst("DBClusterIdentifier");
+            if (source != null && !source.isBlank()) {
+                int owners = (rdsService.hasClusterOrInstance(source, null, region) ? 1 : 0)
+                        + (docDbService.hasCluster(source, region) ? 1 : 0)
+                        + (!neptuneService.listDbClusters(source).isEmpty() ? 1 : 0);
+                if (owners > 1) {
+                    return xmlErrorResponse("InvalidParameterCombination",
+                            "The source cluster identifier is ambiguous across RDS-family stores.", 400);
+                }
             }
         }
         return null;

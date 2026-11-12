@@ -262,6 +262,7 @@ floci:
       scheduled-action-sweep-interval-seconds: 60
     neptune:
       enabled: true
+      mock: false
       proxy-base-port: 8182
       proxy-max-port: 8282
       default-image: "tinkerpop/gremlin-server:3.7.3"

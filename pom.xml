@@ -750,6 +750,18 @@
             <version>2.5.252</version>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>neptune</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tinkerpop</groupId>
+            <artifactId>gremlin-driver</artifactId>
+            <version>3.7.3</version>
+            <scope>test</scope>
+        </dependency>
         <!-- openCypher/Bolt client for the Neptune neo4j db-type integration test -->
         <dependency>
             <groupId>org.neo4j.driver</groupId>
