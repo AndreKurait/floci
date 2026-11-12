@@ -68,6 +68,24 @@ public class S3TablesController {
         return Response.noContent().build();
     }
 
+    @GET
+    @Path("/buckets/{tableBucketARN}/storage-class")
+    public Response getTableBucketStorageClass(@Context HttpHeaders headers,
+                                               @Encoded @PathParam("tableBucketARN") String tableBucketArn) {
+        return Response.ok(Map.of("storageClassConfiguration",
+                service.getTableBucketStorageClass(decode(tableBucketArn), region(headers)))).build();
+    }
+
+    @PUT
+    @Path("/buckets/{tableBucketARN}/storage-class")
+    public Response putTableBucketStorageClass(@Context HttpHeaders headers,
+                                               @Encoded @PathParam("tableBucketARN") String tableBucketArn,
+                                               Map<String, Object> request) {
+        service.putTableBucketStorageClass(decode(tableBucketArn),
+                request == null ? null : request.get("storageClassConfiguration"), region(headers));
+        return Response.ok().build();
+    }
+
     @PUT
     @Path("/buckets/{tableBucketARN}/policy")
     public Response putTableBucketPolicy(@Context HttpHeaders headers, @Encoded @PathParam("tableBucketARN") String tableBucketArn,
@@ -157,6 +175,15 @@ public class S3TablesController {
     public Response getTable(@Context HttpHeaders headers, @QueryParam("tableBucketARN") String tableBucketArn,
                              @QueryParam("namespace") String namespace, @QueryParam("name") String name) {
         return Response.ok(tableRepresentation(service.getTable(decode(tableBucketArn), namespace, name, region(headers)))).build();
+    }
+
+    @GET
+    @Path("/tables/{tableBucketARN}/{namespace}/{name}/storage-class")
+    public Response getTableStorageClass(@Context HttpHeaders headers,
+                                         @Encoded @PathParam("tableBucketARN") String tableBucketArn,
+                                         @PathParam("namespace") String namespace, @PathParam("name") String name) {
+        return Response.ok(Map.of("storageClassConfiguration",
+                service.getTableStorageClass(decode(tableBucketArn), namespace, name, region(headers)))).build();
     }
 
     @GET
