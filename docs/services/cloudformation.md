@@ -19,11 +19,63 @@ uses 3,600 seconds. Updates preserve the role's identity, and failed updates
 restore its previous duration. The limit controls new STS sessions without
 changing credentials already issued.
 
+## Native drift detection
+
+`DetectStackResourceDrift` and `DetectStackDrift` compare the committed template's
+explicit literal `TopicName` and `DisplayName` properties of `AWS::SNS::Topic`
+with a scoped native SNS read. A missing topic is `DELETED`; unequal properties
+are `MODIFIED`; equal declared properties are `IN_SYNC`. Omitted properties are
+not compared. `ActualProperties` contains only those declared properties, not a
+full SNS resource projection. Parameterized, transformed, conditional, dynamic
+reference, nested-stack and other provider templates are refused explicitly.
+A whole-stack request containing an unsupported selected resource fails rather
+than treating that resource as in sync. Root stacks must have completed creation,
+update, or update rollback and have no operation still running.
+
+Whole-stack checks complete synchronously and return a stored detection UUID.
+`DescribeStackDriftDetectionStatus` reads its completed status and changed count;
+`DescribeStackResourceDrifts` lists the latest checked resources, with status
+filters and pages of 1–100 entries. Detection history and resource results are
+scoped to account, Region and stack ID. Pagination uses logical-ID order locally;
+its opaque tokens bind the stack lifetime, result revision and filters. Results
+are stored together through the existing atomic storage batch: persistent and
+WAL write failures publish no candidate result; hybrid durability remains
+asynchronous. Deleted stack detection history is retained, while a replacement
+stack with the same name starts with no results.
+
+With IAM enforcement enabled, the three stack operations use the actual stack
+ARN and captured stack tags. Describing a detection UUID requires the action on
+`*`. Whole detection also requires `cloudformation:DetectStackResourceDrift` and
+`cloudformation:BatchDescribeTypeConfigurations`. Both detection operations
+require the original caller's `sns:GetTopicAttributes` on each selected topic,
+including a missing topic. Each SNS check uses that topic's captured policy and
+tags, with the caller's permission ceilings; stack tags do not carry into it.
+Reads do not migrate legacy SNS rows. Corrupt or foreign rows are errors rather
+than missing resources. Authorization and result comparison share immutable
+request snapshots; publication checks the stack lifetime again under the root
+stack update/delete admission lock. This does not make arbitrary native SNS
+mutations or all inherited CloudFormation lifecycle operations one transaction.
+
+This branch retains the inherited behavior that discards stack `RoleARN` input.
+Drift uses caller permissions; it cannot reconstruct a previously discarded
+execution-role selection or claim AWS role precedence.
+
+CloudFormation now applies SNS `DisplayName` on creation and update, preserves an
+explicit empty string, and resets a removed previously declared value to empty.
+Templates that never declared it leave out-of-band values alone. Rollback restores
+the previous native display name only for literal `TopicName`/`DisplayName` updates
+on the same topic. Broader SNS rollback and concurrent delete/recreate atomicity
+are outside that bounded support.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
+| `DetectStackDrift` | Check selected supported resources and record a completed detection |
+| `DetectStackResourceDrift` | Compare one supported resource with its declared properties |
+| `DescribeStackDriftDetectionStatus` | Read a scoped detection result |
+| `DescribeStackResourceDrifts` | Page and filter the latest checked resource results |
 | `DescribeStacks` | Get stack status, parameters, and outputs |
 | `CreateStack` | Deploy a CloudFormation template |
 | `UpdateStack` | Update an existing stack |

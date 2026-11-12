@@ -12,6 +12,8 @@ import io.floci.aws.core.common.ServicePrincipals;
 import io.floci.aws.core.common.SigV4CredentialScope;
 import io.floci.aws.core.common.StoredResourceArns;
 import io.floci.aws.core.common.auth.SigV4Canonicalization;
+import io.floci.aws.services.cloudformation.CloudFormationDriftService;
+import io.floci.aws.services.cloudformation.CloudFormationDriftSnapshot;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.floci.aws.services.cloudwatch.logs.LogGroupTagTarget;
@@ -92,6 +94,9 @@ public class ResourceArnBuilder {
     /** The SSM actions whose {@code ResourceArn} names the parameter they act on, in place of {@code Name}. */
     private static final Set<String> SSM_RESOURCE_POLICY_ACTIONS =
             Set.of("PutResourcePolicy", "GetResourcePolicies", "DeleteResourcePolicy");
+
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
 
     private final ObjectMapper objectMapper;
     /**
@@ -219,6 +224,17 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("cloudformation".equals(credentialScope) && CloudFormationDriftService.handles(operation)) {
+            if ("cloudformation:DescribeStackDriftDetectionStatus".equals(operation)) {
+                return List.of("*");
+            }
+            if (driftService == null || !driftService.isResolvable()) {
+                return List.of("*");
+            }
+            CloudFormationDriftSnapshot stack = driftService.get().authorizationTarget(
+                    firstFormParam(ctx, "StackName"), region, accountId);
+            return List.of(stack.stackId() == null ? "*" : stack.stackId());
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
