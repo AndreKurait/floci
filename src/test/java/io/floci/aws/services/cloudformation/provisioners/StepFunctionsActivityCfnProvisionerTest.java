@@ -77,6 +77,18 @@ class StepFunctionsActivityCfnProvisionerTest {
     }
 
     @Test
+    void invalidActivityNamesAreRefusedBeforeServiceCalls() {
+        for (String name : new String[] {"bad:name", "bad/name", "bad name", "bad\tname",
+                "bad?name", "bad#name", "bad{name", "bad\u007Fname", "bad\uFFFEname",
+                "bad\uFFFFname", "bad\uD800name", "bad\uDBFF\uDFFFname", "x".repeat(81)}) {
+            AwsException failure = assertThrows(AwsException.class, () ->
+                    provisioner.provision(resource, MAPPER.createObjectNode().put("Name", name), context(null)));
+            assertEquals("ValidationError", failure.getErrorCode());
+            verifyNoInteractions(service);
+        }
+    }
+
+    @Test
     void tagUpdateAndRollbackKeepTheOriginalActivity() throws Exception {
         existing();
         provisioner.provision(resource, props("old"), context(OLD_ARN));
