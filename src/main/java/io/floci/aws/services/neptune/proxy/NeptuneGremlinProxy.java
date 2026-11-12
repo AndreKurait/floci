@@ -20,7 +20,7 @@ import java.util.concurrent.CountDownLatch;
  * <p>Uses Java virtual threads for non-blocking I/O.
  */
 public class NeptuneGremlinProxy {
-    private static final long RELAY_JOIN_TIMEOUT_MILLIS = 1_000;
+    static final long RELAY_JOIN_TIMEOUT_MILLIS = 1_000;
 
     private static final Logger LOG = Logger.getLogger(NeptuneGremlinProxy.class);
 
@@ -51,6 +51,14 @@ public class NeptuneGremlinProxy {
      */
     ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
         return new ServerSocket(proxyPort, backlog);
+    }
+
+    /**
+     * Waits for a relay direction to end, for at most {@code timeoutMillis}. A seam so a test can
+     * hold the wait on a controlled timeline instead of sitting it out.
+     */
+    void joinRelay(Thread relay, long timeoutMillis) throws InterruptedException {
+        relay.join(timeoutMillis);
     }
 
     public void stop() {
@@ -114,8 +122,8 @@ public class NeptuneGremlinProxy {
                 });
         try {
             firstRelayDone.await();
-            t1.join(RELAY_JOIN_TIMEOUT_MILLIS);
-            t2.join(RELAY_JOIN_TIMEOUT_MILLIS);
+            joinRelay(t1, RELAY_JOIN_TIMEOUT_MILLIS);
+            joinRelay(t2, RELAY_JOIN_TIMEOUT_MILLIS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
