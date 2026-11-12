@@ -8,6 +8,8 @@ import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.backup.BackupFrameworkController;
+import io.floci.aws.services.backup.BackupFrameworkResources;
 import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.s3.S3BucketSubresources;
 import io.floci.aws.services.s3.S3ObjectActions;
@@ -583,6 +585,11 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("backup".equals(credentialScope) && resourceInfo != null
+                && BackupFrameworkController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return BackupFrameworkController.iamAction(resourceInfo.getResourceMethod().getName());
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
@@ -618,6 +625,12 @@ public class IamActionRegistry {
         // S3SlashOnlyKeyFilter rewrites escaped (PUT /bucket// writes the key "/"), and whose own reading of a key,
         // which keeps the slashes it was sent with, names the object (RequestPathLabels).
         String path = routedPath(ctx);
+        if ("backup".equals(credentialScope)) {
+            String frameworkAction = BackupFrameworkResources.routeAction(method, decodedPath(ctx));
+            if (frameworkAction != null) {
+                return frameworkAction;
+            }
+        }
 
         for (ActionRule rule : RULES) {
             if (rule.matches(credentialScope, method, path, ctx)) {
