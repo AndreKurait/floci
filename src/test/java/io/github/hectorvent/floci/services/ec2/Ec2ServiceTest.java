@@ -2914,7 +2914,8 @@ class Ec2ServiceTest {
 
     @Test
     void containerModeLaunchOnARetainedInterfaceRecordsTheElasticIpItCarries() {
-        Ec2Service service = containerModeService();
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(containerManager);
         String region = "us-east-1";
         String subnetId = publicSubnet(service, region, "10.249.0.0/24");
         NetworkInterface retained = service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(),
@@ -2923,6 +2924,7 @@ class Ec2ServiceTest {
         Address carried = service.allocateAddress(region);
         service.associateAddress(region, carried.getAllocationId(), first.getInstanceId());
         service.terminateInstances(region, List.of(first.getInstanceId()));
+        completeContainerTermination(containerManager, first, retained);
         assertNotNull(carried.getAssociationId());
 
         Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
@@ -2976,6 +2978,7 @@ class Ec2ServiceTest {
         service.associateAddress(region, carried.getAllocationId(), first.getInstanceId());
         String firstAddress = carried.getPublicIp();
         service.terminateInstances(region, List.of(first.getInstanceId()));
+        completeContainerTermination(containerManager, first, retained);
         Instance second = runningContainerInstance(service, region, subnetId, retained.getNetworkInterfaceId());
         String secondAddress = containerManager.reachablePublicAddress(second);
         assertNotEquals(firstAddress, secondAddress);
@@ -3008,9 +3011,22 @@ class Ec2ServiceTest {
         assertNull(instance.getPublicIpAddress());
     }
 
+    private static void completeContainerTermination(Ec2ContainerManager containerManager, Instance instance,
+                                                      NetworkInterface retained) {
+        assertEquals("in-use", retained.getStatus());
+        ArgumentCaptor<Runnable> completed = ArgumentCaptor.forClass(Runnable.class);
+        verify(containerManager).terminate(eq(instance), completed.capture());
+        instance.setState(InstanceState.terminated());
+        completed.getValue().run();
+        assertEquals("available", retained.getStatus());
+    }
+
     /** Ec2Service in container mode, with a container manager whose containers answer on loopback. */
     private static Ec2Service containerModeService() {
-        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        return containerModeService(mock(Ec2ContainerManager.class));
+    }
+
+    private static Ec2Service containerModeService(Ec2ContainerManager containerManager) {
         when(containerManager.reachablePublicAddress(any())).thenAnswer(invocation -> {
             Instance instance = invocation.getArgument(0);
             return instance.getDockerContainerId() == null ? null : "127.0.0.1";

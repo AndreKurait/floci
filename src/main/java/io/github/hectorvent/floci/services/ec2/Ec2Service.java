@@ -6138,6 +6138,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         clearPublicAddress(inst);
                     }
                     inst.setTerminatedAt(clock.millis());
+                    releaseStandaloneInterfacesOnTermination(region, inst);
                     detachAttachedVolumesOnTermination(region, inst);
                     if (afterVolumeDetach != null) {
                         afterVolumeDetach.run();
@@ -6146,6 +6147,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     // Docker still holds mounted volumes until asynchronous guest teardown completes.
                     containerManager.terminate(inst, () -> RequestScopes.runAs(owner, () -> {
                         try {
+                            releaseStandaloneInterfacesOnTermination(region, inst);
                             detachAttachedVolumesOnTermination(region, inst);
                             if (afterVolumeDetach != null) {
                                 afterVolumeDetach.run();
@@ -6160,7 +6162,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         writePublicAddress(inst, () -> clearPublicAddress(inst));
                     }
                 }
-                releaseStandaloneInterfacesOnTermination(region, inst);
                 instances.put(key(region, id), inst);
                 // The last instance depending on a deregistered AMI's capture has just gone away.
                 // Cheap and usually sufficient: by here the container is often already removed.
