@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -23,11 +24,21 @@ class CloudFormationCloudWatchAlarmIntegrationTest {
     private static final String CW_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/monitoring/aws4_request";
 
+    private String stackName;
+
+    @AfterEach
+    void deleteOwnedStack() {
+        if (stackName != null) {
+            CfnStackWaits.awaitTerminal(stackName, CFN_AUTH);
+            CfnStackWaits.deleteStack(stackName, CFN_AUTH);
+        }
+    }
+
     @Test
     void createStackProvisionsAlarmVisibleToCloudWatch() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String alarmName = "cfn-alarm-" + suffix;
-        String stackName = "cfn-cw-alarm-stack-" + suffix;
+        stackName = "cfn-cw-alarm-stack-" + suffix;
 
         String template = """
                 {
@@ -100,7 +111,7 @@ class CloudFormationCloudWatchAlarmIntegrationTest {
     void percentileAlarmAcceptsEitherLowSampleCountPolicy(String policy) {
         String suffix = Long.toString(System.nanoTime(), 36);
         String alarmName = "cfn-p90-" + policy + "-" + suffix;
-        String stackName = "cfn-cw-p90-" + policy + "-" + suffix;
+        stackName = "cfn-cw-p90-" + policy + "-" + suffix;
 
         createStack(stackName, percentileAlarmTemplate(alarmName, policy));
 
@@ -123,7 +134,7 @@ class CloudFormationCloudWatchAlarmIntegrationTest {
     @Test
     void percentileAlarmWithAnUnknownLowSampleCountPolicyRollsBack() {
         String suffix = Long.toString(System.nanoTime(), 36);
-        String stackName = "cfn-cw-p90-bogus-" + suffix;
+        stackName = "cfn-cw-p90-bogus-" + suffix;
 
         createStack(stackName, percentileAlarmTemplate("cfn-p90-bogus-" + suffix, "sometimes"));
 
@@ -140,7 +151,7 @@ class CloudFormationCloudWatchAlarmIntegrationTest {
     void metricMathAlarmWithFillReachesCreateComplete() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String alarmName = "cfn-fill-" + suffix;
-        String stackName = "cfn-cw-fill-" + suffix;
+        stackName = "cfn-cw-fill-" + suffix;
 
         createStack(stackName, """
                 {
