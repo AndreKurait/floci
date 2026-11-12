@@ -65,6 +65,8 @@ including batch, transaction and PartiQL table extraction.
 | `DescribeGlobalTable` | Read a global table's replication group |
 | `UpdateGlobalTable` | Add or remove replica regions |
 | `ListGlobalTables` | List global tables, optionally filtered by region |
+| `UpdateTableReplicaAutoScaling` | Store table and index auto scaling settings for logical replicas |
+| `DescribeTableReplicaAutoScaling` | Read stored logical replica auto scaling settings |
 | `DescribeExport` | Get export status and metadata |
 | `ListExports` | List exports, optionally filtered by table ARN |
 | `ImportTable` | Create a table and load DynamoDB JSON from S3 into it |
@@ -643,3 +645,26 @@ With IAM enforcement enabled, `ExecuteStatement` checks `dynamodb:PartiQLSelect`
 statement's operation. A policy can grant that action on the specific table ARN; a wildcard
 resource or a `dynamodb:ExecuteStatement` permission is not required. This mapping covers the
 single-statement API; batch and transaction authorization are separate paths.
+
+## Replica auto scaling settings
+
+On the native backend, `UpdateTableReplicaAutoScaling` stores write settings for the table and its
+global secondary indexes, and read settings for named logical replicas and their indexes.
+`DescribeTableReplicaAutoScaling` returns those settings for the existing replica group. Both
+operations accept the table name or its exact account, region, and partition ARN.
+
+Updates preserve omitted settings, including policy fields. Explicit `false`, zero cooldowns, and
+64-bit capacity bounds survive readback and storage reload. Effective minimum and maximum bounds
+are validated together before any settings are written; a refused multi-member update changes no
+settings. The settings use DynamoDB's existing storage mode and `dynamodb-replica-autoscaling.json`;
+no additional configuration is required. Deleting and recreating a table starts with no settings. A settings-file
+cleanup failure is reported after the existing table, item, stream, and forwarding teardown. A
+retained settings record is tied to the deleted table's identity and cannot affect a recreated table.
+
+This is configuration metadata on the existing logical replica model. It does not replicate items,
+change provisioned throughput in response to load, or create Application Auto Scaling resources.
+Role ARNs and policy names are retained only when supplied; Floci neither creates nor assumes a
+role, verifies its existence, nor invents role or policy defaults. Replica and index descriptions
+follow the native backend's immediate `ACTIVE` state. Changing billing mode does not apply or
+remove these settings. Settings for removed replicas or indexes are hidden, but removing and
+re-adding the same replica region or index name can retain its prior settings.
