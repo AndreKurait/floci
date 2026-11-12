@@ -3,6 +3,8 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.backup.BackupFrameworkResources;
+import io.floci.aws.services.backup.BackupFrameworkService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
@@ -97,6 +99,9 @@ public class IamConditionContextResolver {
     static final String REQUEST_AUTH_TYPE = "lambda:Request/WebFunctionAuthType";
     static final String RESOURCE_AUTH_TYPE = "lambda:Resource/WebFunctionAuthType";
 
+    @Inject
+    Instance<BackupFrameworkService> backupFrameworks;
+
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
     private final Instance<S3Service> s3Service;
@@ -159,6 +164,7 @@ public class IamConditionContextResolver {
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "backup" -> backupFrameworkConditions(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
@@ -169,6 +175,33 @@ public class IamConditionContextResolver {
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> backupFrameworkConditions(String action, ContainerRequestContext ctx) {
+        if (!BackupFrameworkResources.supports(action) || backupFrameworks == null || !backupFrameworks.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (!BackupFrameworkResources.matches(action, ctx, body)) {
+            return null;
+        }
+        String target = BackupFrameworkResources.target(action, ctx, body);
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>(
+                backupFrameworks.get().resourceConditions(region, target));
+        if ("backup:TagResource".equals(action) && body != null && body.path("Tags").isObject()) {
+            List<String> keys = new ArrayList<>();
+            body.path("Tags").properties().forEach(entry -> {
+                keys.add(entry.getKey());
+                conditions.put("aws:RequestTag/" + entry.getKey(), List.of(entry.getValue().asText()));
+            });
+            conditions.put("aws:TagKeys", keys);
+        } else if ("backup:UntagResource".equals(action) && body != null && body.path("TagKeyList").isArray()) {
+            List<String> keys = new ArrayList<>();
+            body.path("TagKeyList").forEach(key -> keys.add(key.asText()));
+            conditions.put("aws:TagKeys", keys);
+        }
+        return conditions;
     }
 
     /** Logs tag operations and group mutations use the handler's resource and request scope. */

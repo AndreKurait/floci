@@ -83,6 +83,16 @@ final class TagOnCreate {
      * twice keeps its last value, as the services keep it.
      */
     static Optional<Tagging> of(String operation, ContainerRequestContext ctx) {
+        if ("backup:CreateFramework".equals(operation)) {
+            JsonNode body = PassedRoles.jsonBody(ctx);
+            if (body == null || !body.path("FrameworkTags").isObject() || body.path("FrameworkTags").isEmpty()) {
+                return Optional.empty();
+            }
+            Map<String, String> tags = new LinkedHashMap<>();
+            body.path("FrameworkTags").properties().forEach(entry -> tags.put(entry.getKey(), entry.getValue().asText()));
+            return Optional.of(new Tagging("backup:TagResource", List.of(new TagSet(null, Map.copyOf(tags))),
+                    List.of(), false, true));
+        }
         TagOnCreateMembers.Entry entry = TagOnCreateMembers.of(operation);
         if (entry == null) {
             return Optional.empty();
