@@ -1388,6 +1388,11 @@ In this mode, public NAT creation without an attached internet gateway returns a
 failed gateway with failure code `Gateway.NotAttached`. Runtime programming errors fail route API calls.
 Deleting a NAT removes forwarding before releasing its addresses; a remaining
 namespace consumer prevents retirement and keeps the reservation for a retry.
+If route reconciliation encounters a namespace Docker confirms is gone, Floci
+withdraws that namespace's routes and converges surviving peers. Its service still
+owns cleanup and any public address reservation; a remaining namespace consumer
+continues to block address release. An unrelated Docker error still fails the
+operation and quarantines the surviving routes.
 This is limited to managed public destinations, with no general internet,
 private NAT, multi-address NAT, IPv6/NAT64, peering or NACL forwarding.
 See the [routing design and qualification limits](../design/vpc-public-routing.md).

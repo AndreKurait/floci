@@ -36,6 +36,7 @@ import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -62,6 +63,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private final Map<String, Endpoint> endpoints = new LinkedHashMap<>();
     private final Map<String, PublicAddress> publicAddresses = new LinkedHashMap<>();
     private final Map<String, NatRuntime> nats = new LinkedHashMap<>();
+    private final Set<String> missingNamespaces = new HashSet<>();
     private String publicNetwork;
     private boolean draining;
 
@@ -89,7 +91,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (!enabled() || draining) {
             return Set.of();
         }
-        return endpoints.values().stream().map(endpoint -> endpoint.publicAddress)
+        return activeEndpoints().stream().map(endpoint -> endpoint.publicAddress)
                 .filter(address -> address != null && address.transport() != null)
                 .map(NativePublicAddress::address).collect(Collectors.toUnmodifiableSet());
     }
@@ -151,6 +153,9 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         }
         endpoints.remove(key, endpoint);
         publicAddresses.remove(key, address);
+        missingNamespaces.removeIf(helper -> endpoints.values().stream()
+                .noneMatch(value -> helper.equals(value.helper))
+                && publicAddresses.values().stream().noneMatch(value -> helper.equals(value.namespace.id())));
         reconcile();
         removeEmptyPublicNetwork();
     }
@@ -352,29 +357,25 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             return;
         }
         try {
-            for (Endpoint endpoint : List.copyOf(endpoints.values())) {
-                RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(), () -> {
-                    Topology topology = topology(endpoint.identity.region());
-                    for (NatGateway gateway : topology.nats) {
-                        if ("available".equals(gateway.getState()) && "public".equals(gateway.getConnectivityType())
-                                && endpoint.identity.vpcId().equals(gateway.getVpcId())) {
-                            createNat(endpoint.identity.accountId(), endpoint.identity.region(), gateway);
-                        }
+            while (true) {
+                try {
+                    reconcilePresentNamespaces();
+                    return;
+                } catch (NotFoundException missing) {
+                    boolean retired;
+                    try {
+                        retired = withdrawMissingNamespaces();
+                    } catch (RuntimeException inspectionFailure) {
+                        missing.addSuppressed(inspectionFailure);
+                        throw missing;
                     }
-                });
-            }
-            configureAwsApi();
-            for (NatRuntime nat : List.copyOf(nats.values())) {
-                if (!nat.retiring && nat.namespace != null) {
-                    RequestScopes.runAs(nat.account, nat.region, () -> configureNat(nat, topology(nat.region)));
+                    if (!retired) {
+                        throw missing;
+                    }
                 }
             }
-            for (Endpoint endpoint : List.copyOf(endpoints.values())) {
-                RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(),
-                        () -> configureEndpoint(endpoint, topology(endpoint.identity.region())));
-            }
         } catch (RuntimeException failure) {
-            for (Endpoint endpoint : endpoints.values()) {
+            for (Endpoint endpoint : activeEndpoints()) {
                 endpoint.applied = null;
                 quarantine(endpoint.helper, false, failure);
             }
@@ -388,6 +389,50 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         }
     }
 
+    private void reconcilePresentNamespaces() {
+        for (Endpoint endpoint : activeEndpoints()) {
+            RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(), () -> {
+                Topology topology = topology(endpoint.identity.region());
+                for (NatGateway gateway : topology.nats) {
+                    if ("available".equals(gateway.getState()) && "public".equals(gateway.getConnectivityType())
+                            && endpoint.identity.vpcId().equals(gateway.getVpcId())) {
+                        createNat(endpoint.identity.accountId(), endpoint.identity.region(), gateway);
+                    }
+                }
+            });
+        }
+        configureAwsApi();
+        for (NatRuntime nat : List.copyOf(nats.values())) {
+            if (!nat.retiring && nat.namespace != null) {
+                RequestScopes.runAs(nat.account, nat.region, () -> configureNat(nat, topology(nat.region)));
+            }
+        }
+        for (Endpoint endpoint : activeEndpoints()) {
+            RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(),
+                    () -> configureEndpoint(endpoint, topology(endpoint.identity.region())));
+        }
+    }
+
+    /** Missing namespaces lose routes, while their owners retain cleanup and address reservations. */
+    private boolean withdrawMissingNamespaces() {
+        Set<String> helpers = new HashSet<>();
+        endpoints.values().forEach(endpoint -> helpers.add(endpoint.helper));
+        publicAddresses.values().forEach(address -> helpers.add(address.namespace.id()));
+        boolean changed = false;
+        for (String helper : helpers) {
+            if (!missingNamespaces.contains(helper) && !exists(helper)) {
+                missingNamespaces.add(helper);
+                changed = true;
+                LOG.debugv("Withdrawing VPC routes for missing namespace {0}; retaining owner cleanup", helper);
+            }
+        }
+        return changed;
+    }
+
+    private List<Endpoint> activeEndpoints() {
+        return endpoints.values().stream().filter(endpoint -> !missingNamespaces.contains(endpoint.helper)).toList();
+    }
+
     private void configureNat(NatRuntime nat, Topology topology) {
         List<VpcRouteSelection.Entry> routes = routes(nat.region, nat.vpc, nat.subnet, topology);
         List<VpcRoutingCommands.Hop> destinations = new ArrayList<>();
@@ -396,12 +441,13 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             destinations.add(new VpcRoutingCommands.Hop(apiAddress, awsApi.transport(), nat.publicDevice, false));
         }
         for (PublicAddress address : publicAddresses.values()) {
-            if (address.transport != null && internet(address.address, routes, nat.vpc, topology)) {
+            if (!missingNamespaces.contains(address.namespace.id())
+                    && address.transport != null && internet(address.address, routes, nat.vpc, topology)) {
                 destinations.add(new VpcRoutingCommands.Hop(address.address, address.transport,
                         nat.publicDevice, false));
             }
         }
-        for (Endpoint endpoint : endpoints.values()) {
+        for (Endpoint endpoint : activeEndpoints()) {
             NativePublicAddress address = endpoint.publicAddress;
             if (address != null && address.transport() != null && publicNetwork.equals(address.network())
                     && internet(address.address(), routes, nat.vpc, topology)) {
@@ -429,6 +475,10 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         List<VpcRoutingCommands.Hop> hops = new ArrayList<>();
         List<String> denied = new ArrayList<>();
         for (PublicAddress destination : publicAddresses.values()) {
+            if (missingNamespaces.contains(destination.namespace.id())) {
+                denied.add(destination.address);
+                continue;
+            }
             if (destination.transport == null || destination == own) {
                 continue;
             }
@@ -442,6 +492,10 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         for (Endpoint peer : endpoints.values()) {
             NativePublicAddress destination = peer.publicAddress;
             if (peer == endpoint || destination == null) {
+                continue;
+            }
+            if (missingNamespaces.contains(peer.helper)) {
+                denied.add(destination.address());
                 continue;
             }
             int previous = hops.size();
@@ -528,7 +582,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (!awsApi.enabled()) {
             return;
         }
-        if (nats.isEmpty() && !hasPublicInstances()) {
+        if (nats.isEmpty() && activeEndpoints().stream().noneMatch(endpoint -> endpoint.publicAddress != null)) {
             awsApi.retire();
             return;
         }
@@ -545,7 +599,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 });
             }
         }
-        for (Endpoint endpoint : endpoints.values()) {
+        for (Endpoint endpoint : activeEndpoints()) {
             NativePublicAddress address = endpoint.publicAddress;
             if (address != null) {
                 if (address.transport() == null) {
@@ -776,6 +830,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (!endpoints.isEmpty() || !nats.isEmpty() || !publicAddresses.isEmpty() || publicNetwork != null) {
             throw new IllegalStateException("VPC packet resources have not finished retirement");
         }
+        missingNamespaces.clear();
     }
 
     @Override
