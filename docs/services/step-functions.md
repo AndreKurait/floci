@@ -47,6 +47,15 @@
 definition, role, logging, tracing, encryption, and tags without replacing the state machine;
 changes to `StateMachineName` or `StateMachineType` use replacement semantics.
 
+CloudFormation `AWS::StepFunctions::Activity` creates a worker activity with a required
+`Name` and optional `Tags`. `Ref` and `Fn::GetAtt Arn` return its ARN; `Fn::GetAtt Name`
+returns its name. Workers use the existing `GetActivityTask`, `SendTaskSuccess`,
+`SendTaskFailure`, and `SendTaskHeartbeat` APIs. Tag updates preserve the activity,
+including removal of dropped tags. Renaming creates a replacement, deletes the old activity
+after the stack update commits, and honors `UpdateReplacePolicy: Retain`. Rollback restores
+the prior activity or its tags. `EncryptionConfiguration` is currently rejected explicitly;
+customer managed encryption is not implemented for activities.
+
 `DescribeStateMachineForExecution` reads a configuration captured before the Standard
 execution starts, including the resolved version when invoked through an alias.
 Later state-machine updates or deletion do not change that definition, execution

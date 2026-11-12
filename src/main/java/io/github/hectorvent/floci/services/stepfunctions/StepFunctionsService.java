@@ -1614,6 +1614,16 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         stateMachineStore.put(arn, updated);
     }
 
+    public synchronized void replaceActivityTags(String arn, Map<String, String> tags) {
+        Activity current = describeActivity(arn);
+        Activity updated = new Activity();
+        updated.setActivityArn(current.getActivityArn());
+        updated.setName(current.getName());
+        updated.setCreationDate(current.getCreationDate());
+        updated.setTags(new HashMap<>(tags != null ? tags : Map.of()));
+        activityStore.put(arn, updated);
+    }
+
     private StateMachineVersion addVersion(StateMachine stateMachine, String description) {
         if (stateMachine.getVersions().size() >= MAX_VERSIONS_PER_STATE_MACHINE) {
             throw new AwsException("ServiceQuotaExceededException",

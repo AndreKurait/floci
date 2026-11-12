@@ -210,6 +210,7 @@ AWS::ServiceDiscovery::PrivateDnsNamespace	CloudMapCfnProvisioner
 AWS::ServiceDiscovery::PublicDnsNamespace	CloudMapCfnProvisioner
 AWS::ServiceDiscovery::Service	CloudMapCfnProvisioner
 AWS::Signer::SigningProfile	SignerCfnProvisioner
+AWS::StepFunctions::Activity	StepFunctionsActivityCfnProvisioner
 AWS::StepFunctions::StateMachine	StepFunctionsCfnProvisioner
 AWS::Transfer::Server	TransferCfnProvisioner
 AWS::Transfer::User	TransferCfnProvisioner
