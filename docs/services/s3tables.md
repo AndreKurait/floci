@@ -14,7 +14,7 @@ S3 Tables requests are signed as `s3tables` and use REST JSON routes such as
 This service stores table-bucket, namespace, table, policy, maintenance
 configuration, and metadata-location state. It does **not** run an Apache
 Iceberg engine or create data-plane artifacts: manifests, warehouse objects,
-queries, compaction, snapshot expiry, replication, encryption-management, and
+queries, compaction, snapshot expiry, replication, data encryption, and
 metrics are intentionally outside this implementation.
 
 ## Supported operations
@@ -23,6 +23,7 @@ metrics are intentionally outside this implementation.
 |---|---|
 | Table buckets | CreateTableBucket, GetTableBucket, ListTableBuckets, DeleteTableBucket |
 | Storage classes | GetTableBucketStorageClass, PutTableBucketStorageClass, GetTableStorageClass |
+| Bucket encryption | GetTableBucketEncryption |
 | Bucket policy | PutTableBucketPolicy, GetTableBucketPolicy, DeleteTableBucketPolicy |
 | Bucket maintenance | PutTableBucketMaintenanceConfiguration, GetTableBucketMaintenanceConfiguration |
 | Namespaces | CreateNamespace, GetNamespace, ListNamespaces, DeleteNamespace |
@@ -41,6 +42,11 @@ retains the class selected at creation, either its explicit configuration or
 the bucket's default at that time. Bucket settings and table classes survive
 restarts in persistent storage modes. These settings are metadata; Floci does
 not move table data between storage tiers.
+
+`GetTableBucketEncryption` reads the encryption configuration supplied at bucket
+creation, including an SSE-KMS key ARN when configured. Buckets created without
+an explicit configuration report the SSE-S3 default, `AES256`. This readback
+reflects stored metadata; it does not encrypt data or manage KMS keys.
 
 ## Example
 
