@@ -978,7 +978,9 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         PostgresStartupSignal startup = new PostgresStartupSignal();
         // This path receives a newly created container, so replay cannot include a prior start.
         try (Closeable observation = logStreamer.observe(containerId, startup)) {
-            execUntilSuccess(containerName, containerId, cmd, "PostgreSQL IAM role", startup.signal);
+            PostgresIamReadiness.await(lifecycleManager.getDockerClient(), containerName, containerId, cmd,
+                    startup.signal);
+            LOG.infov("Initialized PostgreSQL IAM role in RDS container {0}", containerName);
         } catch (IOException e) {
             LOG.warnv(e, "Could not close PostgreSQL startup observation for {0}", containerName);
         }
@@ -1080,11 +1082,6 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     }
 
     private void execUntilSuccess(String containerName, String containerId, String[] cmd, String description) {
-        execUntilSuccess(containerName, containerId, cmd, description, new Semaphore(0));
-    }
-
-    private void execUntilSuccess(String containerName, String containerId, String[] cmd, String description,
-                                  Semaphore startupSignal) {
         String lastOutput = "";
         for (int attempt = 1; attempt <= 60; attempt++) {
             try {
@@ -1098,7 +1095,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                 lastOutput = e.getMessage();
             }
             try {
-                startupSignal.tryAcquire(1, TimeUnit.SECONDS);
+                TimeUnit.SECONDS.sleep(1);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Interrupted initializing " + description + " in " + containerName, e);
