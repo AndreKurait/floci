@@ -2952,7 +2952,12 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchCancelledAfterItsAddressWasPublishedKeepsNoAddress() throws Exception {
-        LaunchHarness harness = launchHarness();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(invocation -> {
+            invocation.getArgument(0, Runnable.class).run();
+            return null;
+        }).when(executor).execute(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofMinutes(30));
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
         InspectContainerResponse withIp = inspectResponse("172.18.0.10");
@@ -2968,11 +2973,10 @@ class Ec2ContainerManagerTest {
         }).when(harness.metadataServer).registerContainer(any(), any(), any());
         harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
 
-        awaitUntil(() -> instance.getPublicIpAddress() == null && "terminated".equals(instance.getState().getName())
-                && instance.getDockerContainerId() == null, Duration.ofSeconds(2));
         assertEquals("terminated", instance.getState().getName());
         assertNull(instance.getPublicIpAddress());
         assertNull(instance.getPublicDnsName());
+        assertNull(instance.getDockerContainerId());
     }
 
     @Test
