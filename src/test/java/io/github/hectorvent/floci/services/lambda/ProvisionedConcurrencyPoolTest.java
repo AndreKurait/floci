@@ -1598,6 +1598,8 @@ class ProvisionedConcurrencyPoolTest {
             environment.initialized.complete(null);
         }
         ready();
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> get().available() == environments.size());
         launcher.stopGate = new CompletableFuture<>();
         AtomicBoolean interruptionPreserved = new AtomicBoolean();
         Thread drain = Thread.ofPlatform().start(() -> {
