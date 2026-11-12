@@ -12,21 +12,26 @@ import io.floci.aws.services.ses.model.ImportJob;
 import io.floci.aws.services.ses.model.Topic;
 import io.floci.aws.services.ses.model.TopicPreference;
 import io.floci.aws.testing.MutableClock;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -54,6 +59,13 @@ class SesImportJobServiceTest {
     private static final String ACCOUNT = "000000000000";
     private static final String BUCKET = "imports";
     private static final String LIST = "newsletter";
+    private static final Duration ONE_NANO = Duration.ofNanos(1);
+    private static final Duration RESET_DRAIN_TIMEOUT =
+            Duration.ofMillis(SesImportJobService.RESET_DRAIN_TIMEOUT_MILLIS);
+    private static final Duration RESET_ADMISSION_WAIT =
+            Duration.ofMillis(SesImportJobService.RESET_ADMISSION_WAIT_MILLIS);
+    // Real-time guard on waits for another thread that is already free to finish.
+    private static final Duration STUCK = Duration.ofSeconds(30);
 
     private S3Service s3Service;
     private SesSuppressionService suppressionService;
@@ -79,6 +91,11 @@ class SesImportJobServiceTest {
     private SesImportJobService newService(Executor workers) {
         return new SesImportJobService(jobStore, s3Service, suppressionService, contactService,
                 new ObjectMapper().findAndRegisterModules(), Clock.systemUTC(), workers);
+    }
+
+    private SesImportJobService newService(Executor workers, SesResetWait resetWait) {
+        return new SesImportJobService(jobStore, s3Service, suppressionService, contactService,
+                new ObjectMapper().findAndRegisterModules(), Clock.systemUTC(), workers, resetWait);
     }
 
     private void stubObject(String key, String content) {
@@ -447,14 +464,15 @@ class SesImportJobServiceTest {
             return new ByteArrayInputStream("alice@example.com,BOUNCE\n".getBytes(StandardCharsets.UTF_8));
         });
         stubObject("a.csv", "bob@example.com,BOUNCE\n");
-        SesImportJobService threaded = newService(task -> new Thread(task).start());
+        TestTime time = TestTime.create();
+        TimelineResetWait resetWait = new TimelineResetWait(time);
+        SesImportJobService threaded = newService(task -> new Thread(task).start(), resetWait);
         ImportJob slow = threaded.createSuppressionListImportJob(REGION, ACCOUNT, url("slow.csv"), "CSV", "PUT");
         assertTrue(s3Blocked.await(5, TimeUnit.SECONDS));
 
         Thread reset = new Thread(threaded::beforeReset);
         reset.start();
-        reset.join(300);
-        assertTrue(reset.isAlive(), "beforeReset must wait for the running worker");
+        assertEquals(RESET_DRAIN_TIMEOUT, resetWait.awaitPark(), "beforeReset must wait for the running worker");
         // The create has to race the drain, not follow it: a job admitted between beforeReset and
         // the storage wipe is exactly what the admission gate exists to stop.
         AtomicInteger created = new AtomicInteger();
@@ -463,17 +481,20 @@ class SesImportJobServiceTest {
             created.incrementAndGet();
         });
         create.start();
-        create.join(300);
-        assertEquals(0, created.get(), "a create arriving while the drain runs waits");
+        assertEquals(RESET_ADMISSION_WAIT, resetWait.awaitPark(), "a create arriving while the drain runs waits");
+        assertEquals(0, created.get());
+        assertTrue(reset.isAlive());
 
         releaseS3.countDown();
-        reset.join(5_000);
-        assertFalse(reset.isAlive(), "beforeReset returns once the worker has left");
-        create.join(300);
+        assertTrue(reset.join(STUCK), "beforeReset returns once the worker has left");
+        // Nothing but afterReset or the end of the admission wait releases the create: it is still
+        // parked on its first wait however close the timeline comes to that deadline.
+        time.advance(RESET_ADMISSION_WAIT.minus(ONE_NANO));
+        assertEquals(0, resetWait.unreportedParks());
         assertEquals(0, created.get(), "and keeps waiting until the reset finishes");
 
         threaded.afterReset();
-        create.join(5_000);
+        assertTrue(create.join(STUCK));
         assertEquals(1, created.get());
         // The slow worker was abandoned: no write after the reset started.
         assertEquals(ImportJob.STATUS_PROCESSING, threaded.getImportJob(REGION, slow.getJobId()).getJobStatus());
@@ -489,21 +510,54 @@ class SesImportJobServiceTest {
             release.await();
             return new ByteArrayInputStream("alice@example.com,BOUNCE\n".getBytes(StandardCharsets.UTF_8));
         });
-        SesImportJobService threaded = new SesImportJobService(jobStore, s3Service, suppressionService,
-                contactService, new ObjectMapper().findAndRegisterModules(), Clock.systemUTC(),
-                task -> new Thread(task).start(), 200);
+        TestTime time = TestTime.create();
+        TimelineResetWait resetWait = new TimelineResetWait(time);
+        SesImportJobService threaded = newService(task -> new Thread(task).start(), resetWait);
         threaded.createSuppressionListImportJob(REGION, ACCOUNT, url("wedged.csv"), "CSV", "PUT");
         assertTrue(blocked.await(5, TimeUnit.SECONDS));
 
         // The worker never finishes, so the drain has to time out rather than block the reset.
-        long started = System.currentTimeMillis();
-        threaded.beforeReset();
-        long waited = System.currentTimeMillis() - started;
+        Thread reset = new Thread(threaded::beforeReset);
+        reset.start();
+        assertEquals(RESET_DRAIN_TIMEOUT, resetWait.awaitPark());
 
-        assertTrue(waited >= 200, "the drain should wait for its deadline, waited " + waited + "ms");
-        assertTrue(waited < 5_000, "beforeReset must return on the deadline, waited " + waited + "ms");
+        time.advance(RESET_DRAIN_TIMEOUT.minus(ONE_NANO));
+        assertEquals(0, resetWait.unreportedParks(), "the drain waits for its whole deadline");
+        assertTrue(reset.isAlive());
+
+        time.advance(ONE_NANO);
+        assertTrue(reset.join(STUCK), "beforeReset must return on the deadline");
+        assertEquals(0, resetWait.unreportedParks(), "and gives up there instead of waiting again");
         release.countDown();
         threaded.afterReset();
+    }
+
+    @Test
+    void aCreateStillWaitingWhenTheAdmissionWaitEndsIsRefusedAsThrottled() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineResetWait resetWait = new TimelineResetWait(time);
+        SesImportJobService gated = newService(Runnable::run, resetWait);
+        stubObject("a.csv", "bob@example.com,BOUNCE\n");
+        gated.beforeReset();
+
+        FutureTask<ImportJob> create = new FutureTask<>(
+                () -> gated.createSuppressionListImportJob(REGION, ACCOUNT, url("a.csv"), "CSV", "PUT"));
+        Thread creator = new Thread(create);
+        creator.start();
+        assertEquals(RESET_ADMISSION_WAIT, resetWait.awaitPark());
+
+        time.advance(RESET_ADMISSION_WAIT.minus(ONE_NANO));
+        assertEquals(0, resetWait.unreportedParks());
+        assertFalse(create.isDone(), "one nanosecond short of the admission wait the create is still waiting");
+
+        time.advance(ONE_NANO);
+        ExecutionException refused = assertThrows(ExecutionException.class,
+                () -> create.get(STUCK.toSeconds(), TimeUnit.SECONDS));
+        AwsException cause = (AwsException) refused.getCause();
+        assertEquals("TooManyRequestsException", cause.getErrorCode());
+        assertEquals(429, cause.getHttpStatus());
+        assertTrue(gated.listImportJobs(REGION, null).isEmpty());
+        gated.afterReset();
     }
 
     @Test
@@ -515,14 +569,19 @@ class SesImportJobServiceTest {
             release.await();
             return new ByteArrayInputStream("alice@example.com,BOUNCE\n".getBytes(StandardCharsets.UTF_8));
         });
-        SesImportJobService threaded = newService(task -> new Thread(task).start());
+        AtomicReference<Thread> worker = new AtomicReference<>();
+        SesImportJobService threaded = newService(task -> {
+            worker.set(new Thread(task));
+            worker.get().start();
+        });
         ImportJob job = threaded.createSuppressionListImportJob(REGION, ACCOUNT, url("slow.csv"), "CSV", "PUT");
         assertTrue(blocked.await(5, TimeUnit.SECONDS));
 
         ImportJob midRun = threaded.getImportJob(REGION, job.getJobId());
         assertEquals(ImportJob.STATUS_PROCESSING, midRun.getJobStatus());
         release.countDown();
-        ImportJob finished = awaitTerminal(threaded, job.getJobId());
+        assertTrue(worker.get().join(STUCK), "the worker returns once its read is released");
+        ImportJob finished = threaded.getImportJob(REGION, job.getJobId());
 
         assertEquals(ImportJob.STATUS_COMPLETED, finished.getJobStatus());
         assertNotNull(finished.getCompletedTimestamp());
@@ -532,17 +591,6 @@ class SesImportJobServiceTest {
         assertEquals(ImportJob.STATUS_PROCESSING, midRun.getJobStatus());
         assertEquals(0, midRun.getProcessedRecordsCount());
         assertNull(midRun.getCompletedTimestamp());
-    }
-
-    private static ImportJob awaitTerminal(SesImportJobService service, String jobId) throws InterruptedException {
-        for (int i = 0; i < 250; i++) {
-            ImportJob job = service.getImportJob(REGION, jobId);
-            if (job.isTerminal()) {
-                return job;
-            }
-            Thread.sleep(20);
-        }
-        throw new AssertionError("import job " + jobId + " never reached a terminal status");
     }
 
     @Test

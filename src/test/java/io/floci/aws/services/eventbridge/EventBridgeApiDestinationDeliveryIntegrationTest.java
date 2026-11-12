@@ -24,7 +24,6 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
@@ -32,6 +31,9 @@ class EventBridgeApiDestinationDeliveryIntegrationTest {
 
     @Inject
     MutableClock clock;
+
+    @Inject
+    TargetDispatcher dispatcher;
 
     private static final String EB_CT = "application/x-amz-json-1.1";
 
@@ -98,14 +100,16 @@ class EventBridgeApiDestinationDeliveryIntegrationTest {
 
     @Test
     void deliveryIsDroppedWhenOauthTokenRequestFails() throws Exception {
-        CountDownLatch delivered = new CountDownLatch(1);
+        AtomicInteger tokenRequests = new AtomicInteger();
+        AtomicInteger delivered = new AtomicInteger();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/token", exchange -> {
+            tokenRequests.incrementAndGet();
             exchange.sendResponseHeaders(401, -1);
             exchange.close();
         });
         server.createContext("/hook", exchange -> {
-            delivered.countDown();
+            delivered.incrementAndGet();
             reply(exchange, "{}");
         });
         server.start();
@@ -125,9 +129,18 @@ class EventBridgeApiDestinationDeliveryIntegrationTest {
                     "http://127.0.0.1:" + port + "/hook");
             routeEventsTo("oauth-fail-rule", "oauth.fail", destinationArn);
 
+            // PutEvents delivers on the calling thread, so the refused token request is over when it returns.
             putEvent("oauth.fail");
 
-            assertFalse(delivered.await(2, TimeUnit.SECONDS),
+            assertEquals(1, tokenRequests.get(), "the delivery asks for a token once");
+            assertEquals(0, delivered.get(),
+                    "an event must not be sent unauthenticated when the token request fails");
+
+            // Nothing is left to retry: a tick an hour later, past every backoff, sends nothing either.
+            clock.advance(Duration.ofHours(1));
+            dispatcher.tick();
+            assertEquals(1, tokenRequests.get(), "a refused token request is not retried");
+            assertEquals(0, delivered.get(),
                     "an event must not be sent unauthenticated when the token request fails");
         } finally {
             server.stop(0);

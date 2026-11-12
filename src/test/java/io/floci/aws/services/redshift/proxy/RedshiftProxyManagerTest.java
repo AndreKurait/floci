@@ -13,18 +13,19 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.time.Duration;
 import java.util.List;
 import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -351,22 +352,15 @@ class RedshiftProxyManagerTest {
     }
 
 
+    /** A stopped listener's port is released once its accept loop has left the socket. */
     private static void assertPortAvailable(int port) {
-        IOException last = null;
-        for (int attempt = 0; attempt < 50; attempt++) {
-            try (ServerSocket ignored = reusableSocket(port)) {
-                return;
-            } catch (IOException e) {
-                last = e;
-            }
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                fail("Interrupted waiting for port " + port, e);
-            }
-        }
-        fail("Proxy port " + port + " was not released", last);
+        await().atMost(Duration.ofMillis(500)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .ignoreExceptionsInstanceOf(IOException.class)
+                .until(() -> {
+                    try (ServerSocket ignored = reusableSocket(port)) {
+                        return true;
+                    }
+                });
     }
 
     private static void assertPortUnavailable(int port) {

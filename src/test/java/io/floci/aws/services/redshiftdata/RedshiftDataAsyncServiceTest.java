@@ -54,7 +54,7 @@ class RedshiftDataAsyncServiceTest {
             } finally {
                 release.countDown();
             }
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals("ABORTED",
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals("ABORTED",
                     service.describeStatement(mapper.createObjectNode().put("Id", id)).path("Status").asText()));
             verify(statement, never()).execute();
             verify(connection, never()).commit();
@@ -81,7 +81,7 @@ class RedshiftDataAsyncServiceTest {
             String id = service.batchExecuteStatement(request, "us-east-1").path("Id").asText();
             assertEquals(RedshiftDataStatementStore.Status.FINISHED, store.getForAccount("000000000000", id).status,
                     () -> store.getForAccount("000000000000", id).error);
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> verify(publisher).publish(argThat(statement ->
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> verify(publisher).publish(argThat(statement ->
                     id.equals(statement.id) && statement.status == RedshiftDataStatementStore.Status.FINISHED)));
             assertEquals(RedshiftDataStatementStore.Status.FINISHED, store.getForAccount("000000000000", id).status);
             service.executeStatement(mapper.createObjectNode().put("Sql", "SELECT 3").put("WaitTimeSeconds", 5), "us-east-1");
@@ -126,7 +126,7 @@ class RedshiftDataAsyncServiceTest {
                     .put("WithEvent", true).put("StatementName", "etl"), "cn-north-1", "role-principal").path("Id").asText();
             try {
                 assertTrue(executor.cancel("111111111111", id));
-                await().atMost(Duration.ofSeconds(5)).until(() -> delivered.get() != null);
+                await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).until(() -> delivered.get() != null);
                 assertEquals("111111111111", delivered.get().accountId);
                 assertEquals("cn-north-1", delivered.get().region);
                 assertEquals("role-principal", delivered.get().principal);
@@ -165,7 +165,7 @@ class RedshiftDataAsyncServiceTest {
             assertEquals("STARTED", service.describeStatement(id).path("Status").asText());
             assertThrows(AwsException.class, () -> service.getStatementResult(id));
             release.countDown();
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                     assertEquals("FAILED", service.describeStatement(id).path("Status").asText()));
             AwsException rejected = assertThrows(AwsException.class, () -> service.cancelStatement(id));
             assertEquals("ValidationException", rejected.getErrorCode());

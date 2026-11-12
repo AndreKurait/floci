@@ -98,6 +98,7 @@ public class ContainerLifecycleManager {
     private final ContainerDetector containerDetector;
     private final EmulatorConfig config;
     private final long archiveRetryBackoffMillis;
+    private final RemovalWait removalWait;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -122,11 +123,32 @@ public class ContainerLifecycleManager {
                               ContainerDetector containerDetector,
                               EmulatorConfig config,
                               long archiveRetryBackoffMillis) {
+        this(dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
+                WaitContainerResultCallback::awaitCompletion);
+    }
+
+    ContainerLifecycleManager(DockerClient dockerClient,
+                              ImageCacheService imageCacheService,
+                              ContainerDetector containerDetector,
+                              EmulatorConfig config,
+                              long archiveRetryBackoffMillis,
+                              RemovalWait removalWait) {
         this.dockerClient = dockerClient;
         this.imageCacheService = imageCacheService;
         this.containerDetector = containerDetector;
         this.config = config;
         this.archiveRetryBackoffMillis = archiveRetryBackoffMillis;
+        this.removalWait = removalWait;
+    }
+
+    /**
+     * The bounded wait for a removal the daemon already has in progress. Production blocks on the
+     * Docker wait callback for the real duration; a test ends the wait from a timeline it moves.
+     */
+    @FunctionalInterface
+    interface RemovalWait {
+        /** Whether the wait completed within the timeout. */
+        boolean await(WaitContainerResultCallback callback, long timeout, TimeUnit unit) throws InterruptedException;
     }
 
     /**
@@ -734,7 +756,7 @@ public class ContainerLifecycleManager {
     private boolean awaitConcurrentRemoval(String containerId) {
         try (WaitContainerResultCallback callback = new WaitContainerResultCallback()) {
             dockerClient.waitContainerCmd(containerId).withCondition(WaitContainerCondition.REMOVED).exec(callback);
-            callback.awaitCompletion(5, TimeUnit.SECONDS);
+            removalWait.await(callback, 5, TimeUnit.SECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             LOG.debugv("Interrupted waiting for container {0} removal", containerId);

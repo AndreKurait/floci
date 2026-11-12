@@ -7,9 +7,11 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.time.Duration;
 import java.util.function.Supplier;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItems;
@@ -294,22 +296,9 @@ class SesImportJobV2IntegrationTest {
     private static String pollUntilTerminal(String jobId, String auth) {
         Supplier<Response> call = () -> given().header("Authorization", auth)
                 .when().get("/v2/email/import-jobs/" + jobId);
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            String status = call.get().then().statusCode(200).extract().jsonPath().getString("JobStatus");
-            if ("COMPLETED".equals(status) || "FAILED".equals(status)) {
-                return status;
-            }
-            sleep(100);
-        }
-        return "TIMEOUT";
-    }
-
-    private static void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        return await("import job " + jobId + " reaches a terminal state")
+                .atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> call.get().then().statusCode(200).extract().jsonPath().getString("JobStatus"),
+                    status -> "COMPLETED".equals(status) || "FAILED".equals(status));
     }
 }

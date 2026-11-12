@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit;
 public class DynamoDbTtlService {
 
     private static final Logger LOG = Logger.getLogger(DynamoDbTtlService.class);
+    static final long SWEEP_INTERVAL_SECONDS = 60;
 
     private final DynamoDbService dynamoDbService;
     private final ScheduledExecutorService scheduler;
@@ -20,16 +21,20 @@ public class DynamoDbTtlService {
 
     @Inject
     public DynamoDbTtlService(DynamoDbService dynamoDbService) {
-        this.dynamoDbService = dynamoDbService;
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        this(dynamoDbService, Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "dynamodb-ttl-sweeper");
             t.setDaemon(true);
             return t;
-        });
+        }));
+    }
+
+    DynamoDbTtlService(DynamoDbService dynamoDbService, ScheduledExecutorService scheduler) {
+        this.dynamoDbService = dynamoDbService;
+        this.scheduler = scheduler;
     }
 
     public void start() {
-        scheduler.scheduleAtFixedRate(this::sweep, 60, 60, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::sweep, SWEEP_INTERVAL_SECONDS, SWEEP_INTERVAL_SECONDS, TimeUnit.SECONDS);
         LOG.infov("DynamoDB TTL sweeper scheduled (60s interval)");
     }
 

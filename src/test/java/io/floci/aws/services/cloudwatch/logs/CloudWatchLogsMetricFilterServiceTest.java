@@ -7,11 +7,13 @@ import io.floci.aws.services.cloudwatch.logs.model.LogEvent;
 import io.floci.aws.services.cloudwatch.logs.model.MetricFilter;
 import io.floci.aws.services.cloudwatch.logs.model.MetricTransformation;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +41,7 @@ class CloudWatchLogsMetricFilterServiceTest {
     private static final String GROUP = "/app/api";
     private static final String OTHER_GROUP = "/app/worker";
 
+    private final TestTime time = TestTime.create();
     private CloudWatchLogsMetricFilterService service;
     private CloudWatchMetricsService metrics;
 
@@ -46,7 +49,8 @@ class CloudWatchLogsMetricFilterServiceTest {
     void setUp() {
         RegionResolver resolver = new RegionResolver(REGION, "000000000000");
         CloudWatchLogsService logs = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 10_000, resolver);
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 10_000, resolver, 0L,
+                time::currentTimeMillis);
         logs.createLogGroup(GROUP, null, null, REGION);
         logs.createLogGroup(OTHER_GROUP, null, null, REGION);
         metrics = mock(CloudWatchMetricsService.class);
@@ -116,9 +120,10 @@ class CloudWatchLogsMetricFilterServiceTest {
     }
 
     @Test
-    void putReplacesAFilterOfTheSameNameAndKeepsItsCreationTime() throws InterruptedException {
+    void putReplacesAFilterOfTheSameNameAndKeepsItsCreationTime() {
         long created = service.putMetricFilter(errorCounter(GROUP, "errors"), REGION).getCreationTime();
-        Thread.sleep(2);
+        assertEquals(time.currentTimeMillis(), created);
+        time.advance(Duration.ofDays(1));
 
         service.putMetricFilter(filter(GROUP, "errors", "FATAL", transformation("FatalCount", "App", "2")), REGION);
 

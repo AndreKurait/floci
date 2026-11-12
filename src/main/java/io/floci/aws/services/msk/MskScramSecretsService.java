@@ -38,6 +38,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -58,9 +59,8 @@ public class MskScramSecretsService {
     private final KmsService kmsService;
     private final ObjectMapper objectMapper;
 
-    private final ScheduledExecutorService reconciler = Executors.newSingleThreadScheduledExecutor();
-    private final ThreadPoolExecutor reconciliationWorkers = new ThreadPoolExecutor(
-        4, 4, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(128));
+    private final ScheduledExecutorService reconciler;
+    private final ExecutorService reconciliationWorkers;
     private final Set<String> pendingReconciliations = ConcurrentHashMap.newKeySet();
     private final Map<String, Object> clusterLocks = new ConcurrentHashMap<>();
 
@@ -74,6 +74,14 @@ public class MskScramSecretsService {
     public MskScramSecretsService(StorageFactory storageFactory, EmulatorConfig config, MskService mskService,
                                   RedpandaManager redpandaManager, SecretsManagerService secretsManagerService,
                                   KmsService kmsService, ObjectMapper objectMapper) {
+        this(storageFactory, config, mskService, redpandaManager, secretsManagerService, kmsService, objectMapper,
+            Executors.newSingleThreadScheduledExecutor(), newReconciliationWorkers());
+    }
+
+    MskScramSecretsService(StorageFactory storageFactory, EmulatorConfig config, MskService mskService,
+                           RedpandaManager redpandaManager, SecretsManagerService secretsManagerService,
+                           KmsService kmsService, ObjectMapper objectMapper,
+                           ScheduledExecutorService reconciler, ExecutorService reconciliationWorkers) {
         this.storage = storageFactory.create("msk", "msk-scram-associations.json",
                 new TypeReference<Map<String, MskScramAssociations>>() {});
         this.config = config;
@@ -82,6 +90,13 @@ public class MskScramSecretsService {
         this.secretsManagerService = secretsManagerService;
         this.kmsService = kmsService;
         this.objectMapper = objectMapper;
+        this.reconciler = reconciler;
+        this.reconciliationWorkers = reconciliationWorkers;
+    }
+
+    // Four at a time, and a queue that refuses a cluster past 128 waiting, which the next scheduled run retries.
+    static ThreadPoolExecutor newReconciliationWorkers() {
+        return new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(128));
     }
 
     void onStart(@Observes StartupEvent ignored) {
