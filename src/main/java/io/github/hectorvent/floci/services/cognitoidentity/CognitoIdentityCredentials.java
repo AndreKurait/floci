@@ -144,6 +144,11 @@ public class CognitoIdentityCredentials {
     public Credentials assumeRole(String token, String roleArn, String sessionName, int duration, String policy,
                                    int minimumSessionTokenSize) {
         CognitoIdentityTokens.Verified verified = tokens.verify(token);
+        CognitoIdentity identity = identities.publicIdentity(verified.identityId(), verified.region());
+        IdentityPool pool = identities.publicPool(identity.identityPoolId(), verified.region());
+        if (!identity.active() || !pool.isAllowClassicFlow()) {
+            throw new AwsException("AccessDenied", "The identity is not eligible for classic authentication.", 403);
+        }
         IamRole role;
         try {
             role = role(roleArn);
