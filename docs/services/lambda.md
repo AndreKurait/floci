@@ -987,6 +987,13 @@ invocation to time out.
 on its container IP. All Lambda containers launched by Floci are configured to
 use it as their DNS resolver. It binds that advertised IP so replies retain the
 queried source address even when the container has multiple network interfaces.
+On an internal Docker bridge, Docker's resolver does not forward to configured DNS
+servers. Lambda prepares a read-only resolver file before runtime initialization:
+Docker's resolver remains first for peer aliases, followed by the configured servers.
+The named volume remains attached while the workload uses it, survives runtime
+restarts, and is removed after container teardown. Failed removal remains queued
+for retry. Explicit mounts covering `/etc/resolv.conf`, `/etc`, or `/` take precedence.
+
 The embedded DNS server:
 
 - Resolves `*.localhost.floci.io` → Floci's Docker network IP
