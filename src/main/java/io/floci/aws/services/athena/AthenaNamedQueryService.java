@@ -98,23 +98,26 @@ public class AthenaNamedQueryService {
     }
 
     public synchronized void deleteWorkGroup(String region, String workGroup, boolean recursive) {
-        if ("primary".equals(workGroup)) {
-            throw invalid("The primary workgroup cannot be deleted.");
-        }
-        List<NamedQuery> contents = queriesInWorkGroup(region, workGroup);
-        if (!recursive && !contents.isEmpty()) {
-            throw invalid("WorkGroup contains named queries. Set RecursiveDeleteOption to true to delete it.");
-        }
-        for (NamedQuery query : contents) {
-            queries.delete(key(region, query.namedQueryId()));
-        }
-        for (String requestKey : requests.keys()) {
-            if (requestKey.startsWith(region + ":") && requests.get(requestKey)
-                    .map(query -> workGroup.equals(query.workGroup())).orElse(false)) {
-                requests.delete(requestKey);
+        synchronized (athenaService.workGroupLock()) {
+            athenaService.validatePreparedStatementDeletion(workGroup, region, recursive);
+            if ("primary".equals(workGroup)) {
+                throw invalid("The primary workgroup cannot be deleted.");
             }
+            List<NamedQuery> contents = queriesInWorkGroup(region, workGroup);
+            if (!recursive && !contents.isEmpty()) {
+                throw invalid("WorkGroup contains named queries. Set RecursiveDeleteOption to true to delete it.");
+            }
+            for (NamedQuery query : contents) {
+                queries.delete(key(region, query.namedQueryId()));
+            }
+            for (String requestKey : requests.keys()) {
+                if (requestKey.startsWith(region + ":") && requests.get(requestKey)
+                        .map(query -> workGroup.equals(query.workGroup())).orElse(false)) {
+                    requests.delete(requestKey);
+                }
+            }
+            athenaService.removeWorkGroup(workGroup, region);
         }
-        athenaService.removeWorkGroup(workGroup, region);
     }
 
     private List<NamedQuery> queriesInWorkGroup(String region, String workGroup) {

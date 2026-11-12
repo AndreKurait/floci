@@ -3,6 +3,7 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.athena.AthenaPreparedStatementService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
@@ -105,6 +106,7 @@ public class IamConditionContextResolver {
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
     private final RequestContext requestContext;
+    private final Instance<AthenaPreparedStatementService> athenaPreparedStatements;
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
@@ -125,10 +127,27 @@ public class IamConditionContextResolver {
                                        RequestContext requestContext,
                                        EmulatorConfig config,
                                        CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<AthenaPreparedStatementService> athenaPreparedStatements) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), athenaPreparedStatements);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
                 lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC());
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -142,6 +161,23 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext, config, currentVertxRequest, serviceCatalog, clock, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                        Instance<AthenaPreparedStatementService> athenaPreparedStatements) {
+        this.athenaPreparedStatements = athenaPreparedStatements;
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -156,6 +192,24 @@ public class IamConditionContextResolver {
         this.serviceCatalog = serviceCatalog;
     }
 
+    private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
+        if (!AthenaPreparedStatementService.supportsAction(action)
+                || athenaPreparedStatements == null || !athenaPreparedStatements.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("WorkGroup").isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        try {
+            return athenaPreparedStatements.get().resourceTagConditions(region, body.path("WorkGroup").textValue());
+        } catch (AwsException expected) {
+            // The handler validates the same selector; an absent workgroup has no resource tags.
+            return null;
+        }
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
@@ -165,6 +219,7 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "athena" -> athenaPreparedStatementConditions(action, ctx);
             case "redshift" -> RequestConditionKeys.requestKeys(action).isEmpty() ? null
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
