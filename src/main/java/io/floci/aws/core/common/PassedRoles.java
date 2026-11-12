@@ -281,7 +281,8 @@ final class PassedRoles {
             case "ecs:CreateTaskSet" -> ecsTaskDefinitionRoles(jsonBody(ctx), lookups);
             case "ecs:CreateCapacityProvider", "ecs:UpdateCapacityProvider" ->
                     ecsRoles(values(jsonBody(ctx), "managedInstancesProvider", "infrastructureRoleArn"), ECS, lookups);
-            case "states:CreateStateMachine", "states:UpdateStateMachine" -> fromJson(ctx, STATES, "roleArn");
+            case "states:CreateStateMachine", "states:UpdateStateMachine", "states:TestState" ->
+                    fromJson(ctx, STATES, "roleArn");
             case "events:PutRule" -> fromJson(ctx, EVENTS, "RoleArn");
             case "events:PutTargets" -> fromJson(ctx, EVENTS, "Targets", "[]", "RoleArn");
             case "scheduler:CreateSchedule", "scheduler:UpdateSchedule" -> fromJson(ctx, SCHEDULER, "Target", "RoleArn");

@@ -930,8 +930,70 @@ public class AslExecutor {
         };
     }
 
+    ObjectNode testPureState(TestStateDefinition.Prepared request, String accountId, String partition) {
+        lambdaTaskAuthorizer.authorizeTestStateRole(request.roleArn(), accountId, partition);
+        JsonNode state = request.state().deepCopy();
+        JsonNode input = request.input().deepCopy();
+        ObjectNode inspection = request.debug() ? objectMapper.createObjectNode() : null;
+        if (inspection != null) {
+            inspection.put("input", request.rawInput());
+        }
+        ObjectNode response = objectMapper.createObjectNode();
+        JsonPathScope previous = JSONPATH_SCOPE.get();
+        ObjectNode variables = objectMapper.createObjectNode();
+        JSONPATH_SCOPE.set(new JsonPathScope(variables, null, objectMapper.createObjectNode()));
+        try {
+            StateResult result = switch (state.path("Type").asText()) {
+                case "Pass" -> executePassState(state, input, false, null, variables, inspection);
+                case "Choice" -> executeChoiceState(state, input, false, null, variables, inspection);
+                case "Succeed" -> executeSucceedState(state, input, false, null, variables, inspection);
+                case "Fail" -> executeFail(state, input, false, null, variables);
+                default -> throw new IllegalArgumentException("A pure state is required");
+            };
+            String output = result.output().toString();
+            if (output.getBytes(StandardCharsets.UTF_8).length > 262144) {
+                throw new FailStateException("States.DataLimitExceeded", "The state output exceeds 262144 bytes.");
+            }
+            response.put("status", "SUCCEEDED");
+            response.put("output", output);
+            if (result.nextState() != null) {
+                response.put("nextState", result.nextState());
+            }
+        } catch (FailStateException failure) {
+            response.put("status", "FAILED");
+            if (failure.error != null) {
+                response.put("error", failure.error);
+            }
+            if (failure.cause != null) {
+                response.put("cause", failure.cause);
+            }
+        } catch (Exception failure) {
+            LOG.debugv(failure, "Pure TestState evaluation failed");
+            response.put("status", "FAILED");
+            response.put("error", "States.Runtime");
+            response.put("cause", failure.getMessage());
+        } finally {
+            restoreJsonPathScope(previous);
+        }
+        if (inspection != null) {
+            response.set("inspectionData", inspection);
+        }
+        return response;
+    }
+
+    private static void inspect(ObjectNode inspection, String field, JsonNode value) {
+        if (inspection != null) {
+            inspection.put(field, value.toString());
+        }
+    }
+
     private StateResult executePassState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context,
                                          ObjectNode variables) throws Exception {
+        return executePassState(stateDef, input, jsonata, context, variables, null);
+    }
+
+    private StateResult executePassState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context,
+                                         ObjectNode variables, ObjectNode inspection) throws Exception {
         if (jsonata) {
             JsonNode result = stateDef.has("Result") ? stateDef.get("Result") : input;
             JsonNode output = applyJsonataOutput(stateDef, input, result, context, variables);
@@ -939,6 +1001,7 @@ public class AslExecutor {
         }
 
         JsonNode effectiveInput = applyInputPath(stateDef, input, context);
+        inspect(inspection, "afterInputPath", effectiveInput);
 
         // Pass states transform their input through Parameters (with intrinsics), then a static
         // Result overrides if present.
@@ -946,12 +1009,15 @@ public class AslExecutor {
         if (stateDef.has("Parameters")) {
             result = resolveParameters(stateDef.get("Parameters"), effectiveInput, context);
         }
+        inspect(inspection, "afterParameters", result);
         if (stateDef.has("Result")) {
             result = stateDef.get("Result");
         }
 
+        inspect(inspection, "afterResultSelector", result);
         applyJsonPathAssign(stateDef, result);
         JsonNode output = mergeResult(stateDef, input, result);
+        inspect(inspection, "afterResultPath", output);
         output = applyOutputPath(stateDef, output, context);
         return new StateResult(output, stateDef.path("Next").asText(null));
     }
@@ -2918,6 +2984,11 @@ public class AslExecutor {
 
     private StateResult executeChoiceState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context,
                                            ObjectNode variables) throws Exception {
+        return executeChoiceState(stateDef, input, jsonata, context, variables, null);
+    }
+
+    private StateResult executeChoiceState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context,
+                                           ObjectNode variables, ObjectNode inspection) throws Exception {
         if (jsonata) {
             JsonNode statesVar = buildStatesVar(input, null, context);
             JsonNode choices = stateDef.path("Choices");
@@ -2946,6 +3017,7 @@ public class AslExecutor {
         }
 
         JsonNode effectiveInput = applyInputPath(stateDef, input, context);
+        inspect(inspection, "afterInputPath", effectiveInput);
         JsonNode choices = stateDef.path("Choices");
         for (JsonNode choice : choices) {
             if (evaluateCondition(choice, effectiveInput, context)) {
@@ -3098,11 +3170,17 @@ public class AslExecutor {
 
     private StateResult executeSucceedState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context,
                                             ObjectNode variables) {
+        return executeSucceedState(stateDef, input, jsonata, context, variables, null);
+    }
+
+    private StateResult executeSucceedState(JsonNode stateDef, JsonNode input, boolean jsonata, JsonNode context,
+                                            ObjectNode variables, ObjectNode inspection) {
         if (jsonata) {
             JsonNode output = applyJsonataOutput(stateDef, input, input, context, variables);
             return new StateResult(output, null);
         }
         JsonNode effectiveInput = applyInputPath(stateDef, input, context);
+        inspect(inspection, "afterInputPath", effectiveInput);
         return new StateResult(applyOutputPath(stateDef, effectiveInput, context), null);
     }
 

@@ -1,6 +1,7 @@
 package io.floci.aws.services.stepfunctions;
 
 import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.IamConditionContextResolver;
 import io.floci.aws.core.common.ServicePrincipals;
 import io.floci.aws.services.iam.AccessDeniedMessages;
@@ -247,6 +248,22 @@ public class LambdaTaskAuthorizer {
         }
         return Optional.of(denied(callerRoleArn, ASSUME_ROLE, roleArn,
                 reason(caller, scpLevels, ASSUME_ROLE, targetRoleArn, context, relationship, grant)));
+    }
+
+    void authorizeTestStateRole(String roleArn, String accountId, String partition) {
+        AwsArnUtils.Arn requested = AwsArnUtils.parse(roleArn);
+        if (!accountId.equals(requested.accountId()) || !partition.equals(requested.partition())) {
+            throw new AwsException("AccessDeniedException",
+                    "TestState requires an execution role in the caller account and partition.", 400);
+        }
+        IamRole executionRole = role(roleArn).orElseThrow(() -> new AwsException("AccessDeniedException",
+                "The TestState execution role does not exist.", 400));
+        // TestState has no persisted state machine. A SourceArn condition cannot match a fabricated ARN.
+        if (!trustEvaluator.allowsService(executionRole.getAssumeRolePolicyDocument(),
+                ServicePrincipals.of("states"), null, null)) {
+            throw new AwsException("AccessDeniedException",
+                    "The TestState execution role does not trust Step Functions for this request.", 400);
+        }
     }
 
     /**
