@@ -13,6 +13,8 @@ import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
 import java.util.List;
@@ -28,6 +30,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -94,7 +97,7 @@ class Ec2FlowLogCfnProvisionerTest {
     @Test
     void flowLogSetsPhysicalIdAndIdAttribute() {
         when(flowLogs.createFlowLog(eq("us-east-1"), eq("vpc-123"), eq("VPC"), eq("ALL"),
-                eq("cloud-watch-logs"), eq("arn:aws:logs:us-east-1:000000000000:log-group:flows"),
+                eq("cloud-watch-logs"), eq("arn:aws:logs:us-east-1:000000000000:log-group:flows"), isNull(),
                 eq("arn:aws:iam::000000000000:role/flow-logs-role"), eq("${srcaddr}"), eq(60)))
                 .thenReturn(flowLog("fl-0abc"));
         StackResource r = resource();
@@ -116,12 +119,12 @@ class Ec2FlowLogCfnProvisionerTest {
 
     @Test
     void omittedAggregationIntervalDefaultsToTenMinutes() {
-        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
+        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
                 .thenReturn(flowLog("fl-0def"));
 
         provisioner.provision(resource(), mapper.createObjectNode().put("ResourceId", "vpc-9"), ctx());
 
-        verify(flowLogs).createFlowLog("us-east-1", "vpc-9", null, null, null, null, null, null, 600);
+        verify(flowLogs).createFlowLog("us-east-1", "vpc-9", null, null, null, null, null, null, null, 600);
     }
 
     @Test
@@ -138,7 +141,7 @@ class Ec2FlowLogCfnProvisionerTest {
         provisioner.provision(r, mapper.createObjectNode().put("ResourceId", "vpc-123"), ctx());
 
         // A second flow log here outlives the stack: delete only knows the id recorded last.
-        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt());
         assertEquals("fl-0abc", r.getPhysicalId());
         assertEquals("fl-0abc", r.getAttributes().get("Id"));
     }
@@ -157,7 +160,7 @@ class Ec2FlowLogCfnProvisionerTest {
         AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r,
                 mapper.createObjectNode().put("ResourceId", "vpc-123").put("TrafficType", "REJECT"), ctx()));
         assertEquals("ValidationError", e.getErrorCode());
-        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt());
     }
 
     @Test
@@ -173,7 +176,30 @@ class Ec2FlowLogCfnProvisionerTest {
                 mapper.createObjectNode().put("ResourceId", "vpc-123")
                         .put("DeliverLogsPermissionArn", "arn:aws:iam::000000000000:role/new-role"), ctx()));
         assertEquals("ValidationError", e.getErrorCode());
-        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"changed-group", ""})
+    void changingOrDroppingTheLogGroupRequiresReplacement(String requested) {
+        StackResource r = resource();
+        r.setPhysicalId("fl-0abc");
+        FlowLog existing = flowLog("fl-0abc");
+        existing.setResourceId("vpc-123");
+        existing.setLogDestinationType("cloud-watch-logs");
+        existing.setLogGroupName("original-group");
+        when(flowLogs.describeFlowLogs("us-east-1", List.of("fl-0abc"))).thenReturn(List.of(existing));
+        ObjectNode props = mapper.createObjectNode().put("ResourceId", "vpc-123")
+                .put("LogDestinationType", "cloud-watch-logs");
+        if (!requested.isEmpty()) {
+            props.put("LogGroupName", requested);
+        }
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+        assertEquals("ValidationError", error.getErrorCode());
+        assertTrue(error.getMessage().contains("LogGroupName"));
+        assertEquals("original-group", existing.getLogGroupName());
+        verifyNoInteractions(ec2);
     }
 
     @Test
@@ -191,7 +217,7 @@ class Ec2FlowLogCfnProvisionerTest {
         AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r,
                 mapper.createObjectNode().put("ResourceId", "vpc-123"), ctx()));
         assertEquals("ValidationError", e.getErrorCode());
-        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt());
     }
 
     @Test
@@ -210,7 +236,7 @@ class Ec2FlowLogCfnProvisionerTest {
         provisioner.provision(r, mapper.createObjectNode().put("ResourceId", "vpc-123"), ctx());
 
         assertEquals("fl-0abc", r.getPhysicalId());
-        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt());
     }
 
     @Test
@@ -257,7 +283,7 @@ class Ec2FlowLogCfnProvisionerTest {
         StackResource r = resource();
         r.setPhysicalId("fl-gone");
         when(flowLogs.describeFlowLogs("us-east-1", List.of("fl-gone"))).thenReturn(List.of());
-        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
+        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
                 .thenReturn(flowLog("fl-new"));
 
         provisioner.provision(r, mapper.createObjectNode().put("ResourceId", "vpc-123"), ctx());
@@ -268,7 +294,7 @@ class Ec2FlowLogCfnProvisionerTest {
 
     @Test
     void createTagsTheNewFlowLog() {
-        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
+        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
                 .thenReturn(flowLog("fl-0abc"));
         ObjectNode props = mapper.createObjectNode().put("ResourceId", "vpc-123");
         props.putArray("Tags").addObject().put("Key", "team").put("Value", "core");
@@ -287,7 +313,7 @@ class Ec2FlowLogCfnProvisionerTest {
         provisioner.provision(r, props, updateCtx("fl-0abc", "old"));
 
         // Tags are the one property an update changes in place, so the log is kept, not replaced.
-        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt());
         // Only the key the previous template owned goes; AWS keeps one added through EC2.
         verify(ec2).deleteTags(eq("us-east-1"), eq(List.of("fl-0abc")), tags("old", "gone"));
         verify(ec2).createTags(eq("us-east-1"), eq(List.of("fl-0abc")), tags("team", "core"));
@@ -356,7 +382,7 @@ class Ec2FlowLogCfnProvisionerTest {
 
     @Test
     void createRecordsTheTagKeysItWrote() {
-        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
+        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
                 .thenReturn(flowLog("fl-0abc"));
         StackResource r = resource();
         ObjectNode props = mapper.createObjectNode().put("ResourceId", "vpc-123");
@@ -384,7 +410,7 @@ class Ec2FlowLogCfnProvisionerTest {
 
         assertThrows(AwsException.class, () -> provisioner.provision(resource(), props, ctx()));
 
-        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt());
     }
 
     @Test
@@ -394,12 +420,12 @@ class Ec2FlowLogCfnProvisionerTest {
 
         assertThrows(AwsException.class, () -> provisioner.provision(resource(), props, ctx()));
 
-        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt());
+        verify(flowLogs, never()).createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt());
     }
 
     @Test
     void aFailedTagWriteDeletesTheNewFlowLog() {
-        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
+        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
                 .thenReturn(flowLog("fl-0abc"));
         doThrow(new AwsException("InternalError", "tag store down", 500))
                 .when(ec2).createTags(anyString(), any(), any());
@@ -458,7 +484,7 @@ class Ec2FlowLogCfnProvisionerTest {
         r.setPhysicalId("fl-gone");
         r.getAttributes().put(Ec2FlowLogCfnProvisioner.TAG_KEYS_ATTR, "[\"team\"]");
         when(flowLogs.describeFlowLogs("us-east-1", List.of("fl-gone"))).thenReturn(List.of());
-        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
+        when(flowLogs.createFlowLog(anyString(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt()))
                 .thenReturn(flowLog("fl-new"));
         provisioner.provision(r, mapper.createObjectNode().put("ResourceId", "vpc-123"), updateCtx("fl-gone"));
         assertEquals("fl-new", r.getPhysicalId());

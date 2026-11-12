@@ -167,7 +167,7 @@ public class FlowLogService {
                                  String logDestination, String logGroupName,
                                  String deliverLogsPermissionArn,
                                  String logFormat, int maxAggregationInterval) {
-        String groupName = logGroupName != null ? logGroupName : logGroupFromArn(logDestination);
+        String groupName = effectiveLogGroupName(logDestination, logGroupName);
         FlowLog fl = new FlowLog();
         fl.setFlowLogId("fl-" + randomHex(17));
         fl.setResourceId(resourceId);
@@ -592,7 +592,12 @@ public class FlowLogService {
         if (logDestinationType != null && !logDestinationType.isBlank()) {
             return logDestinationType;
         }
-        return logGroupName != null || logGroupFromArn(logDestination) != null ? "cloud-watch-logs" : "s3";
+        return effectiveLogGroupName(logDestination, logGroupName) != null ? "cloud-watch-logs" : "s3";
+    }
+
+    /** The effective group for both creation and CloudFormation's unchanged-configuration check. */
+    public static String effectiveLogGroupName(String logDestination, String logGroupName) {
+        return logGroupName != null ? logGroupName : logGroupFromArn(logDestination);
     }
 
     /**
