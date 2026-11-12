@@ -246,6 +246,63 @@ class EcsLoadBalancerRegistrarTest {
     }
 
     @Test
+    void attachedVpcTargetUsesContainerPortAndRecordedDeregistration() {
+        String tgArn = createTargetGroup("reg-tg-attached-vpc");
+        EcsTask task = taskWithContainer("web", 8080, 34567);
+        Container container = task.getContainers().getFirst();
+        container.setAttachedVpcAddress("10.0.0.10");
+        doReturn("vpc-regtest").when(containerManager).taskVpcId(task, REGION);
+        EcsServiceModel svc = serviceWithLb(tgArn, "web", 8080);
+
+        registrar.registerTask(task, svc, REGION);
+
+        TargetDescription registered = elbV2Service.describeTargetHealth(REGION, tgArn, null)
+                .getFirst().getTarget();
+        assertEquals("10.0.0.10", registered.getId());
+        assertEquals(8080, registered.getPort());
+        container.setAttachedVpcAddress("10.0.0.11");
+        registrar.deregisterTask(task, svc, REGION);
+        assertTrue(elbV2Service.describeTargetHealth(REGION, tgArn, null).isEmpty(),
+                "deregistration must use the original recorded address");
+    }
+
+    @Test
+    void targetGroupInAnotherVpcKeepsLegacyHostRouting() {
+        String tgArn = createTargetGroup("reg-tg-foreign-vpc-host");
+        EcsTask task = taskWithContainer("web", 8080, 34568);
+        Container container = task.getContainers().getFirst();
+        container.setAttachedVpcAddress("10.0.0.10");
+        doReturn("vpc-other").when(containerManager).taskVpcId(task, REGION);
+        EcsServiceModel svc = serviceWithLb(tgArn, "web", 8080);
+
+        registrar.registerTask(task, svc, REGION);
+
+        TargetDescription registered = elbV2Service.describeTargetHealth(REGION, tgArn, null)
+                .getFirst().getTarget();
+        assertEquals("127.0.0.1", registered.getId());
+        assertEquals(34568, registered.getPort());
+        registrar.deregisterTask(task, svc, REGION);
+    }
+
+    @Test
+    void evictUnrecordedTargetsScopesPrivateAddressesToTheirVpc() {
+        String local = createTargetGroup("reg-tg-vpc-local");
+        TargetGroup foreign = elbV2Service.createTargetGroup(REGION, "reg-tg-vpc-foreign", "HTTP", "HTTP1",
+                8080, "vpc-other", "ip",
+                null, null, false, null, null, null, null, null, null, null, Map.of());
+        String foreignArn = foreign.getTargetGroupArn();
+        elbV2Service.registerTargets(REGION, local, List.of(target("10.0.0.10", 8080)));
+        elbV2Service.registerTargets(REGION, foreignArn, List.of(target("10.0.0.10", 8080)));
+
+        registrar.evictUnrecordedTargets(taskWithContainer("web", 8080, 8080), List.of(local, foreignArn),
+                List.of(new EcsTaskAddress("10.0.0.10", 8080, "vpc-regtest")), REGION);
+
+        assertTrue(elbV2Service.describeTargetHealth(REGION, local, null).isEmpty());
+        assertEquals(1, elbV2Service.describeTargetHealth(REGION, foreignArn, null).size(),
+                "the same private address in another VPC belongs to another task");
+    }
+
+    @Test
     void evictUnrecordedTargetsKeepsATargetOnAPortTheTaskDoesNotServe() {
         String tgArn = createTargetGroup("reg-tg-evict-port");
         elbV2Service.registerTargets(REGION, tgArn, List.of(target("172.19.0.5", 8080), target("172.19.0.5", 9000)));

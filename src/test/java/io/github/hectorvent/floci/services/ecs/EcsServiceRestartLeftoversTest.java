@@ -245,14 +245,18 @@ class EcsServiceRestartLeftoversTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"127.0.0.1, 32781", "172.19.0.4, 80"})
-    void aStartingTaskEvictsTheUnrecordedRegistrationsAtItsAddress(String host, int targetPort) {
+    @CsvSource({"127.0.0.1, 32781, false", "172.19.0.4, 80, false",
+            "127.0.0.1, 32781, true", "172.19.0.4, 80, true"})
+    void aStartingTaskEvictsTheUnrecordedRegistrationsAtItsAddress(String host, int targetPort, boolean attached) {
         EcsContainerManager containerManager = mock(EcsContainerManager.class);
         when(containerManager.removeLeftoverContainers()).thenReturn(true);
         when(containerManager.startTask(any(), any(), any(), anyString())).thenAnswer(invocation -> {
             EcsTask task = invocation.getArgument(0);
             Container container = new Container();
             container.setName("web");
+            if (attached) {
+                container.setAttachedVpcAddress("10.0.1.5");
+            }
             container.setNetworkBindings(List.of(new NetworkBinding("0.0.0.0", 80, 32781, "tcp")));
             task.setContainers(List.of(container));
             task.setPrivateIpAddress("10.0.1.5");
@@ -285,9 +289,10 @@ class EcsServiceRestartLeftoversTest {
                 .getFirst();
 
         assertEquals("RUNNING", task.getLastStatus());
-        // A target only on the ports the container serves, and never at the VPC-scoped ENI address.
-        verify(lbRegistrar).evictUnrecordedTargets(task, Set.of(TARGET_GROUP_ARN),
-                Set.of(new EcsTaskAddress(host, targetPort)), REGION);
+        Set<EcsTaskAddress> expectedTargets = attached
+                ? Set.of(new EcsTaskAddress(host, targetPort), new EcsTaskAddress("10.0.1.5", 80, "vpc-app"))
+                : Set.of(new EcsTaskAddress(host, targetPort));
+        verify(lbRegistrar).evictUnrecordedTargets(task, Set.of(TARGET_GROUP_ARN), expectedTargets, REGION);
         verify(discoveryRegistrar).evictUnrecordedInstances(task, Set.of("srv-alpha"),
                 Set.of(new EcsTaskAddress("10.0.1.5", null, "vpc-app"), new EcsTaskAddress("172.19.0.4", null)),
                 REGION);

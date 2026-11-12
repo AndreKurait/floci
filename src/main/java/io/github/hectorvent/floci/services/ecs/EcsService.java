@@ -2478,7 +2478,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             return;
         }
         if (lbRegistrar != null && !targetGroupArns.isEmpty()) {
-            lbRegistrar.evictUnrecordedTargets(task, targetGroupArns, targetAddresses(task), region);
+            lbRegistrar.evictUnrecordedTargets(task, targetGroupArns, targetAddresses(task, region), region);
         }
         if (discoveryRegistrar != null && !cloudMapServiceIds.isEmpty()) {
             discoveryRegistrar.evictUnrecordedInstances(task, cloudMapServiceIds, instanceAddresses(task, region),
@@ -2488,11 +2488,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * The address and port pairs at which a load balancer target reaches a running task: each
-     * container's address, on the ports its bindings declare. The ENI address is not among them,
-     * since ECS registers no target at it and it is unique only within its VPC, and a target on a
-     * port the task does not serve sends it nothing.
+     * container's address, on the ports its bindings declare. An attached VPC address is scoped
+     * to that VPC. Keep the Docker or host address too, to remove stale registrations made before
+     * protected tasks registered their VPC addresses.
      */
-    private Set<EcsTaskAddress> targetAddresses(EcsTask task) {
+    private Set<EcsTaskAddress> targetAddresses(EcsTask task, String region) {
         Set<EcsTaskAddress> addresses = new LinkedHashSet<>();
         if (task.getContainers() == null) {
             return addresses;
@@ -2502,9 +2502,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             if (host == null || host.isBlank() || container.getNetworkBindings() == null) {
                 continue;
             }
+            String attachedAddress = container.getAttachedVpcAddress();
+            String vpcId = attachedAddress == null ? null : containerManager.taskVpcId(task, region);
             for (NetworkBinding binding : container.getNetworkBindings()) {
                 int port = EcsTaskAddress.isLoopback(host) ? binding.hostPort() : binding.containerPort();
                 addresses.add(new EcsTaskAddress(host, port));
+                if (attachedAddress != null && vpcId != null) {
+                    addresses.add(new EcsTaskAddress(attachedAddress, binding.containerPort(), vpcId));
+                }
             }
         }
         return addresses;

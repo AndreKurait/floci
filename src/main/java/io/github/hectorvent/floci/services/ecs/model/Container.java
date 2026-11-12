@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ecs.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -41,6 +42,7 @@ public class Container {
 
     // transient — not persisted
     private transient String dockerId;
+    private transient String attachedVpcAddress;
 
     public String getContainerArn() { return containerArn; }
     public void setContainerArn(String containerArn) { this.containerArn = containerArn; }
@@ -103,6 +105,10 @@ public class Container {
 
     public Instant getFinishedAt() { return finishedAt; }
     public void setFinishedAt(Instant finishedAt) { this.finishedAt = finishedAt; }
+
+    @JsonIgnore
+    public String getAttachedVpcAddress() { return attachedVpcAddress; }
+    public void setAttachedVpcAddress(String address) { this.attachedVpcAddress = address; }
 
     public String getDockerId() { return dockerId; }
     public void setDockerId(String dockerId) { this.dockerId = dockerId; }

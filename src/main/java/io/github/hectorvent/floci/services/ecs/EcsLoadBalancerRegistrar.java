@@ -65,7 +65,7 @@ public class EcsLoadBalancerRegistrar {
      */
     public void registerTask(EcsTask task, EcsServiceModel svc, String region) {
         List<EcsRegisteredTargets.Target> planned = new ArrayList<>();
-        forEachTarget(task, svc, (tgArn, td) ->
+        forEachTarget(task, svc, region, (tgArn, td) ->
                 planned.add(new EcsRegisteredTargets.Target(tgArn, td.getId(), td.getPort())));
         if (planned.isEmpty()) {
             return;
@@ -103,7 +103,7 @@ public class EcsLoadBalancerRegistrar {
      */
     public void deregisterTask(EcsTask task, EcsServiceModel svc, String region) {
         if (task.getTaskArn() == null) {
-            forEachTarget(task, svc, (tgArn, td) -> deregister(region, tgArn, td));
+            forEachTarget(task, svc, region, (tgArn, td) -> deregister(region, tgArn, td));
             return;
         }
         Optional<EcsRegisteredTargets> recorded = ledger.get(task.getTaskArn());
@@ -148,7 +148,11 @@ public class EcsLoadBalancerRegistrar {
         }
         for (String tgArn : targetGroupArns) {
             List<TargetHealth> health;
+            List<EcsTaskAddress> scoped;
             try {
+                String vpc = elbV2Service.describeTargetGroups(region, null, List.of(tgArn), null)
+                        .getFirst().getVpcId();
+                scoped = addresses.stream().filter(address -> address.appliesTo(vpc)).toList();
                 health = elbV2Service.describeTargetHealth(region, tgArn, null);
             } catch (Exception e) {
                 // A target group deleted while a service still names it: nothing in it to evict.
@@ -157,7 +161,7 @@ public class EcsLoadBalancerRegistrar {
             }
             for (TargetHealth th : health) {
                 TargetDescription td = th.getTarget();
-                boolean atTaskAddress = addresses.stream().anyMatch(a -> a.matches(td.getId(), td.getPort()));
+                boolean atTaskAddress = scoped.stream().anyMatch(a -> a.matches(td.getId(), td.getPort()));
                 if (!atTaskAddress
                         || recorded.contains(new EcsRegisteredTargets.Target(tgArn, td.getId(), td.getPort()))) {
                     continue;
@@ -194,7 +198,23 @@ public class EcsLoadBalancerRegistrar {
         }
     }
 
-    private void forEachTarget(EcsTask task, EcsServiceModel svc,
+    private String targetHost(EcsTask task, Container container, String targetGroupArn, String region) {
+        if (container.getAttachedVpcAddress() != null) {
+            String taskVpc = containerManager.taskVpcId(task, region);
+            try {
+                String targetVpc = elbV2Service.describeTargetGroups(region, null, List.of(targetGroupArn), null)
+                        .getFirst().getVpcId();
+                if (taskVpc != null && taskVpc.equals(targetVpc)) {
+                    return containerManager.resolveLoadBalancerHost(container);
+                }
+            } catch (Exception e) {
+                LOG.debugv("Could not resolve the VPC of target group {0}: {1}", targetGroupArn, e.getMessage());
+            }
+        }
+        return containerManager.resolveContainerHost(container);
+    }
+
+    private void forEachTarget(EcsTask task, EcsServiceModel svc, String region,
                                BiConsumer<String, TargetDescription> action) {
         if (svc == null || svc.getLoadBalancers() == null || svc.getLoadBalancers().isEmpty()) {
             return;
@@ -223,7 +243,7 @@ public class EcsLoadBalancerRegistrar {
                 continue;
             }
             TargetDescription td = new TargetDescription();
-            td.setId(containerManager.resolveContainerHost(container));
+            td.setId(targetHost(task, container, lb.getTargetGroupArn(), region));
             td.setPort(EcsTaskAddress.isLoopback(td.getId()) ? binding.hostPort() : binding.containerPort());
             action.accept(lb.getTargetGroupArn(), td);
         }
