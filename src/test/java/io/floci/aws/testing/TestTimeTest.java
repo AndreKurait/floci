@@ -675,4 +675,46 @@ class TestTimeTest {
         AssertionError error = assertThrows(AssertionError.class, () -> time.awaitWaiters(1));
         assertTrue(error.getMessage().contains("expected 1 waiting thread(s)"), error.getMessage());
     }
+
+    @Test
+    void aSleeperQueuedForTheTimelinesOwnLockHasNotSettled() throws Exception {
+        // Other threads reading the timeline keep its lock busy, so the poller often has to queue
+        // for it on the way back into its next sleep. Queued there it looks parked, but it is still
+        // on its way: the advance must wait for it, or it leaves polls behind.
+        AtomicBoolean reading = new AtomicBoolean(true);
+        List<Thread> readers = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            readers.add(Thread.ofPlatform().daemon().name("reader-" + i).start(() -> {
+                while (reading.get()) {
+                    time.sleepers();
+                }
+            }));
+        }
+        AtomicInteger polls = new AtomicInteger();
+        Thread poller = Thread.ofPlatform().daemon().name("poller").start(() -> {
+            try {
+                while (true) {
+                    time.sleep(Duration.ofMillis(100));
+                    polls.incrementAndGet();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        try {
+            time.awaitSleepers(1);
+
+            time.advance(Duration.ofSeconds(50).minusNanos(1));
+
+            assertEquals(499, polls.get());
+            assertEquals(1, time.sleepers());
+        } finally {
+            reading.set(false);
+            poller.interrupt();
+            poller.join();
+            for (Thread reader : readers) {
+                reader.join();
+            }
+        }
+    }
 }
