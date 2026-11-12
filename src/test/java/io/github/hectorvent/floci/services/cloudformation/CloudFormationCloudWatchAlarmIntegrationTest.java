@@ -2,9 +2,13 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -22,6 +26,15 @@ class CloudFormationCloudWatchAlarmIntegrationTest {
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/cloudformation/aws4_request";
     private static final String CW_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/monitoring/aws4_request";
+
+    private final List<String> stacks = new ArrayList<>();
+
+    @AfterEach
+    void deleteStacks() {
+        for (String stack : stacks) {
+            CfnStackWaits.deleteStack(stack, CFN_AUTH);
+        }
+    }
 
     @Test
     void createStackProvisionsAlarmVisibleToCloudWatch() {
@@ -52,16 +65,7 @@ class CloudFormationCloudWatchAlarmIntegrationTest {
                 }
                 """.formatted(alarmName);
 
-        given()
-            .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", CFN_AUTH)
-            .formParam("Action", "CreateStack")
-            .formParam("StackName", stackName)
-            .formParam("TemplateBody", template)
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200);
+        createStack(stackName, template);
 
         // Stack completes and Fn::GetAtt(Alarm, Arn) resolves to the real alarm ARN.
         CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE", CFN_AUTH);
@@ -210,7 +214,8 @@ class CloudFormationCloudWatchAlarmIntegrationTest {
                 """.formatted(alarmName, policy);
     }
 
-    private static void createStack(String stackName, String template) {
+    private void createStack(String stackName, String template) {
+        stacks.add(stackName);
         given()
             .contentType("application/x-www-form-urlencoded")
             .header("Authorization", CFN_AUTH)
