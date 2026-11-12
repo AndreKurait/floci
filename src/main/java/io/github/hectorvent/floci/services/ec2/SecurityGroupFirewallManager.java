@@ -1004,28 +1004,44 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
      * their own accepts before peers learn them. {@code force} re-installs unchanged policies too.
      */
     private void converge(boolean force) {
+        while (true) {
+            try {
+                convergePolicies(force);
+                return;
+            } catch (RuntimeException failure) {
+                endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
+                if (!(failure.getCause() instanceof NotFoundException)) {
+                    throw failure;
+                }
+                int previousCount = endpoints.size();
+                retireStoppedHelpers();
+                if (endpoints.size() >= previousCount) {
+                    throw failure;
+                }
+                LOG.debugv("Retrying security-group policies after retiring {0} stopped or missing helpers",
+                        previousCount - endpoints.size());
+            }
+        }
+    }
+
+    private void convergePolicies(boolean force) {
         List<String> vpcResolvers = vpcResolvers();
         List<SecurityGroupNftCompiler.EmulatorOrigin> origins = emulatorOrigins();
         List<SelfAddress> self = selfAddresses();
-        try {
-            for (int round = 0; round < 3; round++) {
-                List<SecurityGroupNftCompiler.Endpoint> peers = peerEndpoints();
-                List<ProtectedEndpoint> order = new ArrayList<>(endpoints.values());
-                order.sort(Comparator.comparing((ProtectedEndpoint target) -> knownByAllPeers(target))
-                        .thenComparing(target -> target.endpoint().eniId()));
-                boolean changed = false;
-                for (ProtectedEndpoint target : order) {
-                    changed |= install(target, peers, vpcResolvers, origins, self, force && round == 0);
-                }
-                if (!changed && endpoints.values().stream().allMatch(this::complete)) {
-                    return;
-                }
+        for (int round = 0; round < 3; round++) {
+            List<SecurityGroupNftCompiler.Endpoint> peers = peerEndpoints();
+            List<ProtectedEndpoint> order = new ArrayList<>(endpoints.values());
+            order.sort(Comparator.comparing((ProtectedEndpoint target) -> knownByAllPeers(target))
+                    .thenComparing(target -> target.endpoint().eniId()));
+            boolean changed = false;
+            for (ProtectedEndpoint target : order) {
+                changed |= install(target, peers, vpcResolvers, origins, self, force && round == 0);
             }
-            throw new IllegalStateException("Security-group policies did not converge");
-        } catch (RuntimeException e) {
-            endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
-            throw e;
+            if (!changed && endpoints.values().stream().allMatch(this::complete)) {
+                return;
+            }
         }
+        throw new IllegalStateException("Security-group policies did not converge");
     }
 
     /** Every registered endpoint in ENI order, so a policy's text depends only on its inputs. */

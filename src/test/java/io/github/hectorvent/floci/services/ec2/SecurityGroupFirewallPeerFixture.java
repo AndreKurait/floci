@@ -10,6 +10,9 @@ import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.InspectExecResponse;
+import com.github.dockerjava.api.command.ListContainersCmd;
+import com.github.dockerjava.api.command.StopContainerCmd;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
@@ -68,6 +71,7 @@ class SecurityGroupFirewallPeerFixture {
     final List<String[]> installs = Collections.synchronizedList(new ArrayList<>());
     final Map<String, String> installed = new ConcurrentHashMap<>();
     final Set<String> stoppedHelpers = ConcurrentHashMap.newKeySet();
+    final Set<String> missingHelpers = ConcurrentHashMap.newKeySet();
     private final Map<String, String> transportByHelper = new ConcurrentHashMap<>();
     final List<String> violations = Collections.synchronizedList(new ArrayList<>());
     final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
@@ -169,8 +173,28 @@ class SecurityGroupFirewallPeerFixture {
             if (networks != null) {
                 when(response.getNetworkSettings().getNetworks()).thenReturn(networks);
             }
-            when(inspect.exec()).thenReturn(response);
+            when(inspect.exec()).thenAnswer(call -> {
+                if (missingHelpers.contains(helper)) {
+                    throw new NotFoundException("No such container: " + helper);
+                }
+                return response;
+            });
             return inspect;
+        });
+        ListContainersCmd list = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(docker.listContainersCmd()).thenReturn(list);
+        when(list.exec()).thenReturn(List.of());
+        when(docker.stopContainerCmd(anyString())).thenAnswer(invocation -> {
+            String helper = invocation.getArgument(0);
+            StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+            when(stop.exec()).thenAnswer(call -> {
+                if (missingHelpers.contains(helper)) {
+                    throw new NotFoundException("No such container: " + helper);
+                }
+                stoppedHelpers.add(helper);
+                return null;
+            });
+            return stop;
         });
         return docker;
     }
@@ -185,6 +209,9 @@ class SecurityGroupFirewallPeerFixture {
 
     private void record(String helper, String script) {
         beforeInstall.accept(helper, script);
+        if (missingHelpers.contains(helper)) {
+            throw new NotFoundException("No such container: " + helper);
+        }
         if (failNextInstall.remove(helper)) {
             throw new IllegalStateException("injected nft failure for " + helper);
         }
