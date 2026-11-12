@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.testing;
 
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -25,7 +26,7 @@ public final class ParkingStore<V> extends InMemoryStorage<String, V> {
         parkNextRead.set(true);
     }
 
-    /** Parks the next {@code put}, before it writes the value. */
+    /** Parks the next {@code put} or atomic batch, before it writes the value. */
     public void parkNextWrite() {
         parkNextWrite.set(true);
     }
@@ -54,6 +55,14 @@ public final class ParkingStore<V> extends InMemoryStorage<String, V> {
             park();
         }
         super.put(key, value);
+    }
+
+    @Override
+    public void putAllAtomically(Map<String, V> entries) {
+        if (parkNextWrite.getAndSet(false)) {
+            park();
+        }
+        super.putAllAtomically(entries);
     }
 
     private void park() {

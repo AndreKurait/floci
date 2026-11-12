@@ -107,6 +107,14 @@ public class AppConfigController {
         return Response.ok(service.getEnvironment(appId, envId)).build();
     }
 
+    @PATCH
+    @Path("/applications/{appId}/environments/{envId}")
+    public Response updateEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId,
+                                      String body) {
+        return Response.ok(service.updateEnvironment(appId, envId,
+                AppConfigUpdateRequest.read(objectMapper, body))).build();
+    }
+
     @DELETE
     @Path("/applications/{appId}/environments/{envId}")
     public Response deleteEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId) {
@@ -246,6 +254,13 @@ public class AppConfigController {
     @Path("/deploymentstrategies/{id}")
     public Response getDeploymentStrategy(@PathParam("id") String id) {
         return Response.ok(service.getDeploymentStrategy(id)).build();
+    }
+
+    @PATCH
+    @Path("/deploymentstrategies/{id}")
+    public Response updateDeploymentStrategy(@PathParam("id") String id, String body) {
+        return Response.ok(service.updateDeploymentStrategy(id,
+                AppConfigUpdateRequest.read(objectMapper, body))).build();
     }
 
     @GET
