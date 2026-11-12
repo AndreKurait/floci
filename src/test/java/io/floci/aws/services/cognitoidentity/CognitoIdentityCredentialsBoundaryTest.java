@@ -104,6 +104,7 @@ class CognitoIdentityCredentialsBoundaryTest {
         pool.setIdentityPoolId(POOL);
         pool.setArn("arn:aws:cognito-identity:us-east-1:" + ACCOUNT + ":identitypool/" + POOL);
         pool.setAllowUnauthenticatedIdentities(true);
+        pool.setAllowClassicFlow(true);
         return pool;
     }
 
