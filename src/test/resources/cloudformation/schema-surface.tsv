@@ -197,6 +197,7 @@ AWS::ServiceDiscovery::PrivateDnsNamespace	Arn,HostedZoneId,Id	Description,Name,
 AWS::ServiceDiscovery::PublicDnsNamespace	Arn,HostedZoneId,Id	Description,Name,Properties,Tags
 AWS::ServiceDiscovery::Service	Arn,Id	Description,DnsConfig,HealthCheckConfig,HealthCheckCustomConfig,Name,NamespaceId,ServiceAttributes,Tags,Type
 AWS::Signer::SigningProfile	Arn,ProfileName,ProfileVersion,ProfileVersionArn	PlatformId,SignatureValidityPeriod,Tags
+AWS::StepFunctions::Activity	Arn	EncryptionConfiguration,Name,Tags
 AWS::StepFunctions::StateMachine	Arn,Name,StateMachineRevisionId	Definition,DefinitionS3Location,DefinitionString,DefinitionSubstitutions,EncryptionConfiguration,LoggingConfiguration,RoleArn,StateMachineName,StateMachineType,Tags,TracingConfiguration
 AWS::Transfer::Server	Arn,As2ServiceManagedEgressIpAddresses,ServerId,State	Certificate,CreateWithHostKey,Domain,EndpointDetails,EndpointType,IdentityProviderDetails,IdentityProviderType,IpAddressType,LoggingRole,PostAuthenticationLoginBanner,PreAuthenticationLoginBanner,ProtocolDetails,Protocols,S3StorageOptions,SecurityPolicyName,StructuredLogDestinations,Tags,WorkflowDetails
 AWS::Transfer::User	Arn	HomeDirectory,HomeDirectoryMappings,HomeDirectoryType,Policy,PosixProfile,Role,ServerId,SshPublicKeys,Tags,UserName
