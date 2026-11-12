@@ -680,6 +680,12 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "testInvokeMethod".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:POST";
+        }
         if ("iot".equals(credentialScope) && resourceInfo != null
                 && IotController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null
