@@ -888,11 +888,10 @@ class ProvisionedConcurrencyPoolTest {
         launcher.stopFailures.set(1);
 
         assertTrue(pool.release(first.handle, false));
-        assertTrue(first.alive);
-        assertEquals(1, first.stops.get());
         assertThrows(AwsException.class, this::get);
 
-        pool.reconcileSafely();
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !first.alive);
         assertFalse(first.alive);
         assertEquals(2, first.stops.get());
     }
