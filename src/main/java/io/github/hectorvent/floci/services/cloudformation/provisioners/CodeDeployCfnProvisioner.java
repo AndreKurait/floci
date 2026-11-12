@@ -18,15 +18,18 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
-/** CodeDeploy applications and groups. Ref returns names; neither schema declares GetAtt attributes. */
+/** CodeDeploy applications, groups and configurations. Ref returns names; these types have no GetAtt attributes. */
 @ApplicationScoped
 public class CodeDeployCfnProvisioner implements CfnResourceProvisioner {
     private static final String APPLICATION = "AWS::CodeDeploy::Application";
     private static final String GROUP = "AWS::CodeDeploy::DeploymentGroup";
+    private static final String CONFIG = "AWS::CodeDeploy::DeploymentConfig";
     private static final String APPLICATION_ATTR = CfnRollback.USES_ATTR_PREFIX + "CodeDeployApplication";
     private static final String PLATFORM_ATTR = CfnRollback.USES_ATTR_PREFIX + "CodeDeployPlatform";
+    private static final String CONFIGURATION_ATTR = CfnRollback.USES_ATTR_PREFIX + "CodeDeployConfiguration";
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final TypeReference<Map<String, Object>> FIELDS = new TypeReference<>() {};
     private static final TypeReference<Map<String, String>> TAGS = new TypeReference<>() {};
@@ -38,6 +41,24 @@ public class CodeDeployCfnProvisioner implements CfnResourceProvisioner {
     private static final Set<String> BOOLEAN_FIELDS = Set.of(
             "Enabled", "IgnorePollAlarmFailure", "TerminationHookEnabled");
     private static final Set<String> INTEGER_FIELDS = Set.of("WaitTimeInMinutes", "TerminationWaitTimeInMinutes");
+    private static final Map<String, Set<String>> CONFIG_MEMBERS = Map.of(
+            "MinimumHealthyHosts", Set.of("Type", "Value"),
+            "MinimumHealthyHostsPerZone", Set.of("Type", "Value"),
+            "TrafficRoutingConfig", Set.of("Type", "TimeBasedCanary", "TimeBasedLinear"),
+            "TimeBasedCanary", Set.of("CanaryInterval", "CanaryPercentage"),
+            "TimeBasedLinear", Set.of("LinearInterval", "LinearPercentage"),
+            "ZonalConfig", Set.of("FirstZoneMonitorDurationInSeconds", "MonitorDurationInSeconds",
+                    "MinimumHealthyHostsPerZone"));
+    private static final Map<String, Set<String>> CONFIG_REQUIRED = Map.of(
+            "MinimumHealthyHosts", Set.of("Type", "Value"),
+            "MinimumHealthyHostsPerZone", Set.of("Type", "Value"),
+            "TrafficRoutingConfig", Set.of("Type"),
+            "TimeBasedCanary", Set.of("CanaryInterval", "CanaryPercentage"),
+            "TimeBasedLinear", Set.of("LinearInterval", "LinearPercentage"));
+    private static final Set<String> CONFIG_INTEGER_FIELDS = Set.of(
+            "Value", "CanaryInterval", "CanaryPercentage", "LinearInterval", "LinearPercentage");
+    private static final Set<String> CONFIG_LONG_FIELDS = Set.of(
+            "FirstZoneMonitorDurationInSeconds", "MonitorDurationInSeconds");
 
     private final CodeDeployService service;
 
@@ -48,7 +69,7 @@ public class CodeDeployCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public Set<String> resourceTypes() {
-        return Set.of(APPLICATION, GROUP);
+        return Set.of(APPLICATION, GROUP, CONFIG);
     }
 
     @Override
@@ -63,9 +84,77 @@ public class CodeDeployCfnProvisioner implements CfnResourceProvisioner {
         switch (resource.getResourceType()) {
             case APPLICATION -> application(resource, props, ctx);
             case GROUP -> group(resource, props, ctx);
+            case CONFIG -> configuration(resource, props, ctx);
             default -> throw new IllegalArgumentException("Unsupported CodeDeploy type " + resource.getResourceType());
         }
         ReplacementCleanup.record(resource, ctx, previous);
+    }
+
+    private void configuration(StackResource resource, JsonNode props, ProvisionContext ctx) {
+        String platform = ctx.resolveOrDefault(props, "ComputePlatform", "Server");
+        Map<String, Object> fields = new TreeMap<>();
+        fields.put("computePlatform", platform);
+        for (String property : List.of("MinimumHealthyHosts", "TrafficRoutingConfig", "ZonalConfig")) {
+            if (props.hasNonNull(property)) {
+                fields.put(Character.toLowerCase(property.charAt(0)) + property.substring(1),
+                        configurationValue(props.get(property), property));
+            }
+        }
+        String desired = MAPPER.valueToTree(fields).toString();
+        boolean changed = existing(resource, ctx)
+                && !desired.equals(resource.getAttributes().get(CONFIGURATION_ATTR));
+        String name = name(resource, props, "DeploymentConfigName", changed, ctx);
+        if (existing(resource, ctx) && ctx.reusesPriorEntity(name)) {
+            service.getDeploymentConfig(ctx.region(), name);
+        } else {
+            service.createDeploymentConfig(ctx.region(), name,
+                    MAPPER.convertValue(fields.get("minimumHealthyHosts"), FIELDS), platform,
+                    MAPPER.convertValue(fields.get("trafficRoutingConfig"), FIELDS),
+                    MAPPER.convertValue(fields.get("zonalConfig"), FIELDS));
+        }
+        resource.setPhysicalId(name);
+        resource.getAttributes().put(CONFIGURATION_ATTR, desired);
+    }
+
+    /** Configuration schemas use lower-camel API keys, including the Type/Value pair used by host counts. */
+    private static Object configurationValue(JsonNode value, String property) {
+        Set<String> members = CONFIG_MEMBERS.get(property);
+        if (members != null) {
+            if (!value.isObject()) {
+                throw invalid(property + " must be an object");
+            }
+            for (String required : CONFIG_REQUIRED.getOrDefault(property, Set.of())) {
+                if (!value.hasNonNull(required)) {
+                    throw invalid(property + "." + required + " is required");
+                }
+            }
+            Map<String, Object> result = new TreeMap<>();
+            value.fields().forEachRemaining(entry -> {
+                String key = entry.getKey();
+                if (!members.contains(key)) {
+                    throw invalid(property + " does not support " + key);
+                }
+                if (!entry.getValue().isNull()) {
+                    result.put(Character.toLowerCase(key.charAt(0)) + key.substring(1),
+                            configurationValue(entry.getValue(), key));
+                }
+            });
+            return result;
+        }
+        if (value.isContainerNode() || value.isNull()) {
+            throw invalid(property + " must be a scalar");
+        }
+        try {
+            if (CONFIG_INTEGER_FIELDS.contains(property)) {
+                return Integer.parseInt(value.asText());
+            }
+            if (CONFIG_LONG_FIELDS.contains(property)) {
+                return Long.parseLong(value.asText());
+            }
+        } catch (NumberFormatException invalidNumber) {
+            throw invalid(property + " must be a valid integer");
+        }
+        return value.asText();
     }
 
     private void application(StackResource resource, JsonNode props, ProvisionContext ctx) {
@@ -307,10 +396,13 @@ public class CodeDeployCfnProvisioner implements CfnResourceProvisioner {
                     throw new IllegalStateException("Missing application identity for CodeDeploy group " + id);
                 }
                 service.deleteDeploymentGroup(region, application, id);
+            } else if (CONFIG.equals(type)) {
+                service.deleteDeploymentConfig(region, id);
             } else {
                 throw new IllegalArgumentException("Unsupported CodeDeploy resource type " + type);
             }
-        }, "ApplicationDoesNotExistException", "DeploymentGroupDoesNotExistException");
+        }, "ApplicationDoesNotExistException", "DeploymentGroupDoesNotExistException",
+                "DeploymentConfigDoesNotExistException");
     }
 
     @Override
