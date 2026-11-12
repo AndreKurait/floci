@@ -5,6 +5,7 @@ import io.floci.aws.core.common.RegionResolver;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,6 +46,18 @@ public final class RegionScopedStorage<V> implements StorageBackend<String, V> {
         if (regionlessHere(key) && delegate.get(key).isPresent()) {
             delegate.delete(key);
         }
+    }
+
+    /**
+     * Publishes replacements in one commit under the current Region. A legacy value remains shadowed
+     * until deletion, avoiding a second fallible write after the new batch has committed.
+     */
+    @Override
+    public void putAllAtomically(Map<String, V> entries) {
+        Map<String, V> scoped = new LinkedHashMap<>();
+        String regionPrefix = prefix();
+        entries.forEach((key, value) -> scoped.put(regionPrefix + key, value));
+        delegate.putAllAtomically(scoped);
     }
 
     @Override
