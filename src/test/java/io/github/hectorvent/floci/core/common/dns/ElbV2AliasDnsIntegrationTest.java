@@ -60,8 +60,11 @@ class ElbV2AliasDnsIntegrationTest {
     URI endpoint;
 
     @ParameterizedTest
-    @CsvSource({"internal,false", "internet-facing,false", "internal,true", "internet-facing,true"})
-    void publicAliasFindsItsNativeAlbAcrossAccounts(String scheme, boolean declaredPublicRoute) throws Exception {
+    @CsvSource({"internal,false,false", "internet-facing,false,false", "internal,true,false",
+            "internet-facing,true,false", "internal,false,true", "internet-facing,false,true",
+            "internal,true,true", "internet-facing,true,true"})
+    void publicAliasFindsItsNativeAlbAcrossAccounts(String scheme, boolean declaredPublicRoute,
+                                                   boolean weighted) throws Exception {
         StaticCredentialsProvider owner =
                 StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000001", "test"));
         StaticCredentialsProvider zoneOwner =
@@ -109,7 +112,7 @@ class ElbV2AliasDnsIntegrationTest {
                 listener.handler(packet -> dns.handleQuery(vertx, listener, packet.data().getBytes(),
                         packet.sender().host(), packet.sender().port(), "127.0.0.1"));
 
-                ResourceRecordSet alias = alias(name, target.dnsName(), target.canonicalHostedZoneId());
+                ResourceRecordSet alias = withRouting(alias(name, target.dnsName(), target.canonicalHostedZoneId()), weighted);
                 change(route53, zone, ChangeAction.CREATE, alias);
                 installed = alias;
                 byte[] response = query(listener, name, 1);
@@ -122,17 +125,18 @@ class ElbV2AliasDnsIntegrationTest {
                 assertEquals(0, rcode(query(listener, name, 28)));
                 assertEquals(0, ByteBuffer.wrap(query(listener, name, 28)).getShort(6));
 
-                installed = ResourceRecordSet.builder().name(name).type("A").ttl(60L)
-                        .resourceRecords(record -> record.value("127.0.0.1")).build();
+                installed = withRouting(ResourceRecordSet.builder().name(name).type("A").ttl(60L)
+                        .resourceRecords(record -> record.value("127.0.0.1")).build(), weighted);
                 change(route53, zone, ChangeAction.UPSERT, installed);
                 assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(listener, name, 1)),
                         "A literal public record keeps its published value even for a declared endpoint name");
-                installed = alias(name, "dualstack." + target.dnsName().toUpperCase(), target.canonicalHostedZoneId());
+                installed = withRouting(alias(name, "dualstack." + target.dnsName().toUpperCase(),
+                        target.canonicalHostedZoneId()), weighted);
                 change(route53, zone, ChangeAction.UPSERT, installed);
                 byte[] uppercase = query(listener, name.toUpperCase() + ".", 1);
                 assertEquals(0, rcode(uppercase));
                 assertArrayEquals(InetAddress.getByName(expectedAddress).getAddress(), address(uppercase));
-                installed = alias(name, target.dnsName(), "WRONG");
+                installed = withRouting(alias(name, target.dnsName(), "WRONG"), weighted);
                 change(route53, zone, ChangeAction.UPSERT, installed);
                 assertEquals(5, rcode(query(listener, name, 1)));
                 installed = alias;
@@ -160,6 +164,10 @@ class ElbV2AliasDnsIntegrationTest {
                 ec2.deleteVpc(r -> r.vpcId(vpc));
             }
         }
+    }
+
+    private static ResourceRecordSet withRouting(ResourceRecordSet record, boolean weighted) {
+        return weighted ? record.toBuilder().setIdentifier("primary").weight(1L).build() : record;
     }
 
     private static ResourceRecordSet alias(String name, String target, String zone) {
