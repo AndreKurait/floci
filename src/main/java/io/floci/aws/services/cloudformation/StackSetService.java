@@ -26,6 +26,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -80,6 +81,7 @@ public class StackSetService implements PassedRoleLookup, AccountPlacementListen
     private final StorageBackend<String, StackSetAutoDeploymentTarget> autoDeploymentTargets;
     private final OrganizationsService organizationsService;
     private final RegionResolver regionResolver;
+    private final Clock clock;
     private final ExecutorService accountPlacementExecutor = newAccountPlacementExecutor();
 
     private static ExecutorService newAccountPlacementExecutor() {
@@ -93,12 +95,15 @@ public class StackSetService implements PassedRoleLookup, AccountPlacementListen
     }
 
     StackSetService(CloudFormationService cfnService, StorageFactory storageFactory) {
-        this(cfnService, storageFactory, null, new RegionResolver("us-east-1", "000000000000")); // partition-literal: test-shaped constructor default
+        this(cfnService, storageFactory, null, new RegionResolver("us-east-1", "000000000000"), // partition-literal: test-shaped constructor default
+                Clock.systemUTC());
     }
 
     @Inject
     public StackSetService(CloudFormationService cfnService, StorageFactory storageFactory,
-                           OrganizationsService organizationsService, RegionResolver regionResolver) {
+                           OrganizationsService organizationsService, RegionResolver regionResolver,
+                           Clock clock) {
+        this.clock = clock;
         this.cfnService = cfnService;
         this.stackSets = storageFactory.create("cloudformation", "cloudformation-stacksets.json",
                 new TypeReference<Map<String, StackSet>>() {});
@@ -336,6 +341,11 @@ public class StackSetService implements PassedRoleLookup, AccountPlacementListen
                     "StackSet is not empty. Delete all stack instances first.", 409);
         }
         stackSets.delete(name);
+        for (String operationKey : new ArrayList<>(operations.keys())) {
+            if (operationKey.startsWith(name + ":")) {
+                operations.delete(operationKey);
+            }
+        }
         LOG.infov("Deleted StackSet: {0}", name);
     }
 
@@ -804,6 +814,7 @@ public class StackSetService implements PassedRoleLookup, AccountPlacementListen
                     "Another operation is currently in progress for StackSet " + stackSetName + ".", 409);
         }
         StackSetOperation operation = new StackSetOperation(operationId, stackSetName, action);
+        operation.setCreationTimestamp(clock.instant());
         operation.setStatus("RUNNING");
         operation.setEndTimestamp(null);
         operations.put(stackSetName + ":" + operationId, operation);
@@ -815,7 +826,7 @@ public class StackSetService implements PassedRoleLookup, AccountPlacementListen
                 .orElseThrow(() -> new AwsException("OperationNotFoundException",
                         "Operation " + operationId + " not found for stack set " + stackSetName, 404));
         operation.setStatus(status);
-        operation.setEndTimestamp(Instant.now());
+        operation.setEndTimestamp(clock.instant());
         operations.put(stackSetName + ":" + operationId, operation);
     }
 
@@ -925,8 +936,10 @@ public class StackSetService implements PassedRoleLookup, AccountPlacementListen
 
     private StackSetOperation recordOperation(String stackSetName, String action, String status) {
         StackSetOperation op = new StackSetOperation(UUID.randomUUID().toString(), stackSetName, action);
+        Instant now = clock.instant();
+        op.setCreationTimestamp(now);
         op.setStatus(status);
-        op.setEndTimestamp(Instant.now());
+        op.setEndTimestamp(now);
         operations.put(stackSetName + ":" + op.getOperationId(), op);
         return op;
     }

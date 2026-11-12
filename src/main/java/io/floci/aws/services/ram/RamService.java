@@ -138,7 +138,8 @@ public class RamService {
                                              String region, String owningAccountId) {
         String arn = AwsArnUtils.Arn.of("ram", region, owningAccountId, "resource-share/" + UUID.randomUUID()).toString();
         ResourceShare share = new ResourceShare(
-                arn, name, owningAccountId, principals, resourceArns, allowExternalPrincipals);
+                arn, name, owningAccountId, principals, resourceArns, allowExternalPrincipals,
+                "ACTIVE", clock.instant(), null, Map.of());
         ResourceShare stored = putForOwner(share);
         inviteAccountPrincipals(stored, principals);
         return stored;
@@ -322,7 +323,7 @@ public class RamService {
                 String arn = AwsArnUtils.Arn.of("ram", region, share.getOwningAccountId(),
                         "resource-share-invitation/" + UUID.randomUUID()).toString();
                 putInvitation(new ResourceShareInvitation(arn, share.getResourceShareArn(), share.getName(),
-                        share.getOwningAccountId(), principal, Instant.now(), "PENDING"));
+                        share.getOwningAccountId(), principal, clock.instant(), "PENDING"));
             }
         }
     }

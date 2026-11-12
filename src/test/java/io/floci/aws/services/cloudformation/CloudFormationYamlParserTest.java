@@ -62,4 +62,38 @@ class CloudFormationYamlParserTest {
         assertEquals(longForm, shorthand);
         assertEquals("Producer", shorthand.get("SubnetId").get("Fn::GetStackOutput").get("StackName").asText());
     }
+
+    @Test
+    void getAttShorthandAcceptsTheSequenceForm() throws Exception {
+        JsonNode shorthand = parse("Value: !GetAtt [Vpc, CidrBlock]\n");
+        JsonNode longForm = parse("""
+            Value:
+              Fn::GetAtt: [Vpc, CidrBlock]
+            """);
+        assertEquals(longForm, shorthand);
+        assertEquals("CidrBlock", shorthand.get("Value").get("Fn::GetAtt").get(1).asText());
+    }
+
+    @Test
+    void getAttSequenceFormResolvesANestedIntrinsic() throws Exception {
+        JsonNode shorthand = parse("Value: !GetAtt [Vpc, !Ref AttributeName]\n");
+        assertEquals("AttributeName", shorthand.get("Value").get("Fn::GetAtt").get(1).get("Ref").asText());
+    }
+
+    @Test
+    void unquotedDatesStayText() throws Exception {
+        JsonNode node = parse("""
+            AWSTemplateFormatVersion: 2010-09-09
+            Resources:
+              Policy:
+                Properties:
+                  PolicyDocument:
+                    Version: 2012-10-17
+            """);
+        assertTrue(node.get("AWSTemplateFormatVersion").isTextual());
+        assertEquals("2010-09-09", node.get("AWSTemplateFormatVersion").asText());
+        JsonNode version = node.get("Resources").get("Policy").get("Properties").get("PolicyDocument").get("Version");
+        assertTrue(version.isTextual());
+        assertEquals("2012-10-17", version.asText());
+    }
 }

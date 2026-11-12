@@ -221,7 +221,7 @@ public class S3Controller {
                     .bytesOut(bytesOut)
                     .errorCode(errorCode)
                     .errorMessage(errorMessage)
-                    .eventTimeMillis(System.currentTimeMillis())
+                    .eventTimeMillis(clock.millis())
                     .build());
         } catch (Exception e) {
             LOG.tracev(e, "CloudTrail event emission failed for {0} {1}/{2}", eventName, bucket, key);
@@ -3375,7 +3375,7 @@ public class S3Controller {
         XmlBuilder xml = new XmlBuilder()
                 .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                 .start("CopyPartResult", AwsNamespaces.S3)
-                .elem("LastModified", ISO_FORMAT.format(java.time.Instant.now()))
+                .elem("LastModified", ISO_FORMAT.format(clock.instant()))
                 .elem("ETag", part.getETag());
         ChecksumAlgorithm declared = destinationUpload.getChecksumAlgorithm();
         if (declared != null) {

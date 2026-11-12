@@ -1887,4 +1887,19 @@ class SecretsManagerJsonHandlerTest {
                 () -> handler.handle("CreateSecret", req, REGION));
         assertThat(ex.getErrorCode(), is("InvalidParameterException"));
     }
+
+    @Test
+    void describeSecretReportsWhenTheSecretWasLastRead() {
+        ObjectNode createReq = MAPPER.createObjectNode();
+        createReq.put("Name", "read-secret");
+        createReq.put("SecretString", "value");
+        handler.handle("CreateSecret", createReq, REGION);
+        ObjectNode secretId = MAPPER.createObjectNode();
+        secretId.put("SecretId", "read-secret");
+        handler.handle("GetSecretValue", secretId, REGION);
+
+        ObjectNode body = (ObjectNode) handler.handle("DescribeSecret", secretId, REGION).getEntity();
+
+        assertThat(body.has("LastAccessedDate"), is(true));
+    }
 }

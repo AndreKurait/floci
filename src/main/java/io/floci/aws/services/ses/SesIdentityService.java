@@ -90,7 +90,7 @@ public class SesIdentityService implements SesTaggable {
             if (existing != null) {
                 return existing;
             }
-            identity = new Identity(emailAddress, "EmailAddress");
+            identity = newIdentity(emailAddress, "EmailAddress");
             identityStore.put(key, identity);
         }
         LOG.infov("Verified email identity: {0} in region {1}", emailAddress, region);
@@ -116,8 +116,15 @@ public class SesIdentityService implements SesTaggable {
         return identity;
     }
 
+    /** Every identity this service creates is dated on its clock, not on the model's default. */
+    private Identity newIdentity(String name, String identityType) {
+        Identity identity = new Identity(name, identityType);
+        identity.setCreatedAt(Instant.now(clock));
+        return identity;
+    }
+
     private Identity newDomainIdentity(String domain) {
-        Identity identity = new Identity(domain, "Domain");
+        Identity identity = newIdentity(domain, "Domain");
         regenerateDkimTokens(identity);
         identity.setVerificationStatus("Pending");
         identity.setDkimEnabled(true);
@@ -157,7 +164,7 @@ public class SesIdentityService implements SesTaggable {
                 configurationSetExistsCheck.run();
             }
             identity = emailIdentity.contains("@")
-                    ? new Identity(emailIdentity, "EmailAddress")
+                    ? newIdentity(emailIdentity, "EmailAddress")
                     : newDomainIdentity(emailIdentity);
             if (configurationSetName != null) {
                 identity.setConfigurationSetName(configurationSetName);
@@ -391,7 +398,7 @@ public class SesIdentityService implements SesTaggable {
             if (identityStore.get(key).isPresent()) {
                 return;
             }
-            Identity identity = new Identity(emailAddress, "EmailAddress");
+            Identity identity = newIdentity(emailAddress, "EmailAddress");
             identity.setVerificationStatus("Pending");
             identityStore.put(key, identity);
         }
@@ -599,7 +606,7 @@ public class SesIdentityService implements SesTaggable {
         synchronized (identityCreationLock) {
             identity = identityStore.get(identityKey(region, domain)).orElse(null);
             if (identity == null) {
-                identity = new Identity(domain, "Domain");
+                identity = newIdentity(domain, "Domain");
                 identity.setVerificationStatus("Pending");
                 identity.setDkimEnabled(true);
                 identity.setDkimVerificationStatus("Pending");

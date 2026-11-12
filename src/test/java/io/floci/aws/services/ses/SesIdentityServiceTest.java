@@ -4,6 +4,7 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.ses.model.Identity;
 import io.floci.aws.services.ses.model.Tag;
+import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,7 @@ import org.mockito.Mockito;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -474,5 +476,21 @@ class SesIdentityServiceTest {
         AwsException e = assertThrows(AwsException.class,
                 () -> service.listTags("ghost@example.com", REGION));
         assertEquals("No EmailIdentity present with name: ghost@example.com", e.getMessage());
+    }
+
+    @Test
+    void everyIdentityTheServiceCreatesIsDatedFromTheInjectedClock() {
+        Instant now = Instant.parse("2031-05-06T07:08:09Z");
+        SesIdentityService onClock =
+                new SesIdentityService(new InMemoryStorage<>(), null, new ManualClock(now));
+
+        assertEquals(now, onClock.verifyEmailIdentity("alice@example.com", REGION).getCreatedAt());
+        assertEquals(now, onClock.verifyDomainIdentity("example.com", REGION).getCreatedAt());
+        assertEquals(now,
+                onClock.createEmailIdentity("bob@example.com", null, null, REGION, null).getCreatedAt());
+        onClock.markPendingEmailIdentity("carol@example.com", REGION);
+        assertEquals(now, onClock.find("carol@example.com", REGION).orElseThrow().getCreatedAt());
+        onClock.verifyDomainDkim("dkim.example", REGION);
+        assertEquals(now, onClock.find("dkim.example", REGION).orElseThrow().getCreatedAt());
     }
 }

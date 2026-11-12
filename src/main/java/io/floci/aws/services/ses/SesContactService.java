@@ -90,7 +90,7 @@ public class SesContactService implements SesTaggable {
         list.setDescription(description);
         list.setTopics(topics);
         list.setTags(tags);
-        Instant now = Instant.now();
+        Instant now = Instant.now(clock);
         list.setCreatedTimestamp(now);
         list.setLastUpdatedTimestamp(now);
         // AWS allows at most one contact list per account per region (verified against real AWS).
@@ -175,15 +175,20 @@ public class SesContactService implements SesTaggable {
                                          List<Topic> topics, String region) {
         validateContactListInput(name, description, topics);
         String key = contactListKey(region, name);
-        ContactList existing = contactListStore.get(key).orElseThrow(() -> contactListNotFound(name));
-        if (topics != null) {
-            existing.setTopics(topics);
+        ContactList existing;
+        // Read and write under the lock deletion takes, so an update cannot put back a list a
+        // concurrent delete has just removed.
+        synchronized (contactMutationLock) {
+            existing = contactListStore.get(key).orElseThrow(() -> contactListNotFound(name));
+            if (topics != null) {
+                existing.setTopics(topics);
+            }
+            if (descriptionPresent) {
+                existing.setDescription(description);
+            }
+            existing.setLastUpdatedTimestamp(Instant.now(clock));
+            contactListStore.put(key, existing);
         }
-        if (descriptionPresent) {
-            existing.setDescription(description);
-        }
-        existing.setLastUpdatedTimestamp(Instant.now());
-        contactListStore.put(key, existing);
         LOG.infov("Updated SES contact list: {0} in region {1}", name, region);
         return existing;
     }

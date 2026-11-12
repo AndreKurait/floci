@@ -549,6 +549,41 @@ class GlueServiceTest {
     }
 
     @Test
+    void deleteDatabaseDeletesItsUserDefinedFunctions() {
+        UserDefinedFunction function = new UserDefinedFunction();
+        function.setFunctionName("fn");
+        glueService.createUserDefinedFunction("db1", function);
+
+        glueService.deleteDatabase("db1");
+        glueService.createDatabase(new Database("db1"));
+
+        AwsException missing = assertThrows(AwsException.class,
+                () -> glueService.getUserDefinedFunction("db1", "fn"));
+        assertEquals("EntityNotFoundException", missing.getErrorCode());
+    }
+
+    @Test
+    void createPartitionRefusesValuesThatAlreadyExist() {
+        Table table = new Table();
+        table.setName("plain");
+        glueService.createTable("db1", table);
+        Partition first = new Partition();
+        first.setValues(List.of("2026"));
+        first.setParameters(Map.of("kept", "yes"));
+        glueService.createPartition("db1", "plain", first);
+
+        Partition second = new Partition();
+        second.setValues(List.of("2026"));
+        second.setParameters(Map.of("kept", "no"));
+        AwsException refused = assertThrows(AwsException.class,
+                () -> glueService.createPartition("db1", "plain", second));
+
+        assertEquals("AlreadyExistsException", refused.getErrorCode());
+        assertEquals(Map.of("kept", "yes"),
+                glueService.getPartition("db1", "plain", List.of("2026")).getParameters());
+    }
+
+    @Test
     void partitionsCanBeFetchedFilteredAndDeleted() {
         Table table = new Table();
         table.setName("plain");

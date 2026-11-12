@@ -4142,4 +4142,17 @@ class KmsServiceTest {
         assertThrows(AwsException.class, () -> kmsService.describeKey(
                 "arn:aws:sns:" + REGION + ":000000000000:alias/team:payments", REGION));
     }
+
+    @Test
+    void createAliasRefusesANameThatAlreadyExists() {
+        KmsKey keyA = kmsService.createKey(null, REGION);
+        KmsKey keyB = kmsService.createKey(null, REGION);
+        kmsService.createAlias("alias/taken", keyA.getKeyId(), REGION);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.createAlias("alias/taken", keyB.getKeyId(), REGION));
+
+        assertEquals("AlreadyExistsException", ex.getErrorCode());
+        assertEquals(keyA.getKeyId(), customerAliases(REGION).getFirst().getTargetKeyId());
+    }
 }
