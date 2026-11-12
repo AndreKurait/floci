@@ -73,6 +73,15 @@ verification; their trust store must include the selected listener's issuer.
 These options select transport destinations and do not implement a peer's
 protocol or authorization.
 
+With the native public HTTPS bridge enabled on port 443, public Route 53 A
+aliases to owned internet-facing Application Load Balancers use `192.0.2.1`
+for known VPC callers. This includes weighted aliases and does not require
+listing generated alias names in configuration. The stored load balancer and
+canonical hosted-zone ID must validate first. Internal load balancers, callers
+outside a known VPC and disabled native HTTPS routing retain their existing
+address selection. Literal DNS records are unchanged. This serves the shared
+HTTPS listener; it does not open arbitrary load-balancer ports on the bridge.
+
 ### Declared public endpoint handoff
 
 The transport handoff is implemented. Application qualification remains separate.

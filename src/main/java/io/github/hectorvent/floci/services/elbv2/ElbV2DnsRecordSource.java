@@ -1,10 +1,13 @@
 package io.github.hectorvent.floci.services.elbv2;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.dns.DnsRecordSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 import java.util.List;
 import java.util.Optional;
@@ -14,10 +17,17 @@ import java.util.Optional;
 public class ElbV2DnsRecordSource implements DnsRecordSource {
     private final ElbV2Service service;
     private final EmbeddedDnsServer dns;
+    private final EmulatorConfig config;
 
     public ElbV2DnsRecordSource(ElbV2Service service, EmbeddedDnsServer dns) {
+        this(service, dns, null);
+    }
+
+    @Inject
+    public ElbV2DnsRecordSource(ElbV2Service service, EmbeddedDnsServer dns, EmulatorConfig config) {
         this.service = service;
         this.dns = dns;
+        this.config = config;
     }
 
     @Override
@@ -27,6 +37,11 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
 
     @Override
     public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        return resolveAliasTarget(name, hostedZoneId, type, null);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, ClientVpc origin) {
         List<LoadBalancer> matches = service.findByDnsName(name);
         if (matches.isEmpty()) {
             return Optional.empty();
@@ -42,7 +57,13 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         if (type == 28) {
             return Optional.of(DnsAnswer.noData());
         }
-        return Optional.of(dns.getServerIp()
+        boolean publicHttps = config != null && "internet-facing".equals(target.getScheme())
+                && config.network().vpcRouting().enabled()
+                && config.network().vpcRouting().publicAwsApi()
+                && config.network().vpcRouting().publicAwsApiNativeHttps()
+                && config.tls().enabled() && config.tls().awsHttpsPort() == 443;
+        Optional<String> selectedAddress = publicHttps ? dns.publicApiAddress(origin) : dns.getServerIp();
+        return Optional.of(selectedAddress
                 .map(address -> DnsAnswer.records(List.of(address), 60))
                 .orElseGet(DnsAnswer::noData));
     }
