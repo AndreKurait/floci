@@ -7,6 +7,7 @@ import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.PublicApiProxySources;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -23,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /** A managed public destination. Native routes and NATs remain outside its TCP forwarding. */
 final class VpcAwsApiBridge {
@@ -33,23 +35,33 @@ final class VpcAwsApiBridge {
     private final ContainerLifecycleManager lifecycle;
     private final ObjectMapper mapper;
     private final ContainerReachableEndpoint endpoint;
+    private final PublicApiProxySources publicSources;
     private NetworkNamespaceLease namespace;
     private String transport;
     private String device;
     private String backend;
+    private String httpsBackend;
     private int httpBackendPort;
     private int httpsBackendPort;
     private String applied;
     private boolean listenersStarted;
+    private String sourcePeer;
 
     VpcAwsApiBridge(EmulatorConfig config, DockerClient docker, ContainerBuilder containers,
                     ContainerLifecycleManager lifecycle, ObjectMapper mapper, ContainerReachableEndpoint endpoint) {
+        this(config, docker, containers, lifecycle, mapper, endpoint, new PublicApiProxySources());
+    }
+
+    VpcAwsApiBridge(EmulatorConfig config, DockerClient docker, ContainerBuilder containers,
+                    ContainerLifecycleManager lifecycle, ObjectMapper mapper, ContainerReachableEndpoint endpoint,
+                    PublicApiProxySources publicSources) {
         this.config = config;
         this.docker = docker;
         this.containers = containers;
         this.lifecycle = lifecycle;
         this.mapper = mapper;
         this.endpoint = endpoint;
+        this.publicSources = publicSources;
     }
 
     boolean enabled() {
@@ -82,6 +94,7 @@ final class VpcAwsApiBridge {
     void ensure(String network) {
         if (namespace != null) {
             if (!Boolean.TRUE.equals(docker.inspectContainerCmd(namespace.id()).exec().getState().getRunning())) {
+                publicSources.revoke(this);
                 throw new IllegalStateException("The public AWS API bridge stopped");
             }
             return;
@@ -93,13 +106,19 @@ final class VpcAwsApiBridge {
                 .map(VpcRouteSelection::ipv4).orElse(null);
         URI target = URI.create(selectedHost == null ? endpoint.baseUrl(false)
                 : "http://" + selectedHost + ":" + config.network().vpcRouting().publicAwsApiUpstreamHttpPort());
-        if (!"http".equals(target.getScheme()) || target.getHost() == null
-                || target.getPort() < 1 || target.getPort() > 65535) {
-            throw new IllegalStateException("Invalid container-reachable AWS API endpoint");
-        }
+        validateTarget(target);
         httpBackendPort = target.getPort();
         httpsBackendPort = selectedHost == null ? httpBackendPort
                 : config.network().vpcRouting().publicAwsApiUpstreamHttpsPort();
+        URI httpsTarget = target;
+        if (config.network().vpcRouting().publicAwsApiNativeHttps()) {
+            httpsBackendPort = config.tls().awsHttpsPort();
+            if (!config.tls().enabled() || httpsBackendPort == config.port()) {
+                throw new IllegalStateException("Native public HTTPS requires a distinct enabled TLS listener");
+            }
+            httpsTarget = URI.create(endpoint.baseUrl(false));
+            validateTarget(httpsTarget);
+        }
         if (httpsBackendPort < 1 || httpsBackendPort > 65535
                 || EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS.equals(selectedHost)) {
             throw new IllegalStateException("Invalid public endpoint upstream address or HTTPS port");
@@ -107,7 +126,7 @@ final class VpcAwsApiBridge {
         retireOrphans();
         ContainerSpec spec = containers.newContainer(config.network().securityGroupEnforcement().helperImage())
                 .withName(ContainerStorageHelper.resourceName(config, SERVICE, null, UUID.randomUUID().toString()))
-                .withDockerNetwork(Optional.empty()).withHostDockerInternalOnLinux().withCapAdd("NET_ADMIN")
+                .withDockerNetwork(Optional.empty()).withHostDockerInternalOnLinux().withCapAdd("NET_ADMIN").withInit()
                 .withNetworkSysctl("net.ipv4.conf.all.rp_filter", "0")
                 .withNetworkSysctl("net.ipv4.conf.default.rp_filter", "0")
                 .withNetworkSysctl("net.ipv6.conf.all.disable_ipv6", "1")
@@ -123,17 +142,16 @@ final class VpcAwsApiBridge {
         try {
             InspectContainerResponse inspection = docker.inspectContainerCmd(id).exec();
             namespace = new NetworkNamespaceLease(id, inspection.getName());
-            List<String> addresses = execute("getent", "ahostsv4", target.getHost()).stdout().lines()
-                    .filter(line -> !line.isBlank()).map(line -> line.split("\\s+")[0]).distinct().toList();
-            if (addresses.size() != 1) {
-                throw new IllegalStateException("The AWS API backend does not resolve to one IPv4 address");
-            }
-            backend = VpcRouteSelection.ipv4(addresses.getFirst());
+            backend = resolveBackend(target);
+            httpsBackend = httpsTarget.equals(target) ? backend : resolveBackend(httpsTarget);
             docker.connectToNetworkCmd().withNetworkId(network).withContainerId(id).exec();
             transport = docker.inspectContainerCmd(id).exec().getNetworkSettings().getNetworks().values().stream()
                     .filter(value -> network.equals(value.getNetworkID())).map(ContainerNetwork::getIpAddress)
                     .filter(value -> value != null && !value.isBlank()).findFirst().orElseThrow();
             device = deviceFor(transport);
+            if (config.network().vpcRouting().publicAwsApiNativeHttps()) {
+                sourcePeer = sourceAddressFor(httpsBackend);
+            }
             configure(List.of());
         } catch (RuntimeException failure) {
             try {
@@ -143,6 +161,22 @@ final class VpcAwsApiBridge {
             }
             throw failure;
         }
+    }
+
+    private static void validateTarget(URI target) {
+        if (!"http".equals(target.getScheme()) || target.getHost() == null
+                || target.getPort() < 1 || target.getPort() > 65535) {
+            throw new IllegalStateException("Invalid container-reachable AWS API endpoint");
+        }
+    }
+
+    private String resolveBackend(URI target) {
+        List<String> addresses = execute("getent", "ahostsv4", target.getHost()).stdout().lines()
+                .filter(line -> !line.isBlank()).map(line -> line.split("\\s+")[0]).distinct().toList();
+        if (addresses.size() != 1) {
+            throw new IllegalStateException("The AWS API backend does not resolve to one IPv4 address");
+        }
+        return VpcRouteSelection.ipv4(addresses.getFirst());
     }
 
     private void retireOrphans() {
@@ -165,27 +199,80 @@ final class VpcAwsApiBridge {
     void configure(List<VpcRoutingCommands.Hop> callers) {
         String address = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
         String script = VpcRoutingCommands.publicApi(
-                address, backend, httpBackendPort, httpsBackendPort, device, callers);
+                address, backend, httpBackendPort, httpsBackend, httpsBackendPort, device, callers);
         if (!script.equals(applied)) {
+            publicSources.revoke(this);
+            applied = null;
             execute("sh", "-c", script);
             applied = script;
+            if (config.network().vpcRouting().publicAwsApiNativeHttps()) {
+                publicSources.register(this, sourcePeer, callers.stream().map(VpcRoutingCommands.Hop::destination)
+                        .collect(Collectors.toUnmodifiableSet()));
+            }
         }
         if (!listenersStarted) {
-            String start = """
-                    set -eu
-                    socat -d -d TCP4-LISTEN:80,bind=%s,reuseaddr,fork TCP4:%s:%d &
-                    first=$!
-                    socat -d -d TCP4-LISTEN:443,bind=%s,reuseaddr,fork TCP4:%s:%d &
-                    second=$!
-                    trap 'kill "$first" "$second" 2>/dev/null || true' EXIT TERM INT
-                    wait -n
-                    exit 1
-                    """.formatted(address, backend, httpBackendPort, address, backend, httpsBackendPort);
+            boolean nativeHttps = config.network().vpcRouting().publicAwsApiNativeHttps();
+            if (nativeHttps) {
+                RetryingTarCopier.copyBytes(docker, namespace.id(), "/tmp", "floci-api-https.sh",
+                        httpsConnector(httpsBackend, httpsBackendPort).getBytes(StandardCharsets.UTF_8), 0600);
+            }
+            String start = listenerScript(address, backend, httpBackendPort, nativeHttps
+                    ? "EXEC:'sh /tmp/floci-api-https.sh',pipes" : "TCP4:" + httpsBackend + ":" + httpsBackendPort);
             RetryingTarCopier.copyBytes(docker, namespace.id(), "/tmp", "floci-api-start.sh",
                     start.getBytes(StandardCharsets.UTF_8), 0600);
             execute("touch", "/tmp/floci-api-ready");
             awaitListeners(address);
             listenersStarted = true;
+        }
+    }
+
+    static String listenerScript(String address, String backend, int httpPort, String httpsTarget) {
+        // Connection subprocesses may outlive their parent; Docker init owns their reaping.
+        // Supervise both listeners explicitly, independent of the helper shell's wait -n behavior.
+        return """
+                set -eu
+                socat -d -d TCP4-LISTEN:80,bind=%s,reuseaddr,fork TCP4:%s:%d &
+                first=$!
+                socat -d -d TCP4-LISTEN:443,bind=%s,reuseaddr,fork %s &
+                second=$!
+                trap 'kill "$first" "$second" 2>/dev/null || true' EXIT TERM INT
+                while kill -0 "$first" 2>/dev/null && kill -0 "$second" 2>/dev/null; do
+                    sleep 0.1
+                done
+                exit 1
+                """.formatted(address, backend, httpPort, address, httpsTarget);
+    }
+
+    static String httpsConnector(String backend, int port) {
+        String address = VpcRouteSelection.ipv4(backend);
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("Invalid native HTTPS backend port");
+        }
+        return """
+                set -eu
+                {
+                    printf 'PROXY TCP4 %%s %%s %%s %%s\\r\\n' "$SOCAT_PEERADDR" "$SOCAT_SOCKADDR" \
+                "$SOCAT_PEERPORT" "$SOCAT_SOCKPORT"
+                    cat
+                } | socat - TCP4:%s:%d
+                """.formatted(address, port);
+    }
+
+    private String sourceAddressFor(String target) {
+        try {
+            JsonNode routes = mapper.readTree(execute("ip", "-j", "-4", "route", "get", target).stdout());
+            if (!routes.isArray() || routes.size() != 1) {
+                throw new IllegalStateException("The public API backend requires one source route");
+            }
+            String source = VpcRouteSelection.ipv4(routes.get(0).path("prefsrc").asText());
+            boolean owned = docker.inspectContainerCmd(namespace.id()).exec().getNetworkSettings().getNetworks()
+                    .values().stream().anyMatch(network -> source.equals(network.getIpAddress()));
+            if (!owned) {
+                throw new IllegalStateException("The public API source is not an owned Docker interface");
+            }
+            return source;
+        } catch (IOException failure) {
+            throw new IllegalStateException("Cannot decode the public API source route", failure);
         }
     }
 
@@ -207,6 +294,7 @@ final class VpcAwsApiBridge {
     }
 
     void retire() {
+        publicSources.revoke(this);
         if (namespace != null) {
             namespace.requireUnused(docker);
             lifecycle.removeIfExistsStrict(namespace.id());
@@ -215,8 +303,10 @@ final class VpcAwsApiBridge {
         transport = null;
         device = null;
         backend = null;
+        httpsBackend = null;
         applied = null;
         listenersStarted = false;
+        sourcePeer = null;
     }
 
     private String deviceFor(String address) {

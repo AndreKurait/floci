@@ -228,10 +228,17 @@ final class VpcRoutingCommands {
 
     static String publicApi(String publicAddress, String backendAddress, int httpPort, int httpsPort,
                             String publicDevice, List<Hop> callers) {
+        return publicApi(publicAddress, backendAddress, httpPort, backendAddress, httpsPort, publicDevice, callers);
+    }
+
+    static String publicApi(String publicAddress, String httpAddress, int httpPort, String httpsAddress, int httpsPort,
+                            String publicDevice, List<Hop> callers) {
         String external = VpcRouteSelection.ipv4(publicAddress);
-        String backend = VpcRouteSelection.ipv4(backendAddress);
+        String httpBackend = VpcRouteSelection.ipv4(httpAddress);
+        String httpsBackend = VpcRouteSelection.ipv4(httpsAddress);
         String outside = device(publicDevice);
-        if (httpPort < 1 || httpPort > 65535 || httpsPort < 1 || httpsPort > 65535 || external.equals(backend)) {
+        if (httpPort < 1 || httpPort > 65535 || httpsPort < 1 || httpsPort > 65535
+                || external.equals(httpBackend) || external.equals(httpsBackend)) {
             throw new IllegalArgumentException("Public AWS APIs require a distinct backend and valid TCP ports");
         }
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush default dev ")
@@ -246,11 +253,12 @@ final class VpcRoutingCommands {
                 add rule inet floci_public_api ingress iifname lo counter accept
                 add rule inet floci_public_api egress oifname lo counter accept
                 """);
-        for (int port : List.of(httpPort, httpsPort).stream().distinct().toList()) {
-            rules.append("add rule inet floci_public_api ingress ip saddr ").append(backend)
-                    .append(" tcp sport ").append(port).append(" ct state established,related counter accept\n")
-                    .append("add rule inet floci_public_api egress ip daddr ").append(backend)
-                    .append(" tcp dport ").append(port).append(" counter accept\n");
+        for (Backend backend : List.of(new Backend(httpBackend, httpPort), new Backend(httpsBackend, httpsPort))
+                .stream().distinct().toList()) {
+            rules.append("add rule inet floci_public_api ingress ip saddr ").append(backend.address())
+                    .append(" tcp sport ").append(backend.port()).append(" ct state established,related counter accept\n")
+                    .append("add rule inet floci_public_api egress ip daddr ").append(backend.address())
+                    .append(" tcp dport ").append(backend.port()).append(" counter accept\n");
         }
         for (Hop caller : callers) {
             if (!caller.replyOnly()) {
@@ -268,6 +276,8 @@ final class VpcRoutingCommands {
         }
         return script.append(nft(rules.toString())).toString();
     }
+
+    private record Backend(String address, int port) {}
 
     static String device(String value) {
         Objects.requireNonNull(value, "Network device");

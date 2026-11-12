@@ -150,6 +150,10 @@ public interface EmulatorConfig {
         @WithDefault("443")
         int publicAwsApiUpstreamHttpsPort();
 
+        /** Sends public HTTPS through Floci's SNI listener, retaining the selected HTTP upstream. */
+        @WithDefault("false")
+        boolean publicAwsApiNativeHttps();
+
         /** Exact additional peer names served by the selected public endpoint front door. */
         Optional<List<String>> publicAwsApiHosts();
     }
@@ -4264,6 +4268,19 @@ public interface EmulatorConfig {
          */
         @WithDefault("443")
         int awsHttpsPort();
+
+        /** Optional local TLS destination for names without an owned listener on the AWS HTTPS port. */
+        @WithDefault("0")
+        int awsHttpsFallbackPort();
+
+        /** Explicit local IPv4 destination; defaults to loopback. */
+        Optional<String> awsHttpsFallbackHost();
+
+        @WithDefault("false")
+        boolean awsHttpsFallbackProxyProtocol();
+
+        /** Exact names selecting the configured TLS destination before owned listener lookup. */
+        Optional<List<String>> awsHttpsFallbackHosts();
     }
 
     /**

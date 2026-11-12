@@ -2125,6 +2125,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HOST` | unset | Optional exact IPv4 front door for the public TCP bridge; unset retains Floci's API listener |
 | `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HTTP_PORT` | `80` | HTTP port at the explicitly selected front door |
 | `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HTTPS_PORT` | `443` | TLS port at that front door; clients retain certificate verification |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_NATIVE_HTTPS` | `false` | Send public HTTPS through Floci's owned SNI listener while retaining the configured HTTP upstream; see [public routing](../design/vpc-public-routing.md) |
 | `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` | unset | Comma-separated exact peer DNS names that use the public destination for known VPC clients, after native DNS records and forwarding rules |
 
 ## VPC Docker networks

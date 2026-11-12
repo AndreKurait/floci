@@ -41,6 +41,38 @@ The bridge forwards HTTP and TLS bytes to Floci's container-reachable API
 listener. The client keeps its AWS hostname, protocol and certificate verification.
 Use the ordinary TLS configuration and install Floci's CA for HTTPS.
 
+### Owned HTTPS listeners through the public bridge
+
+`FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_NATIVE_HTTPS=true` sends the bridge's
+port 443 connections to Floci's extra AWS HTTPS listener. TLS must be enabled,
+and `FLOCI_TLS_AWS_HTTPS_PORT` must select a different port from the API listener.
+The HTTP upstream retains its configured address and port. This option defaults
+to false.
+
+The bridge forwards the original TLS bytes and supplies the routed caller's
+public source address through a PROXY preface. Floci accepts that preface only
+from its owned bridge and only for callers admitted by the current route
+configuration. Revocation invalidates partially received prefaces. Unknown
+callers, malformed prefaces and incomplete headers cannot reach a backend.
+Direct connections retain their socket identity. Existing NAT, internet-gateway
+and security-group checks still apply; the bridge exposes only ports 80 and 443.
+
+Owned HTTPS load-balancer names select their registered SNI listener. Other
+names retain the API backend unless `FLOCI_TLS_AWS_HTTPS_FALLBACK_PORT` selects a
+separate TLS destination. Its host defaults to loopback and can be set with
+`FLOCI_TLS_AWS_HTTPS_FALLBACK_HOST`, which requires an explicit local IPv4
+address. Proxy loops and local private API destinations are rejected.
+`FLOCI_TLS_AWS_HTTPS_FALLBACK_HOSTS` optionally assigns exact DNS names to this
+destination before owned SNI lookup. These names do not imply wildcard matches.
+
+The external TLS destination receives the original TLS bytes.
+`FLOCI_TLS_AWS_HTTPS_FALLBACK_PROXY_PROTOCOL=true` additionally supplies the
+caller identity to a destination configured to trust only Floci's socket.
+This option defaults to false. Clients keep certificate and hostname
+verification; their trust store must include the selected listener's issuer.
+These options select transport destinations and do not implement a peer's
+protocol or authorization.
+
 ### Declared public endpoint handoff
 
 The transport handoff is implemented. Application qualification remains separate.
