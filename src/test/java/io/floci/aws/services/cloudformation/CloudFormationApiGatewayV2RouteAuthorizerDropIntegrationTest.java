@@ -4,6 +4,7 @@ import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
 import io.floci.aws.services.apigatewayv2.model.Authorizer;
 import io.floci.aws.services.apigatewayv2.model.Route;
 import io.floci.aws.services.cloudformation.model.Stack;
+import io.floci.aws.testing.AwsTestClients;
 import io.floci.aws.testing.CfnStackWaits;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
@@ -11,6 +12,10 @@ import io.restassured.response.ValidatableResponse;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.http.apache5.Apache5HttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
+import software.amazon.awssdk.services.apigatewayv2.model.GetAuthorizerResponse;
 
 import java.util.List;
 import java.util.Map;
@@ -265,6 +270,69 @@ class CloudFormationApiGatewayV2RouteAuthorizerDropIntegrationTest {
         getAuthorizerResponse(updated)
                 .body("authorizerResultTtlInSeconds", equalTo(60))
                 .body("enableSimpleResponses", equalTo(false));
+    }
+
+    @Test
+    void requestRequiredSettingsDroppedByConditionRemainWhileOptionalSettingsClear() {
+        String stackName = "authorizer-required-request-stack";
+        stackAction("CreateStack", stackName, template("", AUTHORIZER_SETTINGS));
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
+        String required = "\"AuthorizerUri\":\"" + LAMBDA_URI
+                + "\",\"AuthorizerPayloadFormatVersion\":\"2.0\"";
+        String omitted = "\"AuthorizerUri\":{\"Ref\":\"AWS::NoValue\"},"
+                + "\"AuthorizerPayloadFormatVersion\":{\"Ref\":\"AWS::NoValue\"}";
+
+        stackAction("UpdateStack", stackName, template("", "").replace(required, omitted));
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
+
+        getAuthorizerResponse(stack(cloudFormationService, stackName))
+                .body("authorizerType", equalTo("REQUEST"))
+                .body("authorizerUri", equalTo(LAMBDA_URI))
+                .body("authorizerPayloadFormatVersion", equalTo("2.0"))
+                .body("authorizerResultTtlInSeconds", nullValue())
+                .body("enableSimpleResponses", nullValue());
+        GetAuthorizerResponse sdk = getAuthorizerWithSdk(stack(cloudFormationService, stackName));
+        assertEquals(LAMBDA_URI, sdk.authorizerUri());
+        assertEquals("2.0", sdk.authorizerPayloadFormatVersion());
+        assertNull(sdk.authorizerResultTtlInSeconds());
+    }
+
+    @Test
+    void jwtConfigurationDroppedFromStackRemainsUntilTheTypeChanges() {
+        String stackName = "authorizer-required-jwt-stack";
+        String required = "\"AuthorizerUri\":\"" + LAMBDA_URI
+                + "\",\"AuthorizerPayloadFormatVersion\":\"2.0\"";
+        String jwt = "\"JwtConfiguration\":{\"Issuer\":\"https://issuer.example\","
+                + "\"Audience\":[\"aud\"]}";
+        String before = template("", "").replace("\"REQUEST\"", "\"JWT\"").replace(required, jwt);
+        stackAction("CreateStack", stackName, before);
+        CfnStackWaits.awaitStatus(stackName, "CREATE_COMPLETE");
+
+        stackAction("UpdateStack", stackName, before.replace(jwt,
+                "\"JwtConfiguration\":{\"Ref\":\"AWS::NoValue\"}"));
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
+        getAuthorizerResponse(stack(cloudFormationService, stackName))
+                .body("authorizerType", equalTo("JWT"))
+                .body("jwtConfiguration.issuer", equalTo("https://issuer.example"))
+                .body("jwtConfiguration.audience", equalTo(List.of("aud")));
+        GetAuthorizerResponse sdk = getAuthorizerWithSdk(stack(cloudFormationService, stackName));
+        assertEquals("https://issuer.example", sdk.jwtConfiguration().issuer());
+        assertEquals(List.of("aud"), sdk.jwtConfiguration().audience());
+
+        stackAction("UpdateStack", stackName, template("", ""));
+        CfnStackWaits.awaitStatus(stackName, "UPDATE_COMPLETE");
+        getAuthorizerResponse(stack(cloudFormationService, stackName))
+                .body("authorizerType", equalTo("REQUEST"))
+                .body("authorizerUri", equalTo(LAMBDA_URI));
+    }
+
+    private GetAuthorizerResponse getAuthorizerWithSdk(Stack stack) {
+        try (ApiGatewayV2Client client = AwsTestClients.create(ApiGatewayV2Client.builder(), "test", Region.US_EAST_1,
+                Apache5HttpClient.builder())) {
+            return client.getAuthorizer(request -> request
+                    .apiId(stack.getResources().get("HttpApi").getPhysicalId())
+                    .authorizerId(stack.getResources().get("Authorizer").getPhysicalId()));
+        }
     }
 
     private ValidatableResponse getRouteResponse(Stack stack) {
