@@ -3,6 +3,9 @@ package io.github.hectorvent.floci.services.emr;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.emrserverless.EmrServerlessSparkRunner;
+import io.github.hectorvent.floci.services.emrserverless.SparkJobRunner;
 import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.github.hectorvent.floci.testing.ContainerDataPlaneProfile;
 import io.github.hectorvent.floci.testing.DockerAvailability;
@@ -12,9 +15,11 @@ import io.github.hectorvent.floci.testing.S3TestClients;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
@@ -29,10 +34,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
 
 import static io.github.hectorvent.floci.testing.EmrRequests.awaitStep;
 import static io.github.hectorvent.floci.testing.EmrRequests.emr;
+import static io.github.hectorvent.floci.testing.EmrRequests.terminateClusterAndAwaitCleanup;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -56,6 +63,15 @@ class EmrHiveStepsDockerIntegrationTest {
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
 
+    @Inject
+    EmrService emrService;
+
+    @Inject
+    EmrReleaseImages releaseImages;
+
+    @Inject
+    EmulatorConfig config;
+
     private S3Client s3;
     private String bucket;
     private String clusterId;
@@ -66,8 +82,14 @@ class EmrHiveStepsDockerIntegrationTest {
     }
 
     @BeforeEach
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
     void putInputs() throws InterruptedException {
         assumeTrue(DockerAvailability.isAvailable(), "Docker daemon must be available for EMR's Hive steps");
+        String release = "emr-7.5.0";
+        String spark = EmrServerlessSparkRunner.image(config.services().emr().imageTemplate().orElse(null), release);
+        String hive = EmrServerlessSparkRunner.image(config.services().emr().hiveImageTemplate().orElse(null),
+                release, SparkJobRunner.Engine.HIVE);
+        releaseImages.image(release, spark, hive);
         s3 = AwsTestClients.create(S3Client.builder().forcePathStyle(true), "000000000000", Region.US_EAST_1);
         cleanup.register(s3::close);
         bucket = "emr-hive-" + UUID.randomUUID().toString().substring(0, 8);
@@ -179,8 +201,7 @@ class EmrHiveStepsDockerIntegrationTest {
                 .put("InstanceCount", 1);
         clusterId = emr("RunJobFlow", request.toString()).then().statusCode(200).extract().jsonPath()
                 .getString("JobFlowId");
-        cleanup.register(() -> emr("TerminateJobFlows", "{\"JobFlowIds\":[\"" + clusterId + "\"]}")
-                .then().statusCode(200));
+        cleanup.register(() -> terminateClusterAndAwaitCleanup(clusterId, emrService));
     }
 
     /** Runs the AWS CLI's Hive step with {@code args} and returns the state it ended in. */
