@@ -258,6 +258,13 @@ public class ContainerLogStreamer {
         return frameCallback(accountId, logGroup, logStream, region, logPrefix, logToConsole);
     }
 
+    /** Reassembles exec output into bounded UTF-8 lines, including the final unterminated line. */
+    public ResultCallback.Adapter<Frame> execLineLogCallbackForAccount(
+            String accountId, String logGroup, String logStream, String region) {
+        return new LogReassemblyCallback(
+                line -> forwardToCloudWatchLogs(accountId, logGroup, logStream, region, line));
+    }
+
     /**
      * Handles frames from Docker exec streams.
      *
