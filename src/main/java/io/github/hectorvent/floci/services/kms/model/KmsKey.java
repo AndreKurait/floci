@@ -45,6 +45,9 @@ public class KmsKey {
     // and KmsService lazily generates material for them on first use.
     private Map<String, String> backingKeys = new HashMap<>();
     private String currentBackingKeyId;
+    // Only completed rotations have a timestamp. The first material and material loaded
+    // from older snapshots have no recorded rotation date.
+    private Map<String, Long> backingKeyRotationDates = new HashMap<>();
 
     public KmsKey() {
         this.creationDate = Instant.now().getEpochSecond();
@@ -131,4 +134,9 @@ public class KmsKey {
 
     public String getCurrentBackingKeyId() { return currentBackingKeyId; }
     public void setCurrentBackingKeyId(String currentBackingKeyId) { this.currentBackingKeyId = currentBackingKeyId; }
+
+    public Map<String, Long> getBackingKeyRotationDates() { return backingKeyRotationDates; }
+    public void setBackingKeyRotationDates(Map<String, Long> dates) {
+        this.backingKeyRotationDates = dates == null ? new HashMap<>() : dates;
+    }
 }

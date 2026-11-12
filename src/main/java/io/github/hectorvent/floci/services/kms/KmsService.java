@@ -358,6 +358,7 @@ public class KmsService implements ResourceProvider {
             replica.setPublicKeyEncoded(primary.getPublicKeyEncoded());
             replica.setBackingKeys(new HashMap<>(primary.getBackingKeys()));
             replica.setCurrentBackingKeyId(primary.getCurrentBackingKeyId());
+            replica.setBackingKeyRotationDates(new HashMap<>(primary.getBackingKeyRotationDates()));
         }
         keyStore.put(storageKey, replica);
 
@@ -834,6 +835,54 @@ public class KmsService implements ResourceProvider {
 
     // ──────────────────────────── Key Rotation ────────────────────────────
 
+    public record KeyRotation(String keyId, String keyMaterialId, String keyMaterialState,
+                              Long rotationDate, String importState, String expirationModel, Long validTo) {
+        private String cursor() {
+            return String.format(Locale.ROOT, "%019d:%s", rotationDate == null ? 0L : rotationDate, keyMaterialId);
+        }
+    }
+
+    public Page<KeyRotation> listKeyRotations(String keyId, String includeKeyMaterial, String region,
+                                             String marker, Integer limit) {
+        String include = includeKeyMaterial == null ? "ROTATIONS_ONLY" : includeKeyMaterial;
+        if (!Set.of("ROTATIONS_ONLY", "ALL_KEY_MATERIAL").contains(include)) {
+            throw SmithyValidationErrors.validationException("Value '" + include
+                    + "' at 'includeKeyMaterial' failed to satisfy constraint: Member must satisfy enum value set: "
+                    + "[ALL_KEY_MATERIAL, ROTATIONS_ONLY]");
+        }
+        if (limit != null && (limit < 1 || limit > MAX_LIST_KEYS_LIMIT)) {
+            throw SmithyValidationErrors.validationException("Limit must be between 1 and 1000.");
+        }
+        synchronized (backingKeyMaterialLock) {
+            KmsKey key = resolveKey(keyId, region);
+            if (includeKeyMaterial != null) {
+                validateRotationKeySpec(key);
+            }
+            List<KeyRotation> rotations = new ArrayList<>();
+            boolean includeAll = "ALL_KEY_MATERIAL".equals(include);
+            boolean external = EXTERNAL_ORIGIN.equals(key.getOrigin());
+            if (key.getBackingKeys() != null) {
+                for (Map.Entry<String, String> material : key.getBackingKeys().entrySet()) {
+                    Long rotationDate = key.getBackingKeyRotationDates().get(material.getKey());
+                    if (includeAll || rotationDate != null) {
+                        String materialId = keyMaterialId(key.getKeyId(), decodeBackingMaterial(material.getValue()));
+                        String state = material.getKey().equals(key.getCurrentBackingKeyId()) ? "CURRENT" : "NON_CURRENT";
+                        rotations.add(new KeyRotation(key.getArn(), materialId, state, rotationDate,
+                                external ? "IMPORTED" : null, external ? key.getExpirationModel() : null,
+                                external && KEY_MATERIAL_EXPIRES.equals(key.getExpirationModel()) ? key.getValidTo() : null));
+                    }
+                }
+            }
+            if (includeAll && external && rotations.isEmpty() && key.getKeyMaterialId() != null) {
+                rotations.add(new KeyRotation(key.getArn(), key.getKeyMaterialId(), "CURRENT", null,
+                        "PENDING_IMPORT", null, null));
+            }
+            return page(rotations, KeyRotation::cursor,
+                    "ListKeyRotations\n" + key.getArn() + "\n" + include, marker,
+                    limit == null ? 100 : limit, MAX_LIST_KEYS_LIMIT);
+        }
+    }
+
     public boolean getKeyRotationStatus(String keyId, String region) {
         KmsKey key = resolveKey(keyId, region);
         if (KmsKeyUsage.ENCRYPT_DECRYPT != key.getKeyUsage()
@@ -909,6 +958,7 @@ public class KmsService implements ResourceProvider {
             // AWS keeps prior backing keys after rotation so ciphertext encrypted under them keeps
             // decrypting.
             keyTypes.symmetric().addBackingKey(key);
+            key.getBackingKeyRotationDates().put(key.getCurrentBackingKeyId(), Instant.now().toEpochMilli());
             keyStore.put(region + "::" + key.getKeyId(), key);
             if (MULTI_REGION_PRIMARY.equals(key.getMultiRegionKeyType())) {
                 synchronizeMultiRegionReplicas(key);
@@ -924,6 +974,7 @@ public class KmsService implements ResourceProvider {
             }
             candidate.setBackingKeys(new HashMap<>(primary.getBackingKeys()));
             candidate.setCurrentBackingKeyId(primary.getCurrentBackingKeyId());
+            candidate.setBackingKeyRotationDates(new HashMap<>(primary.getBackingKeyRotationDates()));
             String replicaRegion = AwsArnUtils.parse(candidate.getArn()).region();
             keyStore.put(replicaRegion + "::" + candidate.getKeyId(), candidate);
         }
