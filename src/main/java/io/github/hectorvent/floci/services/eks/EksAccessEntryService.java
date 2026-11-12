@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.eks.model.AssociatedAccessPolicy;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateAccessEntryRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateAccessEntryRequest;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
@@ -32,6 +33,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
 /** Access-entry and access-policy management metadata; Kubernetes authorization is handled separately. */
@@ -243,6 +245,89 @@ public class EksAccessEntryService {
 
     public synchronized AccessEntry describe(Cluster cluster, String principal) {
         return storedEntry(cluster, principal).entry();
+    }
+
+    public synchronized AccessEntry update(String accountId, Cluster cluster, String principal,
+                                            UpdateAccessEntryRequest request) {
+        StoredEntry stored = storedUpdateTarget(accountId, cluster, principal, true)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Access entry not found", 404));
+        if (request == null) {
+            throw invalid("Request is required");
+        }
+        AccessEntry current = stored.entry();
+        if (!"STANDARD".equals(current.type())
+                && (request.username() != null || request.kubernetesGroups() != null)) {
+            throw invalid("Node access entries cannot specify username or kubernetesGroups");
+        }
+        if (request.username() != null) {
+            validateUsername(request.username());
+        }
+        List<String> groups = request.kubernetesGroups();
+        if (groups != null && groups.stream().anyMatch(group -> group == null || group.isBlank())) {
+            throw invalid("kubernetesGroups must contain nonempty strings");
+        }
+        List<String> nextGroups = groups == null ? current.kubernetesGroups() : groups;
+        if (nextGroups != null) {
+            nextGroups = List.copyOf(nextGroups);
+        }
+        Map<String, String> nextTags = current.tags() == null ? null : Map.copyOf(current.tags());
+        AccessEntry updated = new AccessEntry(current.accessEntryArn(), current.clusterName(), current.principalArn(),
+                current.type(), request.username() == null ? current.username() : request.username(),
+                nextGroups, nextTags, current.createdAt(), EpochSeconds.fromMillis(clock.millis()));
+        Map<String, StoredEntry> replacement = Map.of(prefix(cluster) + principal,
+                new StoredEntry(updated, stored.principalId(), stored.clientRequestToken(), stored.accessPolicies()));
+        if (entries instanceof AccountAwareStorageBackend<StoredEntry> aware) {
+            aware.putAllAtomicallyForAccount(accountId, replacement);
+        } else {
+            entries.putAllAtomically(replacement);
+        }
+        return updated;
+    }
+
+    synchronized Optional<AccessEntry> findUpdateTarget(String accountId, Cluster cluster, String principal) {
+        return storedUpdateTarget(accountId, cluster, principal, false).map(StoredEntry::entry);
+    }
+
+    private Optional<StoredEntry> storedUpdateTarget(String accountId, Cluster cluster, String principal,
+                                                     boolean migrateLegacy) {
+        requireApiAccess(cluster);
+        AwsArnUtils.Arn clusterArn = AwsArnUtils.parse(cluster.getArn());
+        if (!accountId.equals(clusterArn.accountId())) {
+            return Optional.empty();
+        }
+        String key = prefix(cluster) + principal;
+        Predicate<StoredEntry> owner = value -> {
+            AccessEntry entry = value.entry();
+            if (entry == null || !principal.equals(entry.principalArn()) || !cluster.getName().equals(entry.clusterName())
+                    || !AwsArnUtils.isArnFor(entry.accessEntryArn(), "eks")) {
+                return false;
+            }
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(entry.accessEntryArn());
+            return arn.accountId().equals(accountId) && arn.region().equals(clusterArn.region())
+                    && arn.partition().equals(clusterArn.partition())
+                    && arn.resource().startsWith("access-entry/" + cluster.getName() + "/");
+        };
+        Optional<StoredEntry> found;
+        if (entries instanceof AccountAwareStorageBackend<StoredEntry> aware) {
+            found = migrateLegacy ? aware.getForAccountMigratingLegacy(accountId, key, owner)
+                    : aware.getForAccount(accountId, key).or(() -> aware.getLegacyForAccount(accountId, key));
+        } else {
+            found = entries.get(key);
+        }
+        return found.filter(owner);
+    }
+
+    private static void validateUsername(String username) {
+        if (username.isBlank() || List.of("system:", "eks:", "aws:", "amazon:", "iam:").stream()
+                .anyMatch(username::startsWith)) {
+            throw invalid("Invalid username");
+        }
+        for (String placeholder : List.of("{{SessionName}}", "{{SessionNameRaw}}")) {
+            int position = username.indexOf(placeholder);
+            if (position >= 0 && !username.substring(0, position).contains(":")) {
+                throw invalid("A session-name placeholder must be preceded by a colon");
+            }
+        }
     }
 
     public synchronized void delete(Cluster cluster, String principal) {

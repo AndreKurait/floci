@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.eks.EksAccessEntryUpdateConditions;
 import io.github.hectorvent.floci.services.elbv2.ElbV2ConditionKeys;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -109,6 +110,7 @@ public class IamConditionContextResolver {
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
@@ -127,9 +129,26 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog,
                                        Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, eksAccessEntryUpdates);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService,
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -143,7 +162,7 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -157,7 +176,7 @@ public class IamConditionContextResolver {
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, clock, null, null);
+                config, currentVertxRequest, serviceCatalog, clock, null, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -171,7 +190,8 @@ public class IamConditionContextResolver {
                                         CurrentVertxRequest currentVertxRequest,
                                         ResolvedServiceCatalog serviceCatalog, Clock clock,
                                         Instance<SsmService> ssmService,
-                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -184,6 +204,7 @@ public class IamConditionContextResolver {
         this.config = config;
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
+        this.eksAccessEntryUpdates = eksAccessEntryUpdates;
         this.serviceCatalog = serviceCatalog;
     }
 
@@ -197,6 +218,8 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "eks" -> "eks:UpdateAccessEntry".equals(action) && eksAccessEntryUpdates != null
+                    && eksAccessEntryUpdates.isResolvable() ? eksAccessEntryUpdates.get().resolve(ctx) : null;
             case "redshift" -> redshiftConditionContext(action, ctx);
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
