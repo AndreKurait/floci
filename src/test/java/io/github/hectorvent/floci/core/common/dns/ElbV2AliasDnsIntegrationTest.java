@@ -42,8 +42,11 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.when;
 
 /** Signed management calls in separate accounts, followed by accountless DNS packets. */
 @QuarkusTest
@@ -60,11 +63,17 @@ class ElbV2AliasDnsIntegrationTest {
     URI endpoint;
 
     @ParameterizedTest
-    @CsvSource({"internal,false,false", "internet-facing,false,false", "internal,true,false",
-            "internet-facing,true,false", "internal,false,true", "internet-facing,false,true",
-            "internal,true,true", "internet-facing,true,true"})
+    @CsvSource({"internal,false,false,false,true", "internet-facing,false,false,false,true",
+            "internal,true,false,false,true", "internet-facing,true,false,false,true",
+            "internal,false,true,false,true", "internet-facing,false,true,false,true",
+            "internal,true,true,false,true", "internet-facing,true,true,false,true",
+            "internal,false,false,true,true", "internet-facing,false,false,true,true",
+            "internal,false,true,true,true", "internet-facing,false,true,true,true",
+            "internal,false,false,true,false", "internet-facing,false,false,true,false",
+            "internal,false,true,true,false", "internet-facing,false,true,true,false"})
     void publicAliasFindsItsNativeAlbAcrossAccounts(String scheme, boolean declaredPublicRoute,
-                                                   boolean weighted) throws Exception {
+                                                   boolean weighted, boolean nativeHttps, boolean knownVpc)
+            throws Exception {
         StaticCredentialsProvider owner =
                 StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000001", "test"));
         StaticCredentialsProvider zoneOwner =
@@ -100,14 +109,20 @@ class ElbV2AliasDnsIntegrationTest {
                 zone = route53.createHostedZone(r -> r.name(name).callerReference(UUID.randomUUID().toString()))
                         .hostedZone().id();
                 List<DnsRecordSource> sources = new ArrayList<>();
-                DnsClientVpcSource clients = address -> Optional.of(
-                        new DnsClientVpcSource.ClientVpc("730000000001", "eu-west-1", vpc));
+                DnsClientVpcSource clients = address -> knownVpc ? Optional.of(
+                        new DnsClientVpcSource.ClientVpc("730000000001", "eu-west-1", vpc)) : Optional.empty();
                 EmbeddedDnsServer dns = spy(new EmbeddedDnsServer(
-                        List.of(), sources, List.of(), List.of(clients), declaredPublicRoute,
+                        List.of(), sources, List.of(), List.of(clients), declaredPublicRoute || nativeHttps,
                         declaredPublicRoute ? List.of(name) : List.of()));
                 doReturn(Optional.of("127.0.0.1")).when(dns).getServerIp();
                 sources.add(new Route53DnsRecordSource(zones, config, new DnsLookupHelper(), dns));
-                sources.add(new ElbV2DnsRecordSource(loadBalancers, dns));
+                EmulatorConfig transportConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+                when(transportConfig.network().vpcRouting().enabled()).thenReturn(nativeHttps);
+                when(transportConfig.network().vpcRouting().publicAwsApi()).thenReturn(nativeHttps);
+                when(transportConfig.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(nativeHttps);
+                when(transportConfig.tls().enabled()).thenReturn(nativeHttps);
+                when(transportConfig.tls().awsHttpsPort()).thenReturn(443);
+                sources.add(new ElbV2DnsRecordSource(loadBalancers, dns, transportConfig));
                 listener.listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
                 listener.handler(packet -> dns.handleQuery(vertx, listener, packet.data().getBytes(),
                         packet.sender().host(), packet.sender().port(), "127.0.0.1"));
@@ -119,6 +134,7 @@ class ElbV2AliasDnsIntegrationTest {
                 assertEquals(0, rcode(response));
                 assertEquals(1, ByteBuffer.wrap(response).getShort(6));
                 String expectedAddress = declaredPublicRoute
+                        || nativeHttps && knownVpc && "internet-facing".equals(scheme)
                         ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : "127.0.0.1";
                 assertArrayEquals(InetAddress.getByName(expectedAddress).getAddress(), address(response));
                 assertTrue((ByteBuffer.wrap(response).getShort(2) & 0x0400) != 0);
