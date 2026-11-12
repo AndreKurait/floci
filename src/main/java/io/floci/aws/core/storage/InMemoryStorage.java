@@ -49,6 +49,19 @@ public class InMemoryStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public synchronized void applyAtomically(Map<K, V> entries, Set<K> keys) {
+        Map<K, V> replacements = Map.copyOf(entries);
+        Set<K> deletions = Set.copyOf(keys);
+        if (replacements.isEmpty() && deletions.isEmpty()) {
+            return;
+        }
+        ConcurrentHashMap<K, V> candidate = new ConcurrentHashMap<>(store);
+        candidate.putAll(replacements);
+        candidate.keySet().removeAll(deletions);
+        store = candidate;
+    }
+
+    @Override
     public List<V> scan(Predicate<K> keyFilter) {
         List<V> result = new ArrayList<>();
         store.forEach((k, v) -> {
