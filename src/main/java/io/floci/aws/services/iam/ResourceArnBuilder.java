@@ -62,6 +62,11 @@ import java.util.regex.Pattern;
 public class ResourceArnBuilder {
 
     private static final Pattern ACCESS_POLICY_ARN = Pattern.compile(EksController.ACCESS_POLICY_ARN);
+    private static final Pattern APP_CONFIG_ENVIRONMENT =
+            Pattern.compile("^/?applications/([a-z0-9]{4,7})/environments/([a-z0-9]{4,7})/?$");
+    private static final Pattern APP_CONFIG_STRATEGY =
+            Pattern.compile("^/?deploymentstrategies/([a-z0-9]{4,7}|AppConfig\\.[A-Za-z0-9]{9,40})/?$");
+
 
     /** The only scheme IAM accepts on an OIDC provider URL, and the part its ARN drops. */
     private static final String OIDC_URL_SCHEME = "https://";
@@ -226,6 +231,7 @@ public class ResourceArnBuilder {
         String path = "s3".equals(credentialScope) ? ctx.getUriInfo().getPath()
                 : IamActionRegistry.decodedPath(ctx);
         return switch (credentialScope) {
+            case "appconfig"      -> buildAppConfigUpdateResources(operation, path, region, accountId, partition);
             case "s3"             -> buildS3Resources(operation, path, ctx, region);
             case "lambda"         -> List.of(buildLambdaArn(path, ctx, region, accountId));
             case "sqs"            -> List.of(buildSqsArn(ctx, region, accountId));
@@ -247,6 +253,28 @@ public class ResourceArnBuilder {
             case "bedrock"        -> List.of(buildBedrockArn(path, ctx));
             default               -> namedResources(credentialScope, operation, ctx, region, accountId, partition);
         };
+    }
+
+    /** Exact IDs of the two native AppConfig PATCH routes; other AppConfig operations remain unchanged. */
+    private static List<String> buildAppConfigUpdateResources(String operation, String path, String region,
+                                                               String accountId, String partition) {
+        String routed = path.replaceAll(";[^/]*", "");
+        if ("appconfig:UpdateEnvironment".equals(operation)) {
+            Matcher matcher = APP_CONFIG_ENVIRONMENT.matcher(routed);
+            if (matcher.matches()) {
+                String application = "application/" + matcher.group(1);
+                return List.of(new AwsArnUtils.Arn(partition, "appconfig", region, accountId, application).toString(),
+                        new AwsArnUtils.Arn(partition, "appconfig", region, accountId,
+                                application + "/environment/" + matcher.group(2)).toString());
+            }
+        } else if ("appconfig:UpdateDeploymentStrategy".equals(operation)) {
+            Matcher matcher = APP_CONFIG_STRATEGY.matcher(routed);
+            if (matcher.matches()) {
+                return List.of(new AwsArnUtils.Arn(partition, "appconfig", region, accountId,
+                        "deploymentstrategy/" + matcher.group(1)).toString());
+            }
+        }
+        return List.of("*");
     }
 
     /**

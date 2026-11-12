@@ -21,6 +21,7 @@ The management plane allows you to create and manage applications, environments,
 - `CreateEnvironment`
 - `GetEnvironment`
 - `ListEnvironments`
+- `UpdateEnvironment` (IDs only)
 - `DeleteEnvironment`
 - `CreateConfigurationProfile`
 - `GetConfigurationProfile`
@@ -32,6 +33,7 @@ The management plane allows you to create and manage applications, environments,
 - `CreateDeploymentStrategy`
 - `GetDeploymentStrategy`
 - `ListDeploymentStrategies`
+- `UpdateDeploymentStrategy`
 - `DeleteDeploymentStrategy`
 - `StartDeployment`
 - `StopDeployment`
@@ -52,6 +54,24 @@ A missing or undeployed environment returns `BadRequestException`; an unknown ap
 returns `ResourceNotFoundException`.
 Only hosted configurations are served: a deployed version with no hosted configuration version behind it,
 such as one from an S3 or SSM source, returns `ResourceNotFoundException`.
+
+`UpdateEnvironment` and `UpdateDeploymentStrategy` apply only the mutable fields present in a native
+PATCH request. Omitted fields retain their values; an empty description or monitor list clears that
+field, and a zero duration or final bake time is stored. The whole request is validated before the
+stored record is replaced. Persistent and WAL storage publish each replacement after the atomic write
+succeeds; hybrid storage retains asynchronous durability. Updates preserve resource IDs, environment state, strategy names and
+`ReplicateTo`, and survive storage reloads. Predefined strategies cannot be updated.
+
+`UpdateEnvironment` currently requires the application and environment IDs. AWS also documents name
+selectors; this PATCH implementation does not resolve them. Existing Get operations retain their
+name lookup behavior. The PATCH operations do not change rollout behavior or environment state spelling.
+CloudFormation continues to replace all mutable properties, including clearing omitted template fields.
+
+With IAM enforcement enabled, these PATCH requests check their own action and concrete resources:
+both the application and environment for `UpdateEnvironment`, and the custom strategy for
+`UpdateDeploymentStrategy`. Every supplied monitor `AlarmRoleArn` also needs `iam:PassRole` for
+AppConfig. Omitting monitors reuses stored roles without another PassRole check; an empty list passes
+no role. Environment and strategy resource-tag conditions are not implemented by this change.
 
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.

@@ -263,6 +263,8 @@ final class PassedRoles {
      */
     static List<PassedRole> byHand(String action, ContainerRequestContext ctx, Lookups lookups) {
         return switch (action) {
+            case "appconfig:UpdateEnvironment" ->
+                    fromJson(ctx, ServicePrincipals.of("appconfig"), "Monitors", "[]", "AlarmRoleArn");
             case "lambda:CreateFunction", "lambda:UpdateFunctionConfiguration" -> fromJson(ctx, LAMBDA, "Role");
             case "lambda:CreateWebFunction" ->
                     fromJson(ctx, LAMBDA, "revisionConfig", "serviceConfig", "executionRoleArn");
