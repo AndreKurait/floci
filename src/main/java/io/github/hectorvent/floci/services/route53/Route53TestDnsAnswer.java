@@ -53,7 +53,8 @@ final class Route53TestDnsAnswer {
     private static Answer resolve(HostedZone zone, List<ResourceRecordSet> records, String name, String type,
                                   Set<String> visited) {
         String apex = Route53Service.normalizeRecordName(zone.getName());
-        if (!DomainNames.isWithin(name, apex) || visited.size() >= MAX_ALIAS_DEPTH || !visited.add(name)) {
+        if (!".".equals(apex) && !DomainNames.isWithin(name, apex)
+                || visited.size() >= MAX_ALIAS_DEPTH || !visited.add(name)) {
             return new Answer("REFUSED", List.of());
         }
         // Delegation records are referrals, not answers from this zone. In particular the API
