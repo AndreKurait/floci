@@ -46,6 +46,8 @@ import java.util.stream.Collectors;
  *   DELETE: [0x02] [4-byte key length] [key bytes]
  *   BATCH:  [0x03] [4-byte map length] [CBOR map bytes]
  *   DELETE_BATCH: [0x04] [4-byte array length] [CBOR key array bytes]
+ *   MIXED_BATCH: [0x05] [4-byte payload length] [4-byte map length] [CBOR map bytes]
+ *                [4-byte array length] [CBOR key array bytes]
  *
  * Key and value bytes are serialized via Jackson CBOR (compact binary format).
  * Snapshot files use indented JSON for debuggability.
@@ -58,6 +60,7 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
     static final byte OP_DELETE = 0x02;
     static final byte OP_BATCH = 0x03;
     static final byte OP_DELETE_BATCH = 0x04;
+    static final byte OP_MIXED_BATCH = 0x05;
 
     private volatile ConcurrentHashMap<K, V> store = new ConcurrentHashMap<>();
     private final Path snapshotPath;
@@ -162,6 +165,25 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
             throw new UncheckedIOException("Failed to encode atomic WAL deletions", exception);
         }
         commitBatch(OP_DELETE_BATCH, payload, Map.of(), deletions);
+    }
+
+    @Override
+    public void applyAtomically(Map<K, V> entries, Set<K> keys) {
+        Map<K, V> replacements = Map.copyOf(entries);
+        Set<K> deletions = Set.copyOf(keys);
+        if (replacements.isEmpty() && deletions.isEmpty()) {
+            return;
+        }
+        byte[] payload;
+        try {
+            byte[] puts = walMapper.writeValueAsBytes(replacements);
+            byte[] removes = walMapper.writeValueAsBytes(deletions);
+            payload = ByteBuffer.allocate(2 * Integer.BYTES + puts.length + removes.length)
+                    .putInt(puts.length).put(puts).putInt(removes.length).put(removes).array();
+        } catch (IOException exception) {
+            throw new UncheckedIOException("Failed to encode mixed atomic WAL batch", exception);
+        }
+        commitBatch(OP_MIXED_BATCH, payload, replacements, deletions);
     }
 
     private void commitBatch(byte operation, byte[] payload, Map<K, V> replacements, Set<K> deletions) {
@@ -513,6 +535,33 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
                         LOG.warnv("Invalid WAL deletion batch at offset {0} in {1}, stopping replay", consumed, walPath);
                         break;
                     }
+                    keys.forEach(store::remove);
+                } else if (op == OP_MIXED_BATCH) {
+                    ByteBuffer payload = ByteBuffer.wrap(keyBytes);
+                    if (payload.remaining() < 2 * Integer.BYTES) {
+                        break;
+                    }
+                    int putsLength = payload.getInt();
+                    if (putsLength < 1 || putsLength > payload.remaining() - Integer.BYTES) {
+                        break;
+                    }
+                    byte[] puts = new byte[putsLength];
+                    payload.get(puts);
+                    int removesLength = payload.getInt();
+                    if (removesLength < 1 || removesLength != payload.remaining()) {
+                        break;
+                    }
+                    byte[] removes = new byte[removesLength];
+                    payload.get(removes);
+                    Map<K, V> batch = walMapper.readValue(puts, typeReference);
+                    List<K> keys = walMapper.readValue(removes, walMapper.getTypeFactory().constructCollectionType(
+                            List.class, walMapper.constructType(typeReference.getType()).getKeyType()));
+                    if (batch == null || batch.entrySet().stream()
+                            .anyMatch(entry -> entry.getKey() == null || entry.getValue() == null)
+                            || keys == null || keys.stream().anyMatch(key -> key == null)) {
+                        break;
+                    }
+                    store.putAll(batch);
                     keys.forEach(store::remove);
                 } else if (op == OP_PUT) {
                     byte[] valueBytes = readFrame(in, fileSize - consumed - recordLength);
