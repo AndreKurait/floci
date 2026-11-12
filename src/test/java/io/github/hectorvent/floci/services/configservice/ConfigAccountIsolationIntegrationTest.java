@@ -39,6 +39,9 @@ class ConfigAccountIsolationIntegrationTest {
                     "SourceIdentifier":"arn:aws:lambda:us-east-1:%s:function:check"}}}
                     """.formatted(account));
         }
+        call(FIRST, "PutDeliveryChannel", """
+                {"DeliveryChannel":{"name":"shared","s3BucketName":"config-isolation"}}
+                """);
         call(FIRST, "StartConfigurationRecorder", "{\"ConfigurationRecorderName\":\"shared\"}");
         call(FIRST, "StartConfigRulesEvaluation", "{\"ConfigRuleNames\":[\"shared\"]}");
         call(SECOND, "DescribeConfigurationRecorderStatus", "{}")
@@ -55,5 +58,6 @@ class ConfigAccountIsolationIntegrationTest {
                 .body("ConfigRulesEvaluationStatus[0].FirstActivatedTime", notNullValue());
         call(FIRST, "DeleteConfigRule", "{\"ConfigRuleName\":\"shared\"}");
         call(FIRST, "DeleteConfigurationRecorder", "{\"ConfigurationRecorderName\":\"shared\"}");
+        call(FIRST, "DeleteDeliveryChannel", "{\"DeliveryChannelName\":\"shared\"}");
     }
 }

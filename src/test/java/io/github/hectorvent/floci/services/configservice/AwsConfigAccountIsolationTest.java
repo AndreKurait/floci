@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.configservice;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -55,6 +56,7 @@ class AwsConfigAccountIsolationTest {
         assertFalse(service.describeConfigurationRecorderStatus(REGION, null).getFirst().recording());
         assertNull(service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStartTime());
         service.deleteDeliveryChannel(REGION, "default");
+        service.putDeliveryChannel(REGION, new DeliveryChannel("replacement", "bucket", null, null, null, null));
         service.startConfigurationRecorder(REGION, "default");
         service.stopConfigurationRecorder(REGION, "default");
         context.setAccountId(FIRST);
@@ -65,6 +67,86 @@ class AwsConfigAccountIsolationTest {
         context.setAccountId(FIRST);
         assertTrue(service.describeConfigurationRecorderStatus(REGION, null).getFirst().recording());
         assertNotNull(service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStartTime());
+    }
+
+    @Test
+    void recorderWithoutDeliveryChannelCannotStartOrAcquireStartTime() {
+        service.putConfigurationRecorder(REGION, new ConfigurationRecorder("default", "role", null, null));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startConfigurationRecorder(REGION, "default"));
+
+        assertEquals("NoAvailableDeliveryChannelException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertFalse(service.describeConfigurationRecorderStatus(REGION, null).getFirst().recording());
+        assertNull(service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStartTime());
+        service.putDeliveryChannel(REGION, new DeliveryChannel("delivery", "bucket", null, null, null, null));
+        service.startConfigurationRecorder(REGION, "default");
+        assertTrue(service.describeConfigurationRecorderStatus(REGION, null).getFirst().recording());
+        assertNotNull(service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStartTime());
+    }
+
+    @Test
+    void deliveryChannelInAnotherAccountDoesNotAllowRecorderStart() {
+        service.putConfigurationRecorder(REGION, new ConfigurationRecorder("default", "role", null, null));
+        service.putDeliveryChannel(REGION, new DeliveryChannel("default", "bucket", null, null, null, null));
+        context.setAccountId(SECOND);
+        service.putConfigurationRecorder(REGION, new ConfigurationRecorder("default", "role", null, null));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startConfigurationRecorder(REGION, "default"));
+
+        assertEquals("NoAvailableDeliveryChannelException", error.getErrorCode());
+        assertFalse(service.describeConfigurationRecorderStatus(REGION, null).getFirst().recording());
+        assertNull(service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStartTime());
+        context.setAccountId(FIRST);
+        service.startConfigurationRecorder(REGION, "default");
+        assertTrue(service.describeConfigurationRecorderStatus(REGION, null).getFirst().recording());
+    }
+
+    @Test
+    void deliveryChannelInAnotherRegionDoesNotAllowRecorderStart() {
+        service.putConfigurationRecorder(REGION, new ConfigurationRecorder("default", "role", null, null));
+        service.putDeliveryChannel(REGION, new DeliveryChannel("default", "bucket", null, null, null, null));
+        String otherRegion = "eu-west-1";
+        service.putConfigurationRecorder(otherRegion, new ConfigurationRecorder("default", "role", null, null));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startConfigurationRecorder(otherRegion, "default"));
+
+        assertEquals("NoAvailableDeliveryChannelException", error.getErrorCode());
+        assertFalse(service.describeConfigurationRecorderStatus(otherRegion, null).getFirst().recording());
+        assertNull(service.describeConfigurationRecorderStatus(otherRegion, null).getFirst().lastStartTime());
+        service.startConfigurationRecorder(REGION, "default");
+        assertTrue(service.describeConfigurationRecorderStatus(REGION, null).getFirst().recording());
+    }
+
+    @Test
+    void failedRestartAfterChannelDeletionPreservesPreviousRecorderTimes() {
+        service.putConfigurationRecorder(REGION, new ConfigurationRecorder("default", "role", null, null));
+        service.putDeliveryChannel(REGION, new DeliveryChannel("default", "bucket", null, null, null, null));
+        service.startConfigurationRecorder(REGION, "default");
+        service.stopConfigurationRecorder(REGION, "default");
+        Long lastStart = service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStartTime();
+        Long lastStop = service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStopTime();
+        service.deleteDeliveryChannel(REGION, "default");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startConfigurationRecorder(REGION, "default"));
+
+        assertEquals("NoAvailableDeliveryChannelException", error.getErrorCode());
+        assertFalse(service.describeConfigurationRecorderStatus(REGION, null).getFirst().recording());
+        assertEquals(lastStart, service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStartTime());
+        assertEquals(lastStop, service.describeConfigurationRecorderStatus(REGION, null).getFirst().lastStopTime());
+    }
+
+    @Test
+    void missingRecorderKeepsItsOwnErrorWhenDeliveryChannelIsAlsoMissing() {
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startConfigurationRecorder(REGION, "missing"));
+
+        assertEquals("NoSuchConfigurationRecorderException", error.getErrorCode());
+        assertTrue(service.describeConfigurationRecorders(REGION, null).isEmpty());
     }
 
     @Test
