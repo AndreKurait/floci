@@ -7,6 +7,7 @@ Route53 emulation supporting hosted zones, reusable delegation sets, resource re
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
+| `TestDNSAnswer` | `GET /2013-04-01/testdnsanswer`. Evaluates supported records in a selected public hosted zone; see limitations below. |
 | `CreateReusableDelegationSet` | `POST /2013-04-01/delegationset`. Optionally promotes an existing public zone with `HostedZoneId`. |
 | `GetReusableDelegationSet` | `GET /2013-04-01/delegationset/{Id}` |
 | `DeleteReusableDelegationSet` | `DELETE /2013-04-01/delegationset/{Id}`. Refuses to delete a set in use by a zone. |
@@ -59,6 +60,30 @@ Route53 emulation supporting hosted zones, reusable delegation sets, resource re
 - A cross-account association without a matching authorization fails with `NotAuthorizedException`.
 - Private hosted zones support up to 300 VPC associations and up to 1000 outstanding cross-account VPC association authorizations, matching the documented Route 53 default quotas.
 - Set `FLOCI_SERVICES_ROUTE53_VPC_ASSOCIATION_CONTROL_PLANE_DELAY_MS` above `0` to emulate a short in-flight control-plane window for retry testing. During that window, a subsequent `AssociateVPCWithHostedZone` for the same hosted zone returns `PriorRequestNotComplete`; overlapping create/delete authorization requests return `ConcurrentModification`. These are the retryable overlap errors documented by Route 53 for those operations.
+
+## Testing public DNS answers
+
+`TestDNSAnswer` evaluates records in the caller's selected public hosted zone.
+It returns stored DNS presentation values (including quoted TXT chunks), the
+submitted record name and type, a member of the zone's assigned delegation set,
+and a DNS response code. Exact names, wildcards, empty nonterminals, `NXDOMAIN`
+and `NOERROR` without answer data follow the existing record lookup rules.
+Simple records, weighted selection, and `A`/`AAAA` aliases to records in the
+same zone are supported. Subdomain NS delegations are referrals and are not
+returned as answer data; DS records at a delegation owner remain parent-zone
+answers.
+
+The operation validates IPv4/IPv6 resolver and EDNS client subnet options.
+Location-dependent, failover, health-evaluated, and other unsupported routing
+policies return `REFUSED`; resolver and subnet options do not alter simple or
+weighted selection. External aliases, CNAME chasing, alias cycles, alias chains
+beyond eight visited names, and queries outside the selected zone also return
+`REFUSED`. This is an in-process answer
+simulation with `Protocol=UDP`; it does not contact external resolvers or
+simulate packet-size limits, TCP fallback, DNSSEC, or recursive resolution.
+Private zones return `InvalidInput`; missing or other-account zones return
+`NoSuchHostedZone`. With IAM enforcement enabled, access requires
+`route53:TestDNSAnswer` on `Resource: "*"`.
 
 ## Private Hosted Zone DNS Resolution
 
@@ -208,5 +233,4 @@ the record. DELETE still requires matching record values and routing properties.
 - Traffic policies and traffic policy instances
 - Query logging configs
 - DNSSEC (key signing keys, enabling/disabling)
-- `TestDNSAnswer`
 - Public authoritative record types other than simple TXT, NS, and SOA; public routing policies, delegation referrals, and DNS-over-TCP
