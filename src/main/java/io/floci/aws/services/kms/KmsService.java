@@ -954,16 +954,17 @@ public class KmsService implements ResourceProvider {
                 throw new AwsException("LimitExceededException",
                         "On-demand rotation quota for KMS key " + key.getKeyId() + " is exceeded.", 400);
             }
-            key.setOnDemandRotationCount(key.getOnDemandRotationCount() + 1);
+            KmsKey rotated = new KmsKey(key);
+            rotated.setOnDemandRotationCount(rotated.getOnDemandRotationCount() + 1);
             // AWS keeps prior backing keys after rotation so ciphertext encrypted under them keeps
             // decrypting.
-            keyTypes.symmetric().addBackingKey(key);
-            key.getBackingKeyRotationDates().put(key.getCurrentBackingKeyId(), Instant.now().toEpochMilli());
-            keyStore.put(region + "::" + key.getKeyId(), key);
-            if (MULTI_REGION_PRIMARY.equals(key.getMultiRegionKeyType())) {
-                synchronizeMultiRegionReplicas(key);
+            keyTypes.symmetric().addBackingKey(rotated);
+            rotated.getBackingKeyRotationDates().put(rotated.getCurrentBackingKeyId(), Instant.now().toEpochMilli());
+            keyStore.put(region + "::" + rotated.getKeyId(), rotated);
+            if (MULTI_REGION_PRIMARY.equals(rotated.getMultiRegionKeyType())) {
+                synchronizeMultiRegionReplicas(rotated);
             }
-            return key.getKeyId();
+            return rotated.getKeyId();
         }
     }
 

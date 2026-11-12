@@ -53,6 +53,36 @@ public class KmsKey {
         this.creationDate = Instant.now().getEpochSecond();
     }
 
+    public KmsKey(KmsKey source) {
+        this.keyId = source.keyId;
+        this.arn = source.arn;
+        this.description = source.description;
+        this.enabled = source.enabled;
+        this.keyState = source.keyState;
+        this.origin = source.origin;
+        this.keyManager = source.keyManager;
+        this.expirationModel = source.expirationModel;
+        this.validTo = source.validTo;
+        this.importParameters = source.importParameters;
+        this.keyMaterialId = source.keyMaterialId;
+        this.keyUsage = source.keyUsage;
+        this.keySpec = source.keySpec;
+        this.multiRegion = source.multiRegion;
+        this.multiRegionKeyType = source.multiRegionKeyType;
+        this.multiRegionPrimaryRegion = source.multiRegionPrimaryRegion;
+        this.creationDate = source.creationDate;
+        this.deletionDate = source.deletionDate;
+        this.policy = source.policy;
+        this.keyRotationEnabled = source.keyRotationEnabled;
+        this.tags = source.tags == null ? null : new HashMap<>(source.tags);
+        this.privateKeyEncoded = source.privateKeyEncoded;
+        this.publicKeyEncoded = source.publicKeyEncoded;
+        this.onDemandRotationCount = source.onDemandRotationCount;
+        this.backingKeys = source.backingKeys == null ? null : new HashMap<>(source.backingKeys);
+        this.currentBackingKeyId = source.currentBackingKeyId;
+        this.backingKeyRotationDates = source.backingKeyRotationDates == null ? null : new HashMap<>(source.backingKeyRotationDates);
+    }
+
     public String getKeyId() { return keyId; }
     public void setKeyId(String keyId) { this.keyId = keyId; }
 
