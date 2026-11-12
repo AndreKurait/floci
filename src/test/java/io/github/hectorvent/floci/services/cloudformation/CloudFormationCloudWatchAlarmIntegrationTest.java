@@ -32,6 +32,7 @@ class CloudFormationCloudWatchAlarmIntegrationTest {
     @AfterEach
     void deleteStacks() {
         for (String stack : stacks) {
+            CfnStackWaits.awaitTerminal(stack, CFN_AUTH);
             CfnStackWaits.deleteStack(stack, CFN_AUTH);
         }
     }
