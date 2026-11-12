@@ -1,6 +1,7 @@
 package io.floci.aws.services.cloudformation;
 
 import io.floci.aws.core.common.XmlParser;
+import io.floci.aws.testing.CfnStackWaits;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
@@ -196,6 +197,7 @@ class CloudFormationDeletionPolicyIntegrationTest {
             """.formatted(keptBucket, rolledBackBucket, suffix);
 
         String stackId = createStack(stackName, template);
+        CfnStackWaits.awaitStatus(stackId, "ROLLBACK_COMPLETE");
 
         assertThat(describeStacks(stackId), containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
         assertBucketExists(keptBucket);

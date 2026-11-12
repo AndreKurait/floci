@@ -9,6 +9,7 @@ import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.apigateway.ApiGatewayController;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
 import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.route53.Route53Controller;
@@ -656,6 +657,13 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && ("getModelTemplate".equals(resourceInfo.getResourceMethod().getName())
+                || "getV2ModelTemplate".equals(resourceInfo.getResourceMethod().getName()))) {
+            return "apigateway:GET";
+        }
         if ("route53".equals(credentialScope) && resourceInfo != null
                 && Route53Controller.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
