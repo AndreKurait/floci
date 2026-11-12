@@ -3639,7 +3639,7 @@ class Ec2ServiceTest {
     @Test
     void aSecondaryAddressUpdateRefusesAGatewayStoredAsDeleted() throws Exception {
         CountDownLatch putReached = new CountDownLatch(1);
-        CountDownLatch deleteDone = new CountDownLatch(1);
+        CountDownLatch gatewayDeleted = new CountDownLatch(1);
         AtomicReference<Boolean> pausePut = new AtomicReference<>(false);
         InMemoryStorage<String, NatGateway> rawGateways = new InMemoryStorage<>() {
             @Override
@@ -3647,12 +3647,18 @@ class Ec2ServiceTest {
                 if (pausePut.getAndSet(false)) {
                     putReached.countDown();
                     try {
-                        assertTrue(deleteDone.await(5, TimeUnit.SECONDS));
+                        assertTrue(gatewayDeleted.await(5, TimeUnit.SECONDS));
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
                 }
                 super.put(key, value);
+            }
+
+            @Override
+            public void delete(String key) {
+                super.delete(key);
+                gatewayDeleted.countDown();
             }
         };
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
@@ -3671,7 +3677,6 @@ class Ec2ServiceTest {
                     List.of(new Tag("k", "v"))));
             assertTrue(putReached.await(5, TimeUnit.SECONDS), "the tag write reaches its put");
             service.deleteNatGateway(region, natId);
-            deleteDone.countDown();
             tagging.get(5, TimeUnit.SECONDS);
             assertEquals("deleted", rawGateways.scan(k -> true).getFirst().getState(),
                     "the tag write stored the deleted gateway");
@@ -3682,6 +3687,7 @@ class Ec2ServiceTest {
             assertNull(service.describeAddresses(region, List.of(added), Map.of()).getFirst().getAssociationId(),
                     "the requested Elastic IP is not held for the deleted gateway");
         } finally {
+            gatewayDeleted.countDown();
             worker.shutdownNow();
             assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
         }

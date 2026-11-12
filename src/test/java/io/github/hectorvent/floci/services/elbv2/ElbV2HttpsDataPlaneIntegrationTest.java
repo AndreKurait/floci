@@ -22,6 +22,7 @@ import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
+import org.awaitility.core.ThrowingRunnable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -44,6 +45,7 @@ import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.MessageDigest;
@@ -748,11 +750,14 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static void awaitPlainResponse(String host, int port, String body) {
-        await().ignoreException(ConnectException.class)
-                .atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+        awaitPlainResponse(() -> assertPlainResponse(host, port, body), Duration.ofSeconds(10));
+    }
+
+    static void awaitPlainResponse(ThrowingRunnable response, Duration timeout) {
+        await().ignoreExceptionsMatching(SocketException.class::isInstance)
+                .atMost(timeout).pollInterval(Duration.ofMillis(100))
                 .pollDelay(Duration.ZERO)
-                .untilAsserted(() ->
-                        assertPlainResponse(host, port, body));
+                .untilAsserted(response);
     }
 
     @Test
