@@ -38,6 +38,36 @@ class CognitoIdentityDataPlaneSdkIntegrationTest {
     @TestHTTPResource URI endpoint;
 
     @Test
+    void developerProviderCannotBeChangedOrRemovedThroughPoolUpdate() {
+        try (CognitoIdentityClient admin = client(Region.US_EAST_1, false)) {
+            String pool = pool(admin);
+            try {
+                String identity = admin.getOpenIdTokenForDeveloperIdentity(r -> r.identityPoolId(pool)
+                        .logins(Map.of(PROVIDER, "alice"))).identityId();
+                for (String replacement : new String[]{"login.other.test", null}) {
+                    CognitoIdentityException error = assertThrows(CognitoIdentityException.class,
+                            () -> admin.updateIdentityPool(r -> r.identityPoolId(pool)
+                                    .identityPoolName("rejected update").allowUnauthenticatedIdentities(true)
+                                    .developerProviderName(replacement)));
+                    assertEquals("InvalidParameterException", error.awsErrorDetails().errorCode());
+                    assertEquals(400, error.statusCode());
+                    assertEquals(PROVIDER, admin.describeIdentityPool(r -> r.identityPoolId(pool))
+                            .developerProviderName());
+                    assertEquals(List.of(PROVIDER), admin.describeIdentity(r -> r.identityId(identity)).logins());
+                    assertEquals(identity, admin.lookupDeveloperIdentity(r -> r.identityPoolId(pool)
+                            .developerUserIdentifier("alice").maxResults(1)).identityId());
+                }
+                admin.updateIdentityPool(r -> r.identityPoolId(pool).identityPoolName("accepted update")
+                        .allowUnauthenticatedIdentities(true).developerProviderName(PROVIDER));
+                assertEquals("accepted update", admin.describeIdentityPool(r -> r.identityPoolId(pool))
+                        .identityPoolName());
+            } finally {
+                admin.deleteIdentityPool(r -> r.identityPoolId(pool));
+            }
+        }
+    }
+
+    @Test
     void nativeGuestAndDeveloperLifecyclesUseRealRecordsPaginationAndLastLinkDeactivation() throws Exception {
         try (CognitoIdentityClient admin = client(Region.US_EAST_1, false);
              CognitoIdentityClient publicClient = client(Region.US_EAST_1, true)) {
