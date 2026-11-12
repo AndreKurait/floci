@@ -42,7 +42,8 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class IamActionRegistry {
 
-    private static final Map<String, String> ROUTE53_DELEGATION_ACTIONS = Map.of(
+    private static final Map<String, String> ROUTE53_ACTIONS = Map.of(
+            "testDnsAnswer", "route53:TestDNSAnswer",
             "createReusableDelegationSet", "route53:CreateReusableDelegationSet",
             "getReusableDelegationSet", "route53:GetReusableDelegationSet",
             "listReusableDelegationSets", "route53:ListReusableDelegationSets",
@@ -689,7 +690,7 @@ public class IamActionRegistry {
         if ("route53".equals(credentialScope) && resourceInfo != null
                 && Route53Controller.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
-            return ROUTE53_DELEGATION_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+            return ROUTE53_ACTIONS.get(resourceInfo.getResourceMethod().getName());
         }
         return null;
     }
