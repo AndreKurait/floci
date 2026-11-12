@@ -63,6 +63,11 @@ public class ResourceArnBuilder {
 
     private static final Pattern ACCESS_POLICY_ARN = Pattern.compile(EksController.ACCESS_POLICY_ARN);
 
+    private static final Set<String> S3TABLES_METRICS_ACTIONS = Set.of(
+            "s3tables:PutTableBucketMetricsConfiguration",
+            "s3tables:GetTableBucketMetricsConfiguration",
+            "s3tables:DeleteTableBucketMetricsConfiguration");
+
     /** The only scheme IAM accepts on an OIDC provider URL, and the part its ARN drops. */
     private static final String OIDC_URL_SCHEME = "https://";
 
@@ -219,6 +224,12 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("s3tables".equals(credentialScope) && operation != null && S3TABLES_METRICS_ACTIONS.contains(operation)) {
+            String bucketArn = ctx.getUriInfo().getPathParameters().getFirst("tableBucketARN");
+            return AwsArnUtils.isArnFor(bucketArn, "s3tables")
+                    && AwsArnUtils.parse(bucketArn).resource().startsWith("bucket/")
+                    ? List.of(bucketArn) : List.of("*");
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
