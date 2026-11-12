@@ -7379,6 +7379,33 @@ class RdsServiceTest {
         return rdsService.createDbClusterSnapshot(snapshotId, "aurora-cluster", Map.of("owner", "platform"));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void clusterSnapshotCopyRefusesMissingDataWithoutCreatingATarget(boolean mockMode) {
+        when(rdsConfig.mock()).thenReturn(mockMode);
+        Map<String, StorageBackend<String, ?>> stores = new HashMap<>();
+        StorageFactory factory = mock(StorageFactory.class);
+        when(factory.create(eq("rds"), any(), any())).thenAnswer(invocation -> stores.computeIfAbsent(
+                invocation.getArgument(1), name -> AccountAwareStorageBackend.inMemory("123456789012")));
+        RdsService service = new RdsService(containerManager, proxyManager, ec2Service, regionResolver, config,
+                factory, null, null, null, null, kmsService, null);
+        service.createDbCluster("copy-source", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", false, null);
+        when(containerManager.createPostgresSnapshot(any(), eq("admin"))).thenReturn("CLUSTER_DUMP");
+        DbClusterSnapshot source = service.createDbClusterSnapshot("source-snapshot", "copy-source", Map.of());
+        stores.get("rds-snapshot-data.json").clear();
+
+        AwsException failure = assertThrows(AwsException.class, () ->
+                service.copyDbClusterSnapshot(source.getDbClusterSnapshotArn(), "target-snapshot", false, null));
+
+        assertEquals("DBClusterSnapshotNotFoundFault", failure.getErrorCode());
+        assertEquals(404, failure.getHttpStatus());
+        assertEquals(1, service.describeDbClusterSnapshots("source-snapshot", null, null).size());
+        assertEquals("DBClusterSnapshotNotFoundFault", assertThrows(AwsException.class, () ->
+                service.describeDbClusterSnapshots("target-snapshot", null, null)).getErrorCode());
+        assertTrue(stores.get("rds-snapshot-data.json").scan(key -> true).isEmpty());
+    }
+
     @Test
     void createDbClusterSnapshotRecordsTheClusterAndItsData() {
         DbClusterSnapshot snapshot = clusterSnapshotOfNewCluster("csnap");
