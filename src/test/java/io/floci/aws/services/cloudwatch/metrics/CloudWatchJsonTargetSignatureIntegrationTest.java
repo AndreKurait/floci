@@ -9,6 +9,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -86,6 +87,33 @@ class CloudWatchJsonTargetSignatureIntegrationTest {
                     .then().statusCode(200).body("Metrics", notNullValue());
             json(prefix, "DescribeAlarms").filter(signer).post("/")
                     .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+        }
+    }
+
+    @Test
+    void alarmActionPermissionsAreCheckedBeforeChangingTheAlarm() throws Exception {
+        String name = "cw-action-permissions-" + Long.toString(System.nanoTime(), 36);
+        AwsRequestSigner root = AwsRequestSigner.signedAs("test", "test", "monitoring");
+        json(CURRENT_TARGET, "PutCompositeAlarm").filter(root)
+                .body("{\"AlarmName\":\"" + name + "\",\"AlarmRule\":\"FALSE\",\"ActionsEnabled\":false}")
+                .post("/").then().statusCode(200);
+        String selected = "{\"AlarmNames\":[\"" + name + "\"]}";
+        String describe = "{\"AlarmNames\":[\"" + name + "\"],\"AlarmTypes\":[\"CompositeAlarm\"]}";
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "cw-action-permissions-", "enable-only", """
+                {"Version":"2012-10-17","Statement":[{
+                  "Effect":"Allow","Action":"cloudwatch:EnableAlarmActions","Resource":"*"
+                }]}
+                """)) {
+            AwsRequestSigner signer = user.signer("monitoring");
+            json(CURRENT_TARGET, "EnableAlarmActions").filter(signer).body(selected).post("/")
+                    .then().statusCode(200);
+            json(CURRENT_TARGET, "DisableAlarmActions").filter(signer).body(selected).post("/")
+                    .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+            json(CURRENT_TARGET, "DescribeAlarms").filter(root).body(describe).post("/")
+                    .then().statusCode(200).body("CompositeAlarms[0].ActionsEnabled", equalTo(true));
+        } finally {
+            json(CURRENT_TARGET, "DeleteAlarms").filter(root).body(selected).post("/")
+                    .then().statusCode(200);
         }
     }
 
