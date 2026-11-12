@@ -22,6 +22,7 @@ metrics are intentionally outside this implementation.
 | Area | Operations |
 |---|---|
 | Table buckets | CreateTableBucket, GetTableBucket, ListTableBuckets, DeleteTableBucket |
+| Storage classes | GetTableBucketStorageClass, PutTableBucketStorageClass, GetTableStorageClass |
 | Bucket policy | PutTableBucketPolicy, GetTableBucketPolicy, DeleteTableBucketPolicy |
 | Bucket maintenance | PutTableBucketMaintenanceConfiguration, GetTableBucketMaintenanceConfiguration |
 | Namespaces | CreateNamespace, GetNamespace, ListNamespaces, DeleteNamespace |
@@ -33,6 +34,13 @@ metrics are intentionally outside this implementation.
 Tables must use `ICEBERG` format. `UpdateTableMetadataLocation` implements
 optimistic concurrency: supply the table's current `versionToken`; a stale
 token returns `ConflictException`.
+
+Storage classes support `STANDARD` (the default) and `INTELLIGENT_TIERING`.
+`PutTableBucketStorageClass` changes the default for new tables. Each table
+retains the class selected at creation, either its explicit configuration or
+the bucket's default at that time. Bucket settings and table classes survive
+restarts in persistent storage modes. These settings are metadata; Floci does
+not move table data between storage tiers.
 
 ## Example
 
