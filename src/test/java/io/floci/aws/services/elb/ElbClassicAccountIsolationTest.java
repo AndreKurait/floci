@@ -114,16 +114,19 @@ class ElbClassicAccountIsolationTest {
         // The instance now fails, which only the first account's own periodic check can notice.
         healthChecker.runArmedChecks();
         context.setAccountId(FIRST);
-        await().pollInSameThread().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            ElbClassicHealthChecker.InstanceHealth health = health();
-            assertEquals("OutOfService", health.state());
-            assertEquals("Instance", health.reasonCode());
-        });
+        await().pollInSameThread().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    ElbClassicHealthChecker.InstanceHealth health = health();
+                    assertEquals("OutOfService", health.state());
+                    assertEquals("Instance", health.reasonCode());
+                });
 
         // And it recovers, which the other account's default TCP:80 check could not report.
         backendStatus.set(200);
         healthChecker.runArmedChecks();
         await().pollInSameThread().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .until(() -> "InService".equals(health().state()));
     }
 
@@ -156,6 +159,7 @@ class ElbClassicAccountIsolationTest {
         healthChecker.healthCheckChanged(lb);
         service.registerInstances(REGION, "web", List.of(INSTANCE));
         await().pollInSameThread().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .until(() -> "InService".equals(health().state()));
     }
 

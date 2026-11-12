@@ -14,6 +14,7 @@ import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -27,6 +28,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.xml.HasXPath.hasXPath;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -712,18 +714,15 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
      * somewhere else from being mistaken for a parked launch, which would deregister too early
      * and let the launch fail its *first* check instead, proving nothing.
      */
-    private static void awaitParkedOnTheRegistryLock(Thread thread) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (System.nanoTime() - deadline < 0) {
-            StackTraceElement[] stack = thread.getStackTrace();
-            if (thread.getState() == Thread.State.BLOCKED && stack.length > 0
-                    && "runInstances".equals(stack[0].getMethodName())
-                    && Ec2Service.class.getName().equals(stack[0].getClassName())) {
-                return;
-            }
-            Thread.sleep(1);
-        }
-        throw new AssertionError("the launch never parked on the image registry lock");
+    private static void awaitParkedOnTheRegistryLock(Thread thread) {
+        await("the launch parked on the image registry lock").atMost(Duration.ofSeconds(30))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> {
+                    StackTraceElement[] stack = thread.getStackTrace();
+                    return thread.getState() == Thread.State.BLOCKED && stack.length > 0
+                            && "runInstances".equals(stack[0].getMethodName())
+                            && Ec2Service.class.getName().equals(stack[0].getClassName());
+                });
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────

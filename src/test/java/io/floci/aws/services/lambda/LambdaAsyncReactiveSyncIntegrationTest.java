@@ -60,15 +60,17 @@ class LambdaAsyncReactiveSyncIntegrationTest {
 
         given().header("Authorization", S3_AUTH).body(v2).when().put("/" + BUCKET + "/" + KEY).then().statusCode(200);
 
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
-            given()
-                .header("Authorization", LAMBDA_AUTH)
-            .when()
-                .get("/2015-03-31/functions/" + FN + "/configuration")
-            .then()
-                .statusCode(200)
-                .body("LastUpdateStatus", equalTo("Successful"))
-                .body("CodeSha256", equalTo(sha256(v2))));
+        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+                .pollDelay(Duration.ZERO)
+                .untilAsserted(() ->
+                    given()
+                        .header("Authorization", LAMBDA_AUTH)
+                    .when()
+                        .get("/2015-03-31/functions/" + FN + "/configuration")
+                    .then()
+                        .statusCode(200)
+                        .body("LastUpdateStatus", equalTo("Successful"))
+                        .body("CodeSha256", equalTo(sha256(v2))));
     }
 
     private static String sha256(byte[] data) throws Exception {

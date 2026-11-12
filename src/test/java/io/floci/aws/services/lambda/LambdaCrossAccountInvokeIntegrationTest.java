@@ -432,8 +432,10 @@ class LambdaCrossAccountInvokeIntegrationTest {
      * trying to update.
      */
     private static void awaitRotationFinished(String accessKeyId, String secretName) {
-        await().atMost(Duration.ofSeconds(5)).until(() -> secretsManager(accessKeyId, "DescribeSecret",
-                "{\"SecretId\":\"" + secretName + "\"}").statusCode(200).extract().path("LastRotatedDate") != null);
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> secretsManager(accessKeyId, "DescribeSecret",
+                        "{\"SecretId\":\"" + secretName + "\"}").statusCode(200).extract().path("LastRotatedDate") != null);
     }
 
     private String createUser(String account, String userName, String policyDocument) {
