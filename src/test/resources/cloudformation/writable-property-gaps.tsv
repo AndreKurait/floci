@@ -128,6 +128,7 @@ AWS::CloudFormation::CustomResource	ServiceTimeout	accepted and ignored
 AWS::CloudFront::Distribution	Tags	accepted and ignored
 AWS::CloudFront::Function	FunctionMetadata	accepted and ignored
 AWS::CloudTrail::Trail	AggregationConfigurations	accepted and ignored
+AWS::CloudTrail::Trail	RecursiveLogging	accepted and ignored; recursive logging is not implemented
 AWS::CloudTrail::Trail	CloudWatchLogsLogGroupArn	accepted and ignored
 AWS::CloudTrail::Trail	CloudWatchLogsRoleArn	accepted and ignored
 AWS::CloudTrail::Trail	InsightSelectors	accepted and ignored

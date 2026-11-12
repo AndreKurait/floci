@@ -848,6 +848,10 @@
     "S3Destination",
     "SyncType"
   ],
+  "AWS::StepFunctions::Activity": [
+    "Name",
+    "EncryptionConfiguration"
+  ],
   "AWS::StepFunctions::StateMachine": [
     "StateMachineName",
     "StateMachineType"
