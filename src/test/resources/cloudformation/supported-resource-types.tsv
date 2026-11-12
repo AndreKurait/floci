@@ -64,6 +64,7 @@ AWS::CloudWatch::CompositeAlarm	CloudWatchCompositeAlarmCfnProvisioner
 AWS::CloudWatch::Dashboard	CloudWatchDashboardCfnProvisioner
 AWS::CodeBuild::Project	CodeBuildCfnProvisioner
 AWS::CodeDeploy::Application	CodeDeployCfnProvisioner
+AWS::CodeDeploy::DeploymentConfig	CodeDeployCfnProvisioner
 AWS::CodeDeploy::DeploymentGroup	CodeDeployCfnProvisioner
 AWS::CodePipeline::CustomActionType	CodePipelineCfnProvisioner
 AWS::CodePipeline::Pipeline	CodePipelineCfnProvisioner

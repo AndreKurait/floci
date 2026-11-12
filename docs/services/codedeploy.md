@@ -53,6 +53,17 @@ existing application storage and region visibility.
 | `DeleteDeploymentConfig` | Custom configs only; built-ins cannot be deleted |
 | `ListDeploymentConfigs` | Returns all configs including all 17 pre-seeded built-ins |
 
+CloudFormation provisions `AWS::CodeDeploy::DeploymentConfig` through these
+APIs. `Ref` returns the configuration name. The resource supports
+`ComputePlatform`, `MinimumHealthyHosts`, `TrafficRoutingConfig`, and
+`ZonalConfig`, including per-zone host counts and monitoring durations.
+
+Configuration properties are immutable. An unchanged resource keeps its name
+and identity. Changes replace an unnamed configuration, while a configuration
+with an explicit `DeploymentConfigName` requires a new name. Stack rollback
+restores the previous configuration and removes the attempted replacement;
+stack deletion removes the owned configuration.
+
 ### Deployment Execution
 
 | Operation | Notes |

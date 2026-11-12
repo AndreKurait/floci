@@ -210,6 +210,13 @@
   "AWS::CodeBuild::Project": [
     "Name"
   ],
+  "AWS::CodeDeploy::DeploymentConfig": [
+    "ComputePlatform",
+    "DeploymentConfigName",
+    "MinimumHealthyHosts",
+    "TrafficRoutingConfig",
+    "ZonalConfig"
+  ],
   "AWS::CodePipeline::CustomActionType": [
     "Category",
     "ConfigurationProperties",
