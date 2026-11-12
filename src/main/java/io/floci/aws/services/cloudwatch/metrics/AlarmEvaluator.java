@@ -11,6 +11,7 @@ import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -44,21 +45,31 @@ import java.util.concurrent.TimeUnit;
 public class AlarmEvaluator {
 
     private static final Logger LOG = Logger.getLogger(AlarmEvaluator.class);
+    static final long INITIAL_DELAY_SECONDS = 5;
+    static final long TICK_SECONDS = 10;
 
     private final CloudWatchMetricsService metricsService;
     private final Instance<AlarmActionHandler> handlers;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
-            r -> new Thread(r, "alarm-evaluator"));
+    private final Clock clock;
+    private final ScheduledExecutorService scheduler;
 
     @Inject
     AlarmEvaluator(CloudWatchMetricsService metricsService, @Any Instance<AlarmActionHandler> handlers) {
+        this(metricsService, handlers, Clock.systemUTC(), Executors.newSingleThreadScheduledExecutor(
+                r -> new Thread(r, "alarm-evaluator")));
+    }
+
+    AlarmEvaluator(CloudWatchMetricsService metricsService, Instance<AlarmActionHandler> handlers,
+                   Clock clock, ScheduledExecutorService scheduler) {
         this.metricsService = metricsService;
         this.handlers = handlers;
+        this.clock = clock;
+        this.scheduler = scheduler;
     }
 
     @PostConstruct
     void start() {
-        scheduler.scheduleAtFixedRate(this::evaluateAll, 5, 10, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::evaluateAll, INITIAL_DELAY_SECONDS, TICK_SECONDS, TimeUnit.SECONDS);
     }
 
     @PreDestroy
@@ -114,7 +125,7 @@ public class AlarmEvaluator {
         int period = alarm.getPeriod();
         int evaluationPeriods = alarm.getEvaluationPeriods();
         int range = evaluationRange(evaluationPeriods);
-        long nowBucket = (Instant.now().getEpochSecond() / period) * period;
+        long nowBucket = (clock.instant().getEpochSecond() / period) * period;
         long lastCompleteBucket = nowBucket - period;
         long oldestBucket = lastCompleteBucket - (long) period * (range - 1);
         Instant start = Instant.ofEpochSecond(oldestBucket);

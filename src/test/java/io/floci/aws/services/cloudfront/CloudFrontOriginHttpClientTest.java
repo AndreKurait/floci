@@ -693,6 +693,7 @@ class CloudFrontOriginHttpClientTest {
 
     @Test
     void theCompletionTimeoutEndsAStalledBody() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.createContext("/", exchange -> {
@@ -701,7 +702,7 @@ class CloudFrontOriginHttpClientTest {
                 out.write('x');
                 out.flush();
                 // The body then stalls: the headers arrived, the rest of the body never does.
-                Thread.sleep(30_000);
+                release.await();
             } catch (IOException | InterruptedException expected) {
                 // The client ended the connection, which is what the completion timeout does.
             } finally {
@@ -732,6 +733,7 @@ class CloudFrontOriginHttpClientTest {
                     "expected the 700 ms completion timeout to end the stalled body, took "
                             + elapsedMillis + " ms");
         } finally {
+            release.countDown();
             server.stop(0);
         }
     }
@@ -806,10 +808,11 @@ class CloudFrontOriginHttpClientTest {
     void theCompletionTimeoutBoundsTheTlsHandshake() throws Exception {
         // An origin that accepts the connection and never answers the handshake.
         InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        CountDownLatch release = new CountDownLatch(1);
         try (ServerSocket socket = new ServerSocket(0, 1, loopback)) {
             Thread acceptor = new Thread(() -> {
                 try (Socket accepted = socket.accept()) {
-                    Thread.sleep(30_000);
+                    release.await();
                 } catch (IOException | InterruptedException expected) {
                     // The client gave up on the handshake.
                 }
@@ -834,6 +837,8 @@ class CloudFrontOriginHttpClientTest {
                         "expected the 500 ms completion timeout to end the handshake, not the 10 s "
                                 + "connect timeout, took " + elapsedMillis + " ms");
             }
+        } finally {
+            release.countDown();
         }
     }
 

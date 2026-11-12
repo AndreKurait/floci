@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.util.Arrays;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -78,25 +79,15 @@ class SesExportJobS3AuthEnforcementIntegrationTest {
     }
 
     private static String awaitTerminal(String jobId) {
-        for (int attempt = 0; attempt < 100; attempt++) {
-            Response response = given()
-                .header("Authorization", AUTH)
-            .when()
-                .get("/v2/email/export-jobs/" + jobId)
-            .then()
-                .statusCode(200)
-                .extract().response();
-            String status = response.path("JobStatus");
-            if (!"PROCESSING".equals(status) && !"CREATED".equals(status)) {
-                return status;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("interrupted while waiting for the export job", e);
-            }
-        }
-        throw new AssertionError("export job " + jobId + " never reached a terminal state");
+        return await("export job " + jobId + " reaches a terminal state")
+                .atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> given()
+                        .header("Authorization", AUTH)
+                    .when()
+                        .get("/v2/email/export-jobs/" + jobId)
+                    .then()
+                        .statusCode(200)
+                        .extract().path("JobStatus"),
+                    status -> !"PROCESSING".equals(status) && !"CREATED".equals(status));
     }
 }

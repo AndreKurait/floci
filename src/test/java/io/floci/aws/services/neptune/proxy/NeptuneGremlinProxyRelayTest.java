@@ -1,16 +1,23 @@
 package io.floci.aws.services.neptune.proxy;
 
+import io.floci.aws.services.elasticache.proxy.TimelineRelayJoin;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class NeptuneGremlinProxyRelayTest {
+
+    private static final Duration ONE_NANO = Duration.ofNanos(1);
+    private static final Duration RELAY_JOIN_TIMEOUT =
+            Duration.ofMillis(NeptuneGremlinProxy.RELAY_JOIN_TIMEOUT_MILLIS);
 
     @Test
     void closingBackendReleasesClientConnection() throws Exception {
@@ -97,12 +104,51 @@ class NeptuneGremlinProxyRelayTest {
     }
 
     @Test
-    void keepsHealthyIdleConnectionOpenBeyondRelayShutdownDeadline() throws Exception {
+    void aRelayWhoseBackendStaysOpenIsClosedWhenTheJoinTimeoutEnds() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineRelayJoin joins = new TimelineRelayJoin(time);
         try (ServerSocket backendServer = new ServerSocket(0);
              ServerSocket freePort = new ServerSocket(0)) {
             int proxyPort = freePort.getLocalPort();
-            NeptuneGremlinProxy proxy = new NeptuneGremlinProxy(
-                    "cluster", "127.0.0.1", backendServer.getLocalPort());
+            NeptuneGremlinProxy proxy = proxyJoiningOn(joins, backendServer.getLocalPort());
+            freePort.close();
+            proxy.start(proxyPort);
+
+            try (Socket client = new Socket("127.0.0.1", proxyPort);
+                 Socket backend = backendServer.accept()) {
+                client.setSoTimeout(30_000);
+                client.shutdownOutput();
+                while (backend.getInputStream().read() != -1) {
+                    // Drain until the client half-close reaches the backend.
+                }
+
+                assertEquals(RELAY_JOIN_TIMEOUT, joins.awaitJoin(), "the client direction, which has ended");
+                assertEquals(RELAY_JOIN_TIMEOUT, joins.awaitJoin(), "the backend direction, which is still open");
+
+                time.advance(RELAY_JOIN_TIMEOUT.minus(ONE_NANO));
+                assertEquals(1, joins.waiting(), "the proxy is still waiting for the backend direction");
+                backend.getOutputStream().write("response".getBytes(StandardCharsets.US_ASCII));
+                backend.getOutputStream().flush();
+                assertEquals("response", new String(client.getInputStream().readNBytes(8),
+                        StandardCharsets.US_ASCII));
+
+                time.advance(ONE_NANO);
+                assertEquals(-1, client.getInputStream().read());
+                assertEquals(2, joins.started());
+            } finally {
+                proxy.stop();
+            }
+        }
+    }
+
+    @Test
+    void keepsHealthyIdleConnectionOpenBeyondRelayShutdownDeadline() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineRelayJoin joins = new TimelineRelayJoin(time);
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket freePort = new ServerSocket(0)) {
+            int proxyPort = freePort.getLocalPort();
+            NeptuneGremlinProxy proxy = proxyJoiningOn(joins, backendServer.getLocalPort());
             freePort.close();
             proxy.start(proxyPort);
 
@@ -116,12 +162,14 @@ class NeptuneGremlinProxyRelayTest {
                     backend.setSoTimeout(5_000);
                     assertEquals("PING", new String(backend.getInputStream().readNBytes(request.length),
                             StandardCharsets.US_ASCII));
-                    Thread.sleep(2_200);
+                    time.advance(RELAY_JOIN_TIMEOUT.multipliedBy(2).plusMillis(200));
 
                     backend.getOutputStream().write("PONG".getBytes(StandardCharsets.US_ASCII));
                     backend.getOutputStream().flush();
                     assertEquals("PONG", new String(client.getInputStream().readNBytes(4),
                             StandardCharsets.US_ASCII));
+                    assertEquals(0, joins.started(),
+                            "neither direction ended, so the proxy never started its shutdown wait");
                 }
             } finally {
                 proxy.stop();
@@ -146,5 +194,14 @@ class NeptuneGremlinProxyRelayTest {
         } finally {
             proxy.stop();
         }
+    }
+
+    private static NeptuneGremlinProxy proxyJoiningOn(TimelineRelayJoin joins, int backendPort) {
+        return new NeptuneGremlinProxy("cluster", "127.0.0.1", backendPort) {
+            @Override
+            void joinRelay(Thread relay, long timeoutMillis) throws InterruptedException {
+                joins.join(relay, timeoutMillis);
+            }
+        };
     }
 }

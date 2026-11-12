@@ -17,11 +17,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -214,14 +217,8 @@ class AthenaServiceTest {
         return service.getQueryResults(id).getMetadata().getColumnInfo();
     }
 
-    private void awaitState(String id, QueryExecutionState expected) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (System.nanoTime() < deadline) {
-            if (service.getQueryExecution(id).getStatus().getState() == expected) {
-                return;
-            }
-            Thread.sleep(10);
-        }
-        assertEquals(expected, service.getQueryExecution(id).getStatus().getState());
+    private void awaitState(String id, QueryExecutionState expected) {
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> service.getQueryExecution(id).getStatus().getState(), equalTo(expected));
     }
 }

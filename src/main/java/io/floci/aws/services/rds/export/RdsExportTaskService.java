@@ -28,6 +28,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
@@ -50,7 +51,7 @@ public class RdsExportTaskService implements Resettable {
 
     static final String RESTART_FAILURE_CAUSE = "The emulator restarted before the export finished";
     static final long RESET_DRAIN_TIMEOUT_MILLIS = 5_000L;
-    private static final long RESET_ADMISSION_WAIT_MILLIS = 30_000L;
+    static final long RESET_ADMISSION_WAIT_MILLIS = 30_000L;
     static final long GIB = 1_073_741_824L;
     private static final String KEY_PREFIX = "export-task::";
 
@@ -68,6 +69,7 @@ public class RdsExportTaskService implements Resettable {
     private final boolean mock;
     private final Clock clock;
     private final Executor workers;
+    private final ExportResetWait resetWait;
     private final Object lock = new Object();
     // Reset support, following SesExportJobService: beforeReset bumps the generation so a running
     // worker stops writing, then waits for the workers already running, for a bounded time. A
@@ -90,6 +92,12 @@ public class RdsExportTaskService implements Resettable {
     RdsExportTaskService(StorageBackend<String, ExportTask> tasks, RdsService rdsService, S3Service s3Service,
                          SnapshotExporter exporter, RegionResolver regionResolver, boolean mock, Clock clock,
                          Executor workers) {
+        this(tasks, rdsService, s3Service, exporter, regionResolver, mock, clock, workers, ExportResetWait.SYSTEM);
+    }
+
+    RdsExportTaskService(StorageBackend<String, ExportTask> tasks, RdsService rdsService, S3Service s3Service,
+                         SnapshotExporter exporter, RegionResolver regionResolver, boolean mock, Clock clock,
+                         Executor workers, ExportResetWait resetWait) {
         this.tasks = tasks;
         this.rdsService = rdsService;
         this.s3Service = s3Service;
@@ -98,6 +106,7 @@ public class RdsExportTaskService implements Resettable {
         this.mock = mock;
         this.clock = clock;
         this.workers = workers;
+        this.resetWait = resetWait;
         recoverInterruptedTasks();
     }
 
@@ -203,14 +212,14 @@ public class RdsExportTaskService implements Resettable {
     // Holds lock. A start arriving while a reset drains would capture the already-bumped generation,
     // so its task would be wiped by clear() after it was admitted. It waits for afterReset.
     private void awaitResetFinished() {
-        long deadline = System.currentTimeMillis() + RESET_ADMISSION_WAIT_MILLIS;
+        long deadline = resetWait.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESET_ADMISSION_WAIT_MILLIS);
         while (resetting) {
-            long remaining = deadline - System.currentTimeMillis();
+            long remaining = deadline - resetWait.nanoTime();
             if (remaining <= 0) {
                 throw resettingNow();
             }
             try {
-                lock.wait(remaining);
+                resetWait.timedWait(lock, remaining);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw resettingNow();
@@ -422,17 +431,17 @@ public class RdsExportTaskService implements Resettable {
             generation.incrementAndGet();
         }
         boolean interrupted = false;
-        long deadline = System.currentTimeMillis() + RESET_DRAIN_TIMEOUT_MILLIS;
+        long deadline = resetWait.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESET_DRAIN_TIMEOUT_MILLIS);
         synchronized (workerMonitor) {
             while (activeWorkers > 0) {
-                long remaining = deadline - System.currentTimeMillis();
+                long remaining = deadline - resetWait.nanoTime();
                 if (remaining <= 0) {
                     LOG.warnv("{0} RDS export worker(s) still running after {1}ms",
                             activeWorkers, RESET_DRAIN_TIMEOUT_MILLIS);
                     break;
                 }
                 try {
-                    workerMonitor.wait(remaining);
+                    resetWait.timedWait(workerMonitor, remaining);
                 } catch (InterruptedException e) {
                     // Keep draining to the deadline; the interrupt is re-asserted on the way out.
                     interrupted = true;

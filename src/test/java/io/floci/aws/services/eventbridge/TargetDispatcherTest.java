@@ -10,6 +10,7 @@ import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.services.sqs.model.MessageAttributeValue;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -19,10 +20,10 @@ import org.mockito.MockMakers;
 import org.mockito.MockedStatic;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -45,7 +46,7 @@ class TargetDispatcherTest {
 
     private LambdaService lambdaService;
     private SqsService sqsService;
-    private AtomicReference<Instant> clockNow;
+    private TestTime time;
     private EventBridgeInvoker invoker;
     private Clock clock;
     private TargetDispatcher dispatcher;
@@ -58,9 +59,8 @@ class TargetDispatcherTest {
         when(config.baseUrl()).thenReturn(BASE_URL);
         invoker = new EventBridgeInvoker(
                 lambdaService, sqsService, mock(SnsService.class), new ObjectMapper(), config);
-        clockNow = new AtomicReference<>(T0);
-        clock = mock(Clock.class);
-        when(clock.instant()).thenAnswer(invocation -> clockNow.get());
+        time = TestTime.startingAt(T0);
+        clock = time.clock();
         dispatcher = new TargetDispatcher(invoker, sqsService, BASE_URL, clock, null);
     }
 
@@ -114,21 +114,21 @@ class TargetDispatcherTest {
         when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
                 .thenThrow(unavailable())
                 .thenReturn(null);
-        EmulatorConfig config = mock(EmulatorConfig.class);
-        when(config.baseUrl()).thenReturn(BASE_URL);
-        EventBridgeInvoker invoker = new EventBridgeInvoker(
-                lambdaService, sqsService, mock(SnsService.class), new ObjectMapper(), config);
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-        TargetDispatcher scheduled = new TargetDispatcher(invoker, sqsService, BASE_URL, Clock.systemUTC(), executor);
+        TargetDispatcher scheduled = new TargetDispatcher(invoker, sqsService, BASE_URL, clock, time.scheduler());
         Target target = sqsTarget(null, DLQ_ARN);
-        try {
-            scheduled.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
 
-            verify(sqsService, timeout(5000).times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
-        } finally {
-            executor.shutdownNow();
-        }
+        scheduled.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        time.advance(Duration.ofSeconds(1).minusNanos(1));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        time.advance(Duration.ofNanos(1));
+        verify(sqsService, times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
         verifyNoDeadLetter();
+
+        scheduled.shutdown();
+        assertEquals(0, time.pendingTasks());
     }
 
     @Test
@@ -273,13 +273,13 @@ class TargetDispatcherTest {
         when(sqsService.sendMessage(slowUrl, EVENT, 0, null, null, REGION))
                 .thenThrow(unavailable())
                 .thenAnswer(invocation -> {
-                    clockNow.set(T0.plusSeconds(100));
+                    time.advanceTo(T0.plusSeconds(100));
                     return null;
                 });
         when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
 
         dispatcher.dispatch(RULE_ARN, slow, EVENT, REGION, () -> List.of(slow, aged));
-        clockNow.set(T0.plusMillis(500));
+        time.advanceTo(T0.plusMillis(500));
         dispatcher.dispatch(RULE_ARN, aged, EVENT, REGION, () -> List.of(slow, aged));
         tickAt(T0.plusSeconds(2));
 
@@ -302,7 +302,7 @@ class TargetDispatcherTest {
         when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
 
         dispatcher.dispatch(RULE_ARN, first, EVENT, REGION, () -> List.of(first, second));
-        clockNow.set(T0.plusMillis(500));
+        time.advanceTo(T0.plusMillis(500));
         dispatcher.dispatch(RULE_ARN, second, EVENT, REGION, () -> List.of(first, second));
         tickAt(T0.plusSeconds(2));
 
@@ -526,7 +526,7 @@ class TargetDispatcherTest {
     }
 
     private void tickAt(Instant now) {
-        clockNow.set(now);
+        time.advanceTo(now);
         dispatcher.tick();
     }
 
