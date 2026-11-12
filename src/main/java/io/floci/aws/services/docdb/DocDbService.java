@@ -892,10 +892,13 @@ public class DocDbService {
     }
 
     private void loadInto(DocDbCluster cluster, String data) {
-        if (config.services().docdb().mock() || data.isEmpty() || cluster.getContainerId() == null) {
+        if (config.services().docdb().mock() || data.isEmpty()) {
             return;
         }
         try {
+            if (cluster.getContainerId() == null) {
+                throw new IllegalStateException("No running MongoDB backend is available for the restored cluster");
+            }
             containerManager.restoreCluster(cluster.getContainerId(), data);
         } catch (RuntimeException e) {
             try {
