@@ -1186,7 +1186,7 @@ public class IamPolicyEvaluator {
     private static String logGroupResourceAlias(String action, String resource) {
         if (action == null || !switch (action) {
             case "logs:createloggroup", "logs:deleteloggroup", "logs:putretentionpolicy",
-                    "logs:deleteretentionpolicy", "logs:tagloggroup" -> true;
+                    "logs:deleteretentionpolicy", "logs:tagloggroup", "logs:createexporttask" -> true;
             default -> false;
         } || !AwsArnUtils.isArnFor(resource, "logs")) {
             return null;
