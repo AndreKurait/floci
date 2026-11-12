@@ -20,12 +20,13 @@ import java.nio.charset.StandardCharsets;
 import java.security.Signature;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.matchesPattern;
@@ -247,12 +248,9 @@ class SnsMessageSignatureIntegrationTest {
         return verifier.verify(Base64.getDecoder().decode(message.get("Signature").asText()));
     }
 
-    private static String awaitMessage(int index) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (received.size() <= index && System.nanoTime() < deadline) {
-            Thread.sleep(50);
-        }
-        assertTrue(received.size() > index, "no HTTP delivery #" + index);
+    private static String awaitMessage(int index) {
+        await("HTTP delivery #" + index).atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10)).until(() -> received.size() > index);
         return received.get(index);
     }
 

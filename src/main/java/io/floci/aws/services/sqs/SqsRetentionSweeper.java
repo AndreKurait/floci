@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit;
 public class SqsRetentionSweeper {
 
     private static final Logger LOG = Logger.getLogger(SqsRetentionSweeper.class);
-    private static final long SWEEP_INTERVAL_SECONDS = 60;
+    static final long SWEEP_INTERVAL_SECONDS = 60;
 
     private final SqsService sqsService;
     private final boolean enabled;
@@ -24,13 +24,17 @@ public class SqsRetentionSweeper {
 
     @Inject
     public SqsRetentionSweeper(SqsService sqsService, EmulatorConfig config) {
-        this.sqsService = sqsService;
-        this.enabled = config.services().sqs().enabled();
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        this(sqsService, config.services().sqs().enabled(), Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "sqs-retention-sweeper");
             t.setDaemon(true);
             return t;
-        });
+        }));
+    }
+
+    SqsRetentionSweeper(SqsService sqsService, boolean enabled, ScheduledExecutorService scheduler) {
+        this.sqsService = sqsService;
+        this.enabled = enabled;
+        this.scheduler = scheduler;
     }
 
     void onStart(@Observes StartupEvent ignored) {
