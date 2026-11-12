@@ -4,11 +4,13 @@ package io.github.hectorvent.floci.core.common.dns;
 // test needs a plain blocking socket to stand in for the rule's target resolver.
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.quarkus.test.junit.QuarkusTest;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
@@ -32,9 +34,10 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.mockito.Mockito.doNothing;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.when;
 
 /**
  * Drives the whole packet path with a forwarding rule in place: the query really leaves the DNS
@@ -72,11 +75,19 @@ class ResolverRuleDnsPacketTest {
 
     @Test
     void protectedNamespaceRegistrationControlsWhichDnsPacketsUseTheVpcRule() throws Exception {
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(mock(DockerClient.class),
+        DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        when(docker.execCreateCmd("helper-dns").withAttachStdout(true).withAttachStderr(true)
+                .withCmd("nft", "-f", "/tmp/floci-sg.nft").exec().getId()).thenReturn("dns-policy");
+        when(docker.execStartCmd("dns-policy").exec(any())).thenAnswer(invocation -> {
+            ResultCallback.Adapter<?> callback = invocation.getArgument(0);
+            callback.onComplete();
+            return callback;
+        });
+        when(docker.inspectExecCmd("dns-policy").exec().getExitCodeLong()).thenReturn(0L);
+        SecurityGroupFirewallManager manager = new SecurityGroupFirewallManager(docker,
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config,
-                mock(EmbeddedDnsServer.class)));
+                mock(EmbeddedDnsServer.class));
         // This test exercises UDP DNS and registry ownership; the Docker suite owns nftables enforcement.
-        doNothing().when(manager).reconcileAll();
         DnsClientVpcSource origin = assertInstanceOf(DnsClientVpcSource.class, manager);
         byte[] request = buildQuery("db.corp.internal");
         byte[] targetAnswer = answerFor(request, "10.4.0.11");
@@ -92,8 +103,13 @@ class ResolverRuleDnsPacketTest {
             assertArrayEquals(new byte[]{10, 4, 0, 22},
                     Arrays.copyOfRange(ordinaryAnswer, request.length + 12, request.length + 16));
 
+            SecurityGroup group = new SecurityGroup();
+            group.setGroupId("sg-dns");
+            group.setVpcId(VPC_ID);
+            group.setOwnerId(ACCOUNT);
+            group.setRegion(REGION);
             manager.register(new SecurityGroupNftCompiler.Endpoint(ACCOUNT, REGION, VPC_ID, "eni-dns",
-                    "10.0.1.10", CLIENT, Set.of(), List.of()), "helper-dns", Map.of());
+                    "10.0.1.10", CLIENT, Set.of(group.getGroupId()), List.of(group)), "helper-dns", Map.of());
             assertArrayEquals(targetAnswer, query(dns, request));
 
             manager.unregister("eni-dns");
