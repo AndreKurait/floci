@@ -16,6 +16,7 @@ import io.floci.aws.services.cloudformation.model.StackSetOperation;
 import io.floci.aws.services.cloudformation.model.TemplateSummary;
 import io.floci.aws.services.iam.IamService;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
@@ -37,6 +38,9 @@ public class CloudFormationQueryHandler {
     private static final Logger LOG = Logger.getLogger(CloudFormationQueryHandler.class);
     private static final DateTimeFormatter ISO = DateTimeFormatter.ISO_INSTANT;
     private static final String CF_NS = "http://cloudformation.amazonaws.com/doc/2010-05-15/";
+
+    @Inject
+    Instance<CloudFormationDriftHandler> driftHandler;
 
     private final CloudFormationService cfnService;
     /** Reads the delegation a caller holds, for the cap a stack's roles have to carry. */
@@ -74,6 +78,9 @@ public class CloudFormationQueryHandler {
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
         return switch (action) {
+            case "DetectStackDrift", "DetectStackResourceDrift",
+                    "DescribeStackDriftDetectionStatus", "DescribeStackResourceDrifts" ->
+                    driftHandler.get().handle(action, params, region);
             case "DescribeStacks" -> describeStacks(params, region);
             case "CreateStack" -> createStack(params, region);
             case "UpdateStack" -> updateStack(params, region);
