@@ -5225,13 +5225,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     clearPublicAddress(inst);
                 }
                 inst.setTerminatedAt(System.currentTimeMillis());
+                releaseStandaloneInterfacesOnTermination(region, inst);
             } else {
                 // Also attempt the reclaim once this container is really gone. The synchronous
                 // attempt below runs while teardown is still scheduled, so for a batch whose
                 // containers all tear down slowly every in-loop attempt can be refused by the
                 // daemon and, without this, nothing would try again.
-                containerManager.terminate(inst, () ->
-                        RequestScopes.runAs(owner, () -> reclaimCapturesPinnedBy(region, inst, terminating)));
+                containerManager.terminate(inst, () -> RequestScopes.runAs(owner, () -> {
+                    try {
+                        releaseStandaloneInterfacesOnTermination(region, inst);
+                        instances.put(key(region, inst.getInstanceId()), inst);
+                    } finally {
+                        reclaimCapturesPinnedBy(region, inst, terminating);
+                    }
+                }));
                 // Termination releases the public address with a container too, under the lock a
                 // DescribeAddresses re-point holds, so one already under way cannot write it back.
                 synchronized (privateIpAllocationLock) {
@@ -5239,7 +5246,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
             detachAttachedVolumesOnTermination(region, inst);
-            releaseStandaloneInterfacesOnTermination(region, inst);
             instances.put(key(region, id), inst);
             synchronized (capacityReservationLock) {
                 reconcileCapacityMembership(region);
@@ -7882,6 +7888,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         if (securityGroups.get(key(region, groupId)).isEmpty()) {
             throw new AwsException("InvalidGroup.NotFound", "The security group '" + groupId + "' does not exist", 400);
+        }
+        boolean standaloneDependency = networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                .flatMap(eni -> nullToEmpty(eni.getGroups()).stream())
+                .anyMatch(group -> group != null && groupId.equals(group.getGroupId()));
+        boolean instanceDependency = instances.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(instance -> instance.getState() == null
+                        || !"terminated".equals(instance.getState().getName()))
+                .flatMap(instance -> nullToEmpty(instance.getNetworkInterfaces()).stream())
+                .flatMap(eni -> nullToEmpty(eni.getGroups()).stream())
+                .anyMatch(group -> group != null && groupId.equals(group.getGroupId()));
+        if (standaloneDependency || instanceDependency) {
+            throw new AwsException("DependencyViolation",
+                    "The security group '" + groupId + "' has a dependent network interface", 400);
         }
         securityGroups.delete(key(region, groupId));
     }
