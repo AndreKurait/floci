@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.apigateway.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.HashMap;
@@ -10,6 +11,7 @@ import java.util.Map;
 @RegisterForReflection
 public class Stage {
 
+    private String documentationVersion;
     private String stageName;
     private String deploymentId;
     private String description;
@@ -131,5 +133,13 @@ public class Stage {
 
     public void setLastUpdatedDate(long lastUpdatedDate) {
         this.lastUpdatedDate = lastUpdatedDate;
+    }
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public String getDocumentationVersion() {
+        return documentationVersion;
+    }
+
+    public void setDocumentationVersion(String documentationVersion) {
+        this.documentationVersion = documentationVersion;
     }
 }
