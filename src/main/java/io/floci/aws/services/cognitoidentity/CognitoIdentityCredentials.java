@@ -65,10 +65,15 @@ public class CognitoIdentityCredentials {
                               String issuer, String audience) {}
 
     public boolean recognizes(String token, String roleArn) {
+        return recognizes(token, roleArn, false);
+    }
+
+    /** The caller must retain the resolved local issuer key for subsequent token verification. */
+    public boolean recognizes(String token, String roleArn, boolean hasLocalIssuerKey) {
         if (tokens.recognizes(token)) {
             return true;
         }
-        if (tokens.identifiesIssuer(token)) {
+        if (hasLocalIssuerKey) {
             return false;
         }
         try {

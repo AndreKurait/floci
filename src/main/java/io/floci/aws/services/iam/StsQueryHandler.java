@@ -388,8 +388,10 @@ public class StsQueryHandler {
         String callerAccountId = regionResolver.getAccountId();
         String accountId = AwsArnUtils.accountOrDefault(roleArn, callerAccountId);
 
+        String tokenIssuer = tokenVerifier.peekIssuer(webIdentityToken).orElse(null);
+        RSAPublicKey issuerKey = tokenIssuer == null ? null : oidcIssuerKeys.findVerificationKey(tokenIssuer).orElse(null);
         if (cognitoIdentities != null && cognitoIdentities.isResolvable()
-                && cognitoIdentities.get().recognizes(webIdentityToken, roleArn)) {
+                && cognitoIdentities.get().recognizes(webIdentityToken, roleArn, issuerKey != null)) {
             if (params.keySet().stream().anyMatch(key -> key.startsWith("PolicyArns."))) {
                 return AwsQueryResponse.error("ValidationError",
                         "Managed session-policy ARNs are not supported for Cognito token exchange.", AwsNamespaces.STS, 400);
@@ -410,7 +412,8 @@ public class StsQueryHandler {
             }
         }
 
-        WebIdentityOutcome outcome = verifyWebIdentityToken(webIdentityToken, roleName, accountId, roleArn);
+        WebIdentityOutcome outcome = verifyWebIdentityToken(
+                webIdentityToken, roleName, accountId, roleArn, tokenIssuer, issuerKey);
         if (outcome.denial() != null) {
             return outcome.denial();
         }
@@ -499,16 +502,14 @@ public class StsQueryHandler {
 
     /** Inspects {@code token} and decides whether it may assume {@code roleArn}. */
     private WebIdentityOutcome verifyWebIdentityToken(String token, String roleName, String roleAccountId,
-                                                      String roleArn) {
-        Optional<String> issuer = tokenVerifier.peekIssuer(token);
-        if (issuer.isEmpty()) {
+                                                      String roleArn, String issuer, RSAPublicKey key) {
+        if (issuer == null) {
             return config.services().iam().enforcementEnabled()
                     ? WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
                     "The web identity token does not identify a trusted issuer.", AwsNamespaces.STS, 400))
                     : WebIdentityOutcome.unverifiable();
         }
-        Optional<RSAPublicKey> key = oidcIssuerKeys.findVerificationKey(issuer.get());
-        if (key.isEmpty()) {
+        if (key == null) {
             return config.services().iam().enforcementEnabled()
                     ? WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
                     "The web identity token issuer is not trusted.", AwsNamespaces.STS, 400))
@@ -517,7 +518,7 @@ public class StsQueryHandler {
 
         WebIdentityToken claims;
         try {
-            claims = tokenVerifier.verify(token, key.get(), issuer.get(), STS_AUDIENCE);
+            claims = tokenVerifier.verify(token, key, issuer, STS_AUDIENCE);
         } catch (WebIdentityTokenVerifier.ExpiredTokenException e) {
             LOG.debugv("Rejecting web identity token for role {0}: {1}", roleArn, e.getMessage());
             return WebIdentityOutcome.deny(AwsQueryResponse.error("ExpiredTokenException",
@@ -535,7 +536,7 @@ public class StsQueryHandler {
             return WebIdentityOutcome.deny(accessDenied(roleArn));
         }
 
-        String issuerKeyPrefix = stripScheme(issuer.get());
+        String issuerKeyPrefix = stripScheme(issuer);
         // The provider is an IAM resource of the role's account, so it shares the role's partition.
         String oidcProviderArn = AwsArnUtils.Arn.global(
                 AwsArnUtils.partitionOrDefault(role.get().getArn(), regionResolver.getPartition()),
