@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.InspectVolumeCmd;
@@ -21,6 +22,7 @@ import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.Container;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
@@ -35,6 +37,8 @@ import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -44,6 +48,8 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
@@ -131,6 +137,47 @@ class EcsContainerManagerSecurityGroupTest {
         group.setGroupId("sg-1");
         when(ec2Service.describeSecurityGroups(any(), eq(List.of("sg-1")), any(), any()))
                 .thenReturn(List.of(group));
+    }
+
+    @Test
+    void attachedVpcAddressIsRuntimeStateOnly() throws Exception {
+        Container container = new Container();
+        container.setName("app");
+        container.setAttachedVpcAddress("10.0.0.10");
+        ObjectMapper mapper = new ObjectMapper();
+
+        String json = mapper.writeValueAsString(container);
+
+        assertFalse(mapper.readTree(json).has("attachedVpcAddress"));
+        assertNull(mapper.readValue(json, Container.class).getAttachedVpcAddress());
+        assertNull(mapper.readValue("{\"attachedVpcAddress\":\"10.0.0.10\"}", Container.class)
+                .getAttachedVpcAddress());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void loadBalancerUsesTheActuallyAttachedVpcAddress(boolean inDocker) {
+        protectedTaskNetwork();
+        when(containerDetector.isRunningInContainer()).thenReturn(inDocker);
+        when(vpcNetworks.enabled()).thenReturn(true);
+        when(vpcNetworks.attach("us-east-1", "vpc-1", "subnet-1", "helper-id", "10.0.0.10"))
+                .thenReturn(Optional.of("native-vpc-network"));
+        EcsTask task = awsvpcTask();
+
+        manager.startTask(task, awsvpcTaskDef(List.of()), List.of(), "us-east-1");
+
+        Container container = task.getContainers().getFirst();
+        assertEquals("10.0.0.10", manager.resolveLoadBalancerHost(container));
+    }
+
+    @Test
+    void controlPlaneEniWithoutVpcAttachmentKeepsHostRouting() {
+        protectedTaskNetwork();
+        EcsTask task = awsvpcTask();
+        manager.startTask(task, awsvpcTaskDef(List.of()), List.of(), "us-east-1");
+
+        assertEquals("10.0.0.10", task.getPrivateIpAddress());
+        assertEquals("127.0.0.1", manager.resolveLoadBalancerHost(task.getContainers().getFirst()));
     }
 
     @Test

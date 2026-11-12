@@ -742,6 +742,10 @@ public class EcsContainerManager {
             List<ManagedAgent> agents = List.of(ManagedAgent.executeCommandAgent(Instant.now()));
             containersInDefinitionOrder.forEach(container -> container.setManagedAgents(agents));
         }
+        if (protectedNetwork != null && protectedNetwork.vpcAttached()) {
+            containersInDefinitionOrder.forEach(container ->
+                    container.setAttachedVpcAddress(protectedNetwork.eni().getPrivateIpAddress()));
+        }
         task.setContainers(containersInDefinitionOrder);
         task.setLastStatus(TaskStatus.RUNNING.name());
         task.setDesiredStatus(TaskStatus.RUNNING.name());
@@ -1488,7 +1492,7 @@ public class EcsContainerManager {
                     List.of(), false, privateAddresses), namespace.helperId(), prefixLists);
             task.setNetworkInterfaceId(eniId);
             task.setPrivateIpAddress(eni.getPrivateIpAddress());
-            return new PreparedNetwork(eni, namespace);
+            return new PreparedNetwork(eni, namespace, attached);
         } catch (Exception e) {
             if (namespace != null) {
                 lifecycleManager.removeIfExists(namespace.helperId());
@@ -1535,7 +1539,8 @@ public class EcsContainerManager {
         return port.hostPort() > 0 ? port.hostPort() : port.containerPort();
     }
 
-    private record PreparedNetwork(NetworkInterface eni, SecurityGroupFirewallManager.Namespace namespace) {}
+    private record PreparedNetwork(NetworkInterface eni, SecurityGroupFirewallManager.Namespace namespace,
+                                   boolean vpcAttached) {}
 
     /**
      * Stops and removes all Docker containers for a task.
@@ -2563,13 +2568,16 @@ public class EcsContainerManager {
     }
 
     /**
-     * Resolves the host address at which a running task container is reachable from the
-     * Floci process — used to register the container as an ELBv2 target.
-     * <p>
-     * Native mode: the container's port is published to a host port, reachable at
-     * {@code 127.0.0.1}. Floci-in-Docker mode: the container is reached by its IP on the
-     * shared Docker network. Returns {@code 127.0.0.1} as a safe fallback.
+     * A load balancer reaches a protected task through its attached VPC interface. Only a
+     * successful runtime attachment supplies this address; a control-plane ENI alone does not.
+     * Other tasks retain their Docker-network or published host-port routing.
      */
+    public String resolveLoadBalancerHost(Container container) {
+        String address = container.getAttachedVpcAddress();
+        return address != null ? address : resolveContainerHost(container);
+    }
+
+    /** The address the Floci process reaches on the Docker network or a published host port. */
     public String resolveContainerHost(Container container) {
         if (!containerDetector.isRunningInContainer()) {
             return "127.0.0.1";
@@ -2583,8 +2591,8 @@ public class EcsContainerManager {
      * protected namespace has no network of its own, so the namespace holder's address is the one
      * it answers on.
      *
-     * <p>This is deliberately not the task ENI address. ECS containers never join the subnet's
-     * VPC network, so the ENI address is control-plane state that no peer can connect to.
+     * <p>Service discovery retains this Docker-network address. Load balancer registration uses
+     * {@link #resolveLoadBalancerHost} for an attached VPC interface.
      *
      * @return the address, or empty when the container has not started or Docker cannot say
      */
