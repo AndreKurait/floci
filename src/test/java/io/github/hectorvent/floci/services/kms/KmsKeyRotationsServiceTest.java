@@ -117,7 +117,7 @@ class KmsKeyRotationsServiceTest {
         service.rotateKeyOnDemand(key.getKeyId(), REGION);
         List<KmsService.KeyRotation> expected = list(key, "ALL_KEY_MATERIAL").items();
         ObjectMapper mapper = new ObjectMapper();
-        KmsKey reloaded = mapper.readValue(mapper.writeValueAsBytes(key), KmsKey.class);
+        KmsKey reloaded = mapper.readValue(mapper.writeValueAsBytes(service.describeKey(key.getKeyId(), REGION)), KmsKey.class);
         keys.put(REGION + "::" + key.getKeyId(), reloaded);
 
         KmsService restarted = new KmsService(keys, new InMemoryStorage<>(),
@@ -131,7 +131,7 @@ class KmsKeyRotationsServiceTest {
         KmsKey key = service.createKey("legacy history", REGION);
         service.rotateKeyOnDemand(key.getKeyId(), REGION);
         ObjectMapper mapper = new ObjectMapper();
-        String snapshot = mapper.writeValueAsString(key);
+        String snapshot = mapper.writeValueAsString(service.describeKey(key.getKeyId(), REGION));
         ObjectNode node = (ObjectNode) mapper.readTree(snapshot);
         node.remove("backingKeyRotationDates");
         KmsKey reloaded = mapper.treeToValue(node, KmsKey.class);
