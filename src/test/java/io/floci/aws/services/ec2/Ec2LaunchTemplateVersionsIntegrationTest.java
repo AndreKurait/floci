@@ -200,15 +200,17 @@ class Ec2LaunchTemplateVersionsIntegrationTest {
                     long readerId = Thread.currentThread().threadId();
                     startWriter.countDown();
                     // Force the writer to finish or wait on this reader before the next iterator step.
-                    await().atMost(Duration.ofSeconds(5)).until(() -> {
-                        if (writer.isDone()) {
-                            return true;
-                        }
-                        Thread thread = writerThread.get();
-                        ThreadInfo info = thread == null ? null
-                                : ManagementFactory.getThreadMXBean().getThreadInfo(thread.threadId());
-                        return info != null && info.getLockOwnerId() == readerId;
-                    });
+                    await().atMost(Duration.ofSeconds(5))
+                            .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                            .until(() -> {
+                                if (writer.isDone()) {
+                                    return true;
+                                }
+                                Thread thread = writerThread.get();
+                                ThreadInfo info = thread == null ? null
+                                        : ManagementFactory.getThreadMXBean().getThreadInfo(thread.threadId());
+                                return info != null && info.getLockOwnerId() == readerId;
+                            });
                 }));
                 List<LaunchTemplate> snapshot = assertDoesNotThrow(() -> RequestScopes.callAs(ACCOUNT,
                         () -> service.describeLaunchTemplateVersions(

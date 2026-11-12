@@ -12,13 +12,16 @@ import io.floci.aws.services.pipes.PipesFilterMatcher;
 import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.services.sqs.model.Message;
 import io.floci.aws.services.sqs.model.MessageAttributeValue;
+import io.floci.aws.testing.TestTime;
 import io.vertx.core.Vertx;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -40,6 +43,7 @@ import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -47,6 +51,8 @@ class SqsEventSourcePollerTest {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private SqsEventSourcePoller poller;
+    private final PollExecutor polls = PollExecutor.onThreads();
+    private EmulatorConfig emulatorConfig;
     private SqsService sqsService;
     private LambdaExecutorService executorService;
     private LambdaFunctionStore functionStore;
@@ -75,8 +81,15 @@ class SqsEventSourcePollerTest {
                 mock(EsmStore.class),
                 config,
                 OBJECT_MAPPER,
-                new PipesFilterMatcher(OBJECT_MAPPER)
+                new PipesFilterMatcher(OBJECT_MAPPER),
+                polls
         );
+        emulatorConfig = config;
+    }
+
+    @AfterEach
+    void stopPolls() {
+        polls.shutdownNow();
     }
 
     @Test
@@ -446,7 +459,6 @@ class SqsEventSourcePollerTest {
         esm.setRegion("us-east-1");
 
         String firstCall = poller.buildSqsEvent(List.of(msg), esm);
-        Thread.sleep(10);
         String secondCall = poller.buildSqsEvent(List.of(msg), esm);
 
         JsonNode firstTs = OBJECT_MAPPER.readTree(firstCall)
@@ -531,41 +543,18 @@ class SqsEventSourcePollerTest {
     }
 
     /**
-     * Hard happens-after barrier: re-stub the fetch to return empty, then re-kick until a SECOND
-     * receiveMessage is observed. {@code activePolls} serializes polls per ESM, so fetch #2 cannot begin until
-     * poll #1's finally-block ran, so poll #1 is fully complete. The empty re-stub makes poll #2 a no-op, so
-     * poll #1's exact delete/return counts are preserved for the assertions.
+     * Hard happens-after barrier: waits for poll #1 to finish, re-stubs the fetch to return empty, then runs a
+     * second poll to its end and checks that it fetched. {@code activePolls} serializes polls per ESM, so fetch
+     * #2 cannot begin until poll #1's finally-block ran. The empty re-stub makes poll #2 a no-op, so poll #1's
+     * exact delete/return counts are preserved for the assertions.
      */
     private void awaitPollCompleted(EventSourceMapping esm) {
+        polls.awaitIdle();
         when(sqsService.receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
                 .thenReturn(List.of());
-        long deadline = System.currentTimeMillis() + 5000;
-        while (true) {
-            poller.pollAndInvoke(esm);
-            try {
-                verify(sqsService, atLeast(2))
-                        .receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1"));
-                return;
-            } catch (AssertionError retry) {
-                if (System.currentTimeMillis() > deadline) {
-                    throw retry;
-                }
-                try {
-                    Thread.sleep(25);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw retry;
-                }
-            }
-        }
-    }
-
-    private static void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-        }
+        awaitPoll(poller.pollAndInvoke(esm));
+        verify(sqsService, atLeast(2))
+                .receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1"));
     }
 
     private static void awaitPoll(Future<?> poll) {
@@ -579,21 +568,11 @@ class SqsEventSourcePollerTest {
         }
     }
 
-    private void pollUntilInvoked(EventSourceMapping esm, LambdaFunction fn) {
-        long deadline = System.currentTimeMillis() + 5000;
-        while (true) {
-            poller.pollAndInvoke(esm);
-            try {
-                verify(executorService, timeout(2000))
-                        .invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
-                return;
-            } catch (AssertionError retry) {
-                if (System.currentTimeMillis() > deadline) {
-                    throw retry;
-                }
-                sleep(25);
-            }
-        }
+    /** Lets the polls started so far finish, then runs one more, which must invoke the function. */
+    private void pollAndExpectInvocation(EventSourceMapping esm, LambdaFunction fn) {
+        polls.awaitIdle();
+        awaitPoll(poller.pollAndInvoke(esm));
+        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @Test
@@ -625,7 +604,7 @@ class SqsEventSourcePollerTest {
 
         // Once the window elapses the buffered record is delivered.
         now.set(5000);
-        pollUntilInvoked(esm, fn);
+        pollAndExpectInvocation(esm, fn);
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
     }
 
@@ -645,10 +624,15 @@ class SqsEventSourcePollerTest {
         when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult());
 
-        pollUntilInvoked(esm, fn);
+        // The first poll buffers one record of the two the batch needs
+        awaitPoll(poller.pollAndInvoke(esm));
+        verify(executorService, never()).invoke(any(), any(), any());
 
-        verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
-        verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
+        // The second poll fills the batch, which is delivered without waiting for the window
+        awaitPoll(poller.pollAndInvoke(esm));
+        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
+        verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
     }
 
     @Test
@@ -726,7 +710,7 @@ class SqsEventSourcePollerTest {
 
         // Window turned off: the next poll must flush the stranded batch instead of ignoring it.
         esm.setMaximumBatchingWindowInSeconds(0);
-        pollUntilInvoked(esm, fn);
+        pollAndExpectInvocation(esm, fn);
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
     }
 
@@ -914,5 +898,128 @@ class SqsEventSourcePollerTest {
         awaitPollCompleted(esm);
         verify(sqsService, never()).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
         verify(sqsService, never()).changeMessageVisibility(eq(esm.getQueueUrl()), eq("rh-m1"), anyInt(), any());
+    }
+
+    // ─────────── The poll timer and the batching window on a controlled timeline ───────────
+
+    private static final Instant TIMELINE_START = Instant.parse("2026-01-15T10:30:00Z");
+
+    /** A poller whose timer, clock and polls all run on {@code time}: a tick returns once its poll is done. */
+    private SqsEventSourcePoller timelinePoller(TestTime time, EventSourceMapping stored) {
+        EsmStore store = mock(EsmStore.class);
+        when(store.getForAccount(stored.getAccountId(), stored.getUuid())).thenReturn(Optional.of(stored));
+        SqsEventSourcePoller timed = new SqsEventSourcePoller(TimelineVertx.timersOn(time), sqsService,
+                executorService, new LambdaTargetResolver(functionStore, aliasStore), store, emulatorConfig, OBJECT_MAPPER,
+                new PipesFilterMatcher(OBJECT_MAPPER), PollExecutor.inline());
+        timed.setClockForTest(time::currentTimeMillis);
+        return timed;
+    }
+
+    private void verifyReceives(EventSourceMapping esm, int polls) {
+        verify(sqsService, times(polls))
+                .receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1"));
+    }
+
+    @Test
+    void timerPollsAnEnabledMappingOncePerConfiguredIntervalUntilItIsStopped() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setEnabled(true);
+        stubReceive(esm, List.of());
+        SqsEventSourcePoller timed = timelinePoller(time, esm);
+
+        timed.startPolling(esm);
+        time.advance(Duration.ofMillis(999));
+        verifyReceives(esm, 0);
+        time.advance(Duration.ofMillis(1));
+        verifyReceives(esm, 1);
+        time.advance(Duration.ofSeconds(9));
+        verifyReceives(esm, 10);
+
+        esm.setEnabled(false);
+        time.advance(Duration.ofSeconds(5));
+        verifyReceives(esm, 10);
+        esm.setEnabled(true);
+        time.advance(Duration.ofSeconds(1));
+        verifyReceives(esm, 11);
+
+        timed.stopPolling(esm.getUuid());
+        time.advance(Duration.ofMinutes(1));
+        verifyReceives(esm, 11);
+        assertEquals(0, time.pendingTasks(), "stopPolling must cancel the timer");
+    }
+
+    @Test
+    void startingAMappingTwiceKeepsOneTimer() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setEnabled(true);
+        stubReceive(esm, List.of());
+        SqsEventSourcePoller timed = timelinePoller(time, esm);
+
+        timed.startPolling(esm);
+        timed.startPolling(esm);
+        time.advance(Duration.ofSeconds(3));
+
+        assertEquals(1, time.pendingTasks());
+        verifyReceives(esm, 3);
+    }
+
+    /**
+     * The first tick, at 1 s, receives the message and opens the 20 s window. The ticks from 2 s to 20 s find
+     * it 1 to 19 s old and hold it; the tick at 21 s finds it exactly 20 s old and delivers it.
+     */
+    @Test
+    void timerHoldsAnUnderfilledBatchUntilTheTickThatFindsItsBatchingWindowElapsed() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setEnabled(true);
+        esm.setBatchSize(2);
+        esm.setMaximumBatchingWindowInSeconds(20);
+        when(sqsService.receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
+                .thenReturn(List.of(message("m1")))
+                .thenReturn(List.of());
+        when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult());
+        timelinePoller(time, esm).startPolling(esm);
+
+        time.advanceTo(TIMELINE_START.plusMillis(20_999));
+        verifyReceives(esm, 20);
+        verify(executorService, never()).invoke(any(), any(), any());
+        verify(sqsService, never()).deleteMessage(any(), any(), any());
+
+        time.advance(Duration.ofMillis(1));
+        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
+
+        time.advance(Duration.ofMinutes(1));
+        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    @Test
+    void stoppingAMappingDropsItsBufferedBatchSoARestartOpensANewWindow() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setEnabled(true);
+        esm.setBatchSize(2);
+        esm.setMaximumBatchingWindowInSeconds(20);
+        when(sqsService.receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
+                .thenReturn(List.of(message("m1")))
+                .thenReturn(List.of());
+        when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult());
+        SqsEventSourcePoller timed = timelinePoller(time, esm);
+        timed.startPolling(esm);
+        time.advance(Duration.ofSeconds(10));
+
+        timed.stopPolling(esm.getUuid());
+        timed.startPolling(esm);
+        time.advance(Duration.ofMinutes(1));
+
+        verify(executorService, never()).invoke(any(), any(), any());
     }
 }
