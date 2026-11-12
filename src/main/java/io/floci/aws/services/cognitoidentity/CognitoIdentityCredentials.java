@@ -68,6 +68,9 @@ public class CognitoIdentityCredentials {
         if (tokens.recognizes(token)) {
             return true;
         }
+        if (tokens.identifiesIssuer(token)) {
+            return false;
+        }
         try {
             JsonNode statements = mapper.readTree(role(roleArn).getAssumeRolePolicyDocument()).path("Statement");
             List<JsonNode> values = new ArrayList<>();
