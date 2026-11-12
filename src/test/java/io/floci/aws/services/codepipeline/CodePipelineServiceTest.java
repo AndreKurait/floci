@@ -19,6 +19,8 @@ import io.floci.aws.services.codepipeline.model.CodePipelinePipeline.TransitionS
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.s3.model.S3Object;
+import io.floci.aws.testing.LockWaits;
+import io.floci.aws.testing.TestTime;
 import io.floci.aws.testing.ThreadStates;
 import io.smallrye.config.SmallRyeConfigBuilder;
 import org.junit.jupiter.api.Test;
@@ -59,6 +61,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -271,9 +274,62 @@ class CodePipelineServiceTest {
         assertWorkerPollingProgress(0L, false);
     }
 
+    /**
+     * The same on a controlled timeline, where each check of the build can be counted. The test above
+     * leaves the pauses to the worker's own thread in real time.
+     */
     @Test
     void invalidDirectWorkerIntervalKeepsPollingAndStopsAfterBuildCompletion() throws Exception {
-        assertWorkerPollingProgress(Long.MIN_VALUE, true);
+        TestTime time = TestTime.create();
+        CodeBuildService codeBuild = mock(CodeBuildService.class);
+        AtomicReference<Build> currentBuild = new AtomicReference<>(build("IN_PROGRESS", false));
+        when(codeBuild.startBuild(anyString(), anyString(), anyString(),
+                any(), any(), any(), any(), any(), any(), any())).thenAnswer(invocation -> currentBuild.get());
+        when(codeBuild.getBuild(anyString(), anyString(), anyString()))
+                .thenAnswer(invocation -> currentBuild.get());
+        // An interval that is not positive: the worker pauses for the 100 ms fallback instead.
+        CodePipelineService pipelineService = new CodePipelineService(new InMemoryStorageFactory(), mapper,
+                codeBuild, mock(CodeDeployService.class), mock(LambdaService.class), mock(S3Service.class),
+                new CodePipelineEventPublisher(null, null, mapper), 500L, Long.MIN_VALUE,
+                TimeUnit.SECONDS.toNanos(5), () -> { }, time.scheduler(), time::sleepMillis);
+        String pipeline = "worker-poll-timeline";
+        try {
+            createExternalActionPipeline(pipelineService, pipeline, """
+                    {"name":"BuildAction","actionTypeId":{
+                      "category":"Build","owner":"AWS","provider":"CodeBuild","version":"1"},
+                     "configuration":{"ProjectName":"build-project"}}
+                    """);
+            String execution = startExecution(pipelineService, pipeline);
+
+            for (int checks = 1; checks <= 3; checks++) {
+                time.awaitSleepers(1);
+                time.advance(Duration.ofMillis(99));
+                verify(codeBuild, times(checks - 1)).getBuild(anyString(), anyString(), anyString());
+                time.advance(Duration.ofMillis(1));
+                verify(codeBuild, times(checks)).getBuild(anyString(), anyString(), anyString());
+            }
+
+            // A stop that does not abandon lets the build finish: the worker keeps its pace.
+            stopExecution(pipelineService, pipeline, execution, false);
+            waitForExecutionStatus(pipelineService, pipeline, execution, "Stopping");
+            currentBuild.set(build("SUCCEEDED", true));
+            time.awaitSleepers(1);
+            time.advance(Duration.ofMillis(99));
+            assertEquals("Stopping", handle(pipelineService, "GetPipelineExecution", """
+                    {"pipelineName": "%s", "pipelineExecutionId": "%s"}
+                    """.formatted(pipeline, execution)).path("pipelineExecution").path("status").asText());
+            time.advance(Duration.ofMillis(1));
+
+            waitForExecutionStatus(pipelineService, pipeline, execution, "Stopped");
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(3))
+                    .until(() -> !pipelineService.activeRuns.contains(ACCOUNT + ":" + execution));
+            verify(codeBuild, times(4)).getBuild(anyString(), anyString(), anyString());
+            assertEquals("Succeeded", pipelineState(pipelineService, pipeline).path("stageStates").path(0)
+                    .path("actionStates").path(0).path("latestExecution").path("status").asText());
+            verify(codeBuild, never()).stopBuild(anyString(), anyString(), anyString());
+        } finally {
+            pipelineService.shutdown();
+        }
     }
 
     private CodePipelineService workerPollingService(CodeBuildService codeBuild, long interval, boolean direct) {
@@ -423,13 +479,16 @@ class CodePipelineServiceTest {
             return source;
         });
 
+        TestTime time = TestTime.create();
         CodePipelineService pollingService = new CodePipelineService(
                 new InMemoryStorageFactory(),
                 mapper,
                 mock(CodeBuildService.class),
                 mock(CodeDeployService.class),
                 mock(LambdaService.class),
-                s3Service, configWithPollInterval(500L));
+                s3Service, new CodePipelineEventPublisher(null, null, mapper),
+                CodePipelineService.DEFAULT_SOURCE_POLL_INTERVAL_MS, 100L,
+                CodePipelineService.DEFAULT_RUN_FINISH_WAIT_NANOS, () -> { }, time.scheduler());
         String pipelineRequest = """
                 {
                     "pipeline": {
@@ -472,17 +531,26 @@ class CodePipelineServiceTest {
         try {
             pollingService.handle("CreatePipeline", request, REGION, ACCOUNT);
             pollingService.resumePersistedExecutions();
+            time.advance(Duration.ofMillis(CodePipelineService.DEFAULT_SOURCE_POLL_INTERVAL_MS - 1));
+            assertEquals(1, headCalls.get(), "no poll before the source poll interval is up");
+            // The poll runs on the thread that makes it due, and parks in the S3 call holding the poll lock.
+            AtomicReference<Thread> poller = new AtomicReference<>(Thread.ofPlatform().name("source-poll")
+                    .start(() -> time.advance(Duration.ofMillis(1))));
             assertTrue(pollEntered.await(2, TimeUnit.SECONDS));
 
             JsonNode updateRequest = mapper.readTree(pipelineRequest);
-            CompletableFuture<JsonNode> update = CompletableFuture.supplyAsync(
-                    () -> pollingService.handle("UpdatePipeline", updateRequest, REGION, ACCOUNT));
+            AtomicReference<Thread> updater = new AtomicReference<>();
+            CompletableFuture<JsonNode> update = CompletableFuture.supplyAsync(() -> {
+                updater.set(Thread.currentThread());
+                return pollingService.handle("UpdatePipeline", updateRequest, REGION, ACCOUNT);
+            });
 
-            Thread.sleep(150);
+            LockWaits.awaitBlockedBehind(updater, poller, update);
             assertFalse(update.isDone(), "UpdatePipeline must wait for the in-flight source poll");
 
             releasePoll.countDown();
             update.get(2, TimeUnit.SECONDS);
+            assertTrue(poller.get().join(Duration.ofSeconds(2)));
         } finally {
             releasePoll.countDown();
             pollingService.shutdown();
@@ -1717,19 +1785,12 @@ class CodePipelineServiceTest {
 
     private JsonNode waitForExecutionStatus(CodePipelineService pipelineService, String pipelineName,
                                             String executionId, String expectedStatus) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
-        JsonNode execution;
-        do {
-            execution = handle(pipelineService, "GetPipelineExecution", """
-                    {"pipelineName": "%s", "pipelineExecutionId": "%s"}
-                    """.formatted(pipelineName, executionId)).path("pipelineExecution");
-            if (expectedStatus.equals(execution.path("status").asText())) {
-                return execution;
-            }
-            Thread.sleep(25);
-        } while (System.nanoTime() < deadline);
-        throw new AssertionError("Pipeline did not reach " + expectedStatus
-                + "; last status was " + execution.path("status").asText());
+        return await("pipeline " + pipelineName + " to reach " + expectedStatus)
+                .atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                .until(() -> handle(pipelineService, "GetPipelineExecution", """
+                        {"pipelineName": "%s", "pipelineExecutionId": "%s"}
+                        """.formatted(pipelineName, executionId)).path("pipelineExecution"),
+                        execution -> expectedStatus.equals(execution.path("status").asText()));
     }
 
     private JsonNode pipelineState(CodePipelineService pipelineService, String pipelineName) throws Exception {

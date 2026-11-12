@@ -11,9 +11,11 @@ import io.floci.aws.services.scheduler.model.Schedule;
 import io.floci.aws.services.scheduler.model.ScheduleGroup;
 import io.floci.aws.services.scheduler.model.ScheduleRequest;
 import io.floci.aws.services.scheduler.model.Target;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -580,6 +582,48 @@ class SchedulerServiceTest {
         assertEquals("updated desc", updated.getDescription());
         assertNotNull(updated.getCreationDate());
         assertTrue(updated.getLastModificationDate().compareTo(updated.getCreationDate()) >= 0);
+    }
+
+    @Test
+    void taggingAGroupStampsTheInstantOfTheChangeAndKeepsItsCreationDate() {
+        TestTime time = TestTime.create();
+        service = new SchedulerService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), time.clock());
+        Instant created = time.now();
+        ScheduleGroup group = service.createScheduleGroup("stamped", Map.of("team", "platform"), REGION);
+        assertEquals(created, group.getCreationDate());
+        assertEquals(created, group.getLastModificationDate());
+
+        time.advance(Duration.ofMillis(1));
+        service.tagScheduleGroup("stamped", REGION, Map.of("owner", "Alice"));
+        group = service.getScheduleGroup("stamped", REGION);
+        assertEquals(created, group.getCreationDate());
+        assertEquals(created.plusMillis(1), group.getLastModificationDate());
+
+        time.advance(Duration.ofHours(36));
+        service.untagScheduleGroup("stamped", REGION, List.of("owner"));
+        group = service.getScheduleGroup("stamped", REGION);
+        assertEquals(created, group.getCreationDate());
+        assertEquals(created.plusMillis(1).plus(Duration.ofHours(36)), group.getLastModificationDate());
+    }
+
+    @Test
+    void updatingAScheduleStampsTheInstantOfTheChangeAndKeepsItsCreationDate() {
+        TestTime time = TestTime.create();
+        service = new SchedulerService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), time.clock());
+        Instant created = time.now();
+        ScheduleRequest request = newRequest("stamped", null, "rate(1 hour)",
+                new FlexibleTimeWindow("OFF", null),
+                new Target("arn:t", "arn:aws:iam::000000000000:role/r", null, null));
+        Schedule schedule = service.createSchedule(request, REGION);
+        assertEquals(created, schedule.getCreationDate());
+        assertEquals(created, schedule.getLastModificationDate());
+
+        time.advance(Duration.ofMillis(1));
+        Schedule updated = service.updateSchedule(request, REGION);
+        assertEquals(created, updated.getCreationDate());
+        assertEquals(created.plusMillis(1), updated.getLastModificationDate());
     }
 
     @Test

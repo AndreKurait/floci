@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 
 /**
@@ -41,7 +42,7 @@ class KarapaceManager implements ContainerTeardown {
 
     private static final Logger LOG = Logger.getLogger(KarapaceManager.class);
     private static final int REST_PORT = 8082;
-    private static final Duration READY_TIMEOUT = Duration.ofSeconds(30);
+    static final Duration READY_TIMEOUT = Duration.ofSeconds(30);
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -50,6 +51,8 @@ class KarapaceManager implements ContainerTeardown {
     private final PortAllocator portAllocator;
     private final DockerHostResolver dockerHostResolver;
     private final Duration readyTimeout;
+    private final LongSupplier nanoTime;
+    private final Sleeper sleeper;
     private final Map<String, URI> restBaseUriByTarget = new ConcurrentHashMap<>();
     private final Map<String, ManagedContainer> containersByTarget = new ConcurrentHashMap<>();
     private final Object lifecycleLock = new Object();
@@ -58,6 +61,12 @@ class KarapaceManager implements ContainerTeardown {
     private CompletableFuture<Void> teardown;
 
     private record ManagedContainer(String id, int hostPort) {
+    }
+
+    /** The pause between two readiness probes. */
+    @FunctionalInterface
+    interface Sleeper {
+        void sleepMillis(long millis) throws InterruptedException;
     }
 
     @Inject
@@ -79,6 +88,20 @@ class KarapaceManager implements ContainerTeardown {
                     PortAllocator portAllocator,
                     DockerHostResolver dockerHostResolver,
                     Duration readyTimeout) {
+        this(containerBuilder, lifecycleManager, containerDetector, config, portAllocator, dockerHostResolver,
+                readyTimeout, System::nanoTime, Thread::sleep);
+    }
+
+    /** For tests that decide when the readiness timeout runs out: the elapsed-time source and the pause. */
+    KarapaceManager(ContainerBuilder containerBuilder,
+                    ContainerLifecycleManager lifecycleManager,
+                    ContainerDetector containerDetector,
+                    EmulatorConfig config,
+                    PortAllocator portAllocator,
+                    DockerHostResolver dockerHostResolver,
+                    Duration readyTimeout,
+                    LongSupplier nanoTime,
+                    Sleeper sleeper) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.containerDetector = containerDetector;
@@ -86,6 +109,8 @@ class KarapaceManager implements ContainerTeardown {
         this.portAllocator = portAllocator;
         this.dockerHostResolver = dockerHostResolver;
         this.readyTimeout = readyTimeout;
+        this.nanoTime = nanoTime;
+        this.sleeper = sleeper;
     }
 
     URI ensureStarted(String bootstrapServers) {
@@ -210,13 +235,13 @@ class KarapaceManager implements ContainerTeardown {
     }
 
     private void waitUntilReady(URI restBaseUri) {
-        long deadline = System.nanoTime() + readyTimeout.toNanos();
-        while (System.nanoTime() < deadline) {
+        long deadline = nanoTime.getAsLong() + readyTimeout.toNanos();
+        while (nanoTime.getAsLong() < deadline) {
             if (isReady(restBaseUri)) {
                 return;
             }
             try {
-                Thread.sleep(Math.min(200, Math.max(1, readyTimeout.toMillis() / 4)));
+                sleeper.sleepMillis(Math.min(200, Math.max(1, readyTimeout.toMillis() / 4)));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Interrupted waiting for Karapace to become ready at " + restBaseUri, e);

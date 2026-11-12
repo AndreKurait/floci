@@ -63,11 +63,7 @@ public class PipesPoller implements Resettable {
     private final ConcurrentHashMap<String, String> kinesisIterators = new ConcurrentHashMap<>();
     /** Per pipe, its DynamoDB Stream progress, which a poll only starts while the pipe polls. */
     private final ConcurrentHashMap<String, DynamoDbProgress> dynamoDbProgress = new ConcurrentHashMap<>();
-    private final ExecutorService pollExecutor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "pipes-poller");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService pollExecutor;
 
     @Inject
     public PipesPoller(Vertx vertx,
@@ -79,6 +75,26 @@ public class PipesPoller implements Resettable {
                        PipesFilterMatcher filterMatcher,
                        ObjectMapper objectMapper,
                        EmulatorConfig config) {
+        this(vertx, sqsService, kinesisService, streamReader, kafkaConsumerManager, targetInvoker, filterMatcher,
+                objectMapper, config, Executors.newCachedThreadPool(r -> {
+                    Thread t = new Thread(r, "pipes-poller");
+                    t.setDaemon(true);
+                    return t;
+                }));
+    }
+
+    /** For tests that decide when a poll runs: the executor each tick hands its poll to. */
+    PipesPoller(Vertx vertx,
+                SqsService sqsService,
+                KinesisService kinesisService,
+                DynamoDbStreamReader streamReader,
+                PipesKafkaConsumerManager kafkaConsumerManager,
+                PipesTargetInvoker targetInvoker,
+                PipesFilterMatcher filterMatcher,
+                ObjectMapper objectMapper,
+                EmulatorConfig config,
+                ExecutorService pollExecutor) {
+        this.pollExecutor = pollExecutor;
         this.vertx = vertx;
         this.sqsService = sqsService;
         this.kinesisService = kinesisService;

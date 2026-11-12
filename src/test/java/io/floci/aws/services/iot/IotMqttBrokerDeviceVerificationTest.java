@@ -257,7 +257,10 @@ class IotMqttBrokerDeviceVerificationTest {
         try {
             assertNotAuthorized(() -> connectTls("shared-id", otherLeaf, null));
 
-            Thread.sleep(200);
+            // A round trip on the holder's own connection, sent after the refusal came back: the
+            // broker answers it only for a session the refused connect left open.
+            holder.setTimeToWait(10_000);
+            holder.unsubscribe("after/the/refusal");
             assertTrue(holder.isConnected());
             assertTrue(broker.getConnection("shared-id").isPresent());
         } finally {

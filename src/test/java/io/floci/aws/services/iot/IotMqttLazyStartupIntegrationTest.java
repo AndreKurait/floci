@@ -9,8 +9,10 @@ import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.time.Duration;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -38,16 +40,17 @@ class IotMqttLazyStartupIntegrationTest {
      * refuses connections before a test asserts the broker is not listening — this
      * removes a startup-order race that only surfaced under the full ordered suite.
      */
-    private static void awaitPortClosed(int port) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (System.currentTimeMillis() < deadline) {
-            try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress("127.0.0.1", port), 100);
-            } catch (Exception refused) {
-                return; // connection refused — the broker port is closed
-            }
-            Thread.sleep(50); // still accepting connections; back off and retry
-        }
+    private static void awaitPortClosed(int port) {
+        await("port " + port + " to refuse connections").atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                .until(() -> {
+                    try (Socket socket = new Socket()) {
+                        socket.connect(new InetSocketAddress("127.0.0.1", port), 100);
+                        return false; // still accepting connections; retry
+                    } catch (Exception refused) {
+                        return true; // connection refused: the broker port is closed
+                    }
+                });
     }
 
     @Test

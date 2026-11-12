@@ -8,10 +8,12 @@ import io.floci.aws.services.scheduler.model.Schedule;
 import io.floci.aws.services.scheduler.model.Target;
 import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.services.sqs.model.MessageAttributeValue;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +35,8 @@ class ScheduleDispatcherTest {
     private ScheduleInvoker invoker;
     private SqsService sqsService;
     private ScheduleDispatcher dispatcher;
+    private EmulatorConfig config;
+    private EmulatorConfig.SchedulerServiceConfig schedulerCfg;
 
     @BeforeEach
     void setUp() {
@@ -40,13 +44,13 @@ class ScheduleDispatcherTest {
         invoker = mock(ScheduleInvoker.class);
         sqsService = mock(SqsService.class);
 
-        EmulatorConfig.SchedulerServiceConfig schedulerCfg = mock(EmulatorConfig.SchedulerServiceConfig.class);
+        schedulerCfg = mock(EmulatorConfig.SchedulerServiceConfig.class);
         when(schedulerCfg.enabled()).thenReturn(true);
         when(schedulerCfg.invocationEnabled()).thenReturn(true);
         when(schedulerCfg.tickIntervalSeconds()).thenReturn(10L);
         EmulatorConfig.ServicesConfig servicesCfg = mock(EmulatorConfig.ServicesConfig.class);
         when(servicesCfg.scheduler()).thenReturn(schedulerCfg);
-        EmulatorConfig config = mock(EmulatorConfig.class);
+        config = mock(EmulatorConfig.class);
         when(config.services()).thenReturn(servicesCfg);
         when(config.baseUrl()).thenReturn("http://localhost:4566");
 
@@ -99,6 +103,55 @@ class ScheduleDispatcherTest {
         assertNotNull(value, name);
         assertEquals("String", value.getDataType(), name);
         return value.getStringValue();
+    }
+
+    @Test
+    void theDispatcherEvaluatesSchedulesOnEachConfiguredTick() {
+        TestTime time = TestTime.startingAt(Instant.parse("2026-04-21T09:17:45Z"));
+        Schedule s = newSchedule("timed", "at(2026-04-21T09:18:00)", "ENABLED");
+        when(schedulerService.listAllSchedules()).thenReturn(List.of(s));
+        new ScheduleDispatcher(schedulerService, invoker, sqsService, config, time.scheduler(), time.clock())
+                .onStart(null);
+
+        // Ticks every ten seconds: 09:17:55 is before the schedule, 09:18:05 is the first tick after it.
+        time.advance(Duration.ofSeconds(10).minusMillis(1));
+        verify(schedulerService, never()).listAllSchedules();
+        time.advance(Duration.ofMillis(1));
+        verify(schedulerService, times(1)).listAllSchedules();
+        time.advance(Duration.ofSeconds(10).minusMillis(1));
+        verify(schedulerService, times(1)).listAllSchedules();
+        verify(invoker, never()).invoke(any(), any(), any(), anyInt());
+
+        time.advance(Duration.ofMillis(1));
+        verify(schedulerService, times(2)).listAllSchedules();
+        verify(invoker, times(1)).invoke(eq(s), eq(Instant.parse("2026-04-21T09:18:00Z")), any(), anyInt());
+    }
+
+    @Test
+    void aTickThatFailsDoesNotStopTheNextOne() {
+        TestTime time = TestTime.create();
+        when(schedulerService.listAllSchedules())
+                .thenThrow(new IllegalStateException("storage is briefly unavailable"))
+                .thenReturn(List.of());
+        new ScheduleDispatcher(schedulerService, invoker, sqsService, config, time.scheduler(), time.clock())
+                .onStart(null);
+
+        time.advance(Duration.ofSeconds(10));
+        verify(schedulerService, times(1)).listAllSchedules();
+        time.advance(Duration.ofSeconds(10));
+        verify(schedulerService, times(2)).listAllSchedules();
+    }
+
+    @Test
+    void aDispatcherDisabledByConfigurationNeverTicks() {
+        TestTime time = TestTime.create();
+        when(schedulerCfg.invocationEnabled()).thenReturn(false);
+        new ScheduleDispatcher(schedulerService, invoker, sqsService, config, time.scheduler(), time.clock())
+                .onStart(null);
+
+        time.advance(Duration.ofHours(1));
+
+        verifyNoInteractions(schedulerService, invoker);
     }
 
     @Test

@@ -7,6 +7,7 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.iot.model.IotAuthorizer;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -19,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -45,8 +47,9 @@ class IotAuthorizerServiceTest {
     private static String privateKey;
 
     private final ObjectMapper mapper = new ObjectMapper();
-    private final IotAuthorizerService service =
-            new IotAuthorizerService(new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"));
+    private final TestTime time = TestTime.create();
+    private final IotAuthorizerService service = new IotAuthorizerService(
+            new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"), time.clock());
 
     @BeforeAll
     static void generateKeys() throws GeneralSecurityException {
@@ -276,16 +279,17 @@ class IotAuthorizerServiceTest {
     }
 
     @Test
-    void updateChangesOnlyTheFieldsSentAndBumpsLastModifiedDate() throws InterruptedException {
+    void updateChangesOnlyTheFieldsSentAndBumpsLastModifiedDate() {
         Instant created = service.createAuthorizer("upd", unsigned(), REGION).getLastModifiedDate();
-        Thread.sleep(5);
+        assertEquals(time.now(), created);
+        time.advance(Duration.ofMinutes(5));
 
         service.updateAuthorizer("upd", mapper.createObjectNode(), REGION);
         assertEquals(created, service.describeAuthorizer("upd", REGION).getLastModifiedDate());
 
         IotAuthorizer active = service.updateAuthorizer("upd", mapper.createObjectNode().put("status", "ACTIVE"), REGION);
         assertEquals("ACTIVE", active.getStatus());
-        assertTrue(active.getLastModifiedDate().isAfter(created));
+        assertEquals(created.plus(Duration.ofMinutes(5)), active.getLastModifiedDate());
         assertEquals(created, active.getCreationDate());
 
         IotAuthorizer moved = service.updateAuthorizer("upd", mapper.createObjectNode()
@@ -331,10 +335,10 @@ class IotAuthorizerServiceTest {
         assertEquals(Map.of("k1", rsaKey2, "k2", rsaKey2), service.describeAuthorizer("merge", REGION).getTokenSigningPublicKeys());
 
         Instant before = service.describeAuthorizer("merge", REGION).getLastModifiedDate();
-        Thread.sleep(5);
+        time.advance(Duration.ofMillis(1));
         IotAuthorizer emptied = service.updateAuthorizer("merge", keysOnly(Map.of()), REGION);
         assertEquals(Map.of("k1", rsaKey2, "k2", rsaKey2), emptied.getTokenSigningPublicKeys());
-        assertTrue(emptied.getLastModifiedDate().isAfter(before));
+        assertEquals(before.plusMillis(1), emptied.getLastModifiedDate());
     }
 
     @Test
@@ -407,10 +411,10 @@ class IotAuthorizerServiceTest {
     }
 
     @Test
-    void listOrdersByCreationFiltersByStatusAndPages() throws InterruptedException {
+    void listOrdersByCreationFiltersByStatusAndPages() {
         for (String name : List.of("l2", "l3", "l1")) {
             service.createAuthorizer(name, unsigned(), REGION);
-            Thread.sleep(2);
+            time.advance(Duration.ofMillis(1));
         }
         service.updateAuthorizer("l3", mapper.createObjectNode().put("status", "ACTIVE"), REGION);
         service.createAuthorizer("elsewhere", unsigned(), "eu-west-1");

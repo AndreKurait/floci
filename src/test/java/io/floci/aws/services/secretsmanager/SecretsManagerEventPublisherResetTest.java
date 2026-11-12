@@ -9,6 +9,7 @@ import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.lifecycle.EmulatorInfoController;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.eventbridge.EventBridgeService;
+import io.floci.aws.testing.LockWaits;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,7 +25,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -99,8 +99,8 @@ class SecretsManagerEventPublisherResetTest {
             write("queued-before-reset");
 
             Future<?> reset = resets.submit(() -> controller().reset());
-            assertThrows(TimeoutException.class, () -> reset.get(200, TimeUnit.MILLISECONDS),
-                    "reset must wait for active target deliveries before wiping storage");
+            LockWaits.awaitWaitingIn(SecretsManagerEventPublisher.class, "beforeReset");
+            assertFalse(reset.isDone(), "reset must wait for active target deliveries before wiping storage");
             verify(storage, never()).clearAll();
             release.countDown();
             reset.get(5, TimeUnit.SECONDS);

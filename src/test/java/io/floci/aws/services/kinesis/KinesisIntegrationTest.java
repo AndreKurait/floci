@@ -916,17 +916,31 @@ class KinesisIntegrationTest {
             .extract().jsonPath().getString("ShardIterator");
     }
 
+    /**
+     * A wall-clock millisecond later than any the service has stamped a record with so far. Records
+     * are stamped by the system clock and AT_TIMESTAMP compares whole milliseconds, so a timestamp
+     * taken here falls strictly after the previous record and at or before the next one.
+     */
+    private static long nextWallClockMillisecond() {
+        long before = System.currentTimeMillis();
+        long now = System.currentTimeMillis();
+        while (now <= before) {
+            Thread.onSpinWait();
+            now = System.currentTimeMillis();
+        }
+        return now;
+    }
+
     @Test
     @Order(50)
-    void atTimestampReturnsRecordsAtAndAfter() throws InterruptedException {
+    void atTimestampReturnsRecordsAtAndAfter() {
         String stream = "at-timestamp-basic";
         String shardId = atTimestampCreateStream(stream);
 
         long[] tsMillis = new long[5];
         for (int i = 0; i < 5; i++) {
-            tsMillis[i] = System.currentTimeMillis();
+            tsMillis[i] = nextWallClockMillisecond();
             atTimestampPutAndGetSequence(stream, "cmVjMA=="); // "rec0" base64
-            Thread.sleep(100);
         }
 
         // tsMillis[i] is captured just before rec[i], so rec[i].arrival >= tsMillis[i]

@@ -14,12 +14,14 @@ import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -82,10 +84,7 @@ class IotMqttWebSocketFramingIntegrationTest {
 
             assertTrue(raw.closed.await(10, TimeUnit.SECONDS));
             assertEquals(1003, raw.closeCode.get(10, TimeUnit.SECONDS), "MQTT over WebSocket is binary only");
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-            while (broker.getConnection(clientId).isPresent() && System.nanoTime() < deadline) {
-                Thread.sleep(20);
-            }
+            awaitSessionGone(clientId);
             assertTrue(broker.getConnection(clientId).isEmpty(), "the broker side is closed with the WebSocket");
         }
     }
@@ -100,11 +99,15 @@ class IotMqttWebSocketFramingIntegrationTest {
 
         raw.socket.abort();
 
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (broker.getConnection(clientId).isPresent() && System.nanoTime() < deadline) {
-            Thread.sleep(20);
-        }
+        awaitSessionGone(clientId);
         assertTrue(broker.getConnection(clientId).isEmpty(), "a vanished client frees the broker session without an MQTT DISCONNECT");
+    }
+
+    /** The broker ends the session on its event loop, a moment after the WebSocket closes. */
+    private void awaitSessionGone(String clientId) {
+        await("the broker session of " + clientId + " to end").atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(20))
+                .until(() -> broker.getConnection(clientId).isEmpty());
     }
 
     @Test
