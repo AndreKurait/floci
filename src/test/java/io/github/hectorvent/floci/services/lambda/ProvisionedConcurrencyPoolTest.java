@@ -1585,6 +1585,34 @@ class ProvisionedConcurrencyPoolTest {
                 });
     }
 
+    private void awaitAvailable(int expected) {
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> get().available() == expected);
+    }
+
+    @Test
+    void readyStatusCanPrecedeTheLastInitializationWorker() throws Exception {
+        put(2);
+        Environment first = launched();
+        Environment second = launched();
+        first.initializationGate = new CompletableFuture<>();
+        second.initializationGate = new CompletableFuture<>();
+        try {
+            second.initialized.complete(null);
+            first.initialized.complete(null);
+            await().atMost(Duration.ofSeconds(5)).until(() -> get().allocated() == 2);
+            first.initializationGate.complete(null);
+            ready();
+            assertEquals(1, get().available(), "The parked initializer has not admitted its idle environment");
+            second.initializationGate.complete(null);
+            awaitAvailable(2);
+            assertEquals(2, get().available());
+        } finally {
+            first.initializationGate.complete(null);
+            second.initializationGate.complete(null);
+        }
+    }
+
     @Test
     void interruptedDrainRetainsEveryOwnedEnvironmentForRetry() throws Exception {
         pool.shutdown();
@@ -1597,7 +1625,7 @@ class ProvisionedConcurrencyPoolTest {
             environments.add(environment);
             environment.initialized.complete(null);
         }
-        ready();
+        awaitAvailable(32);
         launcher.stopGate = new CompletableFuture<>();
         AtomicBoolean interruptionPreserved = new AtomicBoolean();
         Thread drain = Thread.ofPlatform().start(() -> {
@@ -1848,6 +1876,7 @@ class ProvisionedConcurrencyPoolTest {
         final AtomicInteger stops = new AtomicInteger();
         final AtomicBoolean faulted = new AtomicBoolean();
         final ContainerHandle handle;
+        volatile CompletableFuture<Void> initializationGate = CompletableFuture.completedFuture(null);
         volatile CompletableFuture<Void> stopGate = CompletableFuture.completedFuture(null);
         volatile boolean alive = true;
 
@@ -1855,6 +1884,7 @@ class ProvisionedConcurrencyPoolTest {
             handle = new ContainerHandle("environment-" + id, fn.getFunctionName(), runtime, ContainerState.WARM);
             doAnswer(call -> {
                 initialized.get(5, TimeUnit.SECONDS);
+                initializationGate.get(5, TimeUnit.SECONDS);
                 return null;
             }).when(runtime).awaitInitialization(anyLong());
             when(runtime.isInitialized()).thenAnswer(call ->
