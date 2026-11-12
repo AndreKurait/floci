@@ -768,7 +768,8 @@ public class Ec2ContainerManager {
                     eniId = eni.getNetworkInterfaceId();
                     instance.setLogicalPrivateIpAddress(eni.getPrivateIpAddress());
                     namespace = firewallManager.createNamespace("ec2", instanceId,
-                            regionResolver.getAccountId(), region, Optional.empty(), Map.of(22, sshHostPort));
+                            regionResolver.getAccountId(), region, Optional.empty(), Map.of(22, sshHostPort),
+                            Map.of(), metadataNamespaces.sshHostBindAddress());
                     helperId = namespace.helperId();
                 } else {
                     helperId = metadataNamespaces.create(instanceId, regionResolver.getAccountId(), region, sshHostPort);

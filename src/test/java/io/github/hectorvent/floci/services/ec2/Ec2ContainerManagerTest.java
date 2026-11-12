@@ -2748,7 +2748,7 @@ class Ec2ContainerManagerTest {
         when(harness.lifecycleManager.create(any(ContainerSpec.class)))
                 .thenReturn("container-conflict", TEST_CONTAINER_ID);
         when(harness.lifecycleManager.startCreated(anyString(), any(ContainerSpec.class)))
-                .thenThrow(new RuntimeException("Bind for 0.0.0.0:2201 failed: port is already allocated"))
+                .thenThrow(new RuntimeException("Bind for 127.0.0.1:2201 failed: port is already allocated"))
                 .thenReturn(null);
 
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
@@ -2765,8 +2765,8 @@ class Ec2ContainerManagerTest {
         verify(harness.lifecycleManager).removeIfExists("container-conflict");
         verify(harness.portAllocator).release(2201);
         verify(harness.portAllocator, never()).markReserved(anyInt());
-        verify(harness.builder).withPortBinding(22, 2201);
-        verify(harness.builder).withPortBinding(22, 2202);
+        verify(harness.builder).withPortBinding(22, 2201, "127.0.0.1");
+        verify(harness.builder).withPortBinding(22, 2202, "127.0.0.1");
     }
 
     @Test
@@ -4329,6 +4329,21 @@ class Ec2ContainerManagerTest {
         assertNull(host.getCapDrop());
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,,127.0.0.1", "true,,127.0.0.1",
+            "false,192.0.2.10,192.0.2.10", "true,192.0.2.10,192.0.2.10",
+            "false,' ',127.0.0.1", "true,' ',127.0.0.1"})
+    void sshHostAddressReachesMetadataAndSecurityGroupHelpers(
+            boolean protectedNamespace, String configuredAddress, String expectedAddress)
+            throws Exception {
+        Map<String, String> environment = configuredAddress == null ? Map.of()
+                : Map.of("FLOCI_SERVICES_EC2_SSH_HOST_BIND_ADDRESS", configuredAddress);
+        ContainerSpec guest = launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"),
+                environment, protectedNamespace, false, false, expectedAddress);
+
+        assertTrue(guest.portBindings().isEmpty());
+    }
+
     @Test
     void configuredPrivilegesCannotOverrideMandatorySecurityGroupContainment() throws Exception {
         ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
@@ -4478,6 +4493,12 @@ class Ec2ContainerManagerTest {
     private static ContainerSpec launchConfiguredGuest(ResolvedAmiImage image, Map<String, String> environment,
                                                        boolean protectedNamespace, boolean instanceProfile,
                                                        boolean refused) throws Exception {
+        return launchConfiguredGuest(image, environment, protectedNamespace, instanceProfile, refused, "127.0.0.1");
+    }
+
+    private static ContainerSpec launchConfiguredGuest(ResolvedAmiImage image, Map<String, String> environment,
+                                                        boolean protectedNamespace, boolean instanceProfile,
+                                                        boolean refused, String sshHostAddress) throws Exception {
         DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
         when(dockerHostResolver.resolve()).thenReturn("floci");
         ContainerReachableEndpoint reachableEndpoint = mock(ContainerReachableEndpoint.class);
@@ -4535,7 +4556,7 @@ class Ec2ContainerManagerTest {
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
         when(firewall.enabled()).thenReturn(protectedNamespace);
         when(firewall.createNamespace(eq("ec2"), eq("i-spec-limits"), eq("000000000000"),
-                eq("us-west-2"), eq(Optional.empty()), eq(Map.of(22, 2201))))
+                eq("us-west-2"), eq(Optional.empty()), eq(Map.of(22, 2201)), eq(Map.of()), eq(sshHostAddress)))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("firewall-helper", "172.18.0.12"));
 
         Ec2ContainerManager manager = new Ec2ContainerManager(
@@ -4581,14 +4602,14 @@ class Ec2ContainerManagerTest {
             if (refused) {
                 verify(portAllocator, never()).allocate(anyInt(), anyInt());
                 verify(firewall, never()).createNamespace(anyString(), anyString(), anyString(), anyString(),
-                        any(), any());
+                        any(), any(), any(), any());
                 verify(lifecycleManager, never()).create(any());
                 verify(lifecycleManager, never()).create(any(), anyString());
                 return null;
             }
             if (protectedNamespace) {
                 verify(firewall).createNamespace("ec2", "i-spec-limits", "000000000000",
-                        "us-west-2", Optional.empty(), Map.of(22, 2201));
+                        "us-west-2", Optional.empty(), Map.of(22, 2201), Map.of(), sshHostAddress);
                 if (image.dockerPlatform() == null) {
                     verify(lifecycleManager, times(1)).create(any());
                 } else {
@@ -4600,6 +4621,7 @@ class Ec2ContainerManagerTest {
                 assertEquals(List.of("NET_ADMIN"), helper.getValue().linuxOptions().capAdd());
                 assertTrue(helper.getValue().linuxOptions().capDrop().isEmpty());
                 assertFalse(helper.getValue().privileged());
+                assertEquals(Map.of(22, sshHostAddress), helper.getValue().portBindingHostIps());
             }
             ContainerSpec unrelated = realBuilder.newContainer("example/unrelated-helper:1").build();
             assertTrue(unrelated.env().isEmpty());
