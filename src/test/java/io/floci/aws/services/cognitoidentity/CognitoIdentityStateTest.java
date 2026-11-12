@@ -32,6 +32,39 @@ class CognitoIdentityStateTest {
     @TempDir Path directory;
 
     @Test
+    void providerChangeAndRemovalPreserveExistingIdentityLinks() {
+        CognitoIdentityService owner = service(ACCOUNT);
+        IdentityPool pool = owner.createIdentityPool(spec(), REGION);
+        CognitoIdentity alice = owner.developerIdentity(pool.getIdentityPoolId(), null,
+                Map.of(PROVIDER, "alice"), REGION);
+        for (String replacement : new String[]{"login.other.test", null}) {
+            IdentityPool update = spec();
+            update.setIdentityPoolId(pool.getIdentityPoolId());
+            update.setDeveloperProviderName(replacement);
+            AwsException error = assertThrows(AwsException.class, () -> owner.updateIdentityPool(update, REGION));
+            assertEquals("InvalidParameterException", error.getErrorCode());
+            CognitoIdentityService restored = service(ACCOUNT);
+            assertEquals(PROVIDER, restored.describeIdentityPool(pool.getIdentityPoolId(), REGION)
+                    .getDeveloperProviderName());
+            assertEquals(alice.identityId(), restored.developerIdentity(pool.getIdentityPoolId(), null,
+                    Map.of(PROVIDER, "alice"), REGION).identityId());
+        }
+    }
+
+    @Test
+    void unchangedProviderAllowsOtherPoolUpdates() {
+        CognitoIdentityService owner = service(ACCOUNT);
+        IdentityPool pool = owner.createIdentityPool(spec(), REGION);
+        IdentityPool update = spec();
+        update.setIdentityPoolId(pool.getIdentityPoolId());
+        update.setIdentityPoolName("renamed");
+        owner.updateIdentityPool(update, REGION);
+        IdentityPool restored = service(ACCOUNT).describeIdentityPool(pool.getIdentityPoolId(), REGION);
+        assertEquals("renamed", restored.getIdentityPoolName());
+        assertEquals(PROVIDER, restored.getDeveloperProviderName());
+    }
+
+    @Test
     void linksPaginationDeactivationAndDeletionSurvivePersistentReload() {
         CognitoIdentityService first = service(ACCOUNT);
         IdentityPool pool = first.createIdentityPool(spec(), REGION);
