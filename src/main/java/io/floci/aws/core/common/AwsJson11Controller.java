@@ -360,7 +360,8 @@ public class AwsJson11Controller {
                 case "application-autoscaling" -> applicationAutoScalingJsonHandler.handle(action, request, region);
                 case "lightsail" -> lightsailJsonHandler.handle(action, request, region);
                 case "route53resolver" -> route53ResolverJsonHandler.handle(action, request, region, regionResolver.getAccountId());
-                case "cognito-identity" -> cognitoIdentityJsonHandler.handle(action, request, region);
+                case "cognito-identity" -> cognitoIdentityJsonHandler.handle(action, request, region,
+                        authorization != null && !authorization.isBlank());
                 // Global Accelerator is a global service: its resources carry an empty ARN region
                 // segment and are never partitioned by the region the caller signed with, so the
                 // handler takes no region.

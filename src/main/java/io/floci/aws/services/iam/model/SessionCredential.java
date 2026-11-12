@@ -4,6 +4,9 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -18,6 +21,7 @@ public class SessionCredential {
     private Instant expiration;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
     private String sessionPolicyDocument;
+    private Map<String, List<String>> cognitoIdentityClaims = Map.of();
     /**
      * Account of the caller that minted this session, captured at mint time. Used to route
      * temporary credentials that carry no role ARN (e.g. GetSessionToken) back to the caller. A
@@ -157,4 +161,16 @@ public class SessionCredential {
 
     public String getDelegatedApproverArn() { return delegatedApproverArn; }
     public void setDelegatedApproverArn(String arn) { this.delegatedApproverArn = arn; }
+
+    public Map<String, List<String>> getCognitoIdentityClaims() {
+        return cognitoIdentityClaims;
+    }
+
+    public void setCognitoIdentityClaims(Map<String, List<String>> claims) {
+        Map<String, List<String>> copy = new LinkedHashMap<>();
+        if (claims != null) {
+            claims.forEach((key, value) -> copy.put(key, List.copyOf(value)));
+        }
+        this.cognitoIdentityClaims = Map.copyOf(copy);
+    }
 }
