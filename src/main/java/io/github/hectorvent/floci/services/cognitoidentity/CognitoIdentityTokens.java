@@ -107,10 +107,6 @@ public class CognitoIdentityTokens {
                     && CognitoIdentityService.isIdentityId(claims.path("sub").asText()));
     }
 
-    boolean identifiesIssuer(String token) {
-        return verifier.peekIssuer(token).isPresent();
-    }
-
     public Verified verify(String token) {
         String keyId = part(token, 0).path("kid").asText();
         List<CognitoIdentityKey> matches = keys instanceof AccountAwareStorageBackend<CognitoIdentityKey> aware
