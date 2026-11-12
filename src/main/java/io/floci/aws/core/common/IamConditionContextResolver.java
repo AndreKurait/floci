@@ -175,7 +175,8 @@ public class IamConditionContextResolver {
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
         if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || LogGroupTagTarget.supports(action) || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
-                || "logs:PutRetentionPolicy".equals(action) || "logs:DeleteRetentionPolicy".equals(action))) {
+                || "logs:PutRetentionPolicy".equals(action) || "logs:DeleteRetentionPolicy".equals(action)
+                || "logs:CreateExportTask".equals(action))) {
             return null;
         }
         JsonNode body = bufferedJsonBody(ctx);
@@ -231,7 +232,10 @@ public class IamConditionContextResolver {
             } else {
                 String group = direct ? logsService.get().resolveTagTarget(body.path("resourceArn").asText(), region).name()
                         : body.path("logGroupName").asText();
-                tags = logsService.get().listTagsLogGroup(group, region);
+                tags = "logs:CreateExportTask".equals(action)
+                        ? logsService.get().readLogExportTags(requestContext.getAccountId() == null
+                                ? config.defaultAccountId() : requestContext.getAccountId(), region, group)
+                        : logsService.get().listTagsLogGroup(group, region);
             }
         } catch (AwsException e) {
             if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
