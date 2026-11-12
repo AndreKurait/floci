@@ -795,6 +795,12 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         stopManagedContainers();
     }
 
+    /** Keep NAT and API bridges until workloads, including EC2 instances, release their interfaces. */
+    @Override
+    public int teardownOrder() {
+        return 2;
+    }
+
     @Override
     public synchronized void beginTeardown() {
         draining = true;

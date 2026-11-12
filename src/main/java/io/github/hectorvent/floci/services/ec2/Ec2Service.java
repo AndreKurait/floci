@@ -6183,6 +6183,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return result;
     }
 
+    /** Instance retirement reconciles shared ENIs, so drain Lambda and ECS workloads first. */
+    @Override
+    public int teardownOrder() {
+        return 1;
+    }
+
     /**
      * Stops the Docker containers of running instances on emulator shutdown. Without this
      * they outlive the process as orphans. Persistent instances flip to {@code stopped},
