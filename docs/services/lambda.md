@@ -52,6 +52,8 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `PutFunctionConcurrency` | Set reserved concurrent executions |
 | `GetFunctionConcurrency` | Get reserved concurrent executions |
 | `DeleteFunctionConcurrency` | Clear reserved concurrent executions |
+| `GetFunctionRecursionConfig` | Read the function's stored recursion setting |
+| `PutFunctionRecursionConfig` | Store `Allow` or `Terminate` for an unqualified function |
 | `PutProvisionedConcurrencyConfig` | Initialize Docker environments for a published version or simple alias |
 | `GetProvisionedConcurrencyConfig` | Read the allocation's actual initialization status and capacity |
 | `ListProvisionedConcurrencyConfigs` | List configured versions and aliases with their current capacity |
@@ -83,6 +85,33 @@ each destination and the SQS queue or SNS topic SAM creates when a destination g
 Asynchronous invocations apply its retry, event age, destination settings, and dead-letter queue
 configurations (`DeadLetterConfig`).
 
+### Recursion settings
+
+`GetFunctionRecursionConfig` and `PutFunctionRecursionConfig` use the AWS SDK routes
+under `/2024-08-31/functions/{FunctionName}/recursion-config`. The stored value is
+`Allow` or `Terminate`; new functions and older stored functions without the setting
+default to `Terminate`. Both operations accept an unqualified name, partial ARN, or
+full ARN and reject version and alias suffixes. A supplied ARN must match the caller's
+account, region, and partition. Settings persist with the function, remain independent
+of published versions, and disappear when the function is deleted.
+
+`AWS::Lambda::Function.RecursiveLoop` sets the same value during stack creation and
+updates without replacing the function. Floci validates its value before changing
+code, configuration, or tags. Floci's property-removal policy resets a previously
+template-owned setting to `Terminate`, including when `Fn::If` selects `AWS::NoValue`.
+If the prior template never declared the setting, an unrelated update preserves a
+value written through the Lambda API. This removal policy is Floci reconciliation
+behavior; the AWS property reference does not specify removal semantics.
+
+Full Lambda function update rollback is not implemented. If a later stack resource
+fails after the function was updated, the stack reports `UPDATE_ROLLBACK_FAILED` and
+the applied recursion setting can remain. Invalid `RecursiveLoop` values are rejected
+before code, configuration, tags, or the setting are changed.
+
+These APIs configure and report settings. Floci does not detect or terminate recursive
+invocations, emit recursion notifications or metrics, or propagate X-Ray lineage.
+SAM forwarding of `RecursiveLoop` is not implemented.
+
 ### Function policies under IAM enforcement
 
 With [IAM enforcement](iam.md#resource-based-policies) on, the statements `AddPermission` adds take
@@ -99,6 +128,7 @@ part in authorizing calls to the function:
   policy to allow the caller in the same way.
 - Provisioned-concurrency configuration operations also act in the account named by the function
   reference. Cross-account access requires that function's policy to allow the caller.
+- Recursion-setting operations reject ARNs naming another account, region, or partition.
 - Other operations act on the caller's own function of the name the ARN gives, whatever account
   the ARN names, and are authorized against that function. Floci does not serve them on another
   account's function, which AWS allows through a function policy.

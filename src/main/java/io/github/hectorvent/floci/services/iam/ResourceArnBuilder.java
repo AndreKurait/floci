@@ -1007,6 +1007,9 @@ public class ResourceArnBuilder {
         if (path.endsWith("/code-signing-config")) {
             return codeSigningFunctionArn(name, region, accountId);
         }
+        if (path.startsWith("/2024-08-31/functions/") && path.endsWith("/recursion-config")) {
+            return recursionFunctionArn(name, region, accountId);
+        }
         boolean qualifiedTarget = path.endsWith("/functions/" + name + "/invocations")
                 || path.endsWith("/functions/" + name + "/response-streaming-invocations")
                 || path.endsWith("/functions/" + name + "/provisioned-concurrency");
@@ -1045,6 +1048,15 @@ public class ResourceArnBuilder {
         }
     }
 
+    private static String recursionFunctionArn(String name, String region, String accountId) {
+        try {
+            LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveUnqualifiedFunctionName(name);
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + ref.name()).toString();
+        } catch (AwsException e) {
+            // The handler rejects malformed references before reading or mutating a function.
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        }
+    }
     /**
      * The function {@code CreateFunction} makes, which its body names, in the caller's account and Region, as
      * every route but an invoke acts there: the Service Reference gives it the {@code function} resource, so
