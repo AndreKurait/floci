@@ -12,6 +12,7 @@ import io.floci.aws.services.dynamodb.DynamoDbTableNames;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.model.Tag;
+import io.floci.aws.services.eks.EksAccessEntryUpdateConditions;
 import io.floci.aws.services.iam.IamActionRegistry;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.IamRole;
@@ -115,6 +116,7 @@ public class IamConditionContextResolver {
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
@@ -122,6 +124,24 @@ public class IamConditionContextResolver {
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       Instance<RequestConditionSpelling> requestConditionSpellings,
+                                       Instance<StoredResourceArns> storedResourceArns,
+                                       RequestContext requestContext,
+                                       RegionResolver regionResolver,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates) {
+        this(dynamoDbFacade, ec2Service, s3Service, iamService,
+                lambdaWebService, requestConditionSpellings, storedResourceArns, requestContext, regionResolver,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), eksAccessEntryUpdates);
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -151,6 +171,24 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, iamService,
+                lambdaWebService, requestConditionSpellings, storedResourceArns, requestContext, regionResolver,
+                config, currentVertxRequest, serviceCatalog, clock, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                Instance<RequestConditionSpelling> requestConditionSpellings,
+                                Instance<StoredResourceArns> storedResourceArns,
+                                RequestContext requestContext,
+                                RegionResolver regionResolver,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -163,6 +201,7 @@ public class IamConditionContextResolver {
         this.config = config;
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
+        this.eksAccessEntryUpdates = eksAccessEntryUpdates;
         this.serviceCatalog = serviceCatalog;
     }
 
@@ -281,6 +320,9 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "eks" -> "eks:UpdateAccessEntry".equals(action) && eksAccessEntryUpdates != null
+                    && eksAccessEntryUpdates.isResolvable() ? eksAccessEntryUpdates.get().resolve(ctx)
+                    : requestMemberConditions(action, ctx);
             default -> requestMemberConditions(action, ctx);
         };
     }

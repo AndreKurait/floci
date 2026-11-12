@@ -35,6 +35,7 @@ import io.floci.aws.services.ec2.model.Tag;
 import io.floci.aws.services.ec2.model.UserIdGroupPair;
 import io.floci.aws.services.ec2.model.Vpc;
 import io.floci.aws.services.eks.model.AccessConfig;
+import io.floci.aws.services.eks.model.AccessEntry;
 import io.floci.aws.services.eks.model.CertificateAuthority;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
@@ -58,6 +59,7 @@ import io.floci.aws.services.eks.model.Provider;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
 import io.floci.aws.services.eks.model.StorageConfig;
 import io.floci.aws.services.eks.model.Update;
+import io.floci.aws.services.eks.model.UpdateAccessEntryRequest;
 import io.floci.aws.services.eks.model.UpdateClusterConfigRequest;
 import io.floci.aws.services.eks.model.UpdateParam;
 import io.floci.aws.services.eks.model.UpgradePolicy;
@@ -90,6 +92,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -1744,6 +1747,64 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             throw new AwsException("ResourceNotFoundException", "No cluster found for name: " + name, 404);
         }
         return cluster;
+    }
+
+    /** Shares cluster deletion's lock and re-reads the current incarnation before updating its entry. */
+    public AccessEntry updateAccessEntryInRequestRegion(String name, String principal,
+                                                        UpdateAccessEntryRequest request) {
+        synchronized (capacityLock(regionResolver.getAccountId(), requestClusterKey(name))) {
+            Cluster cluster = accessEntryUpdateCluster(name, true)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException", "No cluster found for name: " + name, 404));
+            return accessEntries.update(regionResolver.getAccountId(), cluster, principal, request);
+        }
+    }
+
+    /** IAM reads the actual target without migrating legacy rows before authorization. */
+    public Optional<AccessEntry> findAccessEntryUpdateTarget(String name, String principal) {
+        synchronized (capacityLock(regionResolver.getAccountId(), requestClusterKey(name))) {
+            try {
+                return accessEntryUpdateCluster(name, false)
+                        .flatMap(cluster -> accessEntries.findUpdateTarget(regionResolver.getAccountId(), cluster, principal));
+            } catch (AwsException unavailable) {
+                if (!"InvalidRequestException".equals(unavailable.getErrorCode())) {
+                    throw unavailable;
+                }
+                // The handler answers unavailable clusters after IAM authorization.
+                return Optional.empty();
+            }
+        }
+    }
+
+    private Optional<Cluster> accessEntryUpdateCluster(String name, boolean migrateLegacy) {
+        if (name == null || !name.matches(CLUSTER_NAME_REGEX)) {
+            return Optional.empty();
+        }
+        String account = regionResolver.getAccountId();
+        String region = regionResolver.getRegion();
+        Predicate<Cluster> owner = cluster -> {
+            if (!name.equals(cluster.getName()) || !AwsArnUtils.isArnFor(cluster.getArn(), "eks")
+                    || (cluster.getAccountId() != null && !account.equals(cluster.getAccountId()))) {
+                return false;
+            }
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(cluster.getArn());
+            return account.equals(arn.accountId()) && region.equals(arn.region())
+                    && regionResolver.getPartition().equals(arn.partition()) && ("cluster/" + name).equals(arn.resource());
+        };
+        String key = requestClusterKey(name);
+        Optional<Cluster> found;
+        if (storage instanceof AccountAwareStorageBackend<Cluster> aware) {
+            found = migrateLegacy ? aware.getForAccountMigratingLegacyKeys(account, key, List.of(name), owner)
+                    : aware.getForAccount(account, key).or(() -> aware.getLegacyForAccount(account, key))
+                            .or(() -> aware.getForAccount(account, name))
+                            .or(() -> aware.getLegacyForAccount(account, name));
+        } else {
+            found = storage.get(key).or(() -> storage.get(name)).filter(owner);
+            if (migrateLegacy && found.isPresent() && storage.get(key).isEmpty()) {
+                storage.put(key, found.get());
+                storage.delete(name);
+            }
+        }
+        return found.filter(owner);
     }
 
     public Cluster deleteCluster(String name) {

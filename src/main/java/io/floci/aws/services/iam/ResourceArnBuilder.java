@@ -6,6 +6,7 @@ import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.services.eks.EksService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -41,13 +42,20 @@ public class ResourceArnBuilder {
      * normalized path gives them otherwise (an S3 key's own slashes).
      */
     private final Instance<RequestPathLabels> requestPathLabels;
+    private final Instance<EksService> eksService;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<StoredResourceArns> storedResourceArns,
-                              Instance<RequestPathLabels> requestPathLabels) {
+                              Instance<RequestPathLabels> requestPathLabels, Instance<EksService> eksService) {
+        this.eksService = eksService;
         this.objectMapper = objectMapper;
         this.storedResourceArns = storedResourceArns;
         this.requestPathLabels = requestPathLabels;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<StoredResourceArns> storedResourceArns,
+                              Instance<RequestPathLabels> requestPathLabels) {
+        this(objectMapper, storedResourceArns, requestPathLabels, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<StoredResourceArns> storedResourceArns) {
@@ -91,6 +99,15 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("eks".equals(credentialScope) && "eks:UpdateAccessEntry".equals(operation)) {
+            Map<String, String> labels = IamActionRegistry.pathLabels(credentialScope, ctx);
+            if (eksService == null || eksService.isUnsatisfied()
+                    || !labels.containsKey("name") || !labels.containsKey("principalArn")) {
+                return List.of("*");
+            }
+            return List.of(eksService.get().findAccessEntryUpdateTarget(labels.get("name"), labels.get("principalArn"))
+                    .map(entry -> entry.accessEntryArn()).orElse("*"));
         }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
