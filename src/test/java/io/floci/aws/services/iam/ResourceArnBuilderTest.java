@@ -84,6 +84,25 @@ class ResourceArnBuilderTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"application/a", "application/a/environment/e", "application/a/configurationprofile/c",
+            "deploymentstrategy/d"})
+    void appConfigTagActionsUseTheExactResourceArn(String resource) {
+        String arn = "arn:aws:appconfig:us-east-1:" + ACCOUNT + ":" + resource;
+        for (String path : List.of("/tags/" + arn, "/tags/" + arn.replace(":", "%3A").replace("/", "%2F"))) {
+            request(path);
+            for (String action : List.of("TagResource", "UntagResource", "ListTagsForResource")) {
+                assertEquals(List.of(arn), builder.buildResources("appconfig", "appconfig:" + action,
+                        ctx, "us-east-1", ACCOUNT, "aws"));
+            }
+        }
+        request("/tags");
+        when(ctx.getMethod()).thenReturn("GET");
+        queryParams.putSingle("resourceArn", arn);
+        assertEquals(List.of(arn), builder.buildResources("appconfig", "appconfig:ListTagsForResource",
+                ctx, "us-east-1", ACCOUNT, "aws"));
+    }
+
     @BeforeEach
     void setUp() {
         builder = new ResourceArnBuilder(new ObjectMapper());

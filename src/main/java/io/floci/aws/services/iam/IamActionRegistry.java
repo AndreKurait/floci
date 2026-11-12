@@ -303,6 +303,11 @@ public class IamActionRegistry {
         rule("apigateway", "PATCH",  ".*",                                          "apigateway:PATCH"),
         rule("apigateway", "DELETE", ".*",                                          "apigateway:DELETE"),
 
+        // AppConfig tags share the ARN-addressed tagging routes.
+        rule("appconfig", "GET",    "^/tags(/.+)?$", "appconfig:ListTagsForResource"),
+        rule("appconfig", "POST",   "^/tags(/.+)?$", "appconfig:TagResource"),
+        rule("appconfig", "DELETE", "^/tags(/.+)?$", "appconfig:UntagResource"),
+
         // ── EventBridge Scheduler ──────────────────────────────────────────────
         rule("scheduler", "GET",    "^/schedules/[^/]+$",       "scheduler:GetSchedule"),
         rule("scheduler", "POST",   "^/schedules/[^/]+$",       "scheduler:CreateSchedule"),
