@@ -42,7 +42,7 @@ class KmsKeyRotationsServiceTest {
         assertFalse(all.truncated());
         assertNull(all.nextMarker());
         KmsService.KeyRotation first = all.items().getFirst();
-        assertEquals(key.getArn(), first.keyId());
+        assertEquals(key.getKeyId(), first.keyId());
         assertTrue(first.keyMaterialId().matches("[a-f0-9]{64}"));
         assertEquals("CURRENT", first.keyMaterialState());
         assertNull(first.rotationDate());
@@ -157,7 +157,7 @@ class KmsKeyRotationsServiceTest {
             assertEquals(expected.keyMaterialId(), actual.keyMaterialId());
             assertEquals(expected.rotationDate(), actual.rotationDate());
             assertEquals("CURRENT", actual.keyMaterialState());
-            assertTrue(actual.keyId().contains(":" + region + ":"));
+            assertEquals(primary.getKeyId(), actual.keyId());
         }
     }
 
@@ -198,6 +198,9 @@ class KmsKeyRotationsServiceTest {
         service.deleteImportedKeyMaterial(key.getKeyId(), REGION);
         KmsService.KeyRotation deleted = list(key, "ALL_KEY_MATERIAL").items().getFirst();
         assertEquals(first.keyMaterialId(), deleted.keyMaterialId());
+        assertEquals(key.getKeyId(), deleted.keyId());
+        assertEquals(deleted, service.listKeyRotations(key.getArn(), "ALL_KEY_MATERIAL", REGION, null, null)
+                .items().getFirst());
         assertEquals("PENDING_IMPORT", deleted.importState());
         assertTrue(list(key, null).items().isEmpty());
     }

@@ -60,6 +60,7 @@ class KmsKeyRotationsIntegrationTest {
                 Set<String> materials = new HashSet<>();
                 for (RotationsListEntry entry : List.of(first.rotations().getFirst(), second.rotations().getFirst())) {
                     assertTrue(materials.add(entry.keyMaterialId()));
+                    assertEquals(keyId, entry.keyId());
                     assertEquals("ON_DEMAND", entry.rotationTypeAsString());
                     assertNotNull(entry.rotationDate());
                     assertTrue(entry.rotationDate().isAfter(before));
@@ -68,6 +69,11 @@ class KmsKeyRotationsIntegrationTest {
                 ListKeyRotationsResponse all = kms.listKeyRotations(
                         b -> b.keyId(keyId).includeKeyMaterial("ALL_KEY_MATERIAL"));
                 assertEquals(3, all.rotations().size());
+                String arn = kms.describeKey(b -> b.keyId(keyId)).keyMetadata().arn();
+                for (String identifier : List.of(keyId, arn)) {
+                    assertTrue(kms.listKeyRotations(b -> b.keyId(identifier).includeKeyMaterial("ALL_KEY_MATERIAL"))
+                            .rotations().stream().allMatch(entry -> keyId.equals(entry.keyId())));
+                }
                 assertEquals(1, all.rotations().stream().filter(r -> "CURRENT".equals(r.keyMaterialStateAsString())).count());
                 assertEquals(1, all.rotations().stream().filter(r -> r.rotationDate() == null).count());
                 assertNull(all.rotations().getFirst().rotationType());

@@ -99,7 +99,8 @@ it, matching real AWS KMS, which also retains prior backing keys.
 for each completed `RotateKeyOnDemand` call. By default it lists only rotated material.
 `IncludeKeyMaterial=ALL_KEY_MATERIAL` also includes the first material, which has no rotation date
 or type. `KeyMaterialState` identifies the `CURRENT` encryption material and the `NON_CURRENT`
-material retained for decryption. The listing accepts a key ID or key ARN, with `Limit` from 1 to
+material retained for decryption. Each entry returns the bare key ID in `KeyId`, including when
+the request uses a key ARN. The listing accepts a key ID or key ARN, with `Limit` from 1 to
 1000 (default 100) and `Marker`/`NextMarker` pagination.
 
 History is stored with the key and follows multi-Region material replication. Disabling a key
