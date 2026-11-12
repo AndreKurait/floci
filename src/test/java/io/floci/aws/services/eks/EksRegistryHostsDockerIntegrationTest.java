@@ -59,7 +59,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @QuarkusTest
 @TestProfile(RealEksProfile.class)
-// Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
+// Bounded cluster/workload waits total 315 s; allow Docker setup and cleanup as well.
 @Timeout(value = 6, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
@@ -211,6 +211,11 @@ class EksRegistryHostsDockerIntegrationTest {
         dockerClient.restartContainerCmd(containerId).exec();
         Instant restartCompletedAt = Instant.now();
         waitUntilReady(cluster);
+        long apiDeadline = System.currentTimeMillis() + 30000;
+        while (!eksClusterManager.isReady(cluster) && System.currentTimeMillis() < apiDeadline) {
+            Thread.sleep(1000);
+        }
+        assertTrue(eksClusterManager.isReady(cluster), "the restarted API server must respond before guest execs");
         String hostsTomlAfterRestart = null;
         long restartDeadline = System.currentTimeMillis() + 30000;
         while (System.currentTimeMillis() < restartDeadline) {
