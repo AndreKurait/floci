@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.InMemoryStorage;
-import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.glue.schemaregistry.GlueSchemaRegistryService;
 import io.floci.aws.services.kms.KmsService;
@@ -15,7 +14,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -51,7 +49,8 @@ class GlueJsonHandlerEmptyListTest {
                 new GlueTriggerService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), glueService,
                         jobRunService, crawlerRunService),
                 schemaRegistryService, new GlueCatalogService(new InMemoryStorage<>(), null, null,
-                        new RegionResolver("us-east-1", "000000000000"), null, mapper), mapper);
+                        new RegionResolver("us-east-1", "000000000000"), null, mapper), mapper,
+                new GlueCustomEntityService(storageFactory, regionResolver, mapper));
     }
 
     @Test
@@ -76,4 +75,5 @@ class GlueJsonHandlerEmptyListTest {
         assertFalse(body.has("NextToken"), action + " response must omit NextToken");
         assertEquals(1, body.size(), action + " response must contain only " + listKey);
     }
+
 }
