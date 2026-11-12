@@ -17,6 +17,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -39,6 +41,8 @@ class WebSocketMockIntegrationTest {
     private static String mockIntegrationIdDeny;
     private static String connectRouteId;
     private static String defaultRouteId;
+
+    private static final String MARKER_FUNCTION = "ws-mock-marker-missing-fn";
 
     // ──────────────────────────── Setup ────────────────────────────
 
@@ -115,25 +119,56 @@ class WebSocketMockIntegrationTest {
                 .statusCode(201)
                 .extract().path("routeId");
 
-        // Connect (no $connect route, so upgrade succeeds directly)
-        WebSocket ws = connectWebSocket(wsApiId, "test");
-        assertNotNull(ws, "WebSocket connection should succeed");
+        // A route that does answer, so the test can tell when the MOCK messages have been handled.
+        // It forwards to this server's own Lambda API for a function that does not exist.
+        String markerIntegrationId = given()
+                .contentType(ContentType.JSON)
+                .body("""
+                        {"integrationType":"HTTP_PROXY","integrationMethod":"POST","integrationUri":"%s2015-03-31/functions/%s/invocations"}
+                        """.formatted(baseUri, MARKER_FUNCTION))
+                .when().post("/v2/apis/" + wsApiId + "/integrations")
+                .then()
+                .statusCode(201)
+                .extract().path("integrationId");
+        String markerRouteId = given()
+                .contentType(ContentType.JSON)
+                .body("""
+                        {"routeKey":"marker","target":"integrations/%s","routeResponseSelectionExpression":"$default"}
+                        """.formatted(markerIntegrationId))
+                .when().post("/v2/apis/" + wsApiId + "/routes")
+                .then()
+                .statusCode(201)
+                .extract().path("routeId");
 
-        // Send a message — it will route to $default which uses MOCK integration.
-        // MOCK integration does NOT invoke any Lambda.
-        // If it tried to invoke a Lambda, it would fail since there's no integrationUri.
-        ws.sendText("{\"action\":\"hello\",\"data\":\"world\"}", true).join();
+        try {
+            // Connect (no $connect route, so upgrade succeeds directly)
+            WebSocketTestSupport.MultiMessageCapture capture = new WebSocketTestSupport.MultiMessageCapture();
+            WebSocket ws = WebSocketTestSupport.connectWebSocket(baseUri, wsApiId, "test", capture);
+            assertNotNull(ws, "WebSocket connection should succeed");
 
-        // Wait a bit to ensure no errors occur server-side
-        Thread.sleep(1000);
+            // Send two messages — they route to $default which uses MOCK integration.
+            // MOCK integration does NOT invoke any Lambda.
+            // If it tried to invoke a Lambda, it would fail since there's no integrationUri,
+            // and the server would send an "Internal server error" frame.
+            ws.sendText("{\"action\":\"hello\",\"data\":\"world\"}", true).join();
+            ws.sendText("{\"action\":\"ping\"}", true).join();
 
-        // The connection should still be open (no error frame sent for MOCK integration success)
-        // Send another message to verify the connection is still alive
-        ws.sendText("{\"action\":\"ping\"}", true).join();
-        Thread.sleep(500);
+            // Integrations of one connection run one at a time and answer in order, so the answer
+            // to a later message can only arrive after the MOCK messages have been handled.
+            ws.sendText("{\"action\":\"marker\"}", true).join();
+            String first = capture.getNextMessage(15, TimeUnit.SECONDS);
+            assertNotNull(first, "The marker route should answer");
+            assertThat("The MOCK messages must not produce a frame ahead of the marker's answer",
+                    first, containsString(MARKER_FUNCTION));
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+            // The connection is still open: it closes normally, and nothing else was sent
+            WebSocketTestSupport.closeAndAwait(ws);
+            assertNull(capture.getNextMessage(0, TimeUnit.MILLISECONDS),
+                    "No frame other than the marker's answer should have been sent");
+        } finally {
+            given().when().delete("/v2/apis/" + wsApiId + "/routes/" + markerRouteId)
+                    .then().statusCode(204);
+        }
     }
 
     // ──────────────────────────── Test 2: MOCK integration on $connect allows upgrade ────────────────────────────
@@ -162,8 +197,7 @@ class WebSocketMockIntegrationTest {
         // Connection should succeed because MOCK returns 200
         WebSocket ws = connectWebSocket(wsApiId, "test");
         assertNotNull(ws, "WebSocket connection should succeed with MOCK integration returning 200");
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 3: MOCK integration on $connect denies upgrade ────────────────────────────

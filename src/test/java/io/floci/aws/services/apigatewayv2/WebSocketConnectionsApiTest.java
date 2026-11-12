@@ -2,9 +2,12 @@ package io.floci.aws.services.apigatewayv2;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.services.apigatewayv2.websocket.WebSocketConnectionManager;
+import io.floci.aws.testing.MutableClock;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -13,11 +16,16 @@ import org.junit.jupiter.api.TestMethodOrder;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -30,6 +38,12 @@ class WebSocketConnectionsApiTest {
 
     @TestHTTPResource("/")
     URI baseUri;
+
+    @Inject
+    MutableClock clock;
+
+    @Inject
+    WebSocketConnectionManager connectionManager;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -180,8 +194,9 @@ class WebSocketConnectionsApiTest {
         WebSocketTestSupport.MessageCapture capture2 = new WebSocketTestSupport.MessageCapture();
         // We need a new listener to capture the pushed message
         // Actually, the first capture already consumed its future. Let's reconnect.
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
+        assertFalse(connectionManager.isConnected(connectionId),
+                "the server unregisters a connection before it echoes the client's Close frame");
 
         // Reconnect with a fresh capture
         WebSocketTestSupport.MessageCapture pushCapture = new WebSocketTestSupport.MessageCapture();
@@ -227,9 +242,8 @@ class WebSocketConnectionsApiTest {
         assertNotNull(pushed, "Client should receive pushed message");
         assertEquals(pushMessage, pushed, "Pushed message should match");
 
-        ws2.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        ws3.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws2);
+        WebSocketTestSupport.closeAndAwait(ws3);
     }
 
     // ──────────────────────────── Test 2: POST to gone connection returns 410 ────────────────────────────
@@ -290,8 +304,7 @@ class WebSocketConnectionsApiTest {
         String lastActiveAt = info.get("lastActiveAt").asText();
         assertTrue(lastActiveAt.contains("T"), "lastActiveAt should be ISO 8601 format");
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 4: GET gone connection returns 410 ────────────────────────────
@@ -339,7 +352,7 @@ class WebSocketConnectionsApiTest {
         Integer closeCode = closeFuture.get(15, TimeUnit.SECONDS);
         assertNotNull(closeCode, "WebSocket should receive close frame");
 
-        Thread.sleep(500);
+        awaitServerSideClose(connId);
     }
 
     // ──────────────────────────── Test 6: DELETE gone connection returns 410 ────────────────────────────
@@ -385,8 +398,9 @@ class WebSocketConnectionsApiTest {
         JsonNode info1 = MAPPER.readTree(info1Body);
         String lastActive1 = info1.get("lastActiveAt").asText();
 
-        // Wait a bit and send another message
-        Thread.sleep(1100);
+        // Let time pass on the server's clock and send another message
+        Duration elapsed = Duration.ofSeconds(2);
+        clock.advance(elapsed);
         ws.sendText("{\"action\":\"update\"}", true).join();
         String updateResp = capture.getNextMessage(15, TimeUnit.SECONDS);
         assertNotNull(updateResp, "Should get response after second message");
@@ -400,12 +414,13 @@ class WebSocketConnectionsApiTest {
         JsonNode info2 = MAPPER.readTree(info2Body);
         String lastActive2 = info2.get("lastActiveAt").asText();
 
-        // lastActiveAt should have been updated
+        // lastActiveAt should have been updated to the time the second message arrived
         assertNotEquals(lastActive1, lastActive2,
                 "lastActiveAt should be updated after receiving a message");
+        assertThat("lastActiveAt should be the arrival time of the second message",
+                Instant.parse(lastActive2), greaterThanOrEqualTo(Instant.parse(lastActive1).plus(elapsed)));
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 8: Server-initiated DELETE does not invoke $disconnect ────────────────────────────
@@ -439,8 +454,8 @@ class WebSocketConnectionsApiTest {
         Integer closeCode = closeFuture.get(15, TimeUnit.SECONDS);
         assertNotNull(closeCode, "WebSocket should receive close frame");
 
-        // Wait for cleanup
-        Thread.sleep(500);
+        // The server unregisters the connection once the client's Close reply arrives
+        awaitServerSideClose(connId);
 
         // Verify the connection is fully cleaned up (POST returns 410)
         given()
@@ -470,6 +485,17 @@ class WebSocketConnectionsApiTest {
     }
 
     // ──────────────────────────── Helpers ────────────────────────────
+
+    /**
+     * A server-initiated close completes server-side only when the client's Close reply arrives,
+     * which is after the client has seen the server's Close frame.
+     */
+    private void awaitServerSideClose(String connectionId) {
+        await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(5))
+                .until(() -> !connectionManager.isConnected(connectionId));
+    }
 
     private WebSocket connectWebSocketWithListener(String apiId, String stageName,
                                                     WebSocketTestSupport.MessageCapture capture) throws Exception {

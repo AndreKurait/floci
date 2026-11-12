@@ -12,7 +12,6 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.notNullValue;
@@ -65,9 +64,11 @@ class WebSocketRouteResponseTest {
     @Test
     @Order(2)
     void setupLambdaFunction() throws Exception {
-        // Lambda that returns {"statusCode": 200, "body": "extracted-body"}
+        // Lambda that returns {"statusCode": 200, "body": "extracted-body"}, or "marker-body" for a
+        // message whose data is "marker" so a test can tell two answers apart
         String zip = WebSocketTestSupport.createLambdaZip(
-                "exports.handler = async (event) => ({ statusCode: 200, body: 'extracted-body' });");
+                "exports.handler = async (event) => ({ statusCode: 200, body: "
+                        + "event.body && event.body.includes('\"data\":\"marker\"') ? 'marker-body' : 'extracted-body' });");
         given()
                 .contentType(ContentType.JSON)
                 .body("""
@@ -141,8 +142,7 @@ class WebSocketRouteResponseTest {
         String response = capture.getResponse(15, TimeUnit.SECONDS);
         assertNotNull(response, "Should receive a response when routeResponseSelectionExpression is set");
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 2: No response when routeResponseSelectionExpression is null ────────────────────────────
@@ -152,20 +152,24 @@ class WebSocketRouteResponseTest {
     void noResponseWhenRouteResponseExpressionNull() throws Exception {
         // When a route has null routeResponseSelectionExpression,
         // no response is sent back to the client
-        WebSocketTestSupport.MessageCapture capture = new WebSocketTestSupport.MessageCapture();
-        WebSocket ws = connectWebSocketWithListener(wsApiId, "test", capture);
+        WebSocketTestSupport.MultiMessageCapture capture = new WebSocketTestSupport.MultiMessageCapture();
+        WebSocket ws = WebSocketTestSupport.connectWebSocket(baseUri, wsApiId, "test", capture);
         assertNotNull(ws);
 
         // Send a message that routes to the "noResponse" route
         ws.sendText("{\"action\":\"noResponse\",\"data\":\"hello\"}", true).join();
 
-        // Should NOT receive a response — expect a timeout
-        assertThrows(TimeoutException.class, () -> {
-            capture.getResponse(3, TimeUnit.SECONDS);
-        }, "Should NOT receive a response when routeResponseSelectionExpression is null");
+        // Integrations of one connection run one at a time and answer in order, so the answer to a
+        // later message on the responding route can only arrive after the first message was handled.
+        ws.sendText("{\"action\":\"withResponse\",\"data\":\"marker\"}", true).join();
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        // Should NOT receive a response to the first message: the first frame is the marker's answer
+        assertEquals("marker-body", capture.getNextMessage(15, TimeUnit.SECONDS),
+                "Should NOT receive a response when routeResponseSelectionExpression is null");
+
+        WebSocketTestSupport.closeAndAwait(ws);
+        assertNull(capture.getNextMessage(0, TimeUnit.MILLISECONDS),
+                "No frame other than the marker's answer should have been sent");
     }
 
     // ──────────────────────────── Test 3: Body field extracted from Lambda response ────────────────────────────
@@ -187,8 +191,7 @@ class WebSocketRouteResponseTest {
         assertEquals("extracted-body", response,
                 "Response should be the extracted 'body' field value from the Lambda JSON response");
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Cleanup ────────────────────────────

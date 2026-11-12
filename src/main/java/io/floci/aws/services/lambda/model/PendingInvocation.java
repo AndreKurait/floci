@@ -1,7 +1,6 @@
 package io.floci.aws.services.lambda.model;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 public class PendingInvocation {
 
@@ -12,25 +11,34 @@ public class PendingInvocation {
     private final String functionArn;
     private final CompletableFuture<InvokeResult> resultFuture;
     private final CompletableFuture<Void> dispatchedFuture = new CompletableFuture<>();
+    private final InvocationTimer timer;
     private volatile String clientContext;
     private volatile ResponseStreamListener responseStreamListener;
 
     public PendingInvocation(String requestId, byte[] payload, long deadlineMs,
                               String functionArn, CompletableFuture<InvokeResult> resultFuture) {
+        this(requestId, payload, deadlineMs, functionArn, resultFuture, InvocationTimer.SYSTEM);
+    }
+
+    /** As above, with the deadline measured and enforced on {@code timer}, so tests can control it. */
+    public PendingInvocation(String requestId, byte[] payload, long deadlineMs,
+                              String functionArn, CompletableFuture<InvokeResult> resultFuture,
+                              InvocationTimer timer) {
         this.requestId = requestId;
         this.payload = payload;
         this.deadlineMs = deadlineMs;
-        this.timeoutMs = Math.max(0, deadlineMs - System.currentTimeMillis());
+        this.timer = timer;
+        this.timeoutMs = Math.max(0, deadlineMs - timer.currentTimeMillis());
         this.functionArn = functionArn;
         this.resultFuture = resultFuture;
     }
 
     public void prepareForDispatch() {
-        deadlineMs = System.currentTimeMillis() + timeoutMs;
+        deadlineMs = timer.currentTimeMillis() + timeoutMs;
     }
 
     public void markDispatched() {
-        resultFuture.orTimeout(Math.max(0, deadlineMs - System.currentTimeMillis()), TimeUnit.MILLISECONDS);
+        timer.failAfter(resultFuture, Math.max(0, deadlineMs - timer.currentTimeMillis()));
         dispatchedFuture.complete(null);
     }
 
