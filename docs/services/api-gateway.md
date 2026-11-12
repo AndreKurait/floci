@@ -115,11 +115,27 @@ changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not a
 | **Request Validators** | CreateRequestValidator, GetRequestValidator, GetRequestValidators, UpdateRequestValidator, DeleteRequestValidator |
 | **Gateway Responses** | PutGatewayResponse, GetGatewayResponse, GetGatewayResponses, UpdateGatewayResponse, DeleteGatewayResponse |
 | **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
-| **Documentation Parts** | CreateDocumentationPart, GetDocumentationPart, GetDocumentationParts, UpdateDocumentationPart, DeleteDocumentationPart |
+| **Documentation Parts** | CreateDocumentationPart, GetDocumentationPart, GetDocumentationParts, UpdateDocumentationPart, DeleteDocumentationPart, ImportDocumentationParts |
+| **Documentation Versions** | CreateDocumentationVersion, GetDocumentationVersion, GetDocumentationVersions, UpdateDocumentationVersion, DeleteDocumentationVersion |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **Base Path Mappings** | CreateBasePathMapping, GetBasePathMapping, GetBasePathMappings, UpdateBasePathMapping, DeleteBasePathMapping |
 | **Account** | GetAccount, UpdateAccount |
 | **Tags** | TagResource, UntagResource, GetTags (ListTagsForResource) |
+
+`ImportDocumentationParts` accepts a JSON OpenAPI 2.0 or 3.0 document containing
+`x-amazon-apigateway-documentation.documentationParts`. Its default `merge` mode preserves
+existing part IDs and property attributes omitted from the import; an incoming attribute
+replaces the corresponding whole attribute, including an object or array. `overwrite`
+replaces the documentation collection and properties. An empty array in overwrite mode
+clears the collection. API resources, methods, models and other API definitions in the
+OpenAPI document are not changed by this operation.
+
+The complete import is validated before a single storage commit. Invalid locations or
+properties, duplicate canonical locations within one import, and `failOnWarnings=true`
+with parser warnings leave the prior collection intact. Warnings come from the local
+OpenAPI parser; their wording is not an exact AWS diagnostic catalog. YAML and external
+reference resolution are not supported. The extension's `version` is snapshot metadata;
+importing it does not create a documentation version.
 
 Documentation part listing covers created parts. The `UNDOCUMENTED` location status does not
 discover API locations without documentation content yet.
@@ -131,6 +147,54 @@ An ARN with an account segment is rejected with `BadRequestException` and an ARN
 Tagged REST APIs, stages, API keys, usage plans and custom domain names are discoverable through the
 [Resource Groups Tagging API](resource-groups-tagging.md), whose `TagResources` and `UntagResources`
 write REST API, stage, API key, usage plan and custom domain name tags through to API Gateway.
+
+### Documentation Versions
+
+`CreateDocumentationVersion`, `GetDocumentationVersion`, `GetDocumentationVersions`,
+`UpdateDocumentationVersion` and `DeleteDocumentationVersion` manage immutable snapshots
+of an API's documentation parts. Creation returns `201`; deletion returns `202`. A version
+retains the captured locations and typed properties after live parts are edited, imported
+or deleted. Updating a version supports only `replace /description` and preserves its
+creation date and snapshot.
+
+Associate a snapshot through `CreateDocumentationVersion.stageName`,
+`CreateStage.documentationVersion`, or `UpdateStage` with `replace /documentationVersion`.
+The stage response includes its selected version. Stage patch operations `add`, `remove`
+and `copy` for this path are unsupported. Floci returns `ConflictException` when deleting
+a version still associated with a stage; this association conflict is a local compatibility
+policy. Deleting the stage removes the association. New CloudFormation documentation
+resources are outside this feature.
+
+Creation with `stageName` publishes the snapshot and association together. Refusal of the
+storage batch leaves neither a new snapshot nor a changed association. An old, unscoped
+stage may first move unchanged into the default account's storage partition; that
+representation change can survive a later refused publication. Reads and IAM checks do
+not perform this migration. Hybrid mode retains its asynchronous durability behavior.
+
+Version listing defaults to 25 items and accepts limits from 1 through 500. Floci sorts
+versions lexically and binds each pagination token to the caller, Region, API and supplied
+limit. Keep those arguments unchanged between pages. Tokens are valid only for the current
+server process; listing does not hold a snapshot across concurrent mutations.
+
+The five version operations use their native HTTP-verb IAM actions and canonical API
+Gateway resource paths. Documentation children inherit the current REST API tags for
+`aws:ResourceTag` conditions. This inheritance grants no `GetTags` support for documentation
+children. Policy evaluation and later publication are separate operations.
+
+A pinned stage's `GetExport` includes the captured
+`x-amazon-apigateway-documentation` extension in both Swagger and OpenAPI 3 exports,
+including default exports and explicit `extensions=documentation`. Importing those
+exported bytes with `ImportDocumentationParts` reproduces the captured parts without
+creating a documentation version. The deployment definition and documentation snapshot
+remain independently selected by the stage.
+
+The complete snapshot stays in the extension. Inline documentation is limited to named
+API, model and authorizer fields, literal resource and method locations, and literal
+response status codes already present in the export. Only supported descriptive fields
+with the expected top-level JSON kind and ordinary `x-` extensions are projected;
+operational `x-amazon-apigateway-` fields are preserved. Wildcard inheritance and request or
+response parameter/body projection are not implemented. This is not full OpenAPI schema
+validation of documentation properties.
 
 ### API Key Behaviour Notes
 
@@ -408,7 +472,6 @@ These management-plane operations have no handler in v1. Calls will return `404`
 - Model templates: `GetModelTemplate`
 - Documentation versions (5 operations)
 - Client Certificates (5 operations)
-- `ImportDocumentationParts`
 
 The execute plane (actual proxied HTTP traffic via `/restapis/{id}/{stage}/_user_request_/…`)
 is implemented separately and is not counted as management-plane operations. A deployed REST
@@ -525,7 +588,7 @@ persisted deployments without a snapshot must be redeployed before export; Floci
 `BadRequestException` rather than exporting the live definition.
 
 This exports Floci's stored configuration, not the original uploaded document. Unsupported metadata,
-Postman extensions and full documentation exports are outside this operation's scope. Non-JSON models are rejected. Swagger supports only one body schema per
+Postman extensions and inline documentation beyond the supported projections described above are outside this operation's scope. Non-JSON models are rejected. Swagger supports only one body schema per
 operation, so methods using different request models per content type cannot be exported as Swagger;
 use `oas30` instead. Swagger response headers do not retain the method-response required flag.
 Integration responses must have distinct selection patterns to fit OpenAPI's response map. Duplicate
