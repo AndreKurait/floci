@@ -756,6 +756,10 @@ public class AwsConfigService {
             throw new AwsException("NoSuchConfigurationRecorderException",
                     "Cannot find configuration recorder with the specified name.", 400);
         }
+        if (!deliveryChannels.containsKey(region)) {
+            throw new AwsException("NoAvailableDeliveryChannelException",
+                    "You must create a delivery channel before starting the configuration recorder.", 400);
+        }
         recorderRunning.put(runtimeKey(region), true);
         recorderLastStartTime.put(runtimeKey(region), now());
     }
