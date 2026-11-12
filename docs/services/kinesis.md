@@ -13,6 +13,9 @@
 | `ListStreams` | List all streams |
 | `DescribeStream` | Get stream details and shard info |
 | `DescribeStreamSummary` | Lightweight stream description |
+| `GetResourcePolicy` | - |
+| `PutResourcePolicy` | - |
+| `DeleteResourcePolicy` | - |
 | `RegisterStreamConsumer` | Register an enhanced fan-out consumer |
 | `DeregisterStreamConsumer` | Remove a consumer |
 | `DescribeStreamConsumer` | Get consumer details |
@@ -201,3 +204,35 @@ aws kinesis get-records \
   --shard-iterator $ITERATOR \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+## Resource policy configuration
+
+`PutResourcePolicy`, `GetResourcePolicy`, and `DeleteResourcePolicy` store resource policy
+documents on streams and registered consumers. Put replaces the document and Get preserves
+its original string, including whitespace. Get on an existing resource without a policy
+returns `Policy: "{}"`; Delete without a policy returns `ResourceNotFoundException`.
+The document must contain statements with valid Allow/Deny effects, principals, and actions.
+This validates the supported policy structure, not the full IAM policy language or service
+action catalog.
+
+Requests require the exact stream or consumer ARN in the caller's account, Region, and
+partition. With IAM enforcement enabled, each API checks its own action on that ARN and
+supports `aws:ResourceTag/<key>` conditions. Stream tags come from the stream; consumer tags
+are retained from `RegisterStreamConsumer.Tags` and are not inherited from the parent.
+Policies use the existing Kinesis storage mode. Memory, persistent, and WAL backends publish
+a detached policy replacement atomically; hybrid retains its asynchronous disk durability.
+
+Deleting a stream removes its policies. Retained consumer records from an earlier stream
+generation cannot receive policies after recreating the same stream name. Consumer
+registration and deregistration clear that consumer's prior policy before updating the
+separate consumer store. These two stores do not share a transaction: if the consumer write
+fails after policy removal, the previous consumer may remain without its policy. Legacy
+account-key migration retains the existing storage migration semantics.
+
+These APIs provide SDK configuration storage. Resource-policy statements, including Deny,
+are not evaluated for Kinesis data-plane authorization or cross-account sharing. Channel
+resources and `AWS::Kinesis::ResourcePolicy` CloudFormation provisioning are not included.
+
+The reserved `StreamId` field is not used as a selector. IAM refusals retain the existing
+protocol behavior: Java SDK CBOR requests receive HTTP 403, and JSON 1.1 requests receive
+HTTP 400, both with `AccessDeniedException`.

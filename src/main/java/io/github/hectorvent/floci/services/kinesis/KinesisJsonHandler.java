@@ -66,6 +66,9 @@ public class KinesisJsonHandler {
             case "ListStreams" -> handleListStreams(request, region);
             case "DescribeStream" -> handleDescribeStream(request, region);
             case "DescribeStreamSummary" -> handleDescribeStreamSummary(request, region);
+            case "GetResourcePolicy" -> handleGetResourcePolicy(request, region);
+            case "PutResourcePolicy" -> handlePutResourcePolicy(request, region);
+            case "DeleteResourcePolicy" -> handleDeleteResourcePolicy(request, region);
             case "RegisterStreamConsumer" -> handleRegisterStreamConsumer(request, region);
             case "DeregisterStreamConsumer" -> handleDeregisterStreamConsumer(request, region);
             case "DescribeStreamConsumer" -> handleDescribeStreamConsumer(request, region);
@@ -371,10 +374,27 @@ public class KinesisJsonHandler {
         return BigDecimal.valueOf(timestamp.toEpochMilli(), 3);
     }
 
+    private Response handleGetResourcePolicy(JsonNode request, String region) {
+        String policy = service.getResourcePolicy(KinesisResourcePolicies.requiredString(request, "ResourceARN"), region);
+        return Response.ok(objectMapper.createObjectNode().put("Policy", policy)).build();
+    }
+
+    private Response handlePutResourcePolicy(JsonNode request, String region) {
+        service.putResourcePolicy(KinesisResourcePolicies.requiredString(request, "ResourceARN"),
+                KinesisResourcePolicies.requiredString(request, "Policy"), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleDeleteResourcePolicy(JsonNode request, String region) {
+        service.deleteResourcePolicy(KinesisResourcePolicies.requiredString(request, "ResourceARN"), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
     private Response handleRegisterStreamConsumer(JsonNode request, String region) {
         String streamArn = request.path("StreamARN").asText();
         String consumerName = request.path("ConsumerName").asText();
-        KinesisConsumer consumer = service.registerStreamConsumer(streamArn, consumerName, region);
+        KinesisConsumer consumer = service.registerStreamConsumer(streamArn, consumerName,
+                KinesisResourcePolicies.consumerTags(request), region);
         ObjectNode response = objectMapper.createObjectNode();
         response.set("Consumer", consumerToNode(consumer));
         return Response.ok(response).build();

@@ -222,6 +222,12 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("kinesis".equals(credentialScope) && operation != null && Set.of("kinesis:GetResourcePolicy",
+                "kinesis:PutResourcePolicy", "kinesis:DeleteResourcePolicy").contains(operation)) {
+            JsonNode body = readJsonBody(ctx);
+            String resource = body == null ? null : body.path("ResourceARN").asText(null);
+            return List.of(resource == null || resource.isEmpty() ? "*" : resource);
+        }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",
                 "states:SendTaskFailure", "states:SendTaskHeartbeat").contains(operation)) {

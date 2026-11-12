@@ -74,6 +74,7 @@ public class KinesisService implements ResourceProvider {
     private final StorageBackend<String, KinesisConsumer> consumerStore;
     private final RegionResolver regionResolver;
     private final Clock clock;
+    private final KinesisResourcePolicies resourcePolicies;
     private final AtomicLong sequenceGenerator = new AtomicLong(System.currentTimeMillis());
     // One monitor per stream key, handed out by lockFor. Serializes sequence allocation + shard
     // append + persist so the in-memory log, the assigned sequence order and the WAL write order
@@ -115,6 +116,7 @@ public class KinesisService implements ResourceProvider {
         this.consumerStore = consumerStore;
         this.regionResolver = regionResolver;
         this.clock = clock;
+        this.resourcePolicies = new KinesisResourcePolicies(store, consumerStore, regionResolver, this::lockFor);
     }
 
     public KinesisStream createStream(String streamName, int shardCount, String region) {
@@ -147,31 +149,33 @@ public class KinesisService implements ResourceProvider {
         }
 
         String storageKey = regionKey(region, streamName);
-        if (store.get(storageKey).isPresent()) {
-            throw new AwsException("ResourceInUseException", "Stream already exists: " + streamName, 400);
-        }
+        synchronized (lockFor(storageKey)) {
+            if (store.get(storageKey).isPresent()) {
+                throw new AwsException("ResourceInUseException", "Stream already exists: " + streamName, 400);
+            }
 
-        String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
-        KinesisStream stream = new KinesisStream(streamName, arn);
-        stream.setStreamCreationTimestamp(clock.instant());
-        stream.setAccountId(regionResolver.getAccountId());
-        stream.setStreamMode(resolvedMode);
-        if (maxRecordSizeInKiB != null) {
-            stream.setMaxRecordSizeInKiB(maxRecordSizeInKiB);
-        }
+            String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
+            KinesisStream stream = new KinesisStream(streamName, arn);
+            stream.setStreamCreationTimestamp(clock.instant());
+            stream.setAccountId(regionResolver.getAccountId());
+            stream.setStreamMode(resolvedMode);
+            if (maxRecordSizeInKiB != null) {
+                stream.setMaxRecordSizeInKiB(maxRecordSizeInKiB);
+            }
 
-        for (int i = 0; i < shardCount; i++) {
-            String shardId = String.format("shardId-%012d", i);
-            stream.getShards().add(new KinesisShard(shardId,
-                    shardStartingHashKey(i, shardCount),
-                    shardEndingHashKey(i, shardCount),
-                    INITIAL_SEQUENCE_NUMBER));
-        }
+            for (int i = 0; i < shardCount; i++) {
+                String shardId = String.format("shardId-%012d", i);
+                stream.getShards().add(new KinesisShard(shardId,
+                        shardStartingHashKey(i, shardCount),
+                        shardEndingHashKey(i, shardCount),
+                        INITIAL_SEQUENCE_NUMBER));
+            }
 
-        store.put(storageKey, stream);
-        LOG.infov("Created Kinesis stream: {0} in region {1} with {2} shards (mode: {3})",
-                streamName, region, shardCount, resolvedMode);
-        return stream;
+            store.put(storageKey, stream);
+            LOG.infov("Created Kinesis stream: {0} in region {1} with {2} shards (mode: {3})",
+                    streamName, region, shardCount, resolvedMode);
+            return stream;
+        }
     }
 
     public void updateStreamMode(String streamName, String streamMode, String region) {
@@ -226,13 +230,40 @@ public class KinesisService implements ResourceProvider {
         return stream;
     }
 
+    public String getResourcePolicy(String resourceArn, String region) {
+        return resourcePolicies.get(resourceArn, region);
+    }
+
+    public void putResourcePolicy(String resourceArn, String policy, String region) {
+        resourcePolicies.put(resourceArn, policy, region);
+    }
+
+    public void deleteResourcePolicy(String resourceArn, String region) {
+        resourcePolicies.delete(resourceArn, region);
+    }
+
+    /** Read-only ownership-checked context for the three resource-policy IAM actions. */
+    public Map<String, String> resourcePolicyTags(String resourceArn, String region) {
+        return resourcePolicies.tags(resourceArn, region);
+    }
+
     public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName, String region) {
-        String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
-        KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
-        consumer.setConsumerCreationTimestamp(clock.instant());
-        consumerStore.put(region + "::" + consumerArn, consumer);
-        LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);
-        return consumer;
+        return registerStreamConsumer(streamArn, consumerName, Map.of(), region);
+    }
+
+    public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName,
+                                                   Map<String, String> tags, String region) {
+        String streamName = streamArn.substring(streamArn.lastIndexOf('/') + 1);
+        synchronized (lockFor(regionKey(region, streamName))) {
+            String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
+            KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
+            consumer.setConsumerCreationTimestamp(clock.instant());
+            consumer.setPolicyStreamGeneration(resourcePolicies.clearConsumerPolicy(consumerArn, region));
+            consumer.setTags(tags);
+            consumerStore.put(region + "::" + consumerArn, consumer);
+            LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);
+            return consumer;
+        }
     }
 
     public void deregisterStreamConsumer(String streamArn, String consumerName, String consumerArn, String region) {
@@ -243,8 +274,12 @@ public class KinesisService implements ResourceProvider {
                     .findFirst().map(KinesisConsumer::getConsumerArn).orElse(null);
         }
         if (resolvedArn != null) {
-            consumerStore.delete(region + "::" + resolvedArn);
-            LOG.infov("Deregistered Kinesis consumer: {0}", resolvedArn);
+            String key = resourcePolicies.consumerKey(resolvedArn, region);
+            synchronized (lockFor(key)) {
+                resourcePolicies.clearConsumerPolicy(resolvedArn, region);
+                consumerStore.delete(region + "::" + resolvedArn);
+                LOG.infov("Deregistered Kinesis consumer: {0}", resolvedArn);
+            }
         }
     }
 
