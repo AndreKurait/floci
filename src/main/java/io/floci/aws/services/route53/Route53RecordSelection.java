@@ -23,7 +23,7 @@ final class Route53RecordSelection {
             }
             Long weight = record.getWeight();
             if (weight == null) {
-                if (record.getSetIdentifier() != null) {
+                if (record.getSetIdentifier() != null && !record.getSetIdentifier().isBlank()) {
                     throw new IllegalArgumentException("Unsupported public DNS routing identifier");
                 }
             } else {
