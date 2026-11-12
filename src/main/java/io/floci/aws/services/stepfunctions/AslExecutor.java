@@ -115,6 +115,7 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -125,6 +126,7 @@ import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -290,6 +292,7 @@ public class AslExecutor {
     private final Clock clock;
     private final Sleeper sleeper;
     private final NestedWaiter nestedWaiter;
+    private final BoundedWaits waits;
     // Null in production, where the ceiling comes from the Step Functions config. Tests pin it.
     private final Integer maxWaitSecondsOverride;
     private final Duration expressMaxExecutionTime;
@@ -327,7 +330,7 @@ public class AslExecutor {
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, redshiftDataHandler, serviceRegistry,
                 nestedTaskCredentials, lambdaTaskAuthorizer, null, null, apiGatewayTaskInvoker, emrTaskInvoker,
-                emrServerlessTaskInvoker, sdkManagementTaskInvoker, null, eventBridgeInvoker);
+                emrServerlessTaskInvoker, sdkManagementTaskInvoker, null, eventBridgeInvoker, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaTargetResolver targetResolver,
@@ -347,7 +350,7 @@ public class AslExecutor {
                 Duration expressMaxExecutionTimeOverride, LongSupplier nanoTimeOverride,
                 ApiGatewayTaskInvoker apiGatewayTaskInvoker, EmrTaskInvoker emrTaskInvoker,
                 EmrServerlessTaskInvoker emrServerlessTaskInvoker, SdkManagementTaskInvoker sdkManagementTaskInvoker,
-                NestedWaiter nestedWaiter, EventBridgeInvoker eventBridgeInvoker) {
+                NestedWaiter nestedWaiter, EventBridgeInvoker eventBridgeInvoker, BoundedWaits waits) {
         this.apiGatewayTaskInvoker = apiGatewayTaskInvoker;
         this.emrTaskInvoker = emrTaskInvoker;
         this.emrServerlessTaskInvoker = emrServerlessTaskInvoker;
@@ -386,6 +389,7 @@ public class AslExecutor {
         this.clock = clock;
         this.sleeper = sleeper;
         this.nestedWaiter = nestedWaiter != null ? nestedWaiter : ExecutionStatusSubscription::awaitChange;
+        this.waits = waits != null ? waits : BoundedWaits.BLOCKING;
         this.maxWaitSecondsOverride = maxWaitSecondsOverride;
         this.nanoTime = nanoTimeOverride != null ? nanoTimeOverride : System::nanoTime;
         this.expressMaxExecutionTime = expressMaxExecutionTimeOverride != null
@@ -417,7 +421,7 @@ public class AslExecutor {
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 Clock.systemUTC(), TimeUnit.NANOSECONDS::sleep, null, null, null, null, null, null, null, null, null,
-                null, null, null, null);
+                null, null, null, null, null);
     }
 
     // Kept for tests that do not exercise the Redshift Data API integration.
@@ -439,7 +443,7 @@ public class AslExecutor {
                 eventBridgeHandler, schedulerService, schedulerController, rdsDataService,
                 objectMapper, jsonataEvaluator, sfnService, config, vertx, customResourceLiveness,
                 clock, sleeper, maxWaitSecondsOverride, null, null, null, null, null, null, null, null, null, null,
-                null, null);
+                null, null, null);
     }
 
     AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
@@ -554,7 +558,7 @@ public class AslExecutor {
         try {
             Future<?> f = executor.submit(() -> runUnderExecutionAccount(sm,
                     () -> doExecute(sm, exec, history, onUpdate, maxExecutionDeadlineNanos)));
-            f.get(maxExecutionDeadlineNanos - nanoTime.getAsLong(), TimeUnit.NANOSECONDS);
+            waits.get(f, maxExecutionDeadlineNanos - nanoTime.getAsLong());
         } catch (TimeoutException e) {
             answerTimedOutUnlessEnded(exec, history, onUpdate);
         } catch (Exception e) {
@@ -1169,7 +1173,7 @@ public class AslExecutor {
                 long wakeAtNanos = Math.min(executionDeadlineNanos, Math.min(timeoutDeadlineNanos,
                         heartbeatDeadlineNanos(taskToken, heartbeatSeconds)));
                 try {
-                    return future.get(wakeAtNanos - nanoTime.getAsLong(), TimeUnit.NANOSECONDS);
+                    return waits.get(future, wakeAtNanos - nanoTime.getAsLong());
                 } catch (TimeoutException e) {
                     TokenWait decision = sfnService.get().expirePendingToken(taskToken, nanoTime.getAsLong(),
                             executionDeadlineNanos, timeoutDeadlineNanos, heartbeatSeconds);
@@ -3160,7 +3164,8 @@ public class AslExecutor {
         // a failure in any branch ends the Parallel while the others are still running, as on AWS
         // (measured: the Parallel fails within about 0.1 s of the failing branch, whichever branch
         // is listed first). The outputs still land in declaration order.
-        CompletionService<JsonNode> completions = new ExecutorCompletionService<>(executor);
+        BlockingQueue<Future<JsonNode>> completed = new LinkedBlockingQueue<>();
+        CompletionService<JsonNode> completions = new ExecutorCompletionService<>(executor, completed);
         List<Future<JsonNode>> futures = new ArrayList<>();
 
         for (JsonNode branch : branches) {
@@ -3205,7 +3210,7 @@ public class AslExecutor {
                 if (remainingNanos <= 0) {
                     throw parallelJoinExpired(stateDeadlineNanos, timeoutSeconds);
                 }
-                Future<JsonNode> done = completions.poll(remainingNanos, TimeUnit.NANOSECONDS);
+                Future<JsonNode> done = waits.poll(completed, remainingNanos);
                 if (done == null) {
                     throw parallelJoinExpired(stateDeadlineNanos, timeoutSeconds);
                 }
@@ -3466,7 +3471,7 @@ public class AslExecutor {
                         childCount, Math.max(1, effectiveConcurrency),
                         i -> () -> callUnderExecutionAccount(sm, makeTask.apply(i)),
                         executionDeadlineNanos,
-                        i -> cutIteration(iterationChains.get(i), i, cutIterations));
+                        i -> cutIteration(iterationChains.get(i), i, cutIterations), nanoTime, waits);
             } catch (TimeoutException e) {
                 // The only deadline the scheduler is given is the state machine's budget, so its
                 // expiry ends the execution rather than failing the Map state.

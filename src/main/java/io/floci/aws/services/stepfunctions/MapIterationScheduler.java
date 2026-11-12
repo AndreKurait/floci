@@ -6,6 +6,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionService;
 import java.util.concurrent.ExecutionException;
@@ -13,10 +14,11 @@ import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeoutException;
 import java.util.function.IntConsumer;
 import java.util.function.IntFunction;
+import java.util.function.LongSupplier;
 
 /** Runs Map iterations with a bounded in-flight window while preserving input order. */
 final class MapIterationScheduler {
@@ -46,6 +48,25 @@ final class MapIterationScheduler {
                                IntFunction<Callable<T>> taskFactory, long deadlineNanos,
                                IntConsumer cutting)
             throws Exception {
+        return execute(itemCount, maxConcurrency, taskFactory, deadlineNanos, cutting, System::nanoTime);
+    }
+
+    static <T> List<T> execute(int itemCount, int maxConcurrency,
+                               IntFunction<Callable<T>> taskFactory, long deadlineNanos,
+                               IntConsumer cutting, LongSupplier nanoTime)
+            throws Exception {
+        return execute(itemCount, maxConcurrency, taskFactory, deadlineNanos, cutting, nanoTime,
+                BoundedWaits.BLOCKING);
+    }
+
+    /**
+     * @param nanoTime the clock {@code deadlineNanos} is a reading of
+     * @param waits    how the wait for the next finished iteration is bounded by that deadline
+     */
+    static <T> List<T> execute(int itemCount, int maxConcurrency,
+                               IntFunction<Callable<T>> taskFactory, long deadlineNanos,
+                               IntConsumer cutting, LongSupplier nanoTime, BoundedWaits waits)
+            throws Exception {
         if (itemCount < 0) {
             throw new IllegalArgumentException("itemCount must not be negative");
         }
@@ -55,7 +76,7 @@ final class MapIterationScheduler {
         if (itemCount == 0) {
             return List.of();
         }
-        if (System.nanoTime() >= deadlineNanos) {
+        if (nanoTime.getAsLong() >= deadlineNanos) {
             throw new TimeoutException();
         }
 
@@ -63,7 +84,8 @@ final class MapIterationScheduler {
         List<T> results = new ArrayList<>(Collections.nCopies(itemCount, null));
         ExecutorService executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("sfn-map-", 0).factory());
-        CompletionService<IndexedResult<T>> completions = new ExecutorCompletionService<>(executor);
+        BlockingQueue<Future<IndexedResult<T>>> finished = new LinkedBlockingQueue<>();
+        CompletionService<IndexedResult<T>> completions = new ExecutorCompletionService<>(executor, finished);
         Map<Future<IndexedResult<T>>, Integer> inFlight = new LinkedHashMap<>();
         int nextIndex = 0;
         int completed = 0;
@@ -74,8 +96,7 @@ final class MapIterationScheduler {
                 nextIndex++;
             }
             while (completed < itemCount) {
-                Future<IndexedResult<T>> future =
-                        completions.poll(deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+                Future<IndexedResult<T>> future = waits.poll(finished, deadlineNanos - nanoTime.getAsLong());
                 if (future == null) {
                     cancel(inFlight.keySet());
                     throw new TimeoutException();

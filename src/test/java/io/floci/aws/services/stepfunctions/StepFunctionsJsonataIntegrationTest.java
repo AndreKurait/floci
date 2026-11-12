@@ -14,10 +14,12 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -4330,40 +4332,23 @@ class StepFunctionsJsonataIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private String waitForExecution(String execArn) throws InterruptedException {
+    private String waitForExecution(String execArn) {
         return waitForExecution(execArn, 50);
     }
 
-    private String waitForExecution(String execArn, int attempts) throws InterruptedException {
-        for (int i = 0; i < attempts; i++) {
-            Response resp = describeExecution(execArn);
-            String status = resp.jsonPath().getString("status");
-            if ("SUCCEEDED".equals(status)) {
-                return resp.jsonPath().getString("output");
-            }
-            if ("FAILED".equals(status) || "ABORTED".equals(status)) {
-                fail("Execution " + status + ": " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete within timeout");
-        return null;
+    private String waitForExecution(String execArn, int attempts) {
+        Response resp = waitForTerminalState(execArn, Duration.ofMillis(attempts * 100L));
+        String status = resp.jsonPath().getString("status");
+        assertEquals("SUCCEEDED", status, "Execution " + status + ": " + resp.body().asString());
+        return resp.jsonPath().getString("output");
     }
 
-    private Response waitForExecutionFailure(String execArn) throws InterruptedException {
-        for (int i = 0; i < 50; i++) {
-            Response resp = describeExecution(execArn);
-            String status = resp.jsonPath().getString("status");
-            if ("FAILED".equals(status) || "ABORTED".equals(status)) {
-                return resp;
-            }
-            if ("SUCCEEDED".equals(status)) {
-                fail("Execution SUCCEEDED: " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not fail within timeout");
-        return null;
+    private Response waitForExecutionFailure(String execArn) {
+        Response resp = waitForTerminalState(execArn, Duration.ofSeconds(5));
+        String status = resp.jsonPath().getString("status");
+        assertTrue("FAILED".equals(status) || "ABORTED".equals(status),
+                "Execution " + status + ": " + resp.body().asString());
+        return resp;
     }
 
     private List<String> historyEventTypes(String execArn) {
@@ -4376,17 +4361,6 @@ class StepFunctionsJsonataIntegrationTest {
                 .when()
                 .post("/")
                 .jsonPath().getList("events.type", String.class);
-    }
-
-    private Response describeExecution(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body(String.format("""
-                        { "executionArn": "%s" }
-                        """, execArn))
-                .when()
-                .post("/");
     }
 
     private void createBucket(String bucket) {

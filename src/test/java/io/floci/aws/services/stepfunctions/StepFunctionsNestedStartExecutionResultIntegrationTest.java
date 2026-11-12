@@ -8,14 +8,15 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * The Task result of {@code states:startExecution} in its three modes, the way AWS returns it
@@ -147,27 +148,8 @@ class StepFunctionsNestedStartExecutionResultIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private static Response describeExecution(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"executionArn": "%s"}
-                        """.formatted(execArn))
-                .when()
-                .post("/");
-    }
-
-    private static Response waitForTerminalExecution(String execArn) throws InterruptedException {
-        for (int poll = 0; poll < 200; poll++) {
-            Response resp = describeExecution(execArn);
-            if (!"RUNNING".equals(resp.jsonPath().getString("status"))) {
-                return resp;
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution " + execArn + " was still RUNNING after 20 seconds");
-        return null;
+    private static Response waitForTerminalExecution(String execArn) {
+        return waitForTerminalState(execArn, Duration.ofSeconds(20));
     }
 
     private static String quote(String raw) {

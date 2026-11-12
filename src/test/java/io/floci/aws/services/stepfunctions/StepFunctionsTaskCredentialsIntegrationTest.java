@@ -26,12 +26,14 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -354,21 +356,23 @@ class StepFunctionsTaskCredentialsIntegrationTest {
         String parent = machine(SOURCE, definition(child, "states:startExecution.sync:2", role()).toString(),
                 "STANDARD");
         String execution = start(parent, "{}");
-        String childExecution = null;
-        for (int i = 0; i < 100; i++) {
-            Response history = request(SOURCE, "GetExecutionHistory", Map.of("executionArn", execution));
-            history.then().statusCode(200);
-            for (JsonNode event : MAPPER.readTree(history.asString()).path("events")) {
-                if ("TaskSubmitted".equals(event.path("type").asText())) {
-                    childExecution = MAPPER.readTree(event.path("taskSubmittedEventDetails").path("output").asText())
-                            .path("ExecutionArn").asText();
-                }
-            }
-            if (childExecution != null) {
-                break;
-            }
-            Thread.sleep(50);
-        }
+        String childExecution = await("a TaskSubmitted event in " + execution)
+                .atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    Response history = request(SOURCE, "GetExecutionHistory", Map.of("executionArn", execution));
+                    history.then().statusCode(200);
+                    String submitted = null;
+                    for (JsonNode event : MAPPER.readTree(history.asString()).path("events")) {
+                        if ("TaskSubmitted".equals(event.path("type").asText())) {
+                            JsonNode output = MAPPER.readTree(
+                                    event.path("taskSubmittedEventDetails").path("output").asText());
+                            submitted = output.path("ExecutionArn").asText();
+                        }
+                    }
+                    return submitted;
+                }, found -> found != null);
         assertTrue(childExecution != null && childExecution.contains(TARGET));
         request(SOURCE, "StopExecution", Map.of("executionArn", execution)).then().statusCode(200);
         assertEquals("ABORTED", terminal(TARGET, childExecution).jsonPath().getString("status"));

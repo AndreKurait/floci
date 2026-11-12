@@ -17,6 +17,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -31,19 +32,18 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 /**
  * Concurrency-race coverage for {@code StartExecution}: concurrent same-name starts must launch exactly
- * once (the check-and-create is serialized). The execution store's {@code get} is delayed to widen the
- * check→create window, so the {@code executeAsync} count deterministically distinguishes a serialized
- * implementation (exactly one launch) from an unserialized one (one launch per thread). The test fails
- * if the lock is removed.
+ * once (the check-and-create is serialized). The execution store's {@code get} reads the entry and then
+ * holds its caller in the check→create window until every other racing thread is blocked behind the
+ * lock or has made its own read, so the {@code executeAsync} count deterministically distinguishes a
+ * serialized implementation (exactly one launch) from an unserialized one (every thread has read "no
+ * such execution" before any creates it: one launch per thread). The test fails if the lock is removed.
  *
  * <p>CI-only: {@code mock(AslExecutor.class)} forces AslExecutor to load, which needs Vert.x (absent in
  * the offline sandbox). The idempotency DECISION runs locally in
@@ -55,14 +55,48 @@ class StepFunctionsServiceStartExecutionRaceTest {
     private static final String ACCOUNT = "000000000000";
     private static final String REGION = "us-east-1";
     private static final int N = 16;
+    private static final long HOLD_TIMEOUT_SECONDS = 10;
 
-    /** In-memory StorageBackend whose get() sleeps, widening the check→create window to expose an unserialized create. */
+    /** The threads of the current race, each registered once the barrier has released it. */
+    private final Set<Thread> racers = ConcurrentHashMap.newKeySet();
+    private final CountDownLatch released = new CountDownLatch(N);
+    /** The racing threads that have read the execution store, and the ones whose start has returned. */
+    private final Set<Thread> haveRead = ConcurrentHashMap.newKeySet();
+    private final Set<Thread> done = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Holds the calling thread in the check→create window until none of the other racing threads
+     * can still get to its own read: each has made it already, or has returned, or is blocked
+     * entering a monitor, which on the way to that read is the start lock.
+     */
+    private void holdUntilNoOtherRacerCanRead() {
+        haveRead.add(Thread.currentThread());
+        try {
+            assertTrue(released.await(HOLD_TIMEOUT_SECONDS, TimeUnit.SECONDS), "every racing thread must be released");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted waiting for the racing threads", e);
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(HOLD_TIMEOUT_SECONDS);
+        for (Thread racer : racers) {
+            while (!haveRead.contains(racer) && !done.contains(racer)
+                    && racer.getState() != Thread.State.BLOCKED) {
+                assertTrue(System.nanoTime() - deadline < 0, racer.getName() + " neither read nor blocked");
+                Thread.onSpinWait();
+            }
+        }
+    }
+
+    /**
+     * In-memory StorageBackend whose get() answers what it read only after {@code afterRead} has run,
+     * keeping its caller in the check→create window to expose an unserialized create.
+     */
     private static final class DelayStore<V> implements StorageBackend<String, V> {
         private final Map<String, V> map = new ConcurrentHashMap<>();
-        private final long getDelayMillis;
+        private final Runnable afterRead;
 
-        DelayStore(long getDelayMillis) {
-            this.getDelayMillis = getDelayMillis;
+        DelayStore(Runnable afterRead) {
+            this.afterRead = afterRead;
         }
 
         @Override
@@ -72,14 +106,9 @@ class StepFunctionsServiceStartExecutionRaceTest {
 
         @Override
         public Optional<V> get(String key) {
-            if (getDelayMillis > 0) {
-                try {
-                    Thread.sleep(getDelayMillis);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            return Optional.ofNullable(map.get(key));
+            Optional<V> read = Optional.ofNullable(map.get(key));
+            afterRead.run();
+            return read;
         }
 
         @Override
@@ -120,19 +149,19 @@ class StepFunctionsServiceStartExecutionRaceTest {
         // backends must be wrapped in one: stubbing a bare DelayStore is a WrongTypeOfReturnValue that
         // fails build() before any thread starts. The wrapper is what the service gets in production too.
         AccountAwareStorageBackend<StateMachine> smStore =
-                new AccountAwareStorageBackend<>(new DelayStore<>(0), null, ACCOUNT);
-        AccountAwareStorageBackend<Execution> execStore =
-                new AccountAwareStorageBackend<>(new DelayStore<>(100), null, ACCOUNT); // widen check->create window
+                new AccountAwareStorageBackend<>(new DelayStore<>(() -> { }), null, ACCOUNT);
+        AccountAwareStorageBackend<Execution> execStore = new AccountAwareStorageBackend<>(
+                new DelayStore<>(this::holdUntilNoOtherRacerCanRead), null, ACCOUNT); // hold the check->create window
         AccountAwareStorageBackend<Object> actStore =
-                new AccountAwareStorageBackend<>(new DelayStore<>(0), null, ACCOUNT);
+                new AccountAwareStorageBackend<>(new DelayStore<>(() -> { }), null, ACCOUNT);
 
         StorageFactory factory = mock(StorageFactory.class);
         doReturn(smStore).doReturn(execStore).doReturn(actStore)
                 .when(factory).create(anyString(), anyString(), any());
 
-        RegionResolver region = mock(RegionResolver.class);
-        when(region.buildArn(eq("states"), any(), anyString()))
-                .thenAnswer(i -> "arn:aws:states:us-east-1:000000000000:" + i.getArgument(2));
+        // A real resolver: a mock serializes its callers on a monitor of its own, and the store
+        // must be able to tell a thread blocked at the start lock from one that is not there yet.
+        RegionResolver region = new RegionResolver(REGION, ACCOUNT);
 
         AslExecutor executor = mock(AslExecutor.class);
         StepFunctionsService service =
@@ -159,7 +188,10 @@ class StepFunctionsServiceStartExecutionRaceTest {
                 futures.add(pool.submit(() -> {
                     try {
                         barrier.await();
+                        racers.add(Thread.currentThread());
+                        released.countDown();
                         body.accept(idx);
+                        done.add(Thread.currentThread());
                     } catch (Exception e) {
                         throw new RuntimeException(e);
                     }

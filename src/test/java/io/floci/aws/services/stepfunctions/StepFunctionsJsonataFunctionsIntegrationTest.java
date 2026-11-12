@@ -8,10 +8,12 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * The six functions the Step Functions JSONata dialect adds on top of the JSONata language:
@@ -319,47 +321,19 @@ class StepFunctionsJsonataFunctionsIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private String waitForExecution(String execArn) throws InterruptedException {
-        for (int i = 0; i < 50; i++) {
-            Response resp = describeExecution(execArn);
-            String status = resp.jsonPath().getString("status");
-            if ("SUCCEEDED".equals(status)) {
-                return resp.jsonPath().getString("output");
-            }
-            if ("FAILED".equals(status) || "ABORTED".equals(status)) {
-                fail("Execution " + status + ": " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete within timeout");
-        return null;
+    private String waitForExecution(String execArn) {
+        Response resp = waitForTerminalState(execArn, Duration.ofSeconds(5));
+        String status = resp.jsonPath().getString("status");
+        assertEquals("SUCCEEDED", status, "Execution " + status + ": " + resp.body().asString());
+        return resp.jsonPath().getString("output");
     }
 
-    private Response waitForExecutionFailure(String execArn) throws InterruptedException {
-        for (int i = 0; i < 50; i++) {
-            Response resp = describeExecution(execArn);
-            String status = resp.jsonPath().getString("status");
-            if ("FAILED".equals(status) || "ABORTED".equals(status)) {
-                return resp;
-            }
-            if ("SUCCEEDED".equals(status)) {
-                fail("Execution SUCCEEDED: " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not fail within timeout");
-        return null;
-    }
-
-    private Response describeExecution(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body(String.format("""
-                        { "executionArn": "%s" }
-                        """, execArn))
-                .when()
-                .post("/");
+    private Response waitForExecutionFailure(String execArn) {
+        Response resp = waitForTerminalState(execArn, Duration.ofSeconds(5));
+        String status = resp.jsonPath().getString("status");
+        assertTrue("FAILED".equals(status) || "ABORTED".equals(status),
+                "Execution " + status + ": " + resp.body().asString());
+        return resp;
     }
 
     /**
