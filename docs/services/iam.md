@@ -546,8 +546,14 @@ reading "Active | Inactive | Expired" as well.
 
 An account holds one alias, and AWS enforces that by replacement rather than rejection:
 `CreateAccountAlias` with a new value silently swaps the current one. `EntityAlreadyExists` means
-the requested name is taken — on AWS that includes names held by other accounts, since aliases are
-globally unique, but the store here is per-account so only "you already hold this one" arises.
+the requested name is taken, including by another local account. A rejected claim preserves
+both accounts' existing aliases. Replacing or deleting an alias releases its old name for reuse.
+Concurrent claims are serialized so only one account obtains a name.
+
+Alias ownership comes from the existing IAM store, including after a restart. Legacy aliases
+without an account prefix belong to the configured default account. They cannot be migrated
+into another account by a read or a conflicting claim. Internal alias resolution rejects
+ambiguous ownership in older stored data instead of selecting an arbitrary account.
 
 `DeleteAccountAlias` must name the current alias; a mismatch returns `NoSuchEntity`. Both verbs
 apply the same pattern constraint, so a malformed value returns `ValidationError` on either.

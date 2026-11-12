@@ -743,9 +743,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             return;
         }
         validateAccountAlias(seededAccountAlias);
-        Optional<String> stored = accountAliases.get(ACCOUNT_ALIAS_KEY);
+        Optional<String> stored = getAccountAlias();
         if (stored.isEmpty()) {
-            accountAliases.put(ACCOUNT_ALIAS_KEY, seededAccountAlias);
+            createAccountAlias(seededAccountAlias);
             LOG.infov("Seeded IAM account alias: {0}", seededAccountAlias);
         } else if (!stored.get().equals(seededAccountAlias)) {
             // Under persistent storage the alias outlives the process, so a changed configuration
@@ -2707,24 +2707,54 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // Account Aliases
     // ==================================================================
     public Optional<String> getAccountAlias() {
+        if (accountAliases instanceof AccountAwareStorageBackend<String> aliases) {
+            String accountId = aliases.accountId();
+            return aliases.getForAccountMigratingLegacy(accountId, ACCOUNT_ALIAS_KEY,
+                    value -> aliases.getLegacyForAccount(accountId, ACCOUNT_ALIAS_KEY)
+                            .filter(value::equals).isPresent());
+        }
         return accountAliases.get(ACCOUNT_ALIAS_KEY);
+    }
+
+    /** Resolves an alias using stored account ownership, independent of the requesting account. */
+    public Optional<String> findAccountIdByAlias(String alias) {
+        validateAccountAlias(alias);
+        synchronized (accountAliasLock) {
+            Set<String> owners = accountAliasOwners(alias);
+            if (owners.size() > 1) {
+                throw new AwsException("InternalFailure",
+                        "The account alias " + alias + " has conflicting stored owners.", 500);
+            }
+            return owners.stream().findFirst();
+        }
+    }
+
+    private Set<String> accountAliasOwners(String alias) {
+        if (accountAliases instanceof AccountAwareStorageBackend<String> aliases) {
+            return aliases.findAllAccountEntries(ACCOUNT_ALIAS_KEY).stream()
+                    .filter(entry -> alias.equals(entry.value()))
+                    .map(AccountAwareStorageBackend.AccountEntry::accountId)
+                    .collect(Collectors.toSet());
+        }
+        return accountAliases.get(ACCOUNT_ALIAS_KEY).filter(alias::equals)
+                .map(ignored -> Set.of(regionResolver.getDefaultAccountId()))
+                .orElseGet(Set::of);
     }
 
     /**
      * An account holds one alias, and AWS enforces that by replacement rather than rejection:
      * creating a free alias while another is set silently swaps it. {@code EntityAlreadyExists}
-     * means the requested name is taken — globally on AWS, since aliases are unique across all
-     * accounts. Only the "you already hold this one" case can arise here, because the store is
-     * namespaced per account and holds no other account's aliases.
+     * means the requested name is taken, including when another account holds it. The ownership
+     * check and write share the same lock so concurrent accounts cannot claim the same alias.
      */
     public void createAccountAlias(String alias) {
         validateAccountAlias(alias);
         synchronized (accountAliasLock) {
-            Optional<String> existing = accountAliases.get(ACCOUNT_ALIAS_KEY);
-            if (existing.isPresent() && existing.get().equals(alias)) {
+            if (!accountAliasOwners(alias).isEmpty()) {
                 throw new AwsException("EntityAlreadyExists",
                         "The account alias " + alias + " already exists.", 409);
             }
+            getAccountAlias();
             accountAliases.put(ACCOUNT_ALIAS_KEY, alias);
         }
         LOG.infov("Set IAM account alias: {0}", alias);
@@ -2739,7 +2769,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         // a ValidationError rather than a miss.
         validateAccountAlias(alias);
         synchronized (accountAliasLock) {
-            String existing = accountAliases.get(ACCOUNT_ALIAS_KEY)
+            String existing = getAccountAlias()
                     .orElseThrow(() -> new AwsException("NoSuchEntity",
                             "The account alias " + alias + " cannot be found.", 404));
             if (!existing.equals(alias)) {
