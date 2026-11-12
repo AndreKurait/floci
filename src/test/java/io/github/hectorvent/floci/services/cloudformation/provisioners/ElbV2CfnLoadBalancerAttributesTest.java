@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
+import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -144,6 +145,45 @@ class ElbV2CfnLoadBalancerAttributesTest {
         assertEquals(resource.getAttributes(), previous.getAttributes());
         provisioner.clearUpdate(resource);
         assertFalse(provisioner.requiresUpdateRecovery(resource));
+    }
+
+    @Test
+    void idempotentCreateDuringUpdateKeepsTheAttributeRollbackSnapshot() throws Exception {
+        ElbV2CfnProvisioner provisioner = idempotentProvisioner();
+        provisioner.provision(resource, mapper.readTree("""
+                {"LoadBalancerAttributes":[{"Key":"routing.http.preserve_host_header.enabled","Value":true}]}
+                """), context(true));
+        assertEquals("true", live.get(HOST));
+        assertTrue(resource.getAttributes().containsKey(SNAPSHOT));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertEquals("false", live.get(HOST));
+        verify(service, never()).deleteLoadBalancer(anyString(), anyString());
+    }
+
+    @Test
+    void failedIdempotentUpdateRestoresAttributesWithoutDeletingTheExistingBalancer() throws Exception {
+        ElbV2CfnProvisioner provisioner = idempotentProvisioner();
+        AwsException failure = new AwsException("InternalFailure", "write failed", 500);
+        doAnswer(call -> {
+            live.put(HOST, "true");
+            throw failure;
+        }).when(service).modifyLoadBalancerAttributes(eq(REGION), eq(ARN), anyMap());
+        assertSame(failure, assertThrows(AwsException.class, () -> provisioner.provision(resource,
+                mapper.readTree("""
+                        {"LoadBalancerAttributes":[{"Key":"routing.http.preserve_host_header.enabled","Value":true}]}
+                        """), context(true))));
+        assertEquals("false", live.get(HOST));
+        verify(service, never()).deleteLoadBalancer(anyString(), anyString());
+    }
+
+    private ElbV2CfnProvisioner idempotentProvisioner() {
+        LoadBalancer existing = new LoadBalancer();
+        existing.setLoadBalancerArn(ARN);
+        existing.setLoadBalancerName("web");
+        existing.setAvailabilityZones(List.of());
+        when(service.createLoadBalancer(eq(REGION), anyString(), isNull(), isNull(), isNull(),
+                anyList(), anyList(), anyMap())).thenReturn(existing);
+        return new ElbV2CfnProvisioner(service);
     }
 
     private ProvisionContext context(boolean update) {
