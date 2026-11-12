@@ -18,6 +18,7 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.ResourceArnBuilder;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
+import io.floci.aws.services.lambda.LambdaRuntimeManagementService;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.s3.S3ConditionKeys;
 import io.floci.aws.services.s3.S3ControlTagConditionKeys;
@@ -104,6 +105,7 @@ public class IamConditionContextResolver {
     private final Instance<CloudWatchLogsCrossAccountService> crossAccountService;
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
+    private final Instance<LambdaRuntimeManagementService> runtimeManagement;
     private final RequestContext requestContext;
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
@@ -125,10 +127,26 @@ public class IamConditionContextResolver {
                                        RequestContext requestContext,
                                        EmulatorConfig config,
                                        CurrentVertxRequest currentVertxRequest,
-                                       ResolvedServiceCatalog serviceCatalog) {
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<LambdaRuntimeManagementService> runtimeManagement) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
                 lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC());
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), runtimeManagement);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext, config, currentVertxRequest, serviceCatalog, Clock.systemUTC());
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -142,6 +160,22 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext, config, currentVertxRequest, serviceCatalog, clock, null);
+    }
+
+    IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                Instance<LambdaRuntimeManagementService> runtimeManagement) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -149,6 +183,7 @@ public class IamConditionContextResolver {
         this.crossAccountService = crossAccountService;
         this.iamService = iamService;
         this.lambdaWebService = lambdaWebService;
+        this.runtimeManagement = runtimeManagement;
         this.requestContext = requestContext;
         this.config = config;
         this.currentVertxRequest = currentVertxRequest;
@@ -420,6 +455,17 @@ public class IamConditionContextResolver {
     /** The authType a web function endpoint request names, and the one the endpoint has before it. */
     private Map<String, List<String>> lambdaConditionContext(String action, ContainerRequestContext ctx) {
         Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (("lambda:GetRuntimeManagementConfig".equals(action)
+                || "lambda:PutRuntimeManagementConfig".equals(action))
+                && runtimeManagement != null && runtimeManagement.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId()
+                    : requestContext.getAccountId();
+            runtimeManagement.get().authorizationTags(region, account,
+                    ctx.getUriInfo().getPathParameters().getFirst("functionName"),
+                    ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"))
+                    .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        }
         for (String member : RequestConditionKeys.members(action, REQUEST_AUTH_TYPE)) {
             PassedRoles.values(PassedRoles.jsonBody(ctx), member.split("\\."))
                     .forEach(value -> putIfPresent(conditions, REQUEST_AUTH_TYPE, value));
