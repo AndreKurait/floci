@@ -86,6 +86,21 @@ public class LambdaAliasStore {
         return backend.get(key(region, functionName, aliasName));
     }
 
+    public Optional<LambdaAlias> getReadOnlyForAccount(
+            String accountId, String region, String functionName, String aliasName) {
+        String key = key(region, functionName, aliasName);
+        Optional<LambdaAlias> result;
+        if (backend instanceof AccountAwareStorageBackend<LambdaAlias> aware) {
+            result = aware.getForAccount(accountId, key).or(() -> aware.getLegacyForAccount(accountId, key));
+        } else {
+            result = backend.get(key);
+        }
+        return result.filter(alias -> functionName.equals(alias.getFunctionName()) && aliasName.equals(alias.getName()))
+                .filter(alias -> accountId.equals(AwsArnUtils.accountOrDefault(alias.getAliasArn(), "")))
+                .filter(alias -> AwsArnUtils.Arn.of("lambda", region, accountId,
+                        "function:" + functionName + ":" + aliasName).toString().equals(alias.getAliasArn()));
+    }
+
     public Optional<LambdaAlias> getByUrlId(String urlId) {
         return Optional.ofNullable(urlIdIndex.get(urlId));
     }

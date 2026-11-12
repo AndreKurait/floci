@@ -12,6 +12,8 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `CreateFunction` | Deploy a Lambda function |
 | `GetFunction` | Get function details and download URL |
 | `GetFunctionConfiguration` | Get runtime configuration |
+| `GetRuntimeManagementConfig` | Read a version's stored runtime update mode and optional pin |
+| `PutRuntimeManagementConfig` | Replace a version's stored runtime update mode and optional pin |
 | `ListFunctions` | List all functions |
 | `UpdateFunctionCode` | Upload new code |
 | `UpdateFunctionConfiguration` | Update runtime, handler, memory, timeout, environment, architectures, tracing, layers, and more |
@@ -97,6 +99,33 @@ provisions it from a stack. A SAM function's `EventInvokeConfig` expands into th
 each destination and the SQS queue or SNS topic SAM creates when a destination gives only its `Type`.
 Asynchronous invocations apply its retry, event age, destination settings, and dead-letter queue
 configurations (`DeadLetterConfig`).
+
+### Runtime management configuration
+
+`GetRuntimeManagementConfig` and `PutRuntimeManagementConfig` use the native
+`/2021-07-20/functions/{FunctionName}/runtime-management-config` route. Each function's
+`$LATEST` and numeric published versions have independent stored settings, initially `Auto`.
+`Manual` requires a modeled `RuntimeVersionArn`, which is preserved exactly. `Auto` and
+`FunctionUpdate` clear the stored and returned pin, including when a valid ARN is supplied.
+These settings do not install runtimes, alter invocation environments, or emulate runtime rollout.
+
+Local compatibility policies: aliases select their primary numeric version and retain the
+requested alias in the response ARN; newly published versions start at `Auto`, independently
+of the latest version's setting. `$LATEST.PUBLISHED` is unresolved and returns
+`ResourceNotFoundException`. Conflicting embedded/query qualifiers are rejected. IAM grants
+match the requested qualified ARN, including an alias or explicit `$LATEST`; unqualified
+requests match the unqualified ARN. Both actions use the function's current resource tags.
+Function references must belong to the caller's account, Region and partition.
+
+Reads and IAM condition lookup do not migrate legacy functions or aliases. An authorized
+first write can migrate a legacy function and persist an internal lifetime identifier before
+committing its settings; these are separate writes. Failed settings writes leave the prior
+visible settings. Immutable settings use the Lambda storage mode, including persistent reload
+and atomic replacement; hybrid mode retains asynchronous durability. Deletion clears settings
+before removing the function/version, so a later parent-store failure can leave that resource
+present with default settings. A settings deletion failure stops parent deletion. New function
+lifetimes and stale-writer checks prevent old settings from returning after name reuse.
+
 
 ### Function policies under IAM enforcement
 

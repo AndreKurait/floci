@@ -19,6 +19,7 @@ import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.eks.EksService;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambda.LambdaArnUtils;
+import io.floci.aws.services.lambda.LambdaRuntimeManagementReference;
 import io.floci.aws.services.lambda.durable.DurableTokens;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
 import io.floci.aws.services.s3.S3ControlArnUtils;
@@ -219,6 +220,10 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("lambda:GetRuntimeManagementConfig".equals(operation)
+                || "lambda:PutRuntimeManagementConfig".equals(operation)) {
+            return List.of(runtimeManagementArn(ctx, region, accountId));
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
@@ -1048,6 +1053,22 @@ public class ResourceArnBuilder {
         } catch (AwsException e) {
             // A reference Lambda refuses, which its handler answers with a 400 before acting on anything.
             return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        }
+    }
+
+    private String runtimeManagementArn(ContainerRequestContext ctx, String region, String accountId) {
+        String reference = ctx.getUriInfo().getPathParameters().getFirst("functionName");
+        if (reference == null) {
+            reference = extractSegmentAfter(IamActionRegistry.decodedPath(ctx), "functions");
+        }
+        try {
+            return LambdaRuntimeManagementReference.resolve(reference,
+                    ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"), region, accountId)
+                    .authorizationArn();
+        } catch (AwsException expected) {
+            // Preserve a malformed or foreign identifier for policy matching; the service refuses it.
+            return AwsArnUtils.looksLikeArn(reference) ? reference
+                    : AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + reference).toString();
         }
     }
 
