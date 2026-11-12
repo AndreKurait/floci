@@ -1,4 +1,5 @@
 AWS::ApiGatewayV2::Authorizer	ApiId	create-only	a drop fails: the authorizer is not found
+AWS::ApiGatewayV2::Authorizer	AuthorizerCredentialsArn	clear	only credentials previously declared by the stack are cleared
 AWS::ApiGatewayV2::Authorizer	AuthorizerPayloadFormatVersion	clear	a create without it accepts the authorizer
 AWS::ApiGatewayV2::Authorizer	AuthorizerResultTtlInSeconds	clear	the field reads back absent
 AWS::ApiGatewayV2::Authorizer	AuthorizerType	keep:required by AWS
@@ -7,6 +8,19 @@ AWS::ApiGatewayV2::Authorizer	EnableSimpleResponses	clear	the field reads back a
 AWS::ApiGatewayV2::Authorizer	IdentitySource	clear	an update also clears it when the stack never declared it, so a value set outside the stack is lost
 AWS::ApiGatewayV2::Authorizer	JwtConfiguration	clear	a create without it accepts the authorizer
 AWS::ApiGatewayV2::Authorizer	Name	keep:required by AWS
+AWS::ApiGatewayV2::Integration	ApiId	create-only
+AWS::ApiGatewayV2::Integration	ConnectionId	clear
+AWS::ApiGatewayV2::Integration	ConnectionType	default:INTERNET
+AWS::ApiGatewayV2::Integration	CredentialsArn	clear	only credentials previously declared by the stack are cleared
+AWS::ApiGatewayV2::Integration	IntegrationMethod	clear
+AWS::ApiGatewayV2::Integration	IntegrationSubtype	clear
+AWS::ApiGatewayV2::Integration	IntegrationType	keep:required by AWS
+AWS::ApiGatewayV2::Integration	IntegrationUri	keep:management updates retain an omitted URI
+AWS::ApiGatewayV2::Integration	PayloadFormatVersion	default:derived from IntegrationSubtype
+AWS::ApiGatewayV2::Integration	RequestParameters	clear
+AWS::ApiGatewayV2::Integration	RequestTemplates	clear
+AWS::ApiGatewayV2::Integration	TemplateSelectionExpression	clear
+AWS::ApiGatewayV2::Integration	TimeoutInMillis	default:0
 AWS::ApiGatewayV2::Route	ApiId	create-only	a drop fails: the route is not found
 AWS::ApiGatewayV2::Route	AuthorizationScopes	clear	an update also clears it when the stack never declared it, so a value set outside the stack is lost
 AWS::ApiGatewayV2::Route	AuthorizationType	default:NONE
