@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.athena.model.CreateWorkGroupRequest;
 import io.github.hectorvent.floci.services.athena.model.DataCatalog;
 import io.github.hectorvent.floci.services.athena.model.ManagedQueryResultsConfiguration;
 import io.github.hectorvent.floci.services.athena.model.ManagedQueryResultsConfigurationUpdates;
+import io.github.hectorvent.floci.services.athena.model.PreparedStatement;
 import io.github.hectorvent.floci.services.athena.model.QueryExecution;
 import io.github.hectorvent.floci.services.athena.model.QueryExecutionContext;
 import io.github.hectorvent.floci.services.athena.model.QueryExecutionState;
@@ -264,7 +265,7 @@ public class AthenaService {
                 || state == QueryExecutionState.CANCELLED;
     }
 
-    public WorkGroup createWorkGroup(CreateWorkGroupRequest request, String region) {
+    public synchronized WorkGroup createWorkGroup(CreateWorkGroupRequest request, String region) {
         validateWorkGroupName(request.getName());
         if (DEFAULT_WORKGROUP.equals(request.getName())) {
             throw new AwsException("InvalidRequestException",
@@ -319,8 +320,37 @@ public class AthenaService {
     }
 
     public void deleteWorkGroup(String name, String region) {
-        workGroupStore.delete(workGroupKey(region, name));
+        deleteWorkGroup(name, region, false);
     }
+
+    public synchronized void deleteWorkGroup(String name, String region, boolean recursive) {
+        validatePreparedStatementDeletion(name, region, recursive);
+        workGroupStore.deleteAllAtomically(Set.of(workGroupKey(region, name)));
+    }
+
+    // Return the target monitor even when this service is accessed through a CDI client proxy.
+    Object workGroupLock() {
+        return this;
+    }
+
+    synchronized WorkGroup preparedStatementWorkGroup(String region, String name) {
+        return DEFAULT_WORKGROUP.equals(name) ? primaryWorkGroup(region) : requireWorkGroup(region, name);
+    }
+
+    synchronized void savePreparedStatements(String region, WorkGroup current,
+                                              Map<String, PreparedStatement> statements) {
+        workGroupStore.putAllAtomically(Map.of(workGroupKey(region, current.getName()),
+                current.withPreparedStatements(statements)));
+    }
+
+    synchronized void validatePreparedStatementDeletion(String name, String region, boolean recursive) {
+        if (!recursive && workGroupStore.get(workGroupKey(region, name))
+                .map(group -> !group.getPreparedStatements().isEmpty()).orElse(false)) {
+            throw new AwsException("InvalidRequestException",
+                    "WorkGroup contains prepared statements. Set RecursiveDeleteOption to true to delete it.", 400);
+        }
+    }
+
 
     /**
      * github.com/floci-io/floci/issues/2791: terraform-provider-aws calls this on every
