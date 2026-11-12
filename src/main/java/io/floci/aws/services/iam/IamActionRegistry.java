@@ -14,6 +14,7 @@ import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.route53.Route53Controller;
 import io.floci.aws.services.s3.S3BucketSubresources;
 import io.floci.aws.services.s3.S3ObjectActions;
+import io.floci.aws.services.s3tables.S3TablesController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -49,6 +50,11 @@ public class IamActionRegistry {
             "getReusableDelegationSet", "route53:GetReusableDelegationSet",
             "listReusableDelegationSets", "route53:ListReusableDelegationSets",
             "deleteReusableDelegationSet", "route53:DeleteReusableDelegationSet");
+
+    private static final Map<String, String> S3TABLES_METRICS_ACTIONS = Map.of(
+            "putTableBucketMetricsConfiguration", "s3tables:PutTableBucketMetricsConfiguration",
+            "getTableBucketMetricsConfiguration", "s3tables:GetTableBucketMetricsConfiguration",
+            "deleteTableBucketMetricsConfiguration", "s3tables:DeleteTableBucketMetricsConfiguration");
 
     private static final Logger LOG = Logger.getLogger(IamActionRegistry.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -656,6 +662,11 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("s3tables".equals(credentialScope) && resourceInfo != null
+                && S3TablesController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return S3TABLES_METRICS_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
         if ("route53".equals(credentialScope) && resourceInfo != null
                 && Route53Controller.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
