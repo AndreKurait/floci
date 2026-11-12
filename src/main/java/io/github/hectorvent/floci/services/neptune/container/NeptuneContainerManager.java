@@ -4,12 +4,14 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.services.neptune.model.NeptuneDbType;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -22,8 +24,10 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -209,6 +213,61 @@ public class NeptuneContainerManager {
         }
         for (NeptuneContainerHandle handle : handles) {
             stop(handle);
+        }
+    }
+
+    /** Writes a GraphSON archive through the backend's Gremlin WebSocket protocol. */
+    public String snapshotGraph(NeptuneContainerHandle handle) {
+        String directory = archiveDirectory();
+        try {
+            runArchiveCommand(handle, "mkdir", "-m", "700", directory);
+            String path = directory + "/snapshot.graphson";
+            GremlinArchiveClient.write(handle.getHost(), handle.getPort(), path);
+            long size = Long.parseLong(runArchiveCommand(handle, "stat", "-c", "%s", path).trim());
+            if (size < 0 || size > 67_108_864) {
+                throw new IllegalStateException("Neptune GraphSON snapshots are limited to 64 MiB");
+            }
+            return runArchiveCommand(handle, "base64", "-w0", path).trim();
+        } finally {
+            removeArchiveDirectory(handle, directory);
+        }
+    }
+
+    /** Loads a stored archive into a newly provisioned, unpublished Gremlin backend. */
+    public void restoreGraph(NeptuneContainerHandle handle, String archiveBase64) {
+        byte[] archive = Base64.getDecoder().decode(archiveBase64);
+        if (archive.length > 67_108_864) {
+            throw new IllegalStateException("Neptune GraphSON snapshots are limited to 64 MiB");
+        }
+        String directory = archiveDirectory();
+        try {
+            runArchiveCommand(handle, "mkdir", "-m", "700", directory);
+            RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), handle.getContainerId(), directory,
+                    "snapshot.graphson", archive, 0644, RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, 500);
+            GremlinArchiveClient.read(handle.getHost(), handle.getPort(), directory + "/snapshot.graphson");
+        } finally {
+            removeArchiveDirectory(handle, directory);
+        }
+    }
+
+    private static String archiveDirectory() {
+        return "/tmp/floci-neptune-snapshot-" + UUID.randomUUID();
+    }
+
+    private String runArchiveCommand(NeptuneContainerHandle handle, String... command) {
+        ContainerExec.Result result = ContainerExec.run(lifecycleManager.getDockerClient(),
+                handle.getContainerId(), command, 120);
+        if (result.exitCode() != 0) {
+            throw new IllegalStateException("Neptune archive command failed: " + result.stderr());
+        }
+        return result.stdout();
+    }
+
+    private void removeArchiveDirectory(NeptuneContainerHandle handle, String directory) {
+        try {
+            runArchiveCommand(handle, "rm", "-rf", directory);
+        } catch (RuntimeException exception) {
+            LOG.warnv(exception, "Could not remove owned Neptune archive directory {0}", directory);
         }
     }
 
