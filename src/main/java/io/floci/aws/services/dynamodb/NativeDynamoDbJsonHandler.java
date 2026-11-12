@@ -9,6 +9,9 @@ import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsErrorResponse;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.SmithyValidationErrors;
+import io.floci.aws.services.dynamodb.DynamoDbReplicaAutoScalingService.Description;
+import io.floci.aws.services.dynamodb.DynamoDbReplicaAutoScalingService.IndexDescription;
+import io.floci.aws.services.dynamodb.DynamoDbReplicaAutoScalingService.ReplicaDescription;
 import io.floci.aws.services.dynamodb.NativeDynamoDbTableService.CreateTableRequest;
 import io.floci.aws.services.dynamodb.NativeDynamoDbTableService.GsiThroughputUpdate;
 import io.floci.aws.services.dynamodb.NativeDynamoDbTableService.IndexOverride;
@@ -29,6 +32,9 @@ import io.floci.aws.services.dynamodb.model.ImportTableDescription;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.KinesisStreamingDestination;
 import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
+import io.floci.aws.services.dynamodb.model.ReplicaAutoScalingState.Policy;
+import io.floci.aws.services.dynamodb.model.ReplicaAutoScalingState.Settings;
+import io.floci.aws.services.dynamodb.model.ReplicaAutoScalingState.TargetTracking;
 import io.floci.aws.services.dynamodb.model.SearchSchemaElement;
 import io.floci.aws.services.dynamodb.model.TableBackup;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
@@ -88,6 +94,7 @@ public class NativeDynamoDbJsonHandler {
 
     private final DynamoDbService dynamoDbService;
     private final NativeDynamoDbTableService tableService;
+    private final DynamoDbReplicaAutoScalingService replicaAutoScalingService;
     private final ObjectMapper objectMapper;
     private final EmulatorConfig config;
     private final DynamoDbPartiQLHandler partiQLHandler;
@@ -95,12 +102,19 @@ public class NativeDynamoDbJsonHandler {
 
     @Inject
     public NativeDynamoDbJsonHandler(DynamoDbService dynamoDbService, NativeDynamoDbTableService tableService,
+                                     DynamoDbReplicaAutoScalingService replicaAutoScalingService,
                                      ObjectMapper objectMapper, EmulatorConfig config) {
         this.dynamoDbService = dynamoDbService;
         this.tableService = tableService;
+        this.replicaAutoScalingService = replicaAutoScalingService;
         this.objectMapper = objectMapper;
         this.config = config;
         this.partiQLHandler = new DynamoDbPartiQLHandler(dynamoDbService, objectMapper);
+    }
+
+    public NativeDynamoDbJsonHandler(DynamoDbService dynamoDbService, NativeDynamoDbTableService tableService,
+                                     ObjectMapper objectMapper, EmulatorConfig config) {
+        this(dynamoDbService, tableService, new DynamoDbReplicaAutoScalingService(dynamoDbService), objectMapper, config);
     }
 
     /** Package-private constructor for testing. */
@@ -128,6 +142,10 @@ public class NativeDynamoDbJsonHandler {
             case "BatchWriteItem" -> handleBatchWriteItem(request, region);
             case "BatchGetItem" -> handleBatchGetItem(request, region);
             case "UpdateTable" -> handleUpdateTable(request, region);
+            case "UpdateTableReplicaAutoScaling" -> Response.ok(replicaAutoScalingResponse(
+                    replicaAutoScalingService.update(ReplicaAutoScalingRequest.parse(request), region))).build();
+            case "DescribeTableReplicaAutoScaling" -> Response.ok(replicaAutoScalingResponse(
+                    replicaAutoScalingService.describe(ReplicaAutoScalingRequest.tableName(request), region))).build();
             case "DescribeTimeToLive" -> handleDescribeTimeToLive(request, region);
             case "UpdateTimeToLive" -> handleUpdateTimeToLive(request, region);
             case "DescribeContinuousBackups" -> handleDescribeContinuousBackups(request, region);
@@ -150,6 +168,7 @@ public class NativeDynamoDbJsonHandler {
             case "GetResourcePolicy" -> handleGetResourcePolicy(request, region);
             case "DeleteResourcePolicy" -> handleDeleteResourcePolicy(request, region);
             case "EnableKinesisStreamingDestination" -> handleEnableKinesisStreamingDestination(request, region);
+            case "UpdateKinesisStreamingDestination" -> handleUpdateKinesisStreamingDestination(request, region);
             case "DisableKinesisStreamingDestination" -> handleDisableKinesisStreamingDestination(request, region);
             case "DescribeKinesisStreamingDestination" -> handleDescribeKinesisStreamingDestination(request, region);
             case "ExportTableToPointInTime" -> handleExportTable(request, region);
@@ -3504,6 +3523,114 @@ public class NativeDynamoDbJsonHandler {
 
         return Response.ok(kinesisDestinationResponse(
                 tableService.disableKinesisStreamingDestination(tableName, streamArn, region))).build();
+    }
+
+    private ObjectNode replicaAutoScalingResponse(Description value) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ObjectNode description = response.putObject("TableAutoScalingDescription");
+        description.put("TableName", value.tableName());
+        description.put("TableStatus", value.tableStatus());
+        ArrayNode replicas = description.putArray("Replicas");
+        for (ReplicaDescription replica : value.replicas()) {
+            ObjectNode node = replicas.addObject();
+            node.put("RegionName", replica.region());
+            node.put("ReplicaStatus", replica.status());
+            autoScalingSettings(node, "ReplicaProvisionedReadCapacityAutoScalingSettings", replica.read());
+            autoScalingSettings(node, "ReplicaProvisionedWriteCapacityAutoScalingSettings", replica.write());
+            ArrayNode indexes = node.putArray("GlobalSecondaryIndexes");
+            for (IndexDescription index : replica.indexes()) {
+                ObjectNode indexNode = indexes.addObject();
+                indexNode.put("IndexName", index.name());
+                indexNode.put("IndexStatus", index.status());
+                autoScalingSettings(indexNode, "ProvisionedReadCapacityAutoScalingSettings", index.read());
+                autoScalingSettings(indexNode, "ProvisionedWriteCapacityAutoScalingSettings", index.write());
+            }
+        }
+        return response;
+    }
+
+    private static void autoScalingSettings(ObjectNode parent, String member, Settings settings) {
+        if (settings == null) {
+            return;
+        }
+        ObjectNode node = parent.putObject(member);
+        if (settings.minimumUnits() != null) {
+            node.put("MinimumUnits", settings.minimumUnits());
+        }
+        if (settings.maximumUnits() != null) {
+            node.put("MaximumUnits", settings.maximumUnits());
+        }
+        if (settings.disabled() != null) {
+            node.put("AutoScalingDisabled", settings.disabled());
+        }
+        if (settings.roleArn() != null) {
+            node.put("AutoScalingRoleArn", settings.roleArn());
+        }
+        Policy policy = settings.policy();
+        if (policy != null) {
+            ObjectNode policyNode = node.putArray("ScalingPolicies").addObject();
+            if (policy.name() != null) {
+                policyNode.put("PolicyName", policy.name());
+            }
+            TargetTracking target = policy.targetTracking();
+            ObjectNode targetNode = policyNode.putObject("TargetTrackingScalingPolicyConfiguration");
+            targetNode.put("TargetValue", target.targetValue());
+            if (target.disableScaleIn() != null) {
+                targetNode.put("DisableScaleIn", target.disableScaleIn());
+            }
+            if (target.scaleInCooldown() != null) {
+                targetNode.put("ScaleInCooldown", target.scaleInCooldown());
+            }
+            if (target.scaleOutCooldown() != null) {
+                targetNode.put("ScaleOutCooldown", target.scaleOutCooldown());
+            }
+        }
+    }
+
+    private Response handleUpdateKinesisStreamingDestination(JsonNode request, String region) {
+        String tableName = kinesisUpdateString(request, "TableName", "tableName", 1);
+        String streamArn = kinesisUpdateString(request, "StreamArn", "streamArn", 37);
+        JsonNode configuration = request.path("UpdateKinesisStreamingConfiguration");
+        if (!configuration.isMissingNode() && !configuration.isNull() && !configuration.isObject()) {
+            throw new AwsException("SerializationException",
+                    "UpdateKinesisStreamingConfiguration must be an object", 400);
+        }
+        JsonNode precisionNode = configuration.path("ApproximateCreationDateTimePrecision");
+        if (!precisionNode.isMissingNode() && !precisionNode.isNull() && !precisionNode.isTextual()) {
+            throw new AwsException("SerializationException", "ApproximateCreationDateTimePrecision must be a string", 400);
+        }
+        String precision = precisionNode.isMissingNode() || precisionNode.isNull() ? null : precisionNode.asText();
+        if (precision != null && !KinesisStreamingDestination.PRECISION_MILLISECOND.equals(precision)
+                && !KinesisStreamingDestination.PRECISION_MICROSECOND.equals(precision)) {
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + precision
+                            + "' at 'updateKinesisStreamingConfiguration.approximateCreationDateTimePrecision' "
+                            + "failed to satisfy constraint: Member must satisfy enum value set: [MILLISECOND, MICROSECOND]");
+        }
+        KinesisDestination result = tableService.updateKinesisStreamingDestination(
+                tableName, streamArn, precision, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("TableName", result.tableName());
+        response.put("StreamArn", result.streamArn());
+        response.put("DestinationStatus", result.destinationStatus());
+        response.putObject("UpdateKinesisStreamingConfiguration")
+                .put("ApproximateCreationDateTimePrecision", result.approximateCreationDateTimePrecision());
+        return Response.ok(response).build();
+    }
+
+    private static String kinesisUpdateString(JsonNode request, String member, String path, int minimumLength) {
+        JsonNode value = request.path(member);
+        if (value.isMissingNode() || value.isNull()) {
+            throw SmithyValidationErrors.validationException(SmithyValidationErrors.notNull(path));
+        }
+        if (!value.isTextual()) {
+            throw new AwsException("SerializationException", member + " must be a string", 400);
+        }
+        String violation = SmithyValidationErrors.lengthOutOfRange(path, value.asText(), minimumLength, 1024);
+        if (violation != null) {
+            throw SmithyValidationErrors.validationException(violation);
+        }
+        return value.asText();
     }
 
     /**

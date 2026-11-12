@@ -18,6 +18,7 @@ import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.SmithyValidationErrors;
+import io.floci.aws.core.common.StripedLocks;
 import io.floci.aws.core.common.Totp;
 import io.floci.aws.core.resource.ExplorerResource;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
@@ -36,6 +37,7 @@ import io.floci.aws.services.dynamodb.model.IncrementalExportSpecification;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
 import io.floci.aws.services.dynamodb.model.PointInTimeChange;
+import io.floci.aws.services.dynamodb.model.ReplicaAutoScalingState;
 import io.floci.aws.services.dynamodb.model.StreamDescription;
 import io.floci.aws.services.dynamodb.model.TableBackup;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
@@ -115,6 +117,8 @@ public class DynamoDbService {
     static final String DEFAULT_STREAM_VIEW_TYPE = "NEW_AND_OLD_IMAGES";
 
     private final StorageBackend<String, TableDefinition> tableStore;
+    private final StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore;
+    private final StripedLocks tableControlLocks = new StripedLocks(256);
     private final StorageBackend<String, Map<String, JsonNode>> itemStore;
     private final StorageBackend<String, ExportDescription> exportStore;
     private final StorageBackend<String, ImportTableDescription> importStore;
@@ -194,7 +198,10 @@ public class DynamoDbService {
              regionResolver, streamService, kinesisForwarder, s3Service, objectMapper,
              config.services().dynamodb().vectorIndexAllocationSeconds(),
              config.services().dynamodb().vectorIndexBackfillSeconds(),
-             config.services().dynamodb().latestRestorableLagSeconds(), Clock.systemUTC());
+             config.services().dynamodb().latestRestorableLagSeconds(), Clock.systemUTC(),
+             command -> Thread.ofVirtual().start(command),
+             storageFactory.create("dynamodb", "dynamodb-replica-autoscaling.json",
+                     new TypeReference<Map<String, ReplicaAutoScalingState>>() {}));
     }
 
     /** The item store the configured {@code item-layout} selects; package-private for tests. */
@@ -218,6 +225,25 @@ public class DynamoDbService {
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore, RegionResolver regionResolver) {
         this(tableStore, null, null, null, regionResolver, null, null, null, null);
+    }
+
+    /** Explicit stores and collaborators for replica-settings deletion failure tests. */
+    DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
+                    StorageBackend<String, Map<String, JsonNode>> itemStore,
+                    RegionResolver regionResolver, DynamoDbStreamService streamService,
+                    KinesisStreamingForwarder kinesisForwarder,
+                    StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore) {
+        this(tableStore, itemStore, null, null, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                regionResolver, streamService, kinesisForwarder, null, null, 0, 0, 0, Clock.systemUTC(),
+                Runnable::run, replicaAutoScalingStore);
+    }
+
+    /** Explicit stores for replica-settings persistence and refused-write tests. */
+    DynamoDbService(StorageBackend<String, TableDefinition> tableStore, RegionResolver regionResolver,
+                    StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore) {
+        this(tableStore, null, null, null, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                regionResolver, null, null, null, null, 0, 0, 0, Clock.systemUTC(),
+                Runnable::run, replicaAutoScalingStore);
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
@@ -316,7 +342,30 @@ public class DynamoDbService {
                     int latestRestorableLagSeconds,
                     Clock clock,
                     Executor exportExecutor) {
+        this(tableStore, itemStore, exportStore, importStore, backupStore, pointInTimeStore, regionResolver,
+                streamService, kinesisForwarder, s3Service, objectMapper, vectorIndexAllocationSeconds,
+                vectorIndexBackfillSeconds, latestRestorableLagSeconds, clock, exportExecutor, new InMemoryStorage<>());
+    }
+
+    private DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
+                            StorageBackend<String, Map<String, JsonNode>> itemStore,
+                            StorageBackend<String, ExportDescription> exportStore,
+                            StorageBackend<String, ImportTableDescription> importStore,
+                            StorageBackend<String, TableBackup> backupStore,
+                            StorageBackend<String, PointInTimeChange> pointInTimeStore,
+                            RegionResolver regionResolver,
+                            DynamoDbStreamService streamService,
+                            KinesisStreamingForwarder kinesisForwarder,
+                            S3Service s3Service,
+                            ObjectMapper objectMapper,
+                            int vectorIndexAllocationSeconds,
+                            int vectorIndexBackfillSeconds,
+                            int latestRestorableLagSeconds,
+                            Clock clock,
+                            Executor exportExecutor,
+                            StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore) {
         this.tableStore = tableStore;
+        this.replicaAutoScalingStore = replicaAutoScalingStore;
         this.itemStore = itemStore;
         this.exportStore = exportStore;
         this.importStore = importStore;
@@ -946,6 +995,15 @@ public class DynamoDbService {
         tableStore.put(regionKey(region, canonicalTableName), table);
     }
 
+    Optional<ReplicaAutoScalingState> replicaAutoScalingState(TableDefinition table) {
+        return replicaAutoScalingStore.get(table.getTableArn())
+                .filter(state -> table.getTableId().equals(state.tableId()));
+    }
+
+    void persistReplicaAutoScalingState(TableDefinition table, ReplicaAutoScalingState state) {
+        replicaAutoScalingStore.putAllAtomically(Map.of(table.getTableArn(), state));
+    }
+
     /**
      * Turns on the table's stream and persists the result, so DescribeTable reports
      * StreamSpecification / LatestStreamArn and event source mappings can find the stream.
@@ -996,7 +1054,17 @@ public class DynamoDbService {
         return table;
     }
 
+    Object tableControlLock(String tableName, String region) {
+        return tableControlLocks.lockFor(scopedItemsKey(regionKey(region, canonicalTableName(region, tableName))));
+    }
+
     public void deleteTable(String tableName, String region) {
+        synchronized (tableControlLock(tableName, region)) {
+            deleteTableLocked(tableName, region);
+        }
+    }
+
+    private void deleteTableLocked(String tableName, String region) {
         String canonicalTableName = canonicalTableName(region, tableName);
         String storageKey = regionKey(region, canonicalTableName);
         TableDefinition table = tableStore.get(storageKey)
@@ -1026,6 +1094,11 @@ public class DynamoDbService {
         if (kinesisForwarder != null) {
             // Discard any buffered CDC records and stop draining: the destination stream is gone.
             kinesisForwarder.onTableDeleted(regionResolver.getAccountId(), region, canonicalTableName);
+        }
+        // Preserve the existing item/stream teardown even if the new settings file cannot be committed.
+        // A retained record belongs to the deleted TableId and cannot attach to a recreated table.
+        if (replicaAutoScalingStore.get(table.getTableArn()).isPresent()) {
+            replicaAutoScalingStore.deleteAllAtomically(Set.of(table.getTableArn()));
         }
         LOG.infov("Deleted table: {0}", canonicalTableName);
     }
