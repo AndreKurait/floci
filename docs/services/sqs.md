@@ -229,6 +229,8 @@ The region is the one the request was signed for, and the host carries that regi
 
 Under either setting every form is accepted as input. That covers the AWS URL, the Floci URL, any other host whose path ends in `/<account>/<queue-name>`, and the bare queue name. A queue is stored by account and name, so a base URL with a path of its own, such as `http://localhost:4566/sqs`, keeps the same queues under either setting. Existing queues, persisted ones included, are reported in the form the current setting and base URL give.
 
+Query clients such as Boto 2 can send signed `GET` requests to `/<account>/<queue-name>` (with an optional trailing slash), with `Action` and its parameters in the query string. The path supplies the queue URL for both authorization and dispatch. Header signatures and presigned requests are verified against the original URI. A Query request on `/queue/<region>/<account>/<queue-name>` returns `InvalidAddress` after signature verification. S3-signed object requests keep their S3 routing.
+
 ## Queue policies under IAM enforcement
 
 With `floci.services.iam.enforcement-enabled` on, a queue's `Policy` attribute, written by
