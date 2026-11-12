@@ -1,6 +1,7 @@
 package io.floci.aws.services.cognitoidentity;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.services.eks.EksOidcService;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.SignedIamEnforcementProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
@@ -50,6 +51,56 @@ class CognitoIdentityCredentialsIamIntegrationTest {
     private static final AwsCredentialsProvider ROOT = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
     @TestHTTPResource URI endpoint;
     @Inject IamService iamService;
+    @Inject EksOidcService oidc;
+
+    @Test
+    void mixedTrustRoutesOtherOidcTokensThroughSignatureAndTrustVerification() {
+        String name = "mixed-oidc-" + UUID.randomUUID();
+        String issuer = oidc.newIssuerUrl("us-east-1");
+        String issuerKey = issuer.substring(8);
+        String providerArn = "arn:aws:iam::" + ACCOUNT + ":oidc-provider/" + issuerKey;
+        String policy = "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\""
+                + PRINCIPAL + "\"},\"Action\":\"sts:AssumeRoleWithWebIdentity\"},"
+                + "{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\"" + providerArn
+                + "\"},\"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{\"StringEquals\":{\""
+                + issuerKey + ":sub\":\"system:serviceaccount:default:app\"}}}]}";
+        List<String> sessions = new ArrayList<>();
+        try (IamClient admin = iam(ROOT); StsClient sts = sts(AnonymousCredentialsProvider.create())) {
+            String roleArn = admin.createRole(r -> r.roleName(name).assumeRolePolicyDocument(policy)).role().arn();
+            try {
+                String token = oidc.mintServiceAccountToken(name, issuer, "default", "app", "sts.amazonaws.com", 3600);
+                AssumeRoleWithWebIdentityResponse response = sts.assumeRoleWithWebIdentity(r -> r.roleArn(roleArn)
+                        .roleSessionName("mixed").webIdentityToken(token));
+                sessions.add(response.credentials().accessKeyId());
+                assertEquals(issuer, response.provider());
+                assertEquals("system:serviceaccount:default:app", response.subjectFromWebIdentityToken());
+                String[] parts = token.split("\\.");
+                String damaged = parts[0] + "." + parts[1] + ".invalid";
+                StsException invalid = assertThrows(StsException.class, () -> recordMixedSession(sts, roleArn, damaged, sessions));
+                assertEquals("InvalidIdentityToken", invalid.awsErrorDetails().errorCode());
+                String denied = oidc.mintServiceAccountToken(name, issuer, "default", "other", "sts.amazonaws.com", 3600);
+                StsException untrusted = assertThrows(StsException.class, () -> recordMixedSession(sts, roleArn, denied, sessions));
+                assertEquals("AccessDenied", untrusted.awsErrorDetails().errorCode());
+                StsException opaque = assertThrows(StsException.class,
+                        () -> recordMixedSession(sts, roleArn, "stripped-of-all-jwt-fields", sessions));
+                assertEquals("InvalidIdentityToken", opaque.awsErrorDetails().errorCode());
+            } finally {
+                for (String accessKey : sessions) {
+                    iamService.unregisterSession(ACCOUNT, accessKey);
+                    assertTrue(iamService.resolveCallerArns(accessKey).isEmpty());
+                }
+                oidc.deleteKey(name);
+                assertTrue(oidc.findKeyByCluster(name).isEmpty());
+                admin.deleteRole(r -> r.roleName(name));
+            }
+        }
+    }
+
+    private void recordMixedSession(StsClient sts, String roleArn, String token, List<String> sessions) {
+        AssumeRoleWithWebIdentityResponse response = sts.assumeRoleWithWebIdentity(r -> r.roleArn(roleArn)
+                .roleSessionName("mixed-check").webIdentityToken(token));
+        sessions.add(response.credentials().accessKeyId());
+    }
 
     @Test
     void guestScopeDownClassicPermissionsSessionTokenAndTrustDenyAreEnforcedOnSignedRequests() throws Exception {
