@@ -79,6 +79,49 @@ public class AthenaBatchQueryService {
         return List.copyOf(targets.values());
     }
 
+    /** Direct query actions resolve their stored workgroup without migrating rows before IAM decides. */
+    public List<AuthorizationTarget> authorizationTargets(String action, String region, String account, JsonNode request) {
+        if ("athena:BatchGetQueryExecution".equals(action)) {
+            return authorizationTargets(region, account, request);
+        }
+        String group;
+        if ("athena:ListQueryExecutions".equals(action)) {
+            JsonNode name = request == null ? null : request.get("WorkGroup");
+            if (name != null && !name.isNull() && !name.isTextual()) {
+                throw invalid("WorkGroup must be a string.");
+            }
+            group = name == null || name.isNull() ? "primary" : name.textValue();
+            AthenaService.validateWorkGroupName(group);
+        } else {
+            QueryExecution execution = athenaService.findBatchQueryExecutionForAuthorization(
+                    region, directIdentifier(request));
+            if (execution == null) {
+                return List.of();
+            }
+            group = Objects.requireNonNullElse(execution.getWorkGroup(), "primary");
+        }
+        String resource = regionResolver.buildArn("athena", region, account, "workgroup/" + group);
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        for (WorkGroupTag tag : athenaService.batchWorkGroupTags(region, group)) {
+            if (tag.getKey() != null && tag.getValue() != null) {
+                context.put("aws:ResourceTag/" + tag.getKey(), List.of(tag.getValue()));
+            }
+        }
+        return List.of(new AuthorizationTarget(resource, Map.copyOf(context)));
+    }
+
+    static String directIdentifier(JsonNode request) {
+        JsonNode value = request == null ? null : request.get("QueryExecutionId");
+        if (value == null || !value.isTextual()) {
+            throw invalid("QueryExecutionId must be a string.");
+        }
+        String id = value.textValue();
+        if (id.codePointCount(0, id.length()) > 128 || !IDENTIFIER.matcher(id).matches()) {
+            throw invalid("QueryExecutionId must contain 1 to 128 non-whitespace characters.");
+        }
+        return id;
+    }
+
     static List<String> identifiers(JsonNode request) {
         JsonNode values = request == null ? null : request.get("QueryExecutionIds");
         if (values == null || !values.isArray() || values.isEmpty() || values.size() > 50) {
