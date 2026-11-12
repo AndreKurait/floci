@@ -87,7 +87,7 @@ Resolver rules steer the DNS resolution Floci performs for containers wired to i
 server, which is how cluster containers resolve (see
 [Route 53](route53.md#private-hosted-zone-dns-resolution)). What each rule type does:
 
-- **`FORWARD`** sends a matching query to the rule's `TargetIps` over UDP, each target on its own
+- **`FORWARD`** sends a matching query to the rule's `TargetIps` using the client's UDP or TCP transport, each target on its own
   `Port` (default 53), in a random order with the next target tried when one does not answer, as in
   AWS. Only IPv4 targets are used, and a rule left with no usable target is ignored.
 - **`SYSTEM`** carries no targets and hands the query back to Floci's own resolution, which is how
