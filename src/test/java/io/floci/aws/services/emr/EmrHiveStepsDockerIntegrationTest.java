@@ -3,6 +3,9 @@ package io.floci.aws.services.emr;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.emrserverless.EmrServerlessSparkRunner;
+import io.floci.aws.services.emrserverless.SparkJobRunner;
 import io.floci.aws.testing.AwsTestClients;
 import io.floci.aws.testing.ContainerDataPlaneProfile;
 import io.floci.aws.testing.DockerAvailability;
@@ -59,6 +62,12 @@ class EmrHiveStepsDockerIntegrationTest {
     @Inject
     EmrService emrService;
 
+    @Inject
+    EmrReleaseImages releaseImages;
+
+    @Inject
+    EmulatorConfig config;
+
     private S3Client s3;
     private String bucket;
     private String clusterId;
@@ -71,6 +80,12 @@ class EmrHiveStepsDockerIntegrationTest {
     @BeforeEach
     void putInputs() throws InterruptedException {
         assumeTrue(DockerAvailability.isAvailable(), "Docker daemon must be available for EMR's Hive steps");
+        // Compose the shared release image during setup, outside each step scenario's deadline.
+        EmulatorConfig.EmrServiceConfig emrConfig = config.services().emr();
+        releaseImages.image("emr-7.5.0",
+                EmrServerlessSparkRunner.image(emrConfig.imageTemplate().orElse(null), "emr-7.5.0"),
+                EmrServerlessSparkRunner.image(emrConfig.hiveImageTemplate().orElse(null), "emr-7.5.0",
+                        SparkJobRunner.Engine.HIVE), true);
         s3 = AwsTestClients.create(S3Client.builder().forcePathStyle(true), "000000000000", Region.US_EAST_1);
         cleanup.register(s3::close);
         bucket = "emr-hive-" + UUID.randomUUID().toString().substring(0, 8);
