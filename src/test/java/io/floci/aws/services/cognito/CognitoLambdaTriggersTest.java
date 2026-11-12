@@ -2095,6 +2095,89 @@ class CognitoLambdaTriggersTest {
     }
 
     @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void customAuthNamedDefineChallengeAcceptsCustomChallengeResponse(boolean configureCreate) throws Exception {
+        Map<String, Object> config = new HashMap<>(Map.of(
+                "DefineAuthChallenge", "arn:aws:lambda:::define",
+                "VerifyAuthChallengeResponse", "arn:aws:lambda:::verify"));
+        if (configureCreate) {
+            config.put("CreateAuthChallenge", "arn:aws:lambda:::create");
+            when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::create"), any(byte[].class), any()))
+                    .thenReturn(ok(Map.of()));
+        }
+        UserPool pool = createPoolWithLambdaConfig(config);
+        seedUser(pool, "alice", "Perm1234!");
+        UserPoolClient client = createClient(pool);
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::define"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("challengeName", "MY_CHALLENGE")))
+                .thenReturn(ok(Map.of("issueTokens", true)));
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::verify"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("answerCorrect", true)));
+
+        Map<String, Object> started = service.initiateAuth(client.getClientId(), "CUSTOM_AUTH",
+                Map.of("USERNAME", "alice"));
+        assertEquals("MY_CHALLENGE", started.get("ChallengeName"));
+        assertEquals(Map.of("USERNAME", "alice"), started.get("ChallengeParameters"));
+        assertFalse(((String) started.get("Session")).isBlank());
+        Map<String, Object> completed = service.respondToAuthChallenge(client.getClientId(),
+                "CUSTOM_CHALLENGE", (String) started.get("Session"), Map.of("USERNAME", "alice", "ANSWER", "blue"));
+        assertTrue(completed.containsKey("AuthenticationResult"));
+        ArgumentCaptor<byte[]> payload = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService).invoke(anyString(), eq("arn:aws:lambda:::verify"), payload.capture(), any());
+        JsonNode request = MAPPER.readTree(payload.getValue()).path("request");
+        assertEquals("blue", request.path("challengeAnswer").asText());
+        assertEquals(MAPPER.createObjectNode(), request.path("privateChallengeParameters"));
+        verify(lambdaService, times(configureCreate ? 1 : 0))
+                .invoke(anyString(), eq("arn:aws:lambda:::create"), any(byte[].class), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void customAuthNamedDefineChallengeCanRetryWrongAnswer(boolean configureCreate) throws Exception {
+        Map<String, Object> config = new HashMap<>(Map.of(
+                "DefineAuthChallenge", "arn:aws:lambda:::define",
+                "VerifyAuthChallengeResponse", "arn:aws:lambda:::verify"));
+        if (configureCreate) {
+            config.put("CreateAuthChallenge", "arn:aws:lambda:::create");
+            when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::create"), any(byte[].class), any()))
+                    .thenReturn(ok(Map.of()));
+        }
+        UserPool pool = createPoolWithLambdaConfig(config);
+        seedUser(pool, "alice", "Perm1234!");
+        UserPoolClient client = createClient(pool);
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::define"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("challengeName", "MY_CHALLENGE")))
+                .thenReturn(ok(Map.of("challengeName", "MY_CHALLENGE")))
+                .thenReturn(ok(Map.of("issueTokens", true)));
+        when(lambdaService.invoke(anyString(), eq("arn:aws:lambda:::verify"), any(byte[].class), any()))
+                .thenReturn(ok(Map.of("answerCorrect", false)))
+                .thenReturn(ok(Map.of("answerCorrect", true)));
+
+        Map<String, Object> started = service.initiateAuth(client.getClientId(), "CUSTOM_AUTH",
+                Map.of("USERNAME", "alice"));
+        assertEquals("MY_CHALLENGE", started.get("ChallengeName"));
+        assertEquals(Map.of("USERNAME", "alice"), started.get("ChallengeParameters"));
+        assertFalse(((String) started.get("Session")).isBlank());
+        Map<String, Object> retry = service.respondToAuthChallenge(client.getClientId(),
+                "CUSTOM_CHALLENGE", (String) started.get("Session"), Map.of("USERNAME", "alice", "ANSWER", "wrong"));
+        assertEquals("MY_CHALLENGE", retry.get("ChallengeName"));
+        assertFalse(retry.containsKey("AuthenticationResult"));
+        assertNotEquals(started.get("Session"), retry.get("Session"));
+        assertThrows(AwsException.class, () -> service.respondToAuthChallenge(client.getClientId(),
+                "CUSTOM_CHALLENGE", (String) started.get("Session"), Map.of("USERNAME", "alice", "ANSWER", "blue")));
+        Map<String, Object> completed = service.respondToAuthChallenge(client.getClientId(),
+                "CUSTOM_CHALLENGE", (String) retry.get("Session"), Map.of("USERNAME", "alice", "ANSWER", "blue"));
+        assertTrue(completed.containsKey("AuthenticationResult"));
+        ArgumentCaptor<byte[]> payload = ArgumentCaptor.forClass(byte[].class);
+        verify(lambdaService, times(2)).invoke(anyString(), eq("arn:aws:lambda:::verify"), payload.capture(), any());
+        JsonNode request = MAPPER.readTree(payload.getValue()).path("request");
+        assertEquals("blue", request.path("challengeAnswer").asText());
+        assertEquals(MAPPER.createObjectNode(), request.path("privateChallengeParameters"));
+        verify(lambdaService, times(configureCreate ? 2 : 0))
+                .invoke(anyString(), eq("arn:aws:lambda:::create"), any(byte[].class), any());
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"lambdaError", "malformed", "invocation"})
     void configuredCreateAuthChallengeFailuresRemainErrors(String failure) {
         UserPool pool = createPoolWithLambdaConfig(Map.of(
