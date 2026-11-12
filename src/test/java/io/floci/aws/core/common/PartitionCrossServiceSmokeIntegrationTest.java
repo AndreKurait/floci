@@ -922,6 +922,25 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     @ParameterizedTest
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void backupFrameworkArnAndDefinition(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "backup");
+        String name = unique("Framework", partitionCase).replace("-", "_");
+        String body = "{\"FrameworkName\":\"" + name + "\",\"FrameworkControls\":["
+                + "{\"ControlName\":\"BACKUP_RECOVERY_POINT_ENCRYPTED\"}]}";
+        String arn = signed(region, "backup").contentType(JSON).body(body)
+                .when().post("/audit/frameworks").then().statusCode(200)
+                .extract().jsonPath().getString("FrameworkArn");
+        cleanup.register(() -> signed(region, "backup").when().delete("/audit/frameworks/" + name));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
+        Response described = signed(region, "backup").when().get("/audit/frameworks/" + name)
+                .then().statusCode(200).extract().response();
+        assertEquals(arn, described.jsonPath().getString("FrameworkArn"));
+        assertEquals("UNAVAILABLE", described.jsonPath().getString("FrameworkStatus"));
+        assertEquals("BACKUP_RECOVERY_POINT_ENCRYPTED", described.jsonPath().getString("FrameworkControls[0].ControlName"));
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void backupVaultArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "backup");
         String name = unique("smoke-vault", partitionCase);

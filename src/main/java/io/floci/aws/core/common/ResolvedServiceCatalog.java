@@ -12,6 +12,7 @@ import io.floci.aws.services.appsync.AppSyncController;
 import io.floci.aws.services.appsync.graphql.AppSyncExecutionController;
 import io.floci.aws.services.aps.ApsController;
 import io.floci.aws.services.backup.BackupController;
+import io.floci.aws.services.backup.BackupFrameworkController;
 import io.floci.aws.services.batch.BatchController;
 import io.floci.aws.services.bedrock.BedrockController;
 import io.floci.aws.services.bedrockagentcore.BedrockAgentCoreController;
@@ -628,7 +629,7 @@ public class ResolvedServiceCatalog {
                         "backup", storageMode(config.storage().services().backup().mode(), config.storage().mode()),
                         config.storage().services().backup().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class)),
+                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class, BackupFrameworkController.class)),
                 descriptor("resource-explorer-2", "resourceexplorer2",
                         config.services().resourceexplorer2().enabled(), true,
                         "resourceexplorer2",

@@ -64,6 +64,9 @@ public class BackupService {
     private final StorageBackend<String, String>          accessPolicyStore;
     private final StorageBackend<String, BackupVaultNotifications> notificationStore;
 
+    @Inject
+    BackupFrameworkService frameworkService;
+
     private final RegionResolver regionResolver;
     private final SnsService snsService;
     private final int jobCompletionDelaySeconds;
@@ -892,14 +895,25 @@ public class BackupService {
     // ── Tags ───────────────────────────────────────────────────────────────────
 
     public Map<String, String> listTags(String resourceArn) {
+        if (frameworkService != null && BackupFrameworkService.isFrameworkArn(resourceArn)) {
+            return frameworkService.listTags(regionResolver.getRegion(), resourceArn);
+        }
         return findTagsByArn(resourceArn);
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags) {
+        if (frameworkService != null && BackupFrameworkService.isFrameworkArn(resourceArn)) {
+            frameworkService.tag(regionResolver.getRegion(), resourceArn, tags);
+            return;
+        }
         applyTags(resourceArn, tags);
     }
 
     public void untagResource(String resourceArn, List<String> tagKeys) {
+        if (frameworkService != null && BackupFrameworkService.isFrameworkArn(resourceArn)) {
+            frameworkService.untag(regionResolver.getRegion(), resourceArn, tagKeys);
+            return;
+        }
         removeTags(resourceArn, tagKeys);
     }
 
