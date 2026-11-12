@@ -56,6 +56,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 import static io.github.hectorvent.floci.services.elbv2.ElbV2PublicationTestSupport.allowPublications;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -476,6 +477,22 @@ class ElbV2ServiceTest {
         AwsException refusal = assertThrows(AwsException.class, () -> service.createLoadBalancer(REGION,
                 "taken", "internal", "application", "ipv4", List.of(), List.of(), Map.of()));
         assertEquals("DuplicateLoadBalancerName", refusal.getErrorCode());
+    }
+
+    @Test
+    void repeatedCreateReturnsThePersistedLoadBalancer(@TempDir Path directory) {
+        ElbV2Service first = serviceWithStorage(new PersistentStorageFactory(directory), dataPlane, healthChecker);
+        LoadBalancer original = first.createLoadBalancer(REGION, "persisted-retry", "internal", "application",
+                "ipv4", ALB_SUBNETS, List.of("sg-a"), Map.of("owner", "retry"));
+        ElbV2Service restored = serviceWithStorage(new PersistentStorageFactory(directory), dataPlane, healthChecker);
+
+        LoadBalancer repeated = assertDoesNotThrow(() -> restored.createLoadBalancer(REGION, "persisted-retry",
+                "internal", "application", "ipv4", ALB_SUBNETS, List.of("sg-a"), Map.of("owner", "retry")));
+
+        assertEquals(original.getLoadBalancerArn(), repeated.getLoadBalancerArn());
+        assertEquals(original.getDnsName(), repeated.getDnsName());
+        assertEquals(original.getCreatedTime(), repeated.getCreatedTime());
+        assertEquals(1, restored.describeLoadBalancers(REGION, null, List.of("persisted-retry"), null, null).size());
     }
 
     @ParameterizedTest

@@ -131,6 +131,11 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 
 ## Behavior Notes
 
+- `CreateLoadBalancer` retries with the same name, type, scheme, IP address type, subnets,
+  security groups and tags return the existing load balancer without resetting its listeners
+  or attributes. Omitted defaults and reordered subnet, security-group and tag collections
+  describe the same configuration. A name used with different settings returns
+  `DuplicateLoadBalancerName`.
 - `DescribeLoadBalancers`, `DescribeTargetGroups`, `DescribeListeners`, `DescribeRules`,
   `DescribeAccountLimits` and `DescribeListenerCertificates` return their complete matching
   results without a `NextMarker`. These handlers do not yet split results using `PageSize`

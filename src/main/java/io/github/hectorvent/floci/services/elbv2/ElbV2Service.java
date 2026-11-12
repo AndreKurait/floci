@@ -421,17 +421,29 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                                            List<String> subnets, List<String> securityGroups,
                                                            Map<String, String> initialTags) {
         validateName(name, "load balancer");
+        String lbType = type != null ? type : "application";
+        String lbScheme = scheme != null ? scheme : "internet-facing";
+        String ipType = ipAddressType != null ? ipAddressType : "ipv4";
         Map<String, LoadBalancer> regionLbs = loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
-        boolean duplicate = regionLbs.values().stream()
-                .anyMatch(lb -> lb.getLoadBalancerName().equals(name));
-        if (duplicate) {
+        LoadBalancer existing = regionLbs.values().stream()
+                .filter(lb -> lb.getLoadBalancerName().equals(name)).findFirst().orElse(null);
+        if (existing != null) {
+            // CreateLoadBalancer is idempotent for the same settings. Returning the stored
+            // resource also preserves its listeners, attributes, creation time and DNS name.
+            if (lbType.equals(existing.getType()) && lbScheme.equals(existing.getScheme())
+                    && ipType.equals(existing.getIpAddressType())
+                    && new HashSet<>(subnets != null ? subnets : List.of()).equals(
+                            existing.getAvailabilityZones().stream().map(AvailabilityZone::getSubnetId)
+                                    .collect(Collectors.toSet()))
+                    && new HashSet<>(securityGroups != null ? securityGroups : List.of()).equals(
+                            new HashSet<>(existing.getSecurityGroups()))
+                    && initialTags.equals(tags.getOrDefault(existing.getLoadBalancerArn(), Map.of()))) {
+                return existing;
+            }
             throw new AwsException("DuplicateLoadBalancerName",
                     "A load balancer with name '" + name + "' already exists.", 400);
         }
 
-        String lbType = type != null ? type : "application";
-        String lbScheme = scheme != null ? scheme : "internet-facing";
-        String ipType = ipAddressType != null ? ipAddressType : "ipv4";
         String typePrefix = lbTypePrefix(lbType);
         String id = randomHex16();
         String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();

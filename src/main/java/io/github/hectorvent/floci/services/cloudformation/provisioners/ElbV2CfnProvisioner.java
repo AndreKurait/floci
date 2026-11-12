@@ -201,7 +201,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             lb = elbV2Service.createLoadBalancer(ctx.region(), name, scheme, type, ipAddressType,
                     subnets, securityGroups, tags);
             onSubnets = subnetIds(lb);
-            created = true;
+            created = !ctx.reusesPriorEntity(lb.getLoadBalancerArn());
         } catch (AwsException e) {
             if (!"DuplicateLoadBalancerName".equals(e.getErrorCode())) {
                 throw e;
