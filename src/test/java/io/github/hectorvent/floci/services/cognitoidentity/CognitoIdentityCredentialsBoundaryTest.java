@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cognitoidentity;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.cognitoidentity.model.CognitoIdentity;
@@ -20,6 +21,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -69,6 +71,23 @@ class CognitoIdentityCredentialsBoundaryTest {
                 eq(Map.of("aud", List.of(POOL), "sub", List.of(IDENTITY), "amr", List.of("unauthenticated"))));
         assertTrue(credentials.recognizes("stripped-of-all-jwt-fields", foreignArn),
                 "A Cognito role cannot fall through to the unrelated permissive legacy STS path");
+    }
+
+    @Test
+    void tokenIdentitySelectsTheVerifierBeforeRoleTrust() {
+        String roleArn = "arn:aws:iam::" + ACCOUNT + ":role/mixed";
+        IamRole role = new IamRole("AROAEXAMPLE", "mixed", "/", roleArn, trust(true));
+        String external = Base64Url.encode("{\"alg\":\"RS256\"}") + "."
+                + Base64Url.encode("{\"iss\":\"https://login.example.test\",\"sub\":\"app\"}") + ".signature";
+        assertFalse(credentials.recognizes(external, roleArn));
+        verifyNoInteractions(iam);
+        when(iam.findRole(ACCOUNT, "mixed")).thenReturn(Optional.of(role));
+        assertTrue(credentials.recognizes("stripped-of-all-jwt-fields", roleArn));
+        String damaged = Base64Url.encode("{\"kid\":\"cognito-missing\"}") + "."
+                + Base64Url.encode("{\"iss\":\"https://login.example.test\"}") + ".invalid";
+        assertTrue(credentials.recognizes(damaged, roleArn));
+        assertEquals("InvalidIdentityToken", assertThrows(AwsException.class,
+                () -> credentials.assumeRole(damaged, roleArn, "damaged", 3600, null, 0)).getErrorCode());
     }
 
     @Test
