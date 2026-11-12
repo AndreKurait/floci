@@ -354,7 +354,7 @@ class CognitoIdentityIntegrationTest {
     @Test
     @Order(14)
     void unimplementedOperationReturnsUnknownOperation() {
-        action("GetCredentialsForIdentity")
+        action("MergeDeveloperIdentities")
             .body("{\"IdentityId\": \"us-east-1:00000000-0000-0000-0000-000000000000\"}")
         .when()
             .post("/")
