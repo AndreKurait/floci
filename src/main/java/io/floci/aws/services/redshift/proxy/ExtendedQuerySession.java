@@ -92,6 +92,16 @@ final class ExtendedQuerySession {
         // pointing at a statement that no longer exists, the same cleanup stageClose('S', ...) does.
         portals.entrySet().removeIf(entry -> !statements.containsKey(entry.getValue().statementName()));
 
+        // Later rollbacks must not restore a binding this rejection has invalidated.
+        for (int i = rejectedIndex + 1; i < journal.size(); i++) {
+            JournalEntry entry = journal.get(i);
+            Map<String, BoundPortal> portalsBefore = new LinkedHashMap<>(entry.portalsBefore());
+            Map<String, BoundPortal> portalsAfter = new LinkedHashMap<>(entry.portalsAfter());
+            revertUnchangedSince(portalsBefore, rejected.portalsBefore(), rejected.portalsAfter());
+            revertUnchangedSince(portalsAfter, rejected.portalsBefore(), rejected.portalsAfter());
+            journal.set(i, new JournalEntry(entry.mutation(), entry.statementsBefore(), portalsBefore,
+                    entry.statementsAfter(), portalsAfter));
+        }
         journal.remove(rejectedIndex);
     }
 
