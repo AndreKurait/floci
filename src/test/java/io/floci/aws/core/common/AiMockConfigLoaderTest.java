@@ -8,6 +8,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -106,15 +107,18 @@ class AiMockConfigLoaderTest {
     }
 
     @Test
-    void reloadsFileWhenModified() throws IOException, InterruptedException {
+    void reloadsFileWhenModified() throws IOException {
         Path file = tempDir.resolve("ai-mock-config.json");
         Files.writeString(file, CONFIG);
         AiMockConfigLoader loader = new AiMockConfigLoader(Optional.of(file.toString()), new ObjectMapper());
         assertTrue(loader.lookup("comprehend", "I love this", "DetectSentiment").isPresent());
         assertFalse(loader.lookup("comprehend", "I hate this", "DetectSentiment").isPresent());
 
-        Thread.sleep(1100);
+        // The loader notices a change by the file's modification time, so the rewrite is given a
+        // later one explicitly instead of waiting for the file system's clock to tick.
+        FileTime loaded = Files.getLastModifiedTime(file);
         Files.writeString(file, CONFIG.replace("I love this", "I hate this"));
+        Files.setLastModifiedTime(file, FileTime.fromMillis(loaded.toMillis() + 1_000));
         assertTrue(loader.lookup("comprehend", "I hate this", "DetectSentiment").isPresent());
         assertFalse(loader.lookup("comprehend", "I love this", "DetectSentiment").isPresent());
     }
