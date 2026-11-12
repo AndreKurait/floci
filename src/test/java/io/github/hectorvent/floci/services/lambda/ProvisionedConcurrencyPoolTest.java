@@ -888,12 +888,14 @@ class ProvisionedConcurrencyPoolTest {
         launcher.stopFailures.set(1);
 
         assertTrue(pool.release(first.handle, false));
-        assertTrue(first.alive);
-        assertEquals(1, first.stops.get());
         assertThrows(AwsException.class, this::get);
 
+        // Release queues its own retry, which can complete before this thread observes the failed stop.
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !first.alive);
+        assertEquals(2, first.stops.get());
+
         pool.reconcileSafely();
-        assertFalse(first.alive);
         assertEquals(2, first.stops.get());
     }
 
