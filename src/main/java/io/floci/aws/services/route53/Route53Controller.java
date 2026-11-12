@@ -46,6 +46,31 @@ public class Route53Controller {
     @Inject
     Route53Service service;
 
+    @GET
+    @Path("/testdnsanswer")
+    public Response testDnsAnswer(@QueryParam("hostedzoneid") String hostedZoneId,
+                                  @QueryParam("recordname") String recordName,
+                                  @QueryParam("recordtype") String recordType,
+                                  @QueryParam("resolverip") String resolverIp,
+                                  @QueryParam("edns0clientsubnetip") String subnetIp,
+                                  @QueryParam("edns0clientsubnetmask") String subnetMask) {
+        try {
+            Route53Service.TestDnsAnswerResult answer = service.testDnsAnswer(hostedZoneId, recordName, recordType,
+                    resolverIp, subnetIp, subnetMask);
+            XmlBuilder xml = new XmlBuilder().start("TestDNSAnswerResponse", NS)
+                    .elem("Nameserver", answer.nameserver()).elem("Protocol", answer.protocol())
+                    .elem("RecordName", answer.recordName()).elem("RecordType", answer.recordType())
+                    .elem("ResponseCode", answer.responseCode()).start("RecordData");
+            for (String value : answer.recordData()) {
+                xml.elem("RecordDataEntry", value);
+            }
+            xml.end("RecordData").end("TestDNSAnswerResponse");
+            return Response.ok(xml.build(), XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
     @POST
     @Path("/delegationset")
     public Response createReusableDelegationSet(String body) {
