@@ -79,8 +79,9 @@ jobs:
       - name: Start floci
         run: |
           DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+          # The suite's JWT authorizer test serves its issuer over http on a private address.
           docker run -d --name floci --network compat-net \
-            -p 4566:4566 \
+            -p 127.0.0.1:4566:4566 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --group-add "$DOCKER_GID" \
             -e FLOCI_DEFAULT_REGION="$REGION" \
@@ -90,6 +91,7 @@ jobs:
             -e FLOCI_SERVICES_IOT_MQTT_ENABLED=true \
             -e FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED=true \
             -e FLOCI_TLS_ENABLED=true \
+            -e FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=true \
             -e FLOCI_SERVICES_EC2_MOCK=true \
             -e FLOCI_SERVICES_REDSHIFT_ENDPOINT_HOST=floci \
             -e FLOCI_SERVICES_RDS_ENDPOINT_HOST=floci \
