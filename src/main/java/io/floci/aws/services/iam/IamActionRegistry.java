@@ -9,6 +9,7 @@ import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
 import io.floci.aws.services.eks.EksController;
+import io.floci.aws.services.lambda.LambdaRuntimeManagementController;
 import io.floci.aws.services.s3.S3BucketSubresources;
 import io.floci.aws.services.s3.S3ObjectActions;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -583,6 +584,15 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("lambda".equals(credentialScope) && resourceInfo != null
+                && LambdaRuntimeManagementController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return switch (resourceInfo.getResourceMethod().getName()) {
+                case "getRuntimeManagementConfig" -> "lambda:GetRuntimeManagementConfig";
+                case "putRuntimeManagementConfig" -> "lambda:PutRuntimeManagementConfig";
+                default -> null;
+            };
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
