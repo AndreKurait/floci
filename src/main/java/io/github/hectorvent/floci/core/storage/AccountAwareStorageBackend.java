@@ -125,6 +125,21 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public void applyAtomically(Map<String, V> entries, Set<String> keys) {
+        applyAtomicallyForAccount(prefix(), entries, keys);
+    }
+
+    public void applyAtomicallyForAccount(String accountId, Map<String, V> entries, Set<String> keys) {
+        Map<String, V> replacements = Map.copyOf(entries);
+        Set<String> deletions = Set.copyOf(keys);
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        replacements.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
+        Set<String> prefixedKeys = deletions.stream().map(key -> accountId + "/" + key).collect(Collectors.toSet());
+        delegate.applyAtomically(prefixedEntries, prefixedKeys);
+        trackOwner(accountId);
+    }
+
+    @Override
     public Optional<V> get(String key) {
         String prefixedKey = prefixed(key);
         Optional<V> result = delegate.get(prefixedKey);
