@@ -240,7 +240,7 @@ public class ResourceArnBuilder {
             case "ec2"            -> Ec2ResourceArns.of(operation, ctx, region, accountId, partition,
                     ec2Service != null && ec2Service.isResolvable() ? ec2Service.get() : null);
             case "lambda"         -> List.of(buildLambdaArn(path, ctx, region, accountId));
-            case "sqs"            -> List.of(buildSqsArn(ctx, region, accountId));
+            case "sqs"            -> List.of(buildSqsArn(operation, ctx, region, accountId));
             case "sns"            -> List.of(buildSnsArn(ctx, region, accountId));
             // ListTables authorizes the regional collection, regardless of request-body selectors.
             case "dynamodb"       -> "dynamodb:ListTables".equals(operation)
@@ -1596,14 +1596,25 @@ public class ResourceArnBuilder {
     }
 
     // ── SQS ─────────────────────────────────────────────────────────────────────
-    private String buildSqsArn(ContainerRequestContext ctx, String region, String accountId) {
+    private String buildSqsArn(String operation, ContainerRequestContext ctx, String region, String accountId) {
+        if ("sqs:GetQueueUrl".equals(operation) || "sqs:CreateQueue".equals(operation)) {
+            // These handlers select by name, even if an unrelated QueueUrl was sent.
+            // QueueOwnerAWSAccountId is not consumed by either handler.
+            String queueName = firstFormParam(ctx, "QueueName");
+            JsonNode json = readJsonBody(ctx);
+            if (json != null && json.isObject()) {
+                queueName = json.path("QueueName").asText(null);
+            }
+            return AwsArnUtils.Arn.of("sqs", region, accountId,
+                    queueName == null || queueName.isEmpty() ? "*" : queueName).toString();
+        }
         String queueUrl = firstFormParam(ctx, "QueueUrl");
         if (queueUrl == null) {
             JsonNode json = readJsonBody(ctx);
             if (json != null && json.isObject()) {
                 if (json.hasNonNull("QueueUrl")) {
                     queueUrl = json.get("QueueUrl").asText().trim();
-                } else if (json.hasNonNull("QueueName")) {
+                } else if (operation == null && json.hasNonNull("QueueName")) {
                     String queueName = json.get("QueueName").asText().trim();
                     if (!queueName.isEmpty()) {
                         return AwsArnUtils.Arn.of("sqs", region, accountId, queueName).toString();
