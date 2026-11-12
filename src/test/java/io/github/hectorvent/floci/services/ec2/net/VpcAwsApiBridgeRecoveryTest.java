@@ -91,6 +91,38 @@ class VpcAwsApiBridgeRecoveryTest {
         verifyNoInteractions(lifecycle);
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {0, -1, 65536, 4566})
+    void nativeHttpsRejectsInvalidOrPrimaryPortsBeforeDocker(int port) {
+        when(config.port()).thenReturn(4566);
+        when(config.tls().enabled()).thenReturn(true);
+        when(config.tls().awsHttpsPort()).thenReturn(port);
+        when(config.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(true);
+        assertThrows(IllegalStateException.class, () -> bridge.ensure("public-network"));
+        verifyNoInteractions(docker, lifecycle, containers);
+    }
+
+    @Test
+    void nativeHttpsRequiresTlsBeforeDocker() {
+        when(config.tls().awsHttpsPort()).thenReturn(443);
+        when(config.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(true);
+        assertThrows(IllegalStateException.class, () -> bridge.ensure("public-network"));
+        verifyNoInteractions(docker, lifecycle, containers);
+    }
+
+    @Test
+    void nativeHttpsResolvesCurrentEmulatorEvenWithAnExplicitHttpFrontDoor() {
+        when(config.port()).thenReturn(4566);
+        when(config.tls().enabled()).thenReturn(true);
+        when(config.tls().awsHttpsPort()).thenReturn(443);
+        when(config.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost()).thenReturn(Optional.of("172.18.0.3"));
+        when(config.network().vpcRouting().publicAwsApiUpstreamHttpPort()).thenReturn(80);
+        when(listed.exec()).thenReturn(List.of());
+        assertSame(allocation, assertThrows(IllegalStateException.class, () -> bridge.ensure("public-network")));
+        verify(endpoint).baseUrl(false);
+    }
+
     private String owner() {
         return ContainerStorageHelper.ownerIdentity(config);
     }

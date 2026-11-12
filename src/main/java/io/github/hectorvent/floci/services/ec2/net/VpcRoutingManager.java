@@ -8,6 +8,7 @@ import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.PublicApiProxySources;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RequestScopes;
@@ -71,7 +72,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     public VpcRoutingManager(EmulatorConfig config, Ec2Service ec2, VpcNetworkManager vpcs,
                              DockerClient docker, ContainerBuilder containers,
                              ContainerLifecycleManager lifecycle, ObjectMapper mapper,
-                             ContainerReachableEndpoint endpoint) {
+                             ContainerReachableEndpoint endpoint, PublicApiProxySources publicSources) {
         this.config = config;
         this.ec2 = ec2;
         this.vpcs = vpcs;
@@ -79,7 +80,13 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         this.containers = containers;
         this.lifecycle = lifecycle;
         this.mapper = mapper;
-        this.awsApi = new VpcAwsApiBridge(config, docker, containers, lifecycle, mapper, endpoint);
+        this.awsApi = new VpcAwsApiBridge(config, docker, containers, lifecycle, mapper, endpoint, publicSources);
+    }
+
+    VpcRoutingManager(EmulatorConfig config, Ec2Service ec2, VpcNetworkManager vpcs,
+                      DockerClient docker, ContainerBuilder containers, ContainerLifecycleManager lifecycle,
+                      ObjectMapper mapper, ContainerReachableEndpoint endpoint) {
+        this(config, ec2, vpcs, docker, containers, lifecycle, mapper, endpoint, new PublicApiProxySources());
     }
 
     public boolean enabled() {

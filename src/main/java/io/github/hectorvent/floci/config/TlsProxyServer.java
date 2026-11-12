@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.config;
 
+import io.netty.util.NetUtil;
 import io.quarkus.runtime.Startup;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
@@ -18,12 +19,15 @@ import org.jboss.logging.Logger;
 
 import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -52,7 +56,7 @@ import java.util.function.ToIntFunction;
  * so they PUT to 443 regardless of Floci's configured port; binding 443 lets those callbacks
  * reach Floci. The extra binding is skipped when the port is {@code 0} or equals the public port.
  * HTTPS load balancers may register a loopback backend for declared SNI hostnames on this
- * extra port; all other traffic retains the API backend.
+ * extra port. Other TLS uses the explicitly configured fallback, or the API backend by default.
  *
  * <p>Both listen on the configured {@code quarkus.http.host}, not the loopback pin
  * {@link TlsConfigSource} applies to Quarkus itself, and a non-loopback host needs the same consent
@@ -78,6 +82,9 @@ public class TlsProxyServer {
     private final String host;
     private final int httpBackendPort;
     private final int httpsBackendPort;
+    private final PublicApiProxySources publicSources;
+    private String fallbackHost;
+    private Set<String> fallbackNames = Set.of();
     private final List<NetServer> proxyServers = new ArrayList<>();
     private volatile URI localApiUri;
     /**
@@ -135,17 +142,24 @@ public class TlsProxyServer {
     }
 
     @Inject
-    public TlsProxyServer(Vertx vertx, EmulatorConfig config, Config mpConfig) {
-        this(vertx, config, NetworkExposureGuard.publicHost(mpConfig), HTTP_BACKEND_PORT, HTTPS_BACKEND_PORT);
+    public TlsProxyServer(Vertx vertx, EmulatorConfig config, Config mpConfig, PublicApiProxySources publicSources) {
+        this(vertx, config, NetworkExposureGuard.publicHost(mpConfig), HTTP_BACKEND_PORT, HTTPS_BACKEND_PORT,
+                publicSources);
     }
 
     /** Visible for testing — lets tests point the proxy at backends on non-default ports. */
     TlsProxyServer(Vertx vertx, EmulatorConfig config, String host, int httpBackendPort, int httpsBackendPort) {
+        this(vertx, config, host, httpBackendPort, httpsBackendPort, new PublicApiProxySources());
+    }
+
+    TlsProxyServer(Vertx vertx, EmulatorConfig config, String host, int httpBackendPort, int httpsBackendPort,
+                   PublicApiProxySources publicSources) {
         this.vertx = vertx;
         this.config = config;
         this.host = host;
         this.httpBackendPort = httpBackendPort;
         this.httpsBackendPort = httpsBackendPort;
+        this.publicSources = publicSources;
         startIfTlsEnabled();
     }
 
@@ -154,6 +168,7 @@ public class TlsProxyServer {
             return;
         }
 
+        validateFallback();
         NetworkExposureGuard.requireConsent(host, config.security());
 
         client = vertx.createNetClient();
@@ -198,6 +213,65 @@ public class TlsProxyServer {
                 }
             }
         }
+    }
+
+    private void validateFallback() {
+        Set<String> names = new LinkedHashSet<>();
+        for (String name : config.tls().awsHttpsFallbackHosts().orElse(List.of())) {
+            String normalized = normalizeHostname(name);
+            if (normalized.isEmpty() || normalized.length() > 253
+                    || NetUtil.isValidIpV4Address(normalized) || NetUtil.isValidIpV6Address(normalized)
+                    || !normalized.matches("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                        + "(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+                    || !names.add(normalized)) {
+                throw new IllegalArgumentException("TLS fallback hosts must be distinct exact DNS hostnames");
+            }
+        }
+        fallbackNames = Set.copyOf(names);
+        int fallbackPort = config.tls().awsHttpsFallbackPort();
+        if (fallbackPort == 0) {
+            if (config.tls().awsHttpsFallbackProxyProtocol()) {
+                throw new IllegalArgumentException("External PROXY transport requires a configured TLS fallback");
+            }
+            if (!fallbackNames.isEmpty()) {
+                throw new IllegalArgumentException("Explicit TLS fallback hosts require a fallback destination");
+            }
+            return;
+        }
+        int awsPort = config.tls().awsHttpsPort();
+        if (fallbackPort < 1 || fallbackPort > 65535 || awsPort < 1 || awsPort > 65535
+                || awsPort == config.port()) {
+            throw new IllegalArgumentException("TLS fallback requires valid, distinct AWS HTTPS and fallback ports");
+        }
+        String selected = config.tls().awsHttpsFallbackHost().orElse("127.0.0.1");
+        if (!NetUtil.isValidIpV4Address(selected)) {
+            throw new IllegalArgumentException("TLS fallback must be an explicit local IPv4 address");
+        }
+        try {
+            InetAddress address = InetAddress.getByName(selected);
+            boolean reservedEmulation = Byte.toUnsignedInt(address.getAddress()[0]) >= 240
+                    && !"255.255.255.255".equals(selected);
+            if (!address.getHostAddress().equals(selected)
+                    || (!address.isLoopbackAddress() && !address.isSiteLocalAddress() && !reservedEmulation)) {
+                throw new IllegalArgumentException("TLS fallback must be a canonical local IPv4 address");
+            }
+            boolean local = address.isLoopbackAddress() || NetworkInterface.getByInetAddress(address) != null;
+            if (local && (fallbackPort == config.port() || fallbackPort == awsPort
+                    || fallbackPort == httpBackendPort || fallbackPort == httpsBackendPort)) {
+                throw new IllegalArgumentException("TLS fallback cannot point to a local proxy or private API listener");
+            }
+            fallbackHost = selected;
+        } catch (UnknownHostException | SocketException failure) {
+            throw new IllegalArgumentException("Cannot validate the TLS fallback address", failure);
+        }
+    }
+
+    private static String normalizeHostname(String name) {
+        if (name == null) {
+            return "";
+        }
+        String normalized = name.toLowerCase(Locale.ROOT);
+        return normalized.endsWith(".") ? normalized.substring(0, normalized.length() - 1) : normalized;
     }
 
     private static URI connectUri(String host, int port) {
@@ -245,37 +319,69 @@ public class TlsProxyServer {
      */
     private Handler<NetSocket> buildConnectHandler() {
         return frontSocket -> {
-            // Pause incoming data until we've peeked at the first byte
             frontSocket.pause();
-
-            frontSocket.handler(buffer -> {
-                // Remove handler and keep socket paused to prevent data loss
-                // while we establish the backend connection.
-                frontSocket.handler(null);
-                frontSocket.pause();
-
-                boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
-                int port = frontSocket.localAddress().port();
-                if (tls && sharedTlsRoutes.containsKey(port)) {
-                    readClientHello(frontSocket, buffer, port);
-                    return;
-                }
-                int backendPort;
-                if (tls) {
-                    backendPort = httpsBackendPort;
-                } else {
-                    backendPort = httpBackendPort;
-                }
-
-                connectBackend(frontSocket, buffer, backendPort);
-            });
-
-            // Resume to receive the first buffer
+            int port = frontSocket.localAddress().port();
+            PublicApiProxySources.Ticket ticket = port == config.tls().awsHttpsPort()
+                    ? publicSources.ticket(frontSocket.remoteAddress().hostAddress()) : null;
+            if (ticket != null) {
+                readPublicProxy(frontSocket, ticket);
+            } else {
+                readFirst(frontSocket, new PublicApiProxySources.Addresses(
+                        frontSocket.remoteAddress(), frontSocket.localAddress()));
+            }
             frontSocket.resume();
         };
     }
 
-    private void readClientHello(NetSocket socket, Buffer first, int port) {
+    private void readFirst(NetSocket socket, PublicApiProxySources.Addresses addresses) {
+        socket.handler(buffer -> dispatch(socket, buffer, addresses));
+    }
+
+    private void readPublicProxy(NetSocket socket, PublicApiProxySources.Ticket ticket) {
+        StringBuilder header = new StringBuilder();
+        long timer = vertx.setTimer(5000, ignored -> socket.close());
+        socket.closeHandler(ignored -> vertx.cancelTimer(timer));
+        socket.handler(buffer -> {
+            try {
+                for (int index = 0; index < buffer.length(); index++) {
+                    int value = Byte.toUnsignedInt(buffer.getByte(index));
+                    if (value > 127 || header.length() == 108) {
+                        throw new IllegalArgumentException("Invalid public bridge preface");
+                    }
+                    header.append((char) value);
+                    if (value == '\n') {
+                        PublicApiProxySources.Addresses addresses = publicSources.decode(ticket, header.toString());
+                        vertx.cancelTimer(timer);
+                        if (index + 1 < buffer.length()) {
+                            dispatch(socket, buffer.getBuffer(index + 1, buffer.length()), addresses);
+                        } else {
+                            readFirst(socket, addresses);
+                        }
+                        return;
+                    }
+                }
+            } catch (IllegalArgumentException failure) {
+                LOG.debug("TLS proxy: rejected public bridge preface");
+                socket.close();
+            }
+        });
+    }
+
+    private void dispatch(NetSocket socket, Buffer buffer, PublicApiProxySources.Addresses addresses) {
+        socket.handler(null);
+        socket.pause();
+        boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
+        int port = socket.localAddress().port();
+        if (tls && sharedTlsRoutes.containsKey(port)) {
+            readClientHello(socket, buffer, port, addresses);
+        } else if (tls) {
+            connectTlsBackend(socket, buffer, port, 0, addresses);
+        } else {
+            connectBackend(socket, buffer, httpBackendPort, addresses);
+        }
+    }
+
+    private void readClientHello(NetSocket socket, Buffer first, int port, PublicApiProxySources.Addresses addresses) {
         TlsClientHello hello = new TlsClientHello();
         Buffer pending = Buffer.buffer();
         long timer = vertx.setTimer(5000, ignored -> socket.close());
@@ -298,10 +404,12 @@ public class TlsProxyServer {
                 socket.handler(null);
                 vertx.cancelTimer(timer);
                 SharedTlsRoute route = sharedTlsRoutes.get(port);
-                int selected = route == null || hello.hostname() == null
+                boolean shared = port == config.tls().awsHttpsPort() && port != config.port()
+                        && fallbackNames.contains(normalizeHostname(hello.hostname()));
+                int selected = shared || route == null || hello.hostname() == null
                         ? 0 : route.backend().applyAsInt(hello.hostname());
                 hello.close();
-                connectBackend(socket, pending, selected > 0 ? selected : httpsBackendPort);
+                connectTlsBackend(socket, pending, port, selected, addresses);
             } catch (RuntimeException failure) {
                 LOG.debugv("TLS proxy: invalid or unavailable shared TLS route: {0}", failure.getMessage());
                 socket.close();
@@ -311,16 +419,37 @@ public class TlsProxyServer {
         read.handle(first);
     }
 
-    private void connectBackend(NetSocket frontSocket, Buffer buffer, int backendPort) {
-        client.connect(backendPort, "127.0.0.1").onComplete(ar -> {
+    private void connectTlsBackend(NetSocket socket, Buffer buffer, int port, int nativePort,
+                                   PublicApiProxySources.Addresses addresses) {
+        if (nativePort > 0) {
+            connectBackend(socket, buffer, nativePort, addresses);
+        } else if (fallbackHost != null && port == config.tls().awsHttpsPort() && port != config.port()) {
+            connectBackend(socket, buffer, fallbackHost, config.tls().awsHttpsFallbackPort(),
+                    config.tls().awsHttpsFallbackProxyProtocol(), addresses);
+        } else {
+            connectBackend(socket, buffer, httpsBackendPort, addresses);
+        }
+    }
+
+    private void connectBackend(NetSocket frontSocket, Buffer buffer, int backendPort,
+                                PublicApiProxySources.Addresses addresses) {
+        connectBackend(frontSocket, buffer, "127.0.0.1", backendPort, true, addresses);
+    }
+
+    private void connectBackend(NetSocket frontSocket, Buffer buffer, String backendHost,
+                                int backendPort, boolean proxyPreface, PublicApiProxySources.Addresses addresses) {
+        client.connect(backendPort, backendHost).onComplete(ar -> {
             if (ar.succeeded()) {
                 NetSocket backSocket = ar.result();
 
-                SocketAddress source = frontSocket.remoteAddress();
-                SocketAddress destination = frontSocket.localAddress();
-                String family = source.hostAddress().contains(":") ? "TCP6" : "TCP4";
-                Buffer initial = Buffer.buffer("PROXY " + family + " " + source.hostAddress() + " "
-                        + destination.hostAddress() + " " + source.port() + " " + destination.port() + "\r\n");
+                Buffer initial = Buffer.buffer();
+                if (proxyPreface) {
+                    SocketAddress source = addresses.source();
+                    SocketAddress destination = addresses.destination();
+                    String family = source.hostAddress().contains(":") ? "TCP6" : "TCP4";
+                    initial.appendString("PROXY " + family + " " + source.hostAddress() + " "
+                            + destination.hostAddress() + " " + source.port() + " " + destination.port() + "\r\n");
+                }
                 backSocket.write(initial.appendBuffer(buffer));
 
                 // pipeTo propagates end-of-stream and resumes the paused client.

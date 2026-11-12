@@ -18,6 +18,7 @@ floci:
       public-aws-api: false
       public-aws-api-upstream-http-port: 80
       public-aws-api-upstream-https-port: 443
+      public-aws-api-native-https: false
     security-group-enforcement:
       enabled: true
       helper-image: floci/network-helper:local
@@ -128,6 +129,10 @@ floci:
     # extra-ca-certs: ""               # FLOCI_TLS_EXTRA_CA_CERTS (optional public PEM trust anchors)
     enabled: false
     self-signed: true
+    aws-https-fallback-port: 0
+    # aws-https-fallback-host: 127.0.0.1
+    aws-https-fallback-proxy-protocol: false
+    aws-https-fallback-hosts:
 
   protocols:
     strict-claiming: false

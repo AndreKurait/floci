@@ -190,6 +190,7 @@ floci:
       # public-aws-api-upstream-host: ""
       public-aws-api-upstream-http-port: 80
       public-aws-api-upstream-https-port: 443
+      public-aws-api-native-https: false
       # public-aws-api-hosts: []  # Exact peer names, in addition to native AWS names.
     security-group-enforcement:
       enabled: false
@@ -378,6 +379,10 @@ floci:
     # extra-ca-certs: ""               # FLOCI_TLS_EXTRA_CA_CERTS (additional public PEM trust anchors)
     self-signed: true                  # FLOCI_TLS_SELF_SIGNED: auto-generate a server cert signed by Floci's local CA if no cert-path provided
     aws-https-port: 443                # FLOCI_TLS_AWS_HTTPS_PORT — also bind 443 so CDK cfn-response/AWS-on-443 callbacks reach Floci (0 disables)
+    aws-https-fallback-port: 0
+    # aws-https-fallback-host: 127.0.0.1
+    aws-https-fallback-proxy-protocol: false
+    aws-https-fallback-hosts: ${FLOCI_TLS_AWS_HTTPS_FALLBACK_HOSTS:}
 
   protocols:
     max-request-size: 2048             # FLOCI_PROTOCOLS_MAX_REQUEST_SIZE: max HTTP request body size in MB (legacy: floci.max-request-size / FLOCI_MAX_REQUEST_SIZE)

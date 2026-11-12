@@ -361,6 +361,10 @@ class EventBridgeSchedulerIntegrationTest {
                     @Override public Optional<String> extraCaCerts() { return Optional.empty(); }
                     @Override public boolean selfSigned() { return true; }
                     @Override public int awsHttpsPort() { return 443; }
+                    @Override public int awsHttpsFallbackPort() { return 0; }
+                    @Override public Optional<String> awsHttpsFallbackHost() { return Optional.empty(); }
+                    @Override public boolean awsHttpsFallbackProxyProtocol() { return false; }
+                    @Override public Optional<List<String>> awsHttpsFallbackHosts() { return Optional.empty(); }
                 };
             }
         };
