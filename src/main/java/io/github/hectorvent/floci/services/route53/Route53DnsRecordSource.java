@@ -24,6 +24,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.LongUnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -47,6 +49,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private final Route53Service route53Service;
     private final DnsLookupHelper dnsLookupHelper;
     private final EmbeddedDnsServer dnsServer;
+    private final LongUnaryOperator weightedDraw;
     private final Set<String> flociSuffixes = new LinkedHashSet<>();
 
     public Route53DnsRecordSource(Route53Service route53Service) {
@@ -64,9 +67,17 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     @Inject
     public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config,
                                   DnsLookupHelper dnsLookupHelper, EmbeddedDnsServer dnsServer) {
+        this(route53Service, config, dnsLookupHelper, dnsServer,
+                bound -> ThreadLocalRandom.current().nextLong(bound));
+    }
+
+    Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config,
+                          DnsLookupHelper dnsLookupHelper, EmbeddedDnsServer dnsServer,
+                          LongUnaryOperator weightedDraw) {
         this.route53Service = route53Service;
         this.dnsLookupHelper = dnsLookupHelper != null ? dnsLookupHelper : new DnsLookupHelper(config);
         this.dnsServer = dnsServer;
+        this.weightedDraw = weightedDraw;
         this.flociSuffixes.addAll(BUILTIN_SUFFIXES);
         if (config != null) {
             config.hostname().ifPresent(this.flociSuffixes::add);
@@ -118,21 +129,14 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         int ttl = Integer.MAX_VALUE;
         boolean upstream = false;
         try {
-            for (ResourceRecordSet record : zone.matchingRecords()) {
-                if (!record.getType().equals(switch (type) {
-                    case 1 -> "A";
-                    case 28 -> "AAAA";
-                    case 2 -> "NS";
-                    case 6 -> "SOA";
-                    default -> "TXT";
-                })) {
-                    continue;
-                }
-                if (record.getSetIdentifier() != null
-                        || record.getWeight() != null || record.getRegion() != null
-                        || record.getFailover() != null || record.getHealthCheckId() != null) {
-                    return Optional.of(DnsAnswer.refused());
-                }
+            String recordType = switch (type) {
+                case 1 -> "A";
+                case 28 -> "AAAA";
+                case 2 -> "NS";
+                case 6 -> "SOA";
+                default -> "TXT";
+            };
+            for (ResourceRecordSet record : selectPublicRecords(zone.matchingRecords(), recordType)) {
                 AliasTarget alias = record.getAliasTarget();
                 if (alias != null) {
                     if (dnsServer == null || alias.isEvaluateTargetHealth() || record.getTtl() != null
@@ -185,6 +189,49 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             LOG.debugv("Cannot encode public DNS records for {0}: {1}", name, e.getMessage());
             return Optional.of(DnsAnswer.refused());
         }
+    }
+
+    private List<ResourceRecordSet> selectPublicRecords(List<ResourceRecordSet> records, String type) {
+        List<ResourceRecordSet> matching = records.stream().filter(record -> type.equals(record.getType())).toList();
+        Set<String> identifiers = new HashSet<>();
+        long totalWeight = 0;
+        for (ResourceRecordSet record : matching) {
+            if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null
+                    || record.getAliasTarget() != null && record.getAliasTarget().isEvaluateTargetHealth()) {
+                throw new IllegalArgumentException("Unsupported public DNS routing policy");
+            }
+            Long weight = record.getWeight();
+            if (weight == null) {
+                if (record.getSetIdentifier() != null) {
+                    throw new IllegalArgumentException("Unsupported public DNS routing identifier");
+                }
+            } else {
+                String identifier = record.getSetIdentifier();
+                if (weight < 0 || weight > 255 || identifier == null || identifier.isBlank()
+                        || !identifiers.add(identifier)) {
+                    throw new IllegalArgumentException("Invalid weighted DNS record");
+                }
+                totalWeight += weight;
+            }
+        }
+        if (identifiers.isEmpty()) {
+            return matching;
+        }
+        if (identifiers.size() != matching.size()) {
+            throw new IllegalArgumentException("Mixed simple and weighted DNS records");
+        }
+        // Zero-weight records participate only when the entire group has weight zero.
+        long draw = weightedDraw.applyAsLong(totalWeight == 0 ? matching.size() : totalWeight);
+        if (totalWeight == 0) {
+            return List.of(matching.get(Math.toIntExact(draw)));
+        }
+        for (ResourceRecordSet record : matching) {
+            if (draw < record.getWeight()) {
+                return List.of(record);
+            }
+            draw -= record.getWeight();
+        }
+        throw new IllegalArgumentException("Weighted DNS selection is outside the group");
     }
 
     @Override

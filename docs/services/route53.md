@@ -109,7 +109,9 @@ management API authorization. Unknown, deleted, ambiguous, or mismatched targets
 are refused; the resolver never infers ownership from an emulator suffix.
 See [ELB v2](elb.md#route-53-aliases).
 
-Other public alias targets, alias `AAAA` records, `EvaluateTargetHealth=true`, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones or alias targets, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary. Clients can retry over TCP, which supports messages up to 65,535 bytes, fragmented input, pipelining and connection reuse. TCP admission is bounded to 128 connections and 16 pending queries per connection; idle connections expire after 30 seconds.
+Weighted public records select one record set per DNS response, in proportion to its `Weight`. A zero-weight record is excluded when another record in the group has positive weight; if every weight is zero, each record set has an equal chance. Selection preserves all values and the TTL of the chosen record set, including the target TTL and validated transport of supported aliases. Each weighted record requires a distinct `SetIdentifier` and a weight from 0 through 255. Simple and weighted records cannot be mixed in the same name/type group.
+
+Other public alias targets, alias `AAAA` records, `EvaluateTargetHealth=true`, CNAME chasing, health-based or other routing policies, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones or alias targets, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary. Clients can retry over TCP, which supports messages up to 65,535 bytes, fragmented input, pipelining and connection reuse. TCP admission is bounded to 128 connections and 16 pending queries per connection; idle connections expire after 30 seconds.
 
 ## Default Nameservers
 
@@ -239,4 +241,4 @@ the record. DELETE still requires matching record values and routing properties.
 - Query logging configs
 - DNSSEC (key signing keys, enabling/disabling)
 - `TestDNSAnswer`
-- Public authoritative record types other than simple A, AAAA, TXT, NS, and SOA; public routing policies, delegation referrals, and DNS-over-TCP
+- Public authoritative record types other than A, AAAA, TXT, NS, and SOA; routing policies other than the weighted selection above; delegation referrals
