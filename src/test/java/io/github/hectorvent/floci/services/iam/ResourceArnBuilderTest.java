@@ -1621,6 +1621,39 @@ class ResourceArnBuilderTest {
 
     // ── SQS ─────────────────────────────────────────────────────────────────────
 
+    @ParameterizedTest
+    @CsvSource({"aws,us-east-1", "aws-us-gov,us-gov-west-1", "aws-cn,cn-north-1"})
+    void sqsNameOperationsUseTheDispatchedOperationsQueueName(String partition, String region) {
+        queryParams.putSingle("QueueName", "query-decoy");
+        for (String operation : List.of("sqs:GetQueueUrl", "sqs:CreateQueue")) {
+            setFormBody("Action=SendMessage&QueueName=orders.fifo&QueueUrl=http://localhost/000000000000/decoy");
+            assertEquals(List.of("arn:" + partition + ":sqs:" + region + ":" + ACCOUNT + ":orders.fifo"),
+                    builder.buildResources("sqs", operation, ctx, region, ACCOUNT, partition));
+        }
+    }
+
+    @Test
+    void sqsJsonNameOperationsIgnoreAnUnrelatedQueueUrlAndOwner() {
+        setJsonBody("""
+                {"QueueName":"orders","QueueUrl":"http://localhost/111122223333/decoy",
+                 "QueueOwnerAWSAccountId":"111122223333"}
+                """);
+        for (String operation : List.of("sqs:GetQueueUrl", "sqs:CreateQueue")) {
+            assertEquals(List.of("arn:aws:sqs:us-east-1:" + ACCOUNT + ":orders"),
+                    builder.buildResources("sqs", operation, ctx, "us-east-1", ACCOUNT, "aws"));
+        }
+    }
+
+    @Test
+    void sqsUrlOperationsDoNotAuthorizeAnUnrelatedQueueName() {
+        setJsonBody("{\"QueueName\":\"allowed\",\"QueueUrl\":\"http://localhost/000000000000/denied\"}");
+        assertEquals(List.of("arn:aws:sqs:us-east-1:" + ACCOUNT + ":denied"),
+                builder.buildResources("sqs", "sqs:SendMessage", ctx, "us-east-1", ACCOUNT, "aws"));
+        setJsonBody("{\"QueueName\":\"allowed\"}");
+        assertEquals(List.of("arn:aws:sqs:us-east-1:" + ACCOUNT + ":*"),
+                builder.buildResources("sqs", "sqs:SendMessage", ctx, "us-east-1", ACCOUNT, "aws"));
+    }
+
     @Test
     void sqsNamesTheAccountTheQueueUrlNames() {
         queryParams.putSingle("QueueUrl", "http://localhost:4566/111122223333/orders");

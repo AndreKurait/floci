@@ -239,6 +239,12 @@ describes. Within one account either the policy or the caller's identity policie
 and an explicit `Deny` in either refuses it. A `QueueUrl` whose path names another account is a
 cross-account call: the queue's policy and the caller's identity policies both have to allow it.
 
+`GetQueueUrl` and `CreateQueue` authorize the queue named by `QueueName`, including
+legacy Query GET and POST requests and SDK JSON requests. An unrelated `QueueUrl`
+does not select their authorization resource. Other queue operations continue to
+authorize their `QueueUrl`. `GetQueueUrl` currently selects the caller's account;
+the optional `QueueOwnerAWSAccountId` is not implemented.
+
 ## Storage write failures
 
 When the message backend reports a failed write, the queue retains its previously acknowledged
