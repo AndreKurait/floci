@@ -118,6 +118,7 @@ import io.floci.aws.services.cloudformation.provisioners.SignerCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.SnsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.SqsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.SsmCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.StepFunctionsActivityCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.StepFunctionsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.TransferCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.WafV2CfnProvisioner;
@@ -334,6 +335,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new SignerCfnProvisioner(signerService));
             }
             if (stepFunctionsService != null) {
+                discovered.add(new StepFunctionsActivityCfnProvisioner(stepFunctionsService));
                 discovered.add(new StepFunctionsCfnProvisioner(stepFunctionsService, s3Service, objectMapper));
             }
             if (lambdaService != null) {

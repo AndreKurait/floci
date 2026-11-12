@@ -812,6 +812,10 @@
   "AWS::SSM::Parameter": [
     "Name"
   ],
+  "AWS::StepFunctions::Activity": [
+    "Name",
+    "EncryptionConfiguration"
+  ],
   "AWS::StepFunctions::StateMachine": [
     "StateMachineName",
     "StateMachineType"
