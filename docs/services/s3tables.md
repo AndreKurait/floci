@@ -14,7 +14,7 @@ S3 Tables requests are signed as `s3tables` and use REST JSON routes such as
 This service stores table-bucket, namespace, table, policy, maintenance
 configuration, and metadata-location state. It does **not** run an Apache
 Iceberg engine or create data-plane artifacts: manifests, warehouse objects,
-queries, compaction, snapshot expiry, replication, encryption-management, and
+queries, compaction, snapshot expiry, replication, data encryption, and
 metrics are intentionally outside this implementation.
 
 ## Supported operations
@@ -22,6 +22,7 @@ metrics are intentionally outside this implementation.
 | Area | Operations |
 |---|---|
 | Table buckets | CreateTableBucket, GetTableBucket, ListTableBuckets, DeleteTableBucket |
+| Bucket encryption | GetTableBucketEncryption |
 | Bucket policy | PutTableBucketPolicy, GetTableBucketPolicy, DeleteTableBucketPolicy |
 | Bucket maintenance | PutTableBucketMaintenanceConfiguration, GetTableBucketMaintenanceConfiguration |
 | Namespaces | CreateNamespace, GetNamespace, ListNamespaces, DeleteNamespace |
@@ -33,6 +34,11 @@ metrics are intentionally outside this implementation.
 Tables must use `ICEBERG` format. `UpdateTableMetadataLocation` implements
 optimistic concurrency: supply the table's current `versionToken`; a stale
 token returns `ConflictException`.
+
+`GetTableBucketEncryption` reads the encryption configuration supplied at bucket
+creation, including an SSE-KMS key ARN when configured. Buckets created without
+an explicit configuration report the SSE-S3 default, `AES256`. This readback
+reflects stored metadata; it does not encrypt data or manage KMS keys.
 
 ## Example
 
