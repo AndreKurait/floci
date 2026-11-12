@@ -1527,7 +1527,8 @@ class EcrServiceTest {
                 sendJson(exchange, 200, "{\"name\":\"" + repository + "\",\"tags\":[\"" + tag + "\"]}");
                 return;
             }
-            if (("/v2/" + repository + "/manifests/" + tag).equals(path) && "HEAD".equals(method)) {
+            if ((("/v2/" + repository + "/manifests/" + tag).equals(path)
+                    || ("/v2/" + repository + "/manifests/" + digest).equals(path)) && "HEAD".equals(method)) {
                 exchange.getResponseHeaders().add("Docker-Content-Digest", digest);
                 exchange.sendResponseHeaders(200, -1);
                 exchange.close();

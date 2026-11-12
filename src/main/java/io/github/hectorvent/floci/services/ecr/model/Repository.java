@@ -13,6 +13,8 @@ import java.util.Map;
  */
 @RegisterForReflection
 public class Repository {
+    private String repositoryGeneration;
+    private LifecyclePolicyPreview lifecyclePolicyPreview;
     private String repositoryArn;
     private String registryId;
     private String repositoryName;
@@ -28,6 +30,29 @@ public class Repository {
     private Map<String, String> tags = new HashMap<>();
 
     public Repository() {}
+
+    public Repository(Repository source) {
+        repositoryGeneration = source.repositoryGeneration;
+        lifecyclePolicyPreview = source.lifecyclePolicyPreview;
+        repositoryArn = source.repositoryArn;
+        registryId = source.registryId;
+        repositoryName = source.repositoryName;
+        repositoryUri = source.repositoryUri;
+        registryRepositoryName = source.registryRepositoryName;
+        createdAt = source.createdAt;
+        imageTagMutability = source.imageTagMutability;
+        scanOnPush = source.scanOnPush;
+        encryptionType = source.encryptionType;
+        kmsKey = source.kmsKey;
+        lifecyclePolicyText = source.lifecyclePolicyText;
+        repositoryPolicyText = source.repositoryPolicyText;
+        tags = source.tags == null ? new HashMap<>() : new HashMap<>(source.tags);
+    }
+
+    public String getRepositoryGeneration() { return repositoryGeneration; }
+    public void setRepositoryGeneration(String generation) { repositoryGeneration = generation; }
+    public LifecyclePolicyPreview getLifecyclePolicyPreview() { return lifecyclePolicyPreview; }
+    public void setLifecyclePolicyPreview(LifecyclePolicyPreview preview) { lifecyclePolicyPreview = preview; }
 
     public String getRepositoryArn() { return repositoryArn; }
     public void setRepositoryArn(String repositoryArn) { this.repositoryArn = repositoryArn; }
