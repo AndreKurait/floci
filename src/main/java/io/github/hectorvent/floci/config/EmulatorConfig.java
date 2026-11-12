@@ -498,6 +498,7 @@ public interface EmulatorConfig {
     }
 
     interface LambdaStorageConfig {
+        // Function runtime-management settings share the Lambda storage mode and flush interval.
         Optional<String> mode();
 
         @WithDefault("5000")

@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
+import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementReference;
 import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
@@ -229,6 +230,10 @@ public class ResourceArnBuilder {
             String resource = body == null || stepFunctionsService == null || stepFunctionsService.isUnsatisfied()
                     ? null : stepFunctionsService.get().callbackResourceArn(body.path("taskToken").asText(null), accountId);
             return List.of(resource == null ? "*" : resource);
+        }
+        if ("lambda:GetRuntimeManagementConfig".equals(operation)
+                || "lambda:PutRuntimeManagementConfig".equals(operation)) {
+            return List.of(runtimeManagementArn(ctx, region, accountId));
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
@@ -1031,6 +1036,22 @@ public class ResourceArnBuilder {
         } catch (AwsException e) {
             // A reference Lambda refuses, which its handler answers with a 400 before acting on anything.
             return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        }
+    }
+
+    private String runtimeManagementArn(ContainerRequestContext ctx, String region, String accountId) {
+        String reference = ctx.getUriInfo().getPathParameters().getFirst("functionName");
+        if (reference == null) {
+            reference = extractSegmentAfter(IamActionRegistry.decodedPath(ctx), "functions");
+        }
+        try {
+            return LambdaRuntimeManagementReference.resolve(reference,
+                    ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"), region, accountId)
+                    .authorizationArn();
+        } catch (AwsException expected) {
+            // Preserve a malformed or foreign identifier for policy matching; the service refuses it.
+            return AwsArnUtils.looksLikeArn(reference) ? reference
+                    : AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + reference).toString();
         }
     }
 
