@@ -23,6 +23,7 @@ import io.floci.aws.services.iam.model.OpenIDConnectProvider;
 import io.floci.aws.services.iam.model.OrganizationRootFeatures;
 import io.floci.aws.services.iam.model.PolicyVersion;
 import io.floci.aws.services.iam.model.SessionCredential;
+import io.floci.aws.services.iam.model.VerifiedIdentityContext;
 import io.floci.aws.services.iam.model.VirtualMfaDevice;
 import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.MutableClock;
@@ -75,7 +76,8 @@ class IamServiceTest {
     // IAM User Guide includes "only when the principal uses temporary credentials".
     private static void assertSessionCaller(IamService.CallerArns expected, IamService.CallerArns actual) {
         assertNotNull(actual.tokenIssueTime());
-        assertEquals(expected.withTokenIssueTime(actual.tokenIssueTime()), actual);
+        assertEquals(expected.withTokenIssueTime(actual.tokenIssueTime())
+                .withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of())), actual);
     }
 
     private static IamService iamService(boolean seedDeployerPrincipal) {

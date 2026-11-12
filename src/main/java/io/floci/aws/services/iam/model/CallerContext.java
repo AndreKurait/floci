@@ -28,8 +28,17 @@ public record CallerContext(
         String boundaryPolicyDocument,
         List<List<String>> scpLevels,
         String principalArn,
-        List<PolicySource> identityPolicySources
+        List<PolicySource> identityPolicySources,
+        VerifiedIdentityContext verifiedIdentityContext
 ) {
+    /** Source-compatible constructor for callers predating verified identity claims. */
+    public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
+                         String boundaryPolicyDocument, List<List<String>> scpLevels,
+                         String principalArn, List<PolicySource> identityPolicySources) {
+        this(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels,
+                principalArn, identityPolicySources, null);
+    }
+
     /** Source-compatible constructor for callers predating named policy sources. */
     public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
                          String boundaryPolicyDocument, List<List<String>> scpLevels,
@@ -75,7 +84,7 @@ public record CallerContext(
     /** Copy of this context with the effective SCP levels attached. */
     public CallerContext withScpLevels(List<List<String>> levels) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, levels,
-                principalArn, identityPolicySources);
+                principalArn, identityPolicySources, verifiedIdentityContext);
     }
 
     /** Copy of this context with one more identity policy, evaluated like the caller's own. */
@@ -109,19 +118,19 @@ public record CallerContext(
             named.addAll(padded(sources, policyDocuments.size()));
         }
         return new CallerContext(policies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels,
-                principalArn, named);
+                principalArn, named, verifiedIdentityContext);
     }
 
     /** Copy of this context with the permissions boundary document a caller handed in instead. */
     public CallerContext withBoundaryPolicy(String policyDocument) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, policyDocument, scpLevels,
-                principalArn, identityPolicySources);
+                principalArn, identityPolicySources, verifiedIdentityContext);
     }
 
     /** Copy of this context with the caller principal ARN attached. */
     public CallerContext withPrincipalArn(String principalArn) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels,
-                principalArn, identityPolicySources);
+                principalArn, identityPolicySources, verifiedIdentityContext);
     }
 
     /** {@code sources} as a list of exactly {@code size}, naming nothing where it says nothing. */
@@ -131,5 +140,11 @@ public record CallerContext(
             named.add(sources != null && index < sources.size() ? sources.get(index) : PolicySource.unnamed());
         }
         return named;
+    }
+
+    /** Attaches claims captured by credential resolution, retaining every policy ceiling. */
+    public CallerContext withVerifiedIdentityContext(VerifiedIdentityContext context) {
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, identityPolicySources, context);
     }
 }
