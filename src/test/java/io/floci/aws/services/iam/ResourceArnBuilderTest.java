@@ -70,6 +70,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -109,6 +110,34 @@ class ResourceArnBuilderTest {
                         builder.buildResources("route53", "route53:" + operation, ctx, region, ACCOUNT, partition));
             }
         }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"application/a", "application/a/environment/e", "application/a/configurationprofile/c",
+            "deploymentstrategy/d"})
+    void appConfigTagActionsUseTheExactResourceArn(String resource) {
+        String arn = "arn:aws:appconfig:us-east-1:" + ACCOUNT + ":" + resource;
+        for (String action : List.of("TagResource", "UntagResource", "ListTagsForResource")) {
+            request("/tags/" + arn.replace(":", "%3A").replace("/", "%2F"));
+            when(ctx.getMethod()).thenReturn(switch (action) {
+                case "TagResource" -> "POST";
+                case "UntagResource" -> "DELETE";
+                default -> "GET";
+            });
+            assertEquals(List.of(arn), builder.buildResources("appconfig", "appconfig:" + action,
+                    ctx, "us-east-1", ACCOUNT, "aws"));
+            // The shared dispatcher rejects an unencoded slash outside the ARN's modeled path label.
+            request("/tags/" + arn);
+            assertFalse(IamActionRegistry.modelRoutes("appconfig", uriInfo));
+            assertEquals(List.of("*"), builder.buildResources("appconfig", "appconfig:" + action,
+                    ctx, "us-east-1", ACCOUNT, "aws"));
+        }
+        request("/tags");
+        when(ctx.getMethod()).thenReturn("GET");
+        queryParams.putSingle("resourceArn", arn);
+        assertFalse(IamActionRegistry.modelRoutes("appconfig", uriInfo));
+        assertEquals(List.of("*"), builder.buildResources("appconfig", "appconfig:ListTagsForResource",
+                ctx, "us-east-1", ACCOUNT, "aws"));
     }
 
     @BeforeEach
