@@ -8,6 +8,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
@@ -191,6 +193,55 @@ class CognitoIdentityCredentialsIamIntegrationTest {
                 iam.deleteRole(r -> r.roleName(roleName));
             }
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void classicExchangeRechecksPoolSettingAndIdentityState(boolean disableClassic) {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String roleName = "cognito-classic-" + suffix;
+        List<String> sessions = new ArrayList<>();
+        try (CognitoIdentityClient admin = identities(ROOT); IamClient iam = iam(ROOT);
+             StsClient anonymousSts = sts(AnonymousCredentialsProvider.create())) {
+            String pool = pool(admin, suffix);
+            String createdRoleArn = null;
+            try {
+                createdRoleArn = iam.createRole(r -> r.roleName(roleName)
+                        .assumeRolePolicyDocument(trust(pool, "Allow"))).role().arn();
+                String roleArn = createdRoleArn;
+                GetOpenIdTokenForDeveloperIdentityResponse developer = admin.getOpenIdTokenForDeveloperIdentity(r ->
+                        r.identityPoolId(pool).logins(Map.of(PROVIDER, "alice")));
+                exchange(anonymousSts, roleArn, developer.token(), sessions);
+                if (disableClassic) {
+                    admin.updateIdentityPool(r -> r.identityPoolId(pool).identityPoolName("iam-" + suffix)
+                            .allowUnauthenticatedIdentities(true).allowClassicFlow(false).developerProviderName(PROVIDER));
+                } else {
+                    admin.unlinkDeveloperIdentity(r -> r.identityPoolId(pool).identityId(developer.identityId())
+                            .developerProviderName(PROVIDER).developerUserIdentifier("alice"));
+                }
+                StsException denied = assertThrows(StsException.class,
+                        () -> exchange(anonymousSts, roleArn, developer.token(), sessions));
+                assertEquals("AccessDenied", denied.awsErrorDetails().errorCode());
+                assertEquals(403, denied.statusCode());
+                if (disableClassic) {
+                    admin.updateIdentityPool(r -> r.identityPoolId(pool).identityPoolName("iam-" + suffix)
+                            .allowUnauthenticatedIdentities(true).allowClassicFlow(true).developerProviderName(PROVIDER));
+                    exchange(anonymousSts, roleArn, developer.token(), sessions);
+                }
+            } finally {
+                sessions.forEach(key -> iamService.unregisterSession(ACCOUNT, key));
+                admin.deleteIdentityPool(r -> r.identityPoolId(pool));
+                if (createdRoleArn != null) {
+                    iam.deleteRole(r -> r.roleName(roleName));
+                }
+            }
+        }
+    }
+
+    private void exchange(StsClient sts, String roleArn, String token, List<String> sessions) {
+        AssumeRoleWithWebIdentityResponse response = sts.assumeRoleWithWebIdentity(r -> r.roleArn(roleArn)
+                .roleSessionName("classic-state").webIdentityToken(token));
+        sessions.add(response.credentials().accessKeyId());
     }
 
     private String trust(String pool, String effect) {
