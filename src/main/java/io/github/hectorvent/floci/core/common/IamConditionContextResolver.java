@@ -1142,13 +1142,24 @@ public class IamConditionContextResolver {
     record AthenaQueryTarget(String resource, Map<String, List<String>> context) {
     }
 
+    static boolean athenaQueryAction(String action) {
+        if (action == null) {
+            return false;
+        }
+        return switch (action) {
+            case "athena:BatchGetQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults",
+                    "athena:StopQueryExecution", "athena:ListQueryExecutions" -> true;
+            default -> false;
+        };
+    }
+
     List<AthenaQueryTarget> athenaQueryTargets(String action, JsonNode body,
                                               String region, String account) {
-        if (!"athena:BatchGetQueryExecution".equals(action) || athenaBatchQueryService == null
+        if (!athenaQueryAction(action) || athenaBatchQueryService == null
                 || !athenaBatchQueryService.isResolvable()) {
             return List.of();
         }
-        return athenaBatchQueryService.get().authorizationTargets(region, account, body).stream()
+        return athenaBatchQueryService.get().authorizationTargets(action, region, account, body).stream()
                 .map(target -> new AthenaQueryTarget(target.resource(), target.context())).toList();
     }
 

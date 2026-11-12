@@ -219,9 +219,15 @@ public class AthenaService {
     }
 
     public QueryExecution getQueryExecution(String id) {
-        return queryStore.get(id)
-                .orElseThrow(() -> new AwsException("InvalidRequestException",
-                        "Query execution not found: " + id, 400));
+        return getQueryExecution(regionResolver.getRegion(), id);
+    }
+
+    public QueryExecution getQueryExecution(String region, String id) {
+        QueryExecution execution = findBatchQueryExecution(region, id);
+        if (execution == null) {
+            throw new AwsException("InvalidRequestException", "Query execution not found: " + id, 400);
+        }
+        return execution;
     }
 
     /** Legacy unprefixed rows belong to the default account; missing region means the configured default. */
@@ -235,8 +241,7 @@ public class AthenaService {
     }
 
     private QueryExecution findBatchQueryExecution(String region, String id, boolean migrateLegacy) {
-        Predicate<QueryExecution> inRegion = execution -> Objects.equals(region,
-                execution.storedRegion() == null ? regionResolver.getDefaultRegion() : execution.storedRegion());
+        Predicate<QueryExecution> inRegion = execution -> queryInRegion(execution, region);
         Optional<QueryExecution> execution = batchScopedRead(queryStore, id, inRegion, migrateLegacy);
         return execution.filter(inRegion).orElse(null);
     }
@@ -267,6 +272,29 @@ public class AthenaService {
         return queryStore.scan(k -> true);
     }
 
+    private boolean queryInRegion(QueryExecution execution, String region) {
+        return Objects.equals(region,
+                execution.storedRegion() == null ? regionResolver.getDefaultRegion() : execution.storedRegion());
+    }
+
+    /** Listing reads eligible legacy rows in place, with explicitly scoped records taking precedence. */
+    private List<QueryExecution> queryHistory(String region) {
+        if (queryStore instanceof AccountAwareStorageBackend<QueryExecution> accounts) {
+            String account = regionResolver.getAccountId();
+            Map<String, QueryExecution> records = new LinkedHashMap<>();
+            for (QueryExecution execution : accounts.scanForAccount(account, key -> true)) {
+                records.put(execution.getQueryExecutionId(), execution);
+            }
+            if (account.equals(regionResolver.getDefaultAccountId())) {
+                for (QueryExecution execution : accounts.scanUnscopedLegacy(value -> true)) {
+                    records.putIfAbsent(execution.getQueryExecutionId(), execution);
+                }
+            }
+            return records.values().stream().filter(execution -> queryInRegion(execution, region)).toList();
+        }
+        return listQueryExecutions().stream().filter(execution -> queryInRegion(execution, region)).toList();
+    }
+
     public PaginatedResult<QueryExecution> listQueryExecutionsPage(String region, String workGroup,
                                                                    Integer maxResults, String nextToken) {
         if (maxResults != null && (maxResults < 0 || maxResults > 50)) {
@@ -277,8 +305,11 @@ public class AthenaService {
         }
         String group = workGroup == null ? DEFAULT_WORKGROUP : workGroup;
         validateWorkGroupName(group);
-        getWorkGroup(group, region);
-        List<QueryExecution> executions = listQueryExecutions().stream()
+        if (!DEFAULT_WORKGROUP.equals(group)
+                && batchScopedRead(workGroupStore, workGroupKey(region, group), value -> true, false).isEmpty()) {
+            throw new AwsException("InvalidRequestException", "WorkGroup " + group + " is not found.", 400);
+        }
+        List<QueryExecution> executions = queryHistory(region).stream()
                 .filter(execution -> group.equals(Objects.requireNonNullElse(execution.getWorkGroup(), DEFAULT_WORKGROUP)))
                 .toList();
         int limit = maxResults == null || maxResults == 0 ? 50 : maxResults;
@@ -288,7 +319,11 @@ public class AthenaService {
     }
 
     public void stopQueryExecution(String id) {
-        QueryExecution execution = getQueryExecution(id);
+        stopQueryExecution(regionResolver.getRegion(), id);
+    }
+
+    public void stopQueryExecution(String region, String id) {
+        QueryExecution execution = getQueryExecution(region, id);
         synchronized (execution) {
             if (isTerminal(execution.getStatus().getState())) {
                 return;
@@ -572,7 +607,11 @@ public class AthenaService {
     }
 
     public ResultSet getQueryResults(String id) {
-        QueryExecution execution = getQueryExecution(id);
+        return getQueryResults(regionResolver.getRegion(), id);
+    }
+
+    public ResultSet getQueryResults(String region, String id) {
+        QueryExecution execution = getQueryExecution(region, id);
 
         if (execution.getStatus().getState() != QueryExecutionState.SUCCEEDED) {
             throw new AwsException("InvalidRequestException", "Query has not succeeded yet", 400);
@@ -1083,7 +1122,7 @@ public class AthenaService {
         return region + ":" + name;
     }
 
-    private void validateWorkGroupName(String name) {
+    static void validateWorkGroupName(String name) {
         if (name == null || name.isBlank()) {
             throw new AwsException("InvalidRequestException", "WorkGroup name is required", 400);
         }

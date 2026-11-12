@@ -21,15 +21,14 @@ or statistics, and does not promise one atomic snapshot across separate queries.
 
 Newly started queries retain their request Region in the existing account-scoped
 query record. The internal Region field is persisted and omitted from every public
-query projection. Batch reads cannot retrieve another Region's records. As a Floci
-migration policy, older records without Region metadata are visible to batch reads
+query projection. Batch and direct query reads cannot retrieve another Region's
+records. As a Floci migration policy, older records without Region metadata are visible
 only in the configured default Region. Legacy rows without an account prefix may
 be migrated only by the configured default account; a refused account or Region
 lookup cannot move them. Account-prefixed IDs use only the caller's explicit
 storage namespace and cannot be reinterpreted as legacy raw keys during either
-IAM authorization or response lookup. Existing single-query lookup behavior is
-preserved. Existing persistent, hybrid and WAL storage reload this metadata;
-memory mode remains in-memory only.
+IAM authorization or response lookup. Existing persistent, hybrid and WAL storage
+reload this metadata; memory mode remains in-memory only.
 
 IAM target and tag discovery reads scoped records or matching default-account
 legacy records without migrating them. A denied request leaves those raw keys and
@@ -49,6 +48,31 @@ policies have not been independently measured against AWS.
 No query-history deletion is added. Terminal history remains in the existing query
 store, including when result objects or workgroups are removed. This change does
 not expand SQL execution support or claim measured AWS statistics equivalence.
+
+## Direct query ownership and authorization
+
+`GetQueryExecution`, `GetQueryResults` and `StopQueryExecution` resolve IDs in the
+caller's account and request Region. An unauthorized account or Region lookup
+cannot migrate a legacy query or change its state. This does not change the existing S3 result-access behavior.
+
+`ListQueryExecutions` filters the requested workgroup and Region before pagination.
+Continuation tokens remain bound to the account, Region and workgroup. As a Floci
+migration policy, unprefixed legacy history is visible only to the default account,
+uses the default Region when Region metadata is absent, is read without migration,
+and never replaces an explicitly account-scoped record with the same ID. Workgroup existence and tag lookups for
+query listings also leave legacy rows in place.
+
+With IAM enforcement enabled, the four direct actions use the exact action and
+workgroup ARN, with that workgroup's current `aws:ResourceTag` values. IAM target
+and tag discovery never migrates rows. Listing authorizes the named workgroup, or
+`primary` when omitted. A missing or out-of-scope ID cannot supply a workgroup ARN,
+so the three ID-based actions use the conservative Floci action-on-`*` fallback:
+a workgroup-only allow is insufficient; an allowed wildcard request reaches the
+existing `InvalidRequestException`. This fallback is local policy and has not
+been independently measured against AWS.
+
+This change does not alter asynchronous query callback account propagation,
+SQL execution, S3 authorization, result pagination or history retention.
 
 ## Supported Actions
 

@@ -645,7 +645,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             return;
         }
         List<IamConditionContextResolver.AthenaQueryTarget> queryTargets =
-                "athena:BatchGetQueryExecution".equals(action)
+                IamConditionContextResolver.athenaQueryAction(action)
                         ? conditionContextResolver.athenaQueryTargets(action, arnBuilder.readJsonBody(ctx), region, accountId)
                         : List.of();
         if (!queryTargets.isEmpty()) {
