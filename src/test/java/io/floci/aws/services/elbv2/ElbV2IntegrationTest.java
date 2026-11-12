@@ -190,7 +190,7 @@ class ElbV2IntegrationTest {
 
     @Test
     @Order(4)
-    void duplicateLoadBalancerNameThrows() {
+    void repeatedLoadBalancerCreateReturnsTheExistingResource() {
         given()
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "my-test-lb")
@@ -200,8 +200,9 @@ class ElbV2IntegrationTest {
             .when()
                 .post("/")
             .then()
-                .statusCode(400)
-                .body("ErrorResponse.Error.Code", equalTo("DuplicateLoadBalancerName"));
+                .statusCode(200)
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn",
+                        equalTo(lbArn));
     }
 
     @Test
