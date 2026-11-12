@@ -79,7 +79,11 @@ class CloudWatchLegacyProtocolIntegrationTest {
     @ParameterizedTest
     @CsvSource({"GET,ListMetrics", "POST,ListMetrics", "GET,DescribeAlarms", "POST,DescribeAlarms"})
     void commonLegacyReadsUseTheRequestedXmlNamespace(String method, String action) throws Exception {
-        String xml = queryRequest(method, action).request(method, "/").then().statusCode(200)
+        RequestSpecification request = queryRequest(method, action);
+        if ("DescribeAlarms".equals(action)) {
+            request.param("AlarmNamePrefix", "legacy-namespace-" + UUID.randomUUID());
+        }
+        String xml = request.request(method, "/").then().statusCode(200)
                 .body(containsString(action + "Response")).extract().asString();
 
         assertEquals(AwsNamespaces.CW_2013, XmlParser.parseDocument(xml)
