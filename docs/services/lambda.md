@@ -654,6 +654,7 @@ Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ENABLED` | `true` | Re-deploy a function when its S3 deployment object is overwritten. See [Reactive S3 Sync](#reactive-s3-sync-configuration) |
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ASYNC` | `false` | Run that re-deploy in the background so the upload does not wait for it |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | *(unset)* | Docker network to attach Lambda containers to (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
+| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | *(unset)* | Comma-separated existing Docker network names or IDs joined before a function starts. Name/ID aliases attach once. Additional endpoints use a lower gateway priority where Docker supports it, preserving the primary route. A failed attachment aborts and cleans up the launch; duplicate or invalid names are rejected |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | *(unset)* | Additional Docker flags applied to Lambda containers, including `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Explicit `--dns` entries replace automatic embedded DNS and public fallback resolvers. Published ports support `host:container` and `127.0.0.1:host:container` forms |
 | `FLOCI_SERVICES_LAMBDA_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to each Lambda container's `/etc/hosts`; `ip` may be `host-gateway`, mirroring `docker run --add-host` |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | *(unset)* | Explicit host/IP that spawned Lambda containers use to reach Floci's Runtime API, bypassing auto-detection |
@@ -987,6 +988,13 @@ invocation to time out.
 on its container IP. All Lambda containers launched by Floci are configured to
 use it as their DNS resolver. It binds that advertised IP so replies retain the
 queried source address even when the container has multiple network interfaces.
+On an internal Docker bridge, Docker's resolver does not forward to configured DNS
+servers. Lambda prepares a read-only resolver file before runtime initialization:
+Docker's resolver remains first for peer aliases, followed by the configured servers.
+The named volume remains attached while the workload uses it, survives runtime
+restarts, and is removed after container teardown. Failed removal remains queued
+for retry. Explicit mounts covering `/etc/resolv.conf`, `/etc`, or `/` take precedence.
+
 The embedded DNS server:
 
 - Resolves `*.localhost.floci.io` → Floci's Docker network IP
@@ -1057,13 +1065,34 @@ A rejected update preserves the configuration and revision. Empty subnet and sec
 group lists detach the function, and the response then omits `VpcConfig`. Published
 versions retain their network configuration when `$LATEST` changes.
 
-These checks validate the declaration. Function containers still use the configured
-Docker network. With Docker-backed VPC networks (`FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=true`
-and `FLOCI_SERVICES_EC2_MOCK=false`) and a known `VpcId`, the container also joins that VPC's
-Docker network at an address leased from the first subnet in `SubnetIds`, so it reaches EC2
-instances and `awsvpc` ECS tasks in the VPC at the private addresses they report. The address is
-returned once the container is removed. `VpcConfig` does not yet enforce security-group rules or
-NAT egress, and the other subnets are not used.
+For Docker execution with `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`,
+each VPC-connected execution environment gets an ENI in a declared subnet and a
+protected network namespace. Subnet selection rotates across the declared subnets
+when new environments start. Security-group rules are installed before function
+code starts, and SDK rule changes update warm environments. A missing ingress or
+egress rule drops real packets, leaving the function's own client to time out.
+
+The namespace permits the exact IP and TCP port of that environment's Runtime API,
+so blocked application traffic does not prevent invocation delivery or results.
+This does not open the emulator's other API ports. EC2 instance metadata is blocked.
+Privileged containers and Docker network, port, DNS or host overrides cannot be
+combined with protected VPC execution. Ordinary environment retirement removes the
+container before releasing its helper and ENI; startup retires surviving owned
+helpers and their workloads.
+
+This currently allocates an ENI per execution environment. Hyperplane ENI sharing,
+attachment-time IAM permission checks, VPC routes, NACLs and NAT translation are
+not emulated by this path. Packets still use Docker transport addresses. The
+security-group flag is opt-in and applies to Docker execution.
+
+Without security-group enforcement, Docker-backed VPC networks
+(`FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=true` and `FLOCI_SERVICES_EC2_MOCK=false`)
+and a known `VpcId` let the container join that VPC's Docker network at an address
+leased from the first declared subnet. That address is returned after the container
+is removed. This path does not enforce security-group rules or NAT egress and does
+not use the other declared subnets. Protected execution uses its helper's namespace
+instead of adding this ordinary VPC network attachment.
+
 
 `RuntimeVersionConfig.RuntimeVersionArn` is returned for managed (non-image)
 runtimes. Its value is derived from the runtime name, so it is stable across
