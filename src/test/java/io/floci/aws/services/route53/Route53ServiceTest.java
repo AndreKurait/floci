@@ -43,6 +43,30 @@ class Route53ServiceTest {
 
     private final Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
 
+    @Test
+    void testDnsAnswerRejectsPrivateAndMissingZones() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("private.example", "answer-private", null,
+                new VpcAssociation("vpc-123", "us-east-1")).zone().getId();
+        AwsException privateError = assertThrows(AwsException.class, () ->
+                service.testDnsAnswer(zoneId, "private.example", "NS", null, null, null));
+        assertEquals("InvalidInput", privateError.getErrorCode());
+        AwsException missingError = assertThrows(AwsException.class, () ->
+                service.testDnsAnswer("ZMissing", "private.example", "NS", null, null, null));
+        assertEquals("NoSuchHostedZone", missingError.getErrorCode());
+    }
+
+    @Test
+    void testDnsAnswerUsesDelegationMetadataAndAcceptsZonePrefix() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com", "answer-public", null, null).zone().getId();
+        Route53Service.TestDnsAnswerResult answer = service.testDnsAnswer("/hostedzone/" + zoneId,
+                "EXAMPLE.com", "NS", null, "2001:db8::1", null);
+        assertEquals("EXAMPLE.com", answer.recordName());
+        assertEquals(service.getAssignedNameServers(zoneId).getFirst(), answer.nameserver());
+        assertEquals(service.getAssignedNameServers(zoneId).stream().map(ns -> ns + ".").toList(), answer.recordData());
+    }
+
     private Route53Service newService() {
         return newService(".");
     }
