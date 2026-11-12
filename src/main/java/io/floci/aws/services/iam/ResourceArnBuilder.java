@@ -220,6 +220,12 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("kinesis".equals(credentialScope) && operation != null && Set.of("kinesis:GetResourcePolicy",
+                "kinesis:PutResourcePolicy", "kinesis:DeleteResourcePolicy").contains(operation)) {
+            JsonNode body = readJsonBody(ctx);
+            String resource = body == null ? null : body.path("ResourceARN").asText(null);
+            return List.of(resource == null || resource.isEmpty() ? "*" : resource);
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }

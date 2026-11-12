@@ -18,6 +18,7 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.ResourceArnBuilder;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
+import io.floci.aws.services.kinesis.KinesisService;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.s3.S3ConditionKeys;
 import io.floci.aws.services.s3.S3ControlTagConditionKeys;
@@ -104,6 +105,7 @@ public class IamConditionContextResolver {
     private final Instance<CloudWatchLogsCrossAccountService> crossAccountService;
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
+    private final Instance<KinesisService> kinesisService;
     private final RequestContext requestContext;
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
@@ -115,6 +117,23 @@ public class IamConditionContextResolver {
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<KinesisService> kinesisService) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), kinesisService);
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -142,6 +161,22 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext, config, currentVertxRequest, serviceCatalog, clock, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                Instance<KinesisService> kinesisService) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -149,11 +184,32 @@ public class IamConditionContextResolver {
         this.crossAccountService = crossAccountService;
         this.iamService = iamService;
         this.lambdaWebService = lambdaWebService;
+        this.kinesisService = kinesisService;
         this.requestContext = requestContext;
         this.config = config;
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
         this.serviceCatalog = serviceCatalog;
+    }
+
+    private Map<String, List<String>> kinesisConditionContext(String action, ContainerRequestContext ctx) {
+        if (kinesisService == null || !kinesisService.isResolvable() || !Set.of("kinesis:GetResourcePolicy",
+                "kinesis:PutResourcePolicy", "kinesis:DeleteResourcePolicy").contains(action)) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("ResourceARN").isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        try {
+            kinesisService.get().resourcePolicyTags(body.path("ResourceARN").textValue(), region)
+                    .forEach((key, value) -> context.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        } catch (AwsException expected) {
+            // Missing or foreign resources provide no tags; the handler returns its resource error if authorized.
+        }
+        return context;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -165,6 +221,7 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "kinesis" -> kinesisConditionContext(action, ctx);
             case "redshift" -> RequestConditionKeys.requestKeys(action).isEmpty() ? null
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
