@@ -62,6 +62,7 @@ import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.oas.models.security.SecurityScheme;
+import io.swagger.v3.parser.core.models.ParseOptions;
 import io.swagger.v3.parser.core.models.SwaggerParseResult;
 import io.swagger.v3.parser.util.OpenAPIDeserializer;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -2404,6 +2405,97 @@ public class ApiGatewayService implements ResourceProvider, Resettable {
             "QUERY_PARAMETER", "REQUEST_HEADER", "REQUEST_BODY", "RESPONSE", "RESPONSE_HEADER", "RESPONSE_BODY");
     private static final Set<String> DOCUMENTATION_PART_STATUS_TYPES = Set.of("RESPONSE", "RESPONSE_HEADER",
             "RESPONSE_BODY");
+
+    public record DocumentationPartImportResult(List<String> ids, List<String> warnings) {}
+
+    /** Imports documentation metadata without applying the OpenAPI document's API definitions. */
+    public synchronized DocumentationPartImportResult importDocumentationParts(String region, String apiId,
+                                                                                String mode, String body,
+                                                                                boolean failOnWarnings) {
+        getRestApi(region, apiId);
+        String effectiveMode = mode == null ? "merge" : mode;
+        if (!Set.of("merge", "overwrite").contains(effectiveMode)) {
+            throw new AwsException("BadRequestException", "Invalid documentation import mode", 400);
+        }
+        JsonNode document;
+        try {
+            document = body == null ? null : JSON.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS,
+                    DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).readTree(body);
+        } catch (JsonProcessingException exception) {
+            throw new AwsException("BadRequestException", "Documentation import requires a JSON OpenAPI document", 400);
+        }
+        if (document == null || !document.isObject()) {
+            throw new AwsException("BadRequestException", "Documentation import requires a JSON OpenAPI document", 400);
+        }
+        JsonNode parts = document.path("x-amazon-apigateway-documentation").path("documentationParts");
+        if (!parts.isArray()) {
+            throw new AwsException("BadRequestException", "documentationParts must be an array", 400);
+        }
+        ParseOptions options = new ParseOptions();
+        options.setResolve(false);
+        options.setResolveFully(false);
+        SwaggerParseResult parsed = new OpenAPIParser().readContents(body, null, options);
+        if (parsed.getOpenAPI() == null) {
+            throw new AwsException("BadRequestException", "Invalid OpenAPI document", 400);
+        }
+        List<String> warnings = parsed.getMessages() == null ? List.of() : List.copyOf(parsed.getMessages());
+        if (failOnWarnings && !warnings.isEmpty()) {
+            throw new AwsException("BadRequestException", "Warnings found during documentation import: "
+                    + String.join("; ", warnings), 400);
+        }
+        String prefix = region + "::" + apiId + "::";
+        List<DocumentationPart> existing = documentationPartStore.scan(key -> key.startsWith(prefix));
+        Map<Map<String, String>, DocumentationPart> byLocation = new HashMap<>();
+        Set<String> usedIds = new HashSet<>();
+        existing.forEach(part -> {
+            byLocation.put(part.getLocation(), part);
+            usedIds.add(part.getId());
+        });
+        Set<Map<String, String>> incomingLocations = new HashSet<>();
+        Map<String, DocumentationPart> replacements = new LinkedHashMap<>();
+        List<String> ids = new ArrayList<>();
+        for (JsonNode input : parts) {
+            if (!input.isObject() || !input.path("properties").isObject()) {
+                throw new AwsException("BadRequestException", "Imported documentation properties must be an object", 400);
+            }
+            ObjectNode request = JSON.createObjectNode().put("restApiId", apiId)
+                    .put("properties", input.get("properties").toString());
+            request.set("location", input.get("location"));
+            ApiGatewayDocumentationRequestShapes.check("CreateDocumentationPart", request);
+            Map<String, String> location = documentationPartLocation(JSON.convertValue(input.get("location"), Map.class));
+            if (!incomingLocations.add(location)) {
+                throw new AwsException("BadRequestException", "Duplicate documentation part location in import", 400);
+            }
+            DocumentationPart previous = byLocation.get(location);
+            String id = previous == null ? shortId(6) : previous.getId();
+            while (previous == null && !usedIds.add(id)) {
+                id = shortId(6);
+            }
+            ObjectNode properties = JSON.createObjectNode();
+            if (previous != null && "merge".equals(effectiveMode)) {
+                try {
+                    properties.setAll((ObjectNode) JSON.reader().with(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+                            .readTree(previous.getProperties()));
+                } catch (JsonProcessingException exception) {
+                    throw new IllegalStateException("Stored documentation properties are invalid", exception);
+                }
+            }
+            properties.setAll((ObjectNode) input.get("properties"));
+            DocumentationPart replacement = new DocumentationPart();
+            replacement.setId(id);
+            replacement.setLocation(location);
+            replacement.setProperties(properties.toString());
+            replacements.put(documentationPartKey(region, apiId, id), replacement);
+            ids.add(id);
+        }
+        Set<String> deletions = new HashSet<>();
+        if ("overwrite".equals(effectiveMode)) {
+            existing.forEach(part -> deletions.add(documentationPartKey(region, apiId, part.getId())));
+            deletions.removeAll(replacements.keySet());
+        }
+        documentationPartStore.applyAtomically(replacements, deletions);
+        return new DocumentationPartImportResult(List.copyOf(ids), warnings);
+    }
 
     public synchronized DocumentationPart createDocumentationPart(String region, String apiId,
                                                                    Map<String, Object> request) {

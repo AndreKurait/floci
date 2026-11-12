@@ -101,6 +101,24 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public synchronized void applyAtomically(Map<K, V> entries, Set<K> keys) {
+        Map<K, V> replacements = Map.copyOf(entries);
+        Set<K> deletions = Set.copyOf(keys);
+        if (replacements.isEmpty() && deletions.isEmpty()) {
+            return;
+        }
+        ConcurrentHashMap<K, V> candidate = new ConcurrentHashMap<>(store);
+        candidate.putAll(replacements);
+        candidate.keySet().removeAll(deletions);
+        try {
+            StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), candidate));
+        } catch (IOException exception) {
+            throw new UncheckedIOException("Failed to commit mixed atomic batch to " + filePath, exception);
+        }
+        store = candidate;
+    }
+
+    @Override
     public List<V> scan(Predicate<K> keyFilter) {
         return store.entrySet().stream()
                 .filter(e -> keyFilter.test(e.getKey()))

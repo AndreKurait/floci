@@ -115,11 +115,26 @@ changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not a
 | **Request Validators** | CreateRequestValidator, GetRequestValidator, GetRequestValidators, UpdateRequestValidator, DeleteRequestValidator |
 | **Gateway Responses** | PutGatewayResponse, GetGatewayResponse, GetGatewayResponses, UpdateGatewayResponse, DeleteGatewayResponse |
 | **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
-| **Documentation Parts** | CreateDocumentationPart, GetDocumentationPart, GetDocumentationParts, UpdateDocumentationPart, DeleteDocumentationPart |
+| **Documentation Parts** | CreateDocumentationPart, GetDocumentationPart, GetDocumentationParts, UpdateDocumentationPart, DeleteDocumentationPart, ImportDocumentationParts |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **Base Path Mappings** | CreateBasePathMapping, GetBasePathMapping, GetBasePathMappings, UpdateBasePathMapping, DeleteBasePathMapping |
 | **Account** | GetAccount, UpdateAccount |
 | **Tags** | TagResource, UntagResource, GetTags (ListTagsForResource) |
+
+`ImportDocumentationParts` accepts a JSON OpenAPI 2.0 or 3.0 document containing
+`x-amazon-apigateway-documentation.documentationParts`. Its default `merge` mode preserves
+existing part IDs and property attributes omitted from the import; an incoming attribute
+replaces the corresponding whole attribute, including an object or array. `overwrite`
+replaces the documentation collection and properties. An empty array in overwrite mode
+clears the collection. API resources, methods, models and other API definitions in the
+OpenAPI document are not changed by this operation.
+
+The complete import is validated before a single storage commit. Invalid locations or
+properties, duplicate canonical locations within one import, and `failOnWarnings=true`
+with parser warnings leave the prior collection intact. Warnings come from the local
+OpenAPI parser; their wording is not an exact AWS diagnostic catalog. YAML and external
+reference resolution are not supported. The extension's `version` is snapshot metadata;
+importing it does not create a documentation version.
 
 Documentation part listing covers created parts. The `UNDOCUMENTED` location status does not
 discover API locations without documentation content yet.
@@ -408,7 +423,6 @@ These management-plane operations have no handler in v1. Calls will return `404`
 - Model templates: `GetModelTemplate`
 - Documentation versions (5 operations)
 - Client Certificates (5 operations)
-- `ImportDocumentationParts`
 
 The execute plane (actual proxied HTTP traffic via `/restapis/{id}/{stage}/_user_request_/…`)
 is implemented separately and is not counted as management-plane operations. A deployed REST

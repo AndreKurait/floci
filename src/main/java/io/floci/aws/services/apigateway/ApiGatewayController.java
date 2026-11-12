@@ -1224,6 +1224,20 @@ public class ApiGatewayController {
 
     // ──────────────────────────── Documentation Parts (v1) ────────────────────────────
 
+    @PUT
+    @Path("/restapis/{apiId}/documentation/parts")
+    public Response importDocumentationParts(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                             @QueryParam("mode") String mode,
+                                             @QueryParam("failonwarnings") boolean failOnWarnings, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        ApiGatewayService.DocumentationPartImportResult result = service.importDocumentationParts(
+                region, apiId, mode, body, failOnWarnings);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("ids", objectMapper.valueToTree(result.ids()));
+        response.set("warnings", objectMapper.valueToTree(result.warnings()));
+        return Response.ok(response.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
     @POST
     @Path("/restapis/{apiId}/documentation/parts")
     public Response createDocumentationPart(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
