@@ -368,6 +368,7 @@ floci:
       metadata-helper-image: floci/network-helper:local
       ssh-port-range-start: 2200
       ssh-port-range-end: 2299
+      ssh-host-bind-address: "127.0.0.1"
       publish-security-group-ports: true
       app-port-range-start: 30000
       app-port-range-end: 30999

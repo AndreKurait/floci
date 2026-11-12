@@ -142,6 +142,10 @@ until [[ "$(docker logs "$guest")" == "first_metadata=$instance" ]]; do
 done
 helper="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$guest")"
 [[ "$helper" == container:* ]]
+[[ "$(docker inspect "${helper#container:}" | jq -r \
+    '.[0].HostConfig.PortBindings["22/tcp"][0].HostIp')" == "127.0.0.1" ]]
+[[ "$(docker inspect "${helper#container:}" | jq -r \
+    '.[0].NetworkSettings.Ports["22/tcp"][0].HostIp')" == "127.0.0.1" ]]
 [[ "$(docker exec "${helper#container:}" /usr/local/bin/floci-ec2-init --version)" == "floci-ec2-init 1" ]]
 [[ "$(docker inspect --format '{{.Image}}' "${helper#container:}")" == \
    "$(docker image inspect --format '{{.Id}}' "$helper_image")" ]]

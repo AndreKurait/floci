@@ -3722,6 +3722,10 @@ public interface EmulatorConfig {
         @WithDefault("2299")
         int sshPortRangeEnd();
 
+        /** Host interface for SSH published by either EC2 network helper. */
+        @WithDefault("127.0.0.1")
+        String sshHostBindAddress();
+
         /**
          * When true, TCP ports opened by an instance's security-group ingress rules are
          * published on the host via a socat sidecar container, both at launch and on later

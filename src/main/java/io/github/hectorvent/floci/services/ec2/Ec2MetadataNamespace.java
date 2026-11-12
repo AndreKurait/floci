@@ -42,11 +42,16 @@ final class Ec2MetadataNamespace {
                 .withEntrypoint(List.of("sh", "-c"))
                 .withCmd(List.of("exec sleep 2147483647"))
                 .withCapAdd("NET_ADMIN")
-                .withPortBinding(22, sshHostPort)
+                .withPortBinding(22, sshHostPort, sshHostBindAddress())
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels("ec2", instanceId, accountId, region))
                 .withLabels(Map.of(HELPER_LABEL, "true",
                         ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)))
                 .build();
         return lifecycleManager.createAndStart(spec).containerId();
+    }
+
+    String sshHostBindAddress() {
+        String address = config.services().ec2().sshHostBindAddress();
+        return address == null || address.isBlank() ? "127.0.0.1" : address;
     }
 }
