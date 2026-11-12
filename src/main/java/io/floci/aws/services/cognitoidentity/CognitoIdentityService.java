@@ -5,21 +5,28 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.cognitoidentity.model.CognitoIdentity;
 import io.floci.aws.services.cognitoidentity.model.IdentityPool;
 import io.floci.aws.services.cognitoidentity.model.PrincipalTagAttributeMap;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 /**
@@ -43,12 +50,15 @@ public class CognitoIdentityService {
 
     private final StorageBackend<String, IdentityPool> pools;
     private final RegionResolver regionResolver;
+    private final StorageBackend<String, CognitoIdentity> identities;
 
     @Inject
     public CognitoIdentityService(StorageFactory storageFactory, RegionResolver regionResolver) {
         this.pools = storageFactory.create("cognitoidentity", "cognitoidentity-pools.json",
                 new TypeReference<Map<String, IdentityPool>>() {});
         this.regionResolver = regionResolver;
+        this.identities = storageFactory.create("cognitoidentity", "cognitoidentity-identities.json",
+                new TypeReference<Map<String, CognitoIdentity>>() {});
     }
 
     // ──────────────────────────── Identity pools ────────────────────────────
@@ -96,8 +106,11 @@ public class CognitoIdentityService {
         return spec;
     }
 
-    public void deleteIdentityPool(String identityPoolId, String region) {
-        describeIdentityPool(identityPoolId, region);
+    public synchronized void deleteIdentityPool(String identityPoolId, String region) {
+        IdentityPool pool = describeIdentityPool(identityPoolId, region);
+        Set<String> identityKeys = new LinkedHashSet<>();
+        poolIdentities(pool, region).forEach(identity -> identityKeys.add(identity.identityId()));
+        deleteForAccount(pool.getAccountId(), identityKeys);
         pools.delete(storageKey(region, identityPoolId));
         LOG.infov("Deleted Cognito identity pool: {0}", identityPoolId);
     }
@@ -305,5 +318,268 @@ public class CognitoIdentityService {
 
     private String storageKey(IdentityPool pool) {
         return storageKey(AwsArnUtils.parse(pool.getArn()).region(), pool.getIdentityPoolId());
+    }
+
+    public static boolean isIdentityId(String value) {
+        return value != null && value.matches("[\\w-]+:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
+    }
+
+    public IdentityPool publicPool(String poolId, String region) {
+        requireIdentity(poolId, region);
+        String key = storageKey(region, poolId);
+        List<IdentityPool> matches = pools instanceof AccountAwareStorageBackend<IdentityPool> aware
+                ? aware.findAllAccountEntries(key).stream()
+                        .filter(entry -> entry.accountId().equals(entry.value().getAccountId()))
+                        .map(entry -> entry.value()).toList()
+                : pools.get(key).stream().toList();
+        if (matches.size() != 1) {
+            throw identityMissing();
+        }
+        return matches.getFirst();
+    }
+
+    public synchronized CognitoIdentity getId(String poolId, String accountId, Map<String, String> logins,
+                                               String region) {
+        IdentityPool pool = publicPool(poolId, region);
+        if (accountId != null && !pool.getAccountId().equals(accountId)) {
+            throw identityMissing();
+        }
+        rejectLogins(logins);
+        requireGuest(pool, null);
+        CognitoIdentity identity = newIdentity(pool, region, false, List.of());
+        putIdentity(identity);
+        return identity;
+    }
+
+    public CognitoIdentity publicIdentity(String identityId, String region) {
+        requireIdentity(identityId, region);
+        List<CognitoIdentity> matches = identities instanceof AccountAwareStorageBackend<CognitoIdentity> aware
+                ? aware.findAllAccountEntries(identityId).stream()
+                        .filter(entry -> entry.accountId().equals(entry.value().accountId()))
+                        .map(entry -> entry.value()).toList()
+                : identities.get(identityId).stream().toList();
+        if (matches.size() != 1 || !region.equals(matches.getFirst().region())) {
+            throw identityMissing();
+        }
+        CognitoIdentity identity = matches.getFirst();
+        IdentityPool pool = publicPool(identity.identityPoolId(), region);
+        if (!pool.getAccountId().equals(identity.accountId())) {
+            throw identityMissing();
+        }
+        return identity;
+    }
+
+    public CognitoIdentity describeIdentity(String identityId, String region) {
+        requireIdentity(identityId, region);
+        CognitoIdentity identity = identities.get(identityId).orElseThrow(CognitoIdentityService::identityMissing);
+        if (!identity.accountId().equals(regionResolver.getAccountId()) || !identity.region().equals(region)) {
+            throw identityMissing();
+        }
+        describeIdentityPool(identity.identityPoolId(), region);
+        return identity;
+    }
+
+    public record IdentityPage(List<CognitoIdentity> identities, String nextToken) {}
+
+    public IdentityPage listIdentities(String poolId, Integer maxResults, String nextToken,
+                                       boolean hideDisabled, String region) {
+        IdentityPool pool = describeIdentityPool(poolId, region);
+        List<CognitoIdentity> values = poolIdentities(pool, region).stream()
+                .filter(identity -> !hideDisabled || identity.active())
+                .sorted(Comparator.comparing(CognitoIdentity::identityId)).toList();
+        int limit = pageSize(maxResults);
+        String cursor = cursor(nextToken, poolId + ":identities:" + hideDisabled);
+        List<CognitoIdentity> remaining = values.stream()
+                .filter(identity -> cursor == null || identity.identityId().compareTo(cursor) > 0).toList();
+        List<CognitoIdentity> page = remaining.stream().limit(limit).toList();
+        return new IdentityPage(page, remaining.size() > limit
+                ? nextToken(poolId + ":identities:" + hideDisabled, page.getLast().identityId()) : null);
+    }
+
+    public CognitoIdentity developerIdentity(String poolId, String requestedIdentityId,
+                                              Map<String, String> logins, String region) {
+        return developerIdentity(poolId, requestedIdentityId, logins, region, Function.identity());
+    }
+
+    public synchronized <T> T developerIdentity(String poolId, String requestedIdentityId,
+                                                Map<String, String> logins, String region,
+                                                Function<CognitoIdentity, T> beforePublish) {
+        IdentityPool pool = describeIdentityPool(poolId, region);
+        String provider = pool.getDeveloperProviderName();
+        if (provider == null || logins.size() != 1 || !logins.containsKey(provider)
+                || logins.get(provider) == null || logins.get(provider).isBlank()) {
+            throw new AwsException("InvalidParameterException", "A configured developer provider login is required.", 400);
+        }
+        String user = logins.get(provider);
+        CognitoIdentity linked = poolIdentities(pool, region).stream()
+                .filter(identity -> identity.developerUserIdentifiers().contains(user)).findFirst().orElse(null);
+        CognitoIdentity selected = requestedIdentityId == null ? linked : describeIdentity(requestedIdentityId, region);
+        if (selected != null && (!selected.identityPoolId().equals(poolId) || !selected.active())) {
+            throw identityMissing();
+        }
+        if (linked != null && selected != null && !linked.identityId().equals(selected.identityId())) {
+            throw new AwsException("DeveloperUserAlreadyRegisteredException",
+                    "The developer user is already registered with another identity.", 400);
+        }
+        if (selected == null) {
+            selected = newIdentity(pool, region, true, List.of(user));
+        } else {
+            List<String> users = new ArrayList<>(selected.developerUserIdentifiers());
+            if (!users.contains(user)) {
+                users.add(user);
+            }
+            selected = selected.withDeveloperUsers(users, Instant.now());
+        }
+        T result = beforePublish.apply(selected);
+        putIdentity(selected);
+        return result;
+    }
+
+    public record DeveloperLookup(String identityId, List<String> developerUserIdentifiers, String nextToken) {}
+
+    public DeveloperLookup lookupDeveloper(String poolId, String identityId, String developerUser,
+                                           Integer maxResults, String nextToken, String region) {
+        IdentityPool pool = describeIdentityPool(poolId, region);
+        if (identityId == null && developerUser == null) {
+            throw new AwsException("InvalidParameterException", "An identity or developer user is required.", 400);
+        }
+        CognitoIdentity identity = identityId == null ? poolIdentities(pool, region).stream()
+                .filter(value -> value.developerUserIdentifiers().contains(developerUser))
+                .findFirst().orElseThrow(CognitoIdentityService::identityMissing) : describeIdentity(identityId, region);
+        if (!poolId.equals(identity.identityPoolId())) {
+            throw identityMissing();
+        }
+        if (developerUser != null && !identity.developerUserIdentifiers().contains(developerUser)) {
+            throw new AwsException("ResourceConflictException", "The developer user does not match the identity.", 400);
+        }
+        int limit = pageSize(maxResults);
+        String scope = poolId + ":developer:" + identity.identityId();
+        String cursor = cursor(nextToken, scope);
+        List<String> remaining = identity.developerUserIdentifiers().stream().sorted()
+                .filter(value -> cursor == null || value.compareTo(cursor) > 0).toList();
+        List<String> page = remaining.stream().limit(limit).toList();
+        return new DeveloperLookup(identity.identityId(), page,
+                remaining.size() > limit ? nextToken(scope, page.getLast()) : null);
+    }
+
+    public synchronized void unlinkDeveloper(String poolId, String identityId, String provider,
+                                               String developerUser, String region) {
+        IdentityPool pool = describeIdentityPool(poolId, region);
+        CognitoIdentity identity = describeIdentity(identityId, region);
+        if (!poolId.equals(identity.identityPoolId()) || provider == null
+                || !provider.equals(pool.getDeveloperProviderName())
+                || !identity.developerUserIdentifiers().contains(developerUser)) {
+            throw new AwsException("ResourceConflictException", "The developer login is not linked to this identity.", 400);
+        }
+        List<String> users = new ArrayList<>(identity.developerUserIdentifiers());
+        users.remove(developerUser);
+        putIdentity(identity.withDeveloperUsers(users, Instant.now()));
+    }
+
+    public synchronized List<String> deleteIdentities(List<String> identityIds, String region) {
+        if (identityIds == null || identityIds.isEmpty() || identityIds.size() > 60) {
+            throw new AwsException("InvalidParameterException", "Between 1 and 60 identities are required.", 400);
+        }
+        identityIds.forEach(value -> requireIdentity(value, region));
+        Set<String> existing = new LinkedHashSet<>();
+        List<String> unprocessed = new ArrayList<>();
+        for (String id : identityIds) {
+            CognitoIdentity identity = identities.get(id).orElse(null);
+            if (identity != null && identity.accountId().equals(regionResolver.getAccountId())
+                    && identity.region().equals(region)) {
+                existing.add(id);
+            }
+        }
+        deleteForAccount(regionResolver.getAccountId(), existing);
+        return unprocessed;
+    }
+
+    public static void requireGuest(IdentityPool pool, CognitoIdentity identity) {
+        if (!pool.isAllowUnauthenticatedIdentities()
+                || (identity != null && (identity.authenticated() || !identity.active()))) {
+            throw new AwsException("NotAuthorizedException", "Unauthenticated access is not supported.", 400);
+        }
+    }
+
+    public static void rejectLogins(Map<String, String> logins) {
+        if (logins != null && !logins.isEmpty()) {
+            throw new AwsException("NotAuthorizedException", "External provider token validation is not supported.", 400);
+        }
+    }
+
+    public static void requireSupportedRoleConfiguration(IdentityPool pool) {
+        if ((pool.getRoleMappings() != null && !pool.getRoleMappings().isEmpty())
+                || (pool.getPrincipalTagAttributeMaps() != null && !pool.getPrincipalTagAttributeMaps().isEmpty())) {
+            throw new AwsException("InvalidIdentityPoolConfigurationException",
+                    "Credential issuance with role mappings or principal-tag mappings is not supported.", 400);
+        }
+    }
+
+    private List<CognitoIdentity> poolIdentities(IdentityPool pool, String region) {
+        List<CognitoIdentity> values = identities instanceof AccountAwareStorageBackend<CognitoIdentity> aware
+                ? aware.scanForAccount(pool.getAccountId(), key -> true) : identities.scan(key -> true);
+        return values.stream().filter(value -> pool.getAccountId().equals(value.accountId())
+                && pool.getIdentityPoolId().equals(value.identityPoolId()) && region.equals(value.region())).toList();
+    }
+
+    private void putIdentity(CognitoIdentity identity) {
+        if (identities instanceof AccountAwareStorageBackend<CognitoIdentity> aware) {
+            aware.putAllAtomicallyForAccount(identity.accountId(), Map.of(identity.identityId(), identity));
+        } else {
+            identities.putAllAtomically(Map.of(identity.identityId(), identity));
+        }
+    }
+
+    private void deleteForAccount(String account, Set<String> keys) {
+        if (identities instanceof AccountAwareStorageBackend<CognitoIdentity> aware) {
+            aware.deleteAllAtomicallyForAccounts(Map.of(account, keys));
+        } else {
+            identities.deleteAllAtomically(keys);
+        }
+    }
+
+    private static CognitoIdentity newIdentity(IdentityPool pool, String region, boolean authenticated,
+                                               List<String> developerUsers) {
+        Instant now = Instant.now();
+        return new CognitoIdentity(region + ":" + UUID.randomUUID(), pool.getIdentityPoolId(), pool.getAccountId(),
+                region, now, now, authenticated, true, developerUsers);
+    }
+
+    private static void requireIdentity(String id, String region) {
+        if (!isIdentityId(id) || !id.startsWith(region + ":")) {
+            throw new AwsException("InvalidParameterException", "A valid identity identifier in this region is required.", 400);
+        }
+    }
+
+    private static AwsException identityMissing() {
+        return new AwsException("ResourceNotFoundException", "The identity or identity pool was not found.", 400);
+    }
+
+    private static int pageSize(Integer requested) {
+        int value = requested == null ? 60 : requested;
+        if (value < 1 || value > 60) {
+            throw new AwsException("InvalidParameterException", "MaxResults must be between 1 and 60.", 400);
+        }
+        return value;
+    }
+
+    private static String nextToken(String scope, String last) {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString((scope + "\n" + last).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String cursor(String token, String scope) {
+        if (token == null) {
+            return null;
+        }
+        try {
+            String decoded = new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8);
+            if (decoded.startsWith(scope + "\n") && decoded.length() > scope.length() + 1) {
+                return decoded.substring(scope.length() + 1);
+            }
+        } catch (IllegalArgumentException ignored) {
+            // Invalid or foreign pagination tokens are refused below.
+        }
+        throw new AwsException("InvalidParameterException", "The pagination token is invalid for this request.", 400);
     }
 }

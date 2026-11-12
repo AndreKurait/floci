@@ -24,8 +24,14 @@ public record CallerContext(
         String sessionPolicyDocument,
         String boundaryPolicyDocument,
         List<List<String>> scpLevels,
-        String principalArn
+        String principalArn,
+        VerifiedIdentityContext verifiedIdentityContext
 ) {
+    public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
+                         String boundaryPolicyDocument, List<List<String>> scpLevels, String principalArn) {
+        this(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels, principalArn, null);
+    }
+
     /** Source-compatible constructor for callers predating principalArn support. */
     public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
                          String boundaryPolicyDocument, List<List<String>> scpLevels) {
@@ -45,18 +51,27 @@ public record CallerContext(
 
     /** Copy of this context with the effective SCP levels attached. */
     public CallerContext withScpLevels(List<List<String>> levels) {
-        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, levels, principalArn);
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                levels, principalArn, verifiedIdentityContext);
     }
 
     /** Copy of this context with one more identity policy, evaluated like the caller's own. */
     public CallerContext withIdentityPolicy(String policyDocument) {
         List<String> policies = new ArrayList<>(identityPolicies);
         policies.add(policyDocument);
-        return new CallerContext(policies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels, principalArn);
+        return new CallerContext(policies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, verifiedIdentityContext);
     }
 
     /** Copy of this context with the caller principal ARN attached. */
     public CallerContext withPrincipalArn(String principalArn) {
-        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels, principalArn);
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, verifiedIdentityContext);
+    }
+
+    /** Attaches facts captured by credential resolution, retaining all policy ceilings. */
+    public CallerContext withVerifiedIdentityContext(VerifiedIdentityContext context) {
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, context);
     }
 }
