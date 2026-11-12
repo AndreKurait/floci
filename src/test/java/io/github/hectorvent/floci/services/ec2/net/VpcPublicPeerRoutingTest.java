@@ -5,6 +5,9 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Network;
@@ -35,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -91,6 +95,8 @@ class VpcPublicPeerRoutingTest {
         when(publicNetwork.getOptions()).thenReturn(Map.of("com.docker.network.bridge.enable_ip_masquerade", "false"));
         String name = ContainerStorageHelper.resourceName(config, "vpc-public-transport", null, "network");
         when(docker.inspectNetworkCmd().withNetworkId(name).exec()).thenReturn(publicNetwork);
+        when(docker.inspectNetworkCmd().withNetworkId("public-network").exec()).thenReturn(publicNetwork);
+        when(publicNetwork.getContainers()).thenReturn(Map.of());
     }
 
     @ParameterizedTest
@@ -201,6 +207,140 @@ class VpcPublicPeerRoutingTest {
                 "Failure quarantine must not reuse the temporary update guard");
     }
 
+    @Test
+    void missingPeerDoesNotBlockAnotherOwnersRetirementOrForgetItsOwnCleanup() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        admit("third", 4, true);
+        missing("second");
+
+        assertDoesNotThrow(() -> manager.unregister(ACCOUNT, REGION, "first"));
+
+        assertEquals(Set.of("172.18.0.4"), manager.publicInstanceAddresses());
+        assertFalse(latest("third").contains("via 240.0.0.3"));
+        assertTrue(latest("third").contains("egress ip daddr 172.18.0.3 counter drop"));
+        verify(docker, never()).removeContainerCmd("second");
+        manager.unregister(ACCOUNT, REGION, "third");
+        assertThrows(IllegalStateException.class, manager::clear,
+                "Missing namespace ownership remains until its service unregisters it");
+        manager.unregister(ACCOUNT, REGION, "second");
+        assertDoesNotThrow(manager::clear);
+    }
+
+    @Test
+    void peerDisappearingDuringRouteInstallationIsWithdrawnInTheSameReconciliation() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        gateway.setAttachments(List.of());
+        InspectContainerCmd inspect = docker.inspectContainerCmd("second");
+        when(docker.execCreateCmd("second")).thenAnswer(invocation -> {
+            when(inspect.exec()).thenThrow(new NotFoundException("namespace absent"));
+            throw new NotFoundException("namespace removed during retirement");
+        });
+
+        assertDoesNotThrow(manager::reconcile);
+
+        assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+        assertTrue(latest("first").contains("egress ip daddr 172.18.0.3 counter drop"));
+        assertFalse(latest("first").contains("via 240.0.0.3"));
+        verify(docker, never()).stopContainerCmd("first");
+    }
+
+    @Test
+    void missingExecForAnExistingNamespaceStillFailsAndQuarantinesSurvivors() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        gateway.setAttachments(List.of());
+        ExecCreateCmd ordinary = docker.execCreateCmd("second");
+        AtomicBoolean once = new AtomicBoolean();
+        NotFoundException failure = new NotFoundException("exec object absent, namespace still present");
+        when(docker.execCreateCmd("second")).thenAnswer(invocation -> {
+            if (once.compareAndSet(false, true)) {
+                throw failure;
+            }
+            return ordinary;
+        });
+
+        assertSame(failure, assertThrows(NotFoundException.class, manager::reconcile));
+
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+        assertFalse(latest("first").contains("accept"));
+        assertFalse(latest("second").contains("accept"));
+        assertDoesNotThrow(manager::reconcile);
+    }
+
+    @Test
+    void inabilityToInspectAnAffectedNamespacePreservesTheOriginalFailure() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        gateway.setAttachments(List.of());
+        NotFoundException original = new NotFoundException("exec object absent");
+        IllegalStateException inspectionFailure = new IllegalStateException("Docker inspection unavailable");
+        ExecCreateCmd ordinary = docker.execCreateCmd("second");
+        AtomicBoolean once = new AtomicBoolean();
+        when(docker.execCreateCmd("second")).thenAnswer(invocation -> {
+            if (once.compareAndSet(false, true)) {
+                throw original;
+            }
+            return ordinary;
+        });
+        when(docker.inspectContainerCmd("second").exec()).thenThrow(inspectionFailure);
+
+        assertSame(original, assertThrows(NotFoundException.class, manager::reconcile));
+
+        assertTrue(List.of(original.getSuppressed()).contains(inspectionFailure));
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+        assertFalse(latest("first").contains("accept"));
+    }
+
+    @Test
+    void missingFrontendRetainsItsPublicAddressUntilItsOwnerChecksNamespaceUsers() {
+        prepareNamespace("frontend", 2, true);
+        manager.register(identity("frontend", 2), "frontend", List.of());
+        String address = manager.attachPublicFrontend(ACCOUNT, REGION, interfaceFor("frontend", 2), "frontend");
+        admit("peer", 3, true);
+        missing("frontend");
+        gateway.setAttachments(List.of());
+
+        assertDoesNotThrow(manager::reconcile);
+
+        assertEquals(Optional.of(address), manager.publicAddress(ACCOUNT, REGION, "frontend"));
+        assertTrue(latest("peer").contains("egress ip daddr " + address + " counter drop"));
+        prepareNamespace("replacement", 4, true);
+        manager.register(identity("replacement", 4), "replacement", List.of());
+        String replacement = manager.attachPublicFrontend(
+                ACCOUNT, REGION, interfaceFor("replacement", 4), "replacement");
+        assertNotEquals(address, replacement, "Missing namespace addresses are not free allocations");
+        verify(docker, never()).removeContainerCmd("frontend");
+        assertThrows(IllegalStateException.class, manager::clear);
+        Container consumer = mock(Container.class, RETURNS_DEEP_STUBS);
+        when(consumer.getId()).thenReturn("surviving-consumer");
+        when(consumer.getHostConfig().getNetworkMode()).thenReturn("container:frontend");
+        when(docker.listContainersCmd().withShowAll(true).exec()).thenReturn(List.of(consumer));
+        IllegalStateException inUse = assertThrows(IllegalStateException.class,
+                () -> manager.unregister(ACCOUNT, REGION, "frontend"));
+        assertTrue(inUse.getMessage().contains("still has a consumer"));
+        assertEquals(Optional.of(address), manager.publicAddress(ACCOUNT, REGION, "frontend"));
+        when(docker.listContainersCmd().withShowAll(true).exec()).thenReturn(List.of());
+        manager.unregister(ACCOUNT, REGION, "frontend");
+        assertTrue(manager.publicAddress(ACCOUNT, REGION, "frontend").isEmpty());
+    }
+
+    private void missing(String helper) {
+        InspectContainerCmd inspect = docker.inspectContainerCmd(helper);
+        when(inspect.exec()).thenThrow(new NotFoundException("namespace absent"));
+        when(docker.execCreateCmd(helper)).thenThrow(new NotFoundException("namespace absent"));
+    }
+
+    private static NetworkInterface interfaceFor(String helper, int host) {
+        NetworkInterface eni = new NetworkInterface();
+        eni.setNetworkInterfaceId(helper);
+        eni.setVpcId("vpc");
+        eni.setSubnetId("subnet");
+        eni.setPrivateIpAddress("10.0." + host + ".10");
+        return eni;
+    }
+
     private void admit(String helper, int host, boolean internal) {
         prepareNamespace(helper, host, internal);
         SecurityGroupNftCompiler.Endpoint identity = identity(helper, host);
@@ -221,6 +361,7 @@ class VpcPublicPeerRoutingTest {
                 "vpc", attachment("vpc-network", privateIp),
                 "public", attachment("public-network", "240.0.0." + host));
         when(docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks()).thenReturn(attachments);
+        when(docker.inspectContainerCmd(helper).exec().getName()).thenReturn("/" + helper);
         Network control = mock(Network.class);
         when(control.getInternal()).thenReturn(internal);
         when(docker.inspectNetworkCmd().withNetworkId("control-network").exec()).thenReturn(control);
