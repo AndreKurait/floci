@@ -93,6 +93,11 @@ public class CognitoIdentityService {
     public IdentityPool updateIdentityPool(IdentityPool spec, String region) {
         IdentityPool existing = describeIdentityPool(spec.getIdentityPoolId(), region);
         validatePoolConfiguration(spec);
+        if (existing.getDeveloperProviderName() != null
+                && !existing.getDeveloperProviderName().equals(spec.getDeveloperProviderName())) {
+            throw new AwsException("InvalidParameterException",
+                    "DeveloperProviderName cannot be changed after it is set.", 400);
+        }
 
         spec.setArn(existing.getArn());
         spec.setAccountId(existing.getAccountId());
