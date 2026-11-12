@@ -6,7 +6,7 @@ import io.floci.aws.core.common.RequestConstraintCheck;
 
 import java.util.List;
 
-/** Checks documentation-part requests against the pinned API Gateway service model. */
+/** Checks documentation requests against the pinned API Gateway service model. */
 final class ApiGatewayDocumentationRequestShapes {
 
     private static final RequestConstraintCheck CHECK = RequestConstraintCheck.load(
