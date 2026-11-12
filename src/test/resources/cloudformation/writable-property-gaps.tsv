@@ -177,7 +177,6 @@ AWS::EC2::EIP	PublicIpv4Pool	accepted and ignored
 AWS::EC2::EIP	TransferAddress	accepted and ignored
 AWS::EC2::FlowLog	DeliverCrossAccountRole	accepted and ignored
 AWS::EC2::FlowLog	DestinationOptions	accepted and ignored
-AWS::EC2::FlowLog	LogGroupName	accepted and ignored
 AWS::EC2::FlowLog	TagFieldSpecifications	accepted and ignored
 AWS::EC2::Instance	AdditionalInfo	accepted and ignored
 AWS::EC2::Instance	Affinity	accepted and ignored

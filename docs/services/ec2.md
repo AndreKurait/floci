@@ -1911,6 +1911,13 @@ Validation matches AWS behavior:
 | DescribeFlowLogs | Lists stored flow logs, optionally filtered by id. |
 | DeleteFlowLogs | Deletes the named flow logs. |
 
+CloudFormation `AWS::EC2::FlowLog` accepts `LogGroupName`, including a `Ref`
+to an `AWS::Logs::LogGroup`, and infers `cloud-watch-logs` when the destination
+type is omitted. A CloudWatch Logs ARN in `LogDestination` also supplies the
+group name. Tag updates preserve the flow log ID when its destination is
+unchanged. Changing or removing the group requires replacement, which Floci
+currently rejects with `ValidationError`.
+
 ### Spot Instances
 
 | Action | Description |
