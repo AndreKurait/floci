@@ -179,3 +179,21 @@ def test_math_cloudformation_alarm_evaluates_error_ratio_and_recovery(math_scope
     _put(scope, "Requests", 900)
     _until(state, lambda value: value == "OK")
     record_property("alarm_and_recovery_seconds", time.monotonic() - began)
+
+
+@pytest.mark.parametrize("filler,expected", [
+    ("0", [2.0, 0.0, 8.0]),
+    ("REPEAT", [2.0, 2.0, 8.0]),
+    ("LINEAR", [2.0, 5.0, 8.0]),
+])
+def test_math_fill_resolves_sparse_samples_through_sdk(math_scope, filler, expected):
+    scope = math_scope
+    _put(scope, "Sparse", 2, -120)
+    _put(scope, "Sparse", 8)
+    result = _data(scope, [
+        {"Id": "filled", "Expression": f"FILL(sparse, {filler})", "ReturnData": True},
+        _query(scope, "sparse", "Sparse", statistic="Maximum"),
+    ])[0]
+    assert result["Values"] == expected
+    assert [int(value.timestamp()) for value in result["Timestamps"]] == [
+        scope["bucket"] - 120, scope["bucket"] - 60, scope["bucket"]]
