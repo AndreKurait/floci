@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.CsvParser;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.athena.model.CreateWorkGroupConfigurationRequest;
@@ -55,6 +56,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -153,6 +155,7 @@ public class AthenaService {
                 : null;
 
         QueryExecution execution = new QueryExecution(id, query, workGroup, resolvedResult, resolvedContext);
+        execution.storeRegion(regionResolver.getRegion());
         if (createDatabaseStatement) {
             execution.setStatementType("DDL");
         }
@@ -219,6 +222,45 @@ public class AthenaService {
         return queryStore.get(id)
                 .orElseThrow(() -> new AwsException("InvalidRequestException",
                         "Query execution not found: " + id, 400));
+    }
+
+    /** Legacy unprefixed rows belong to the default account; missing region means the configured default. */
+    QueryExecution findBatchQueryExecution(String region, String id) {
+        return findBatchQueryExecution(region, id, true);
+    }
+
+    /** IAM target discovery cannot write or migrate rows before the permission decision. */
+    QueryExecution findBatchQueryExecutionForAuthorization(String region, String id) {
+        return findBatchQueryExecution(region, id, false);
+    }
+
+    private QueryExecution findBatchQueryExecution(String region, String id, boolean migrateLegacy) {
+        Predicate<QueryExecution> inRegion = execution -> Objects.equals(region,
+                execution.storedRegion() == null ? regionResolver.getDefaultRegion() : execution.storedRegion());
+        Optional<QueryExecution> execution = batchScopedRead(queryStore, id, inRegion, migrateLegacy);
+        return execution.filter(inRegion).orElse(null);
+    }
+
+    synchronized List<WorkGroupTag> batchWorkGroupTags(String region, String name) {
+        return batchScopedRead(workGroupStore, workGroupKey(region, name), group -> true, false)
+                .map(group -> group.getTags() == null ? List.<WorkGroupTag>of() : List.copyOf(group.getTags()))
+                .orElse(List.of());
+    }
+
+    private <T> Optional<T> batchScopedRead(StorageBackend<String, T> backend, String key,
+                                             Predicate<T> legacyScope, boolean migrateLegacy) {
+        if (backend instanceof AccountAwareStorageBackend<T> accounts) {
+            String account = regionResolver.getAccountId();
+            if (!account.equals(regionResolver.getDefaultAccountId()) || AccountAwareStorageBackend.hasAccountPrefix(key)) {
+                return accounts.getForAccount(account, key);
+            }
+            if (migrateLegacy) {
+                return accounts.getForAccountMigratingLegacy(account, key, legacyScope);
+            }
+            return accounts.getForAccount(account, key)
+                    .or(() -> accounts.getLegacyForAccount(account, key).filter(legacyScope));
+        }
+        return backend.get(key);
     }
 
     public List<QueryExecution> listQueryExecutions() {

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
@@ -109,6 +110,7 @@ public class IamConditionContextResolver {
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final Instance<AthenaBatchQueryService> athenaBatchQueryService;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
@@ -116,6 +118,23 @@ public class IamConditionContextResolver {
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, athenaBatchQueryService);
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -172,6 +191,23 @@ public class IamConditionContextResolver {
                                         ResolvedServiceCatalog serviceCatalog, Clock clock,
                                         Instance<SsmService> ssmService,
                                         Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext, config,
+                currentVertxRequest, serviceCatalog, clock, ssmService, elbV2ConditionKeys, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                        Instance<Ec2Service> ec2Service,
+                                        Instance<S3Service> s3Service,
+                                        Instance<CloudWatchLogsService> logsService,
+                                        Instance<IamService> iamService,
+                                        Instance<LambdaWebService> lambdaWebService,
+                                        RequestContext requestContext,
+                                        EmulatorConfig config,
+                                        CurrentVertxRequest currentVertxRequest,
+                                        ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                        Instance<SsmService> ssmService,
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -185,6 +221,7 @@ public class IamConditionContextResolver {
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
         this.serviceCatalog = serviceCatalog;
+        this.athenaBatchQueryService = athenaBatchQueryService;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -1100,6 +1137,19 @@ public class IamConditionContextResolver {
             }
         }
         return modes.isEmpty() ? List.of("NONE") : List.copyOf(modes);
+    }
+
+    record AthenaQueryTarget(String resource, Map<String, List<String>> context) {
+    }
+
+    List<AthenaQueryTarget> athenaQueryTargets(String action, JsonNode body,
+                                              String region, String account) {
+        if (!"athena:BatchGetQueryExecution".equals(action) || athenaBatchQueryService == null
+                || !athenaBatchQueryService.isResolvable()) {
+            return List.of();
+        }
+        return athenaBatchQueryService.get().authorizationTargets(region, account, body).stream()
+                .map(target -> new AthenaQueryTarget(target.resource(), target.context())).toList();
     }
 
     /** One transaction item keeps its action, table and condition keys together. */

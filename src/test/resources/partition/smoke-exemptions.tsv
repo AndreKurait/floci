@@ -4,6 +4,7 @@
 # without a reason.
 appconfig	internal IAM and S3 source ARNs are covered by AppConfigResourceArnsTest in commercial, China and GovCloud; AppConfigS3AccountIntegrationTest and iam/test_appconfig_permissions.py exercise IAM enforcement and signed China SDK requests
 appintegrations	no non-commercial partition publishes the service, so a case would be skipped in every partition
+athena	internal workgroup authorization ARN covered by AthenaBatchQueryIamIntegrationTest in each offered non-commercial partition; query history has no delete API
 cloudformation	covered by PartitionArnMintingIntegrationTest (all partitions)
 cloudhsmv2	the only ARN on the wire is the automatic backup's, and a backup is never removed (DeleteBackup only marks it), so a case would leak state into the shared emulator
 cloudtrail	covered by CloudTrailSelfDeliveryTest (one partition)

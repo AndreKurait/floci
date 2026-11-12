@@ -5,6 +5,51 @@
 
 Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duck](https://hub.docker.com/r/floci/floci-duck) sidecar container running DuckDB. When a query is submitted, Floci spins up the sidecar on first use, registers every Glue database as a DuckDB schema (`CREATE SCHEMA IF NOT EXISTS "<schema>"`) with qualified views (`"<db>"."<table>"`) pointing to S3 data, creates unqualified view aliases for the query context database in DuckDB's default `main` schema, then executes the SQL and stores results as CSV in S3.
 
+## Query execution batch reads
+
+`BatchGetQueryExecution` reads existing execution records using 1 to 50 IDs. Each
+ID must contain 1 to 128 non-whitespace characters; IDs are not restricted to UUID
+syntax. The response includes complete stored query metadata and
+`UnprocessedQueryExecutionIds` entries with `QUERY_EXECUTION_NOT_FOUND` for any
+accepted absent ID. The UUID-shaped absent-ID case matches recorded AWS behavior;
+classification of other accepted absent strings is a Floci policy that has not
+been independently measured against AWS. Each result uses the same public
+projection as `GetQueryExecution`, including
+numeric timestamps. Reads take a detached snapshot under the execution's existing
+status lock. A batch does not submit queries or change their states, SQL, results,
+or statistics, and does not promise one atomic snapshot across separate queries.
+
+Newly started queries retain their request Region in the existing account-scoped
+query record. The internal Region field is persisted and omitted from every public
+query projection. Batch reads cannot retrieve another Region's records. As a Floci
+migration policy, older records without Region metadata are visible to batch reads
+only in the configured default Region. Legacy rows without an account prefix may
+be migrated only by the configured default account; a refused account or Region
+lookup cannot move them. Account-prefixed IDs use only the caller's explicit
+storage namespace and cannot be reinterpreted as legacy raw keys during either
+IAM authorization or response lookup. Existing single-query lookup behavior is
+preserved. Existing persistent, hybrid and WAL storage reload this metadata;
+memory mode remains in-memory only.
+
+IAM target and tag discovery reads scoped records or matching default-account
+legacy records without migrating them. A denied request leaves those raw keys and
+records unchanged. After authorization, the batch response lookup may migrate its
+matching legacy query record; reading workgroup tags never migrates the workgroup.
+
+With IAM enforcement enabled, every found execution is authorized for
+`athena:BatchGetQueryExecution` against its actual workgroup ARN and that
+workgroup's own current resource tags. A denied found target refuses the whole
+request. Tag contexts are not combined across workgroups. As a conservative Floci
+policy, a batch containing only missing IDs uses the existing action-on-`*`
+authorization fallback because no workgroup can be resolved. A policy allowing
+only a particular workgroup therefore does not authorize an all-missing batch;
+a wildcard-resource allow can. These whole-request and all-missing authorization
+policies have not been independently measured against AWS.
+
+No query-history deletion is added. Terminal history remains in the existing query
+store, including when result objects or workgroups are removed. This change does
+not expand SQL execution support or claim measured AWS statistics equivalence.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
@@ -12,6 +57,7 @@ Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duc
 | --- | --- |
 | `StartQueryExecution` | Submits a SQL query; executed asynchronously via DuckDB |
 | `GetQueryExecution` | Returns query status (`QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`) |
+| `BatchGetQueryExecution` | Returns up to 50 stored query executions and per-ID errors for absent records |
 | `GetQueryResults` | Returns the result set for a completed query |
 | `ListQueryExecutions` | Returns a list of past query executions |
 | `StopQueryExecution` | Cancels a running query |
