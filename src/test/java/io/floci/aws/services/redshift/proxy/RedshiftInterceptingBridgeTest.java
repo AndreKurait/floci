@@ -40,6 +40,65 @@ import static org.mockito.Mockito.*;
 class RedshiftInterceptingBridgeTest {
 
     @Test
+    @Timeout(10)
+    void extendedSpectrumReleasesBufferedCloseBeforeTakingBackendOwnership() throws Exception {
+        String sql = "ALTER TABLE lake.events ADD PARTITION (dt='today') LOCATION 's3://bucket/today/'";
+        SpectrumInterceptor interceptor = inlineMock(SpectrumInterceptor.class);
+        when(interceptor.plan(eq(sql), any())).thenReturn(new SpectrumInterceptor.Plan.ExternalDdl(
+                sql, new SpectrumSession("000000000000", "000000000000:c", "dev", List.of(), false)));
+        when(interceptor.execute(any(), anyString(), anyString(), any())).thenReturn(
+                new SpectrumInterceptor.Decision.Handled("ALTER TABLE"));
+        startBridge(interceptor);
+        testClientEnd.setSoTimeout(3000);
+        testBackendEnd.setSoTimeout(3000);
+        PostgresWireDecoder backendDecoder = new PostgresWireDecoder(testBackendEnd.getInputStream());
+        PostgresWireDecoder clientDecoder = new PostgresWireDecoder(testClientEnd.getInputStream());
+        PostgresWireDecoder.ParseMessage previous = new PostgresWireDecoder.ParseMessage("previous", "SELECT 1", List.of());
+        testClientEnd.getOutputStream().write(PostgresWireDecoder.encodeParse(previous, previous.sql()));
+        testClientEnd.getOutputStream().flush();
+        assertEquals('P', backendDecoder.nextMessage().type());
+        writeBackendFrame('1', new byte[0]);
+        assertEquals('1', clientDecoder.nextMessage().type());
+
+        PostgresWireDecoder.ParseMessage spectrum = new PostgresWireDecoder.ParseMessage("spectrum", sql, List.of());
+        testClientEnd.getOutputStream().write(PostgresWireDecoder.encodeParse(spectrum, sql));
+        testClientEnd.getOutputStream().write(frame('B', concat(cString("spectrum-p"), cString("spectrum"), new byte[6])));
+        testClientEnd.getOutputStream().flush();
+        assertEquals('1', clientDecoder.nextMessage().type());
+        assertEquals('2', clientDecoder.nextMessage().type());
+        verify(interceptor, never()).execute(any(), anyString(), anyString(), any());
+
+        AtomicReference<Throwable> backendFailure = new AtomicReference<>();
+        Thread backend = Thread.ofVirtual().start(() -> {
+            try {
+                assertEquals('C', backendDecoder.nextMessage().type());
+                assertEquals('H', backendDecoder.nextMessage().type());
+                verify(interceptor, never()).execute(any(), anyString(), anyString(), any());
+                writeBackendFrame('3', new byte[0]);
+                assertEquals('S', backendDecoder.nextMessage().type());
+                writeBackendFrame('Z', new byte[]{'I'});
+            } catch (Throwable failure) {
+                backendFailure.compareAndSet(null, failure);
+            }
+        });
+        ByteArrayOutputStream pipeline = new ByteArrayOutputStream();
+        pipeline.write(frame('C', concat(new byte[]{'S'}, cString("previous"))));
+        pipeline.write(frame('E', concat(cString("spectrum-p"), new byte[4])));
+        pipeline.write(frame('S', new byte[0]));
+        testClientEnd.getOutputStream().write(pipeline.toByteArray());
+        testClientEnd.getOutputStream().flush();
+        for (char expected : new char[]{'3', 'C', 'Z'}) {
+            assertEquals(expected, clientDecoder.nextMessage().type());
+        }
+        backend.join(3000);
+        assertFalse(backend.isAlive(), "fake backend did not finish the response sequence");
+        if (backendFailure.get() != null) {
+            throw new AssertionError("fake backend failed", backendFailure.get());
+        }
+        verify(interceptor).execute(any(), anyString(), anyString(), any());
+    }
+
+    @Test
     void tracksBeginCommandAcrossFragmentedBackendFrames() {
         BackendResponseCoordinator coordinator = new BackendResponseCoordinator(new ExtendedQuerySession());
         RedshiftInterceptingBridge.WireFrameTracker tracker =
@@ -331,6 +390,65 @@ class RedshiftInterceptingBridgeTest {
     }
 
     @Test
+    @Timeout(10)
+    void extendedCopyReleasesBufferedCloseBeforeTakingBackendOwnership() throws Exception {
+        startBridge();
+        testClientEnd.setSoTimeout(3000);
+        testBackendEnd.setSoTimeout(3000);
+        when(s3Stub.objectExists("b", "in/data")).thenReturn(true);
+        when(s3Stub.getObject("b", "in/data")).thenReturn(
+                new S3Object("b", "in/data", "1|a\n".getBytes(StandardCharsets.US_ASCII), "text/plain"));
+        PostgresWireDecoder backendDecoder = new PostgresWireDecoder(testBackendEnd.getInputStream());
+        PostgresWireDecoder clientDecoder = new PostgresWireDecoder(testClientEnd.getInputStream());
+        PostgresWireDecoder.ParseMessage previous = new PostgresWireDecoder.ParseMessage("previous", "SELECT 1", List.of());
+        testClientEnd.getOutputStream().write(PostgresWireDecoder.encodeParse(previous, previous.sql()));
+        testClientEnd.getOutputStream().flush();
+        assertEquals('P', backendDecoder.nextMessage().type());
+        writeBackendFrame('1', new byte[0]);
+        assertEquals('1', clientDecoder.nextMessage().type());
+
+        AtomicReference<Throwable> backendFailure = new AtomicReference<>();
+        Thread backend = Thread.ofVirtual().start(() -> {
+            try {
+                assertEquals('C', backendDecoder.nextMessage().type());
+                assertEquals('P', backendDecoder.nextMessage().type());
+                assertEquals('B', backendDecoder.nextMessage().type());
+                assertEquals('D', backendDecoder.nextMessage().type());
+                // PostgreSQL can buffer these responses until a Flush or Sync arrives.
+                assertEquals('H', backendDecoder.nextMessage().type());
+                writeBackendFrame('3', new byte[0]);
+                writeBackendFrame('1', new byte[0]);
+                writeBackendFrame('2', new byte[0]);
+                writeBackendFrame('n', new byte[0]);
+                assertEquals('E', backendDecoder.nextMessage().type());
+                assertEquals('H', backendDecoder.nextMessage().type());
+                writeBackendFrame('C', cString("DO"));
+                completeInternalCopy(backendDecoder);
+            } catch (Throwable failure) {
+                backendFailure.compareAndSet(null, failure);
+            }
+        });
+        PostgresWireDecoder.ParseMessage copy = new PostgresWireDecoder.ParseMessage(
+                "copy-s", "COPY t FROM 's3://b/in/data'", List.of());
+        ByteArrayOutputStream pipeline = new ByteArrayOutputStream();
+        pipeline.write(frame('C', concat(new byte[]{'S'}, cString("previous"))));
+        pipeline.write(PostgresWireDecoder.encodeParse(copy, copy.sql()));
+        pipeline.write(frame('B', concat(cString("copy-p"), cString("copy-s"), new byte[6])));
+        pipeline.write(frame('D', concat(new byte[]{'P'}, cString("copy-p"))));
+        pipeline.write(frame('E', concat(cString("copy-p"), new byte[4])));
+        pipeline.write(frame('S', new byte[0]));
+        testClientEnd.getOutputStream().write(pipeline.toByteArray());
+        testClientEnd.getOutputStream().flush();
+        for (char expected : new char[]{'3', '1', '2', 'n', 'C', 'Z'}) {
+            assertEquals(expected, clientDecoder.nextMessage().type());
+        }
+        backend.join();
+        if (backendFailure.get() != null) {
+            throw new AssertionError("fake backend failed", backendFailure.get());
+        }
+    }
+
+    @Test
     @Timeout(15)
     void pipelinedExtendedCopyPreservesResponseOrderAndSyncReadyForQuery() throws Exception {
         startBridge();
@@ -354,49 +472,7 @@ class RedshiftInterceptingBridgeTest {
                 assertEquals('E', decoder.nextMessage().type());
                 assertEquals('H', decoder.nextMessage().type());
                 writeBackendFrame('C', cString("DO"));
-                String command = "";
-                boolean inTransaction = false;
-                while (true) {
-                    PostgresWireDecoder.FrontendMessage message = decoder.nextMessage();
-                    switch (message.type()) {
-                        case 'P' -> {
-                            command = decoder.decodeParse(message).sql();
-                            writeBackendFrame('1', new byte[0]);
-                        }
-                        case 'B' -> writeBackendFrame('2', new byte[0]);
-                        case 'E' -> {
-                            if (command.startsWith("COPY ")) {
-                                assertTrue(command.contains("FROM STDIN"));
-                                writeBackendFrame('G', new byte[]{0, 0, 0});
-                            } else {
-                                if (command.startsWith("SELECT a.attname")) {
-                                    ByteArrayOutputStream row = new ByteArrayOutputStream();
-                                    row.writeBytes(new byte[]{0, 3});
-                                    row.writeBytes(new byte[]{0, 0, 0, 2, 'i', 'd'});
-                                    row.writeBytes(new byte[]{-1, -1, -1, -1});
-                                    row.writeBytes(new byte[]{0, 0, 0, 2, '2', '3'});
-                                    writeBackendFrame('D', row.toByteArray());
-                                }
-                                if (command.equals("BEGIN")) {
-                                    inTransaction = true;
-                                } else if (command.equals("COMMIT")) {
-                                    inTransaction = false;
-                                }
-                                writeBackendFrame('C', cString(command.equals("BEGIN") ? "BEGIN" : "OK"));
-                            }
-                        }
-                        case 'd' -> assertEquals("1|a\n", new String(message.body(), StandardCharsets.US_ASCII));
-                        case 'c' -> writeBackendFrame('C', cString("COPY 1"));
-                        case 'C' -> writeBackendFrame('3', new byte[0]);
-                        case 'S' -> {
-                            assertFalse(inTransaction, "Only the client's final Sync may end this cycle");
-                            writeBackendFrame('Z', new byte[]{'I'});
-                            return;
-                        }
-                        case 'H' -> { }
-                        default -> throw new AssertionError("Unexpected internal COPY message " + message.type());
-                    }
-                }
+                completeInternalCopy(decoder);
             } catch (Throwable failure) {
                 backendFailure.compareAndSet(null, failure);
             }
@@ -667,6 +743,52 @@ class RedshiftInterceptingBridgeTest {
         Mockito.verify(preparation, Mockito.never()).prepare(Mockito.anyString(), Mockito.any(), Mockito.any(),
                 Mockito.any());
         Mockito.verify(interceptor, Mockito.never()).execute(Mockito.any(), Mockito.anyString(), Mockito.anyString(), Mockito.any());
+    }
+
+    private void completeInternalCopy(PostgresWireDecoder decoder) throws Exception {
+        String command = "";
+        boolean inTransaction = false;
+        while (true) {
+            PostgresWireDecoder.FrontendMessage message = decoder.nextMessage();
+            switch (message.type()) {
+                case 'P' -> {
+                    command = decoder.decodeParse(message).sql();
+                    writeBackendFrame('1', new byte[0]);
+                }
+                case 'B' -> writeBackendFrame('2', new byte[0]);
+                case 'E' -> {
+                    if (command.startsWith("COPY ")) {
+                        assertTrue(command.contains("FROM STDIN"));
+                        writeBackendFrame('G', new byte[]{0, 0, 0});
+                    } else {
+                        if (command.startsWith("SELECT a.attname")) {
+                            ByteArrayOutputStream row = new ByteArrayOutputStream();
+                            row.writeBytes(new byte[]{0, 3});
+                            row.writeBytes(new byte[]{0, 0, 0, 2, 'i', 'd'});
+                            row.writeBytes(new byte[]{-1, -1, -1, -1});
+                            row.writeBytes(new byte[]{0, 0, 0, 2, '2', '3'});
+                            writeBackendFrame('D', row.toByteArray());
+                        }
+                        if (command.equals("BEGIN")) {
+                            inTransaction = true;
+                        } else if (command.equals("COMMIT")) {
+                            inTransaction = false;
+                        }
+                        writeBackendFrame('C', cString(command.equals("BEGIN") ? "BEGIN" : "OK"));
+                    }
+                }
+                case 'd' -> assertEquals("1|a\n", new String(message.body(), StandardCharsets.US_ASCII));
+                case 'c' -> writeBackendFrame('C', cString("COPY 1"));
+                case 'C' -> writeBackendFrame('3', new byte[0]);
+                case 'S' -> {
+                    assertFalse(inTransaction, "Only the client's final Sync may end this cycle");
+                    writeBackendFrame('Z', new byte[]{'I'});
+                    return;
+                }
+                case 'H' -> { }
+                default -> throw new AssertionError("Unexpected internal COPY message " + message.type());
+            }
+        }
     }
 
     private static void skipFrameBody(InputStream in) throws IOException {
