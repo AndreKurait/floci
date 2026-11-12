@@ -108,6 +108,20 @@ class S3VectorsWriteLockTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void resourceTagMergesPreserveConcurrentTagsAndVectors(boolean copyOnAccess) throws Exception {
+        setUp(copyOnAccess);
+        createIndex();
+        String arn = service.getIndex("bucket", "index", REGION).getIndexArn();
+        overlap(() -> service.tagResource(arn, Map.of("first", "value")),
+                () -> service.tagResource(arn, Map.of("second", "value")));
+        assertEquals(Map.of("first", "value", "second", "value"), service.listTagsForResource(arn));
+        overlap(() -> service.untagResource(arn, List.of("first")), () -> putVector("stored"));
+        assertEquals(Map.of("second", "value"), service.listTagsForResource(arn));
+        assertEquals(1, service.getVectors("bucket", "index", List.of("stored"), REGION).size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void bucketTagsDoNotOverwriteConcurrentIndexCreation(boolean copyOnAccess) throws Exception {
         setUp(copyOnAccess);
         overlap(() -> service.replaceBucketTags("bucket", Map.of("bucket", "tag"), REGION), this::createIndex);
