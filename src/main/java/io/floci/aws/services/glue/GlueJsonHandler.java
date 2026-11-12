@@ -48,6 +48,7 @@ public class GlueJsonHandler {
     private final GlueTriggerService triggerService;
     private final GlueSchemaRegistryService schemaRegistryService;
     private final ObjectMapper mapper;
+    private final GlueCustomEntityService customEntities;
 
     @Inject
     public GlueJsonHandler(GlueService glueService,
@@ -55,13 +56,15 @@ public class GlueJsonHandler {
                            GlueCrawlerRunService crawlerRunService,
                            GlueTriggerService triggerService,
                            GlueSchemaRegistryService schemaRegistryService,
-                           ObjectMapper mapper) {
+                           ObjectMapper mapper,
+                           GlueCustomEntityService customEntities) {
         this.glueService = glueService;
         this.jobRunService = jobRunService;
         this.crawlerRunService = crawlerRunService;
         this.triggerService = triggerService;
         this.schemaRegistryService = schemaRegistryService;
         this.mapper = mapper;
+        this.customEntities = customEntities;
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
@@ -77,6 +80,11 @@ public class GlueJsonHandler {
 
     private Response dispatch(String action, JsonNode request, String region) throws Exception {
         return switch (action) {
+            case "CreateCustomEntityType" -> Response.ok(customEntities.create(request, region)).build();
+            case "GetCustomEntityType" -> Response.ok(customEntities.get(request, region)).build();
+            case "DeleteCustomEntityType" -> Response.ok(customEntities.delete(request, region)).build();
+            case "BatchGetCustomEntityTypes" -> Response.ok(customEntities.batchGet(request, region)).build();
+            case "ListCustomEntityTypes" -> Response.ok(customEntities.list(request, region)).build();
             case "CreateDatabase" -> {
                 Database db = mapper.treeToValue(request.get("DatabaseInput"), Database.class);
                 @SuppressWarnings("unchecked")
