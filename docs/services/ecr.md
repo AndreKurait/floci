@@ -37,6 +37,7 @@
 | `PutImageScanningConfiguration` | Set a repository's `scanOnPush` flag and return the updated configuration; a non-boolean value is rejected |
 | `BatchGetRepositoryScanningConfiguration` | Report each repository's `scanOnPush` setting with a derived `scanFrequency` (`SCAN_ON_PUSH` or `MANUAL`); a missing repository fails the whole batch instead of appearing in `failures` |
 | `TagResource` / `UntagResource` / `ListTagsForResource` | Resource tagging |
+| `StartLifecyclePolicyPreview` / `GetLifecyclePolicyPreview` | Evaluate and page a stored image-expiry preview without deleting images |
 | `PutLifecyclePolicy` / `GetLifecyclePolicy` / `DeleteLifecyclePolicy` | Lifecycle policy round-trip (stored, not enforced) |
 | `SetRepositoryPolicy` / `GetRepositoryPolicy` / `DeleteRepositoryPolicy` | Repository policy round-trip (stored, not enforced) |
 | `PutRegistryPolicy` / `GetRegistryPolicy` / `DeleteRegistryPolicy` | Registry policy round-trip (stored, not enforced) |
@@ -46,8 +47,8 @@
 
 `PutLifecyclePolicy` checks that the document is one JSON object with a nonempty
 `rules` array and unique positive integer priorities. Rejected documents return
-`InvalidParameterException` without replacing the prior policy. Selection and
-action validation, expiration, and registry garbage collection remain unimplemented.
+`InvalidParameterException` without replacing the prior policy. That policy-storage operation does not evaluate selections or expire images.
+Preview evaluation is described below.
 
 `GetAccountSetting` and `PutAccountSetting` keep values per account and Region.
 Supported names are `BASIC_SCAN_TYPE_VERSION` (`AWS_NATIVE`), `REGISTRY_POLICY_SCOPE`
@@ -109,6 +110,61 @@ a duplicate is `ExclusionAlreadyExistsException`, and removing an unknown ARN is
 and returns a scoped `nextToken` when more results remain. Registry settings and
 exclusions survive storage reloads together. Floci records this metadata without
 changing image pull-time tracking.
+
+## Lifecycle policy previews
+
+`StartLifecyclePolicyPreview` evaluates an explicit policy, or the repository's stored
+policy when omitted, against one captured inventory. It supports `expire` with
+`imageCountMoreThan` and `sinceImagePushed`, tagged prefix or pattern selections,
+untagged images, and a final `any` rule. Filters in a rule all have to match the
+image's tags. Earlier tagging matches protect images from later rules even when the
+earlier rule retains them. Count rules keep the newest images; age rules select
+images strictly older than the requested number of days.
+
+**Digest-only direct-Docker orphan manifests cannot be enumerated.** The registry
+inventory combines all live tags with digests recorded by native `PutImage` calls.
+Native digest-only images participate. Every known image must have a verified native
+first-push timestamp in the current repository lifetime. Legacy timestamps and
+pre-existing Docker images are refused because their first push time is unknown.
+Adding a native tag to an existing Docker digest does not establish that time.
+
+Preview reads verify manifest body digests and referenced blob presence and sizes;
+they do not validate image-config or layer contents or execute images. Registry
+errors, malformed or incomplete pages, changed namespaces, and known missing images
+fail the preview. Pagination bounds fail explicitly instead of truncating results.
+Manifest lists, indexes, reference artifacts, archive/transition actions, pull-age
+rules, and wildcard prefix entries are unsupported and refused. Ordinary prefixes
+and patterns with up to four `*` characters are supported.
+
+Successful starts return `COMPLETE` synchronously and preserve exact policy bytes in
+an immutable repository snapshot. They do not change the stored lifecycle policy or
+delete images. While a start is running, a concurrent Get for the same repository
+lifetime returns a transient `IN_PROGRESS` view; this is Floci's local concurrency
+policy. A failed start preserves the previous completed snapshot. Restart discards
+transient progress and retains completed snapshots according to the configured
+storage mode. Hybrid mode retains its asynchronous durability.
+
+`GetLifecyclePolicyPreview` reads the stored snapshot without contacting or starting
+the registry. It supports image selectors, tag-status filters, and pages of 1-100
+results. Its expiry count describes the whole snapshot before filtering. Local
+result ordering uses push time followed by digest; tokens bind the snapshot, caller,
+Region, repository, and filter. A new preview invalidates previous tokens.
+
+Both actions use the caller's repository ARN and current `aws:ResourceTag/` and
+`ecr:ResourceTag/` values during IAM evaluation. Preauthorization reads do not migrate
+legacy data, initialize generations, or refresh URIs. Foreign `registryId` values are
+explicitly unsupported for previews; repository policies do not grant cross-account
+preview access. IAM evaluation and a later mutation are not one atomic transaction
+against concurrent tag changes.
+
+Repository generations, detached atomic parent replacements, and shared physical
+manifest locks prevent queued native writers from attaching old metadata or previews
+to recreated repositories. Creation shares a gate with final-registry pruning. A
+successful authorized legacy migration is a separate write before preview publication.
+Image metadata cleanup and parent deletion are separate commits: a refused parent
+deletion can leave the old repository and preview after metadata cleanup. The proxy
+retains its existing namespace capture before acquiring the physical lock, so these
+controls do not promise that all queued proxy bytes are rejected after recreation.
 
 ## Configuration
 

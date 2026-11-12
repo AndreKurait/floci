@@ -808,6 +808,8 @@ floci:
       enabled: true
     appconfigdata:
       enabled: true
+    # Immutable lifecycle preview snapshots share the ECR repository metadata store.
+    # Their durability follows the configured storage mode, including asynchronous hybrid flushes.
     ecr:
       enabled: true
       registry-image: "registry:2"
