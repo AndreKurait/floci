@@ -707,6 +707,12 @@ public class IamActionRegistry {
                 && resourceInfo.getResourceMethod() != null) {
             return ROUTE53_ACTIONS.get(resourceInfo.getResourceMethod().getName());
         }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "updateOriginAccessControl".equals(resourceInfo.getResourceMethod().getName())) {
+            return "cloudfront:UpdateOriginAccessControl";
+        }
         return null;
     }
 
