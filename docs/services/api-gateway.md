@@ -96,13 +96,37 @@ Unknown integration type strings produce warnings and leave the method without a
 integration. With `failOnWarnings=true`, the import or update is rejected before
 changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not accepted.
 
+### Test invocation
+
+`TestInvokeMethod` executes the current configuration of a REST API method with a
+`MOCK` integration before deployment. It uses the same request templates, response
+selection, response templates, headers, and request validators as the live MOCK
+pipeline. The response contains the executed status, body, headers, multi-value
+headers, a local execution log, and measured latency. An integration or validation
+failure is reported in that execution result; an unknown API, resource, or method
+is a management API error.
+
+The simulated body, headers, query string, path parameters, and stage variables
+come from the request payload. They do not replace management credentials or
+change a stored stage, deployment, API key, or cache. Methods with `NONE` or
+`AWS_IAM` authorization are supported; test invocation does not run viewer IAM or
+API-key checks. The live execute endpoint continues to enforce its existing
+viewer checks. Management requests use the authenticated account and region and
+require `apigateway:POST` on the method resource when IAM enforcement is enabled.
+
+The supported scope is MOCK execution. Other integration types, custom and Cognito
+authorizers, client certificates, and a header appearing in both `headers` and
+`multiValueHeaders` are explicitly refused. Local execution logs are returned in
+the response and are not delivered to CloudWatch Logs. This does not add backend
+invocation support or change live viewer execution.
+
 ### Supported Operations
 
 | Category | Operations |
 |---|---|
 | **APIs** | CreateRestApi, ImportRestApi, PutRestApi, GetRestApi, GetRestApis, UpdateRestApi, DeleteRestApi |
 | **Resources** | CreateResource, GetResource, GetResources, UpdateResource, DeleteResource |
-| **Methods** | PutMethod, GetMethod, UpdateMethod, DeleteMethod |
+| **Methods** | PutMethod, GetMethod, UpdateMethod, DeleteMethod, TestInvokeMethod |
 | **Method Responses** | PutMethodResponse, GetMethodResponse, DeleteMethodResponse |
 | **Integrations** | PutIntegration, GetIntegration, UpdateIntegration, DeleteIntegration |
 | **Integration Responses** | PutIntegrationResponse, GetIntegrationResponse, UpdateIntegrationResponse, DeleteIntegrationResponse |
