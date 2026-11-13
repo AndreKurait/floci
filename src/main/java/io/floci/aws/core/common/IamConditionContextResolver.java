@@ -159,6 +159,7 @@ public class IamConditionContextResolver {
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "account" -> accountRegionConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
@@ -169,6 +170,18 @@ public class IamConditionContextResolver {
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> accountRegionConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("account:EnableRegion".equals(action) || "account:DisableRegion".equals(action)
+                || "account:GetRegionOptStatus".equals(action))) {
+            return null;
+        }
+        JsonNode body = PassedRoles.jsonBody(ctx);
+        return requestConditions(action, member -> {
+            JsonNode value = body == null ? null : body.get(member);
+            return value != null && value.isTextual() ? value.textValue() : null;
+        });
     }
 
     /** Logs tag operations and group mutations use the handler's resource and request scope. */

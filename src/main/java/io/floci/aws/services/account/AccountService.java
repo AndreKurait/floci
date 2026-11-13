@@ -68,7 +68,7 @@ public class AccountService implements Resettable, StoredResourceArns {
         contacts.deleteForAccount(targetAccountId, type);
     }
 
-    private String resolveTargetAccount(String callerAccountId, JsonNode request) {
+    String resolveTargetAccount(String callerAccountId, JsonNode request) {
         JsonNode accountIdNode = request == null ? null : request.get("AccountId");
         if (accountIdNode == null || accountIdNode.isNull()) {
             return callerAccountId;
