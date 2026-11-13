@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.eks.EksService;
@@ -338,6 +339,14 @@ public class ResourceArnBuilder {
     /** Uses the serving operation and the same raw names as the handler. */
     public List<String> buildLogResources(String action, ContainerRequestContext ctx,
                                           String region, String accountId, String partition) {
+        if (LogTransformerTarget.supports(action)) {
+            JsonNode body = readJsonBody(ctx);
+            String identifier = body == null ? null : body.path("logGroupIdentifier").asText(null);
+            return List.of(LogTransformerTarget.resolve(identifier, region, accountId, partition).arn());
+        }
+        if ("logs:TestTransformer".equals(action)) {
+            return List.of("*");
+        }
         // Operations the vendored table reads (the vended-log delivery family) take their resources from it.
         if (RequestResources.reads(action)) {
             return namedResources("logs", action, ctx, region, accountId, partition);

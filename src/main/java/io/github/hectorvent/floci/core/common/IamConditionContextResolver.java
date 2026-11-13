@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbConditionKeys;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbTableNames;
@@ -275,7 +276,8 @@ public class IamConditionContextResolver {
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
         if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || "logs:PutLogEvents".equals(action)
-                || LogGroupTagTarget.supports(action) || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
+                || LogGroupTagTarget.supports(action) || LogTransformerTarget.supports(action)
+                || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
                 || "logs:PutRetentionPolicy".equals(action) || "logs:DeleteRetentionPolicy".equals(action))) {
             return null;
         }
@@ -325,6 +327,9 @@ public class IamConditionContextResolver {
         }
         String group = direct ? logsService.get().resolveTagTarget(body.path("resourceArn").asText(), region).name()
                 : body.path("logGroupName").asText();
+        if (LogTransformerTarget.supports(action)) {
+            group = logsService.get().resolveTransformerTarget(body.path("logGroupIdentifier").asText(), region).name();
+        }
         Map<String, String> tags;
         try {
             tags = logsService.get().listTagsLogGroup(group, region);
