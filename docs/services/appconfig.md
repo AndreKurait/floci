@@ -11,6 +11,15 @@ their region explicitly in all storage modes.
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
 
+Hosted versions accept a case-sensitive `VersionLabel` of 1–64 characters containing at least
+one non-numeric character. Labels are unique among versions still stored in the profile and
+are returned by create, get and list. Deleting a version releases its label.
+`LatestVersionNumber` checks the highest version currently stored (zero for an empty profile);
+a mismatch returns `ConflictException` without creating a version. Version numbers continue
+increasing after deletion and persist across restart. Lists support `MaxResults`, `NextToken`,
+and exact or trailing-asterisk prefix label filters. A label filter excludes unlabeled versions.
+Hosted deployment and validation requests still select configurations by numeric version.
+
 ### Supported Operations
 
 - `CreateApplication`
@@ -28,6 +37,7 @@ The management plane allows you to create and manage applications, environments,
 - `DeleteConfigurationProfile`
 - `CreateHostedConfigurationVersion`
 - `GetHostedConfigurationVersion`
+- `ListHostedConfigurationVersions`
 - `DeleteHostedConfigurationVersion`
 - `CreateDeploymentStrategy`
 - `GetDeploymentStrategy`
@@ -109,8 +119,9 @@ Floci provisions these resource types:
 - `AWS::AppConfig::Environment`
 - `AWS::AppConfig::ConfigurationProfile`
 - `AWS::AppConfig::DeploymentStrategy`
+- `AWS::AppConfig::HostedConfigurationVersion`
 
-`Ref` returns the AppConfig ID of each, which `Fn::GetAtt` also returns as `ApplicationId`, `EnvironmentId`,
+For the first four types, `Ref` returns the AppConfig ID, which `Fn::GetAtt` also returns as `ApplicationId`, `EnvironmentId`,
 `ConfigurationProfileId` and `Id`. A configuration profile's `KmsKeyArn` is not set.
 
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
@@ -126,7 +137,15 @@ Deleting an environment deletes its deployments, and deleting a configuration pr
 versions. Floci keeps tags on applications only, so `Tags` on the other three types are accepted and not stored, as
 `TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier`, `RetrievalRoleArn` and `Validators`,
 and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
-`AWS::AppConfig::HostedConfigurationVersion`, `Deployment`, `Extension` and `ExtensionAssociation` are not provisioned.
+Hosted configuration versions retain their application, profile and version identity for deletion and rollback.
+`Ref` and `Fn::GetAtt VersionNumber` return the version number as a string. Changing a hosted version property
+creates a replacement; rollback removes the attempted version, while retention policies preserve versions whose
+parent profile remains.
+The hosted provider accepts `VersionLabel` and `LatestVersionNumber`; each is a replacement property.
+An empty CloudFormation label creates an unlabeled version and remains an empty property in the stack template.
+The locking token checks the highest currently stored version before creation. Failed creates consume no number;
+a version created and then removed by rollback leaves an allocation gap. Outputs-only updates retain the version.
+`AWS::AppConfig::Deployment`, `Extension` and `ExtensionAssociation` are not provisioned.
 
 A stack created before Floci provisioned these types holds stubs for them, and an update creates the real resource in
 place of a stub only when it changes that resource. An update that changes an environment or configuration profile of
