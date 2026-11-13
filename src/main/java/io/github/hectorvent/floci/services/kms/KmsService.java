@@ -1,29 +1,29 @@
-package io.floci.aws.services.kms;
+package io.github.hectorvent.floci.services.kms;
 
 import com.fasterxml.jackson.core.type.TypeReference;
-import io.floci.aws.core.common.AwsArnUtils;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.AwsRegions;
-import io.floci.aws.core.common.Base64Url;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.core.common.ReservedTags;
-import io.floci.aws.core.common.SignedMarkers;
-import io.floci.aws.core.common.SmithyValidationErrors;
-import io.floci.aws.core.common.StripedLocks;
-import io.floci.aws.core.resource.ExplorerResource;
-import io.floci.aws.core.resource.ResourceProvider;
-import io.floci.aws.core.resource.SupportedResourceType;
-import io.floci.aws.core.storage.StorageBackend;
-import io.floci.aws.core.storage.StorageFactory;
-import io.floci.aws.services.kms.keytype.KmsKeyType;
-import io.floci.aws.services.kms.keytype.KmsKeyTypes;
-import io.floci.aws.services.kms.model.KmsAlias;
-import io.floci.aws.services.kms.model.KmsGrant;
-import io.floci.aws.services.kms.model.KmsImportParameters;
-import io.floci.aws.services.kms.model.KmsKey;
-import io.floci.aws.services.kms.model.KmsKeySpec;
-import io.floci.aws.services.kms.model.KmsKeyUsage;
-import io.floci.aws.services.kms.model.KmsMessageType;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Base64Url;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ReservedTags;
+import io.github.hectorvent.floci.core.common.SignedMarkers;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.StripedLocks;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.kms.keytype.KmsKeyType;
+import io.github.hectorvent.floci.services.kms.keytype.KmsKeyTypes;
+import io.github.hectorvent.floci.services.kms.model.KmsAlias;
+import io.github.hectorvent.floci.services.kms.model.KmsGrant;
+import io.github.hectorvent.floci.services.kms.model.KmsImportParameters;
+import io.github.hectorvent.floci.services.kms.model.KmsKey;
+import io.github.hectorvent.floci.services.kms.model.KmsKeySpec;
+import io.github.hectorvent.floci.services.kms.model.KmsKeyUsage;
+import io.github.hectorvent.floci.services.kms.model.KmsMessageType;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -41,7 +41,7 @@ import java.util.LinkedHashMap;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
-import static io.floci.aws.services.kms.model.KmsMessageType.RAW;
+import static io.github.hectorvent.floci.services.kms.model.KmsMessageType.RAW;
 
 @ApplicationScoped
 public class KmsService implements ResourceProvider {
@@ -157,7 +157,7 @@ public class KmsService implements ResourceProvider {
         KmsKeyUsage effectiveUsage = Optional.ofNullable(keyUsage)
                 .map(KmsKeyUsage::fromString)
                 .orElse(KmsKeyUsage.ENCRYPT_DECRYPT);
-        KmsKeySpec effectiveSpec = Optional.ofNullable(keySpec)
+        KmsKeySpec effectiveSpec = Optional.of(keySpec)
                 .map(KmsKeySpec::fromString)
                 .orElse(KmsKeySpec.SYMMETRIC_DEFAULT);
         validateKeyUsageForSpec(effectiveUsage, effectiveSpec);
@@ -1527,6 +1527,11 @@ public class KmsService implements ResourceProvider {
         requireNotPendingDeletion(key);
 
         String aliasArn = regionResolver.buildArn("kms", region, aliasName);
+        if (aliasStore.get(region + "::" + aliasName).isPresent()) {
+            // Pointing an existing alias at another key is UpdateAlias; CreateAlias never replaces one.
+            throw new AwsException("AlreadyExistsException",
+                    "An alias with the name " + aliasArn + " already exists", 400);
+        }
         KmsAlias alias = new KmsAlias(aliasName, aliasArn, key.getKeyId());
         aliasStore.put(region + "::" + aliasName, alias);
         LOG.infov("Created KMS alias: {0} -> {1}", aliasName, key.getKeyId());

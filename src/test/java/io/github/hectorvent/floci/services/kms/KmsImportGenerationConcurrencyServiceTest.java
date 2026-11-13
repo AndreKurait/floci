@@ -1,9 +1,9 @@
-package io.floci.aws.services.kms;
+package io.github.hectorvent.floci.services.kms;
 
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.core.storage.InMemoryStorage;
-import io.floci.aws.services.kms.model.KmsKey;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.kms.model.KmsKey;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;

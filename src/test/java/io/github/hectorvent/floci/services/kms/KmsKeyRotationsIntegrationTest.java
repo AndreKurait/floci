@@ -1,7 +1,7 @@
-package io.floci.aws.services.kms;
+package io.github.hectorvent.floci.services.kms;
 
-import io.floci.aws.testing.AwsTestClients;
-import io.floci.aws.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.testing.AwsTestClients;
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
