@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.appconfig.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -34,6 +35,7 @@ public class DeploymentSummary {
     @JsonProperty("Type")
     private String type;
     @JsonProperty("VersionLabel")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     private String versionLabel;
 
     public DeploymentSummary() {
