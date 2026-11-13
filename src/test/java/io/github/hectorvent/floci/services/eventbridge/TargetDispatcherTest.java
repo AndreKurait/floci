@@ -1,0 +1,681 @@
+package io.github.hectorvent.floci.services.eventbridge;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.ServiceCallAuthorizer;
+import io.github.hectorvent.floci.core.common.ServiceRoleCallAuthorizer;
+import io.github.hectorvent.floci.services.eventbridge.model.Target;
+import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.sns.SnsService;
+import io.github.hectorvent.floci.services.sqs.SqsService;
+import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
+import io.github.hectorvent.floci.testing.TestTime;
+import io.github.hectorvent.floci.testutil.LogCapture;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
+import org.mockito.MockMakers;
+import org.mockito.MockedStatic;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.LogRecord;
+
+import static io.github.hectorvent.floci.testing.InlineMocks.inlineMock;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+class TargetDispatcherTest {
+
+    private static final Instant T0 = Instant.parse("2026-06-15T12:00:00Z");
+    private static final String BASE_URL = "http://localhost:4566";
+    private static final String REGION = "us-east-1";
+    private static final String RULE_ARN = "arn:aws:events:us-east-1:000000000000:rule/orders";
+    private static final String TARGET_ARN = "arn:aws:sqs:us-east-1:000000000000:orders";
+    private static final String TARGET_URL = BASE_URL + "/000000000000/orders";
+    private static final String DLQ_ARN = "arn:aws:sqs:us-east-1:000000000000:orders-dlq";
+    private static final String DLQ_URL = BASE_URL + "/000000000000/orders-dlq";
+    private static final String EVENT = "{\"id\":\"e-1\",\"source\":\"orders\",\"detail\":{\"orderId\":\"o-1\"}}";
+
+    private LambdaService lambdaService;
+    private SqsService sqsService;
+    private TestTime time;
+    private EventBridgeInvoker invoker;
+    private Clock clock;
+    private TargetDispatcher dispatcher;
+
+    @BeforeEach
+    void setUp() {
+        lambdaService = mock(LambdaService.class);
+        sqsService = mock(SqsService.class);
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        when(config.baseUrl()).thenReturn(BASE_URL);
+        invoker = new EventBridgeInvoker(
+                lambdaService, sqsService, mock(SnsService.class), new ObjectMapper(), config);
+        time = TestTime.startingAt(T0);
+        clock = time.clock();
+        dispatcher = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class), BASE_URL, clock, null);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {429, 503})
+    void transientRefusalIsRetriedAfterBackoffUntilAccepted(int httpStatus) {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(httpStatus == 429
+                        ? new AwsException("ThrottlingException", "Request limit reached.", 429)
+                        : unavailable())
+                .thenReturn(null);
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        tickAt(T0.plusMillis(999));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        tickAt(T0.plusSeconds(1));
+        verify(sqsService, times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        tickAt(T0.plusSeconds(3600));
+        verify(sqsService, times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void activeStatementsExceededIsRetriedAfterBackoffUntilAccepted() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(new AwsException("ActiveStatementsExceededException", "Too many active statements", 400))
+                .thenReturn(null);
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        tickAt(T0.plusMillis(999));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        tickAt(T0.plusSeconds(1));
+        verify(sqsService, times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        tickAt(T0.plusSeconds(3600));
+        verify(sqsService, times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void queuedRetryWakesItselfUpOnTheExecutor() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(unavailable())
+                .thenReturn(null);
+        TargetDispatcher scheduled = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class), BASE_URL, clock, time.scheduler());
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        scheduled.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        time.advance(Duration.ofSeconds(1).minusNanos(1));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        time.advance(Duration.ofNanos(1));
+        verify(sqsService, times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+
+        scheduled.shutdown();
+        assertEquals(0, time.pendingTasks());
+    }
+
+    @Test
+    void retriesRunFromOnePeriodicTickRatherThanATimerEach() {
+        ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
+        TargetDispatcher scheduled = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class), BASE_URL, clock, executor);
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        scheduled.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        scheduled.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+
+        verify(executor).scheduleWithFixedDelay(any(Runnable.class), eq(1L), eq(1L), eq(TimeUnit.SECONDS));
+        verifyNoMoreInteractions(executor);
+    }
+
+    @Test
+    void exhaustedRetryAttemptsSendTheOriginalEventToTheDeadLetterQueue() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+        Target target = sqsTarget(new Target.RetryPolicy(2, 3600), DLQ_ARN);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        tickAt(T0.plusSeconds(10));
+        tickAt(T0.plusSeconds(20));
+        tickAt(T0.plusSeconds(600));
+
+        verify(sqsService, times(3)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        Map<String, MessageAttributeValue> attributes = deadLetterAttributes();
+        assertAttribute(attributes, "RULE_ARN", RULE_ARN);
+        assertAttribute(attributes, "TARGET_ARN", TARGET_ARN);
+        assertAttribute(attributes, "ERROR_CODE", "ERROR_FROM_TARGET");
+        assertAttribute(attributes, "ERROR_MESSAGE", "Service is unavailable.");
+        assertAttribute(attributes, "EXHAUSTED_RETRY_CONDITION", "MaximumRetryAttempts");
+        assertAttribute(attributes, "RETRY_ATTEMPTS", "2");
+    }
+
+    @Test
+    void expiredEventAgeSendsToTheDeadLetterQueueWithoutAnotherAttempt() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+        Target target = sqsTarget(new Target.RetryPolicy(185, 60), DLQ_ARN);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        tickAt(T0.plusSeconds(61));
+
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        Map<String, MessageAttributeValue> attributes = deadLetterAttributes();
+        assertAttribute(attributes, "EXHAUSTED_RETRY_CONDITION", "MaximumEventAgeInSeconds");
+        assertAttribute(attributes, "RETRY_ATTEMPTS", "0");
+    }
+
+    @Test
+    void nonRetryableRefusalIsDeadLetteredImmediately() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                        "The specified queue does not exist.", 400));
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+
+        Map<String, MessageAttributeValue> attributes = deadLetterAttributes();
+        assertAttribute(attributes, "ERROR_CODE", "NO_RESOURCE");
+        assertAttribute(attributes, "ERROR_MESSAGE", "The specified queue does not exist.");
+        assertAttribute(attributes, "RETRY_ATTEMPTS", "0");
+        assertFalse(attributes.containsKey("EXHAUSTED_RETRY_CONDITION"));
+
+        tickAt(T0.plusSeconds(1));
+        tickAt(T0.plusSeconds(3600));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+    }
+
+    @Test
+    void failedDeadLetterDeliveryDoesNotEscapeOrRetry() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                        "The specified queue does not exist.", 400));
+        when(sqsService.sendMessage(eq(DLQ_URL), anyString(), anyInt(), any(), any(), anyMap(), anyString()))
+                .thenThrow(new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                        "The specified queue does not exist.", 400));
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        assertDoesNotThrow(() -> dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target)));
+        tickAt(T0.plusSeconds(3600));
+
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verify(sqsService, times(1)).sendMessage(eq(DLQ_URL), anyString(), anyInt(), any(), any(), anyMap(), anyString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "arn:aws:sqs:us-east-1:000000000000:orders-dlq.fifo",
+            "arn:aws:sns:us-east-1:000000000000:orders-dlq",
+            "arn:aws:sqs:eu-west-1:000000000000:orders-dlq",
+            "   "
+    })
+    void unsupportedDeadLetterQueueIsSkipped(String deadLetterArn) {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                        "The specified queue does not exist.", 400));
+        Target target = sqsTarget(null, deadLetterArn);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void retryUsesTheCurrentTargetDefinition() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+        Target original = sqsTarget(null, null);
+        Target updated = new Target("orders-target", "arn:aws:sqs:us-east-1:000000000000:orders-v2", null, null);
+        AtomicReference<List<Target>> current = new AtomicReference<>(List.of(original));
+
+        dispatcher.dispatch(RULE_ARN, original, EVENT, REGION, current::get);
+        current.set(List.of(updated));
+        tickAt(T0.plusSeconds(1));
+
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verify(sqsService).sendMessage(BASE_URL + "/000000000000/orders-v2", EVENT, 0, null, null, REGION);
+    }
+
+    @Test
+    void appSyncDeliveryAndRetryKeepTheCurrentGraphqlOperation() {
+        invoker = mock(EventBridgeInvoker.class);
+        dispatcher = new TargetDispatcher(invoker, sqsService, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class), BASE_URL, clock, null);
+        doThrow(unavailable()).doNothing().when(invoker)
+                .invokeTarget(any(Target.class), eq(EVENT), eq(REGION), eq(RULE_ARN));
+        String endpoint = "arn:aws:appsync:us-east-1:000000000000:endpoints/graphql-api/orders";
+        Target original = new Target("appsync", endpoint, null, null);
+        original.setAppSyncParameters(new Target.AppSyncParameters("mutation { first }"));
+        Target updated = new Target("appsync", endpoint, null, null);
+        updated.setAppSyncParameters(new Target.AppSyncParameters("mutation { second }"));
+        AtomicReference<List<Target>> current = new AtomicReference<>(List.of(original));
+
+        dispatcher.dispatch(RULE_ARN, original, EVENT, REGION, current::get);
+        current.set(List.of(updated));
+        tickAt(T0.plusSeconds(1));
+
+        ArgumentCaptor<Target> delivered = ArgumentCaptor.forClass(Target.class);
+        verify(invoker, times(2)).invokeTarget(delivered.capture(), eq(EVENT), eq(REGION), eq(RULE_ARN));
+        assertEquals(original.getAppSyncParameters(), delivered.getAllValues().get(0).getAppSyncParameters());
+        assertEquals(updated.getAppSyncParameters(), delivered.getAllValues().get(1).getAppSyncParameters());
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void loweredRetryLimitDeadLettersAQueuedRetryWithoutAnotherAttempt() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+        Target original = sqsTarget(new Target.RetryPolicy(2, 3600), DLQ_ARN);
+        AtomicReference<List<Target>> current = new AtomicReference<>(List.of(original));
+
+        dispatcher.dispatch(RULE_ARN, original, EVENT, REGION, current::get);
+        current.set(List.of(sqsTarget(new Target.RetryPolicy(0, 3600), DLQ_ARN)));
+        tickAt(T0.plusSeconds(1));
+
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        Map<String, MessageAttributeValue> attributes = deadLetterAttributes();
+        assertAttribute(attributes, "EXHAUSTED_RETRY_CONDITION", "MaximumRetryAttempts");
+        assertAttribute(attributes, "RETRY_ATTEMPTS", "0");
+    }
+
+    @Test
+    void slowRetryDoesNotLetALaterDueRetryOutliveItsEventAge() {
+        String slowUrl = BASE_URL + "/000000000000/slow";
+        Target slow = new Target("slow-target", "arn:aws:sqs:us-east-1:000000000000:slow", null, null);
+        Target aged = sqsTarget(new Target.RetryPolicy(185, 60), DLQ_ARN);
+        when(sqsService.sendMessage(slowUrl, EVENT, 0, null, null, REGION))
+                .thenThrow(unavailable())
+                .thenAnswer(invocation -> {
+                    time.advanceTo(T0.plusSeconds(100));
+                    return null;
+                });
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+
+        dispatcher.dispatch(RULE_ARN, slow, EVENT, REGION, () -> List.of(slow, aged));
+        time.advanceTo(T0.plusMillis(500));
+        dispatcher.dispatch(RULE_ARN, aged, EVENT, REGION, () -> List.of(slow, aged));
+        tickAt(T0.plusSeconds(2));
+
+        verify(sqsService, times(2)).sendMessage(slowUrl, EVENT, 0, null, null, REGION);
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        assertAttribute(deadLetterAttributes(), "EXHAUSTED_RETRY_CONDITION", "MaximumEventAgeInSeconds");
+    }
+
+    @Test
+    void clearDuringATickStopsTheRemainingRetries() {
+        String firstUrl = BASE_URL + "/000000000000/first";
+        Target first = new Target("first-target", "arn:aws:sqs:us-east-1:000000000000:first", null, null);
+        Target second = sqsTarget(null, DLQ_ARN);
+        when(sqsService.sendMessage(firstUrl, EVENT, 0, null, null, REGION))
+                .thenThrow(unavailable())
+                .thenAnswer(invocation -> {
+                    dispatcher.clear();
+                    return null;
+                });
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+
+        dispatcher.dispatch(RULE_ARN, first, EVENT, REGION, () -> List.of(first, second));
+        time.advanceTo(T0.plusMillis(500));
+        dispatcher.dispatch(RULE_ARN, second, EVENT, REGION, () -> List.of(first, second));
+        tickAt(T0.plusSeconds(2));
+
+        verify(sqsService, times(2)).sendMessage(firstUrl, EVENT, 0, null, null, REGION);
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void removedTargetsPendingRetriesAreDroppedEvenIfItsIdReturns() {
+        String otherUrl = BASE_URL + "/000000000000/other";
+        Target removed = sqsTarget(null, DLQ_ARN);
+        Target kept = new Target("other-target", "arn:aws:sqs:us-east-1:000000000000:other", null, null);
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+        when(sqsService.sendMessage(otherUrl, EVENT, 0, null, null, REGION)).thenThrow(unavailable()).thenReturn(null);
+
+        dispatcher.dispatch(RULE_ARN, removed, EVENT, REGION, () -> List.of(removed, kept));
+        dispatcher.dispatch(RULE_ARN, kept, EVENT, REGION, () -> List.of(removed, kept));
+        dispatcher.dropPendingRetries(RULE_ARN, List.of("orders-target"));
+        tickAt(T0.plusSeconds(1));
+
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verify(sqsService, times(2)).sendMessage(otherUrl, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void retryIsDroppedWhenTheTargetWasRemoved() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+        Target target = sqsTarget(null, DLQ_ARN);
+        AtomicReference<List<Target>> current = new AtomicReference<>(List.of(target));
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, current::get);
+        current.set(List.of());
+        tickAt(T0.plusSeconds(1));
+        tickAt(T0.plusSeconds(3600));
+
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void retriesStayWithinTheirOwnAccountAndRegion() {
+        String ruleA = "arn:aws:events:us-east-1:111111111111:rule/orders";
+        String ruleB = "arn:aws:events:eu-west-1:222222222222:rule/orders";
+        String urlA = BASE_URL + "/111111111111/orders";
+        String urlB = BASE_URL + "/222222222222/orders";
+        Target targetA = new Target("orders-target", "arn:aws:sqs:us-east-1:111111111111:orders", null, null);
+        Target targetB = new Target("orders-target", "arn:aws:sqs:eu-west-1:222222222222:orders", null, null);
+        when(sqsService.sendMessage(urlA, EVENT, 0, null, null, "us-east-1"))
+                .thenThrow(unavailable())
+                .thenReturn(null);
+        when(sqsService.sendMessage(urlB, EVENT, 0, null, null, "eu-west-1"))
+                .thenThrow(unavailable())
+                .thenReturn(null);
+
+        dispatcher.dispatch(ruleA, targetA, EVENT, "us-east-1", () -> List.of(targetA));
+        dispatcher.dispatch(ruleB, targetB, EVENT, "eu-west-1", () -> List.of(targetB));
+        tickAt(T0.plusSeconds(1));
+
+        verify(sqsService, times(2)).sendMessage(urlA, EVENT, 0, null, null, "us-east-1");
+        verify(sqsService, times(2)).sendMessage(urlB, EVENT, 0, null, null, "eu-west-1");
+        verify(sqsService, never()).sendMessage(urlA, EVENT, 0, null, null, "eu-west-1");
+        verify(sqsService, never()).sendMessage(urlB, EVENT, 0, null, null, "us-east-1");
+    }
+
+    @Test
+    void acceptedLambdaInvocationIsNotRetried() {
+        String functionArn = "arn:aws:lambda:us-east-1:000000000000:function:f";
+        Target target = new Target("fn-target", functionArn, null, null);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        tickAt(T0.plusSeconds(1));
+        tickAt(T0.plusSeconds(3600));
+
+        verify(lambdaService, times(1)).invokeArn(eq(functionArn), any(), eq(InvocationType.Event));
+    }
+
+    @Test
+    void clearDropsPendingRetries() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        dispatcher.clear();
+        tickAt(T0.plusSeconds(3600));
+
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void attemptFailingAfterAResetIsNeitherRetriedNorDeadLettered() {
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenAnswer(invocation -> {
+            dispatcher.clear();
+            throw unavailable();
+        });
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+        tickAt(T0.plusSeconds(3600));
+
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+    }
+
+    @Test
+    void deliveryFailureRetainsCauseAndRetryOutcome() {
+        RuntimeException failure = new IllegalStateException((String) null, new IllegalArgumentException("nested"));
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(failure).thenReturn(null);
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        List<LogRecord> records = LogCapture.capture(TargetDispatcher.class,
+                () -> dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target)));
+        tickAt(T0.plusSeconds(1));
+
+        verify(sqsService, times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+        assertCause(records, "EventBridge rule {0} target {1} delivery failed with {2}: {3}", failure,
+                RULE_ARN, target.getId(), "INTERNAL_ERROR", "IllegalStateException");
+    }
+
+    @Test
+    void deadLetterFailureRetainsCauseAndDoesNotRetryPermanentRefusal() {
+        RuntimeException failure = new IllegalStateException("dlq unavailable", new IllegalArgumentException("nested"));
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(new AwsException("AccessDeniedException", "denied", 403));
+        when(sqsService.sendMessage(eq(DLQ_URL), eq(EVENT), eq(0), isNull(), isNull(), anyMap(), eq(REGION)))
+                .thenThrow(failure);
+        Target target = sqsTarget(null, DLQ_ARN);
+
+        List<LogRecord> records = LogCapture.capture(TargetDispatcher.class,
+                () -> dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target)));
+        tickAt(T0.plusSeconds(10));
+
+        verify(sqsService).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        Map<String, MessageAttributeValue> attributes = deadLetterAttributes();
+        assertAttribute(attributes, "ERROR_CODE", "NO_PERMISSIONS");
+        assertAttribute(attributes, "ERROR_MESSAGE", "denied");
+        assertAttribute(attributes, "RETRY_ATTEMPTS", "0");
+        assertCause(records, "EventBridge rule {0} target {1} dead-letter delivery to {2} failed: {3}",
+                failure, RULE_ARN, target.getId(), DLQ_ARN, failure.getMessage());
+    }
+
+    @Test
+    void retryLookupFailureRetainsCauseAndAllowsOtherPendingDelivery() {
+        RuntimeException failure = new IllegalStateException("lookup unavailable", new IllegalArgumentException("nested"));
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(unavailable()).thenThrow(unavailable()).thenReturn(null);
+        Target target = sqsTarget(null, DLQ_ARN);
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> { throw failure; });
+        dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target));
+
+        List<LogRecord> records = LogCapture.capture(TargetDispatcher.class, () -> tickAt(T0.plusSeconds(1)));
+        tickAt(T0.plusSeconds(10));
+
+        verify(sqsService, times(3)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+        assertCause(records, "EventBridge retry for rule {0} target {1} failed: {2}",
+                failure, RULE_ARN, target.getId(), failure.getMessage());
+    }
+
+    @Test
+    void dispatchFailureRetainsCauseWithoutEscapingCaller() {
+        RuntimeException failure = new IllegalStateException("policy unavailable", new IllegalArgumentException("nested"));
+        Target.RetryPolicy retryPolicy = inlineMock(Target.RetryPolicy.class);
+        when(retryPolicy.maximumEventAgeInSeconds()).thenThrow(failure);
+        Target target = sqsTarget(retryPolicy, DLQ_ARN);
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION)).thenThrow(unavailable());
+
+        List<LogRecord> records = LogCapture.capture(TargetDispatcher.class,
+                () -> assertDoesNotThrow(() -> dispatcher.dispatch(RULE_ARN, target, EVENT, REGION, () -> List.of(target))));
+        tickAt(T0.plusSeconds(10));
+
+        verify(sqsService).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        verifyNoDeadLetter();
+        assertCause(records, "EventBridge rule {0} could not dispatch to target {1}: {2}",
+                failure, RULE_ARN, target.getId(), failure.getMessage());
+    }
+
+    private static void assertCause(List<LogRecord> records, String template, RuntimeException failure,
+                                    Object... parameters) {
+        LogRecord record = records.stream().filter(entry -> template.equals(entry.getMessage()))
+                .findFirst().orElseThrow();
+        assertArrayEquals(parameters, record.getParameters());
+        assertSame(failure, record.getThrown());
+        assertSame(failure.getCause(), record.getThrown().getCause());
+    }
+
+    @Test
+    void dispatchEstablishesRuleAccountScopeBeforeFirstAttempt() {
+        Target target = sqsTarget(null, null);
+        try (MockedStatic<RequestScopes> scopes =
+                     mockStatic(RequestScopes.class, withSettings().mockMaker(MockMakers.INLINE))) {
+            scopes.when(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)))
+                    .thenAnswer(invocation -> {
+                        invocation.<Runnable>getArgument(1).run();
+                        return null;
+                    });
+
+            dispatcher.dispatch("arn:aws:events:us-east-1:123456789012:rule/orders", target, EVENT, REGION,
+                    () -> List.of(target));
+
+            scopes.verify(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)));
+            verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        }
+    }
+
+    @Test
+    void failureToEstablishRuleAccountScopeIsRetried() {
+        Target target = sqsTarget(null, DLQ_ARN);
+        AtomicReference<Boolean> failFirstScope = new AtomicReference<>(true);
+        try (MockedStatic<RequestScopes> scopes =
+                     mockStatic(RequestScopes.class, withSettings().mockMaker(MockMakers.INLINE))) {
+            scopes.when(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)))
+                    .thenAnswer(invocation -> {
+                        if (failFirstScope.getAndSet(false)) {
+                            throw new IllegalStateException("Request scope is not active");
+                        }
+                        invocation.<Runnable>getArgument(1).run();
+                        return null;
+                    });
+
+            dispatcher.dispatch("arn:aws:events:us-east-1:123456789012:rule/orders", target, EVENT, REGION,
+                    () -> List.of(target));
+            verify(sqsService, never()).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+            tickAt(T0.plusSeconds(1));
+
+            scopes.verify(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)), times(2));
+            verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+            verifyNoDeadLetter();
+        }
+    }
+
+    @Test
+    void repeatedFailureToEstablishRuleAccountScopeIsDeadLetteredAtAttemptLimit() {
+        Target target = sqsTarget(new Target.RetryPolicy(1, 3600), DLQ_ARN);
+        try (MockedStatic<RequestScopes> scopes =
+                     mockStatic(RequestScopes.class, withSettings().mockMaker(MockMakers.INLINE))) {
+            scopes.when(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)))
+                    .thenThrow(new IllegalStateException("Request scope is not active"));
+
+            dispatcher.dispatch("arn:aws:events:us-east-1:123456789012:rule/orders", target, EVENT, REGION,
+                    () -> List.of(target));
+            verify(sqsService, never()).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+            verifyNoDeadLetter();
+
+            tickAt(T0.plusSeconds(1));
+
+            scopes.verify(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)), times(2));
+            Map<String, MessageAttributeValue> attributes = deadLetterAttributes();
+            assertAttribute(attributes, "EXHAUSTED_RETRY_CONDITION", "MaximumRetryAttempts");
+            assertAttribute(attributes, "RETRY_ATTEMPTS", "1");
+            assertAttribute(attributes, "ERROR_CODE", "INTERNAL_ERROR");
+            verify(sqsService, never()).sendMessage(eq(TARGET_URL), eq(EVENT), eq(0), isNull(), isNull(), eq(REGION));
+        }
+    }
+
+    @Test
+    void repeatedFailureToEstablishRuleAccountScopeStopsAtEventAgeLimit() {
+        Target target = sqsTarget(new Target.RetryPolicy(5, 2), DLQ_ARN);
+        try (MockedStatic<RequestScopes> scopes =
+                     mockStatic(RequestScopes.class, withSettings().mockMaker(MockMakers.INLINE))) {
+            scopes.when(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)))
+                    .thenThrow(new IllegalStateException("Request scope is not active"));
+
+            dispatcher.dispatch("arn:aws:events:us-east-1:123456789012:rule/orders", target, EVENT, REGION,
+                    () -> List.of(target));
+            tickAt(T0.plusSeconds(1));
+            tickAt(T0.plusSeconds(2));
+
+            scopes.verify(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)), times(3));
+            Map<String, MessageAttributeValue> attributes = deadLetterAttributes();
+            assertAttribute(attributes, "EXHAUSTED_RETRY_CONDITION", "MaximumEventAgeInSeconds");
+            assertAttribute(attributes, "RETRY_ATTEMPTS", "1");
+        }
+    }
+
+    @Test
+    void retryEstablishesRuleAccountScope() {
+        Target target = sqsTarget(null, null);
+        when(sqsService.sendMessage(TARGET_URL, EVENT, 0, null, null, REGION))
+                .thenThrow(unavailable())
+                .thenReturn(null);
+
+        dispatcher.dispatch("arn:aws:events:us-east-1:123456789012:rule/orders", target, EVENT, REGION,
+                () -> List.of(target));
+        verify(sqsService, times(1)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+
+        try (MockedStatic<RequestScopes> scopes =
+                     mockStatic(RequestScopes.class, withSettings().mockMaker(MockMakers.INLINE))) {
+            scopes.when(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)))
+                    .thenAnswer(invocation -> {
+                        invocation.<Runnable>getArgument(1).run();
+                        return null;
+                    });
+
+            tickAt(T0.plusSeconds(1));
+
+            scopes.verify(() -> RequestScopes.runAs(eq("123456789012"), any(Runnable.class)));
+            verify(sqsService, times(2)).sendMessage(TARGET_URL, EVENT, 0, null, null, REGION);
+        }
+    }
+
+    private void tickAt(Instant now) {
+        time.advanceTo(now);
+        dispatcher.tick();
+    }
+
+    private static Target sqsTarget(Target.RetryPolicy retryPolicy, String deadLetterArn) {
+        Target target = new Target("orders-target", TARGET_ARN, null, null);
+        target.setRetryPolicy(retryPolicy);
+        if (deadLetterArn != null) {
+            target.setDeadLetterConfig(new Target.DeadLetterConfig(deadLetterArn));
+        }
+        return target;
+    }
+
+    private static AwsException unavailable() {
+        return new AwsException("ServiceUnavailable", "Service is unavailable.", 503);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, MessageAttributeValue> deadLetterAttributes() {
+        ArgumentCaptor<Map<String, MessageAttributeValue>> attributes = ArgumentCaptor.forClass(Map.class);
+        verify(sqsService, times(1)).sendMessage(
+                eq(DLQ_URL), eq(EVENT), eq(0), isNull(), isNull(), attributes.capture(), eq(REGION));
+        return attributes.getValue();
+    }
+
+    private void verifyNoDeadLetter() {
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), any(), any(), anyMap(), anyString());
+    }
+
+    private static void assertAttribute(Map<String, MessageAttributeValue> attributes, String name, String value) {
+        MessageAttributeValue attribute = attributes.get(name);
+        assertNotNull(attribute, name);
+        assertEquals(value, attribute.getStringValue(), name);
+        assertEquals("String", attribute.getDataType(), name);
+    }
+}
