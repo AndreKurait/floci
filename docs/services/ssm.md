@@ -29,6 +29,12 @@
 `DescribeParameters` includes the stored parameter's `ARN` in each metadata entry, matching
 `GetParameter`. This applies to filtered and paginated results as well.
 
+`GetParameter` and `GetParameters` remove leading and trailing ASCII spaces from each
+requested name before lookup and secret-reference authorization. An interior space fails
+the complete request with `ValidationException`. ARN, version and label selectors retain
+their normal scope and permission checks. Missing batch names are returned in
+`InvalidParameters` after this trimming.
+
 `GetParametersByPath` supports `Type` and `KeyId` entries in `ParameterFilters`, with `Equals`
 (the default) or `BeginsWith`. Values within one filter combine with OR; multiple
 filters combine with AND. Filtering also applies to public AMI parameters and
