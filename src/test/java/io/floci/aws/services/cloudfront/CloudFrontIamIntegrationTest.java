@@ -11,6 +11,7 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.UUID;
@@ -18,6 +19,7 @@ import java.util.UUID;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 /**
  * CloudFront requests are checked against the caller's policies through its generated routes and request
@@ -104,6 +106,73 @@ class CloudFrontIamIntegrationTest {
         try (SignedIamUsers.User user = user("Allow", "cloudfront:ListCachePolicies", "*")) {
             send(user.signer("cloudfront"), "GET", API + "/cache-policy", null).then().statusCode(200)
                     .body(containsString("<CachePolicyList"));
+        }
+    }
+
+    @Test
+    void taggedKeyValueStoreCreateRequiresTagPermissionBeforeMutation() throws Exception {
+        keyValueStoreCreate("tag-denied", true, "cloudfront:TagResource", 403);
+    }
+
+    @Test
+    void untaggedKeyValueStoreCreateDoesNotRequireTagPermission() throws Exception {
+        keyValueStoreCreate("untagged", false, "cloudfront:TagResource", 201);
+    }
+
+    @Test
+    void taggedKeyValueStoreCreateWithTagPermissionRetainsTags() throws Exception {
+        keyValueStoreCreate("tag-allowed", true, "cloudfront:DeleteDistribution", 201);
+    }
+
+    private void keyValueStoreCreate(String prefix, boolean tagged, String deniedAction, int expectedStatus)
+            throws Exception {
+        keyValueStoreCreate(prefix, tagged, deniedAction, expectedStatus, "");
+    }
+
+    @Test
+    void createActionSeesRequestTagsBeforeMutation() throws Exception {
+        keyValueStoreCreate("create-condition", true, "cloudfront:CreateKeyValueStore", 403,
+                ",\"Condition\":{\"StringEquals\":{\"aws:RequestTag/team\":\"blue\"}}");
+    }
+
+    @Test
+    void taggingActionSeesTagKeysBeforeMutation() throws Exception {
+        keyValueStoreCreate("tag-condition", true, "cloudfront:TagResource", 403,
+                ",\"Condition\":{\"ForAnyValue:StringEquals\":{\"aws:TagKeys\":\"team\"}}");
+    }
+
+    private void keyValueStoreCreate(String prefix, boolean tagged, String deniedAction, int expectedStatus,
+                                     String condition) throws Exception {
+        String name = prefix + "-" + UUID.randomUUID().toString().substring(0, 8);
+        String path = API + "/key-value-store/" + name;
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "cf-tag-", "access",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"cloudfront:*\","
+                        + "\"Resource\":\"*\"},{\"Effect\":\"Deny\",\"Action\":\"" + deniedAction
+                        + "\",\"Resource\":\"*\"" + condition + "}]}")) {
+            String tags = tagged ? "<Tags><Items><Tag><Key>team</Key><Value>blue</Value></Tag></Items></Tags>" : "";
+            Response response = send(user.signer("cloudfront"), "POST", API + "/key-value-store",
+                    "<CreateKeyValueStoreRequest><Name>" + name + "</Name>" + tags
+                            + "</CreateKeyValueStoreRequest>");
+            // Observe state before asserting the response, including when a broken source accepts the create.
+            Response stored = send(admin, "GET", path, null);
+            assertAll(
+                    () -> response.then().statusCode(expectedStatus),
+                    () -> stored.then().statusCode(expectedStatus == 201 ? 200 : 404));
+            if (expectedStatus == 403) {
+                denied(response, deniedAction);
+            } else if (tagged) {
+                String arn = stored.xmlPath().getString("KeyValueStore.ARN");
+                send(admin, "GET", API + "/tagging?Resource="
+                        + URLEncoder.encode(arn, StandardCharsets.UTF_8), null).then().statusCode(200)
+                        .body(containsString("<Key>team</Key>"), containsString("<Value>blue</Value>"));
+            }
+        } finally {
+            Response stored = send(admin, "GET", path, null);
+            if (stored.statusCode() == 200) {
+                send(admin, "DELETE", path, null, Map.of("if-match", stored.header("ETag")))
+                        .then().statusCode(204);
+            }
+            send(admin, "GET", path, null).then().statusCode(404);
         }
     }
 
