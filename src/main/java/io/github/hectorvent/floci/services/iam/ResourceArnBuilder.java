@@ -1939,6 +1939,10 @@ public class ResourceArnBuilder {
             action = action.substring(4);
         }
         JsonNode json = readJsonBody(ctx);
+        List<String> syncResources = ssmDataSyncResources(action, json, region, accountId, partition);
+        if (syncResources != null) {
+            return syncResources;
+        }
         if (json != null && "Document".equals(json.path("ResourceType").asText())
                 && ("AddTagsToResource".equals(action) || "ListTagsForResource".equals(action)
                 || "RemoveTagsFromResource".equals(action))) {
@@ -1963,6 +1967,24 @@ public class ResourceArnBuilder {
                     (managed ? "managed-instance/" : "instance/") + id).toString());
         }
         return List.copyOf(resources);
+    }
+
+    /** Only the dispatched sync operation selects a sync ARN; parameter and body action fields do not. */
+    private static List<String> ssmDataSyncResources(String action, JsonNode json, String region,
+                                                     String accountId, String partition) {
+        if ("ListResourceDataSync".equals(action)) {
+            return List.of("*");
+        }
+        if (!"CreateResourceDataSync".equals(action) && !"UpdateResourceDataSync".equals(action)
+                && !"DeleteResourceDataSync".equals(action)) {
+            return null;
+        }
+        JsonNode name = json == null ? null : json.get("SyncName");
+        if (name == null || !name.isTextual() || name.asText().isEmpty()) {
+            return List.of("*");
+        }
+        return List.of(new AwsArnUtils.Arn(partition, "ssm", region, accountId,
+                "resource-data-sync/" + name.asText()).toString());
     }
 
     private String buildSsmArn(ContainerRequestContext ctx, String region, String accountId) {

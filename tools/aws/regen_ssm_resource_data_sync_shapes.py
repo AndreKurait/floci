@@ -11,5 +11,6 @@ if __name__ == "__main__":
         model=Path("ssm/2014-11-06"),
         output=REPO_ROOT / "src/main/resources/aws/ssm-resource-data-sync-request-shapes.json",
         description=__doc__,
-        operations=("CreateResourceDataSync", "ListResourceDataSync", "DeleteResourceDataSync"),
+        operations=("CreateResourceDataSync", "ListResourceDataSync", "DeleteResourceDataSync",
+                    "UpdateResourceDataSync"),
     ))

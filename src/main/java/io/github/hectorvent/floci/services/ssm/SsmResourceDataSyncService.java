@@ -40,13 +40,14 @@ import java.io.ByteArrayOutputStream;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-/** Exports managed-node inventory to S3 and checkpoints only completed writes. */
+/** Stores source configuration metadata and exports destination inventory to S3. */
 @ApplicationScoped
 public class SsmResourceDataSyncService implements Resettable {
     private static final Logger LOG = Logger.getLogger(SsmResourceDataSyncService.class);
@@ -101,7 +102,11 @@ public class SsmResourceDataSyncService implements Resettable {
 
     public void create(JsonNode request, String region) {
         SsmResourceDataSyncRequests.check("CreateResourceDataSync", request);
-        if (!DESTINATION.equals(type(request)) || request.hasNonNull("SyncSource")) {
+        if (SOURCE.equals(type(request))) {
+            createSource(request, region);
+            return;
+        }
+        if (request.hasNonNull("SyncSource")) {
             throw invalid("Explorer SyncFromSource resource data syncs are not supported.");
         }
         if (!request.hasNonNull("S3Destination")) {
@@ -128,7 +133,9 @@ public class SsmResourceDataSyncService implements Resettable {
                 throw new AwsException("ResourceDataSyncAlreadyExistsException",
                         "A resource data sync named " + name + " already exists.", 400);
             }
-            if (syncs.scan(key -> key.startsWith(region + "::")).size() >= MAX_SYNCS) {
+            if (syncs.scan(key -> key.startsWith(region + "::")).stream()
+                    .filter(sync -> DESTINATION.equals(sync.path("SyncType").asText()))
+                    .count() >= MAX_SYNCS) {
                 throw new AwsException("ResourceDataSyncCountExceededException",
                         "An account can have at most " + MAX_SYNCS + " resource data syncs per Region.", 400);
             }
@@ -139,6 +146,57 @@ public class SsmResourceDataSyncService implements Resettable {
             sync.set("S3Destination", destination);
             sync.putObject("Acknowledged");
             syncs.put(key(region, name), sync);
+        } finally {
+            lifecycle.writeLock().unlock();
+        }
+    }
+
+    private void createSource(JsonNode request, String region) {
+        ObjectNode source = SsmSourceSyncConfiguration.read(request, false);
+        String name = request.get("SyncName").asText();
+        lifecycle.writeLock().lock();
+        try {
+            requireAdmission();
+            if (syncs.get(key(region, name)).isPresent()) {
+                throw new AwsException("ResourceDataSyncAlreadyExistsException",
+                        "A resource data sync named " + name + " already exists.", 400);
+            }
+            if (syncs.scan(key -> key.startsWith(region + "::")).stream()
+                    .filter(sync -> SOURCE.equals(sync.path("SyncType").asText())).count() >= MAX_SYNCS) {
+                throw new AwsException("ResourceDataSyncCountExceededException",
+                        "An account can have at most " + MAX_SYNCS + " source resource data syncs per Region.", 400);
+            }
+            double now = EpochSeconds.fromInstant(Instant.now());
+            ObjectNode sync = JSON.objectNode().put("SyncName", name).put("SyncType", SOURCE)
+                    .put("Region", region).put("Generation", UUID.randomUUID().toString())
+                    .put("SyncCreatedTime", now).put("SyncLastModifiedTime", now);
+            sync.set("SyncSource", source);
+            syncs.putAllAtomically(Map.of(key(region, name), sync));
+        } finally {
+            lifecycle.writeLock().unlock();
+        }
+    }
+
+    public void update(JsonNode request, String region) {
+        SsmResourceDataSyncRequests.check("UpdateResourceDataSync", request);
+        if (!SOURCE.equals(type(request))) {
+            throw SsmSourceSyncConfiguration.invalid("Only SyncFromSource configurations can be updated.");
+        }
+        ObjectNode source = SsmSourceSyncConfiguration.read(request, true);
+        String key = key(region, request.get("SyncName").asText());
+        lifecycle.writeLock().lock();
+        try {
+            requireAdmission();
+            ObjectNode stored = syncs.get(key).filter(sync -> SOURCE.equals(sync.path("SyncType").asText()))
+                    .orElseThrow(SsmResourceDataSyncService::notFound);
+            if (!stored.path("SyncSource").path("SourceType").equals(source.path("SourceType"))
+                    || stored.path("SyncSource").hasNonNull("AwsOrganizationsSource")) {
+                throw SsmSourceSyncConfiguration.invalid("The resource data sync account options cannot change.");
+            }
+            ObjectNode replacement = stored.deepCopy();
+            replacement.set("SyncSource", source);
+            replacement.put("SyncLastModifiedTime", EpochSeconds.fromInstant(Instant.now()));
+            syncs.putAllAtomically(Map.of(key, replacement));
         } finally {
             lifecycle.writeLock().unlock();
         }
@@ -179,11 +237,17 @@ public class SsmResourceDataSyncService implements Resettable {
         String key = key(region, request.get("SyncName").asText());
         lifecycle.writeLock().lock();
         try {
-            if (!DESTINATION.equals(type) || syncs.get(key).isEmpty()) {
-                throw new AwsException("ResourceDataSyncNotFoundException",
-                        "The specified resource data sync does not exist.", 400);
+            if (SOURCE.equals(type)) {
+                requireAdmission();
             }
-            syncs.delete(key);
+            if (syncs.get(key).filter(sync -> type.equals(sync.path("SyncType").asText())).isEmpty()) {
+                throw notFound();
+            }
+            if (SOURCE.equals(type)) {
+                syncs.deleteAllAtomically(Set.of(key));
+            } else {
+                syncs.delete(key);
+            }
         } finally {
             lifecycle.writeLock().unlock();
         }
@@ -198,7 +262,9 @@ public class SsmResourceDataSyncService implements Resettable {
                 if (closed || resetting) {
                     return;
                 }
-                synchronize(entry.accountId(), entry.key());
+                if (DESTINATION.equals(entry.value().path("SyncType").asText())) {
+                    synchronize(entry.accountId(), entry.key());
+                }
             }
         } catch (RuntimeException e) {
             LOG.warnv(e, "Inventory synchronization cycle failed; the next cycle will retry");
@@ -212,7 +278,7 @@ public class SsmResourceDataSyncService implements Resettable {
                 return;
             }
             ObjectNode sync = syncs.getForAccount(account, key).map(ObjectNode::deepCopy).orElse(null);
-            if (sync == null) {
+            if (sync == null || !DESTINATION.equals(sync.path("SyncType").asText())) {
                 return;
             }
             String region = sync.get("Region").asText();
@@ -387,6 +453,17 @@ public class SsmResourceDataSyncService implements Resettable {
                 throw new IllegalStateException("Interrupted while stopping inventory synchronization.", e);
             }
         }
+    }
+
+    private void requireAdmission() {
+        if (closed || resetting) {
+            throw new AwsException("InternalServerError", "Resource data syncs are stopping or resetting.", 500);
+        }
+    }
+
+    private static AwsException notFound() {
+        return new AwsException("ResourceDataSyncNotFoundException",
+                "The specified resource data sync does not exist.", 400);
     }
 
     private static String type(JsonNode request) {
