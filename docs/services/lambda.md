@@ -1072,13 +1072,34 @@ A rejected update preserves the configuration and revision. Empty subnet and sec
 group lists detach the function, and the response then omits `VpcConfig`. Published
 versions retain their network configuration when `$LATEST` changes.
 
-These checks validate the declaration. Function containers still use the configured
-Docker network. With Docker-backed VPC networks (`FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=true`
-and `FLOCI_SERVICES_EC2_MOCK=false`) and a known `VpcId`, the container also joins that VPC's
-Docker network at an address leased from the first subnet in `SubnetIds`, so it reaches EC2
-instances and `awsvpc` ECS tasks in the VPC at the private addresses they report. The address is
-returned once the container is removed. `VpcConfig` does not yet enforce security-group rules or
-NAT egress, and the other subnets are not used.
+For Docker execution with `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`,
+each VPC-connected execution environment gets an ENI in a declared subnet and a
+protected network namespace. Subnet selection rotates across the declared subnets
+when new environments start. Security-group rules are installed before function
+code starts, and SDK rule changes update warm environments. A missing ingress or
+egress rule drops real packets, leaving the function's own client to time out.
+
+The namespace permits the exact IP and TCP port of that environment's Runtime API,
+so blocked application traffic does not prevent invocation delivery or results.
+This does not open the emulator's other API ports. EC2 instance metadata is blocked.
+Privileged containers and Docker network, port, DNS or host overrides cannot be
+combined with protected VPC execution. Ordinary environment retirement removes the
+container before releasing its helper and ENI; startup retires surviving owned
+helpers and their workloads.
+
+This currently allocates an ENI per execution environment. Hyperplane ENI sharing,
+attachment-time IAM permission checks, VPC routes, NACLs and NAT translation are
+not emulated by this path. Packets still use Docker transport addresses. The
+security-group flag is opt-in and applies to Docker execution.
+
+Without security-group enforcement, Docker-backed VPC networks
+(`FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=true` and `FLOCI_SERVICES_EC2_MOCK=false`)
+and a known `VpcId` let the container join that VPC's Docker network at an address
+leased from the first declared subnet. That address is returned after the container
+is removed. This path does not enforce security-group rules or NAT egress and does
+not use the other declared subnets. Protected execution uses its helper's namespace
+instead of adding this ordinary VPC network attachment.
+
 
 `RuntimeVersionConfig.RuntimeVersionArn` is returned for managed (non-image)
 runtimes. Its value is derived from the runtime name, so it is stable across
