@@ -2,6 +2,7 @@ package io.floci.aws.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Network;
@@ -12,6 +13,8 @@ import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.services.ec2.model.IpPermission;
 import io.floci.aws.services.ec2.model.IpRange;
 import io.floci.aws.services.ec2.model.SecurityGroup;
+import io.floci.aws.services.ec2.model.UserIdGroupPair;
+import io.floci.aws.testing.DockerAvailability;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Assumptions;
@@ -27,11 +30,13 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
@@ -47,6 +52,117 @@ class SecurityGroupFirewallDockerIntegrationTest {
     @Inject ContainerBuilder builder;
     @Inject DockerClient docker;
     @Inject EmulatorConfig config;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"stop", "remove", "disconnect"})
+    void externalHelperChangesRetirePeerAccessBeforeAddressReuse(String action) throws Exception {
+        Assumptions.assumeTrue(firewall.enabled());
+        Assumptions.assumeTrue(DockerAvailability.answers(docker), "Docker daemon is unavailable");
+        Assumptions.assumeTrue("linux".equalsIgnoreCase(docker.infoCmd().exec().getOsType()));
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String sourceEni = "eni-peer-source-" + suffix;
+        String targetEni = "eni-peer-target-" + suffix;
+        String controlEni = "eni-peer-control-" + suffix;
+        String networkName = "floci-sg-peer-" + suffix;
+        String network = null;
+        String server = null;
+        String unmanaged = null;
+        List<SecurityGroupFirewallManager.Namespace> namespaces = new ArrayList<>();
+        try {
+            network = docker.createNetworkCmd().withName(networkName)
+                    .withLabels(ContainerStorageHelper.defaultLabels(config)).withIpam(new Network.Ipam()
+                    .withConfig(new Network.Ipam.Config().withSubnet("10.199.43.0/24"))).exec().getId();
+            SecurityGroupFirewallManager.Namespace target = firewall.createNamespace(
+                    "ec2", targetEni, "000000000000", "us-east-1", Optional.of(networkName), Map.of());
+            namespaces.add(target);
+            SecurityGroupFirewallManager.Namespace source = firewall.createNamespace(
+                    "ec2", sourceEni, "000000000000", "us-east-1", Optional.of(networkName), Map.of());
+            namespaces.add(source);
+            SecurityGroupFirewallManager.Namespace control = firewall.createNamespace(
+                    "ec2", controlEni, "000000000000", "us-east-1", Optional.of(networkName), Map.of());
+            namespaces.add(control);
+            SecurityGroup sourceGroup = group("sg-peer-source-" + suffix, true, "0.0.0.0/0");
+            SecurityGroup targetGroup = group("sg-peer-target-" + suffix, false, "192.0.2.0/24");
+            IpPermission ingress = targetGroup.getIpPermissions().getFirst();
+            ingress.getIpRanges().clear();
+            UserIdGroupPair reference = new UserIdGroupPair();
+            reference.setGroupId(sourceGroup.getGroupId());
+            reference.setUserId("000000000000");
+            ingress.getUserIdGroupPairs().add(reference);
+            firewall.register(endpoint(targetEni, "10.0.0.10", target, targetGroup),
+                    target.helperId(), Map.of());
+            firewall.register(endpoint(sourceEni, "10.0.0.11", source, sourceGroup),
+                    source.helperId(), Map.of());
+            firewall.register(endpoint(controlEni, "10.0.0.12", control, sourceGroup),
+                    control.helperId(), Map.of());
+            server = lifecycle.createAndStart(builder.newContainer("alpine:3.21")
+                    .withName("floci-peer-server-" + suffix)
+                    .withNetworkMode("container:" + target.helperId())
+                    .withEntrypoint(List.of("sh", "-c"))
+                    .withCmd(List.of("exec nc -lk -p 8080 -e /bin/cat")).build()).containerId();
+            String targetServer = server;
+            await().atMost(Duration.ofSeconds(10)).until(() -> connect(targetServer, "127.0.0.1") == 0);
+            assertEquals(0, execute(source.helperId(), "nc", "-z", "-w", "2", "-p", "42710",
+                    target.transportAddress(), "8080"));
+            assertEquals(0, connect(control.helperId(), target.transportAddress()));
+            unmanaged = docker.createContainerCmd("alpine:3.21")
+                    .withLabels(ContainerStorageHelper.defaultLabels(config))
+                    .withHostConfig(HostConfig.newHostConfig().withNetworkMode(networkName))
+                    .withCmd("sleep", "600").exec().getId();
+            docker.startContainerCmd(unmanaged).exec();
+            assertNotEquals(0, connect(unmanaged, target.transportAddress(), DENIED_TIMEOUT_SECONDS));
+            lifecycle.removeIfExists(unmanaged);
+            unmanaged = null;
+            String address = source.transportAddress();
+
+            switch (action) {
+                case "stop" -> docker.stopContainerCmd(source.helperId()).withTimeout(0).exec();
+                case "remove" -> docker.removeContainerCmd(source.helperId()).withForce(true).exec();
+                case "disconnect" -> docker.disconnectFromNetworkCmd().withNetworkId(network)
+                        .withContainerId(source.helperId()).withForce(true).exec();
+                default -> throw new IllegalArgumentException(action);
+            }
+            await().atMost(Duration.ofSeconds(10)).until(() -> firewall.vpcForClient(address).isEmpty());
+            unmanaged = docker.createContainerCmd("alpine:3.21")
+                    .withLabels(ContainerStorageHelper.defaultLabels(config))
+                    .withHostConfig(HostConfig.newHostConfig().withNetworkMode(networkName))
+                    .withIpv4Address(address).withCmd("sleep", "600").exec().getId();
+            docker.startContainerCmd(unmanaged).exec();
+            String replacement = unmanaged;
+            assertEquals(address, docker.inspectContainerCmd(replacement).exec()
+                    .getNetworkSettings().getNetworks().get(networkName).getIpAddress());
+            AtomicInteger sourcePort = new AtomicInteger(42711);
+            await("stale peer access after " + action).atMost(Duration.ofSeconds(10))
+                    .until(() -> execute(replacement, "nc", "-z",
+                            "-w", "1", "-p", String.valueOf(sourcePort.getAndIncrement()),
+                            target.transportAddress(), "8080") != 0);
+            assertTrue(docker.inspectContainerCmd(replacement).exec().getState().getRunning());
+            assertEquals(0, connect(control.helperId(), target.transportAddress()),
+                    "retirement must preserve another admitted member of the source group");
+            assertNotEquals(0, execute(replacement, "nc", "-z", "-w", "1",
+                    "-p", String.valueOf(sourcePort.getAndIncrement()), target.transportAddress(), "8080"));
+            String retiredHelper = source.helperId();
+            firewall.unregister(sourceEni);
+            assertThrows(NotFoundException.class, () -> docker.inspectContainerCmd(retiredHelper).exec(),
+                    "ordinary ENI cleanup must still remove a retired helper");
+        } finally {
+            if (unmanaged != null) {
+                lifecycle.removeIfExists(unmanaged);
+            }
+            if (server != null) {
+                lifecycle.removeIfExists(server);
+            }
+            firewall.unregister(sourceEni);
+            firewall.unregister(controlEni);
+            firewall.unregister(targetEni);
+            for (SecurityGroupFirewallManager.Namespace namespace : namespaces) {
+                lifecycle.removeIfExists(namespace.helperId());
+            }
+            if (network != null) {
+                docker.removeNetworkCmd(network).exec();
+            }
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"stop", "remove", "disconnect"})
@@ -192,11 +308,15 @@ class SecurityGroupFirewallDockerIntegrationTest {
     }
 
     private int connect(String worker, String address, int timeoutSeconds) throws Exception {
+        return execute(worker, "nc", "-z", "-w", String.valueOf(timeoutSeconds), address, "8080");
+    }
+
+    private int execute(String worker, String... command) throws Exception {
         String id = docker.execCreateCmd(worker).withAttachStdout(true).withAttachStderr(true)
-                .withCmd("nc", "-z", "-w", String.valueOf(timeoutSeconds), address, "8080")
+                .withCmd(command)
                 .exec().getId();
         try (ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>()) {
-            docker.execStartCmd(id).exec(callback).awaitCompletion(5, TimeUnit.SECONDS);
+            assertTrue(docker.execStartCmd(id).exec(callback).awaitCompletion(5, TimeUnit.SECONDS));
         }
         return docker.inspectExecCmd(id).exec().getExitCodeLong().intValue();
     }
