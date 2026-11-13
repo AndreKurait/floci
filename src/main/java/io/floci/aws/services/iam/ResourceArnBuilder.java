@@ -21,6 +21,7 @@ import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.durable.DurableTokens;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
+import io.floci.aws.services.neptune.NeptuneSnapshotResources;
 import io.floci.aws.services.s3.S3ControlArnUtils;
 import io.floci.aws.services.s3.S3ObjectKeys;
 import io.floci.aws.services.s3.S3ResourceArns;
@@ -118,6 +119,7 @@ public class ResourceArnBuilder {
      * request, as in a unit test, where the request URI's raw path stands in.
      */
     private final CurrentVertxRequest currentVertxRequest;
+    private final Instance<NeptuneSnapshotResources> neptuneSnapshotResources;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -126,7 +128,8 @@ public class ResourceArnBuilder {
                               Instance<EksService> eksService,
                               Instance<KmsService> kmsService,
                               Instance<StoredResourceArns> storedResourceArns,
-                              CurrentVertxRequest currentVertxRequest) {
+                              CurrentVertxRequest currentVertxRequest,
+                              Instance<NeptuneSnapshotResources> neptuneSnapshotResources) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -135,6 +138,17 @@ public class ResourceArnBuilder {
         this.kmsService = kmsService;
         this.storedResourceArns = storedResourceArns;
         this.currentVertxRequest = currentVertxRequest;
+        this.neptuneSnapshotResources = neptuneSnapshotResources;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService, Instance<KmsService> kmsService,
+                              Instance<StoredResourceArns> storedResourceArns,
+                              CurrentVertxRequest currentVertxRequest) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
+                storedResourceArns, currentVertxRequest, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -219,6 +233,22 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation) && neptuneSnapshotResources != null
+                && !neptuneSnapshotResources.isUnsatisfied()) {
+            Map<String, String> parameters = new LinkedHashMap<>();
+            for (String member : List.of("Engine", "DBClusterIdentifier", "DBClusterSnapshotIdentifier",
+                    "SnapshotIdentifier", "DBClusterParameterGroupName", "DBSubnetGroupName")) {
+                String value = firstFormParam(ctx, member);
+                if (value != null) {
+                    parameters.put(member, value);
+                }
+            }
+            Optional<List<String>> resources = neptuneSnapshotResources.get().resolve(operation,
+                    parameters, partition, region, accountId);
+            if (resources.isPresent()) {
+                return resources.get();
+            }
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);

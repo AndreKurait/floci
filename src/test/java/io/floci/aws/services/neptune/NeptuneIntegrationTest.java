@@ -257,7 +257,7 @@ class NeptuneIntegrationTest {
         given()
             .header("Authorization", AUTH)
             .contentType(FORM)
-            .formParam("Action", "RestoreDBClusterFromSnapshot")
+            .formParam("Action", "RestoreDBClusterToPointInTime")
         .when().post("/")
         .then()
             .statusCode(400)

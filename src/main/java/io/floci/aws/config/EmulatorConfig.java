@@ -2026,6 +2026,10 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
+        /** Metadata-only clusters and snapshots, explicitly without a graph backend. */
+        @WithDefault("false")
+        boolean mock();
+
         /** Base port of the proxy port range. First cluster gets this port. */
         @WithDefault("8182")
         int proxyBasePort();
