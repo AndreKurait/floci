@@ -325,6 +325,21 @@ public class ResourceArnBuilder {
                     .map(entry -> entry.accessEntryArn()).orElse("*"));
         }
         if ("ec2".equals(credentialScope)) {
+            if (RequestResources.hasIndividualTargets(operation)) {
+                List<String> generated = namedResources(credentialScope, operation, ctx, region, accountId, partition);
+                List<String> retained = Ec2ResourceArns.of(operation, ctx, region, accountId, partition,
+                        ec2Service != null && ec2Service.isResolvable() ? ec2Service.get() : null);
+                if (generated.size() == retained.size()) {
+                    List<String> combined = new ArrayList<>(generated);
+                    for (int index = 0; index < combined.size(); index++) {
+                        if ("*".equals(combined.get(index))) {
+                            combined.set(index, retained.get(index));
+                        }
+                    }
+                    return List.copyOf(combined);
+                }
+                return generated;
+            }
             if ("ec2:DescribePlacementGroups".equals(operation)) {
                 return List.of("*");
             }
@@ -350,7 +365,8 @@ public class ResourceArnBuilder {
                     firstFormParam(ctx, "StackName"), region, accountId);
             return List.of(stack.stackId() == null ? "*" : stack.stackId());
         }
-        if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
+        if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)
+                && (!"ec2".equals(credentialScope) || RequestResources.hasIndividualTargets(operation))) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
         String path = "s3".equals(credentialScope) ? ctx.getUriInfo().getPath()
@@ -745,6 +761,12 @@ public class ResourceArnBuilder {
         // resource has and leave a deny on the real one unmatched.
         Optional<StoredEntity> stored = storedIamEntity(resourceType, name, accountId);
         if (stored.isEmpty()) {
+            // Without a stored role or a modelled Path member, the request names only the root path.
+            if ("role".equals(resourceType) && IamRequestShapes.hasMember(action, "RoleName")
+                    && !IamRequestShapes.hasMember(action, "Path")) {
+                return List.of(AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "iam", accountId,
+                        "role/" + name).toString());
+            }
             return List.of("*");
         }
         String storedArn = stored.get().arn();

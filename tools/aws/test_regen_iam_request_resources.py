@@ -987,3 +987,48 @@ def test_rest_xml_operations_read_path_labels_without_reading_bodies():
     sample["metadata"]["endpointPrefix"] = "another-service"
     assert r.request_members({"other": sample}, "DescribeKeyValueStore") == {"Name": "Name"}
     assert r.located_members({"other": sample}, "DescribeKeyValueStore") == {"Name": "{Name}"}
+
+
+def test_id_targets_follow_the_model_and_resource_types_not_operation_names():
+    ec2 = model({"AnnotateResources": {"Resources": "Strings"}}, "ec2")
+    member = ec2["shapes"]["AnnotateResourcesIn"]["members"]["Resources"]
+    member["locationName"] = "resourceId"
+    formats = {"instance": "arn:${Partition}:ec2:${Region}:${Account}:instance/${InstanceId}"}
+    upstream = {"action": "ec2:AnnotateResources", "types": ["instance", "volume"]}
+    entry = r.entry_for("ec2:AnnotateResources", upstream, formats, {"ec2": ec2})
+    assert entry["targets"] == {"member": "Resources[]", "query": "ResourceId", "prefixes": {"instance": "i-"}}
+    member["queryName"] = "ExactWireName"
+    assert r.entry_for("ec2:AnnotateResources", upstream, formats, {"ec2": ec2})["targets"]["query"] == "ExactWireName"
+    # Neither a resource type the action does not authorize nor a scalar masquerading as a list is read.
+    assert "targets" not in r.entry_for("ec2:AnnotateResources", {**upstream, "types": ["volume"]}, formats, {"ec2": ec2})
+    member["shape"] = "String"
+    assert "targets" not in r.entry_for("ec2:AnnotateResources", upstream, formats, {"ec2": ec2})
+
+
+def test_generated_ec2_targets_match_botocores_actual_serialization():
+    import botocore.session
+    from botocore.serialize import create_serializer
+
+    document = json.loads(r.OUTPUT.read_text())
+    model = botocore.session.get_session().get_service_model("ec2")
+    serializer = create_serializer("ec2")
+    for name in ("CreateTags", "DeleteTags"):
+        target = document["operations"]["ec2:" + name]["targets"]
+        request = serializer.serialize_to_request(
+            {"Resources": ["i-first", "vpc-second", "i-first"], "Tags": [{"Key": "Owner", "Value": "team+a"}]},
+            model.operation_model(name))
+        assert target["member"] == "Resources[]"
+        assert [request["body"][target["query"] + "." + str(i)] for i in range(1, 4)] == ["i-first", "vpc-second", "i-first"]
+        assert target["prefixes"] == {"instance": "i-"}
+
+
+def test_id_targets_reject_unknown_types_ambiguous_prefixes_and_malformed_members():
+    import copy
+
+    document = json.loads(r.OUTPUT.read_text())
+    for field, value in (("member", "Resources"), ("query", "ResourceId.member"),
+                         ("prefixes", {"not-a-type": "i-"}), ("prefixes", {"instance": ""}),
+                         ("prefixes", {"instance": "i-", "volume": "i-"})):
+        invalid = copy.deepcopy(document)
+        invalid["operations"]["ec2:CreateTags"]["targets"][field] = value
+        assert r.validate(invalid), (field, value)

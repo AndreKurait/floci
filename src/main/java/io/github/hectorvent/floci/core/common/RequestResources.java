@@ -93,6 +93,12 @@ public final class RequestResources {
     public static List<String> of(String operation, ContainerRequestContext ctx, String partition, String region,
                                   String accountId, StoredResourceArns stored, Map<String, String> labels) {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
+        RequestResourceMembers.Targets targets = operation == null ? null : table.targets().get(operation);
+        if (targets != null) {
+            Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
+            return targetArns(targets, formats(table, operation), form,
+                    form.isEmpty() ? PassedRoles.jsonBody(ctx) : null, partition, region, accountId);
+        }
         List<RequestResourceMembers.Resource> resources = operation == null ? null
                 : served(table.operations().get(operation), ctx);
         if (resources == null || resources.isEmpty()) {
@@ -102,6 +108,66 @@ public final class RequestResources {
         JsonNode body = sent.isEmpty() ? located(table, operation, PassedRoles.jsonBody(ctx), ctx, labels) : null;
         Map<String, String> form = located(table, operation, sent, ctx, labels);
         return named(resources, formats(table, operation), form, body, partition, region, accountId, stored);
+    }
+
+    /**
+     * The ARNs of the resources a JSON request body names, for a call that is not an HTTP request of its own, as a
+     * state machine's task to its integrated service: as {@link #of} reads the same request, whatever endpoint it
+     * would have reached.
+     */
+    public static List<String> ofBody(String operation, JsonNode body, String partition, String region,
+                                      String accountId, StoredResourceArns stored) {
+        RequestResourceMembers.Table table = RequestResourceMembers.table();
+        RequestResourceMembers.Targets targets = operation == null ? null : table.targets().get(operation);
+        if (targets != null) {
+            return targetArns(targets, formats(table, operation), Map.of(), body, partition, region, accountId);
+        }
+        List<RequestResourceMembers.Resource> resources = operation == null ? null : table.operations().get(operation);
+        if (resources == null || resources.isEmpty()) {
+            return List.of();
+        }
+        return named(resources, formats(table, operation), Map.of(), body, partition, region, accountId, stored);
+    }
+
+    /** Whether the table holds the operation as one with no resource of its own, which is checked on {@code *}. */
+    public static boolean actsOnNoResource(String operation) {
+        return reads(operation) && !hasIndividualTargets(operation)
+                && RequestResourceMembers.table().operations().get(operation).isEmpty();
+    }
+
+    /** Whether the generated operation names targets in request order, one context per target. */
+    public static boolean hasIndividualTargets(String operation) {
+        return operation != null && RequestResourceMembers.table().targets().containsKey(operation);
+    }
+
+    private static List<String> targetArns(RequestResourceMembers.Targets targets,
+                                           Map<String, RequestResourceMembers.ArnFormat> formats,
+                                           Map<String, String> form, JsonNode body,
+                                           String partition, String region, String accountId) {
+        List<String> ids = new ArrayList<>();
+        if (!form.isEmpty()) {
+            for (int i = 1; form.containsKey(targets.query() + "." + i); i++) {
+                ids.add(form.get(targets.query() + "." + i));
+            }
+        } else if (body != null && body.path(targets.member().name()).isArray()) {
+            body.path(targets.member().name()).forEach(id -> ids.add(id.asText()));
+        }
+        List<String> arns = new ArrayList<>();
+        for (String id : ids) {
+            String arn = "*";
+            for (Map.Entry<String, String> prefix : targets.prefixes().entrySet()) {
+                if (id.startsWith(prefix.getValue())) {
+                    String format = formats.get(prefix.getKey()).format();
+                    Map<String, String> filling = new HashMap<>();
+                    VARIABLE.matcher(format).results().map(match -> match.group(1))
+                            .forEach(variable -> filling.put(variable, id));
+                    arn = render(format, filling, partition, region, accountId);
+                    break;
+                }
+            }
+            arns.add(arn);
+        }
+        return List.copyOf(arns);
     }
 
     /** The ARNs of the resources the request names, as {@link #of} reads them. */

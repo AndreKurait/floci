@@ -779,6 +779,27 @@ class IamEnforcementFilterTest {
     }
 
     @Test
+    void anExpiredSessionOnEc2UsesItsOwnEnvelope() {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        String auth = "AWS4-HMAC-SHA256 Credential=ASIAEXPIRED/20260629/us-east-1/ec2/aws4_request, "
+                + "SignedHeaders=host, Signature=garbage";
+        requestContext.setAccountId("000000000000");
+        when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIAEXPIRED");
+        when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
+        when(containerRequest.getMediaType()).thenReturn(MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+        when(actionRegistry.resolve("ec2", containerRequest)).thenReturn("ec2:DescribeVpcs");
+        when(iamService.isExpiredSession(eq("ASIAEXPIRED"), any())).thenReturn(true);
+
+        newFilter().filter(containerRequest);
+
+        ArgumentCaptor<Response> response = ArgumentCaptor.captor();
+        verify(containerRequest).abortWith(response.capture());
+        assertEquals(400, response.getValue().getStatus());
+        assertTrue(entityString(response.getValue()).contains("<Response><Errors><Error><Code>RequestExpired</Code>"),
+                entityString(response.getValue()));
+    }
+
+    @Test
     void anExpiredSessionOnAnS3RequestIsRejectedWithTheS3ErrorCode() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         String auth = "AWS4-HMAC-SHA256 Credential=ASIAEXPIRED/20260629/us-east-1/s3/aws4_request, "
@@ -2302,7 +2323,7 @@ class IamEnforcementFilterTest {
 
     @Test
     void queryProtocolGetsXmlErrorResponse() {
-        // IAM/STS/EC2/SQS/SNS/RDS/ELBv2/CFN/... — Query protocol, form-encoded body, XML response.
+        // Ordinary Query services retain ErrorResponse; EC2 uses its own envelope.
         Response r = IamEnforcementFilter.accessDeniedResponse(
                 "iam:ListUsers", "iam", MediaType.APPLICATION_FORM_URLENCODED_TYPE);
 
@@ -2314,6 +2335,41 @@ class IamEnforcementFilterTest {
         assertTrue(body.contains("<Type>Sender</Type>"), body);
         assertTrue(body.contains("User is not authorized to perform: iam:ListUsers"), body);
         assertTrue(body.contains("<RequestId>"), body);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ec2,ec2:DescribeVpcs,UnauthorizedOperation", "iam,iam:ListUsers,AccessDenied",
+            "sts,sts:AssumeRole,AccessDenied", "sns,sns:ListTopics,AuthorizationError"})
+    void queryDenialsUseTheServiceErrorEnvelope(String scope, String action, String code) {
+        Response response = IamEnforcementFilter.accessDeniedResponse(
+                action, scope, MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+        String body = entityString(response);
+        assertEquals(403, response.getStatus());
+        assertEquals(MediaType.APPLICATION_XML_TYPE, response.getMediaType());
+        assertTrue(body.contains("<Code>" + code + "</Code>"), body);
+        if ("ec2".equals(scope)) {
+            assertTrue(body.contains("<Response><Errors><Error>"), body);
+            assertTrue(body.contains("<Message>You are not authorized to perform this operation."), body);
+            assertTrue(body.contains("<RequestID>"), body);
+        } else {
+            assertTrue(body.contains("<ErrorResponse><Error>"), body);
+            assertTrue(body.contains("<RequestId>"), body);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ec2,AuthFailure", "iam,InvalidClientTokenId", "sts,InvalidClientTokenId"})
+    void unknownQueryAccessKeysUseTheServiceErrorEnvelope(String scope, String code) {
+        ContainerRequestContext context = mock(ContainerRequestContext.class);
+        when(context.getMediaType()).thenReturn(MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+        Response response = IamEnforcementFilter.unrecognizedClientResponse(scope, context);
+        String body = entityString(response);
+        assertEquals("ec2".equals(scope) ? 401 : 403, response.getStatus());
+        assertTrue(body.contains("ec2".equals(scope)
+                ? "AWS was not able to validate the provided access credentials"
+                : "The security token included in the request is invalid"), body);
+        assertTrue(body.contains("<Code>" + code + "</Code>"), body);
+        assertTrue(body.contains("ec2".equals(scope) ? "<RequestID>" : "<RequestId>"), body);
     }
 
     @ParameterizedTest
