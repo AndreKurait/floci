@@ -190,6 +190,7 @@ import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.ses.SesIdentityService;
 import io.github.hectorvent.floci.services.ses.SesReceiptRuleService;
 import io.github.hectorvent.floci.services.ses.SesService;
+import io.github.hectorvent.floci.services.signer.SignerService;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.ssm.SsmPatchBaselineService;
@@ -231,6 +232,7 @@ final class CfnProvisionerFixture {
 
     static final class Builder {
 
+        private SignerService signerService;
         private S3Service s3Service;
         private PreSignedUrlGenerator presigner;
         private S3VectorsService s3VectorsService;
@@ -356,7 +358,9 @@ final class CfnProvisionerFixture {
                 discovered.add(new CodeDeployCfnProvisioner(codeDeployService));
             }
 
-            discovered.add(new SignerCfnProvisioner());
+            if (signerService != null) {
+                discovered.add(new SignerCfnProvisioner(signerService));
+            }
             if (stepFunctionsService != null) {
                 discovered.add(new StepFunctionsActivityCfnProvisioner(stepFunctionsService));
                 discovered.add(new StepFunctionsCfnProvisioner(stepFunctionsService, s3Service, objectMapper));
@@ -619,6 +623,11 @@ final class CfnProvisionerFixture {
 
         public Builder s3Vectors(S3VectorsService v) {
             this.s3VectorsService = v;
+            return this;
+        }
+
+        public Builder signer(SignerService v) {
+            this.signerService = v;
             return this;
         }
 

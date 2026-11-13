@@ -46,6 +46,7 @@ floci:
       sns:
         flush-interval-ms: 60000
       lambda:
+        # Includes per-version runtime-management settings.
         flush-interval-ms: 60000
       cloudwatchlogs:
         flush-interval-ms: 60000
@@ -405,6 +406,8 @@ floci:
       enabled: true
     appconfigdata:
       enabled: true
+    # Immutable lifecycle preview snapshots share the ECR repository metadata store.
+    # Their durability follows the configured storage mode, including asynchronous hybrid flushes.
     ecr:
       enabled: true
       tls-uri: false
@@ -439,6 +442,7 @@ floci:
       mock: true
       max-health-check-interval-millis: 0
       alb-zone-rule: aws
+      # single-zone-alb-accounts: 111111111111,222222222222
     codebuild:
       enabled: true
       # docker-network: floci-network
@@ -596,6 +600,8 @@ floci:
       enabled: true
     dlm:
       enabled: true
+    signer:
+      enabled: true
     cognitoidentity:
       enabled: true
     globalaccelerator:
@@ -633,6 +639,9 @@ floci:
       enabled: true
     codeartifact:
       enabled: true
+    quicksight:
+      enabled: true
+      embed-base-url: ${floci.base-url}
     marketplace:
       enabled: true
     dms:

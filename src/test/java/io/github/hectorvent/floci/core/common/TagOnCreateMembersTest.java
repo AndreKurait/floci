@@ -31,7 +31,7 @@ import static org.mockito.Mockito.when;
 
 /**
  * The vendored table of the tagging action each operation that tags what it creates needs, and that
- * {@link TagOnCreate} reads every member it gives, from a JSON body and from Query form parameters.
+ * {@link TagOnCreate} reads every member it gives, from its JSON or CloudFront XML body and from Query form parameters.
  */
 class TagOnCreateMembersTest {
 
@@ -114,11 +114,11 @@ class TagOnCreateMembersTest {
     }
 
     @TestFactory
-    Stream<DynamicTest> everyMemberOfTheTableIsReadFromAJsonBody() {
+    Stream<DynamicTest> everyMemberOfTheTableIsReadFromItsBody() {
         return TagOnCreateMembers.table().entries().entrySet().stream()
                 .flatMap(operation -> operation.getValue().members().stream().map(member -> DynamicTest.dynamicTest(
                         operation.getKey() + " " + member.path(), () -> assertEquals(expected(operation.getValue(), member),
-                                TagOnCreate.of(operation.getKey(), json(body(member).toString()))))));
+                                TagOnCreate.of(operation.getKey(), requestBody(operation.getKey(), member))))));
     }
 
     /** Each member a form can carry, as the SDK sends it. */
@@ -136,6 +136,31 @@ class TagOnCreateMembersTest {
     Stream<DynamicTest> aRequestCarryingNoTagsNeedsNoTaggingAction() {
         return TagOnCreateMembers.table().entries().keySet().stream().map(operation -> DynamicTest.dynamicTest(
                 operation, () -> assertEquals(Optional.empty(), TagOnCreate.of(operation, json("{\"Name\":\"n\"}")))));
+    }
+
+    private static ContainerRequestContext requestBody(String operation, Member member) {
+        if (!operation.startsWith("cloudfront:")) {
+            return json(body(member).toString());
+        }
+        XmlBuilder xml = new XmlBuilder().start("Request");
+        for (Step step : member.steps()) {
+            xml.start(step.name());
+            if (step.into() == Into.LIST) {
+                xml.start(step.key());
+            }
+        }
+        xml.elem(member.key(), "team").elem(member.value(), "blue");
+        for (Step step : member.steps().reversed()) {
+            if (step.into() == Into.LIST) {
+                xml.end(step.key());
+            }
+            xml.end(step.name());
+        }
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getMediaType()).thenReturn(MediaType.APPLICATION_XML_TYPE);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(
+                xml.end("Request").build().getBytes(StandardCharsets.UTF_8)));
+        return ctx;
     }
 
     private static Optional<TagOnCreate.Tagging> expected(Entry entry, Member member) {

@@ -55,7 +55,7 @@ class GlueJsonHandlerTest {
         handler = new GlueJsonHandler(glueService, jobRunService, crawlerRunService,
                 new GlueTriggerService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), glueService,
                         jobRunService, crawlerRunService),
-                schemaRegistryService, mapper);
+                schemaRegistryService, mapper, new GlueCustomEntityService(storageFactory, regionResolver, mapper));
     }
 
     private void createDatabaseAndTable(String dbName, String tableName) throws Exception {

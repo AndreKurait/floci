@@ -43,6 +43,29 @@ class RequestResourceMembersTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test
+    void generatedIdTargetsValidateTheirMemberWireNameAndDiscriminators() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode document = (ObjectNode) mapper.readTree("""
+                {"namespaces":{"ec2":["ec2"]},"arnFormats":{"ec2":{
+                "instance":"arn:${Partition}:ec2:${Region}:${Account}:instance/${InstanceId}",
+                "volume":"arn:${Partition}:ec2:${Region}:${Account}:volume/${VolumeId}"}},
+                "operations":{"ec2:Tag":{"types":["instance","volume"],"resources":[],
+                "targets":{"member":"Resources[]","query":"ResourceId","prefixes":{"instance":"i-"}}}}}
+                """);
+        assertEquals("ResourceId", parse(document.toString()).targets().get("ec2:Tag").query());
+        for (String invalid : List.of(
+                "{\"member\":\"Resources\",\"query\":\"ResourceId\",\"prefixes\":{\"instance\":\"i-\"}}",
+                "{\"member\":\"Resources[]\",\"query\":\"ResourceId.member\",\"prefixes\":{\"instance\":\"i-\"}}",
+                "{\"member\":\"Resources[]\",\"query\":\"ResourceId\",\"prefixes\":{\"unknown\":\"i-\"}}",
+                "{\"member\":\"Resources[]\",\"query\":\"ResourceId\",\"prefixes\":{\"instance\":\"\"}}",
+                "{\"member\":\"Resources[]\",\"query\":\"ResourceId\",\"prefixes\":{\"instance\":\"i-\",\"volume\":\"i-\"}}")) {
+            ObjectNode changed = document.deepCopy();
+            ((ObjectNode) changed.path("operations").path("ec2:Tag")).set("targets", mapper.readTree(invalid));
+            assertThrows(IllegalStateException.class, () -> parse(changed.toString()), invalid);
+        }
+    }
+
+    @Test
     void theTableReadsItsNamespacesAndGivesEachTypeItNamesAnArnFormat() {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
         assertTrue(table.namespaces().containsAll(List.of("cognito-idp", "ecr", "elasticloadbalancing", "states")));
@@ -278,6 +301,42 @@ class RequestResourceMembersTest {
                         + "\"account\":\"registryId\"}")).operations().get("a:Op"));
     }
 
+    @Test
+    void aDefaultTheResourceACreateMakesAndAMapsFieldsAreReadAsWritten() {
+        String formats = "\"arnFormats\":{\"a\":{\"thing\":\"arn:${Partition}:a:${Region}:${Account}:thing/${ThingName}\"}}";
+        // The one its service acts on for a request leaving out the member that would name it, read no other way.
+        String absent = "\"when\":{\"ThingArn\":[null]}";
+        assertTrue(parseUnchecked(document(formats, "{\"type\":\"thing\",\"fill\":{}," + absent + ",\"default\":true}"))
+                .operations().get("a:Op").getFirst().byDefault());
+        for (String bad : List.of("\"fill\":{}," + absent + ",\"default\":false",
+                "\"fill\":{\"ThingName\":\"Name\"}," + absent + ",\"default\":true", "\"fill\":{},\"default\":true",
+                "\"fill\":{}," + absent + ",\"default\":true,\"account\":\"registryId\"")) {
+            assertThrows(IllegalStateException.class, () -> parse(document(formats, "{\"type\":\"thing\"," + bad + "}")),
+                    bad);
+        }
+        // The resource a create acting on no type makes, of its variables alone; and none for a create acting on one.
+        String makes = "\"makes\":[{\"type\":\"thing\",\"fill\":{\"ThingName\":\"Name\"}}]";
+        assertEquals(List.of(new Resource(List.of("thing"), null, Map.of("ThingName", new Member("Name", false)), Map.of(),
+                Map.of(), Map.of(), Map.of(), null, null, Map.of(), false, null)),
+                parseUnchecked("{\"namespaces\":{\"a\":[]}," + formats + ",\"operations\":{\"a:Op\":{\"types\":[],"
+                        + "\"resources\":[]," + makes + "}}}").makes().get("a:Op"));
+        for (String bad : List.of("\"types\":[\"thing\"],\"resources\":[]," + makes, "\"types\":[],\"resources\":[],"
+                + "\"makes\":[{\"type\":\"thing\",\"fill\":{},\"made\":true}]", "\"types\":[],\"resources\":[],"
+                + "\"makes\":[{\"types\":[\"thing\"],\"arn\":\"ThingArn\"}]")) {
+            assertThrows(IllegalStateException.class, () -> parse("{\"namespaces\":{\"a\":[]}," + formats
+                    + ",\"operations\":{\"a:Op\":{" + bad + "}}}"), bad);
+        }
+        // A field of each of a map's structure values fills a variable, one value for each.
+        Member each = new Member("A", false, new Member("Name", false), true);
+        assertEquals(List.of(new Resource(List.of("thing"), null, Map.of("ThingName", each), Map.of(), Map.of(), Map.of(),
+                Map.of(), null, null, Map.of(), false, null)),
+                parseUnchecked(document(formats, "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"A{}.Name\"}}"))
+                        .operations().get("a:Op"));
+        assertEquals("A{}.Name", each.path());
+        assertThrows(IllegalStateException.class, () -> parse(document(formats,
+                "{\"type\":\"thing\",\"fill\":{\"ThingName\":\"A{}.B{}.Name\"}}")));
+    }
+
     /**
      * Each resource alone, from a request naming it and nothing else, gives exactly its ARN, in the account its
      * account member names when it has one, with those sharing its explicit member selector, those the operation
@@ -285,8 +344,9 @@ class RequestResourceMembersTest {
      * it is read from (a permission set made in an instance), and those a member it shares fills, their other
      * variables open (Redshift's {@code DeleteClusterSnapshot} names {@code cluster:<id>} by the
      * {@code SnapshotClusterIdentifier} that also fills {@code snapshot:<id>/<name>}); one named through another
-     * resource of its service's own, the ARN its service gives for that. A member the table locates in a REST
-     * request's path or query is given there, and a body or a form giving it another value names nothing.
+     * resource of its service's own, the ARN its service gives for that, and so is one its service acts on for a
+     * request naming none of its type (a default view). A member the table locates in a REST request's path or query
+     * is given there, and a body or a form giving it another value names nothing.
      */
     @TestFactory
     Stream<DynamicTest> everyResourceOfTheTableIsReadFromAJsonBodyAndAForm() {
@@ -298,7 +358,7 @@ class RequestResourceMembersTest {
                     ArnFormat format = table.formats().get(namespace).get(resource.types().getFirst());
                     String arn = example(format.format());
                     String account = resource.account() != null ? "111122223333" : "000000000000";
-                    String expected = resource.arn() != null || resource.through() != null ? arn
+                    String expected = resource.arn() != null || resource.through() != null || resource.byDefault() ? arn
                             : expected(format.format(), resource, account) + (format.minted() ? "/*" : "");
                     ObjectNode body = MAPPER.createObjectNode();
                     StringBuilder form = new StringBuilder("Action=" + name);
@@ -317,6 +377,7 @@ class RequestResourceMembersTest {
                     });
                     // A member the table locates in a REST request's path or query goes there, where the reader takes it
                     // from, and the body and the form give it another value, which names nothing.
+                    // REST map selectors have no Query form encoding, so they are checked only as JSON.
                     Map<String, String> located = table.located().getOrDefault(operation.getKey(), Map.of());
                     Map<String, String> labels = new LinkedHashMap<>();
                     MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
@@ -342,14 +403,46 @@ class RequestResourceMembersTest {
                                     table.formats().get(namespace).get(other.types().getFirst()).format(), other,
                                     "000000000000", given.keySet()))
                             .distinct().toList();
-                    StoredResourceArns stored = runningOn(namespace, arn);
+                    StoredResourceArns stored = runningOn(namespace, arn, resource.byDefault());
                     assertEquals(named, RequestResources.of(operation.getKey(),
                             sentWith(servedBy(json(body.toString()), resource.endpoint()), query), "aws", "us-east-1",
                             "000000000000", stored, labels), body + " " + labels + " " + query);
-                    assertEquals(named, RequestResources.of(operation.getKey(),
-                            sentWith(servedBy(form(form.toString()), resource.endpoint()), query), "aws", "us-east-1",
-                            "000000000000", stored, labels), form + " " + labels + " " + query);
+                    if (given.keySet().stream().noneMatch(Member::map)) {
+                        assertEquals(named, RequestResources.of(operation.getKey(),
+                                sentWith(servedBy(form(form.toString()), resource.endpoint()), query), "aws", "us-east-1",
+                                "000000000000", stored, labels), form + " " + labels + " " + query);
+                    }
                 })));
+    }
+
+    /**
+     * Each resource a create whose action acts on no type makes, from a request naming it, is where its tags go, and
+     * the create itself names none.
+     */
+    @TestFactory
+    Stream<DynamicTest> everyResourceACreateActingOnNoTypeMakesIsWhereItsTagsGo() {
+        RequestResourceMembers.Table table = RequestResourceMembers.table();
+        return table.makes().entrySet().stream().map(operation -> DynamicTest.dynamicTest(operation.getKey(), () -> {
+            String namespace = operation.getKey().substring(0, operation.getKey().indexOf(':'));
+            Resource made = operation.getValue().getFirst();
+            ObjectNode body = MAPPER.createObjectNode();
+            Map<String, String> labels = new LinkedHashMap<>();
+            Map<String, String> located = table.located().getOrDefault(operation.getKey(), Map.of());
+            made.fill().values().forEach(member -> {
+                String where = located.get(member.name());
+                if (where != null && where.startsWith("{")) {
+                    labels.put(where.substring(1, where.length() - 1), "x");
+                } else {
+                    put(body, member, "x");
+                }
+            });
+            String expected = expected(table.formats().get(namespace).get(made.types().getFirst()).format(), made,
+                    "000000000000");
+            assertEquals(List.of(expected), RequestResources.created(operation.getKey(), null, json(body.toString()),
+                    "aws", "us-east-1", "000000000000", labels), body + " " + labels);
+            assertEquals(List.of(), RequestResources.of(operation.getKey(), json(body.toString()), "aws",
+                    "us-east-1", "000000000000", null, labels));
+        }));
     }
 
     /** Each resource a create makes under a parent, from a request naming the parent's ARN, is the parent's own. */
@@ -395,9 +488,17 @@ class RequestResourceMembersTest {
                 && resource.through() == null && resource.when().isEmpty() && resource.unless().isEmpty();
     }
 
-    /** A namespace's stored ARNs that find nothing, and give {@code arn} for whatever a request names a resource through. */
-    private static StoredResourceArns runningOn(String namespace, String arn) {
+    /**
+     * A namespace's stored ARNs that find nothing, and give {@code arn} for whatever a request names a resource through
+     * and, when {@code defaults}, as the resource of any type the service acts on for a request naming none.
+     */
+    private static StoredResourceArns runningOn(String namespace, String arn, boolean defaults) {
         return new StoredResourceArns() {
+            @Override
+            public Optional<String> findDefault(String type, String region) {
+                return defaults ? Optional.of(arn) : Optional.empty();
+            }
+
             @Override
             public String namespace() {
                 return namespace;
@@ -423,7 +524,8 @@ class RequestResourceMembersTest {
      */
     private static boolean sharesAMember(Resource resource, Map<Member, String> given) {
         if (resource.arn() != null || resource.fill().values().stream()
-                .noneMatch(member -> given.containsKey(member) && !resource.arnOf().containsKey(member.path()))) {
+                .noneMatch(member -> given.containsKey(member) && (!resource.arnOf().containsKey(member.path())
+                        || !AwsArnUtils.isArn(given.get(member))))) {
             return false;
         }
         Map<String, String> values = given.entrySet().stream()
@@ -442,6 +544,8 @@ class RequestResourceMembersTest {
             } else {
                 body.put(member.name(), value);
             }
+        } else if (member.map()) {
+            put(body.putObject(member.name()).putObject("table"), member.field(), value);
         } else {
             put(member.list() ? body.putArray(member.name()).addObject() : body.putObject(member.name()), member.field(), value);
         }
