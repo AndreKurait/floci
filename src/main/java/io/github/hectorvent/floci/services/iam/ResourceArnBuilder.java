@@ -12,6 +12,8 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
+import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationService;
+import io.github.hectorvent.floci.services.amazonmq.model.ConfigurationState.Scope;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
@@ -260,6 +262,17 @@ public class ResourceArnBuilder {
             String resource = body == null || stepFunctionsService == null || stepFunctionsService.isUnsatisfied()
                     ? null : stepFunctionsService.get().callbackResourceArn(body.path("taskToken").asText(null), accountId);
             return List.of(resource == null ? "*" : resource);
+        }
+        if ("mq".equals(credentialScope) && operation != null && switch (operation) {
+            case "mq:DescribeConfiguration", "mq:UpdateConfiguration", "mq:DeleteConfiguration",
+                    "mq:DescribeConfigurationRevision", "mq:ListConfigurationRevisions" -> true;
+            default -> false;
+        }) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("configurationId");
+            return List.of(AmazonMqConfigurationService.configurationArn(new Scope(partition, accountId, region), id));
+        }
+        if ("mq:CreateConfiguration".equals(operation) || "mq:ListConfigurations".equals(operation)) {
+            return List.of("*");
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);

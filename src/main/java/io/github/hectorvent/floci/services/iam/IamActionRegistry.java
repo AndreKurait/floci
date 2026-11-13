@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
 import io.github.hectorvent.floci.core.common.WireProtocol;
+import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
@@ -41,6 +42,15 @@ import java.util.regex.Pattern;
  */
 @ApplicationScoped
 public class IamActionRegistry {
+
+    private static final Map<String, String> MQ_CONFIGURATION_ACTIONS = Map.of(
+            "createConfiguration", "mq:CreateConfiguration",
+            "describeConfiguration", "mq:DescribeConfiguration",
+            "updateConfiguration", "mq:UpdateConfiguration",
+            "deleteConfiguration", "mq:DeleteConfiguration",
+            "describeConfigurationRevision", "mq:DescribeConfigurationRevision",
+            "listConfigurationRevisions", "mq:ListConfigurationRevisions",
+            "listConfigurations", "mq:ListConfigurations");
 
     private static final Map<String, String> ROUTE53_DELEGATION_ACTIONS = Map.of(
             "createReusableDelegationSet", "route53:CreateReusableDelegationSet",
@@ -676,6 +686,11 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("mq".equals(credentialScope) && resourceInfo != null
+                && AmazonMqConfigurationController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return MQ_CONFIGURATION_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {

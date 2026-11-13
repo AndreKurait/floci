@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
@@ -98,6 +99,7 @@ public class IamConditionContextResolver {
     static final String REQUEST_AUTH_TYPE = "lambda:Request/WebFunctionAuthType";
     static final String RESOURCE_AUTH_TYPE = "lambda:Resource/WebFunctionAuthType";
 
+    private final Instance<AmazonMqConfigurationService> mqConfigurations;
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
     private final Instance<S3Service> s3Service;
@@ -128,9 +130,26 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog,
                                        Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<AmazonMqConfigurationService> mqConfigurations) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, mqConfigurations);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService,
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -144,7 +163,7 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -158,7 +177,7 @@ public class IamConditionContextResolver {
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, clock, null, null);
+                config, currentVertxRequest, serviceCatalog, clock, null, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -172,7 +191,9 @@ public class IamConditionContextResolver {
                                         CurrentVertxRequest currentVertxRequest,
                                         ResolvedServiceCatalog serviceCatalog, Clock clock,
                                         Instance<SsmService> ssmService,
-                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                        Instance<AmazonMqConfigurationService> mqConfigurations) {
+        this.mqConfigurations = mqConfigurations;
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -197,6 +218,7 @@ public class IamConditionContextResolver {
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
+            case "mq" -> mqConfigurationConditions(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
             case "redshift" -> redshiftConditionContext(action, ctx);
             case "states" -> stepFunctionsConditionContext(action, ctx);
@@ -273,6 +295,26 @@ public class IamConditionContextResolver {
     }
 
     /** Group mutations and stream access use the handler's group and request scope. */
+    private Map<String, List<String>> mqConfigurationConditions(String action, ContainerRequestContext ctx) {
+        if ("mq:CreateConfiguration".equals(action)) {
+            JsonNode body = PassedRoles.jsonBody(ctx);
+            return body == null ? null : AmazonMqConfigurationService.requestTagConditions(
+                    AmazonMqConfigurationService.requestTags(body.get("tags")));
+        }
+        if (mqConfigurations == null || !mqConfigurations.isResolvable() || action == null || !switch (action) {
+            case "mq:DescribeConfiguration", "mq:UpdateConfiguration", "mq:DeleteConfiguration",
+                    "mq:DescribeConfigurationRevision", "mq:ListConfigurationRevisions" -> true;
+            default -> false;
+        }) {
+            return null;
+        }
+        String id = ctx.getUriInfo().getPathParameters().getFirst("configurationId");
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        mqConfigurations.get().tagsForAuthorization(id).forEach((key, value) ->
+                conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions;
+    }
+
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
         if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || "logs:PutLogEvents".equals(action)
