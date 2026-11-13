@@ -25,6 +25,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -42,13 +43,15 @@ public class CloudWatchLogsHandler {
     private final CloudWatchLogsDeliveryHandler deliveryHandler;
     private final ObjectMapper objectMapper;
     private final CloudWatchLogsTransformerHandler transformerHandler;
+    private final CloudWatchLogsSubscriptionAdmissionService admission;
 
     @Inject
     public CloudWatchLogsHandler(CloudWatchLogsService logsService,
                                  CloudWatchLogsCrossAccountService crossAccountService,
                                  CloudWatchLogsMetricFilterService metricFilterService,
                                  CloudWatchLogsDeliveryService deliveryService,
-                                 ObjectMapper objectMapper) {
+                                 ObjectMapper objectMapper,
+                                 CloudWatchLogsSubscriptionAdmissionService admission) {
         this.logsService = logsService;
         this.crossAccountService = crossAccountService;
         this.metricFilterHandler = new CloudWatchLogsMetricFilterHandler(metricFilterService, objectMapper);
@@ -56,15 +59,17 @@ public class CloudWatchLogsHandler {
         this.deliveryHandler = new CloudWatchLogsDeliveryHandler(deliveryService, objectMapper);
         this.objectMapper = objectMapper;
         this.transformerHandler = new CloudWatchLogsTransformerHandler(logsService, objectMapper);
+        this.admission = Objects.requireNonNull(admission);
     }
 
     /** For unit tests that exercise log groups only: deliveries live in memory. */
     CloudWatchLogsHandler(CloudWatchLogsService logsService, CloudWatchLogsCrossAccountService crossAccountService,
-                          CloudWatchLogsMetricFilterService metricFilterService, ObjectMapper objectMapper) {
+                          CloudWatchLogsMetricFilterService metricFilterService, ObjectMapper objectMapper,
+                          CloudWatchLogsSubscriptionAdmissionService admission) {
         this(logsService, crossAccountService, metricFilterService,
                 new CloudWatchLogsDeliveryService(new InMemoryStorage<>(), new InMemoryStorage<>(),
                         new InMemoryStorage<>(), logsService.regionResolver()),
-                objectMapper);
+                objectMapper, admission);
     }
 
     public Response handle(String action, JsonNode request, String region) {
@@ -104,8 +109,11 @@ public class CloudWatchLogsHandler {
             case "DescribeResourcePolicies" -> handleDescribeResourcePolicies(region);
             case "PutDestination" -> handlePutDestination(request, region);
             case "PutDestinationPolicy" -> handlePutDestinationPolicy(request, region);
+            case "DescribeDestinations" -> handleDescribeDestinations(request, region);
+            case "DeleteDestination" -> handleDeleteDestination(request, region);
             case "PutAccountPolicy" -> handlePutAccountPolicy(request, region);
             case "DescribeAccountPolicies" -> handleDescribeAccountPolicies(request, region);
+            case "DeleteAccountPolicy" -> handleDeleteAccountPolicy(request, region);
             case "GetDataProtectionPolicy" -> handleGetDataProtectionPolicy(request, region);
             case "StartQuery" -> handleStartQuery(request, region);
             case "GetQueryResults" -> handleGetQueryResults(request, region);
@@ -249,6 +257,31 @@ public class CloudWatchLogsHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleDescribeDestinations(JsonNode request, String region) {
+        JsonNode prefix = request.get("DestinationNamePrefix");
+        JsonNode limit = request.get("limit");
+        JsonNode token = request.get("nextToken");
+        if ((prefix != null && !prefix.isTextual()) || (token != null && !token.isTextual())
+                || (limit != null && (!limit.isIntegralNumber() || !limit.canConvertToInt()))) {
+            throw new AwsException("InvalidParameterException", "Invalid destination list parameters.", 400);
+        }
+        PaginatedResult<LogDestination> result = crossAccountService.describeDestinations(
+                prefix == null ? null : prefix.textValue(),
+                limit == null ? null : limit.intValue(), token == null ? null : token.textValue(), region);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode values = response.putArray("destinations");
+        result.items().forEach(value -> values.add(buildDestination(value)));
+        if (result.nextToken() != null) {
+            response.put("nextToken", result.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeleteDestination(JsonNode request, String region) {
+        crossAccountService.deleteDestination(request.path("destinationName").asText(null), region);
+        return Response.ok().build();
+    }
+
     private Response handlePutDestinationPolicy(JsonNode request, String region) {
         crossAccountService.putDestinationPolicy(
                 request.path("destinationName").asText(null),
@@ -266,6 +299,21 @@ public class CloudWatchLogsHandler {
         ObjectNode response = objectMapper.createObjectNode();
         response.set("accountPolicy", buildAccountPolicy(policy));
         return Response.ok(response).build();
+    }
+
+    private Response handleDeleteAccountPolicy(JsonNode request, String region) {
+        JsonNode policyName = request.path("policyName");
+        JsonNode policyType = request.path("policyType");
+        if (!policyName.isTextual() || !policyType.isTextual()) {
+            throw new AwsException("InvalidParameterException", "policyName and policyType must be strings.", 400);
+        }
+        JsonNode dryRun = request.get("dryRun");
+        if (dryRun != null && !dryRun.isNull()) {
+            throw new AwsException("InvalidParameterException",
+                    "dryRun is valid only for RETENTION_POLICY, which is not supported.", 400);
+        }
+        crossAccountService.deleteAccountPolicy(policyName.textValue(), policyType.textValue(), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private Response handleDescribeAccountPolicies(JsonNode request, String region) {
@@ -684,6 +732,10 @@ public class CloudWatchLogsHandler {
         JsonNode transformed = request.get("applyOnTransformedLogs");
         if (transformed != null && !transformed.isBoolean()) {
             throw new AwsException("InvalidParameterException", "applyOnTransformedLogs must be a boolean.", 400);
+        }
+        if (CloudWatchLogsCrossAccountService.isCrossAccountDestinationArn(destinationArn)
+                || AwsArnUtils.isArnFor(destinationArn, "lambda")) {
+            admission.validate(destinationArn, logGroupName, region, logsService.regionResolver().getAccountId());
         }
         logsService.putSubscriptionFilter(logGroupName, filterName, filterPattern, destinationArn, distribution,
                 transformed == null ? null : transformed.booleanValue(), region);
