@@ -225,6 +225,12 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("appconfig".equals(credentialScope)) {
+            String taggedPath = IamActionRegistry.decodedPath(ctx);
+            if (taggedPath.equals("/tags") || taggedPath.startsWith("/tags/")) {
+                return List.of(taggedResource(ctx));
+            }
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }

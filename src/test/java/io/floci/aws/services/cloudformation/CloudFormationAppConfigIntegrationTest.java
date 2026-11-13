@@ -248,6 +248,74 @@ class CloudFormationAppConfigIntegrationTest {
         deleteStack(stack);
     }
 
+    @Test
+    void sdkTagOnlyUpdatesKeepAllFourIdsAndRollbackRestoresTheirTags() throws Exception {
+        String stack = unique("cfn-appconfig-tags");
+        Map<String, Object> resources = first();
+        properties(resources, "Env").remove("Monitors");
+        for (String name : RESOURCES) {
+            properties(resources, name).put("Tags", tags("team", "first", "remove", "yes"));
+        }
+        try (CloudFormationClient client = AwsTestClients.create(
+                CloudFormationClient.builder(), "test", Region.US_EAST_1)) {
+            try {
+                String originalTemplate = template(resources, false);
+                client.createStack(request -> request.stackName(stack).templateBody(originalTemplate));
+                assertStatus(stack, "CREATE_COMPLETE");
+                Map<String, String> before = outputs(stack);
+                assertResourceTags(before, Map.of("team", "first", "remove", "yes"));
+                for (String name : RESOURCES) {
+                    properties(resources, name).put("Tags", tags("team", "second", "empty", ""));
+                }
+                String updatedTemplate = template(resources, false);
+                client.updateStack(request -> request.stackName(stack).templateBody(updatedTemplate));
+                assertStatus(stack, "UPDATE_COMPLETE");
+                assertEquals(before, outputs(stack));
+                assertResourceTags(before, Map.of("team", "second", "empty", ""));
+
+                for (String name : RESOURCES) {
+                    properties(resources, name).put("Tags", tags("team", "rolled-back"));
+                }
+                String failingTemplate = template(resources, true);
+                client.updateStack(request -> request.stackName(stack).templateBody(failingTemplate));
+                assertStatus(stack, "UPDATE_ROLLBACK_COMPLETE");
+                assertEquals(before, outputs(stack));
+                assertResourceTags(before, Map.of("team", "second", "empty", ""));
+
+                for (String name : RESOURCES) {
+                    properties(resources, name).remove("Tags");
+                }
+                String withoutTags = template(resources, false);
+                client.updateStack(request -> request.stackName(stack).templateBody(withoutTags));
+                assertStatus(stack, "UPDATE_COMPLETE");
+                assertEquals(before, outputs(stack));
+                assertResourceTags(before, Map.of());
+                client.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+                for (String arn : resourceTagArns(before)) {
+                    appconfig().get("/tags/" + arn).then().statusCode(404);
+                }
+            } finally {
+                deleteStack(stack);
+            }
+        }
+    }
+
+    private static void assertResourceTags(Map<String, String> outputs, Map<String, String> expected) {
+        for (String arn : resourceTagArns(outputs)) {
+            assertEquals(expected, appconfig().get("/tags/" + arn).then().statusCode(200)
+                    .extract().jsonPath().getMap("Tags", String.class, String.class), arn);
+        }
+    }
+
+    private static List<String> resourceTagArns(Map<String, String> outputs) {
+        String prefix = "arn:aws:appconfig:us-east-1:000000000000:";
+        String app = "application/" + outputs.get("AppRef");
+        return List.of(prefix + app, prefix + app + "/environment/" + outputs.get("EnvRef"),
+                prefix + app + "/configurationprofile/" + outputs.get("ProfileRef"),
+                prefix + "deploymentstrategy/" + outputs.get("StrategyRef"));
+    }
+
     /** The first version of the four resources. */
     private static Map<String, Object> first() {
         Map<String, Object> resources = new LinkedHashMap<>();

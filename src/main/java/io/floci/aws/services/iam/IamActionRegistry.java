@@ -286,6 +286,11 @@ public class IamActionRegistry {
         rule("rds-data", "POST", "^/CommitTransaction/?$",    "rds-data:CommitTransaction"),
         rule("rds-data", "POST", "^/RollbackTransaction/?$",  "rds-data:RollbackTransaction"),
 
+        // AppConfig tags share the ARN-addressed tagging routes.
+        rule("appconfig", "GET",    "^/tags(/.+)?$", "appconfig:ListTagsForResource"),
+        rule("appconfig", "POST",   "^/tags(/.+)?$", "appconfig:TagResource"),
+        rule("appconfig", "DELETE", "^/tags(/.+)?$", "appconfig:UntagResource"),
+
         // ── EventBridge Scheduler ──────────────────────────────────────────────
         rule("scheduler", "GET",    "^/schedules/[^/]+$",       "scheduler:GetSchedule"),
         rule("scheduler", "POST",   "^/schedules/[^/]+$",       "scheduler:CreateSchedule"),
