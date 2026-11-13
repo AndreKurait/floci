@@ -2224,7 +2224,8 @@ class Ec2ServiceTest {
 
     @Test
     void containerModeLaunchOnARetainedInterfaceRecordsTheElasticIpItCarries() {
-        Ec2Service service = containerModeService();
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(containerManager);
         String region = "us-east-1";
         String subnetId = publicSubnet(service, region, "10.249.0.0/24");
         NetworkInterface retained = service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(),
@@ -2233,6 +2234,7 @@ class Ec2ServiceTest {
         Address carried = service.allocateAddress(region);
         service.associateAddress(region, carried.getAllocationId(), first.getInstanceId());
         service.terminateInstances(region, List.of(first.getInstanceId()));
+        completeContainerTermination(containerManager, first, retained);
         assertNotNull(carried.getAssociationId());
 
         Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
@@ -2286,6 +2288,7 @@ class Ec2ServiceTest {
         service.associateAddress(region, carried.getAllocationId(), first.getInstanceId());
         String firstAddress = carried.getPublicIp();
         service.terminateInstances(region, List.of(first.getInstanceId()));
+        completeContainerTermination(containerManager, first, retained);
         Instance second = runningContainerInstance(service, region, subnetId, retained.getNetworkInterfaceId());
         String secondAddress = containerManager.reachablePublicAddress(second);
         assertNotEquals(firstAddress, secondAddress);
@@ -2318,9 +2321,103 @@ class Ec2ServiceTest {
         assertNull(instance.getPublicIpAddress());
     }
 
+    @Test
+    void deferredInterfaceCleanupWritesTheUpdatedInstance() {
+        AccountAwareStorageBackend<Instance> store = spy(AccountAwareStorageBackend.<Instance>inMemory("000000000000"));
+        List<Integer> savedInterfaceCounts = new ArrayList<>();
+        doAnswer(call -> {
+            Instance saved = call.getArgument(1);
+            savedInterfaceCounts.add(saved.getNetworkInterfaces().size());
+            return call.callRealMethod();
+        }).when(store).put(anyString(), any(Instance.class));
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(mockConfig(false), manager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", store)));
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region,
+                publicSubnet(service, region, "10.251.0.0/24"), null);
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+        ArgumentCaptor<Runnable> completed = ArgumentCaptor.forClass(Runnable.class);
+        verify(manager).terminate(eq(instance), completed.capture());
+        assertEquals(1, savedInterfaceCounts.getLast());
+        savedInterfaceCounts.clear();
+        instance.setState(InstanceState.terminated());
+
+        completed.getValue().run();
+
+        assertEquals(List.of(0), savedInterfaceCounts,
+                "A write-time storage backend must receive the cleaned instance after teardown");
+    }
+
+    @Test
+    void deferredInterfaceCleanupPreservesReplacementAttachment() {
+        AccountAwareStorageBackend<NetworkInterface> store =
+                spy(AccountAwareStorageBackend.<NetworkInterface>inMemory("000000000000"));
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(mockConfig(false), manager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", store)));
+        String region = "us-east-1";
+        String subnet = publicSubnet(service, region, "10.252.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        Instance instance = runningContainerInstance(service, region, subnet, retained.getNetworkInterfaceId());
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+        ArgumentCaptor<Runnable> completed = ArgumentCaptor.forClass(Runnable.class);
+        verify(manager).terminate(eq(instance), completed.capture());
+        instance.setState(InstanceState.terminated());
+        // Replacement occurs after the callback snapshots the old instance's interfaces.
+        doAnswer(call -> {
+            retained.getAttachment().setInstanceId("i-replacement");
+            return call.callRealMethod();
+        }).when(store).get(region + "::" + retained.getNetworkInterfaceId());
+
+        completed.getValue().run();
+
+        assertNotNull(retained.getAttachment());
+        assertEquals("i-replacement", retained.getAttachment().getInstanceId());
+        assertEquals("in-use", retained.getStatus());
+    }
+
+    @Test
+    void failedLaunchEmbeddedInterfaceDoesNotPinSecurityGroup() {
+        Ec2Service service = containerModeService();
+        String region = "us-east-1";
+        String subnet = publicSubnet(service, region, "10.251.0.0/24");
+        String vpc = service.describeSubnets(region, List.of(subnet), Map.of()).getFirst().getVpcId();
+        String group = service.createSecurityGroup(region, "failed-launch", "failed launch", vpc).getGroupId();
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(group), subnet, null, List.of(), null, null,
+                null, null, 0).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        assertEquals("DependencyViolation", assertThrows(AwsException.class,
+                () -> service.deleteSecurityGroup(region, group)).getErrorCode());
+        instance.setState(InstanceState.terminated());
+
+        service.deleteSecurityGroup(region, group);
+    }
+
+    private static void completeContainerTermination(Ec2ContainerManager containerManager, Instance instance,
+                                                      NetworkInterface retained) {
+        assertEquals("in-use", retained.getStatus());
+        ArgumentCaptor<Runnable> completed = ArgumentCaptor.forClass(Runnable.class);
+        verify(containerManager).terminate(eq(instance), completed.capture());
+        instance.setState(InstanceState.terminated());
+        completed.getValue().run();
+        assertEquals("available", retained.getStatus());
+    }
+
     /** Ec2Service in container mode, with a container manager whose containers answer on loopback. */
     private static Ec2Service containerModeService() {
-        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        return containerModeService(mock(Ec2ContainerManager.class));
+    }
+
+    private static Ec2Service containerModeService(Ec2ContainerManager containerManager) {
         when(containerManager.reachablePublicAddress(any())).thenAnswer(invocation -> {
             Instance instance = invocation.getArgument(0);
             return instance.getDockerContainerId() == null ? null : "127.0.0.1";
