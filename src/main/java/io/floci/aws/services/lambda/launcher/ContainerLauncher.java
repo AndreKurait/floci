@@ -133,9 +133,27 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
     private final Ec2Service ec2Service;
+    private final LambdaVpcNetworkManager vpcNetworkManager;
     private final LambdaContainerReconciler containerReconciler;
     /** The VPC address each VpcConfig function's container holds, returned once it is removed. */
     private final Map<String, VpcLease> vpcLeases = new ConcurrentHashMap<>();
+
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             Ec2Service ec2Service) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, ec2Service, null);
+    }
 
     @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
@@ -149,7 +167,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LambdaLayerService layerService,
                              LaunchedContainerAwsEnv awsEnv,
                              LambdaExecutionRoleCredentials executionRoleCredentials,
-                             Ec2Service ec2Service) {
+                             Ec2Service ec2Service,
+                             LambdaVpcNetworkManager vpcNetworkManager) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.dnsResolver = new LambdaDnsResolver(containerBuilder, lifecycleManager, config);
@@ -163,6 +182,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
         this.ec2Service = ec2Service;
+        this.vpcNetworkManager = vpcNetworkManager;
         this.containerReconciler = new LambdaContainerReconciler(config, lifecycleManager);
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
     }
@@ -240,7 +260,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // failure path, not just the one where useCodeVolume's block itself throws.
         String reservedCodeVolume = null;
         String dnsResolverVolume = null;
+        Closeable logHandle = null;
         Optional<SessionCreds> roleCredentials = Optional.empty();
+        LambdaVpcNetworkManager.Attachment vpcNetwork = null;
         try {
 
         LambdaDockerFlags dockerFlags = configuredDockerFlags();
@@ -325,6 +347,15 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         specBuilder.withLabels(containerReconciler.ownershipLabels());
 
         specBuilder.withEmbeddedDns();
+        if (vpcNetworkManager != null) {
+            vpcNetwork = vpcNetworkManager.prepare(fn, containerName, hostAddress,
+                    runtimeApiServer.getPort(), dockerFlags).orElse(null);
+            if (vpcNetwork != null) {
+                specBuilder.withNetworkMode("container:" + vpcNetwork.helperId())
+                        .withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true",
+                                ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)));
+            }
+        }
         // A container image's runtime is its own, Java as likely as any.
         if (isJavaRuntime(fn.getRuntime()) || "Image".equals(fn.getPackageType())) {
             specBuilder.withJavaTrustStore();
@@ -481,7 +512,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
 
         // Now start the container with code in place
-        joinVpcNetwork(fn, containerId, lambdaAccountId, lambdaRegion);
+        if (vpcNetwork == null) {
+            joinVpcNetwork(fn, containerId, lambdaAccountId, lambdaRegion);
+        }
         lifecycleManager.startCreated(containerId, spec);
         runtimeApiServer.markContainerStarted();
         watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
@@ -516,11 +549,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         ContainerHandle handle = new ContainerHandle(
                 containerId, fn.getFunctionName(), runtimeApiServer, ContainerState.WARM, fn.isHotReload(),
                 roleCredentials.map(SessionCreds::accessKeyId).orElse(null),
-                LambdaExecutionRoleCredentials.sessionAccountId(fn));
+                LambdaExecutionRoleCredentials.sessionAccountId(fn), vpcNetwork);
         handle.setDnsResolverVolume(dnsResolverVolume);
 
         // Attach log streaming
-        Closeable logHandle = logStreamer.attachForAccount(
+        logHandle = logStreamer.attachForAccount(
                 lambdaAccountId, containerId, cwLogGroup, cwLogStream,
                 lambdaRegion, "lambda:" + fn.getFunctionName());
         handle.setLogStream(logHandle);
@@ -535,12 +568,27 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             // failed before the container was created (e.g. an ensureCodeVolume populate failure).
             LOG.errorv("Container launch failed for function {0}; cleaning up: {1}",
                     fn.getFunctionName(), e.getMessage());
+            runtimeApiServer.quiesce();
+            boolean workloadRetained = false;
             if (containerId != null) {
                 try {
-                    lifecycleManager.stopAndRemoveStrict(containerId, null);
+                    if (vpcNetwork != null) {
+                        lifecycleManager.stopAndRemoveStrict(containerId, logHandle, 1);
+                    } else {
+                        lifecycleManager.stopAndRemoveStrict(containerId, logHandle);
+                    }
                     releaseVpcLease(containerId);
                 } catch (Exception cleanupError) {
                     LOG.warnv(cleanupError, "Could not remove failed Lambda container {0}", containerId);
+                    e.addSuppressed(cleanupError);
+                    workloadRetained = vpcNetwork != null;
+                }
+            }
+            if (vpcNetwork != null && !workloadRetained) {
+                try {
+                    vpcNetworkManager.release(vpcNetwork);
+                } catch (RuntimeException cleanupError) {
+                    LOG.warnv(cleanupError, "Could not release failed Lambda network {0}", vpcNetwork.eniId());
                     e.addSuppressed(cleanupError);
                 }
             }
@@ -562,6 +610,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             // null by then); otherwise the failure happened before Docker ever saw the volume, so
             // its in-flight reference must be released here or cleanup would wait on it forever.
             releaseCodeVolumeReference(reservedCodeVolume);
+            if (workloadRetained) {
+                // The old process still owns its namespace and Runtime API port.
+                throw e;
+            }
             // Stop the server before releasing its port, or the still-listening Vert.x server
             // makes a later cold start that reuses the port serve this runtime too.
             try {
@@ -768,6 +820,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Only once the container is gone: a failed removal is retried, and until then Docker
         // still holds the address.
         releaseVpcLease(handle.getContainerId());
+
+        if (handle.getVpcNetwork() != null) {
+            vpcNetworkManager.release(handle.getVpcNetwork());
+        }
 
         // Only now close the runtime API socket. Any pollers that were still parked when
         // the container exited get terminated by their end of the connection closing;
