@@ -1113,6 +1113,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                     || !regionResolver.getPartition().equals(parsed.partition())) {
                 throw new IllegalArgumentException("Execution ARN is outside the request scope");
             }
+            if (!regionResolver.getAccountId().equals(parsed.accountId())) {
+                throw new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400);
+            }
             return parsed;
         } catch (IllegalArgumentException error) {
             throw new AwsException("InvalidArn", "Invalid Arn: '" + arn + "'", 400);

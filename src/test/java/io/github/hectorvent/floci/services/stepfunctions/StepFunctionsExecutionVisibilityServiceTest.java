@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -17,6 +18,8 @@ import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import io.github.hectorvent.floci.services.stepfunctions.model.StateMachineVersion;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.HashMap;
@@ -31,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -57,6 +61,63 @@ class StepFunctionsExecutionVisibilityServiceTest {
 
     @TempDir
     Path directory;
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void foreignReaderCannotMigrateLegacyExecutionOrMachine(boolean configurationReader) {
+        String caller = "111111111111";
+        InMemoryStorage<String, Execution> executions = new InMemoryStorage<>();
+        InMemoryStorage<String, StateMachine> machines = new InMemoryStorage<>();
+        Fixture fixture = legacyFixture(caller, executions, machines);
+        String arn = "arn:aws:states:us-east-1:000000000000:execution:visibility:legacy";
+        AwsException failure = assertThrows(AwsException.class, () -> {
+            if (configurationReader) {
+                fixture.service.describeStateMachineForExecution(arn);
+            } else {
+                fixture.service.describeExecutionForApi(arn);
+            }
+        });
+        assertAll(
+                () -> assertEquals("ExecutionDoesNotExist", failure.getErrorCode()),
+                () -> assertTrue(executions.get(arn).isPresent()),
+                () -> assertTrue(machines.get(MACHINE).isPresent()),
+                () -> assertTrue(executions.get(caller + "/" + arn).isEmpty()),
+                () -> assertTrue(machines.get(caller + "/" + MACHINE).isEmpty()));
+    }
+
+    @Test
+    void owningReaderCanStillMigrateLegacyExecutionAndMachine() {
+        InMemoryStorage<String, Execution> executions = new InMemoryStorage<>();
+        InMemoryStorage<String, StateMachine> machines = new InMemoryStorage<>();
+        Fixture fixture = legacyFixture(ACCOUNT, executions, machines);
+        String arn = "arn:aws:states:us-east-1:000000000000:execution:visibility:legacy";
+        assertEquals(arn, fixture.service.describeExecutionForApi(arn).getExecutionArn());
+        AwsException failure = assertThrows(AwsException.class, () ->
+                fixture.service.describeStateMachineForExecution(arn));
+        assertAll(
+                () -> assertEquals("UnsupportedOperation", failure.getErrorCode()),
+                () -> assertTrue(executions.get(arn).isEmpty()),
+                () -> assertTrue(machines.get(MACHINE).isEmpty()),
+                () -> assertTrue(executions.get(ACCOUNT + "/" + arn).isPresent()),
+                () -> assertTrue(machines.get(ACCOUNT + "/" + MACHINE).isPresent()));
+    }
+
+    private static Fixture legacyFixture(String caller, InMemoryStorage<String, Execution> executions,
+                                         InMemoryStorage<String, StateMachine> machines) {
+        StateMachine machine = new StateMachine();
+        machine.setStateMachineArn(MACHINE);
+        machine.setType("STANDARD");
+        machines.put(MACHINE, machine);
+        Execution execution = new Execution();
+        execution.setExecutionArn("arn:aws:states:us-east-1:000000000000:execution:visibility:legacy");
+        execution.setStateMachineArn(MACHINE);
+        execution.setStatus("SUCCEEDED");
+        executions.put(execution.getExecutionArn(), execution);
+        TestStorage storage = new TestStorage(null);
+        storage.stores.put("sfn-state-machines.json", new AccountAwareStorageBackend<>(machines, null, caller));
+        storage.stores.put("sfn-executions.json", new AccountAwareStorageBackend<>(executions, null, caller));
+        return new Fixture(storage, caller);
+    }
 
     @Test
     void sameNameAndCreationTimeCannotMakeAnOldExecutionVisible() {
@@ -315,6 +376,10 @@ class StepFunctionsExecutionVisibilityServiceTest {
         private final Map<String, BiConsumer<Execution, List<HistoryEvent>>> callbacks = new HashMap<>();
 
         private Fixture(TestStorage storage) {
+            this(storage, ACCOUNT);
+        }
+
+        private Fixture(TestStorage storage, String caller) {
             this.storage = storage;
             AslExecutor executor = mock(AslExecutor.class);
             doAnswer(invocation -> {
@@ -322,7 +387,7 @@ class StepFunctionsExecutionVisibilityServiceTest {
                 callbacks.put(execution.getExecutionArn(), invocation.getArgument(4));
                 return null;
             }).when(executor).executeAsync(any(StateMachine.class), any(Execution.class), anyList(), any(), any());
-            service = new StepFunctionsService(storage, new RegionResolver(REGION, ACCOUNT), executor,
+            service = new StepFunctionsService(storage, new RegionResolver(REGION, caller), executor,
                     MAPPER, mock(SfnMockLoader.class), mock(StepFunctionsEventPublisher.class));
         }
 
