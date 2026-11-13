@@ -9,6 +9,7 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.DockerFlags;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
 import io.floci.aws.services.lambda.model.LambdaFunction;
@@ -52,7 +53,7 @@ class LambdaVpcNetworkManagerTest {
         when(firewall.enabled()).thenReturn(true);
 
         assertThrows(IllegalArgumentException.class, () ->
-                manager.prepare(function(), "environment", "192.0.2.1", 9001, LambdaDockerFlags.parse(flags)));
+                manager.prepare(function(), "environment", "192.0.2.1", 9001, DockerFlags.parse(flags)));
 
         verifyNoInteractions(ec2, lifecycle);
     }
@@ -67,7 +68,7 @@ class LambdaVpcNetworkManagerTest {
         when(lambda.additionalDockerNetworks()).thenReturn(Optional.of(List.of("unfiltered")));
 
         assertThrows(IllegalArgumentException.class, () ->
-                manager.prepare(function(), "environment", "192.0.2.1", 9001, LambdaDockerFlags.parse("")));
+                manager.prepare(function(), "environment", "192.0.2.1", 9001, DockerFlags.parse("")));
 
         verifyNoInteractions(ec2, lifecycle);
     }
@@ -75,7 +76,7 @@ class LambdaVpcNetworkManagerTest {
     @Test
     void disabledEnforcementDoesNotAllocateNetworkResources() {
         assertTrue(manager.prepare(function(), "environment", "192.0.2.1", 9001,
-                LambdaDockerFlags.parse("")).isEmpty());
+                DockerFlags.parse("")).isEmpty());
         verifyNoInteractions(ec2, lifecycle);
     }
 
@@ -86,7 +87,7 @@ class LambdaVpcNetworkManagerTest {
         function.setVpcConfig(Map.of("SecurityGroupIds", List.of("sg-caller")));
 
         assertThrows(IllegalStateException.class, () -> manager.prepare(function, "environment",
-                "192.0.2.1", 9001, LambdaDockerFlags.parse("")));
+                "192.0.2.1", 9001, DockerFlags.parse("")));
 
         verifyNoInteractions(ec2, lifecycle);
     }
