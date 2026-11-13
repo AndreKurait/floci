@@ -64,12 +64,11 @@ quarkus:
       # The Pricing service reads its bundled snapshot, EC2 reads its image
       # catalog (ec2/image-catalog.yaml), SageMaker reads its instance type
       # catalog (sagemaker/instance-type-catalog.yaml), KMS reads its AWS managed
-      # key catalog (kms/aws-managed-keys.yaml), Bedrock reads its model catalog
-      # (bedrock/model-catalog.yaml), AppSync's GraphQL
+      # key catalog (kms/aws-managed-keys.yaml), AppSync's GraphQL
       # parser reads its message bundles, Lambda Web Functions copy their
       # runtime (lambdaweb/index.mjs) into each environment, EMR writes its S3DistCp program
       # (emr/s3-dist-cp.py) into a step's container, EC2 security group enforcement builds
-      # its helper image from docker/*.Dockerfile, and API Gateway's Velocity
+      # its helper image from docker/ Dockerfiles and their declared build inputs, and API Gateway's Velocity
       # engine reads its default properties at runtime via
       # ClassLoader#getResourceAsStream. Quarkus's static resource analysis
       # cannot detect these dynamically-built paths, so they are registered
@@ -83,18 +82,19 @@ quarkus:
         - pricing-snapshots/**
         - ui/*.html
         - appsync/*.mjs
+        - cloudfront/*.cjs
         - lambdaweb/*.mjs
         - emr/*.py
         - ec2/*.yaml
-        - docker/*.Dockerfile
+        - docker/**
         - sagemaker/*.yaml
         - kms/*.yaml
-        - bedrock/*.yaml
         - eks/*.json
         - aws/*.json
-        - proto/**/*.proto
         - iam/service-linked-roles.tsv
         - cloudformation/*.json
+        - draft-04/schema
+        - elb/*.json
         - redshift/*.sql
         - i18n/*.properties
         - floci/version.properties
@@ -143,30 +143,30 @@ quarkus:
       # library in Native's static initializer. Initialized at build time (the Quarkus default),
       # that library loads into the builder and never into the binary, so every JNA call fails
       # with UnsatisfiedLinkError on Native.open. The JNI and proxy metadata JNA needs at run time
-      # is under META-INF/native-image/net.java.dev.jna and META-INF/native-image/io.floci/floci.
+      # is under META-INF/native-image/net.java.dev.jna and META-INF/native-image/io.github.hectorvent/floci.
       - --initialize-at-run-time=com.sun.jna
       - --initialize-at-run-time=com.github.dockerjava.transport.NamedPipeSocket$Kernel32
-      - --initialize-at-run-time=io.floci.aws.services.acm.AcmService
-      - --initialize-at-run-time=io.floci.aws.services.acm.CertificateGenerator
-      - --initialize-at-run-time=io.floci.aws.config.TlsConfigSource
-      - --initialize-at-run-time=io.floci.aws.services.cognito.CognitoSrpHelper
-      - --initialize-at-run-time=io.floci.aws.core.common.Totp
-      - --initialize-at-run-time=io.floci.aws.services.route53.Route53Service
-      - --initialize-at-run-time=io.floci.aws.services.kms.KmsService
-      - --initialize-at-run-time=io.floci.aws.services.bedrockagentcore.BedrockAgentCoreEventService
-      - --initialize-at-run-time=io.floci.aws.services.cloudfront.CloudFrontService
-      - --initialize-at-run-time=io.floci.aws.services.emr.EmrService
-      - --initialize-at-run-time=io.floci.aws.services.elasticbeanstalk.ElasticBeanstalkService
-      - --initialize-at-run-time=io.floci.aws.services.elb.ElbClassicService
-      - --initialize-at-run-time=io.floci.aws.services.datasync.DataSyncService
-      - --initialize-at-run-time=io.floci.aws.services.dms.DmsService
-      - --initialize-at-run-time=io.floci.aws.services.lambda.launcher.LambdaExecutionRoleCredentials
-      - --initialize-at-run-time=io.floci.aws.services.ecs.container.EcsTaskRoleCredentials
-      - --initialize-at-run-time=io.floci.aws.services.ssoportal.SsoPortalService
-      - --initialize-at-run-time=io.floci.aws.services.redshift.proxy.RedshiftRoleAccess
-      - --initialize-at-run-time=io.floci.aws.services.redshift.spectrum.SpectrumMaterializer
-      - --initialize-at-run-time=io.floci.aws.services.ecs.exec.EcsExecSessionRegistry
-      - --initialize-at-run-time=io.floci.aws.services.stepfunctions.ApiGatewayTaskInvoker
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.acm.AcmService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.acm.CertificateGenerator
+      - --initialize-at-run-time=io.github.hectorvent.floci.config.TlsConfigSource
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.cognito.CognitoSrpHelper
+      - --initialize-at-run-time=io.github.hectorvent.floci.core.common.Totp
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.route53.Route53Service
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.kms.KmsService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.bedrockagentcore.BedrockAgentCoreEventService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.cloudfront.CloudFrontService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.emr.EmrService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.elasticbeanstalk.ElasticBeanstalkService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.elb.ElbClassicService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.datasync.DataSyncService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.dms.DmsService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionRoleCredentials
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.ecs.container.EcsTaskRoleCredentials
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.ssoportal.SsoPortalService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.redshift.proxy.RedshiftRoleAccess
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.redshift.spectrum.SpectrumMaterializer
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.ecs.exec.EcsExecSessionRegistry
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.stepfunctions.ApiGatewayTaskInvoker
       # snappy-java (Firehose Snappy/HADOOP_SNAPPY delivery) extracts and loads a
       # bundled JNI library from the static initializers of these two classes.
       - --initialize-at-run-time=org.xerial.snappy.Snappy
@@ -183,6 +183,16 @@ floci:
   port: 4566
   base-url: "http://localhost:4566"
   network:
+    vpc-routing:
+      enabled: false
+      public-aws-api: false
+      # Optional exact IPv4 front door; unset retains Floci's own listener.
+      # Matching upstream DNS A answers use the routed public address for known VPC clients.
+      # public-aws-api-upstream-host: ""
+      public-aws-api-upstream-http-port: 80
+      public-aws-api-upstream-https-port: 443
+      public-aws-api-native-https: false
+      # public-aws-api-hosts: []  # Exact peer names, in addition to native AWS names.
     security-group-enforcement:
       enabled: false
       helper-image: floci/network-helper:local
@@ -222,8 +232,6 @@ floci:
       # metric datapoints, the S3 object index) fold their .wal file into the store's JSON file.
       compaction-interval-ms: 30000
     services:
-      rekognition:
-        flush-interval-ms: 5000
       ssm:
         flush-interval-ms: 5000
       dynamodb:
@@ -240,9 +248,9 @@ floci:
       sns:
         flush-interval-ms: 5000
       lambda:
+        # Includes per-version runtime-management settings.
         flush-interval-ms: 5000
       cloudwatchlogs:
-        # Includes saved Logs Insights query definitions.
         flush-interval-ms: 15000
       cloudwatchmetrics:
         flush-interval-ms: 5000
@@ -307,6 +315,9 @@ floci:
         flush-interval-ms: 5000
 
   dns:
+    # Opt in to host DNS, or select a container listener, on a reachable local IPv4 address.
+    # UDP/TCP port 53 must be available. Unset: automatic container DNS only.
+    # listen-address: 127.0.0.1                    # FLOCI_DNS_LISTEN_ADDRESS
     # Extra hostname suffixes resolved to Floci's container IP by the embedded DNS server.
     # Useful when migrating from LocalStack — add localhost.localstack.cloud to avoid
     # changing Lambda endpoint environment variables.
@@ -367,9 +378,13 @@ floci:
     enabled: false                     # FLOCI_TLS_ENABLED (default: false)
     # cert-path: ""                    # FLOCI_TLS_CERT_PATH (PEM certificate file)
     # key-path: ""                     # FLOCI_TLS_KEY_PATH (PEM private key file)
-    # extra-ca-path: ""                # FLOCI_TLS_EXTRA_CA_PATH (PEM CA certificates Floci's own HTTPS clients also trust; works with TLS on or off)
+    # extra-ca-certs: ""               # FLOCI_TLS_EXTRA_CA_CERTS (additional public PEM trust anchors)
     self-signed: true                  # FLOCI_TLS_SELF_SIGNED: auto-generate a server cert signed by Floci's local CA if no cert-path provided
     aws-https-port: 443                # FLOCI_TLS_AWS_HTTPS_PORT — also bind 443 so CDK cfn-response/AWS-on-443 callbacks reach Floci (0 disables)
+    aws-https-fallback-port: 0
+    # aws-https-fallback-host: 127.0.0.1
+    aws-https-fallback-proxy-protocol: false
+    aws-https-fallback-hosts: ${FLOCI_TLS_AWS_HTTPS_FALLBACK_HOSTS:}
 
   protocols:
     max-request-size: 2048             # FLOCI_PROTOCOLS_MAX_REQUEST_SIZE: max HTTP request body size in MB (legacy: floci.max-request-size / FLOCI_MAX_REQUEST_SIZE)
@@ -416,7 +431,9 @@ floci:
   services:
     ssm:
       enabled: true
+      direct-command-execution-enabled: false
       max-parameter-history: 5
+      resource-data-sync-interval-ms: 1000
     sqs:
       enabled: true
       default-visibility-timeout: 30
@@ -447,10 +464,12 @@ floci:
       enabled: true
     lambda:
       enabled: true
-      reconcile-containers-on-startup: true  # FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP
       ephemeral: false
       # Extra Docker create flags for Lambda containers, for example: --env KEY=VALUE --volume /host:/container:ro
       docker-flags: ""
+      # additional-docker-networks: []         # FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS: existing networks joined before start
+      container-readiness-command: ""        # FLOCI_SERVICES_LAMBDA_CONTAINER_READINESS_COMMAND: optional in-container command before first invoke
+      container-readiness-timeout-seconds: 60 # FLOCI_SERVICES_LAMBDA_CONTAINER_READINESS_TIMEOUT_SECONDS
       ecr-base-uri: public.ecr.aws            # FLOCI_SERVICES_LAMBDA_ECR_BASE_URI — registry for Lambda runtime images (legacy: floci.ecr-base-uri / FLOCI_ECR_BASE_URI)
       # runtime-images:                   # Optional full references keyed by runtime or runtime.os.arch
       #   "python3.12": "public.ecr.aws/lambda/python:3.12@sha256:<digest>"
@@ -504,7 +523,18 @@ floci:
     iam:
       enabled: true
       enforcement-enabled: false
+      issued-session-verification-enabled: false
+      lambda-identity-verification-enabled: false
+      derived-signing-keys:
+        enabled: false                     # FLOCI_SERVICES_IAM_DERIVED_SIGNING_KEYS_ENABLED; docs/services/iam.md
+        # caller-access-key-id: ""         # the one caller's key ID (never an IAM key)
+        # caller-secret-access-key-file: /run/secrets/derived-key-caller   # owner-only file
+        # allowed-regions: us-east-1
+        # allowed-services: example-svc   # never a signing name Floci serves
+        # allowed-levels: signing          # signing and/or service
       seed-deployer-principal: false
+      # service-principal-memberships-path: /config/service-principals.json
+      # FLOCI_SERVICES_IAM_SERVICE_PRINCIPAL_MEMBERSHIPS_PATH; optional local fixture, read at startup.
       # account-alias: ""  # When set, seeds the account alias at startup so callers can read one
                            # without creating it first. Unset means the account has no alias,
                            # matching AWS. Example: FLOCI_SERVICES_IAM_ACCOUNT_ALIAS=my-account
@@ -612,6 +642,7 @@ floci:
       scheduled-action-sweep-interval-seconds: ${FLOCI_SERVICES_REDSHIFT_SERVERLESS_SCHEDULED_ACTION_SWEEP_INTERVAL_SECONDS:60}
     neptune:
       enabled: true
+      mock: false
       proxy-base-port: 8182
       proxy-max-port: 8282
       db-type: "gremlin"
@@ -632,9 +663,6 @@ floci:
       # docker-network: floci-network
       # image-template: "registry.internal/emr-serverless/spark/%s:20250425"   # %s = the release label
       # hive-image-template: "registry.internal/emr-serverless/hive/%s:20250425"   # every cluster's HDFS, and Hive
-      yarn-node-memory-mb: 4096             # memory a cluster's NodeManager offers its YARN containers
-      yarn-node-vcores: 4                   # virtual cores it offers them
-      yarn-max-worker-nodes: 4              # the most core and task nodes a cluster runs as containers of their own
       # Remove the step drivers a previous run of this deployment left on the daemon, and the images
       # bootstrap actions left for clusters that are gone or have ended, when the EMR service starts.
       # Scoped to this deployment's own containers and images.
@@ -666,6 +694,10 @@ floci:
       staging-bucket: floci-firehose-staging
     kms:
       enabled: true
+      # <account-id>=<service principal> entries, comma-separated: ListGrants and ListRetirableGrants list a
+      # grantee or retiring principal in that account as that AWS service principal
+      # (FLOCI_SERVICES_KMS_LISTED_GRANTEE_SERVICE_PRINCIPALS).
+      # listed-grantee-service-principals:
     cognito:
       enabled: true
       google-issuer: https://accounts.google.com
@@ -675,10 +707,12 @@ floci:
       allow-plaintext-http: false
       mock-config-file: ${SFN_MOCK_CONFIG:}
       max-wait-seconds: 30
+      max-wait-millis: 0                     # Positive values override max-wait-seconds, without changing execution or task deadlines
     swf:
       enabled: true
       timeout-sweep-enabled: true
       timeout-sweep-interval-seconds: 1
+      timeout-sweep-interval-millis: 0        # Positive values override the seconds interval, without shortening timeouts
     cloudformation:
       enabled: true
       # How long a deleted stack stays describable by its stack id (ARN) and listed as
@@ -738,30 +772,43 @@ floci:
     ec2:
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
-      # Optional complete catalog override for locally built guest images.
+      # Optional external catalog; includeDefaultImages in the file retains bundled images.
       image-catalog-path: ${FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH:}
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
+      # Explicit workload-only options; helper containers retain their own settings.
+      extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
+      ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
+      privileged: true
+      cap-drop: ${FLOCI_SERVICES_EC2_CAP_DROP:}
+      cap-add: ${FLOCI_SERVICES_EC2_CAP_ADD:}
+      # read-only-binds:               # Paths belong to the Docker daemon host.
+      #   - source: /srv/guest-inputs/ca.pem
+      #     target: /etc/guest-ca.pem
       enabled: true
       imds-port: 9169
+      metadata-helper-image: floci/network-helper:local
       # Sweep EC2 containers left on the daemon by a previous run that died mid-launch or
       # mid-terminate (SIGKILL, OOM, docker kill), which no surviving record refers to.
       # Scoped to this deployment's own containers; stopped instances are never swept.
       reconcile-containers-on-startup: true
       ssh-port-range-start: 2200
       ssh-port-range-end: 2299
+      ssh-host-bind-address: "127.0.0.1"
       publish-security-group-ports: true
       app-port-range-start: 30000
       app-port-range-end: 30999
       max-published-ports-per-instance: 20
       socat-image: alpine/socat
       volume-block-devices: true
-      volume-helper-image: alpine:3.21
+      volume-helper-image: debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
       mock: false
       # Automatic public IPv4 address of a mock instance: none, documentation (203.0.113.0/24,
-      # routed nowhere) or fixed (mock-public-address, default 127.0.0.1). Instances with
+      # routed nowhere), fixed (mock-public-address, default 127.0.0.1), or pool (configured
+      # model identities requiring caller-owned local delivery). Instances with
       # containers report the container's reachable address. FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES
       mock-public-addresses: none
       # mock-public-address: 127.0.0.1  # FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS
+      mock-public-address-pool: ${FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL:}
       # Bound instance containers to their instance type's CPU and memory limits from the catalog.
       # FLOCI_SERVICES_EC2_INSTANCE_RESOURCE_LIMITS
       instance-resource-limits: true
@@ -777,6 +824,7 @@ floci:
       # container actually holds and instances in different VPCs are on different bridges.
       vpc-networks:
         enabled: true                             # FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED
+        isolate-address-spaces: false              # FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES
         # Used only when a declared VPC CIDR cannot be honoured: absent, malformed, outside
         # RFC 1918, or already claimed on this Docker daemon. Substitutions are logged at WARN;
         # a reported private IP that does not match the declared CIDR is never silent.
@@ -786,6 +834,7 @@ floci:
         # so Floci instances sharing a daemon never reconcile each other's networks).
         reconcile-on-startup: true                # FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP
         driver: bridge                            # FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER
+        internal: false                           # FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL
     ecs:
       enabled: true
       mock: false
@@ -799,6 +848,13 @@ floci:
       # the service scheduler starts replacements. Scoped to this deployment's own containers.
       reconcile-containers-on-startup: true
       image-pull-behavior: default
+      # Extra Docker create flags for ECS task containers, same grammar as lambda.docker-flags.
+      # When set, tasks get no AWS_ENDPOINT_URL/FLOCI_ENDPOINT/FLOCI_HOSTNAME (production-like naming).
+      # docker-flags: ""                     # FLOCI_SERVICES_ECS_DOCKER_FLAGS
+      # additional-docker-networks: []       # FLOCI_SERVICES_ECS_ADDITIONAL_DOCKER_NETWORKS: existing networks joined before start
+      # Extra /etc/hosts entries for every task container ("hostname:ip", ip may be host-gateway). Unset: only
+      # the extraHosts a container definition declares, as on ECS. host.docker.internal:host-gateway restores the old entry.
+      # extra-hosts: []                      # FLOCI_SERVICES_ECS_EXTRA_HOSTS
       task-role-credentials:
         enabled: false
         ttl-seconds: 21600
@@ -808,6 +864,8 @@ floci:
       enabled: true
     appconfigdata:
       enabled: true
+    # Immutable lifecycle preview snapshots share the ECR repository metadata store.
+    # Their durability follows the configured storage mode, including asynchronous hybrid flushes.
     ecr:
       enabled: true
       registry-image: "registry:2"
@@ -862,7 +920,6 @@ floci:
       mock: false
       max-memory-mib: 0        # optional k3s container memory ceiling; 0 follows the node type
       max-vcpus: 0             # optional k3s container CPU ceiling; 0 follows the node type
-      # node-instance-type: t2.2xlarge # optional catalog type to size the k3s node from; the API keeps the node group's type
       provider: k3s
       default-image: "rancher/k3s:latest"
       # image-template: "myregistry.io/k3s:v%s" # optional custom image format template taking cluster version
@@ -897,11 +954,18 @@ floci:
     elb:
       enabled: true
       mock: false
+      vpc-frontends: false
+      proxy-image: haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b
     elbv2:
       enabled: true
       mock: false
-      backend-keep-alive: true
-      backend-keep-alive-timeout-seconds: 60
+      max-health-check-interval-millis: 0    # Local acceleration only; probe timeouts and success thresholds are unchanged
+      # single-zone-alb-accounts: 123456789012   # Opt-in: these accounts' ALBs may use one Availability Zone (local single-zone setups)
+      alb-zone-rule: ${FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE:aws}
+      # Per-region entries override this global setting, including an explicit aws reset.
+      # alb-zone-rule-by-region:
+      #   ap-northeast-3: require-two-zones
+      #   us-east-1: allow-single-zone
     codebuild:
       enabled: true
       # docker-network: floci-network
@@ -932,9 +996,10 @@ floci:
       worker-poll-interval-ms: ${FLOCI_SERVICES_CODEPIPELINE_WORKER_POLL_INTERVAL_MS:100}
     autoscaling:
       enabled: true
+      multiple-capacity-reservation-scopes: ${FLOCI_SERVICES_AUTOSCALING_MULTIPLE_CAPACITY_RESERVATION_SCOPES:}
+      max-capacity-reservation-ids: ${FLOCI_SERVICES_AUTOSCALING_MAX_CAPACITY_RESERVATION_IDS:1}
     applicationautoscaling:
       enabled: true
-      scheduled-action-interval-seconds: ${FLOCI_SERVICES_APPLICATIONAUTOSCALING_SCHEDULED_ACTION_INTERVAL_SECONDS:1}
     elasticbeanstalk:
       enabled: true
     backup:
@@ -993,6 +1058,7 @@ floci:
       enabled: true
     cloudfront:
       enabled: true
+      function-runtime-image: node:22-alpine
       allowed-private-origin-hosts: []
     appsync:
       enabled: true
@@ -1028,8 +1094,6 @@ floci:
       enabled: true
     efs:
       enabled: true
-    ec2instanceconnect:
-      enabled: true
     organizations:
       enabled: true
       # management-account-email: ""  # When set, overrides the management-account email reported by DescribeOrganization and account listings.
@@ -1044,7 +1108,7 @@ floci:
     emrserverless:
       enabled: true
       job-run-duration-seconds: 0   # 0 = BATCH job runs succeed as soon as they start
-      runner-mode: immediate        # docker = run each job run's spark-submit or hive in a container
+      runner-mode: immediate        # docker = run each job run's spark-submit or hive in a container; refuse = fail every job run
       # docker-network: floci-network
       # image-template: "registry.internal/emr-serverless/spark/%s:20250425"   # %s = the release label
       # hive-image-template: "registry.internal/emr-serverless/hive/%s:20250425"   # for Hive job runs
@@ -1053,6 +1117,9 @@ floci:
       reconcile-containers-on-startup: true
     ssoadmin:
       enabled: true
+      # AWS-managed application provider ids CreateApplication admits besides custom, comma-separated
+      # (FLOCI_SERVICES_SSOADMIN_ADDITIONAL_APPLICATION_PROVIDERS).
+      # additional-application-providers:
     ssooidc:
       enabled: true
       local-principal-id: ${FLOCI_SERVICES_SSOOIDC_LOCAL_PRINCIPAL_ID:}
@@ -1085,10 +1152,6 @@ floci:
     appintegrations:
       enabled: true
     dlm:
-      enabled: true
-    signer:
-      enabled: true
-    xray:
       enabled: true
     cognitoidentity:
       enabled: true
@@ -1143,9 +1206,6 @@ floci:
       npm-image: "verdaccio/verdaccio:6.10.4"
       pypi-image: "pypiserver/pypiserver:v2.4.2"
       nuget-image: "bagetter/bagetter:1.6.5"
-    quicksight:
-      enabled: true
-      embed-base-url: ${floci.base-url}
     marketplace:
       enabled: true
     dms:
