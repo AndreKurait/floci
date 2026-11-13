@@ -51,6 +51,14 @@ deterministic windows `04:00-06:00` / `mon:00:00-mon:03:00` where AWS picks rand
 (`3.6.0`, `4.0.0`, `5.0.0`, `5.0.1`, `8.0.0`, `8.0.1`, or the `major.minor` form of one); any other
 is refused with `Cannot find version X for docdb`, on create and on modify.
 
+MongoDB archives restore collection data and indexes before users and roles, preserving both
+custom indexes and the snapshot's authentication data.
+
+If Docker is unreachable and target provisioning produces no MongoDB backend, restoring a data
+archive returns `InvalidRestoreFault` and attempts to remove the newly created target, even when
+deletion protection was requested. The source cluster and stored snapshot remain unchanged.
+Mock mode snapshots and restores contain metadata only.
+
 ## Configuration
 
 | Variable | Default | Description |

@@ -17,6 +17,8 @@ import io.floci.aws.services.kms.model.KmsKey;
 import io.floci.aws.services.rds.RdsService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.Map;
@@ -139,6 +141,38 @@ class DocDbClusterSnapshotServiceTest {
         AwsException gone = assertThrows(AwsException.class, () -> docDbService.getDbCluster("restored"));
         assertEquals("DBClusterNotFoundFault", gone.getErrorCode());
         verify(containerManager).stop(argThat(handle -> "container-restored".equals(handle.getContainerId())));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void anUnavailableRestoreTargetFailsAndLeavesItsSourceAndArchiveIntact(boolean pointInTime) {
+        source(DocDbClusterSettings.defaults());
+        DocDbClusterSnapshot snapshot = docDbService.createDbClusterSnapshot("snap", "source", Map.of("saved", "yes"));
+        List<String> savedArchives = List.copyOf(archives.scan(value -> true));
+        when(containerManager.tryStart(eq("restored"), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(null);
+        DocDbClusterSettings protectedCluster = new DocDbClusterSettings(null, null, null, null, null, null,
+                null, null, true);
+
+        AwsException failure = assertThrows(AwsException.class, () -> {
+            if (pointInTime) {
+                docDbService.restoreDbClusterToPointInTime("restored", "source", protectedCluster, Map.of());
+            } else {
+                docDbService.restoreDbClusterFromSnapshot("restored", "snap", null, protectedCluster, Map.of());
+            }
+        });
+
+        assertEquals("InvalidRestoreFault", failure.getErrorCode());
+        assertEquals(400, failure.getHttpStatus());
+        AwsException absent = assertThrows(AwsException.class, () -> docDbService.getDbCluster("restored"));
+        assertEquals("DBClusterNotFoundFault", absent.getErrorCode());
+        assertEquals("container-source", docDbService.getDbCluster("source").getContainerId());
+        assertEquals("available", docDbService.getDbCluster("source").getStatus());
+        assertEquals(snapshot, docDbService.getDbClusterSnapshot("snap"));
+        assertEquals(Map.of("saved", "yes"), docDbService.getDbClusterSnapshot("snap").getTags());
+        assertEquals(savedArchives, archives.scan(value -> true));
+        verify(containerManager, never()).restoreCluster(anyString(), anyString());
+        verify(containerManager, never()).stop(any());
     }
 
     @Test
