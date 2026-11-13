@@ -104,6 +104,22 @@ class AlarmSnsNotifierTest {
     }
 
     @Test
+    void percentileNotificationNamesTheExtendedStatistic() throws Exception {
+        alarm.setStatistic(null);
+        alarm.setExtendedStatistic("p90");
+        alarm.setEvaluateLowSampleCountPercentile("evaluate");
+        service.putMetricAlarm(alarm, REGION);
+        service.setAlarmState("test-alarm", "ALARM", "percentile breached", null, REGION);
+
+        ArgumentCaptor<String> message = ArgumentCaptor.forClass(String.class);
+        verify(sns).publish(eq(TOPIC), isNull(), message.capture(), anyString(), eq(REGION));
+        JsonNode trigger = mapper.readTree(message.getValue()).path("Trigger");
+        assertEquals("ExtendedStatistic", trigger.path("StatisticType").asText());
+        assertEquals("p90", trigger.path("Statistic").asText());
+        assertEquals("evaluate", trigger.path("EvaluateLowSampleCountPercentile").asText());
+    }
+
+    @Test
     void disabledActionsDoNotPublish() {
         alarm.setActionsEnabled(false);
         service.setAlarmState("test-alarm", "ALARM", "breached", null, REGION);
