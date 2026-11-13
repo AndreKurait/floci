@@ -85,7 +85,7 @@ def test_a_route_naming_two_operations_of_a_scope_the_rules_do_not_route_alone_i
                     UploadPart=("PUT", "/{Bucket}/{Key+}")),
     }, "botocore test")
     assert doc["handRouted"] == dict(sorted(r.HAND_ROUTED.items()))
-    assert set(doc["handRouted"]) == {"apigateway", "s3"}
+    assert set(doc["handRouted"]) == {"s3"}
 
 
 def test_the_hand_routed_scopes_are_rendered_with_their_reasons():

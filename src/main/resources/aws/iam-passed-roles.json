@@ -378,7 +378,9 @@
       {"member": "infrastructureRoleArn", "passedTo": "ecs"},
       {"member": "taskRoleArn", "passedTo": "ecs-tasks"}
     ]},
-    "ecs:CreateGateway": {"passedTo": ["ecs"], "notRead": "botocore's model has no such operation"},
+    "ecs:CreateGateway": {"passedTo": ["ecs"], "roles": [
+      {"member": "infrastructureRoleArn", "passedTo": "ecs"}
+    ]},
     "ecs:CreateService": {"passedTo": ["ecs", "ecs-tasks"], "byHand": "the task definition's roles and the service's infrastructure roles"},
     "ecs:CreateTaskSet": {"passedTo": ["ecs-tasks"], "byHand": "the task definition's roles"},
     "ecs:RegisterDaemonTaskDefinition": {"passedTo": ["ecs-tasks"], "roles": [
@@ -394,7 +396,9 @@
       {"member": "executionRoleArn", "passedTo": "ecs-tasks"},
       {"member": "taskRoleArn", "passedTo": "ecs-tasks"}
     ]},
-    "ecs:UpdateGateway": {"passedTo": ["ecs"], "notRead": "botocore's model has no such operation"},
+    "ecs:UpdateGateway": {"passedTo": ["ecs"], "roles": [
+      {"member": "infrastructureRoleArn", "passedTo": "ecs"}
+    ]},
     "ecs:UpdateService": {"passedTo": ["ecs", "ecs-tasks"], "byHand": "the task definition's roles and the service's infrastructure roles"},
     "eks:CreateAccessEntry": {"passedTo": ["ec2"], "byHand": "the principal, for the node types alone"},
     "eks:CreateAddon": {"passedTo": ["eks"], "byHand": "the service account role and each Pod Identity association's role"},
@@ -423,8 +427,8 @@
       {"member": "ExecutionEngine.ExecutionRoleArn"},
       {"member": "ServiceRole", "byName": true}
     ]},
-    "elasticmapreduce:StartSession": {"passedTo": ["elasticmapreduce", "managed-compute.elasticmapreduce"], "roles": [
-      {"member": "ExecutionRoleArn", "passedTo": "elasticmapreduce"}
+    "elasticmapreduce:StartSession": {"passedTo": ["managed-compute.elasticmapreduce"], "roles": [
+      {"member": "ExecutionRoleArn", "passedTo": "managed-compute.elasticmapreduce"}
     ]},
     "elasticmapreduce:UpdateStudio": {"passedTo": [], "notRead": "no member of the request names a role"},
     "emr-serverless:StartJobRun": {"passedTo": ["emr-serverless"], "roles": [
@@ -625,6 +629,7 @@
       {"member": "S3Configuration.RoleARN", "passedTo": "kinesisanalytics"},
       {"member": "ServiceExecutionRole", "passedTo": "kinesisanalytics"}
     ]},
+    "kinesisanalytics:ImportSnapshot": {"passedTo": ["kinesisanalytics"], "notRead": "the pinned botocore does not have the operation yet, so its request cannot be read"},
     "kinesisanalytics:UpdateApplication": {"passedTo": ["kinesisanalytics"], "roles": [
       {"member": "ApplicationUpdate.CloudWatchLoggingOptionUpdates[].RoleARNUpdate", "passedTo": "kinesisanalytics"},
       {"member": "ApplicationUpdate.InputUpdates[].InputProcessingConfigurationUpdate.InputLambdaProcessorUpdate.RoleARNUpdate", "passedTo": "kinesisanalytics"},
@@ -662,6 +667,7 @@
     "logs:PutSubscriptionFilter": {"passedTo": ["logs"], "roles": [
       {"member": "roleArn", "passedTo": "logs"}
     ]},
+    "logs:StartQuery": {"passedTo": ["logs"], "notRead": "no member of the request names a role"},
     "logs:UpdateScheduledQuery": {"passedTo": ["logs"], "roles": [
       {"member": "destinationConfiguration.lookupTableConfiguration.roleArn", "passedTo": "logs"},
       {"member": "destinationConfiguration.s3Configuration.roleArn", "passedTo": "logs"},
@@ -963,6 +969,7 @@
     "ssm:CreateDocument": {"passedTo": ["justintimeaccess.ssm", "ssm"], "notRead": "no member of the request names a role"},
     "ssm:DescribeAutomationStepExecutions": {"passedTo": ["ssm"], "notRead": "no member of the request names a role"},
     "ssm:GetAutomationExecution": {"passedTo": ["ssm"], "notRead": "no member of the request names a role"},
+    "ssm:RegisterDefaultHostManagementConfiguration": {"passedTo": ["ssm"], "notRead": "the pinned botocore does not have the operation yet, so its request cannot be read"},
     "ssm:RegisterTaskWithMaintenanceWindow": {"passedTo": ["ssm"], "roles": [
       {"member": "ServiceRoleArn", "passedTo": "ssm"},
       {"member": "TaskInvocationParameters.RunCommand.ServiceRoleArn", "passedTo": "ssm"}
@@ -985,9 +992,7 @@
     ]},
     "ssm:UpdateServiceSetting": {"passedTo": ["ssm"], "notRead": "a role is only ever a setting's value, which the request names by SettingId"},
     "states:CreateStateMachine": {"passedTo": ["states"], "byHand": "the state machine's role"},
-    "states:TestState": {"passedTo": ["states"], "roles": [
-      {"member": "roleArn", "passedTo": "states"}
-    ]},
+    "states:TestState": {"passedTo": ["states"], "byHand": "the test state execution role"},
     "states:UpdateStateMachine": {"passedTo": ["states"], "byHand": "the state machine's role"},
     "swf:RegisterWorkflowType": {"passedTo": ["swf"], "roles": [
       {"member": "defaultLambdaRole", "passedTo": "swf"}

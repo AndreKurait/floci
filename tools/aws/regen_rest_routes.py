@@ -12,7 +12,9 @@ request on each route and compares the action the registry gives with that one.
 The credential scopes in `HAND_ROUTED` are authorized by the registry's rules alone, each for its
 reason, and their routes are vendored for the coverage test only. Within any other scope, two
 operations on one route would leave a request matching it no single operation, so the generation
-fails on them.
+fails on them. Supported shared-controller alternatives are generated beside the modeled URI, with
+member-location overrides for the bare route, and its own method where that is not the operation's. These
+alternatives describe existing Floci compatibility paths, not additional botocore operations.
 
 The models are botocore's `<model>/<apiVersion>/service-2.json` (Apache-2.0,
 https://github.com/boto/botocore), the latest API version of each, located as
@@ -39,10 +41,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/rest-routes.json"
 
 # Credential scopes the registry's rules authorize alone, and why.
 HAND_ROUTED: dict[str, str] = {
-    "apigateway": "API Gateway's management API is authorized by HTTP method, apigateway:GET, apigateway:POST "
-                  "and so on, on the resource path a route names, not by its operations' names, and the "
-                  "registry's rules give every route its method's action",
-    "s3": "S3 tells apart the operations it serves on one route by their query parameters and headers, which the "
+    "s3":"S3 tells apart the operations it serves on one route by their query parameters and headers, which the "
           "registry's S3 rules and sub-resource overrides read, and an S3 Control route Floci does not serve "
           "runs as the S3 data plane, checked as the bucket or object operation that runs",
 }
@@ -84,18 +83,22 @@ MODELS: dict[str, str] = {
     "signer": "signer",
 }
 
-
-# Shared-controller and ARN-spanning operations are activated with their qualified tables.
+# Operations a model does not serve itself. The shared tags controller serves /tags/{resourceArn} for every
+# service that is a TagHandler, the ARN taking the rest of the path, and the bare /tags too. API Gateway's v1
+# tag routes are the shared controller's too. A route a service's filter moves under an internal prefix is
+# vendored at the model's own path all the same: IAM matches it on the path without the prefix the filter
+# records (SignedServiceRoute).
 SHARED_ROUTES: dict[str, frozenset[str]] = {
+    "apigateway": frozenset({"TagResource", "UntagResource", "GetTags"}),
     "controltower": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "signer": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "fis": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "resource-explorer-2": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
 }
 ARN_SPANNING_ROUTES: dict[str, frozenset[str]] = {
+    "apigatewayv2": frozenset({"TagResource", "UntagResource", "GetTags"}),
     "oam": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
 }
-
 
 ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {}
 
@@ -173,6 +176,8 @@ def build(models: dict[str, dict], provenance: str) -> dict:
         "handRouted": dict(sorted(HAND_ROUTED.items())),
         "models": routes,
     }
+
+
 
 
 def route_key(method: str, request_uri: str) -> tuple:

@@ -69,6 +69,17 @@ class IamRestRoutesTest {
      */
     @Test
     void anAlternativeIsMatchedByItsOwnMethod() {
+        IamRestRoutes vendored = IamRestRoutes.vendored();
+        IamRestRoutes.Match bare = vendored.match("apigateway", "POST", "/tags", null).orElseThrow();
+        assertEquals("TagResource", bare.operation());
+        assertEquals(Map.of("resourceArn", "body"), bare.located());
+        assertEquals(Optional.empty(), vendored.operation("apigateway", "PUT", "/tags", null));
+        assertEquals(Optional.of("TagResource"),
+                vendored.operation("apigateway", "PUT", "/tags/arn:aws:apigateway:us-east-1::/restapis/abc", null));
+        assertEquals(Optional.of("GetTags"), vendored.operation("apigateway", "GET", "/tags", null));
+        assertEquals(Optional.of("TagResource"),
+                vendored.operation("apigateway", "POST", "/v2/tags/arn:aws:apigateway:us-east-1::/apis/abc", null));
+
         IamRestRoutes own = routes(ROUTES.replace("\"requestUri\": \"/things/{ThingName}?tagging\"",
                 "\"requestUri\": \"/things/{ThingName}?tagging\", \"alternatives\": [{\"method\": \"PUT\", "
                         + "\"requestUri\": \"/tagging\", \"located\": {\"ThingName\": \"body\"}}]"));
