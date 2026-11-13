@@ -1847,7 +1847,11 @@ public class ResourceArnBuilder {
     }
 
     private List<String> buildDynamoDbArns(ContainerRequestContext ctx, String region, String accountId) {
-        JsonNode json = readJsonBody(ctx);
+        return dynamoDbArns(readJsonBody(ctx), region, accountId);
+    }
+
+    /** The resources a DynamoDB request names, shared by direct requests and integrated tasks. */
+    public static List<String> dynamoDbArns(JsonNode json, String region, String accountId) {
         if (json != null && json.isObject()) {
             if (json.hasNonNull("TableName")) {
                 String tableName = json.get("TableName").asText().trim();

@@ -27,6 +27,20 @@ public class AccountResolver {
         this.defaultAccountId = defaultAccountId;
     }
 
+    public static boolean isAccountId(String value) {
+        if (value == null || value.length() != 12) {
+            return false;
+        }
+        for (int i = 0; i < 12; i++) {
+            char c = value.charAt(i);
+            if (c < '0' || '9' < c) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+
     /**
      * Returns the account ID for the given Authorization header.
      * When the access key ID is exactly 12 digits it is used directly as the account ID,

@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.testing;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.restassured.response.Response;
+import org.awaitility.Awaitility;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -12,10 +14,20 @@ import java.util.UUID;
 
 import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
-import static org.awaitility.Awaitility.await;
 
 /** Step Functions calls a test makes as one account, and the state machines it leaves to {@code cleanup}. */
 public final class StepFunctionsTestClient {
+
+    /** A trust policy letting Step Functions assume the role: what an execution role needs. */
+    public static final String STATES_TRUST = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+             "Principal":{"Service":"states.amazonaws.com"}}]}
+            """;
+    /** A trust policy naming another service, so Step Functions may not assume the role. */
+    public static final String LAMBDA_TRUST = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+             "Principal":{"Service":"lambda.amazonaws.com"}}]}
+            """;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Duration POLL_INTERVAL = Duration.ofMillis(25);
@@ -28,15 +40,56 @@ public final class StepFunctionsTestClient {
         this.cleanup = cleanup;
     }
 
+    public static String allow(String resource, String... actions) {
+        try {
+            return MAPPER.writeValueAsString(Map.of("Version", "2012-10-17", "Statement", List.of(
+                    Map.of("Effect", "Allow", "Action", List.of(actions), "Resource", resource))));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    public String role(String account, String namePrefix, String trust, String policy) {
+        return EnforcementFixtures.createRole(cleanup, port, account, "/", namePrefix + UUID.randomUUID(), trust, policy);
+    }
+
+    public SqsTestQueue queue(SqsService service, String account, String region, String namePrefix) {
+        SqsTestQueue queue = SqsTestQueue.create(service, account, region, namePrefix);
+        cleanup.register(queue::delete);
+        return queue;
+    }
+
+    public String machine(String account, String namePrefix, Map<String, Object> task, String role) throws Exception {
+        return machineWithDefinition(account, namePrefix, MAPPER.writeValueAsString(
+                Map.of("StartAt", "Send", "States", Map.of("Send", task))), role);
+    }
+
+    public String machineWithDefinition(String account, String namePrefix, String definition, String role) {
+        return createMachine(account, namePrefix, definition, "STANDARD", role);
+    }
+
     public Response request(String account, String action, Map<String, ?> input) {
         return given().port(port).header("Authorization", auth(account, "states"))
                 .header("X-Amz-Target", "AWSStepFunctions." + action)
                 .contentType("application/x-amz-json-1.0").body(MAPPER.valueToTree(input).toString()).post("/");
     }
 
+    /**
+     * A JSON-protocol request to the service a task calls, signed as {@code account} for {@code signingName}, so a
+     * test reads and sets up the resources a task reaches in the account its execution runs in.
+     */
+    public Response json(String account, String signingName, String target, String contentType, Map<String, ?> body) {
+        return given().port(port).header("Authorization", auth(account, signingName))
+                .header("X-Amz-Target", target)
+                .contentType(contentType).body(MAPPER.valueToTree(body).toString()).post("/");
+    }
+
     /** Creates a state machine in us-east-1, which the end of the test stops and deletes. */
     public String createMachine(String account, String namePrefix, String definition, String type, String role) {
-        String name = namePrefix + UUID.randomUUID();
+        return createMachineNamed(account, namePrefix + UUID.randomUUID(), definition, type, role);
+    }
+
+    public String createMachineNamed(String account, String name, String definition, String type, String role) {
         String arn = "arn:aws:states:us-east-1:" + account + ":stateMachine:" + name;
         cleanup.register(() -> removeMachine(account, arn));
         Response created = request(account, "CreateStateMachine", Map.of(
@@ -53,7 +106,7 @@ public final class StepFunctionsTestClient {
 
     /** Polls until the execution ends: nothing in the API waits for a standard workflow. */
     public Response terminal(String account, String execution, int seconds) {
-        return await("execution " + execution + " to leave RUNNING")
+        return Awaitility.await("execution " + execution + " to leave RUNNING")
                 .atMost(Duration.ofSeconds(seconds))
                 .pollDelay(Duration.ZERO)
                 .pollInterval(POLL_INTERVAL)
@@ -62,6 +115,15 @@ public final class StepFunctionsTestClient {
                     response.then().statusCode(200);
                     return response;
                 }, response -> !"RUNNING".equals(response.jsonPath().getString("status")));
+    }
+
+    /** Waits for a history event using the same bounded polling as terminal execution checks. */
+    public void await(String account, String execution, String eventType, int seconds) {
+        Awaitility.await("history event " + eventType)
+                .atMost(Duration.ofSeconds(seconds))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(POLL_INTERVAL)
+                .until(() -> !eventsOfType(account, execution, eventType).isEmpty());
     }
 
     public List<JsonNode> eventsOfType(String account, String execution, String type) throws Exception {
@@ -74,6 +136,14 @@ public final class StepFunctionsTestClient {
             }
         }
         return events;
+    }
+
+    /** A trust policy letting {@code roleArn} assume the role, as a task's {@code Credentials} role needs. */
+    public static String trusting(String roleArn) {
+        return """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                 "Principal":{"AWS":"%s"}}]}
+                """.formatted(roleArn);
     }
 
     private void removeMachine(String account, String arn) {

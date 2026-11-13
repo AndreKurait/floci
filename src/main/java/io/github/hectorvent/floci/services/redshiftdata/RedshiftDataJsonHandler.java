@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.redshiftdata;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -14,6 +15,11 @@ public class RedshiftDataJsonHandler {
     @Inject
     public RedshiftDataJsonHandler(RedshiftDataService service) {
         this.service = service;
+    }
+
+    /** The workgroups and session targets the service finds, for a caller naming the resources of a request. */
+    public StoredResourceArns storedResourceArns() {
+        return service;
     }
 
     public Response handle(String action, JsonNode request, String region) {

@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService.TaskResult;
 import jakarta.enterprise.inject.Instance;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -75,6 +76,11 @@ class AslExecutorTokenTimeoutTest {
         }
         assertTrue(future.isCancelled());
         assertEquals(List.of("unlocked", "TaskTimedOut", "TaskTimedOut", "TaskTimedOut"), callbackResults);
+    }
+
+    @BeforeEach
+    void defaultRegion() {
+        when(resolver.getRegion()).thenReturn("us-east-1");
     }
 
     @Test

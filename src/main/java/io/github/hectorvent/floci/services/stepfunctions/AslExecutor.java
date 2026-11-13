@@ -620,7 +620,8 @@ public class AslExecutor {
      */
     private <T> T callUnderExecutionAccount(StateMachine sm, Callable<T> body) throws Exception {
         String accountId = AwsArnUtils.accountOrDefault(sm.getStateMachineArn(), null);
-        return RequestScopes.callAsChecked(accountId == null || accountId.isBlank() ? null : accountId, body);
+        String region = AwsArnUtils.regionOrDefault(sm.getStateMachineArn(), null);
+        return RequestScopes.callAsChecked(accountId == null || accountId.isBlank() ? null : accountId, region, body);
     }
 
     private void doExecute(StateMachine sm, Execution exec, List<HistoryEvent> history,
@@ -1328,7 +1329,8 @@ public class AslExecutor {
 
     /** Integrations {@link TaskPermissions} does not map stay unchecked, Lambda and API Gateway check their own. */
     private void authorizeTask(StatesIntegration integration, JsonNode input, StateMachine sm, JsonNode credentials) {
-        Optional<TaskPermissions> required = TaskPermissions.of(integration, input, sm);
+        Optional<TaskPermissions> required = TaskPermissions.of(integration, input, sm,
+                redshiftDataHandler == null ? null : redshiftDataHandler.storedResourceArns());
         if (required.isEmpty()) {
             return;
         }
@@ -1336,7 +1338,7 @@ public class AslExecutor {
             NestedTaskCredentials.validateShape(credentials);
         }
         lambdaTaskAuthorizer.authorize(sm, credentials == null ? null : credentials.path("RoleArn").asText(),
-                required.get().errorPrefix() + "AccessDeniedException", required.get().permissions());
+                required.get().deniedError(), required.get().permissions());
     }
 
     private boolean iamEnforcementEnabled() {
