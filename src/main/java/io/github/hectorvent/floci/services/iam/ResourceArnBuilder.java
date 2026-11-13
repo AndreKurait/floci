@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.eks.EksService;
@@ -236,6 +237,27 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("iot".equals(credentialScope) && "iot:DeleteJob".equals(operation)) {
+            String jobId = ctx.getUriInfo().getPathParameters().getFirst("jobId");
+            return List.of(jobId == null ? "*"
+                    : AwsArnUtils.Arn.of("iot", region, accountId, "job/" + jobId).toString());
+        }
+        if ("cloudfront".equals(credentialScope) && operation != null && Set.of("cloudfront:GetFieldLevelEncryption",
+                "cloudfront:GetFieldLevelEncryptionConfig", "cloudfront:GetFieldLevelEncryptionProfile",
+                "cloudfront:GetFieldLevelEncryptionProfileConfig").contains(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            String type = operation.startsWith("cloudfront:GetFieldLevelEncryptionProfile")
+                    ? "field-level-encryption-profile/" : "field-level-encryption-config/";
+            return id == null ? List.of("*")
+                    : List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId, type + id).toString());
+        }
+        if ("cloudfront".equals(credentialScope)
+                && "cloudfront:UpdateOriginAccessControl".equals(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            return List.of(id == null || id.isBlank() ? "*"
+                    : AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
+                            "origin-access-control/" + id).toString());
+        }
         if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation) && neptuneSnapshotResources != null
                 && !neptuneSnapshotResources.isUnsatisfied()) {
             Map<String, String> parameters = new LinkedHashMap<>();
@@ -368,6 +390,14 @@ public class ResourceArnBuilder {
     /** Uses the serving operation and the same raw names as the handler. */
     public List<String> buildLogResources(String action, ContainerRequestContext ctx,
                                           String region, String accountId, String partition) {
+        if (LogTransformerTarget.supports(action)) {
+            JsonNode body = readJsonBody(ctx);
+            String identifier = body == null ? null : body.path("logGroupIdentifier").asText(null);
+            return List.of(LogTransformerTarget.resolve(identifier, region, accountId, partition).arn());
+        }
+        if ("logs:TestTransformer".equals(action)) {
+            return List.of("*");
+        }
         // Operations the vendored table reads (the vended-log delivery family) take their resources from it.
         if (RequestResources.reads(action)) {
             return namedResources("logs", action, ctx, region, accountId, partition);
