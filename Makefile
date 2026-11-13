@@ -299,6 +299,7 @@ aws-data-sync-botocore: ## Regenerate only the AWS data derived from botocore, s
 	$(PYTHON) tools/aws/regen_kinesis_shapes.py
 	$(PYTHON) tools/aws/regen_iam_shapes.py
 	$(PYTHON) tools/aws/regen_sts_shapes.py
+	$(PYTHON) tools/aws/regen_ssm_resource_data_sync_shapes.py
 	$(PYTHON) tools/aws/regen_apigateway_types.py
 	$(PYTHON) tools/aws/regen_sesv2_shapes.py
 	$(PYTHON) tools/aws/regen_apigateway_shapes.py
@@ -365,6 +366,10 @@ aws-data-check-botocore: ## The AWS data derived from botocore must match a fres
 		echo ""; \
 		echo "error: src/main/resources/aws/sts-request-shapes.json is out of date."; \
 		echo "       Run 'make aws-data-sync' and commit the result."; \
+		exit 1; \
+	}
+	@$(PYTHON) tools/aws/regen_ssm_resource_data_sync_shapes.py --check || { \
+		echo "error: SSM ResourceDataSync request shapes are out of date; run 'make aws-data-sync'."; \
 		exit 1; \
 	}
 	@$(PYTHON) tools/aws/regen_redshift_serverless_shapes.py --check || { \

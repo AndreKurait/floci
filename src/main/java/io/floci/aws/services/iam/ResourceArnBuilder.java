@@ -232,7 +232,7 @@ public class ResourceArnBuilder {
             case "sns"            -> List.of(buildSnsArn(ctx, region, accountId));
             case "dynamodb"       -> buildDynamoDbArns(ctx, region, accountId);
             case "kinesis"        -> List.of(buildKinesisArn(ctx, region, accountId));
-            case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
+            case "ssm"            -> buildSsmResources(operation, ctx, region, accountId, partition);
             case "iam"            -> buildIamArns(ctx, region, accountId);
             case "resource-groups" -> List.of(buildResourceGroupArn(ctx, region, accountId));
             case "scheduler"      -> List.of(buildSchedulerArn(path, ctx, region, accountId, partition));
@@ -1891,6 +1891,35 @@ public class ResourceArnBuilder {
     }
 
     // ── SSM ──────────────────────────────────────────────────────────────────────
+    private List<String> buildSsmResources(String operation, ContainerRequestContext ctx,
+                                           String region, String accountId, String partition) {
+        String action = operation == null ? IamActionRegistry.targetOperation(ctx) : operation;
+        if (action != null && action.startsWith("ssm:")) {
+            action = action.substring(4);
+        }
+        JsonNode json = readJsonBody(ctx);
+        List<String> syncResources = ssmDataSyncResources(action, json, region, accountId, partition);
+        return syncResources == null ? List.of(buildSsmArn(ctx, region, accountId)) : syncResources;
+    }
+
+    /** Only the dispatched sync operation selects a sync ARN; parameter and body action fields do not. */
+    private static List<String> ssmDataSyncResources(String action, JsonNode json, String region,
+                                                     String accountId, String partition) {
+        if ("ListResourceDataSync".equals(action)) {
+            return List.of("*");
+        }
+        if (!"CreateResourceDataSync".equals(action) && !"UpdateResourceDataSync".equals(action)
+                && !"DeleteResourceDataSync".equals(action)) {
+            return null;
+        }
+        JsonNode name = json == null ? null : json.get("SyncName");
+        if (name == null || !name.isTextual() || name.asText().isEmpty()) {
+            return List.of("*");
+        }
+        return List.of(new AwsArnUtils.Arn(partition, "ssm", region, accountId,
+                "resource-data-sync/" + name.asText()).toString());
+    }
+
     private String buildSsmArn(ContainerRequestContext ctx, String region, String accountId) {
         JsonNode json = readJsonBody(ctx);
         if (json != null && json.isObject()) {

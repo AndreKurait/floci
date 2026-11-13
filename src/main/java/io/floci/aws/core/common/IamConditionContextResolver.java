@@ -165,6 +165,7 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "ssm" -> ssmSyncConditionContext(action, ctx);
             case "redshift" -> RequestConditionKeys.requestKeys(action).isEmpty() ? null
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
@@ -335,6 +336,25 @@ public class IamConditionContextResolver {
             }
         }
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    /** The same destination default the sync handler uses for omitted create/list/delete types. */
+    private Map<String, List<String>> ssmSyncConditionContext(String action, ContainerRequestContext ctx) {
+        if (!RequestConditionKeys.takes(action, "ssm:SyncType")) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.isObject()) {
+            return null;
+        }
+        for (String member : RequestConditionKeys.members(action, "ssm:SyncType")) {
+            JsonNode value = body.get(member);
+            if (value != null && !value.isNull()) {
+                return value.isTextual() ? Map.of("ssm:SyncType", List.of(value.asText())) : null;
+            }
+        }
+        return "ssm:UpdateResourceDataSync".equals(action)
+                ? null : Map.of("ssm:SyncType", List.of("SyncToDestination"));
     }
 
     public static Map<String, List<String>> withGlobalContext(Map<String, List<String>> serviceContext,
