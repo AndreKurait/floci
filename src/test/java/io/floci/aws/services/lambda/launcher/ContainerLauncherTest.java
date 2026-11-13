@@ -9,6 +9,7 @@ import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectNetworkCmd;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
@@ -16,6 +17,7 @@ import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
+import com.github.dockerjava.api.model.Network;
 import com.github.dockerjava.api.model.StreamType;
 import com.github.dockerjava.api.model.VersionComponent;
 import io.floci.aws.config.EmulatorConfig;
@@ -515,6 +517,29 @@ class ContainerLauncherTest {
                 executionRoleCredentials, ec2Service);
     }
 
+    @Test
+    void resolverRemovalFailureDoesNotLeakRuntimeApiPort() {
+        ContainerHandle handle = launcher.launch(imageFunction());
+        handle.setDnsResolverVolume("owned-resolver");
+        doThrow(new IllegalStateException("volume removal failed"))
+                .when(lifecycleManager).removeVolumeStrict("owned-resolver");
+
+        assertThrows(IllegalStateException.class, () -> launcher.stop(handle));
+
+        InOrder order = inOrder(lifecycleManager, runtimeApiServer, runtimeApiServerFactory);
+        order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
+        order.verify(runtimeApiServer).close();
+        order.verify(runtimeApiServerFactory).release(runtimeApiServer);
+        order.verify(lifecycleManager).removeVolumeStrict("owned-resolver");
+        doNothing().when(lifecycleManager).removeVolumeStrict("owned-resolver");
+        launcher.stop(handle);
+        launcher.stop(handle);
+        verify(runtimeApiServerFactory, times(1)).release(runtimeApiServer);
+        verify(runtimeApiServer, times(1)).close();
+        verify(lifecycleManager, times(2)).removeVolumeStrict("owned-resolver");
+        assertNull(handle.getDnsResolverVolume());
+    }
+
     @ParameterizedTest
     @CsvSource({
             "arm64, true, , linux/arm64, arm64",
@@ -813,6 +838,11 @@ class ContainerLauncherTest {
 
     @Test
     void launchFunction_appliesConfiguredDockerFlagsToRealContainer() throws Exception {
+        InspectNetworkCmd inspectNetwork = mock(InspectNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.inspectNetworkCmd()).thenReturn(inspectNetwork);
+        Network network = mock(Network.class);
+        when(network.getInternal()).thenReturn(false);
+        when(inspectNetwork.exec()).thenReturn(network);
         lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.9");
         when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
