@@ -30,6 +30,15 @@ The legacy `GetConfiguration` data-plane route accepts application, environment 
 It returns only the deployed version, its content type and `Configuration-Version`; a matching
 `ClientConfigurationVersion` returns HTTP 204 with no body. `ClientId` is required.
 
+Hosted versions accept a case-sensitive `VersionLabel` of 1–64 characters containing at least
+one non-numeric character. Labels are unique among versions still stored in the profile and
+are returned by create, get and list. Deleting a version releases its label.
+`LatestVersionNumber` checks the highest version currently stored (zero for an empty profile);
+a mismatch returns `ConflictException` without creating a version. Version numbers continue
+increasing after deletion and persist across restart. Lists support `MaxResults`, `NextToken`,
+and exact or trailing-asterisk prefix label filters. A label filter excludes unlabeled versions.
+Hosted deployment and validation requests still select configurations by numeric version.
+
 ### Supported Operations
 
 - `CreateApplication`
@@ -49,6 +58,7 @@ It returns only the deployed version, its content type and `Configuration-Versio
 - `DeleteConfigurationProfile`
 - `CreateHostedConfigurationVersion`
 - `GetHostedConfigurationVersion`
+- `ListHostedConfigurationVersions`
 - `DeleteHostedConfigurationVersion`
 - `CreateDeploymentStrategy`
 - `GetDeploymentStrategy`
@@ -154,6 +164,11 @@ with `BadRequestException` before changing the active version or stopping the de
 Older persisted deployments without completion timestamps cannot be reverted because
 that window cannot be verified.
 
+Completed reverts preserve `StartedAt` and `CompletedAt`. They prepend a
+`REVERT_COMPLETED` event with `TriggeredBy: USER` and the revert time, retaining all
+recorded event history. Environment state aggregation, ordinary deployment start
+and completion events, and event `ActionInvocations` fields remain unimplemented.
+
 ## Data Plane (AppConfigData) {#data-plane}
 
 The data plane is used by applications to retrieve the active configuration for an environment and profile.
@@ -193,7 +208,7 @@ Floci provisions these resource types:
 For the first four types, `Ref` returns the AppConfig ID, which `Fn::GetAtt` also returns as `ApplicationId`, `EnvironmentId`,
 `ConfigurationProfileId` and `Id`. A configuration profile's `KmsKeyArn` is not set.
 
-For a hosted version, `Ref` and `Fn::GetAtt VersionNumber` return the version number.
+For a hosted version, `Ref` and `Fn::GetAtt VersionNumber` return the version number as a string.
 Its physical identity also includes its application and profile, so versions with the same
 number in different profiles remain separate resources. Hosted version numbers increase
 across concurrent creates, deletions and restarts. Older persisted data without a counter
@@ -203,8 +218,10 @@ Changing hosted content, content type, description or parent creates a new versi
 Successful replacement deletes the old version unless `UpdateReplacePolicy: Retain`
 keeps it; rollback deletes the new version and restores the original resource.
 `DeletionPolicy: Retain` keeps a version when its stack removes it.
-`LatestVersionNumber` and `VersionLabel` are rejected before creation because the
-management service does not implement them.
+The hosted provider accepts `VersionLabel` and `LatestVersionNumber`; each is a replacement property.
+An empty CloudFormation label creates an unlabeled version and remains an empty property in the stack template.
+The locking token checks the highest currently stored version before creation. Failed creates consume no number;
+a version created and then removed by rollback leaves an allocation gap. Outputs-only updates retain the version.
 
 Deployment creation waits for AppConfig's `COMPLETE` state, preserving the strategy's
 rollout and final bake durations. `Fn::GetAtt DeploymentNumber` is a string and `State`
