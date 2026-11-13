@@ -93,7 +93,7 @@ NOT_COVERED = {
     "apigateway": "authorized by HTTP method, so no request is checked as one of these operations",
     "access-analyzer": "REST routes no rule maps yet",
     "airflow": "REST routes no rule maps yet",
-    "appconfig": "REST routes no rule maps yet",
+    "appconfig": "UpdateEnvironment reads supplied monitor roles in PassedRoles; other AppConfig role-bearing routes are not covered",
     "appsync": "REST routes no rule maps yet",
     "aps": "REST routes no rule maps yet",
     "aws-marketplace": "REST routes no rule maps yet",
