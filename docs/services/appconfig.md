@@ -96,8 +96,20 @@ ignores the template's `Validators`; these validators are configured through the
 
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
-Floci does not evaluate the alarms or trigger automatic rollback. More than five monitors, or an `AlarmRoleArn`
-that is not an IAM role ARN, returns `BadRequestException`.
+More than five monitors, or an `AlarmRoleArn` that is not an IAM role ARN, returns `BadRequestException`.
+Before starting a deployment, Floci checks every configured alarm in the deployment's account, Region and
+partition. A missing or unreadable monitor returns `BadRequestException` before deployment or active-content
+changes. With IAM enforcement enabled, configure an explicit monitoring role that trusts AppConfig and
+allows `cloudwatch:DescribeAlarms`. Metric alarms use their ARN and stored resource tags for authorization;
+composite alarms require wildcard resource permission. Role permissions boundaries and SCPs also apply.
+Default monitoring-role discovery is not implemented.
+
+During rollout and final bake, enabled alarms in `ALARM` or `INSUFFICIENT_DATA` trigger automatic rollback
+to the previous available hosted configuration. A background worker advances deployments without requiring
+deployment-status reads. Disabled alarm actions suppress rollback. The returned `EventLog` contains
+`ROLLBACK_COMPLETED` and `ROLLBACK_STARTED`, newest first, identifying the alarm and its state. Monitoring
+ends at the captured rollout-plus-bake deadline; a delayed worker completes an elapsed deployment before
+checking its alarms. The polling interval does not guarantee an AWS response-time bound.
 `StartDeployment` and `GetDeployment` return the deployed profile's name and location URI as
 `ConfigurationName` and `ConfigurationLocationUri`. Deployments stored by earlier Floci versions did not
 record them, so on those neither is set.
@@ -108,10 +120,12 @@ A deployment stored by an earlier Floci version returns no strategy settings fro
 `ListDeployments` reports the strategy's current settings while the strategy exists.
 A configuration profile created without `Type` reports no type, as AWS documents no default.
 
-Configuration content becomes available immediately. A positive `FinalBakeTimeInMinutes`
-keeps the deployment in `BAKING` at 100 percent until that time has elapsed; get and list
-readback then report `COMPLETE`. Started and completed timestamps use the API's ISO 8601
-format and survive restart. Gradual per-client rollout and alarm evaluation are not implemented.
+Configuration content becomes available immediately. A positive `DeploymentDurationInMinutes` starts
+the deployment in `DEPLOYING` at zero percent, with captured LINEAR or EXPONENTIAL growth steps.
+After rollout, a positive `FinalBakeTimeInMinutes` keeps it in `BAKING` at 100 percent until the final
+deadline, then it becomes `COMPLETE`. Started and completed timestamps use the API's ISO 8601 format
+and survive restart; completion records the scheduled deadline. Gradual per-client distribution,
+extension ticks and external configuration retrieval are not implemented.
 
 `StopDeployment` with `AllowRevert=true` returns an in-progress deployment as `ROLLED_BACK`
 or a completed deployment as `REVERTED`, restoring the previous available configuration
@@ -121,6 +135,7 @@ If the previous hosted configuration version has been deleted, the stop is rejec
 with `BadRequestException` before changing the active version or stopping the deployment.
 Older persisted deployments without completion timestamps cannot be reverted because
 that window cannot be verified.
+Explicit stop/revert bypasses alarm reads, so an unhealthy or deleted monitor does not prevent recovery.
 
 ## Data Plane (AppConfigData) {#data-plane}
 
