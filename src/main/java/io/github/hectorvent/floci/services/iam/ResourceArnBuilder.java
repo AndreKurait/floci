@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
+import io.github.hectorvent.floci.services.neptune.NeptuneSnapshotResources;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
@@ -112,6 +113,7 @@ public class ResourceArnBuilder {
     private final Instance<StoredResourceArns> storedResourceArns;
     private final Instance<StepFunctionsService> stepFunctionsService;
     private final Instance<Ec2Service> ec2Service;
+    private final Instance<NeptuneSnapshotResources> neptuneSnapshotResources;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -121,7 +123,8 @@ public class ResourceArnBuilder {
                               Instance<KmsService> kmsService,
                               Instance<StoredResourceArns> storedResourceArns,
                               Instance<StepFunctionsService> stepFunctionsService,
-                              Instance<Ec2Service> ec2Service) {
+                              Instance<Ec2Service> ec2Service,
+                              Instance<NeptuneSnapshotResources> neptuneSnapshotResources) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -131,6 +134,17 @@ public class ResourceArnBuilder {
         this.storedResourceArns = storedResourceArns;
         this.stepFunctionsService = stepFunctionsService;
         this.ec2Service = ec2Service;
+        this.neptuneSnapshotResources = neptuneSnapshotResources;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService, Instance<KmsService> kmsService,
+                              Instance<StoredResourceArns> storedResourceArns,
+                              Instance<StepFunctionsService> stepFunctionsService, Instance<Ec2Service> ec2Service) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
+                storedResourceArns, stepFunctionsService, ec2Service, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -243,6 +257,22 @@ public class ResourceArnBuilder {
             return List.of(id == null || id.isBlank() ? "*"
                     : AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
                             "origin-access-control/" + id).toString());
+        }
+        if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation) && neptuneSnapshotResources != null
+                && !neptuneSnapshotResources.isUnsatisfied()) {
+            Map<String, String> parameters = new LinkedHashMap<>();
+            for (String member : List.of("Engine", "DBClusterIdentifier", "DBClusterSnapshotIdentifier",
+                    "SnapshotIdentifier", "DBClusterParameterGroupName", "DBSubnetGroupName")) {
+                String value = firstFormParam(ctx, member);
+                if (value != null) {
+                    parameters.put(member, value);
+                }
+            }
+            Optional<List<String>> resources = neptuneSnapshotResources.get().resolve(operation,
+                    parameters, partition, region, accountId);
+            if (resources.isPresent()) {
+                return resources.get();
+            }
         }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",
