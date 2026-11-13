@@ -394,11 +394,48 @@ public class AppConfigService implements Resettable {
         return profileStore.get(profileId);
     }
 
+    public synchronized ConfigurationProfile updateConfigurationProfile(String applicationIdentifier,
+                                                                        String profileIdentifier,
+                                                                        Map<String, Object> request) {
+        String appId = resolveApplication(applicationIdentifier).getId();
+        ConfigurationProfile profile = copy(resolveConfigurationProfile(appId, profileIdentifier));
+        if (request.containsKey("Name")) {
+            profile.setName(profileText(request, "Name", 1, 128, false));
+        }
+        if (request.containsKey("Description")) {
+            profile.setDescription(profileText(request, "Description", 0, 1024, true));
+        }
+        if (request.containsKey("Validators")) {
+            profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
+        }
+        if (request.get("RetrievalRoleArn") != null) {
+            throw new AwsException("BadRequestException", "RetrievalRoleArn is not currently supported.", 400);
+        }
+        if (request.get("KmsKeyIdentifier") != null) {
+            throw new AwsException("BadRequestException", "KmsKeyIdentifier is not currently supported.", 400);
+        }
+        profileStore.put(profile.getId(), profile);
+        return profile;
+    }
+
+    private static String profileText(Map<String, Object> request, String field, int minimum,
+                                      int maximum, boolean nullable) {
+        Object value = request.get(field);
+        if (value == null && nullable) {
+            return null;
+        }
+        if (!(value instanceof String text) || text.length() < minimum || text.length() > maximum) {
+            throw new AwsException("BadRequestException",
+                    field + " must be a string of " + minimum + " to " + maximum + " characters.", 400);
+        }
+        return text;
+    }
+
     /**
      * Sets the name and description of a configuration profile, as a CloudFormation update of
      * {@code AWS::AppConfig::ConfigurationProfile} does: both are written, so a null description
-     * clears it. Floci serves no UpdateConfigurationProfile route; the CloudFormation provisioner is
-     * the only caller.
+     * clears it. The CloudFormation provisioner uses this full-property helper; native PATCH calls
+     * use the map overload to retain omitted fields.
      */
     public synchronized ConfigurationProfile updateConfigurationProfile(String applicationId, String profileId,
                                                                         String name, String description) {
