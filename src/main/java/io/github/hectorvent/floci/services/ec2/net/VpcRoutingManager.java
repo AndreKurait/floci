@@ -290,6 +290,27 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         return address == null ? Optional.empty() : Optional.of(address.address);
     }
 
+    public synchronized Optional<String> publicFrontendTransport(String account, String region, String eni) {
+        PublicAddress address = publicAddresses.get(key(account, region, eni));
+        return address == null || missingNamespaces.contains(address.namespace.id()) || !exists(address.namespace.id())
+                ? Optional.empty() : Optional.ofNullable(address.transport);
+    }
+
+    /** Publishes only an exact owner's listening ports; native subnet routes and security groups still apply. */
+    public synchronized void publishFrontendListeners(String account, String region, String eni, String helper,
+                                                       Set<Integer> ports) {
+        requireActive();
+        String identity = key(account, region, eni);
+        PublicAddress address = publicAddresses.get(identity);
+        Endpoint endpoint = endpoints.get(identity);
+        if (address == null || endpoint == null || !helper.equals(address.namespace.id())
+                || !helper.equals(endpoint.helper) || missingNamespaces.contains(helper) || !exists(helper)) {
+            throw new IllegalStateException("Public listeners have no matching protected frontend");
+        }
+        address.listeners = VpcFrontendIngress.checkedPorts(ports);
+        reconcile();
+    }
+
     /** Create holds the native EIP and private address before attaching the runtime. */
     public synchronized void createNat(String account, String region, NatGateway gateway) {
         if (!enabled()) {
@@ -556,10 +577,12 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         List<VpcRoutingCommands.LocalRoute> local = routes.stream().map(route -> new VpcRoutingCommands.LocalRoute(
                 route.destination(), VpcRouteSelection.local(route.route()) && vpcCidr.contains(route.destination())))
                 .toList();
+        VpcFrontendIngress frontend = own == null ? null : new VpcFrontendIngress(own.transport, own.device,
+                own.listeners, VpcFrontendIngress.decisions(vpc, routes, topology.gateways));
         String script = VpcRoutingCommands.endpoint(identity.logicalAddress(), endpoint.privateDevice,
                 local, hops, denied, endpoint.resolvers, identity.controlConnections(),
                 identity.instanceMetadataAllowed(), own == null ? null : own.device, inbound,
-                identity.controlListeners());
+                identity.controlListeners(), frontend);
         if (endpoint.publicAddress != null && endpoint.publicAddress.separateTransport()) {
             NativePublicAddress address = endpoint.publicAddress;
             script += VpcRoutingCommands.publicInstanceSources(identity.logicalAddress(), address.address(),
@@ -898,6 +921,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         final NetworkNamespaceLease namespace;
         String transport;
         String device;
+        Set<Integer> listeners = Set.of();
 
         PublicAddress(String address, NetworkNamespaceLease namespace) {
             this.address = address;
