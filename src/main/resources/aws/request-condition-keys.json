@@ -61,6 +61,18 @@
     ],
     "sts:AssumeRoleWithWebIdentity": [
       "sts:RoleSessionName"
+    ],
+    "ssm:CreateResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:DeleteResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:ListResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:UpdateResourceDataSync": [
+      "ssm:SyncType"
     ]
   },
   "members": {
@@ -131,6 +143,26 @@
         "ChangeBatch.Changes.Change.ResourceRecordSet.Type"
       ]
     },
+    "ssm:CreateResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:DeleteResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:ListResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:UpdateResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
     "sts:AssumeRole": {
       "sts:ExternalId": [
         "ExternalId"
@@ -174,6 +206,18 @@
       "ChangeBatch.Changes.Change.ResourceRecordSet.Name": "DNSName",
       "ChangeBatch.Changes.Change.ResourceRecordSet.Type": "RRType"
     },
+    "ssm:CreateResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:DeleteResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:ListResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:UpdateResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
     "sts:AssumeRole": {
       "ExternalId": "externalIdType",
       "RoleSessionName": "roleSessionNameType"
@@ -187,6 +231,7 @@
     "lambda": "rest-json",
     "redshift": "query",
     "route53": "rest-xml",
+    "ssm": "json",
     "sts": "query"
   }
 }
