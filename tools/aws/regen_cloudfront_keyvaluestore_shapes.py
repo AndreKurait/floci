@@ -24,12 +24,23 @@ import request_shapes
 OUTPUT = request_shapes.REPO_ROOT / "src/main/resources/aws/cloudfront-keyvaluestore-request-shapes.json"
 MODEL = Path("cloudfront-keyvaluestore/2022-07-26")
 
+OPERATIONS = ("DeleteKey", "DescribeKeyValueStore", "GetKey", "ListKeys", "PutKey", "UpdateKeys")
+
+
+def widen_partition_and_region(model: dict) -> dict:
+    """Preserve the model's constraints while accepting ARNs in every partition Floci serves."""
+    for shape in model["shapes"].values():
+        pattern = shape.get("pattern")
+        if pattern:
+            shape["pattern"] = pattern.replace("arn:aws:", "arn:aws[a-z0-9-]*:")
+    return model
+
 
 def main(argv: list[str] | None = None) -> int:
     return request_shapes.main(argv, script=__file__, model=MODEL, output=OUTPUT,
                                description=__doc__,
-                               constraints=True,
-                               prepare=request_shapes.widen_partition_and_region)
+                               operations=OPERATIONS,
+                               prepare=widen_partition_and_region)
 
 
 if __name__ == "__main__":

@@ -4,17 +4,14 @@
 A REST request is authorized by its route: `IamActionRegistry` maps the HTTP method and path to the
 IAM action, by its rules first and then by these routes, and a route neither maps is left unchecked.
 This vendors, for each operation of the models below, its HTTP method and request URI exactly as the
-SDKs send them, plus the explicit access-denied HTTP status of each model when it declares one.
-A request no rule maps is the operation whose route it matches, checked as the action
+SDKs send them. A request no rule maps is the operation whose route it matches, checked as the action
 `iam-authorized-actions.json` names for it, or as its own; `IamRestRouteCoverageTest` builds a
 request on each route and compares the action the registry gives with that one.
 
 The credential scopes in `HAND_ROUTED` are authorized by the registry's rules alone, each for its
 reason, and their routes are vendored for the coverage test only. Within any other scope, two
 operations on one route would leave a request matching it no single operation, so the generation
-fails on them. Supported shared-controller alternatives are generated beside the modeled URI, with
-member-location overrides for the bare route, and its own method where that is not the operation's. These
-alternatives describe existing Floci compatibility paths, not additional botocore operations.
+fails on them.
 
 The models are botocore's `<model>/<apiVersion>/service-2.json` (Apache-2.0,
 https://github.com/boto/botocore), the latest API version of each, located as
@@ -41,7 +38,10 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/rest-routes.json"
 
 # Credential scopes the registry's rules authorize alone, and why.
 HAND_ROUTED: dict[str, str] = {
-    "s3":"S3 tells apart the operations it serves on one route by their query parameters and headers, which the "
+    "apigateway": "API Gateway's management API is authorized by HTTP method, apigateway:GET, apigateway:POST "
+                  "and so on, on the resource path a route names, not by its operations' names, and the "
+                  "registry's rules give every route its method's action",
+    "s3": "S3 tells apart the operations it serves on one route by their query parameters and headers, which the "
           "registry's S3 rules and sub-resource overrides read, and an S3 Control route Floci does not serve "
           "runs as the S3 data plane, checked as the bucket or object operation that runs",
 }
@@ -52,60 +52,41 @@ MODELS: dict[str, str] = {
     "account": "account",
     "apigateway": "apigateway",
     "apigatewayv2": "apigateway",
+    "appconfig": "appconfig",
+    "appconfigdata": "appconfig",
     "cloudfront": "cloudfront",
     "cloudfront-keyvaluestore": "cloudfront-keyvaluestore",
     "controlcatalog": "controlcatalog",
-    "controltower": "controltower",
     "dsql": "dsql",
     "eks": "eks",
     "emr-serverless": "emr-serverless",
-    "guardduty": "guardduty",
     "es": "es",
     "fis": "fis",
-    "inspector2": "inspector2",
-    "lakeformation": "lakeformation",
     "lambda": "lambda",
     "lambda-core": "lambda",
     "lambda-microvms": "lambda",
-    "macie2": "macie2",
     "oam": "oam",
     "opensearch": "es",
-    # The data plane is signed for the service, which is one scope for both of its planes.
-    "payment-cryptography-data": "payment-cryptography",
     "pipes": "pipes",
-    "quicksight": "quicksight",
     "ram": "ram",
     "resource-explorer-2": "resource-explorer-2",
     "s3": "s3",
     "s3control": "s3",
     "scheduler": "scheduler",
-    "securityhub": "securityhub",
-    "signer": "signer",
-    "xray": "xray",
 }
 
-# Operations a model does not serve itself. The shared tags controller serves /tags/{resourceArn} for every
-# service that is a TagHandler, the ARN taking the rest of the path, and the bare /tags too. API Gateway's v1
-# tag routes are the shared controller's too. A route a service's filter moves under an internal prefix is
-# vendored at the model's own path all the same: IAM matches it on the path without the prefix the filter
-# records (SignedServiceRoute).
+
+# Shared-controller and ARN-spanning operations are activated with their qualified tables.
 SHARED_ROUTES: dict[str, frozenset[str]] = {
-    "apigateway": frozenset({"TagResource", "UntagResource", "GetTags"}),
-    "controltower": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "fis": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "resource-explorer-2": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
-    "signer": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
 }
-
-# Operations whose ARN label a model gives one segment, where the controller serving them lets it span
-# the slashes the ARN holds: a request may send the ARN unencoded and still reach the operation, so its
-# route has to take that request too or it would go unchecked. API Gateway v2's tag routes are
-# `/v2/tags/{resourceArn: .+}` in its controller, and OAM's `/tags/{resourceArn:.+}` in its own and in the
-# shared tags controller, which takes every `/tags/{arn}` request.
 ARN_SPANNING_ROUTES: dict[str, frozenset[str]] = {
-    "apigatewayv2": frozenset({"TagResource", "UntagResource", "GetTags"}),
     "oam": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
 }
+
+
+ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {}
 
 
 def access_denied_status(model: dict) -> int | None:
@@ -125,6 +106,15 @@ def access_denied_status(model: dict) -> int | None:
     return next(iter(statuses), None)
 
 
+def bare_tags_route(method: str) -> dict:
+    """The bare `/tags` route SharedTagsController also serves for a shared tags route of the method, with where it
+    reads the ARN: a tagging request is a POST whose body names it, whether the service tags with POST or with
+    PUT, and a GET or DELETE names it in its query. A route of another method than the operation's says so."""
+    bare = "POST" if method in ("POST", "PUT") else method
+    route = {"requestUri": "/tags", "located": {"resourceArn": "body" if bare == "POST" else "?resourceArn"}}
+    return route if bare == method else {"method": bare, **route}
+
+
 def build(models: dict[str, dict], provenance: str) -> dict:
     """The vendored document from each loaded model."""
     routes = {}
@@ -136,7 +126,7 @@ def build(models: dict[str, dict], provenance: str) -> dict:
         shared = SHARED_ROUTES.get(name, frozenset())
         spanning = ARN_SPANNING_ROUTES.get(name, frozenset())
         operations = {}
-        for operation in sorted(model["operations"]):
+        for operation in sorted(ONLY_OPERATIONS.get(name, model["operations"])):
             http = model["operations"][operation]["http"]
             request_uri = http["requestUri"]
             if operation in shared or operation in spanning:
@@ -172,15 +162,6 @@ def build(models: dict[str, dict], provenance: str) -> dict:
         "handRouted": dict(sorted(HAND_ROUTED.items())),
         "models": routes,
     }
-
-
-def bare_tags_route(method: str) -> dict:
-    """The bare `/tags` route SharedTagsController also serves for a shared tags route of the method, with where it
-    reads the ARN: a tagging request is a POST whose body names it, whether the service tags with POST or with
-    PUT, and a GET or DELETE names it in its query. A route of another method than the operation's says so."""
-    bare = "POST" if method in ("POST", "PUT") else method
-    route = {"requestUri": "/tags", "located": {"resourceArn": "body" if bare == "POST" else "?resourceArn"}}
-    return route if bare == method else {"method": bare, **route}
 
 
 def route_key(method: str, request_uri: str) -> tuple:

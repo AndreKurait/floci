@@ -1,0 +1,11 @@
+defaultDockerImage: example/base:1
+images:
+  - imageId: ami-shared-catalog-worker
+    dockerImage: example/worker:1
+    name: shared-worker
+    description: Explicit catalog source for permission and copy tests
+    architecture: x86_64
+    creationDate: '2026-10-01T00:00:00.000Z'
+    guestRuntime: image
+    registrationNames:
+      - shared-source-release
