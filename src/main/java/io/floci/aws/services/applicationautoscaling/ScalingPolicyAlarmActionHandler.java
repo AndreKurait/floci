@@ -45,7 +45,8 @@ import java.time.Instant;
  * moves" rationale no longer applies, and a persistent breach must not stay stuck below where
  * it belongs for a full cooldown window just because of an unrelated capacity change. Cooldown
  * defaults to 300s when unset, matching
- * AWS's documented default for ECS services. Lambda uses its documented zero default.</p>
+ * AWS's documented default for ECS services (the only scalable dimension this handler drives
+ * today) rather than inventing a different value.</p>
  *
  * <p>{@link AlarmEvaluator} dispatches on every tick a breach persists, not only the first
  * transition into {@code ALARM}, so a cooldown-deferred action gets retried on a later tick
@@ -57,7 +58,9 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
     private static final Logger LOG = Logger.getLogger(ScalingPolicyAlarmActionHandler.class);
 
     /**
-     * Default for ECS and most scalable targets. Lambda overrides it with zero below.
+     * AWS's documented per-service default when a cooldown isn't explicitly configured. ECS is
+     * the only scalable dimension this handler drives today, so its default (also shared by
+     * most other scalable-target types) is the one that applies here.
      */
     private static final int DEFAULT_COOLDOWN_SECONDS = 300;
 
@@ -83,6 +86,17 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
             LOG.debugv("No scaling policy found for alarm action {0}", actionArn);
             return;
         }
+        synchronized (service.targetLock(region, policy.getServiceNamespace(), policy.getResourceId(),
+                policy.getScalableDimension())) {
+            ScalingPolicy currentPolicy = service.findPolicyByArn(actionArn, region).orElse(null);
+            if (currentPolicy == null) {
+                return;
+            }
+            execute(currentPolicy, alarm, metricValue, region);
+        }
+    }
+
+    private void execute(ScalingPolicy policy, MetricAlarm alarm, double metricValue, String region) {
         ScalableTarget target = service.findTarget(region, policy.getServiceNamespace(),
                 policy.getResourceId(), policy.getScalableDimension()).orElse(null);
         if (target == null) {
@@ -242,17 +256,16 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
     }
 
     private static int cooldownSeconds(ScalingPolicy policy, boolean scaleOut) {
-        int defaultCooldown = "lambda".equals(policy.getServiceNamespace()) ? 0 : DEFAULT_COOLDOWN_SECONDS;
         if ("StepScaling".equals(policy.getPolicyType())) {
             StepScalingConfiguration config = policy.getStepScalingConfiguration();
-            return config != null && config.getCooldown() != null ? config.getCooldown() : defaultCooldown;
+            return config != null && config.getCooldown() != null ? config.getCooldown() : DEFAULT_COOLDOWN_SECONDS;
         }
         TargetTrackingConfiguration config = policy.getTargetTrackingConfiguration();
         if (config == null) {
-            return defaultCooldown;
+            return DEFAULT_COOLDOWN_SECONDS;
         }
         Integer cooldown = scaleOut ? config.getScaleOutCooldown() : config.getScaleInCooldown();
-        return cooldown != null ? cooldown : defaultCooldown;
+        return cooldown != null ? cooldown : DEFAULT_COOLDOWN_SECONDS;
     }
 
     private static void stampCooldown(ScalingPolicy policy, boolean scaleOut) {

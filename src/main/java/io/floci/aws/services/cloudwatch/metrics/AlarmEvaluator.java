@@ -1,6 +1,5 @@
 package io.floci.aws.services.cloudwatch.metrics;
 
-import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
@@ -79,10 +78,9 @@ public class AlarmEvaluator {
      */
     void evaluateAll() {
         try {
-            for (CloudWatchMetricsService.OwnedAlarm owned : metricsService.allOwnedAlarms()) {
-                MetricAlarm alarm = owned.alarm();
+            for (MetricAlarm alarm : metricsService.allAlarms()) {
                 try {
-                    RequestScopes.runAs(owned.accountId(), alarm.getRegion(), () -> evaluate(alarm));
+                    evaluate(alarm);
                 } catch (Exception e) {
                     LOG.warnv("Alarm evaluation failed for {0}: {1}", alarm.getAlarmName(), e.getMessage());
                 }
