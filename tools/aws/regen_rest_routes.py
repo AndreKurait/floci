@@ -52,6 +52,8 @@ MODELS: dict[str, str] = {
     "account": "account",
     "apigateway": "apigateway",
     "apigatewayv2": "apigateway",
+    "appconfig": "appconfig",
+    "appconfigdata": "appconfig",
     "cloudfront": "cloudfront",
     "cloudfront-keyvaluestore": "cloudfront-keyvaluestore",
     "controlcatalog": "controlcatalog",
