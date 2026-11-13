@@ -26,21 +26,32 @@ public class AthenaJsonHandler {
 
     private final AthenaService athenaService;
     private final ObjectMapper mapper;
+    private final AthenaPreparedStatementHandler preparedStatements;
     private final AthenaBatchQueryService batchQueryService;
 
     @Inject
-    public AthenaJsonHandler(AthenaService athenaService, ObjectMapper mapper, AthenaBatchQueryService batchQueryService) {
+    public AthenaJsonHandler(AthenaService athenaService, ObjectMapper mapper,
+                             AthenaPreparedStatementService preparedStatementService,
+                             AthenaBatchQueryService batchQueryService) {
         this.athenaService = athenaService;
         this.mapper = mapper;
+        this.preparedStatements = new AthenaPreparedStatementHandler(preparedStatementService);
         this.batchQueryService = batchQueryService;
     }
 
     public AthenaJsonHandler(AthenaService athenaService, ObjectMapper mapper) {
-        this(athenaService, mapper, new AthenaBatchQueryService(athenaService, null, mapper));
+        this(athenaService, mapper, new AthenaPreparedStatementService(athenaService),
+                new AthenaBatchQueryService(athenaService, null, mapper));
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
         return switch (action) {
+            case "CreatePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "GetPreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "UpdatePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "DeletePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "BatchGetPreparedStatement" -> preparedStatements.handle(action, request, region);
+
             case "StartQueryExecution" -> {
                 String query = request.get("QueryString").asText();
                 String named = text(request, "WorkGroup");
@@ -187,7 +198,11 @@ public class AthenaJsonHandler {
                 if ("primary".equals(wg)) {
                     throw new AwsException("InvalidRequestException", "The primary workgroup cannot be deleted.", 400);
                 }
-                athenaService.deleteWorkGroup(wg, region);
+                JsonNode recursive = request.get("RecursiveDeleteOption");
+                if (recursive != null && !recursive.isNull() && !recursive.isBoolean()) {
+                    throw new AwsException("InvalidRequestException", "RecursiveDeleteOption must be a boolean.", 400);
+                }
+                athenaService.deleteWorkGroup(wg, region, recursive != null && recursive.asBoolean(false));
                 yield Response.ok(Map.of()).build();
             }
             default -> throw new AwsException("InvalidAction", "Action " + action + " is not supported", 400);
