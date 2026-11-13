@@ -611,6 +611,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 region, accountId, akid)) {
             return;
         }
+        JsonNode testStateBody = "states:TestState".equals(action) ? arnBuilder.readJsonBody(ctx) : null;
+        if (testStateBody != null && testStateBody.path("revealSecrets").isBoolean()
+                && testStateBody.path("revealSecrets").booleanValue()
+                && abortIfDenied(ctx, caller, principal, "states:RevealSecrets", action, credentialScope,
+                        List.of("*"), targetContexts, region, accountId, akid)) {
+            return;
+        }
         if (abortIfConnectorPassDenied(ctx, caller, callerArns.orElse(null), resolvedAuthorization.operation(),
                 region, accountId, akid)) {
             return;

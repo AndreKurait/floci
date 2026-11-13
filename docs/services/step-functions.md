@@ -22,6 +22,7 @@
 | `UpdateStateMachineAlias` | - |
 | `DeleteStateMachineAlias` | - |
 | `ValidateStateMachineDefinition` | Validate an ASL definition without creating a state machine |
+| `TestState` | - |
 | `StartExecution` | Start a new execution |
 | `StartSyncExecution` | - |
 | `DescribeExecution` | Get execution status and output |
@@ -59,6 +60,44 @@ concurrency pool for that qualifier can serve the task; resolving an alias to
 its version does not discard its pool identity. Unqualified invocation retains
 the normal on-demand path, and existing authorization checks still precede
 execution.
+
+## Testing a single pure state
+
+`TestState` evaluates one JSONPath `Pass`, `Choice`, `Succeed`, or `Fail` state.
+Send the state as `definition`, or send a complete state machine with `stateName`
+selecting a top-level state. The complete definition is still validated. The call
+returns `SUCCEEDED` with JSON text in `output` and, when applicable, `nextState`.
+A `Fail` state or runtime evaluation failure returns HTTP 200 with `FAILED`,
+`error`, and `cause`. It does not start an execution, follow a transition, write
+execution history, or call a service integration.
+
+`inspectionLevel` accepts `INFO` and `DEBUG`; `DEBUG` includes the input and
+applicable data-processing stages reached before success or failure. Inspection
+captures the actual evaluation, so a `States.UUID()` value in inspection matches
+the output from that request. Omitted input defaults to `{}`. Output is limited
+to 262144 UTF-8 bytes, including its JSON syntax.
+
+The non-mocked request requires an existing role with its exact ARN, including
+its path, in the caller's account and partition. Its trust policy must allow the
+Step Functions service. These role checks apply even when IAM enforcement is
+disabled. With IAM enforcement enabled, the caller also needs `states:TestState`
+on `*` and `iam:PassRole` on that role, with `iam:PassedToService` set to Step
+Functions when the policy uses that condition. `revealSecrets=true` additionally
+requires `states:RevealSecrets` on `*`. TestState does not create a role session
+or invent a state-machine SourceArn or SourceAccount for trust conditions.
+
+Task, Wait, Map and Parallel states, JSONata, workflow variables, Assign, context
+references, mock, context, variables and stateConfiguration are not supported
+by TestState yet and are explicitly refused. TRACE is rejected for these pure
+states. JSONPath and intrinsic evaluation use the existing execution helpers:
+this is not a complete ASL path grammar validator. Recursive-descent paths are
+rejected; general paths and reference paths are not fully distinguished by the
+pragmatic validator. Existing runtime error names are retained, including
+`States.Runtime` for an unresolved Parameters path.
+
+SDKs can inject a `sync-` prefix into the TestState endpoint. For a local Java
+SDK client, set `SdkAdvancedClientOption.DISABLE_HOST_PREFIX_INJECTION` to `true`
+in its override configuration so the call reaches the configured local endpoint.
 
 ## Task-token IAM resources
 
