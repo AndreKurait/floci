@@ -126,6 +126,21 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public void applyAtomically(Map<String, V> entries, Set<String> keys) {
+        applyAtomicallyForAccount(prefix(), entries, keys);
+    }
+
+    public void applyAtomicallyForAccount(String accountId, Map<String, V> entries, Set<String> keys) {
+        Map<String, V> replacements = Map.copyOf(entries);
+        Set<String> deletions = Set.copyOf(keys);
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        replacements.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
+        Set<String> prefixedKeys = deletions.stream().map(key -> accountId + "/" + key).collect(Collectors.toSet());
+        delegate.applyAtomically(prefixedEntries, prefixedKeys);
+        trackOwner(accountId);
+    }
+
+    @Override
     public Optional<V> get(String key) {
         String prefixedKey = prefixed(key);
         Optional<V> result = delegate.get(prefixedKey);
@@ -410,6 +425,24 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     public Optional<V> getLegacyForAccount(String accountId, String key) {
         return defaultAccountId.equals(accountId) && !hasAccountPrefix(key)
                 ? delegate.get(key) : Optional.empty();
+    }
+
+    /**
+     * Reads an explicitly scoped entry, or an owner-approved legacy entry, without migration.
+     *
+     * <p>A present scoped row takes precedence even if its value fails the caller's later
+     * ownership check. The monitor spans both reads so a concurrent legacy migration cannot
+     * move the row between them. No owner registration or storage write occurs.
+     */
+    public synchronized Optional<V> getForAccountIncludingLegacyReadOnly(
+            String accountId, String key, Predicate<V> legacyOwner) {
+        Optional<V> scoped = getForAccount(accountId, key);
+        return scoped.isPresent() ? scoped : getLegacyMatching(key, legacyOwner);
+    }
+
+    /** Reads an unprefixed entry without migration when its stored metadata proves ownership. */
+    public synchronized Optional<V> getLegacyMatching(String key, Predicate<V> legacyOwner) {
+        return hasAccountPrefix(key) ? Optional.empty() : delegate.get(key).filter(legacyOwner);
     }
 
     /**
