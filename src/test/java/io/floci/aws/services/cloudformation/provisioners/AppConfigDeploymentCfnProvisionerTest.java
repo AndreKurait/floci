@@ -2,6 +2,7 @@ package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.ServiceConfigAccess;
 import io.floci.aws.services.appconfig.AppConfigService;
 import io.floci.aws.services.appconfig.DeploymentStopException;
 import io.floci.aws.services.appconfig.model.Deployment;
@@ -41,12 +42,13 @@ import static org.mockito.Mockito.when;
 class AppConfigDeploymentCfnProvisionerTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private final AppConfigService service = mock(AppConfigService.class);
+    private final ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
     private static final Instant START = Instant.parse("2026-01-01T00:00:00Z");
     private final ManualClock time = new ManualClock(START);
     private final List<Duration> waits = new ArrayList<>();
     private final List<StackEvent> events = new ArrayList<>();
     private final AppConfigDeploymentCfnProvisioner provisioner = new AppConfigDeploymentCfnProvisioner(
-            service, () -> Duration.between(START, time.instant()).toNanos(), delay -> {
+            service, serviceConfig, () -> Duration.between(START, time.instant()).toNanos(), delay -> {
                 waits.add(delay);
                 time.advance(delay);
             });
@@ -209,7 +211,7 @@ class AppConfigDeploymentCfnProvisionerTest {
         startReturns("DEPLOYING");
         when(service.getDeployment("app0001", "env0001", 7)).thenReturn(deployment("DEPLOYING"));
         AppConfigDeploymentCfnProvisioner interrupted = new AppConfigDeploymentCfnProvisioner(
-                service, () -> Duration.between(START, time.instant()).toNanos(), delay -> {
+                service, serviceConfig, () -> Duration.between(START, time.instant()).toNanos(), delay -> {
                     throw new InterruptedException("stop test");
                 });
         try {

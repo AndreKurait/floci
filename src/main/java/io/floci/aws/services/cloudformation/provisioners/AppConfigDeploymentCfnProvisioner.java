@@ -2,6 +2,7 @@ package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.ServiceConfigAccess;
 import io.floci.aws.services.appconfig.AppConfigService;
 import io.floci.aws.services.appconfig.DeploymentStopException;
 import io.floci.aws.services.appconfig.model.Deployment;
@@ -26,16 +27,19 @@ public class AppConfigDeploymentCfnProvisioner implements CfnResourceProvisioner
     private static final Duration TIMEOUT = Duration.ofHours(24);
 
     private final AppConfigService service;
+    private final ServiceConfigAccess serviceConfig;
     private final LongSupplier nanoTime;
     private final Sleeper sleeper;
 
     @Inject
-    public AppConfigDeploymentCfnProvisioner(AppConfigService service) {
-        this(service, System::nanoTime, Thread::sleep);
+    public AppConfigDeploymentCfnProvisioner(AppConfigService service, ServiceConfigAccess serviceConfig) {
+        this(service, serviceConfig, System::nanoTime, Thread::sleep);
     }
 
-    AppConfigDeploymentCfnProvisioner(AppConfigService service, LongSupplier nanoTime, Sleeper sleeper) {
+    AppConfigDeploymentCfnProvisioner(AppConfigService service, ServiceConfigAccess serviceConfig,
+                                    LongSupplier nanoTime, Sleeper sleeper) {
         this.service = service;
+        this.serviceConfig = serviceConfig;
         this.nanoTime = nanoTime;
         this.sleeper = sleeper;
     }
@@ -48,6 +52,16 @@ public class AppConfigDeploymentCfnProvisioner implements CfnResourceProvisioner
     @Override
     public Set<String> resourceTypes() {
         return Set.of(TYPE);
+    }
+
+    @Override
+    public boolean serviceDisabled() {
+        return !serviceConfig.isEnabled("appconfig");
+    }
+
+    @Override
+    public String serviceEnabledFlag() {
+        return "floci.services.appconfig.enabled";
     }
 
     @Override
