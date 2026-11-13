@@ -28,18 +28,31 @@ public class AthenaJsonHandler {
     private final AthenaService athenaService;
     private final AthenaNamedQueryService namedQueryService;
     private final ObjectMapper mapper;
+    private final AthenaPreparedStatementHandler preparedStatements;
 
     @Inject
     public AthenaJsonHandler(AthenaService athenaService, AthenaNamedQueryService namedQueryService,
-                              ObjectMapper mapper) {
+                             ObjectMapper mapper, AthenaPreparedStatementService preparedStatementService) {
         this.athenaService = athenaService;
         this.namedQueryService = namedQueryService;
         this.mapper = mapper;
+        this.preparedStatements = new AthenaPreparedStatementHandler(preparedStatementService);
+    }
+
+    public AthenaJsonHandler(AthenaService athenaService, AthenaNamedQueryService namedQueryService,
+                              ObjectMapper mapper) {
+        this(athenaService, namedQueryService, mapper, new AthenaPreparedStatementService(athenaService));
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
         AthenaRequestShapes.check(action, request);
         return switch (action) {
+            case "CreatePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "GetPreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "UpdatePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "DeletePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "BatchGetPreparedStatement" -> preparedStatements.handle(action, request, region);
+
             case "CreateNamedQuery" -> {
                 String id = namedQueryService.createNamedQuery(region, text(request, "Name"),
                         text(request, "Database"), text(request, "QueryString"),

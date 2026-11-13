@@ -6,6 +6,7 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @RegisterForReflection
 public class WorkGroup {
@@ -28,7 +29,27 @@ public class WorkGroup {
     @JsonProperty("Configuration")
     private WorkGroupConfiguration configuration;
 
+    @JsonProperty("PreparedStatements")
+    private Map<String, PreparedStatement> preparedStatements = Map.of();
+
     public WorkGroup() {}
+
+    public Map<String, PreparedStatement> getPreparedStatements() { return preparedStatements; }
+    public void setPreparedStatements(Map<String, PreparedStatement> statements) {
+        this.preparedStatements = statements == null ? Map.of() : Map.copyOf(statements);
+    }
+
+    public WorkGroup withPreparedStatements(Map<String, PreparedStatement> statements) {
+        WorkGroup copy = new WorkGroup();
+        copy.setName(name);
+        copy.setDescription(description);
+        copy.setState(state);
+        copy.setCreationTime(creationTime);
+        copy.setTags(tags);
+        copy.setConfiguration(configuration);
+        copy.setPreparedStatements(statements);
+        return copy;
+    }
 
     public String getName() { return name; }
     public void setName(String name) { this.name = name; }
