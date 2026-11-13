@@ -1,23 +1,23 @@
-package io.floci.aws.services.ecs;
+package io.github.hectorvent.floci.services.ecs;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.floci.aws.config.EmulatorConfig;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.services.ecs.container.EcsContainerManager;
-import io.floci.aws.services.ecs.container.EcsTaskHandle;
-import io.floci.aws.services.ecs.model.AwsVpcConfiguration;
-import io.floci.aws.services.ecs.model.Container;
-import io.floci.aws.services.ecs.model.ContainerDefinition;
-import io.floci.aws.services.ecs.model.EcsCluster;
-import io.floci.aws.services.ecs.model.EcsTask;
-import io.floci.aws.services.ecs.model.LaunchType;
-import io.floci.aws.services.ecs.model.ManagedAgent;
-import io.floci.aws.services.ecs.model.NetworkConfiguration;
-import io.floci.aws.services.ecs.model.NetworkMode;
-import io.floci.aws.services.ecs.model.RunTaskRequest;
-import io.floci.aws.testing.InMemoryStorageFactory;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
+import io.github.hectorvent.floci.services.ecs.container.EcsTaskHandle;
+import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.Container;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.services.ecs.model.ManagedAgent;
+import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
+import io.github.hectorvent.floci.services.ecs.model.RunTaskRequest;
+import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,7 +31,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -197,6 +197,7 @@ class EcsRunTaskAsyncLaunchServiceTest {
         RunTaskRequest request = new RunTaskRequest();
         request.setTaskDefinition("exec");
         request.setEnableExecuteCommand(true);
+        request.setLaunchType(LaunchType.FARGATE);
 
         EcsTask response = assertTimeoutPreemptively(Duration.ofSeconds(2),
                 () -> service.runTask(request, REGION).getFirst());
@@ -313,6 +314,38 @@ class EcsRunTaskAsyncLaunchServiceTest {
         assertEquals(List.of("STOPPED"), containerStatuses(stopped));
         assertEquals(0, runningTasksCount(service));
         verify(containerManager, never()).startTask(any(), any(), any(), anyString());
+    }
+
+    @Test
+    void preparationInterruptsAPullBeforeOtherOwnersDrainAndResetLaunchesAgain() throws Exception {
+        doAnswer(invocation -> {
+            startEntered.countDown();
+            try {
+                // A pull that only the teardown's interrupt ends.
+                new CountDownLatch(1).await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("image pull interrupted", e);
+            }
+            throw new IllegalStateException("the pull ended without an interrupt");
+        }).when(containerManager).startTask(any(), any(), any(), anyString());
+        EcsService service = newService(false);
+        registerTaskDefinition(service, "teardown");
+        EcsTask response = run(service, "teardown");
+        assertTrue(startEntered.await(5, TimeUnit.SECONDS));
+
+        assertTimeoutPreemptively(LAUNCH_BUDGET, service::beginTeardown);
+
+        verify(containerManager, never()).stopTask(any());
+        EcsTask stopped = describe(service, response);
+        assertEquals("STOPPED", stopped.getLastStatus());
+        assertEquals("TaskFailedToStart", stopped.getStopCode());
+
+        doAnswer(invocation -> started(invocation.getArgument(0)))
+                .when(containerManager).startTask(any(), any(), any(), anyString());
+        service.afterReset();
+        EcsTask again = run(service, "teardown");
+        awaitLastStatus(() -> describe(service, again), EcsTask::getLastStatus, LAUNCH_BUDGET, "RUNNING");
     }
 
     @Test

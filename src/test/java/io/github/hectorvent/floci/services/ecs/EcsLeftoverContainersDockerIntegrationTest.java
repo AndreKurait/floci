@@ -1,17 +1,17 @@
-package io.floci.aws.services.ecs;
+package io.github.hectorvent.floci.services.ecs;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
-import io.floci.aws.config.EmulatorConfig;
-import io.floci.aws.core.common.docker.ContainerStorageHelper;
-import io.floci.aws.services.ecs.container.EcsContainerManager;
-import io.floci.aws.services.ecs.model.ContainerDefinition;
-import io.floci.aws.services.ecs.model.EcsTask;
-import io.floci.aws.services.ecs.model.LaunchType;
-import io.floci.aws.services.ecs.model.NetworkMode;
-import io.floci.aws.services.ecs.model.TaskDefinition;
-import io.floci.aws.testing.TestImages;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
+import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
+import io.github.hectorvent.floci.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
@@ -25,7 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -74,6 +74,7 @@ class EcsLeftoverContainersDockerIntegrationTest {
         TaskDefinition taskDef = ecsService.registerTaskDefinition(unique("leftover-td"), List.of(app),
                 NetworkMode.bridge, null, null, null, null, null, REGION);
 
+        ecsService.registerContainerInstance(clusterName, null, null, REGION);
         EcsTask task = ecsService.runTask(clusterName, taskDef.getTaskDefinitionArn(), 1, LaunchType.EC2, null, null,
                 null, null, REGION).getFirst();
         String foreignId = null;

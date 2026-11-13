@@ -1,6 +1,6 @@
-package io.floci.aws.services.ecs;
+package io.github.hectorvent.floci.services.ecs;
 
-import io.floci.aws.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.response.Response;
@@ -14,7 +14,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.List;
 
-import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;

@@ -1,22 +1,22 @@
-package io.floci.aws.services.ecs;
+package io.github.hectorvent.floci.services.ecs;
 
 import com.fasterxml.jackson.core.type.TypeReference;
-import io.floci.aws.config.EmulatorConfig;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.StorageBackend;
-import io.floci.aws.core.storage.StorageFactory;
-import io.floci.aws.services.ecs.container.EcsContainerManager;
-import io.floci.aws.services.ecs.container.EcsTaskHandle;
-import io.floci.aws.services.ecs.exec.EcsExecSessionRegistry;
-import io.floci.aws.services.ecs.model.Container;
-import io.floci.aws.services.ecs.model.ContainerDefinition;
-import io.floci.aws.services.ecs.model.EcsLoadBalancer;
-import io.floci.aws.services.ecs.model.EcsTask;
-import io.floci.aws.services.ecs.model.EcsTaskAddress;
-import io.floci.aws.services.ecs.model.LaunchType;
-import io.floci.aws.services.ecs.model.NetworkBinding;
-import io.floci.aws.services.ecs.model.NetworkMode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
+import io.github.hectorvent.floci.services.ecs.container.EcsTaskHandle;
+import io.github.hectorvent.floci.services.ecs.exec.EcsExecSessionRegistry;
+import io.github.hectorvent.floci.services.ecs.model.Container;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.EcsTaskAddress;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.services.ecs.model.NetworkBinding;
+import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -28,7 +28,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -68,6 +68,7 @@ class EcsServiceRestartLeftoversTest {
         });
         EcsService restarted = service(storage, false, manager, mock(EcsLoadBalancerRegistrar.class), null);
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         String taskArn = restarted.runTask("app-cluster", "web", 1,
                 LaunchType.EC2, null, null, null, null, REGION).getFirst().getTaskArn();
         EcsTask task = awaitLastStatus(
@@ -106,6 +107,7 @@ class EcsServiceRestartLeftoversTest {
         definition.setImage("busybox:stable");
         restarted.registerTaskDefinition("web", List.of(definition), NetworkMode.bridge, null, null,
                 null, null, List.of(), REGION);
+        restarted.registerContainerInstance(null, null, null, REGION);
         String taskArn = restarted.runTask(null, "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst().getTaskArn();
         awaitLastStatus(() -> restarted.describeTasks(null, List.of(taskArn), REGION).getFirst(),
@@ -175,6 +177,7 @@ class EcsServiceRestartLeftoversTest {
                 null, null, List.of(), REGION);
 
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         String blockedArn = restarted.runTask("app-cluster", "web", 1,
                 LaunchType.EC2, null, null, null, null, REGION).getFirst().getTaskArn();
         EcsTask blocked = awaitLastStatus(
@@ -185,6 +188,7 @@ class EcsServiceRestartLeftoversTest {
         assertThat(blocked.getStoppedReason(), containsString("previous run"));
         verify(containerManager, never()).startTask(any(), any(), any(), anyString());
 
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         String taskArn = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst().getTaskArn();
         awaitLastStatus(() -> restarted.describeTasks("app-cluster", List.of(taskArn), REGION).getFirst(),
@@ -230,6 +234,7 @@ class EcsServiceRestartLeftoversTest {
                 null, null, List.of(), REGION);
 
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         String taskArn = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst().getTaskArn();
         awaitLastStatus(() -> restarted.describeTasks("app-cluster", List.of(taskArn), REGION).getFirst(),
@@ -258,14 +263,18 @@ class EcsServiceRestartLeftoversTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"127.0.0.1, 32781", "172.19.0.4, 80"})
-    void aStartingTaskEvictsTheUnrecordedRegistrationsAtItsAddress(String host, int targetPort) {
+    @CsvSource({"127.0.0.1, 32781, false", "172.19.0.4, 80, false",
+            "127.0.0.1, 32781, true", "172.19.0.4, 80, true"})
+    void aStartingTaskEvictsTheUnrecordedRegistrationsAtItsAddress(String host, int targetPort, boolean attached) {
         EcsContainerManager containerManager = mock(EcsContainerManager.class);
         when(containerManager.removeLeftoverContainers()).thenReturn(true);
         when(containerManager.startTask(any(), any(), any(), anyString())).thenAnswer(invocation -> {
             EcsTask task = invocation.getArgument(0);
             Container container = new Container();
             container.setName("web");
+            if (attached) {
+                container.setAttachedVpcAddress("10.0.1.5");
+            }
             container.setNetworkBindings(List.of(new NetworkBinding("0.0.0.0", 80, 32781, "tcp")));
             task.setContainers(List.of(container));
             task.setPrivateIpAddress("10.0.1.5");
@@ -293,6 +302,7 @@ class EcsServiceRestartLeftoversTest {
         ecs.createService("app-cluster", "alpha", "web", 0, LaunchType.EC2, List.of(lb), null, REGION);
 
         // A task of no service at all: any container can take the address a stale entry points at.
+        ecs.registerContainerInstance("app-cluster", null, null, REGION);
         String taskArn = ecs.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst().getTaskArn();
         EcsTask task = awaitLastStatus(
@@ -300,10 +310,10 @@ class EcsServiceRestartLeftoversTest {
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING", "STOPPED");
 
         assertEquals("RUNNING", task.getLastStatus());
-        // A target only on the ports the container serves, and never at the VPC-scoped ENI address.
-        // The launch evicts them just after it marks the task RUNNING.
-        verify(lbRegistrar, timeout(5000)).evictUnrecordedTargets(task, Set.of(TARGET_GROUP_ARN),
-                Set.of(new EcsTaskAddress(host, targetPort)), REGION);
+        Set<EcsTaskAddress> expectedTargets = attached
+                ? Set.of(new EcsTaskAddress(host, targetPort), new EcsTaskAddress("10.0.1.5", 80, "vpc-app"))
+                : Set.of(new EcsTaskAddress(host, targetPort));
+        verify(lbRegistrar, timeout(5000)).evictUnrecordedTargets(task, Set.of(TARGET_GROUP_ARN), expectedTargets, REGION);
         verify(discoveryRegistrar, timeout(5000)).evictUnrecordedInstances(task, Set.of("srv-alpha"),
                 Set.of(new EcsTaskAddress("10.0.1.5", null, "vpc-app"), new EcsTaskAddress("172.19.0.4", null)),
                 REGION);

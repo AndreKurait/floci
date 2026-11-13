@@ -1,4 +1,4 @@
-package io.floci.aws.services.ecs;
+package io.github.hectorvent.floci.services.ecs;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
@@ -10,12 +10,13 @@ import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.PortBinding;
 import com.github.dockerjava.api.model.Ports;
 import com.github.dockerjava.api.model.PushResponseItem;
-import io.floci.aws.services.ecs.model.ContainerDefinition;
-import io.floci.aws.services.ecs.model.EcsTask;
-import io.floci.aws.services.ecs.model.NetworkMode;
-import io.floci.aws.services.ecs.model.TaskDefinition;
-import io.floci.aws.testing.TestImages;
-import io.floci.aws.testutil.FreePorts;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
+import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
+import io.github.hectorvent.floci.testing.TestImages;
+import io.github.hectorvent.floci.testutil.FreePorts;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
@@ -38,7 +39,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -90,10 +91,11 @@ class EcsImagePullDockerIntegrationTest {
     }
 
     @AfterEach
-    void cleanUp() {
+    void cleanUp() throws Exception {
         for (String taskArn : taskArns) {
             ecsService.stopTask(clusterName, taskArn, "test teardown", REGION);
         }
+        ecsService.awaitPendingStops();
         for (String image : images) {
             try {
                 dockerClient.removeImageCmd(image).withForce(true).exec();
@@ -145,7 +147,7 @@ class EcsImagePullDockerIntegrationTest {
 
     private EcsTask runTask(TaskDefinition taskDef) {
         EcsTask task = ecsService.runTask(clusterName, taskDef.getTaskDefinitionArn(), 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArns.add(task.getTaskArn());
         // RunTask answers before the launch; wait for it to land the task RUNNING or STOPPED.
         EcsTask described = awaitLastStatus(

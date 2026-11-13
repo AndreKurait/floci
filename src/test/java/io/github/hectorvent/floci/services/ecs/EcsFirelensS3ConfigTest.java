@@ -1,24 +1,24 @@
-package io.floci.aws.services.ecs;
+package io.github.hectorvent.floci.services.ecs;
 
-import io.floci.aws.config.EmulatorConfig;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.services.ecs.container.EcsContainerManager;
-import io.floci.aws.services.ecs.model.ContainerDefinition;
-import io.floci.aws.services.ecs.model.EcsTask;
-import io.floci.aws.services.ecs.model.FirelensConfiguration;
-import io.floci.aws.services.ecs.model.KeyValuePair;
-import io.floci.aws.services.ecs.model.LaunchType;
-import io.floci.aws.services.ecs.model.NetworkMode;
-import io.floci.aws.services.ecs.model.TaskDefinition;
-import io.floci.aws.services.ecs.model.TaskStatus;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
+import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
+import io.github.hectorvent.floci.services.ecs.model.TaskStatus;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
-import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -118,6 +118,7 @@ class EcsFirelensS3ConfigTest {
         service.registerTaskDefinition("ec2-s3", List.of(firelensRouter("fluentbit", S3_CONFIG_ARN)),
                 NetworkMode.bridge, null, null, null, null, List.of("EC2"), "us-east-1");
 
+        service.registerContainerInstance("test-cluster", null, null, "us-east-1");
         List<EcsTask> tasks = service.runTask("test-cluster", "ec2-s3", 1,
                 LaunchType.EC2, null, null, List.of(), null, "us-east-1");
 

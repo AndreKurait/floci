@@ -1,4 +1,4 @@
-package io.floci.aws.services.ecs;
+package io.github.hectorvent.floci.services.ecs;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
@@ -6,10 +6,11 @@ import com.github.dockerjava.api.command.TopContainerResponse;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Device;
 import com.github.dockerjava.api.model.HostConfig;
-import io.floci.aws.services.ecs.model.EcsTask;
-import io.floci.aws.testing.DockerAvailability;
-import io.floci.aws.testing.RestAssuredJsonUtils;
-import io.floci.aws.testing.TestImages;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.LaunchType;
+import io.github.hectorvent.floci.testing.DockerAvailability;
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
@@ -26,7 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -119,7 +120,7 @@ class EcsLinuxParametersDockerIntegrationTest {
         clusterName = family;
         ecsService.createCluster(clusterName, REGION);
         EcsTask task = ecsService.runTask(clusterName, taskDefinitionArn, 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArn = task.getTaskArn();
         EcsTask described = awaitLastStatus(
                 () -> ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst(),
@@ -168,7 +169,7 @@ class EcsLinuxParametersDockerIntegrationTest {
         clusterName = family;
         ecsService.createCluster(clusterName, REGION);
         EcsTask task = ecsService.runTask(clusterName, taskDefinitionArn, 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArn = task.getTaskArn();
         EcsTask described = awaitLastStatus(
                 () -> ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst(),

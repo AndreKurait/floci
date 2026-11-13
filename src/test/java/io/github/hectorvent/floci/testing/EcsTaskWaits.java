@@ -1,4 +1,4 @@
-package io.floci.aws.testing;
+package io.github.hectorvent.floci.testing;
 
 import java.time.Duration;
 import java.util.List;
