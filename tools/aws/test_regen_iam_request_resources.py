@@ -107,6 +107,22 @@ def test_a_create_of_a_child_of_a_type_its_action_acts_on_names_it_from_the_pare
     assert r.creates_for("svc:CreateListener", ["loadbalancer/app/"], LISTENERS, members("RoleArn")) == []
 
 
+def test_a_rest_xml_request_is_read_for_its_path_and_query_members_alone():
+    # RequestResources reads a path label or a query parameter whatever the protocol, but not a REST-XML body.
+    shapes = {"String": {"type": "string"},
+              "In": {"type": "structure", "members": {
+                  "Id": {"shape": "String", "location": "uri", "locationName": "Id"},
+                  "Marker": {"shape": "String", "location": "querystring", "locationName": "Marker"},
+                  "Comment": {"shape": "String"}}}}
+    for protocol, read in (("rest-xml", {"Id": "Id", "Marker": "Marker"}),
+                           ("rest-json", {"Id": "Id", "Marker": "Marker", "Comment": "Comment"})):
+        models = {"svc": {"metadata": {"protocol": protocol}, "operations": {"GetThing": {"input": {"shape": "In"}}},
+                          "shapes": shapes}}
+        assert r.request_members(models, "GetThing") == read, protocol
+        assert set(r.string_patterns(models, "GetThing")) == set(read), protocol
+        assert r.located_members(models, "GetThing") == {"Id": "{Id}", "Marker": "?Marker"}, protocol
+
+
 def test_an_arn_inside_a_structure_or_a_lists_structures_is_read_by_its_path():
     shapes = {"String": {"type": "string"}, "Strings": {"type": "list", "member": {"shape": "String"}},
               "Priority": {"type": "structure", "members": {"RuleArn": {"shape": "String"}, "Priority": {"shape": "String"},
@@ -172,6 +188,31 @@ def test_stems_drop_the_suffixes_names_carry():
     # A plural's s goes, from a type's name and a member's alike, so they still meet.
     assert r.related(r.stem("EventBusName"), r.stem("event-bus"))
     assert r.related("autoscalinggroup", "group") and not r.related("ab", "b")
+    # A read of a resource's config is a read of the resource, and a type may carry the config in its name.
+    assert r.stem("DistributionConfig") == "distribution"
+    assert r.related(r.stem("FieldLevelEncryption"), r.stem("field-level-encryption-config"))
+
+
+def test_a_bare_id_names_the_resource_whose_config_an_operation_reads():
+    formats = {"distribution": "arn:${Partition}:cloudfront::${Account}:distribution/${DistributionId}"}
+    assert r.resources_for("cloudfront:GetDistributionConfig", ["distribution"], formats, {"Id": "Id"}) == [
+        {"type": "distribution", "fill": {"DistributionId": "Id"}}]
+
+
+def test_a_resource_member_taking_only_an_arn_holds_the_resource_the_action_acts_on():
+    model = {
+        "metadata": {"protocol": "rest-xml", "endpointPrefix": "svc"},
+        "operations": {"TagResource": {"input": {"shape": "Input"}}},
+        "shapes": {"Input": {"type": "structure", "members": {
+                       "Resource": {"shape": "Value", "location": "querystring", "locationName": "Resource"}}},
+                   "Value": {"type": "string", "pattern": "arn:aws(-cn)?:svc::[0-9]+:.*"}},
+    }
+    formats = {"distribution": "arn:${Partition}:svc::${Account}:distribution/${DistributionId}",
+               "function": "arn:${Partition}:svc::${Account}:function/${Name}"}
+    entry = r.entry_for("svc:TagResource", {"action": "svc:TagResource", "types": ["distribution", "function"]},
+                        formats, {"svc": model})
+    assert entry["resources"] == [{"types": ["distribution", "function"], "arn": "Resource"}]
+    assert entry["located"] == {"Resource": "?Resource"}
 
 
 def reference(namespace: str, operations: dict[str, list[str]], resources: dict[str, str]) -> dict:
@@ -893,44 +934,56 @@ def test_verify_reports_a_rest_models_operation_whose_action_aws_no_longer_has(c
     assert r.main(["--verify", "--source-dir", str(sources), "--output", str(output)]) == 1
 
 
-def test_cloudfront_partial_resource_coverage_does_not_promote_other_operations():
+def test_cloudfront_resource_coverage_includes_the_complete_management_family():
     assert r.reads("cloudfront:DescribeKeyValueStore")
     assert r.reads("cloudfront:DeleteKeyValueStore")
-    assert not r.reads("cloudfront:DescribeFunction")
-    assert not r.reads("cloudfront:ListDistributions")
-    assert "cloudfront" in r.NOT_COVERED
+    assert r.reads("cloudfront:DescribeFunction")
+    assert r.reads("cloudfront:ListDistributions")
+    assert "cloudfront" not in r.NOT_COVERED
 
 
-def test_partial_namespace_rejects_an_operation_outside_its_explicit_allowlist():
+@pytest.fixture
+def partial_cloudfront_document(monkeypatch):
     document = json.loads(r.OUTPUT.read_text(encoding="utf-8"))
+    allowed = {"cloudfront:DescribeKeyValueStore", "cloudfront:DeleteKeyValueStore"}
+    document["operations"] = {operation: entry for operation, entry in document["operations"].items()
+                              if not operation.startswith("cloudfront:") or operation in allowed}
+    document["notCovered"]["cloudfront"] = "Synthetic partial-namespace fixture"
+    monkeypatch.setattr(r, "READ_IN_NOT_COVERED", dict.fromkeys(allowed, "fixture"))
+    assert r.validate(document) == []
+    return document
+
+
+def test_partial_namespace_rejects_an_operation_outside_its_explicit_allowlist(partial_cloudfront_document):
+    document = partial_cloudfront_document
     document["operations"]["cloudfront:DescribeFunction"] = {
         "action": "cloudfront:DescribeFunction", "types": [], "resources": []}
     document["operations"] = dict(sorted(document["operations"].items()))
     assert "cloudfront is in both namespaces and notCovered" in r.validate(document)
 
 
-def test_partial_namespace_requires_at_least_one_qualified_operation():
-    document = json.loads(r.OUTPUT.read_text(encoding="utf-8"))
+def test_partial_namespace_requires_at_least_one_qualified_operation(partial_cloudfront_document):
+    document = partial_cloudfront_document
     document["operations"] = {operation: entry for operation, entry in document["operations"].items()
                               if not operation.startswith("cloudfront:")}
     assert "cloudfront is in both namespaces and notCovered" in r.validate(document)
 
 
 @pytest.mark.parametrize("section", ["handBuilt", "otherNamespaces"])
-def test_partial_namespace_does_not_allow_other_classification_overlap(section):
-    document = json.loads(r.OUTPUT.read_text(encoding="utf-8"))
+def test_partial_namespace_does_not_allow_other_classification_overlap(section, partial_cloudfront_document):
+    document = partial_cloudfront_document
     document[section].append("cloudfront")
     assert f"cloudfront is in both {section} and notCovered" in r.validate(document)
 
 
-def test_only_qualified_cloudfront_xml_operations_read_name_path_labels():
+def test_rest_xml_operations_read_path_labels_without_reading_bodies():
     sample = rest_model({"DescribeKeyValueStore": {"Name": "String"}, "DescribeFunction": {"Name": "String"}},
                         {"DescribeKeyValueStore": {"Name": "uri:Name"}, "DescribeFunction": {"Name": "uri:Name"}})
     sample["metadata"].update(protocol="rest-xml", endpointPrefix="cloudfront")
     assert r.request_members({"cloudfront": sample}, "DescribeKeyValueStore") == {"Name": "Name"}
     assert r.located_members({"cloudfront": sample}, "DescribeKeyValueStore") == {"Name": "{Name}"}
-    assert r.request_members({"cloudfront": sample}, "DescribeFunction") == {}
-    assert r.located_members({"cloudfront": sample}, "DescribeFunction") == {}
+    assert r.request_members({"cloudfront": sample}, "DescribeFunction") == {"Name": "Name"}
+    assert r.located_members({"cloudfront": sample}, "DescribeFunction") == {"Name": "{Name}"}
     sample["metadata"]["endpointPrefix"] = "another-service"
-    assert r.request_members({"other": sample}, "DescribeKeyValueStore") == {}
-    assert r.located_members({"other": sample}, "DescribeKeyValueStore") == {}
+    assert r.request_members({"other": sample}, "DescribeKeyValueStore") == {"Name": "Name"}
+    assert r.located_members({"other": sample}, "DescribeKeyValueStore") == {"Name": "{Name}"}

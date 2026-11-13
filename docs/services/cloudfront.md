@@ -698,8 +698,9 @@ missing or malformed version. Rejected requests preserve the store and its curre
 accepting the UUID versions it issues and persists; it also recognizes the observed CloudFront `E` plus
 13 uppercase alphanumeric form. This is a bounded compatibility rule, not a published AWS format guarantee.
 
-The dev backport adds IAM route and resource coverage for these five KVS control operations and the six
-`cloudfront-keyvaluestore` data operations. Other CloudFront control operations keep their previous IAM
-coverage. Native SDK tests use canonical SigV4A credentials with IAM enforcement; enabling the optional
+The dev backport retains IAM route and resource coverage for the KVS control operations and the six
+`cloudfront-keyvaluestore` data operations. CloudFront management operations also use the modeled IAM
+routes and request resources, including cache policies and functions. Native SDK tests use canonical
+SigV4A credentials with IAM enforcement; enabling the optional
 `validate-signatures` setting still rejects SigV4A in the existing global signature filter. This feature
 adds no SigV4A cryptographic verification or CloudFront Function execution engine.

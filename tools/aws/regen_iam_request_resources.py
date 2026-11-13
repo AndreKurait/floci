@@ -161,7 +161,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
 NAMESPACES = ("access-analyzer", "acm", "appconfig", "application-autoscaling", "athena", "bcm-data-exports",
-              "bcm-pricing-calculator", "budgets", "ce", "cloudfront-keyvaluestore", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
+              "bcm-pricing-calculator", "budgets", "ce", "cloudfront", "cloudfront-keyvaluestore", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
               "cognito-idp", "cur", "datasync", "ecr", "elasticloadbalancing", "elasticmapreduce", "es", "events",
               "firehose", "globalaccelerator", "kinesisanalytics", "payment-cryptography", "redshift",
               "redshift-data", "rekognition", "servicediscovery", "servicequotas", "sso", "states", "swf", "textract",
@@ -195,10 +195,7 @@ READ_IN_HAND_BUILT: dict[str, str] = {
 }
 
 # Bounded families of a namespace whose other operations remain explicitly not covered.
-READ_IN_NOT_COVERED = {
-    f"cloudfront:{operation}": "KVS control-plane IAM checks only; other CloudFront operations remain unchanged"
-    for operation in REST_ONLY_OPERATIONS["cloudfront"]
-}
+READ_IN_NOT_COVERED = {}
 
 
 _LATER = "not read yet: a later batch, with the tests that show its ARNs are the ones its handlers mint"
@@ -220,8 +217,6 @@ NOT_COVERED: dict[str, str] = {
     "batch": _REST,
     "bedrock-agentcore": _REST,
     "cloudformation": _LATER,
-    "cloudfront": "Only the five KeyValueStore control operations are read; other CloudFront management "
-                  "operations still await their own route and resource qualification",
     "cloudhsm": "not read yet: its ARN formats end in ${CloudHsmClusterInstanceName} and "
                 "${CloudHsmBackupInstanceName}, names, while its requests give ClusterId and BackupId, ids, which the "
                 "rule does not fill a name from, so nearly every operation needs a correction",
@@ -679,7 +674,7 @@ KNOWN_VARIABLES = {"Partition", "Region", "Account"}
 # An ARN format's account given as `${AccountId}`, the account `${Account}` gives in every other format.
 ACCOUNT_ID_SLOT_RE = re.compile(r"^(arn:[^:]*:[^:]*:[^:]*:)\$\{AccountId}:")
 VARIABLE_RE = re.compile(r"\$\{(\w+)}")
-STEM_SUFFIX_RE = re.compile(r"(arns|arn|names|name|identifiers|identifier|ids|id|s)$")
+STEM_SUFFIX_RE = re.compile(r"(arns|arn|names|name|identifiers|identifier|ids|id|config|s)$")
 # A bare member that names the resource of the type its operation acts on.
 BARE = {"name", "names", "id", "ids", "identifier", "identifiers"}
 # The patterns botocore gives a string shape that holds an account id.
@@ -690,6 +685,9 @@ CREATING_RE = re.compile(r"^(Create|Run|Allocate|Register|Put|Import|Copy|Reques
 SUBJECT_RE = re.compile(r"^[A-Z][a-z]+")
 # The protocols whose requests RequestResources reads: form parameters or a JSON or CBOR body.
 READ_PROTOCOLS = {"json", "query", "ec2", "smithy-rpc-v2-cbor", "rest-json"}
+# Protocols whose requests are read for the members a request carries in its path and query alone: RequestResources
+# reads those the same way whatever the protocol, while a REST-XML body is not one it reads.
+LOCATED_ONLY_PROTOCOLS = {"rest-xml"}
 BODY_LOCATIONS = (None, "")
 # Where a REST request carries a member outside its body, as the file writes it: a label of its path, `{Name}`, or a
 # parameter of its query, `?name`.
@@ -698,7 +696,8 @@ LOCATED_RE = re.compile(r"^(\{[A-Za-z0-9_]+\}|\?[A-Za-z0-9_.-]+)$")
 
 def stem(name: str) -> str:
     """The name lowercased, without what is not a letter or digit, and without a trailing `Arn`,
-    `Name`, `Id`, `Identifier` or plural, twice over (`TargetGroupArns` is `targetgroup`)."""
+    `Name`, `Id`, `Identifier`, `Config` or plural, twice over (`TargetGroupArns` is `targetgroup`,
+    `DistributionConfig` is `distribution`)."""
     value = re.sub(r"[^a-z0-9]", "", name.lower())
     for _ in range(2):
         value = STEM_SUFFIX_RE.sub("", value)
@@ -758,10 +757,12 @@ def _protocols(model: dict) -> set[str]:
     return set(metadata.get("protocols") or [metadata.get("protocol")])
 
 
-def _cloudfront_kvs_xml(model: dict, operation: str) -> bool:
-    """The partial CloudFront KVS family reads REST-XML path labels; other XML models stay unchanged."""
-    return ("rest-xml" in _protocols(model) and model["metadata"].get("endpointPrefix") == "cloudfront"
-            and f"cloudfront:{operation}" in READ_IN_NOT_COVERED)
+def _reading(model: dict) -> str | None:
+    """How a model's requests are read: "all" of their members, only the "located" ones, or None, not at all."""
+    protocols = _protocols(model)
+    if READ_PROTOCOLS & protocols:
+        return "all"
+    return "located" if LOCATED_ONLY_PROTOCOLS & protocols else None
 
 
 def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
@@ -772,12 +773,14 @@ def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
     found: dict[str, str] = {}
     for model in models.values():
         spec = model["operations"].get(operation)
-        if spec is None or "input" not in spec or not (READ_PROTOCOLS & _protocols(model)
-                                                        or _cloudfront_kvs_xml(model, operation)):
+        reading = _reading(model)
+        if spec is None or "input" not in spec or reading is None:
             continue
         root = model["shapes"][spec["input"]["shape"]]
         for name, member in root.get("members", {}).items():
             if member.get("location") not in BODY_LOCATIONS and _located(member) is None:
+                continue
+            if reading == "located" and member.get("location") in BODY_LOCATIONS:
                 continue
             shape = model["shapes"][member["shape"]]
             if _strings(model, shape) is not None:
@@ -790,6 +793,52 @@ def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
     return found
 
 
+def string_patterns(models: dict[str, dict], operation: str) -> dict[str, set[str | None]]:
+    """Patterns of each top-level string member, including list elements, across the request's clients."""
+    found: dict[str, set[str | None]] = {}
+    for model in models.values():
+        spec = model["operations"].get(operation)
+        reading = _reading(model)
+        if spec is None or "input" not in spec or reading is None:
+            continue
+        for name, member in model["shapes"][spec["input"]["shape"]].get("members", {}).items():
+            if member.get("location") not in BODY_LOCATIONS and _located(member) is None:
+                continue
+            if reading == "located" and member.get("location") in BODY_LOCATIONS:
+                continue
+            shape = model["shapes"][member["shape"]]
+            if _strings(model, shape) is None:
+                continue
+            element = model["shapes"][shape["member"]["shape"]] if shape["type"] == "list" else shape
+            found.setdefault(name, set()).add(element.get("pattern"))
+    return found
+
+
+def only_arn(pattern: str | None) -> bool:
+    """A required ARN prefix, with no top-level alternative that could instead name another value."""
+    if not pattern or not re.match(r"^\^?arn:", pattern):
+        return False
+    depth = 0
+    in_class = False
+    escaped = False
+    for char in pattern:
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif in_class:
+            in_class = char != "]"
+        elif char == "[":
+            in_class = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "|" and depth == 0:
+            return False
+    return True
+
+
 def located_members(models: dict[str, dict], operation: str) -> dict[str, str]:
     """The members of a REST request that its path or its query carries, holding a string, by name, with where:
     `{Label}` for a label of its path, `?name` for a parameter of its query. The reader lays them over the request's
@@ -797,8 +846,7 @@ def located_members(models: dict[str, dict], operation: str) -> dict[str, str]:
     found: dict[str, str] = {}
     for client, model in sorted(models.items()):
         spec = model["operations"].get(operation)
-        if spec is None or "input" not in spec or not ("rest-json" in _protocols(model)
-                                                        or _cloudfront_kvs_xml(model, operation)):
+        if spec is None or "input" not in spec or not ({"rest-json"} | LOCATED_ONLY_PROTOCOLS) & _protocols(model):
             continue
         for name, member in model["shapes"][spec["input"]["shape"]].get("members", {}).items():
             where = _located(member)
@@ -974,12 +1022,14 @@ def compatible(member: str, variable: str) -> bool:
     return not member_kind or not variable_kind or member_kind == variable_kind or member_kind == "identifier"
 
 
-def resources_for(operation: str, types: list[str], formats: dict[str, str], members: dict[str, str]) -> list[dict]:
+def resources_for(operation: str, types: list[str], formats: dict[str, str], members: dict[str, str],
+                  arn_members: set[str] | None = None) -> list[dict]:
     """The resources the rule finds the operation's request naming, as vendored entries."""
     name = operation.split(":", 1)[1]
     created = stem(CREATING_RE.sub("", name)) if CREATING_RE.match(name) else None
     subject = stem(SUBJECT_RE.sub("", name))
-    arns = {member: path for member, path in members.items() if re.search(r"arns?$", member, re.IGNORECASE)}
+    arns = {member: path for member, path in members.items() if re.search(r"arns?$", member, re.IGNORECASE)
+            or member in (arn_members or set())}
     names = {member: path for member, path in members.items() if member not in arns}
     by_arn: dict[str, list[str]] = {}
     filled: dict[str, dict[str, str]] = {}
@@ -1110,6 +1160,12 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
     """What the file says for one operation."""
     types = upstream["types"] or []
     members = request_members(models, operation.split(":", 1)[1])
+    patterns = string_patterns(models, operation.split(":", 1)[1])
+    # A member whose pattern takes only an ARN holds one when it is an identifier, or names whatever the action acts on
+    # (`Resource`, as CloudFront's tagging calls do); another such member names a resource of a type of its own.
+    arn_members = {member for member, values in patterns.items()
+                   if (kind_of(member) == "identifier" or stem(member) in ("", "resource"))
+                   and values and all(only_arn(value) for value in values)}
     if operation in CORRECTIONS:
         resources = CORRECTIONS[operation][0]
         endpoints = {model["metadata"]["endpointPrefix"] for model in models.values()}
@@ -1118,7 +1174,7 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
             raise ValueError(f"CORRECTIONS serves {operation} on {sorted(unknown)}, no endpoint prefix of the clients "
                              f"it reads ({sorted(endpoints)})")
     else:
-        resources = with_through(with_found(with_parent_ids(resources_for(operation, types, formats, members),
+        resources = with_through(with_found(with_parent_ids(resources_for(operation, types, formats, members, arn_members),
                                                             formats, types, members),
                                             namespace_of(operation), types, members),
                                  namespace_of(operation), types, members)

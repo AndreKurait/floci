@@ -69,12 +69,7 @@ MODELS: dict[str, str] = {
 }
 
 
-# CloudFront's existing management APIs still need their own IAM resource qualification.
-# Read only the KVS family added with scoped IAM coverage in this branch.
-ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {
-    "cloudfront": ("CreateKeyValueStore", "DeleteKeyValueStore", "DescribeKeyValueStore",
-                   "ListKeyValueStores", "UpdateKeyValueStore"),
-}
+ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {}
 
 
 def build(models: dict[str, dict], provenance: str) -> dict:

@@ -96,9 +96,10 @@ def test_the_hand_routed_scopes_are_rendered_with_their_reasons():
     assert text.splitlines()[2] == '  "handRouted": {'
 
 
-def test_cloudfront_reads_only_its_qualified_key_value_store_family():
-    operations = {name: ("GET", "/kvs/" + name) for name in r.ONLY_OPERATIONS["cloudfront"]}
+def test_cloudfront_reads_key_value_stores_and_other_management_operations():
+    operations = {name: ("GET", "/kvs/" + name) for name in ("CreateKeyValueStore", "DeleteKeyValueStore", "DescribeKeyValueStore",
+                                  "ListKeyValueStores", "UpdateKeyValueStore")}
     operations["ListDistributions"] = ("GET", "/distributions")
     result = r.build({"cloudfront": model("rest-xml", "2020-05-31", **operations)}, "test")
-    assert set(result["models"]["cloudfront"]["operations"]) == set(r.ONLY_OPERATIONS["cloudfront"])
-    assert "ListDistributions" not in result["models"]["cloudfront"]["operations"]
+    assert set(result["models"]["cloudfront"]["operations"]) == set(operations)
+    assert "ListDistributions" in result["models"]["cloudfront"]["operations"]
