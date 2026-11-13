@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
 import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
@@ -104,6 +105,7 @@ public class IamConditionContextResolver {
     private final Instance<CloudWatchLogsService> logsService;
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
+    private final Instance<LambdaService> lambdaService;
     private final Instance<SsmService> ssmService;
     private final Instance<ElbV2ConditionKeys> elbV2ConditionKeys;
     private final RequestContext requestContext;
@@ -117,6 +119,23 @@ public class IamConditionContextResolver {
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<LambdaService> lambdaService) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, lambdaService);
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -173,12 +192,31 @@ public class IamConditionContextResolver {
                                         ResolvedServiceCatalog serviceCatalog, Clock clock,
                                         Instance<SsmService> ssmService,
                                         Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService,
+                requestContext, config, currentVertxRequest, serviceCatalog, clock,
+                ssmService, elbV2ConditionKeys, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                        Instance<Ec2Service> ec2Service,
+                                        Instance<S3Service> s3Service,
+                                        Instance<CloudWatchLogsService> logsService,
+                                        Instance<IamService> iamService,
+                                        Instance<LambdaWebService> lambdaWebService,
+                                        RequestContext requestContext,
+                                        EmulatorConfig config,
+                                        CurrentVertxRequest currentVertxRequest,
+                                        ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                        Instance<SsmService> ssmService,
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<LambdaService> lambdaService) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
         this.logsService = logsService;
         this.iamService = iamService;
         this.lambdaWebService = lambdaWebService;
+        this.lambdaService = lambdaService;
         this.ssmService = ssmService;
         this.elbV2ConditionKeys = elbV2ConditionKeys;
         this.requestContext = requestContext;
@@ -487,6 +525,28 @@ public class IamConditionContextResolver {
     /** The authType a web function endpoint request names, and the one the endpoint has before it. */
     private Map<String, List<String>> lambdaConditionContext(String action, ContainerRequestContext ctx) {
         Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (("lambda:GetFunctionRecursionConfig".equals(action) || "lambda:PutFunctionRecursionConfig".equals(action))
+                && lambdaService != null && lambdaService.isResolvable()) {
+            String path = ctx.getUriInfo().getPath();
+            String prefix = "2024-08-31/functions/";
+            if (path.startsWith("/")) {
+                path = path.substring(1);
+            }
+            if (path.startsWith(prefix) && path.endsWith("/recursion-config")) {
+                String reference = path.substring(prefix.length(), path.length() - "/recursion-config".length());
+                String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+                try {
+                    lambdaService.get().recursionResourceTags(region, reference)
+                            .forEach((key, value) -> {
+                                if (key != null && value != null) {
+                                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value));
+                                }
+                            });
+                } catch (AwsException expected) {
+                    // Invalid or missing targets have no resource tags; the handler rejects them.
+                }
+            }
+        }
         for (String member : RequestConditionKeys.members(action, REQUEST_AUTH_TYPE)) {
             PassedRoles.values(PassedRoles.jsonBody(ctx), member.split("\\."))
                     .forEach(value -> putIfPresent(conditions, REQUEST_AUTH_TYPE, value));

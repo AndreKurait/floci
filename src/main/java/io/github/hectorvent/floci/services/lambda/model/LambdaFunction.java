@@ -50,6 +50,7 @@ public class LambdaFunction {
     private String version = "$LATEST";
     private LambdaUrlConfig urlConfig;
     private Integer reservedConcurrentExecutions;
+    private String recursiveLoop = "Terminate";
     private List<String> architectures;
     private int ephemeralStorageSize = 512;
     private String tracingMode = "PassThrough";
@@ -173,6 +174,9 @@ public class LambdaFunction {
 
     public Integer getReservedConcurrentExecutions() { return reservedConcurrentExecutions; }
     public void setReservedConcurrentExecutions(Integer reservedConcurrentExecutions) { this.reservedConcurrentExecutions = reservedConcurrentExecutions; }
+
+    public String getRecursiveLoop() { return recursiveLoop == null ? "Terminate" : recursiveLoop; }
+    public void setRecursiveLoop(String recursiveLoop) { this.recursiveLoop = recursiveLoop; }
 
     public List<String> getArchitectures() { return architectures; }
     public void setArchitectures(List<String> architectures) { this.architectures = architectures; }
