@@ -239,6 +239,7 @@ With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, an operation that names a ke
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_KMS_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_KMS_LISTED_GRANTEE_SERVICE_PRINCIPALS` | unset | Comma-separated `<account-id>=<service principal>` entries. `ListGrants` and `ListRetirableGrants` list a grant's `GranteePrincipal` or `RetiringPrincipal` that is an IAM or STS principal of that account as that service principal, as KMS lists an AWS service's grantees ("if the grantee principal is an AWS service, the `GranteePrincipal` field contains an AWS service principal", GrantListEntry). The grant keeps the principal it was created with, and the `GranteePrincipal` and `RetiringPrincipal` filters use it. |
 
 ## Examples
 
