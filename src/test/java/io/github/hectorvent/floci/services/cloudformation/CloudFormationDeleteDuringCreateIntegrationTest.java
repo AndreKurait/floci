@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -98,16 +99,28 @@ class CloudFormationDeleteDuringCreateIntegrationTest {
         cfn(Map.of("Action", "CreateChangeSet", "StackName", stackName, "ChangeSetName", "create",
                 "ChangeSetType", "CREATE", "TemplateBody", template(topicName, exportName)));
         String stackId = stackId(stackName);
-        cfn(Map.of("Action", "ExecuteChangeSet", "StackName", stackName, "ChangeSetName", "create"));
+        cfn(Map.of("Action", "ExecuteChangeSet", "StackName", stackName, "ChangeSetName", "create",
+                "ClientRequestToken", "held-create-token"));
         assertTrue(createReceived.await(10, TimeUnit.SECONDS), "the custom resource was never created");
 
-        cfn(Map.of("Action", "DeleteStack", "StackName", stackName));
+        cfn(Map.of("Action", "DeleteStack", "StackName", stackName,
+                "ClientRequestToken", "deferred-delete-token"));
+        assertEquals("held-create-token", cloudFormationService.describeStacks(stackId, "us-east-1")
+                .getFirst().getClientRequestToken());
+        assertTrue(cloudFormationService.describeStackEvents(stackId, "us-east-1").stream()
+                .noneMatch(event -> "deferred-delete-token".equals(event.getClientRequestToken())));
         releaseCreate.countDown();
 
         assertTrue(deleteReceived.await(10, TimeUnit.SECONDS),
                 "the custom resource the create built was never deleted: " + requests);
         CfnStackWaits.awaitStatus(stackId, "DELETE_COMPLETE");
         assertEquals(List.of("Create", "Delete"), requests);
+        for (StackEvent event : cloudFormationService.describeStackEvents(stackId, "us-east-1")) {
+            if (!"REVIEW_IN_PROGRESS".equals(event.getResourceStatus())) {
+                assertEquals(event.getResourceStatus().startsWith("DELETE_")
+                        ? "deferred-delete-token" : "held-create-token", event.getClientRequestToken());
+            }
+        }
         assertFalse(topicExists(topicName), "the resource after the custom resource was created");
         assertFalse(cfn(Map.of("Action", "ListExports")).contains(exportName), "the export was registered");
 

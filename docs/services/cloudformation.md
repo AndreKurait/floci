@@ -79,6 +79,18 @@ creation and update. Attributes omitted by an update retain their current values
 A failed stack update restores only the attributes changed by that update,
 preserving changes to other attributes.
 
+## Stack event request tokens
+
+`DescribeStackEvents` returns the supplied `ClientRequestToken` captured when each
+stack or resource event was recorded. Later operations keep their own tokens, and
+historical event tokens survive storage reloads. This includes progress, rollback,
+and deletion events produced by the operation.
+
+`CreateChangeSet` uses a separate `ClientToken`. The existing internal
+`REVIEW_IN_PROGRESS` placeholder has no operation token. An omitted
+`ClientRequestToken` remains absent, including on legacy stored events. This
+support does not add token generation, request deduplication, or token expiry.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
