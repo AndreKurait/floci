@@ -22,6 +22,7 @@ import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManagerFactory;
 import java.io.InputStream;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -29,6 +30,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.cert.CertificateFactory;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -37,6 +39,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
@@ -98,40 +101,55 @@ class TlsProxyFallbackServiceTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void managedPublicApiKeepsItsVerifiedTlsOwnerWithAnExternalFallback(boolean registerNative) throws Exception {
+    @CsvSource({"api, false", "api, true", "shared, false", "shared, true"})
+    void managedPublicTlsKeepsItsDeclaredOwner(String owner, boolean registerNative) throws Exception {
         Backend api = backend("api.fixture.local", true);
         Backend nativeOwner = backend("native.fixture.local", true);
-        Backend shared = backend("shared.fixture.local", false);
+        Backend shared = backend("shared.fixture.local", true);
         int[] ports = FreePorts.anyInterfacePorts(2);
         PublicApiProxySources sources = new PublicApiProxySources();
         Object bridge = new Object();
         sources.register(bridge, "127.0.0.1", Set.of("172.18.1.10"));
-        proxy = new TlsProxyServer(vertx, config(ports[0], ports[1], shared.server().actualPort()),
+        EmulatorConfig selectedConfig = config(ports[0], ports[1], shared.server().actualPort());
+        when(selectedConfig.tls().awsHttpsFallbackHosts()).thenReturn(Optional.of(List.of(shared.name())));
+        when(selectedConfig.tls().awsHttpsFallbackProxyProtocol()).thenReturn(true);
+        proxy = new TlsProxyServer(vertx, selectedConfig,
                 "127.0.0.1", api.server().actualPort(), api.server().actualPort(), sources);
         if (registerNative) {
             assertTrue(proxy.registerTlsRoute(ports[1], nativeOwner, name -> nativeOwner.server().actualPort()));
         }
+        Backend selected = owner.equals("api") ? api : shared;
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5))
+                .until(() -> {
+                    try (Socket probe = new Socket()) {
+                        probe.connect(new InetSocketAddress("127.0.0.1", ports[1]), 100);
+                        return true;
+                    } catch (ConnectException ignored) {
+                        // The secondary listener binds asynchronously.
+                        return false;
+                    }
+                });
         try (Socket connection = new Socket()) {
             connection.connect(new InetSocketAddress("127.0.0.1", ports[1]), 5000);
             connection.setSoTimeout(5000);
             connection.getOutputStream().write(
                     "PROXY TCP4 172.18.1.10 192.0.2.1 49152 443\r\n".getBytes(StandardCharsets.US_ASCII));
             connection.getOutputStream().flush();
-            try (SSLSocket tls = (SSLSocket) trustedContext(api).getSocketFactory()
-                    .createSocket(connection, api.name(), ports[1], false)) {
+            try (SSLSocket tls = (SSLSocket) trustedContext(selected).getSocketFactory()
+                    .createSocket(connection, selected.name(), ports[1], false)) {
                 SSLParameters parameters = tls.getSSLParameters();
                 parameters.setEndpointIdentificationAlgorithm("HTTPS");
                 tls.setSSLParameters(parameters);
                 tls.startHandshake();
                 tls.getOutputStream().write(PAYLOAD.getBytes(StandardCharsets.US_ASCII));
                 tls.getOutputStream().flush();
-                Received received = api.received().get(5, TimeUnit.SECONDS);
+                Received received = selected.received().get(5, TimeUnit.SECONDS);
                 assertEquals(PAYLOAD, received.payload());
                 assertEquals("172.18.1.10", received.sourceAddress());
                 assertEquals(49152, received.sourcePort());
                 assertFalse(nativeOwner.received().isDone());
-                assertFalse(shared.received().isDone());
+                assertFalse(selected != api && api.received().isDone());
+                assertFalse(selected != shared && shared.received().isDone());
             }
         }
     }
