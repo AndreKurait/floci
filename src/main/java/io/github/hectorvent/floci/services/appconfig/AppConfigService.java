@@ -260,12 +260,33 @@ public class AppConfigService {
         return environmentStore.get(environmentId);
     }
 
+    /** Applies only members supplied to the native UpdateEnvironment operation. */
+    public synchronized Environment updateEnvironment(String applicationId, String environmentId,
+                                                       Map<String, Object> request) {
+        AppConfigUpdateRequest.environment(applicationId, environmentId, request);
+        List<Monitor> checked = monitors(request.get("Monitors"));
+        requireApplicationById(applicationId);
+        Environment environment = copy(environmentStore.get(environmentId)
+                .filter(value -> applicationId.equals(value.getApplicationId()))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Environment not found", 404)));
+        if (request.get("Name") != null) {
+            environment.setName((String) request.get("Name"));
+        }
+        if (request.get("Description") != null) {
+            environment.setDescription((String) request.get("Description"));
+        }
+        if (request.get("Monitors") != null) {
+            environment.setMonitors(checked);
+        }
+        environmentStore.putAllAtomically(Map.of(environmentId, environment));
+        return environment;
+    }
+
     /**
      * Sets the name, description and monitors of an environment, as a CloudFormation update of
      * {@code AWS::AppConfig::Environment} does: all three are written, so a null description or
      * monitor list clears it. The monitors are checked as CreateEnvironment checks them, before
-     * anything is written. Floci serves no UpdateEnvironment route; the CloudFormation provisioner
-     * is the only caller.
+     * anything is written. The native PATCH overload preserves omitted members instead.
      */
     public synchronized Environment updateEnvironment(String applicationId, String environmentId, String name,
                                                       String description, Object monitors) {
@@ -598,11 +619,38 @@ public class AppConfigService {
         return result;
     }
 
+    /** Applies only members supplied to the native UpdateDeploymentStrategy operation. */
+    public synchronized DeploymentStrategy updateDeploymentStrategy(String id, Map<String, Object> request) {
+        AppConfigUpdateRequest.strategy(id, request);
+        if (builtinStrategy(id) != null) {
+            throw new AwsException("BadRequestException", "Predefined deployment strategies cannot be updated.", 400);
+        }
+        DeploymentStrategy strategy = copy(strategyStore.get(id)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Deployment strategy not found", 404)));
+        if (request.get("Description") != null) {
+            strategy.setDescription((String) request.get("Description"));
+        }
+        if (request.get("DeploymentDurationInMinutes") != null) {
+            strategy.setDeploymentDurationInMinutes(((Number) request.get("DeploymentDurationInMinutes")).intValue());
+        }
+        if (request.get("FinalBakeTimeInMinutes") != null) {
+            strategy.setFinalBakeTimeInMinutes(((Number) request.get("FinalBakeTimeInMinutes")).intValue());
+        }
+        if (request.get("GrowthFactor") != null) {
+            strategy.setGrowthFactor(((Number) request.get("GrowthFactor")).floatValue());
+        }
+        if (request.get("GrowthType") != null) {
+            strategy.setGrowthType((String) request.get("GrowthType"));
+        }
+        strategyStore.putAllAtomically(Map.of(id, strategy));
+        return strategy;
+    }
+
     /**
      * Sets the mutable settings of a stored deployment strategy, as a CloudFormation update of
      * {@code AWS::AppConfig::DeploymentStrategy} does; its name and {@code ReplicateTo} are
-     * create-only. The predefined strategies are not stored, so they are not found here. Floci
-     * serves no UpdateDeploymentStrategy route; the CloudFormation provisioner is the only caller.
+     * create-only. The predefined strategies are not stored, so they are not found here. The native
+     * PATCH overload preserves omitted members instead.
      */
     public synchronized DeploymentStrategy updateDeploymentStrategy(String id, String description,
                                                                     int deploymentDurationInMinutes,
