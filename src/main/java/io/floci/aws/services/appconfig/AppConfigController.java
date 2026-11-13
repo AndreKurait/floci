@@ -26,6 +26,7 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
@@ -173,7 +174,7 @@ public class AppConfigController {
                                                     @Context UriInfo uriInfo) {
         PaginatedResult<HostedConfigurationVersionSummary> page = service.listHostedConfigurationVersionsPage(
                 appId, profileId, parseListMaxResults(maxResults, uriInfo),
-                rawNextToken(nextToken, uriInfo));
+                rawNextToken(nextToken, uriInfo), uriInfo.getQueryParameters().getFirst("version_label"));
         return listResponse(page.items(), page.nextToken());
     }
 
@@ -184,8 +185,12 @@ public class AppConfigController {
                                                      @PathParam("profileId") String profileId,
                                                      @HeaderParam("Content-Type") String contentType,
                                                      @HeaderParam("Description") String description,
+                                                     @Context HttpHeaders headers,
                                                      byte[] content) {
-        HostedConfigurationVersion version = service.createHostedConfigurationVersion(appId, profileId, content, contentType, description);
+        HostedConfigurationVersion version = service.createHostedConfigurationVersion(
+                appId, profileId, content, contentType, description,
+                headers.getHeaderString("VersionLabel"),
+                parseLatestVersionNumber(headers.getHeaderString("Latest-Version-Number")));
         return versionResponse(version, 201);
     }
 
@@ -214,6 +219,9 @@ public class AppConfigController {
         rb.header("Version-Number", v.getVersionNumber());
         rb.header("Content-Type", v.getContentType());
         if (v.getDescription() != null) rb.header("Description", v.getDescription());
+        if (v.getVersionLabel() != null) {
+            rb.header("VersionLabel", v.getVersionLabel());
+        }
         return rb.build();
     }
 
@@ -344,5 +352,16 @@ public class AppConfigController {
             throw new AwsException("BadRequestException", "max_results must be an integer.", 400);
         }
         return Pagination.parseMaxResults(maxResults, "BadRequestException");
+    }
+
+    private static Integer parseLatestVersionNumber(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("BadRequestException", "LatestVersionNumber must be an integer.", 400);
+        }
     }
 }
