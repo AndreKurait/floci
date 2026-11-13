@@ -570,3 +570,21 @@ for the owning account, region and group. Notifications coalesce, each group rem
 serialized, and up to four groups can progress concurrently. A ten-second repair
 sweep covers changes without a local notification. Readiness still requires the
 actual EC2 state; a successful mutation response does not imply capacity is ready.
+
+### Group metrics
+
+`EnableMetricsCollection` publishes the eight basic group metrics to CloudWatch once per minute in
+`AWS/AutoScaling`, with the `AutoScalingGroupName` dimension and unit `None`. Collection starts disabled.
+An omitted metric list enables all collection settings; only the selected basic metrics produce samples:
+`GroupMinSize`, `GroupMaxSize`, `GroupDesiredCapacity`, `GroupInServiceInstances`, `GroupPendingInstances`,
+`GroupStandbyInstances`, `GroupTerminatingInstances`, and `GroupTotalInstances`. Pending and terminating
+lifecycle-hook wait/proceed states are included in their respective counts. The total is in-service plus
+pending plus terminating instances; standby instances have their own metric.
+
+Disabling collection or deleting the group stops future samples and preserves existing CloudWatch history.
+Samples remain isolated by account and Region, include zero values, and are available through the
+CloudWatch metric APIs. Missed collection intervals are not backfilled. Capacity-unit and warm-pool
+collection settings retain their metadata behavior without synthesized datapoints.
+
+Set `floci.services.autoscaling.cloudwatch-metrics-enabled=false` to disable the background publisher.
+The publisher also requires Auto Scaling and CloudWatch metrics to be enabled.
