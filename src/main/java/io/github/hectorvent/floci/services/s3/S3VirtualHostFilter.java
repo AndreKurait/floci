@@ -150,6 +150,9 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
             return;
         }
 
+        if (isEndpointRoot(host, baseHostname, serviceHostSuffixes)) {
+            return;
+        }
         String bucket = extractBucket(host, baseHostname, serviceHostSuffixes);
         if (bucket == null && signedForS3 && s3ServiceInstance != null && s3ServiceInstance.isResolvable()) {
             bucket = extractBucketFromExisting(host, s3ServiceInstance.get());
@@ -268,6 +271,9 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
 
         // Strip port if present
         String hostname = stripPort(host);
+        if (isEndpointRoot(hostname, baseHostname, serviceHostSuffixes)) {
+            return null;
+        }
 
         // Need at least one dot for a subdomain to exist
         int firstDot = hostname.indexOf('.');
@@ -315,6 +321,14 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
         }
 
         return bucketBeforeS3Qualifier(hostname);
+    }
+
+    private static boolean isEndpointRoot(String host, String baseHostname, Set<String> serviceHostSuffixes) {
+        String withoutPort = stripPort(host);
+        String hostname = withoutPort.endsWith(".")
+                ? withoutPort.substring(0, withoutPort.length() - 1) : withoutPort;
+        return hostname.equalsIgnoreCase(baseHostname)
+                || serviceHostSuffixes.stream().anyMatch(hostname::equalsIgnoreCase);
     }
 
     /**
