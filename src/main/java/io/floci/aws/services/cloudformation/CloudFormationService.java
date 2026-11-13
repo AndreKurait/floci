@@ -22,6 +22,7 @@ import io.floci.aws.core.resource.ResourceProvider;
 import io.floci.aws.core.resource.SupportedResourceType;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine.AttributeValueResolver;
 import io.floci.aws.services.cloudformation.model.ChangeSet;
 import io.floci.aws.services.cloudformation.model.Stack;
 import io.floci.aws.services.cloudformation.model.StackEvent;
@@ -1987,6 +1988,21 @@ public class CloudFormationService implements ResourceProvider {
         return buildTemplateSummary(readTemplate(resolvedBody));
     }
 
+    private AttributeValueResolver resourceValueResolver(JsonNode definitions) {
+        return new AttributeValueResolver() {
+            @Override
+            public JsonNode resolve(String logicalId, String attributeName, String value) {
+                return dispatcher.attributeValue(
+                        definitions.path(logicalId).path("Type").asText(), attributeName, value);
+            }
+
+            @Override
+            public String referenceValue(String logicalId, String physicalId) {
+                return dispatcher.referenceValue(definitions.path(logicalId).path("Type").asText(), physicalId);
+            }
+        };
+    }
+
     /** Each parameter the template declares, with its {@link #parameterType}. */
     private static Map<String, String> parameterTypes(JsonNode template) {
         Map<String, String> types = new HashMap<>();
@@ -2458,8 +2474,7 @@ public class CloudFormationService implements ResourceProvider {
                             (name, output, outputRegion, roleArn) ->
                                     resolveStackOutput(accountId, name, output, outputRegion, roleArn),
                             parameterTypes,
-                            (id, attribute, value) -> dispatcher.attributeValue(
-                                    resources.path(id).path("Type").asText(), attribute, value));
+                            resourceValueResolver(resources));
                     // AWS::NoValue removes the property, wherever the template puts it, so no
                     // provisioner sees it: not a member, a list item or a whole property.
                     JsonNode props = engine.omitNoValue(resDef.path("Properties"));
@@ -2641,8 +2656,7 @@ public class CloudFormationService implements ResourceProvider {
                     (name, output, outputRegion, roleArn) ->
                             resolveStackOutput(accountId, name, output, outputRegion, roleArn),
                     parameterTypes,
-                    (id, attribute, value) -> dispatcher.attributeValue(
-                            resources.path(id).path("Type").asText(), attribute, value));
+                    resourceValueResolver(resources));
 
             // Resolve outputs before mutating stack/global export state, so failed updates do not
             // leave stale or partially registered exports behind.
